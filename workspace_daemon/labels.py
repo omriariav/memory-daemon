@@ -28,9 +28,13 @@ def cache_file(base_dir):
 class Catalog:
     """User-label names, read through a TTL cache and refetched on a miss."""
 
-    def __init__(self, base_dir, ttl=DEFAULT_TTL_SECONDS, force_refresh=False):
+    def __init__(self, base_dir, ttl=DEFAULT_TTL_SECONDS, force_refresh=False,
+                 read_only=False):
         self.path = cache_file(base_dir)
         self.ttl = ttl
+        # A dry run promises no state write, and it deliberately runs without the
+        # run lock, so it must not persist anything.
+        self.read_only = read_only
         self._names = None
         self._fetched_at = 0.0
         self._announced = False
@@ -50,6 +54,8 @@ class Catalog:
         self._names, self._fetched_at = names, fetched_at
 
     def _store(self):
+        if self.read_only:
+            return
         try:
             state.write_atomic(
                 self.path,
@@ -62,7 +68,9 @@ class Catalog:
 
     @property
     def age(self):
-        return time.time() - self._fetched_at
+        # A backwards clock jump (laptop resume before NTP) would make age
+        # negative and freeze the cache; treat that as expired instead.
+        return abs(time.time() - self._fetched_at)
 
     def _expired(self):
         return self._names is None or self.age > self.ttl
@@ -94,9 +102,14 @@ class Catalog:
         A miss is the one reliable signal that the cache is behind, so it is
         also the one case where paying for a fetch is clearly worth it.
         """
+        before = self._fetched_at
         match = self._match(name, self.names())
-        if match or self._fetched_at == 0:
+        if match:
             return match
+        if self._fetched_at != before:
+            # names() just fetched (cold or expired cache), so the catalog is
+            # already current — the name is genuinely absent, not stale.
+            return None
         log(f"label {name!r} not in the cached catalog — refreshing to be sure")
         return self._match(name, self.refresh())
 

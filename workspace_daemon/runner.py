@@ -37,7 +37,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False):
     catalog = None
     label_catalog = []
     if _needs_label_catalog(routines):
-        catalog = labels.Catalog(base_dir, force_refresh=refresh_labels)
+        catalog = labels.Catalog(base_dir, force_refresh=refresh_labels,
+                                 read_only=dry_run)
         label_catalog = catalog.names()
 
     if not dry_run:
@@ -236,7 +237,7 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
     # Fail fast on a mistyped configured label: it is a config error affecting
     # every item, so surfacing it once per routine beats failing each item
     # individually and leaving them all to retry forever.
-    if label_catalog:
+    if catalog is not None or label_catalog:
         for name in config.configured_labels(routine):
             _validated_label(name, label_catalog, rid, catalog)
 
@@ -260,7 +261,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
             # be the only run, and continuing risks double-processing.
             lock.check()
         try:
-            _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals)
+            _process(routine, candidate, fetch, processed, label_catalog, dry_run,
+                     totals, catalog)
             totals["processed"] += 1
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
@@ -269,7 +271,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
         log(f"routine={rid} no new matches")
 
 
-def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals):
+def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals,
+             catalog=None):
     rid = routine["id"]
     action_list = routine.get("actions", [])
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")

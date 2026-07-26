@@ -203,7 +203,8 @@ The usual trap with a TTL is staleness: create a label, reference it in a
 routine, and get a false `does not exist in Gmail` until the cache expires. A
 miss is therefore self-healing — the catalog refetches once before reporting a
 name as unknown, so the only case that pays for a fetch is the one where the
-cache is provably behind. Force it with `daemon.py run --refresh-labels`.
+cache is provably behind. Force it with `daemon.py run --refresh-labels`. A dry run reads the cache but
+never writes it, keeping the no-state-write promise.
 
 One caveat this does not solve: with `pick_label: true` the model chooses from
 whatever is cached, so a label created in the last 14 days is not offered. It
@@ -331,7 +332,8 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 41 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 48 tests, no gws/yoetz needed
+python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```
 
