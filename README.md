@@ -1,15 +1,29 @@
-# workspace-daemon
+# memory-daemon
 
-A small scheduled automation that scans Gmail for messages matching declarative
-rules, summarizes each match with an LLM, writes a markdown note into an
-Obsidian vault, and then triages the message in Gmail (label / mark read /
-unstar / archive).
+*(formerly `workspace-daemon`)*
+
+A small scheduled automation that sweeps your work sources — Gmail, Google
+Drive docs, Slack channels and @mentions — against declarative routines,
+distills each match with an LLM, and sinks the result into one or both of:
+
+- a **markdown note** in an Obsidian vault (documents), and/or
+- a **[personal-memory](https://github.com/vladimanaev/personal-memory) entry**
+  (a local RAG memory store), written through the store's own CLI so source-id
+  dedup, index sync and versioning all apply. Model output is validated before
+  it touches the store: entry types against the store's enum, person slugs
+  against the store's known-slug list (unknown ones are dropped, never minted),
+  and every entry is tagged `auto-captured` for later review.
+
+Gmail matches can additionally be triaged (label / mark read / unstar / archive).
 
 **Adding a new routine is a drop-in YAML file, never a code change.**
 
 ```
-query ──▶ gws ──▶ LLM (yoetz) ──▶ note ──▶ ledger ──▶ triage ──▶ ledger outcome
+source (gws / slack-cli) ──▶ LLM (yoetz) ──▶ vault note and/or memory entry
+                                         ──▶ ledger ──▶ triage ──▶ ledger outcome
 ```
+
+See `routines/_example-slack-to-memory.yaml` for the Slack→memory shape.
 
 The ledger is keyed by source item id, so an item is summarized once however
 broad the query or however often the daemon runs. It is written before triage

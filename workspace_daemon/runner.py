@@ -6,7 +6,7 @@ never summarized twice and never left with silently unfinished Gmail actions.
 import re
 from contextlib import ExitStack
 
-from . import actions, config, drive, gmail, labels, llm, notes, state
+from . import actions, config, drive, gmail, labels, llm, memory_sink, notes, slack_source, state
 from .shell import log, utc_now_iso
 
 
@@ -223,6 +223,8 @@ def _drive_fetch(routine, candidate):
 SOURCES = {
     "gmail": (_gmail_candidates, _gmail_fetch),
     "drive_docs": (_drive_candidates, _drive_fetch),
+    "slack": (slack_source.candidates,
+              lambda routine, candidate: slack_source.fetch(routine, candidate)),
 }
 
 
@@ -284,11 +286,13 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     item = fetch(routine, candidate)
 
     if dry_run:
-        path = notes.target_path(routine, item)
         desc = ", ".join(actions.describe(a, "<llm-chosen>") for a in action_list) or "none"
         log(f"routine={rid} [dry-run] would analyze {len(item['body'])} chars via "
             f"provider={routine['analyze']['provider']} model={routine['analyze']['model']}")
-        log(f"routine={rid} [dry-run] would write {path}")
+        if routine.get("output"):
+            log(f"routine={rid} [dry-run] would write {notes.target_path(routine, item)}")
+        if memory_sink.memory_cfg(routine):
+            memory_sink.capture(routine, item, "<summary>", dry_run=True)
         log(f"routine={rid} [dry-run] would apply: {desc}")
         return
 
@@ -304,15 +308,32 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     elif routine["analyze"].get("pick_label"):
         log(f"routine={rid} id={item['id']} label={label!r}")
 
-    path = notes.write(routine, item, summary, label)
-    log(f"routine={rid} wrote {path}")
+    path = None
+    if routine.get("output"):
+        path = notes.write(routine, item, summary, label)
+        log(f"routine={rid} wrote {path}")
 
     record = {
         "rule_id": rid,
         "processed_at": utc_now_iso(),
-        "output_file": str(path),
+        "output_file": str(path) if path else None,
         "gmail_label_applied": label,
     }
+
+    # Memory sink runs after the vault note: the note is the expensive half and
+    # the memory add is idempotent by source id, so a crash between the two is
+    # healed by the next run re-capturing into the same entry.
+    if memory_sink.memory_cfg(routine):
+        try:
+            outcome = memory_sink.capture(routine, item, summary)
+            if outcome:
+                record.update(outcome)
+        except Exception as exc:
+            # Memory failure must not abort Gmail triage; the ledger records it
+            # for a manual re-run.
+            record["memory_error"] = str(exc)[:300]
+            totals["errors"] += 1
+            log(f"routine={rid} memory ERROR: {exc}")
     if item.get("expand_fallback"):
         # Queryable: `grep expand_fallback state/processed.json` lists every
         # item summarized from a stub, so they can be deleted and re-run once
