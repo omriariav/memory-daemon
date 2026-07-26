@@ -197,7 +197,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (config.RoutineError, MissingBinary) as exc:
+    except (config.RoutineError, MissingBinary, state.StateError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

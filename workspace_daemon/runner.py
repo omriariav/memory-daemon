@@ -18,7 +18,7 @@ def run(base_dir, routines, dry_run=False):
     In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
     no state write. Source reads still happen so the preview is real.
     """
-    processed = state.load(base_dir)
+    processed = state.Store(base_dir, dry_run=dry_run)
     label_catalog = []
     if _needs_label_catalog(routines):
         label_catalog = gmail.user_labels()
@@ -35,8 +35,6 @@ def run(base_dir, routines, dry_run=False):
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
 
-    if not dry_run:
-        state.save(base_dir, processed)
     return totals
 
 
@@ -240,9 +238,6 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     path = notes.write(routine, item, summary, label)
     log(f"routine={rid} wrote {path}")
 
-    if action_list:
-        actions.apply(item["id"], action_list, label)
-
     record = {
         "rule_id": rid,
         "processed_at": utc_now_iso(),
@@ -255,4 +250,13 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
         # the underlying document shows up.
         record["expand_fallback"] = item["expand_fallback"]
         totals["fallbacks"] += 1
-    processed[item["id"]] = record
+
+    # Recorded BEFORE triage, because the note on disk is the expensive,
+    # irreversible half. If an action then fails, the item stays in the mailbox
+    # queue but is already ledgered, so the next run skips it instead of writing
+    # a second copy of the same note. An unarchived email is a visible, cheap
+    # failure; a silent duplicate summary is not.
+    processed.record(item["id"], record)
+
+    if action_list:
+        actions.apply(item["id"], action_list, label)
