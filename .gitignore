@@ -1,0 +1,19 @@
+# Runtime state and logs
+state/
+logs/
+
+# Routines are personal config: queries, addresses, vault paths.
+# Only the documented template and examples ship with the repo.
+routines/*.yaml
+!routines/_template.yaml
+!routines/_example-*.yaml
+
+# The rendered LaunchAgent contains absolute paths and an API key.
+launchd/*.plist
+
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Personal handoff/scratch notes
+HANDOFF-PROMPT.md
