@@ -90,6 +90,7 @@ analyze:
 output:
   vault_dir: /absolute/path/to/vault/inbox
   slug_prefix: weekly-report-summary
+  # filename_template: "{slug_prefix}-{date}-{title}"  # {slug_prefix} {date} {title} {id}
   # kind: email-scoop-summary                        # optional frontmatter override
   # tags: [kind/email-scoop-summary, status/inbox]   # optional frontmatter override
 
@@ -99,6 +100,48 @@ actions: [apply_label, mark_read, unstar, archive]
 **Actions** run in order after the note is written:
 `apply_label`, `mark_read`, `mark_unread`, `star`, `unstar`, `archive`.
 Use `[]` to leave the mailbox untouched.
+
+### Scoping: the inbox as a work queue
+
+Dedupe is keyed on item id, so a broad query is safe from *re*-processing. It is
+not safe from *first*-processing — an unscoped query summarizes everything it
+matches on the first run, which is real money and a flooded vault.
+
+The pattern that works well: scope on `in:inbox` and end the routine with
+`archive`. The inbox becomes the queue, and archiving is what marks an item
+done. `is:unread` is a trap if you tend to read mail before the daemon runs —
+check the count first, since a filter that matches nothing fails silently.
+
+### Pulling content from a linked Doc
+
+Some notification emails are only a stub. Gemini meeting notes are the case this
+was built for: the mail holds one tab of the notes and the link to the real
+document exists solely in the HTML part, which `gws` strips — so there is no URL
+to follow. `source.expand` locates the doc by title instead and swaps its tabs in
+as the body:
+
+```yaml
+source:
+  kind: gmail
+  query: 'from:gemini-notes@google.com in:inbox'
+  expand:
+    kind: drive_doc
+    title_from_subject: "Notes: '(?P<title>.+?)'"   # needs a (?P<title>) group
+    name_contains: Notes by Gemini
+    tabs: [Full notes, Transcript]
+    on_missing: body        # or 'error' to skip and retry next run
+```
+
+For those meetings that is ~2k chars of email versus ~31k of document. A doc is
+only accepted when its **name starts with** the captured title: Drive full-text
+search also matches document bodies, and summarizing the wrong meeting into the
+vault is worse than summarizing none. When no doc is found, `on_missing: body`
+falls back to the email stub so the item is never silently dropped.
+
+`source.kind: drive_docs` also exists for searching Drive directly, with
+`name_contains`, `mime_type` and `tabs`. It has no inbox to bound it and no
+Gmail actions, so reach for the `expand` form unless you genuinely want every
+matching document in your Drive history.
 
 **Label safety.** With `pick_label: true` the full catalog of *user* labels is
 passed into the same call that writes the summary, and the model returns a final
@@ -168,7 +211,8 @@ daemon.py                  CLI entrypoint
 workspace_daemon/
   config.py                routine discovery, loading, validation
   shell.py                 binary resolution, subprocess, logging
-  gmail.py                 gws adapter
+  gmail.py                 gws Gmail adapter
+  drive.py                 gws Drive/Docs adapter, tab reading, doc lookup
   llm.py                   yoetz adapter, prompt building, label extraction
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions

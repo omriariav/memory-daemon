@@ -1,0 +1,67 @@
+# Example: Gemini meeting notes, using the inbox as a work queue.
+#
+# Two ideas worth stealing for your own routines:
+#
+# 1. THE INBOX IS THE QUEUE. Scoping on `in:inbox` means only meetings you have
+#    not dealt with get processed, and the `archive` action is what marks one
+#    done. A Drive-wide search instead reaches back through all history — the
+#    first draft of this routine matched 49 docs going back 16 months.
+#
+# 2. THE EMAIL IS A STUB. The notification carries only Gemini's "Quick notes"
+#    tab (~2k chars) and its link to the real document exists solely in the HTML
+#    part, which gws strips. `expand` locates the doc by title and swaps in the
+#    Full notes and Transcript tabs (~31k chars) — roughly 15x the content.
+#
+# Copy without the leading underscore to activate.
+id: meeting-notes
+enabled: true
+description: Scoop Gemini meeting notes (all doc tabs) for anything sitting in the inbox.
+
+source:
+  kind: gmail
+  query: 'from:gemini-notes@google.com in:inbox'
+  max_results: 20
+  expand:
+    kind: drive_doc
+    title_from_subject: "Notes: '(?P<title>.+?)'"
+    name_contains: Notes by Gemini
+    tabs:
+      - Full notes
+      - Transcript
+    on_missing: body
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  pick_label: true
+  instruction: >-
+    You are given the Gemini-generated record of one meeting: a "Full notes"
+    tab and, usually, a verbatim "Transcript" tab. Use the transcript as the
+    authority — it captures commitments and disagreements that the notes
+    summary flattens or omits entirely.
+
+    Write a compact meeting record using exactly these sections, omitting any
+    that would be empty:
+
+    **Decisions** — what was actually decided, one bullet each. Say explicitly
+    where something was discussed but left undecided.
+    **Action items** — "Owner — task", only where an owner is named or clearly
+    implied in the transcript.
+    **Open questions** — unresolved threads, disagreements, deferred items.
+    **Context** — at most three bullets of background needed for this to still
+    make sense in six months.
+
+    Be terse and concrete. Do not invent owners, dates or decisions. Do not
+    reproduce the transcript.
+
+output:
+  vault_dir: /absolute/path/to/your/vault/inbox
+  slug_prefix: meeting-notes
+  kind: meeting-notes
+  filename_template: "{slug_prefix}-{date}-{title}"
+  tags:
+    - kind/meeting-notes
+    - status/inbox
+
+actions: [apply_label, mark_read, unstar, archive]

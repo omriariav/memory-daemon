@@ -13,15 +13,37 @@ enabled: true
 description: One line about what this routine scoops.
 
 source:
-  # Only 'gmail' is supported today.
+  # 'gmail' (Gmail search) or 'drive_docs' (Drive file search).
   kind: gmail
 
   # Any Gmail search query. Quote it so YAML keeps the inner quotes.
-  # Messages already in state/processed.json are skipped, so a broad query is safe.
+  # Items already in state/processed.json are skipped, so a broad query is safe
+  # from re-processing — but note it is NOT safe from *first*-processing: an
+  # unscoped query summarizes everything it matches on the first run. Scope with
+  # in:inbox, is:unread, or newer_than: unless you actually want the backfill.
   query: 'from:someone@example.com subject:"Weekly Report" (is:unread OR is:starred)'
 
-  # Cap on messages examined per run. Optional, default 20.
+  # Cap on items examined per run. Optional, default 20.
   max_results: 20
+
+  # OPTIONAL — replace the email body with a linked Google Doc's tabs.
+  # For notification emails that are only a stub (Gemini meeting notes are the
+  # motivating case: the mail holds one tab and the doc link exists solely in
+  # the HTML part, which gws strips). The doc is located by title instead.
+  #
+  # expand:
+  #   kind: drive_doc
+  #   # Regex over the subject. MUST have a named (?P<title>...) group; that
+  #   # capture is what gets matched against Drive document names.
+  #   title_from_subject: "Notes: '(?P<title>.+?)'"
+  #   # Extra name filter — Drive full-text search also matches doc *bodies*,
+  #   # and a doc name must start with the captured title to be accepted.
+  #   name_contains: Notes by Gemini
+  #   # Tabs to concatenate, in doc order. Missing tabs are skipped, not fatal.
+  #   tabs: [Full notes, Transcript]
+  #   # 'body' (default) summarizes the email stub when no doc is found;
+  #   # 'error' skips the item so a later run retries it.
+  #   on_missing: body
 
 analyze:
   # yoetz provider/model. Gemini resolves natively in yoetz's registry; OpenAI does not.
@@ -52,9 +74,14 @@ output:
   # treats as an inbox so the notes surface in your normal triage flow.
   vault_dir: /absolute/path/to/your/vault/inbox
 
-  # Filename becomes <slug_prefix>-<email date YYYY-MM-DD>.md,
-  # suffixed with a short message id if that file already exists.
+  # Filename becomes <slug_prefix>-<date>.md by default, suffixed with a short
+  # item id if that file already exists.
   slug_prefix: my-routine-summary
+
+  # OPTIONAL filename template. Placeholders: {slug_prefix} {date} {title} {id}.
+  # If a routine can match several items with the same date — several meetings
+  # in one day, say — put {title} in here or they all collide onto one stem.
+  # filename_template: "{slug_prefix}-{date}-{title}"
 
   # Optional frontmatter overrides.
   # kind: email-scoop-summary
