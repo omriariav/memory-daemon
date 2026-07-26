@@ -1,0 +1,80 @@
+# Example: several recurring business reports handled by ONE routine.
+#
+# The idea worth stealing is `streams`. These reports differ only in what they
+# should be called and which Gmail label they belong under — a pure lookup, so
+# it is declared rather than left to the model to judge. Keys match the subject,
+# which is the stable identity of a recurring report: colleagues reply into
+# these threads, so keying on sender would miss those.
+#
+# Copy without the leading underscore to activate.
+id: business-updates
+enabled: true
+description: Regional, channel and BU business reports — product signals only.
+
+source:
+  kind: gmail
+  query: >-
+    in:inbox (
+      subject:"Weekly Report DACH TEAM"
+      OR subject:"Channel Business weekly report"
+      OR subject:"Exec Bi Weekly Report"
+    )
+  max_results: 20
+
+streams:
+  "Weekly Report DACH TEAM":
+    title: Weekly - DACH
+    label: EMEA
+  "Channel Business weekly report":
+    title: Weekly - Channel Business
+    label: CHANNELS
+  "Exec Bi Weekly Report":
+    title: Biweekly - Exec
+    label: ECN
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  focus_domains:
+    - User Data
+    - Tracking
+    - Attribution
+    - Incrementality
+    - Privacy / Consent
+  instruction: >-
+    This is a recurring regional, channel or business-unit report. Read it as a
+    product leader mining it for signal in the focus domains above — NOT as a
+    business summary.
+
+    Deliberately OMIT: advertiser revenue figures, publisher exTAC, margin,
+    attainment tables, sales pipeline, headcount and QBR logistics. Include a
+    number only when it is the evidence for a product point (e.g. a budget
+    blocked by a delivery constraint).
+
+    Open with a one-line orientation in a blockquote naming the report, its
+    period, and what was filtered out. Then group findings under only the
+    focus-domain headings that actually apply — omit a heading entirely rather
+    than writing "none found". Under each, one bullet per item, leading with the
+    bolded advertiser, publisher or partner name. Quote the report's own words
+    verbatim where the phrasing carries the signal.
+
+    Close with "## Product read": your own short interpretation of what this
+    implies for the roadmap and what looks worth chasing. Mark clearly where you
+    are inferring rather than reporting.
+
+    Be terse and concrete. Never invent an owner, a number, or a decision.
+
+output:
+  vault_dir: /absolute/path/to/your/vault/inbox
+  slug_prefix: business-update
+  kind: business-update
+  # {title} comes from the matching `streams` entry, so filenames are stable and
+  # group by stream: weekly-dach-2026-07-19.md, weekly-il-2026-07-13.md, ...
+  filename_template: "{title}-{date}"
+  tags:
+    - kind/business-update
+    - domain/business
+    - status/inbox
+
+actions: [apply_label, mark_read, unstar, archive]

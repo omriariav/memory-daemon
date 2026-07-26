@@ -166,6 +166,34 @@ queue to retry on the next run.
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
 
+### One routine, several report streams
+
+When a routine covers several recurring reports that differ only in what they
+should be called and where they are filed, declare them — that is a lookup, not
+a judgement call, so it should not go to the model:
+
+```yaml
+streams:
+  "Weekly Report DACH TEAM":            # matches the SUBJECT
+    title: Weekly - DACH                # stable name for the note + filename
+    label: EMEA                         # Gmail label for this stream
+  "Channel Business weekly report":
+    title: Weekly - Channel Business
+    label: CHANNELS
+
+output:
+  filename_template: "{title}-{date}"   # -> weekly-dach-2026-07-19.md
+```
+
+Keys match the **subject**, which is the stable identity of a recurring report:
+colleagues reply into these threads, so keying on the sender would miss those.
+Prefix a key with `from:` to match the sender instead.
+
+`title` matters more than it looks — raw subjects carry `RE:`/`FW:` prefixes and
+their own embedded dates, which make for noisy, unsortable filenames
+(`re-turkey-africa-baltics-weekly-updates-472026-2026-07-20.md`). A routine-wide
+fixed `label:` also works when every item belongs under the same one.
+
 **Label safety.** With `pick_label: true` the full catalog of *user* labels is
 passed into the same call that writes the summary, and the model returns a final
 `LABEL: <name>` line. That line is stripped from the note body and the name is
@@ -285,7 +313,18 @@ file. There is no rendezvous left to defend at that point, so the holder checks
 before each item and stops rather than racing on. Don't delete that file while a
 run is going.
 
-Run the crash-safety suite with `python3 -m unittest discover -s tests`.
+## Tests
+
+```sh
+python3 -m unittest discover -s tests   # crash-safety suite, no gws/yoetz needed
+python3 tools/validate_examples.py      # the shipped template and examples
+```
+
+Every case in the suite is a bug that actually shipped and was caught in review:
+note-collision ownership, a failed ledger write riding along with the next
+successful one, wrong-shaped JSON, permission preservation, temp sweeping, lock
+exclusion, and partial action failure with ordered retry. CI runs both on 3.9
+and 3.12.
 
 ## Operational notes
 
