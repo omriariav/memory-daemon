@@ -87,11 +87,18 @@ def cmd_run(args):
     mode = " (dry-run — no LLM call, no Gmail mutation, no file write)" if args.dry_run else ""
     log(f"run start: {len(routines)} routine(s){mode}")
     totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run)
-    log(
-        "run done: "
+    summary = (
         f"{totals['processed']} processed, {totals['skipped']} already-seen, "
         f"{totals['errors']} error(s)"
     )
+    if totals.get("fallbacks"):
+        # A fallback is a silent quality cliff, so it gets its own line in the
+        # summary rather than being buried in the per-item log.
+        summary += (
+            f", {totals['fallbacks']} summarized from a stub "
+            f"(grep expand_fallback state/processed.json)"
+        )
+    log(f"run done: {summary}")
     return 1 if totals["errors"] else 0
 
 

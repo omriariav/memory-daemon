@@ -24,7 +24,7 @@ def run(base_dir, routines, dry_run=False):
         label_catalog = gmail.user_labels()
         log(f"fetched {len(label_catalog)} user labels")
 
-    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0}
+    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0, "fallbacks": 0}
     for routine in routines:
         if not routine.get("enabled", True):
             log(f"routine={routine['id']} disabled, skipping")
@@ -77,6 +77,7 @@ def _gmail_fetch(source, candidate):
 
     expand = source.get("expand")
     if expand:
+        item["frontmatter"]["expanded"] = False
         _expand_from_drive(expand, item, subject, date)
 
     if not item["body"].strip():
@@ -115,6 +116,7 @@ def _expand_from_drive(expand, item, subject, date):
 
     item["body"] = body
     item["frontmatter"].update({
+        "expanded": True,
         "drive_file_id": doc["id"],
         "drive_link": doc.get("web_link", ""),
         "doc_title": doc.get("name", ""),
@@ -126,10 +128,17 @@ def _expand_from_drive(expand, item, subject, date):
 
 
 def _missing(expand, item, reason):
-    """Handle a failed expansion per on_missing: fall back to the stub, or fail."""
+    """Handle a failed expansion per on_missing: fall back to the stub, or fail.
+
+    A fallback is a quiet quality cliff — the stub is a fraction of the document
+    — so it is recorded on the note, in state, and in the run summary rather
+    than being indistinguishable from a full expansion. `on_missing: error`
+    skips the item instead, leaving it in the queue to retry.
+    """
     if expand.get("on_missing", "body") == "error":
         raise RuntimeError(f"expand failed: {reason}")
-    log(f"expand fallback to email body — {reason}")
+    item["expand_fallback"] = reason
+    log(f"WARN routine fell back to the email stub — {reason}")
 
 
 def _drive_candidates(source):
@@ -197,7 +206,7 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals):
         new += 1
         totals["matched"] += 1
         try:
-            _process(routine, candidate, fetch, processed, label_catalog, dry_run)
+            _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals)
             totals["processed"] += 1
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
@@ -206,7 +215,7 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals):
         log(f"routine={rid} no new matches")
 
 
-def _process(routine, candidate, fetch, processed, label_catalog, dry_run):
+def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals):
     rid = routine["id"]
     action_list = routine.get("actions", [])
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
@@ -234,9 +243,16 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run):
     if action_list:
         actions.apply(item["id"], action_list, label)
 
-    processed[item["id"]] = {
+    record = {
         "rule_id": rid,
         "processed_at": utc_now_iso(),
         "output_file": str(path),
         "gmail_label_applied": label,
     }
+    if item.get("expand_fallback"):
+        # Queryable: `grep expand_fallback state/processed.json` lists every
+        # item summarized from a stub, so they can be deleted and re-run once
+        # the underlying document shows up.
+        record["expand_fallback"] = item["expand_fallback"]
+        totals["fallbacks"] += 1
+    processed[item["id"]] = record

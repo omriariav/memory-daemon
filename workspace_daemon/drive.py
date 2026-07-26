@@ -7,13 +7,17 @@ a machine-readable way.
 """
 import re
 
-from .shell import gws_bin, run_json
+from .shell import gws_bin, log, run_json
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
 # "Meeting Title – 2026/07/22 16:59 IDT – Notes by Gemini". The separator is
 # sometimes an en dash and sometimes a hyphen, so match either.
 _NAME_DATE = re.compile(r"(\d{4})/(\d{2})/(\d{2})")
+
+# What must follow the meeting title in a doc name for the match to be a real
+# title boundary rather than a longer, different meeting.
+_BOUNDARY = re.compile(r"^\s*[-–—]\s")
 
 
 def search(query, max_results=50, mime_type=GOOGLE_DOC_MIME, name_contains=None):
@@ -34,28 +38,91 @@ def search(query, max_results=50, mime_type=GOOGLE_DOC_MIME, name_contains=None)
     return files
 
 
-def find_doc(title, name_contains=None, on_date=None, max_results=10):
+def _escape(value):
+    """Escape a literal for a Drive query string."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def search_by_name(fragment, mime_type=GOOGLE_DOC_MIME, max_results=25, date_fragment=None):
+    """Search on the file NAME via a raw Drive query.
+
+    Plain `drive search <text>` is a full-text search, and it silently misses
+    documents whose name matches perfectly — notably notes docs owned by a
+    meeting organiser and only shared with you. Querying `name contains`
+    directly is both more precise and more complete.
+
+    `date_fragment` ("2026/07/20") is ANDed into the query. That matters for
+    recurring meetings: the result set is capped and unordered, so a weekly
+    sync with more docs than the cap can push the one you want off the end.
+    """
+    clauses = [f"name contains '{_escape(fragment)}'", "trashed = false"]
+    if date_fragment:
+        clauses.append(f"name contains '{_escape(date_fragment)}'")
+    if mime_type:
+        clauses.append(f"mimeType = '{_escape(mime_type)}'")
+    result = run_json([
+        gws_bin(), "drive", "search", " and ".join(clauses),
+        "--raw", "--max", str(max_results), "--format", "json",
+    ])
+    return result.get("files", [])
+
+
+def _name_matches(name, needle, name_contains):
+    """The doc name must START with the meeting title, at a title boundary.
+
+    Drive returns plenty of near-misses, and summarizing the wrong meeting into
+    the vault is worse than summarizing none. A bare startswith() is not enough:
+    it accepts "Roadmap review extended" for "Roadmap review". The remainder
+    therefore has to be empty or begin with the " – " separator.
+    """
+    norm = " ".join((name or "").split())
+    if not norm.lower().startswith(needle):
+        return False
+    remainder = norm[len(needle):]
+    if remainder and not _BOUNDARY.match(remainder):
+        return False
+    if name_contains and name_contains.lower() not in norm.lower():
+        return False
+    return True
+
+
+def find_doc(title, name_contains=None, on_date=None, max_results=25):
     """Locate the Drive doc for a meeting title, or None.
 
-    Requires the doc name to *start with* the title — Drive's full-text search
-    happily returns docs that merely mention it, and summarizing the wrong
-    meeting is worse than summarizing none. When several recurring meetings
-    share a title, the date disambiguates.
+    When a date is supplied it is REQUIRED, not merely preferred: a recurring
+    meeting has one doc per occurrence, and quietly substituting a different
+    week's document is the worst thing this function could do.
     """
     needle = " ".join((title or "").split()).lower()
     if not needle:
         return None
-    matches = [
-        f for f in search(title, max_results=max_results, name_contains=name_contains)
-        if " ".join((f.get("name") or "").split()).lower().startswith(needle)
-    ]
-    if not matches:
+    date_fragment = on_date.replace("-", "/") if on_date else None
+
+    def matching(files):
+        return [f for f in files if _name_matches(f.get("name"), needle, name_contains)]
+
+    # Date-scoped query first — precise, and immune to the result cap.
+    candidates = []
+    if date_fragment:
+        candidates = matching(search_by_name(
+            title, max_results=max_results, date_fragment=date_fragment))
+
+    if not candidates:
+        pool = matching(search_by_name(title, max_results=max_results))
+        if not pool:
+            # Full-text backstop: `name contains` can miss on indexing lag, so
+            # retry the broader search. The name still has to match.
+            pool = matching(search(title, max_results=max_results, name_contains=name_contains))
+        if on_date:
+            pool = [f for f in pool if date_from_name(f.get("name")) == on_date]
+        candidates = pool
+
+    if not candidates:
         return None
-    if on_date:
-        dated = [f for f in matches if date_from_name(f.get("name")) == on_date]
-        if dated:
-            return dated[0]
-    return matches[0]
+    if len(candidates) > 1:
+        log(f"ambiguous doc lookup for {title!r} on {on_date}: "
+            f"{len(candidates)} matches, using {candidates[0].get('name')!r}")
+    return candidates[0]
 
 
 def tabs(doc_id):

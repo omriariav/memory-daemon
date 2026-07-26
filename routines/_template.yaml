@@ -35,14 +35,20 @@ source:
   #   kind: drive_doc
   #   # Regex over the subject. MUST have a named (?P<title>...) group; that
   #   # capture is what gets matched against Drive document names.
-  #   title_from_subject: "Notes: '(?P<title>.+?)'"
-  #   # Extra name filter — Drive full-text search also matches doc *bodies*,
-  #   # and a doc name must start with the captured title to be accepted.
+  #   # Prefer a greedy .+ over .+? — a non-greedy capture stops at the first
+  #   # apostrophe, so "Notes: 'Omri's weekly'" would capture just "Omri".
+  #   title_from_subject: "Notes: '(?P<title>.+)'"
+  #   # Extra name filter. A doc is accepted only if its name STARTS WITH the
+  #   # captured title at a title boundary; Drive search also matches bodies,
+  #   # and near-miss names like "Roadmap review extended" must not win.
   #   name_contains: Notes by Gemini
-  #   # Tabs to concatenate, in doc order. Missing tabs are skipped, not fatal.
+  #   # Tabs to concatenate, in doc order. Missing tabs are skipped, not fatal;
+  #   # frontmatter doc_tabs records which ones were actually read.
   #   tabs: [Full notes, Transcript]
-  #   # 'body' (default) summarizes the email stub when no doc is found;
-  #   # 'error' skips the item so a later run retries it.
+  #   # 'body' (default) summarizes the email stub when no doc is found. That is
+  #   # a big quality drop, so it is marked `expanded: false` in the note, gets
+  #   # an expand_fallback entry in state, and is counted in the run summary.
+  #   # 'error' instead skips the item, leaving it queued for a later retry.
   #   on_missing: body
 
 analyze:
