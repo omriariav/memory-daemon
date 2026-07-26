@@ -132,11 +132,32 @@ source:
     on_missing: body        # or 'error' to skip and retry next run
 ```
 
-For those meetings that is ~2k chars of email versus ~31k of document. A doc is
-only accepted when its **name starts with** the captured title: Drive full-text
-search also matches document bodies, and summarizing the wrong meeting into the
-vault is worse than summarizing none. When no doc is found, `on_missing: body`
-falls back to the email stub so the item is never silently dropped.
+For those meetings that is ~2k chars of email versus ~31k of document.
+
+Picking the **wrong** document is the worst thing this can do — a confident
+summary of somebody else's meeting, filed in your vault. Three guards:
+
+- A doc is accepted only if its **name starts with** the captured title *at a
+  title boundary*, so `Roadmap review extended` never answers for
+  `Roadmap review`. Drive search matches document bodies too, hence the check.
+- When the item has a date, that date is **required**, not preferred — it is
+  ANDed into the Drive query. A recurring weekly has one doc per occurrence, and
+  silently substituting last week's is worse than finding nothing.
+- Use a **greedy** `.+` in `title_from_subject`. A non-greedy `.+?` stops at the
+  first apostrophe, so `Notes: 'Omri's weekly'` captures just `Omri` — a
+  fragment broad enough to match an unrelated meeting.
+
+When no doc is found, `on_missing: body` falls back to the email stub so the item
+is never silently dropped. That is a real quality cliff, so it is never
+indistinguishable from success: the note gets `expanded: false`, state records an
+`expand_fallback` reason, and the run summary counts it. To find and re-run them:
+
+```sh
+grep expand_fallback state/processed.json
+```
+
+Set `on_missing: error` instead to skip the item entirely, leaving it in the
+queue to retry on the next run.
 
 `source.kind: drive_docs` also exists for searching Drive directly, with
 `name_contains`, `mime_type` and `tabs`. It has no inbox to bound it and no

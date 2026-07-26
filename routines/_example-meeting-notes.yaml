@@ -23,7 +23,7 @@ source:
   max_results: 20
   expand:
     kind: drive_doc
-    title_from_subject: "Notes: '(?P<title>.+?)'"
+    title_from_subject: "Notes: '(?P<title>.+)'"
     name_contains: Notes by Gemini
     tabs:
       - Full notes
