@@ -8,8 +8,8 @@ import yaml
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
 
-REQUIRED_TOP_LEVEL = ["id", "source", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack"}
+REQUIRED_TOP_LEVEL = ["id", "source", "analyze", "output"]
+VALID_SOURCE_KINDS = {"gmail", "drive_docs"}
 
 
 def analyze_cfg(routine):
@@ -97,21 +97,8 @@ def validate(routine):
             f"{rid}: source.kind must be one of {', '.join(sorted(VALID_SOURCE_KINDS))} "
             f"(got {kind!r})"
         )
-    if kind in ("gmail", "drive_docs") and not source.get("query"):
+    if not source.get("query"):
         problems.append(f"{rid}: source.query is required")
-    if kind == "slack":
-        channels = source.get("channels")
-        if (not channels or not isinstance(channels, list)) and not source.get("include_mentions"):
-            problems.append(
-                f"{rid}: source.kind 'slack' needs a non-empty `channels` list "
-                f"and/or include_mentions: true"
-            )
-        if routine.get("actions"):
-            problems.append(
-                f"{rid}: source.kind 'slack' does not support actions (Gmail triage only)"
-            )
-        if analyze_cfg(routine).get("pick_label"):
-            problems.append(f"{rid}: analyze.pick_label requires source.kind 'gmail'")
 
     expand = source.get("expand")
     if expand is not None:
@@ -181,20 +168,13 @@ def validate(routine):
     if domains is not None and not isinstance(domains, list):
         problems.append(f"{rid}: analyze.focus_domains must be a list")
 
-    output = routine.get("output") or {}
-    has_memory = isinstance(routine.get("memory"), dict)
-    if not output and not has_memory:
-        problems.append(f"{rid}: needs an `output:` block, a `memory:` block, or both")
-    if output:
-        if not output.get("vault_dir"):
-            problems.append(f"{rid}: output.vault_dir is required")
-        elif not str(output["vault_dir"]).startswith("/"):
-            problems.append(f"{rid}: output.vault_dir must be an absolute path")
-        if not output.get("slug_prefix"):
-            problems.append(f"{rid}: output.slug_prefix is required")
-
-    from . import memory_sink
-    problems.extend(memory_sink.validate(routine))
+    output = routine.get("output", {})
+    if not output.get("vault_dir"):
+        problems.append(f"{rid}: output.vault_dir is required")
+    elif not str(output["vault_dir"]).startswith("/"):
+        problems.append(f"{rid}: output.vault_dir must be an absolute path")
+    if not output.get("slug_prefix"):
+        problems.append(f"{rid}: output.slug_prefix is required")
 
     template = output.get("filename_template")
     if template is not None:
