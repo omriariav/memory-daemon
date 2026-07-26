@@ -34,7 +34,30 @@ def search(query, max_results=50, mime_type=GOOGLE_DOC_MIME, name_contains=None)
     return files
 
 
-def find_doc(title, name_contains=None, on_date=None, max_results=10):
+def _escape(value):
+    """Escape a literal for a Drive query string."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def search_by_name(fragment, mime_type=GOOGLE_DOC_MIME, max_results=25):
+    """Search on the file NAME via a raw Drive query.
+
+    Plain `drive search <text>` is a full-text search, and it silently misses
+    documents whose name matches perfectly — notably notes docs owned by a
+    meeting organiser and only shared with you. Querying `name contains`
+    directly is both more precise and more complete.
+    """
+    clauses = [f"name contains '{_escape(fragment)}'", "trashed = false"]
+    if mime_type:
+        clauses.append(f"mimeType = '{_escape(mime_type)}'")
+    result = run_json([
+        gws_bin(), "drive", "search", " and ".join(clauses),
+        "--raw", "--max", str(max_results), "--format", "json",
+    ])
+    return result.get("files", [])
+
+
+def find_doc(title, name_contains=None, on_date=None, max_results=25):
     """Locate the Drive doc for a meeting title, or None.
 
     Requires the doc name to *start with* the title — Drive's full-text search
@@ -45,10 +68,19 @@ def find_doc(title, name_contains=None, on_date=None, max_results=10):
     needle = " ".join((title or "").split()).lower()
     if not needle:
         return None
-    matches = [
-        f for f in search(title, max_results=max_results, name_contains=name_contains)
-        if " ".join((f.get("name") or "").split()).lower().startswith(needle)
-    ]
+
+    def prefixed(files):
+        return [
+            f for f in files
+            if " ".join((f.get("name") or "").split()).lower().startswith(needle)
+            and (not name_contains or name_contains.lower() in (f.get("name") or "").lower())
+        ]
+
+    matches = prefixed(search_by_name(title, max_results=max_results))
+    if not matches:
+        # Full-text search as a backstop: catches docs whose name was reworded
+        # but whose body still leads with the meeting title.
+        matches = prefixed(search(title, max_results=max_results, name_contains=name_contains))
     if not matches:
         return None
     if on_date:
