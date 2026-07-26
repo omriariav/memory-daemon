@@ -237,7 +237,11 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
     # Fail fast on a mistyped configured label: it is a config error affecting
     # every item, so surfacing it once per routine beats failing each item
     # individually and leaving them all to retry forever.
-    if catalog is not None or label_catalog:
+    # `label_catalog` is only ever populated from `catalog`, so testing the
+    # object alone covers both — and unlike the list it stays truthy when the
+    # catalog comes back empty, which is exactly when one routine-level failure
+    # beats a refetch per item.
+    if catalog is not None:
         for name in config.configured_labels(routine):
             _validated_label(name, label_catalog, rid, catalog)
 

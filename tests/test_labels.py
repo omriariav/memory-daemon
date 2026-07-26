@@ -84,6 +84,40 @@ class LabelCacheTest(unittest.TestCase):
         self.assertIsNone(cache.resolve("NEVER EXISTED"))
         self.assertEqual(self.fake.calls, 2, "must not refetch on every miss")
 
+    def test_a_cold_cache_miss_fetches_exactly_once(self):
+        """resolve() as the very first call, with nothing on disk.
+
+        The refetch-on-miss guard has to notice that names() already fetched.
+        An earlier version compared _fetched_at to 0, which names() had already
+        overwritten by then, so a cold miss fetched twice. Every other miss test
+        warms the cache first and so never covered this.
+        """
+        self.assertIsNone(self.cache().resolve("NEVER EXISTED"))
+        self.assertEqual(self.fake.calls, 1,
+                         "a cold cache already holds fresh data; no second fetch")
+
+    def test_a_cold_cache_hit_fetches_exactly_once(self):
+        self.assertEqual(self.cache().resolve("emea"), "EMEA")
+        self.assertEqual(self.fake.calls, 1)
+
+    def test_an_expired_cache_miss_fetches_exactly_once(self):
+        self.cache().names()
+        self.fake.calls = 0
+        self.assertIsNone(self.cache(ttl=-1).resolve("NEVER EXISTED"))
+        self.assertEqual(self.fake.calls, 1, "the expiry refetch is already current")
+
+    def test_a_clock_jump_backwards_does_not_freeze_the_cache(self):
+        """A negative age would otherwise read as fresh forever."""
+        cache = self.cache()
+        cache.names()
+        cache._fetched_at = time.time() + 10 * self.cache().ttl  # clock jumped back
+        self.fake.names.append("LATER")
+        self.assertIn("LATER", cache.names(), "an implausible timestamp must expire")
+
+    def test_read_only_never_writes_the_cache(self):
+        self.cache(read_only=True).names()
+        self.assertFalse(labels.cache_file(self.base).exists())
+
     def test_a_corrupt_cache_file_is_ignored_not_fatal(self):
         for bad in ("not json", "[]", '{"labels": "nope"}', '{"fetched_at": 1}'):
             labels.cache_file(self.base).write_text(bad)

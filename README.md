@@ -332,7 +332,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 48 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 53 tests, no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```

@@ -108,12 +108,24 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(self.ledger(), {}, "nothing should be ledgered")
 
     def test_an_empty_catalog_fails_fast_rather_than_refetching_per_item(self):
-        """Bug #2's shape: an empty catalog must not reject labels item by item."""
+        """An empty catalog must fail the routine once, not once per item.
+
+        Needs MORE THAN ONE candidate: with a single item the buggy guard and
+        the fixed one are indistinguishable, since there is nothing to multiply.
+        """
         calls = []
         gmail.user_labels = lambda: (calls.append(1), [])[1]
+        gmail.search = lambda q, m=20: [
+            {"message_id": f"m{i}", "thread_id": f"m{i}",
+             "subject": "Weekly Report DACH TEAM"}
+            for i in range(4)
+        ]
         totals = runner.run(self.base, [routine(self.vault, label="EMEA")])
-        self.assertEqual(totals["errors"], 1)
-        self.assertLessEqual(len(calls), 2, f"refetch storm: {len(calls)} catalog fetches")
+        self.assertEqual(totals["errors"], 1,
+                         "one routine-level failure, not one per item")
+        self.assertEqual(totals["processed"], 0)
+        self.assertLessEqual(len(calls), 2,
+                             f"refetch storm over 4 items: {len(calls)} catalog fetches")
 
     def test_dry_run_writes_nothing_at_all(self):
         runner.run(self.base, [routine(self.vault, label="EMEA")], dry_run=True)
