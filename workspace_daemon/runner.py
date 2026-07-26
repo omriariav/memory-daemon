@@ -11,9 +11,9 @@ from .shell import log, utc_now_iso
 
 
 def _needs_label_catalog(routines):
-    """Both LLM-chosen and static labels are validated against the live catalog."""
+    """Both LLM-chosen and configured labels are validated against the catalog."""
     return any(
-        (r.get("analyze", {}).get("pick_label") or r.get("label"))
+        (r.get("analyze", {}).get("pick_label") or config.configured_labels(r))
         and r.get("source", {}).get("kind") == "gmail"
         for r in routines
     )
@@ -58,6 +58,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None):
             continue
         try:
             _run_routine(routine, processed, label_catalog, dry_run, totals, lock)
+        except state.AlreadyRunning:
+            # Losing the lock is a whole-run condition, not one routine's bug:
+            # every remaining routine would hit it too. Let it reach the CLI,
+            # which reports it as a clean skip rather than N fatal errors.
+            raise
         except Exception as exc:  # a broken routine must not abort the rest
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
@@ -226,6 +231,13 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
     problems = config.validate(routine)
     if problems:
         raise config.RoutineError("; ".join(problems))
+
+    # Fail fast on a mistyped configured label: it is a config error affecting
+    # every item, so surfacing it once per routine beats failing each item
+    # individually and leaving them all to retry forever.
+    if label_catalog:
+        for name in config.configured_labels(routine):
+            _validated_label(name, label_catalog, rid)
 
     _retry_pending_actions(routine, processed, dry_run, totals)
 

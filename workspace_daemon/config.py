@@ -17,6 +17,23 @@ def analyze_cfg(routine):
     return cfg if isinstance(cfg, dict) else {}
 
 
+def configured_labels(routine):
+    """Every statically-configured Gmail label in a routine.
+
+    The single source of truth for "does this routine apply labels from config".
+    Validation and the runner both ask this; when they each computed it their own
+    way they drifted, and a routine whose labels came only from `streams` ran
+    with an empty catalog and rejected every one of its own valid labels.
+    """
+    names = []
+    if routine.get("label"):
+        names.append(routine["label"])
+    for cfg in (routine.get("streams") or {}).values():
+        if isinstance(cfg, dict) and cfg.get("label"):
+            names.append(cfg["label"])
+    return names
+
+
 class RoutineError(Exception):
     pass
 
@@ -187,10 +204,7 @@ def validate(routine):
             )
 
     streams = routine.get("streams")
-    configured_label = bool(
-        routine.get("label")
-        or (streams and any((v or {}).get("label") for v in streams.values()))
-    )
+    configured_label = bool(configured_labels(routine))
 
     if "apply_label" in routine.get("actions", []) and not (
         analyze.get("pick_label") or configured_label

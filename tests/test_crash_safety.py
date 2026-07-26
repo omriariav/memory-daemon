@@ -210,5 +210,148 @@ class TestActionRetry(unittest.TestCase):
         self.assertEqual((applied, pending), ([], []))
 
 
+class TestFsyncDirFailure(unittest.TestCase):
+    """A dir-fsync failure after a successful replace must not look like a failed write."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        (self.base / "state").mkdir()
+        self.saved = state._fsync_dir
+        state._fsync_dir = lambda p: (_ for _ in ()).throw(OSError("EIO"))
+
+    def tearDown(self):
+        state._fsync_dir = self.saved
+        self.tmp.cleanup()
+
+    def test_write_still_succeeds_and_commits(self):
+        store = state.Store(self.base)
+        store.record("A", {"rule_id": "r"})  # must not raise
+        on_disk = json.loads((self.base / "state" / "processed.json").read_text())
+        self.assertEqual(list(on_disk), ["A"])
+        self.assertIn("A", store, "in-memory state must match what is on disk")
+
+    def test_a_later_write_does_not_lose_the_earlier_one(self):
+        """The bug this guards: treating a committed write as failed, then
+        rebuilding from stale memory and clobbering it."""
+        store = state.Store(self.base)
+        store.record("A", {"rule_id": "r"})
+        store.record("B", {"rule_id": "r"})
+        self.assertEqual(sorted(json.loads((self.base / "state" / "processed.json").read_text())),
+                         ["A", "B"])
+
+
+class TestStreams(unittest.TestCase):
+    """`streams` gives one routine several report streams. Never reviewed until late."""
+
+    @staticmethod
+    def make(streams=None, **extra):
+        r = {"id": "t", "enabled": True,
+             "source": {"kind": "gmail", "query": "in:inbox"},
+             "analyze": {"provider": "gemini", "model": "m", "instruction": "go"},
+             "output": {"vault_dir": "/tmp/x", "slug_prefix": "p"},
+             "actions": ["apply_label"]}
+        if streams is not None:
+            r["streams"] = streams
+        r.update(extra)
+        return r
+
+    @staticmethod
+    def msg(subject="", sender=""):
+        return {"id": "1", "frontmatter": {"email_subject": subject, "email_from": sender}}
+
+    def test_matches_on_subject_including_reply_prefixes(self):
+        r = self.make({"Weekly Report DACH": {"title": "Weekly - DACH", "label": "EMEA"}})
+        from workspace_daemon import runner
+        for subject in ("Weekly Report DACH TEAM - week29",
+                        "Re: Weekly Report DACH TEAM - week29",
+                        "FW: Weekly Report DACH TEAM"):
+            self.assertEqual(runner._stream_for(r, self.msg(subject))["label"], "EMEA", subject)
+
+    def test_subject_match_survives_a_reply_from_someone_else(self):
+        """The real case: the Turkey report arrives as a reply from a colleague."""
+        from workspace_daemon import runner
+        r = self.make({"Turkey, Africa, Baltics Weekly": {"title": "Weekly - TAB", "label": "EMEA"}})
+        item = self.msg("Re: Turkey, Africa, Baltics Weekly Updates | 4/7/2026",
+                        '"Someone Else" <someone.else@example.com>')
+        self.assertEqual(runner._stream_for(r, item)["title"], "Weekly - TAB")
+
+    def test_from_prefix_matches_the_sender(self):
+        from workspace_daemon import runner
+        r = self.make({"from:boss@example.com": {"title": "Boss", "label": "ECN"}})
+        self.assertEqual(runner._stream_for(r, self.msg("anything", "Boss <boss@example.com>"))["title"],
+                         "Boss")
+        self.assertEqual(runner._stream_for(r, self.msg("boss@example.com", "other@example.com")), {})
+
+    def test_no_match_returns_empty_and_no_label(self):
+        from workspace_daemon import runner
+        r = self.make({"Nope": {"title": "N", "label": "L"}})
+        self.assertEqual(runner._stream_for(r, self.msg("unrelated")), {})
+        self.assertIsNone(runner._static_label(r, self.msg("unrelated")))
+
+    def test_routine_label_is_the_fallback(self):
+        from workspace_daemon import runner
+        r = self.make({"Nope": {"title": "N"}}, label="FALLBACK")
+        self.assertEqual(runner._static_label(r, self.msg("unrelated")), "FALLBACK")
+
+    def test_configured_labels_sees_stream_labels(self):
+        """The bug: validation counted stream labels, the runner did not, so a
+        streams-only routine ran with an empty catalog and rejected its own."""
+        from workspace_daemon import config, runner
+        r = self.make({"A": {"label": "EMEA"}, "B": {"label": "CHANNELS"}})
+        self.assertEqual(sorted(config.configured_labels(r)), ["CHANNELS", "EMEA"])
+        self.assertTrue(runner._needs_label_catalog([r]),
+                        "a streams-only routine still needs the label catalog")
+
+    def test_apply_label_is_satisfied_by_a_stream_label(self):
+        from workspace_daemon import config
+        self.assertEqual(config.validate(self.make({"A": {"label": "EMEA"}})), [])
+
+    def test_apply_label_without_any_label_source_is_rejected(self):
+        from workspace_daemon import config
+        problems = config.validate(self.make())
+        self.assertTrue(any("apply_label" in p for p in problems), problems)
+
+    def test_configured_label_and_pick_label_are_mutually_exclusive(self):
+        from workspace_daemon import config
+        r = self.make({"A": {"label": "EMEA"}})
+        r["analyze"]["pick_label"] = True
+        self.assertTrue(any("not both" in p for p in config.validate(r)), config.validate(r))
+
+    def test_malformed_streams_are_rejected(self):
+        from workspace_daemon import config
+        for streams in ({}, [], {"A": "just a string"}, {"A": {"bogus": 1}}):
+            self.assertTrue(config.validate(self.make(streams)),
+                            f"{streams!r} should be rejected")
+
+    def test_validated_label_is_case_insensitive_and_rejects_unknown(self):
+        from workspace_daemon import runner
+        self.assertEqual(runner._validated_label("emea", ["EMEA", "CHANNELS"], "t"), "EMEA")
+        with self.assertRaises(RuntimeError):
+            runner._validated_label("NOPE", ["EMEA"], "t")
+
+
+class TestTempSweepScope(unittest.TestCase):
+    """The sweep runs inside the user's vault, which the daemon does not own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_only_our_own_temp_shape_is_swept(self):
+        ours = self.dir / ".processed.json.123.tmp"
+        theirs = [self.dir / ".obsidian-sync.tmp", self.dir / ".note.md.swp.tmp"]
+        for f in [ours, *theirs]:
+            f.write_text("x")
+            os.utime(f, (0, 0))  # all stale
+        state.sweep_temp_files(self.dir)
+        self.assertFalse(ours.exists())
+        for f in theirs:
+            self.assertTrue(f.exists(), f"{f.name} is not ours and must survive")
+
+
 if __name__ == "__main__":
     unittest.main()

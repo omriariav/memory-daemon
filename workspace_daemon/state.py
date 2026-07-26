@@ -8,6 +8,7 @@ launchd timeout), and a run that dies halfway must not forget what it just did.
 import fcntl
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -103,6 +104,9 @@ def write_atomic(path, text):
 
 TEMP_MAX_AGE_SECONDS = 3600
 
+# The exact shape write_atomic produces: `.<real name>.<pid>.tmp`.
+TEMP_NAME = re.compile(r"^\..+\.\d+\.tmp$")
+
 
 def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
     """Delete orphaned write_atomic temp files.
@@ -119,6 +123,12 @@ def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
     now = time.time()
     removed = 0
     for tmp in directory.glob(".*.tmp"):
+        # Only our own shape: `.<real name>.<pid>.tmp`. A bare `.*.tmp` glob also
+        # matches editor swap files and sync-conflict artifacts in a vault this
+        # daemon does not own, and deleting someone else's data is far worse
+        # than leaving a stray temp behind.
+        if not TEMP_NAME.match(tmp.name):
+            continue
         try:
             if now - tmp.stat().st_mtime < max_age:
                 continue
