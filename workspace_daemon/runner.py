@@ -251,7 +251,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
 
     source = routine["source"]
     list_candidates, fetch = SOURCES[source["kind"]]
-    log(f"routine={rid} querying {source['kind']}: {source['query']}")
+    scope = source.get("query") or ", ".join(source.get("channels", [])) or "mentions"
+    log(f"routine={rid} querying {source['kind']}: {scope}")
     candidates = list_candidates(source)
     log(f"routine={rid} {len(candidates)} item(s) matched")
 

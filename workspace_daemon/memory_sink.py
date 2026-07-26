@@ -142,6 +142,13 @@ def capture(routine, item, summary, dry_run=False):
     rid = routine.get("id")
     source_id = source_id_for(item)
 
+    if dry_run:
+        # Honor the daemon's dry-run contract: no LLM call, no store write. The
+        # extraction verdict can't be previewed without the real summary anyway.
+        log(f"routine={rid} [dry-run] would extract + memory-add "
+            f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}")
+        return {"memory": "dry_run"}
+
     entry = {"worthy": True, "type": cfg.get("type", "note"),
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}
     degraded = None
