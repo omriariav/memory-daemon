@@ -253,7 +253,11 @@ interruptions rather than exceptions. Four properties hold:
 
 **An item is never summarized twice.** The ledger entry is written — atomically,
 and fsynced — immediately after the note, before any Gmail action. A crash
-during triage cannot cause a second summary of the same item on the next run.
+during triage cannot cause a second summary. A crash in the narrower window
+*before* the ledger write leaves an unledgered note, so the item is retried —
+and the retry overwrites its own note rather than writing a second copy, because
+collision is judged by the `item_id` in the note's frontmatter rather than by
+mere filename existence.
 
 **Triage is never silently half-applied.** The entry is first recorded with every
 action `pending`, then updated with what actually succeeded. A failing action
@@ -274,6 +278,14 @@ an empty ledger means re-summarizing and re-triaging everything still matched.
 a manual `daemon.py run` alongside the scheduled one would otherwise have both
 processes summarizing the same item. A second run exits cleanly, logging that it
 skipped. Dry runs never take the lock.
+
+`flock` binds to an inode, not a path, so deleting `state/run.lock` mid-run
+leaves the holder guarding an orphan and lets another run lock a freshly created
+file. There is no rendezvous left to defend at that point, so the holder checks
+before each item and stops rather than racing on. Don't delete that file while a
+run is going.
+
+Run the crash-safety suite with `python3 -m unittest discover -s tests`.
 
 ## Operational notes
 

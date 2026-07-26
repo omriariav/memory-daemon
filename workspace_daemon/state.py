@@ -8,7 +8,10 @@ launchd timeout), and a run that dies halfway must not forget what it just did.
 import fcntl
 import json
 import os
+import time
 from pathlib import Path
+
+from .shell import log
 
 
 class StateError(Exception):
@@ -81,13 +84,51 @@ def write_atomic(path, text):
         if mode is not None:
             os.chmod(tmp, mode)  # replacing must not widen the file's permissions
         os.replace(tmp, path)
-        _fsync_dir(path.parent)
     except BaseException:
         try:
             tmp.unlink()
         except OSError:
             pass
         raise
+
+    # Durability of the rename itself. The content is already visible at `path`,
+    # so a failure here only weakens the power-loss guarantee — it must NOT be
+    # raised, or the caller would treat a completed write as "did not happen"
+    # and later overwrite the new file with its older in-memory state.
+    try:
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        log(f"WARN wrote {path} but could not fsync its directory: {exc}")
+
+
+TEMP_MAX_AGE_SECONDS = 3600
+
+
+def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
+    """Delete orphaned write_atomic temp files.
+
+    SIGTERM and SIGKILL unwind nothing, so the cleanup in write_atomic never
+    runs when launchd stops a job mid-write. The real file is untouched in that
+    case, but the temp lingers; without this they accumulate silently over
+    months of interrupted hourly runs. The age guard keeps this from racing a
+    write that is genuinely in flight.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return 0
+    now = time.time()
+    removed = 0
+    for tmp in directory.glob(".*.tmp"):
+        try:
+            if now - tmp.stat().st_mtime < max_age:
+                continue
+            tmp.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        log(f"swept {removed} orphaned temp file(s) from {directory}")
+    return removed
 
 
 def _serialize(entries):
@@ -159,18 +200,56 @@ class RunLock:
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "w")
+        for _ in range(5):
+            # O_RDWR|O_CREAT, never "w": open(path, "w") truncates before the
+            # lock is even attempted, so a losing contender would erase the
+            # holder's pid — the one diagnostic this file carries.
+            fh = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                holder = fh.read().strip() or "unknown pid"
+                fh.close()
+                raise AlreadyRunning(
+                    f"another run (pid {holder}) holds {self.path}; skipping this one"
+                )
+            # flock binds to the inode, not the path. If the lock file was
+            # deleted or replaced between open and flock, we now hold an
+            # exclusive lock on an orphan inode and guard nothing at all.
+            try:
+                same = os.fstat(fh.fileno()).st_ino == os.stat(self.path).st_ino
+            except FileNotFoundError:
+                same = False
+            if same:
+                self._fh = fh
+                fh.truncate(0)
+                fh.write(f"{os.getpid()}\n")
+                fh.flush()
+                return self
+            fh.close()  # raced with a delete/replace — retry on the new inode
+        raise AlreadyRunning(f"{self.path} kept changing underneath us; skipping this run")
+
+    def still_held(self):
+        """True while our lock still guards the path we took it on.
+
+        Once the lock file is deleted our flock survives only on an orphan inode,
+        and any other run is then free to create the path and lock it. There is
+        no rendezvous left to defend, so the honest move is for the holder to
+        notice and stop rather than race on.
+        """
+        if not self._fh:
+            return False
         try:
-            fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return os.fstat(self._fh.fileno()).st_ino == os.stat(self.path).st_ino
         except OSError:
-            self._fh.close()
-            self._fh = None
+            return False
+
+    def check(self):
+        if not self.still_held():
             raise AlreadyRunning(
-                f"another run holds {self.path}; skipping this one"
+                f"{self.path} was deleted or replaced mid-run; stopping so a "
+                f"concurrent run cannot double-process"
             )
-        self._fh.write(f"{os.getpid()}\n")
-        self._fh.flush()
-        return self
 
     def __exit__(self, *exc):
         if self._fh:

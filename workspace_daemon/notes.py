@@ -52,16 +52,48 @@ def email_date(headers):
         return datetime.date.today().isoformat()
 
 
+ID_KEYS = ("item_id", "gmail_message_id", "drive_file_id")
+
+
+def note_owner(path):
+    """The item id recorded in an existing note's frontmatter, or None."""
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    try:
+        front = yaml.safe_load(text[3:end])
+    except yaml.YAMLError:
+        return None
+    if not isinstance(front, dict):
+        return None
+    for key in ID_KEYS:
+        if front.get(key):
+            return str(front[key])
+    return None
+
+
 def target_path(routine, item):
     """Deterministic note path; suffixed with a short item id on collision.
 
     output.filename_template accepts {slug_prefix}, {date}, {title} and {id}.
     Routines whose matches share a date (several meetings in one day) want
     {title} in there, or every note collides onto the same stem.
+
+    Collision is judged by *ownership*, not mere existence. A crash between
+    writing the note and recording the ledger entry leaves an unledgered note
+    behind; the retry must overwrite its own note rather than treat it as a
+    different item colliding on the same stem and write a second copy.
     """
     output = routine["output"]
     template = output.get("filename_template", DEFAULT_FILENAME_TEMPLATE)
-    short_id = str(item["id"])[:8]
+    item_id = str(item["id"])
+    short_id = item_id[:8]
     slug = title_slug(item.get("title"))
     stem = template.format(
         slug_prefix=output["slug_prefix"],
@@ -72,10 +104,12 @@ def target_path(routine, item):
         message_id=short_id,
     )
     stem = re.sub(r"-{2,}", "-", stem).strip("-")
-    path = Path(output["vault_dir"]) / f"{stem}.md"
-    if path.exists():
-        path = path.with_name(f"{stem}-{short_id}.md")
-    return path
+    directory = Path(output["vault_dir"])
+    for candidate in (directory / f"{stem}.md", directory / f"{stem}-{short_id}.md"):
+        if not candidate.exists() or note_owner(candidate) == item_id:
+            return candidate
+    # Both taken by other items: two ids sharing a stem and an 8-char prefix.
+    return directory / f"{stem}-{item_id}.md"
 
 
 def render(routine, item, summary, label):
@@ -83,6 +117,9 @@ def render(routine, item, summary, label):
         "kind": routine["output"].get("kind", "email-scoop-summary"),
         "rule_id": routine["id"],
         "source": routine["source"]["kind"],
+        # Source-agnostic identity. target_path() reads this back to tell "my own
+        # note from an interrupted run" apart from "a different item, same stem".
+        "item_id": str(item["id"]),
     }
     frontmatter.update(item.get("frontmatter", {}))
     frontmatter["focus_domains"] = routine["analyze"].get("focus_domains") or []

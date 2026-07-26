@@ -11,6 +11,7 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
 import argparse
 import os
 import re
+import signal
 import sys
 from pathlib import Path
 
@@ -190,6 +191,10 @@ def cmd_new(args):
 
 # --- entrypoint -------------------------------------------------------------
 
+def _on_sigterm(signum, frame):
+    raise SystemExit(143)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="daemon.py", description=__doc__,
@@ -207,6 +212,12 @@ def main(argv=None):
                        help="preview only: no LLM call, no Gmail mutation, no file write")
     p_run.set_defaults(func=cmd_run)
 
+    # launchd sends SIGTERM on unload, logout, or timeout. CPython installs no
+    # handler for it, so the process would die without unwinding — skipping the
+    # temp-file cleanup in write_atomic. Turning it into SystemExit lets the
+    # normal exception paths run.
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
@@ -216,6 +227,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\naborted", file=sys.stderr)
         return 130
+    except SystemExit as exc:
+        log(f"terminated by signal (exit {exc.code})")
+        raise
 
 
 if __name__ == "__main__":
