@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the README claims; 3.12 is what most people will run.
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Crash-safety tests
+        # No gws or yoetz on the runner. The suite must not need them — if a
+        # test ever shells out to a real binary, this is where it breaks.
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI smoke test
+        run: |
+          python daemon.py --help > /dev/null
+          python daemon.py validate
+          python daemon.py list
+
+      - name: Validate the shipped template and examples
+        # routines/*.yaml is gitignored (personal config) and the loader skips
+        # files starting with "_", so nothing in the repo is otherwise validated.
+        # Check them directly, or the documented examples silently rot out of
+        # sync with the schema whenever validation changes.
+        run: python tools/validate_examples.py

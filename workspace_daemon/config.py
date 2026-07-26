@@ -17,6 +17,23 @@ def analyze_cfg(routine):
     return cfg if isinstance(cfg, dict) else {}
 
 
+def configured_labels(routine):
+    """Every statically-configured Gmail label in a routine.
+
+    The single source of truth for "does this routine apply labels from config".
+    Validation and the runner both ask this; when they each computed it their own
+    way they drifted, and a routine whose labels came only from `streams` ran
+    with an empty catalog and rejected every one of its own valid labels.
+    """
+    names = []
+    if routine.get("label"):
+        names.append(routine["label"])
+    for cfg in (routine.get("streams") or {}).values():
+        if isinstance(cfg, dict) and cfg.get("label"):
+            names.append(cfg["label"])
+    return names
+
+
 class RoutineError(Exception):
     pass
 
@@ -186,9 +203,36 @@ def validate(routine):
                 f"{rid}: unknown action '{action}' (valid: {', '.join(sorted(VALID_ACTIONS))})"
             )
 
-    if "apply_label" in routine.get("actions", []) and not analyze.get("pick_label"):
+    streams = routine.get("streams")
+    configured_label = bool(configured_labels(routine))
+
+    if "apply_label" in routine.get("actions", []) and not (
+        analyze.get("pick_label") or configured_label
+    ):
         problems.append(
-            f"{rid}: action 'apply_label' requires analyze.pick_label: true"
+            f"{rid}: action 'apply_label' needs `label:`, a `streams:` entry "
+            f"with a label, or analyze.pick_label: true"
         )
+    if configured_label and analyze.get("pick_label"):
+        problems.append(
+            f"{rid}: set a configured label OR analyze.pick_label, not both"
+        )
+    if routine.get("label") is not None and not isinstance(routine["label"], str):
+        problems.append(f"{rid}: `label` must be a string")
+    if streams is not None:
+        if not isinstance(streams, dict) or not streams:
+            problems.append(f"{rid}: `streams` must be a non-empty mapping keyed by sender")
+        else:
+            allowed = {"title", "label"}
+            for sender, cfg in streams.items():
+                if not isinstance(cfg, dict):
+                    problems.append(f"{rid}: streams[{sender}] must be a mapping")
+                    continue
+                unknown = set(cfg) - allowed
+                if unknown:
+                    problems.append(
+                        f"{rid}: streams[{sender}] has unknown key(s) "
+                        f"{', '.join(sorted(unknown))} (valid: title, label)"
+                    )
 
     return problems

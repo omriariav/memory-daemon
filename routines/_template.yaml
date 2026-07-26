@@ -95,6 +95,31 @@ output:
 
 # Gmail triage applied after the note is written, in order.
 # Valid: apply_label, mark_read, mark_unread, star, unstar, archive
-# apply_label is skipped silently when the model returned no valid label.
-# Use an empty list [] to leave the mailbox untouched.
+# A failing action does not abort the others: it is recorded as pending and
+# retried at the start of the next run. Use [] to leave the mailbox untouched.
 actions: [apply_label, mark_read, unstar, archive]
+
+# OPTIONAL — a fixed Gmail label for every item, instead of letting the model
+# choose one. Mutually exclusive with analyze.pick_label. Still validated
+# against the live catalog, so a typo fails loudly rather than creating a label.
+# label: SOME EXISTING LABEL
+
+# OPTIONAL — when one routine covers several recurring report streams that
+# differ only in what they should be called and where they are filed. Keys match
+# against the SUBJECT (the stable identity of a recurring report: a colleague
+# replying into the thread does not change it, where the sender would). Prefix a
+# key with `from:` to match the sender instead.
+#
+#   title  gives the stream a stable name for the note and its filename —
+#          better than the raw subject, which carries RE:/FW: and its own
+#          embedded date. Pair it with filename_template "{title}-{date}".
+#   label  the Gmail label for this stream, validated like `label` above.
+#
+# Both are pure lookups, so they are declared here rather than left to the model.
+# streams:
+#   "Weekly Report DACH TEAM":
+#     title: Weekly - DACH
+#     label: EMEA
+#   "Channel Business weekly report":
+#     title: Weekly - Channel Business
+#     label: CHANNELS

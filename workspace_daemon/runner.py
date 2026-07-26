@@ -1,13 +1,20 @@
-"""The run loop: match → analyze → write note → triage → record state."""
+"""The run loop: match → analyze → write note → ledger → triage → ledger outcome.
+
+The ledger entry is written before triage and updated after it, so an item is
+never summarized twice and never left with silently unfinished Gmail actions.
+"""
 import re
+from contextlib import ExitStack
 
 from . import actions, config, drive, gmail, llm, notes, state
 from .shell import log, utc_now_iso
 
 
 def _needs_label_catalog(routines):
+    """Both LLM-chosen and configured labels are validated against the catalog."""
     return any(
-        r.get("analyze", {}).get("pick_label") and r.get("source", {}).get("kind") == "gmail"
+        (r.get("analyze", {}).get("pick_label") or config.configured_labels(r))
+        and r.get("source", {}).get("kind") == "gmail"
         for r in routines
     )
 
@@ -18,25 +25,48 @@ def run(base_dir, routines, dry_run=False):
     In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
     no state write. Source reads still happen so the preview is real.
     """
-    processed = state.load(base_dir)
+    # A dry run mutates nothing and reads through atomic replaces, so it does
+    # not need the lock and must not be blocked by a real run in progress.
+    with ExitStack() as stack:
+        lock = stack.enter_context(state.RunLock(base_dir)) if not dry_run else None
+        return _run_locked(base_dir, routines, dry_run, lock)
+
+
+def _run_locked(base_dir, routines, dry_run, lock=None):
+    processed = state.Store(base_dir, dry_run=dry_run)
     label_catalog = []
     if _needs_label_catalog(routines):
         label_catalog = gmail.user_labels()
         log(f"fetched {len(label_catalog)} user labels")
 
-    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0, "fallbacks": 0}
+    if not dry_run:
+        state.sweep_temp_files(state.state_file(base_dir).parent)
+        for vault in {r.get("output", {}).get("vault_dir") for r in routines}:
+            if vault:
+                state.sweep_temp_files(vault)
+
+    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0,
+              "fallbacks": 0, "pending_actions": 0}
     for routine in routines:
         if not routine.get("enabled", True):
-            log(f"routine={routine['id']} disabled, skipping")
+            parked = sum(
+                1 for _, e in processed.items()
+                if e.get("rule_id") == routine["id"] and e.get("actions_pending")
+            )
+            note = f" ({parked} item(s) with triage still parked)" if parked else ""
+            log(f"routine={routine['id']} disabled, skipping{note}")
             continue
         try:
-            _run_routine(routine, processed, label_catalog, dry_run, totals)
+            _run_routine(routine, processed, label_catalog, dry_run, totals, lock)
+        except state.AlreadyRunning:
+            # Losing the lock is a whole-run condition, not one routine's bug:
+            # every remaining routine would hit it too. Let it reach the CLI,
+            # which reports it as a clean skip rather than N fatal errors.
+            raise
         except Exception as exc:  # a broken routine must not abort the rest
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
 
-    if not dry_run:
-        state.save(base_dir, processed)
     return totals
 
 
@@ -51,7 +81,8 @@ def _gmail_candidates(source):
     ]
 
 
-def _gmail_fetch(source, candidate):
+def _gmail_fetch(routine, candidate):
+    source = routine["source"]
     message_id = candidate["id"]
     msg = gmail.read_message(message_id)
     headers = msg.get("headers", {})
@@ -74,6 +105,14 @@ def _gmail_fetch(source, candidate):
             "email_date": headers.get("date", ""),
         },
     }
+
+    stream = _stream_for(routine, item)
+    if stream.get("title"):
+        # A stable stream name beats the raw subject, which carries RE:/FW:
+        # prefixes and its own embedded date — both of which make for noisy,
+        # unsortable filenames.
+        item["title"] = stream["title"]
+        item["frontmatter"]["stream"] = stream["title"]
 
     expand = source.get("expand")
     if expand:
@@ -151,7 +190,8 @@ def _drive_candidates(source):
     return [{"id": f["id"], "title": f.get("name", ""), "raw": f} for f in files]
 
 
-def _drive_fetch(source, candidate):
+def _drive_fetch(routine, candidate):
+    source = routine["source"]
     doc_id = candidate["id"]
     meta = candidate["raw"]
     name = meta.get("name", "")
@@ -186,11 +226,20 @@ SOURCES = {
 
 # --- run loop ---------------------------------------------------------------
 
-def _run_routine(routine, processed, label_catalog, dry_run, totals):
+def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
     rid = routine["id"]
     problems = config.validate(routine)
     if problems:
         raise config.RoutineError("; ".join(problems))
+
+    # Fail fast on a mistyped configured label: it is a config error affecting
+    # every item, so surfacing it once per routine beats failing each item
+    # individually and leaving them all to retry forever.
+    if label_catalog:
+        for name in config.configured_labels(routine):
+            _validated_label(name, label_catalog, rid)
+
+    _retry_pending_actions(routine, processed, dry_run, totals)
 
     source = routine["source"]
     list_candidates, fetch = SOURCES[source["kind"]]
@@ -205,6 +254,10 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals):
             continue
         new += 1
         totals["matched"] += 1
+        if lock:
+            # Cheap per-item guard: if the lock file vanished we may no longer
+            # be the only run, and continuing risks double-processing.
+            lock.check()
         try:
             _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals)
             totals["processed"] += 1
@@ -220,7 +273,7 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     action_list = routine.get("actions", [])
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
 
-    item = fetch(routine["source"], candidate)
+    item = fetch(routine, candidate)
 
     if dry_run:
         path = notes.target_path(routine, item)
@@ -234,14 +287,17 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
     summary, label = llm.split_label(content, label_catalog)
-    if routine["analyze"].get("pick_label"):
+    static = _static_label(routine, item)
+    if static:
+        # A configured label still goes through the catalog so a typo in the YAML
+        # fails loudly here rather than creating a stray Gmail label.
+        label = _validated_label(static, label_catalog, rid)
+        log(f"routine={rid} id={item['id']} label={label!r} (from config)")
+    elif routine["analyze"].get("pick_label"):
         log(f"routine={rid} id={item['id']} label={label!r}")
 
     path = notes.write(routine, item, summary, label)
     log(f"routine={rid} wrote {path}")
-
-    if action_list:
-        actions.apply(item["id"], action_list, label)
 
     record = {
         "rule_id": rid,
@@ -255,4 +311,96 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
         # the underlying document shows up.
         record["expand_fallback"] = item["expand_fallback"]
         totals["fallbacks"] += 1
-    processed[item["id"]] = record
+
+    # Two-phase. The note on disk is the expensive, irreversible half, so it is
+    # ledgered immediately — with the whole action list marked pending, so that
+    # dying here leaves the triage recoverable rather than lost. Recording only
+    # after triage would instead risk a duplicate note on the next run.
+    if action_list:
+        record["actions_pending"] = list(action_list)
+    processed.record(item["id"], record)
+
+    if action_list:
+        applied, pending = actions.apply(item["id"], action_list, label)
+        processed.record(item["id"], _with_action_outcome(record, applied, pending))
+        if pending:
+            totals["pending_actions"] += 1
+
+
+def _stream_for(routine, item):
+    """The `streams:` entry matching this item, or {}.
+
+    One routine often covers several recurring report streams that differ only
+    in what they should be called and which label they belong under. That is a
+    pure lookup, so it is declared rather than left to the model to judge.
+
+    Keys match against the subject by default, which is the stable identity of a
+    recurring report — a colleague replying into the thread does not change it,
+    where the sender would. `from:` prefixes a key to match the sender instead.
+    """
+    meta = item.get("frontmatter", {})
+    subject = (meta.get("email_subject") or "").lower()
+    sender = (meta.get("email_from") or "").lower()
+    for needle, cfg in (routine.get("streams") or {}).items():
+        key = needle.lower()
+        haystack, key = (sender, key[5:].strip()) if key.startswith("from:") else (subject, key)
+        if key in haystack:
+            return cfg or {}
+    return {}
+
+
+def _static_label(routine, item):
+    """The configured label for this item: per-stream first, then routine-wide."""
+    return _stream_for(routine, item).get("label") or routine.get("label")
+
+
+def _validated_label(name, catalog, rid):
+    """Resolve a routine's static label against the live catalog, case-insensitively."""
+    match = {n.lower(): n for n in catalog}.get(name.lower())
+    if not match:
+        raise RuntimeError(
+            f"routine={rid} label {name!r} does not exist in Gmail; "
+            f"create it first or fix the routine"
+        )
+    return match
+
+
+def _with_action_outcome(record, applied, pending):
+    """Fold an action result into a ledger entry."""
+    updated = dict(record)
+    updated["actions_applied"] = sorted(set(record.get("actions_applied", [])) | set(applied))
+    if pending:
+        updated["actions_pending"] = pending
+    else:
+        updated.pop("actions_pending", None)
+    return updated
+
+
+def _retry_pending_actions(routine, processed, dry_run, totals):
+    """Re-apply triage that failed on an earlier run.
+
+    Retried by ledger id rather than by re-querying: once `archive` succeeds the
+    item no longer matches an `in:inbox` query, so a query-driven retry could
+    never reach the leftovers. Actions are idempotent, so replaying a partially
+    applied sequence is safe.
+    """
+    rid = routine["id"]
+    if routine["source"]["kind"] != "gmail":
+        return
+    for item_id, entry in processed.items():
+        if entry.get("rule_id") != rid:
+            continue
+        pending = entry.get("actions_pending")
+        if not pending:
+            continue
+        if dry_run:
+            log(f"routine={rid} [dry-run] would retry pending actions on {item_id}: "
+                f"{', '.join(pending)}")
+            continue
+        log(f"routine={rid} retrying pending actions on {item_id}: {', '.join(pending)}")
+        applied, still_pending = actions.apply(item_id, pending, entry.get("gmail_label_applied"))
+        processed.record(item_id, _with_action_outcome(entry, applied, still_pending))
+        if still_pending:
+            totals["pending_actions"] += 1
+        else:
+            log(f"routine={rid} pending actions cleared for {item_id}")

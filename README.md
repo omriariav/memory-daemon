@@ -8,11 +8,13 @@ unstar / archive).
 **Adding a new routine is a drop-in YAML file, never a code change.**
 
 ```
-Gmail query ──▶ gws ──▶ LLM (yoetz) ──▶ markdown note ──▶ Gmail triage ──▶ state
+query ──▶ gws ──▶ LLM (yoetz) ──▶ note ──▶ ledger ──▶ triage ──▶ ledger outcome
 ```
 
-State is keyed by Gmail message id, so a message is processed exactly once no
-matter how broad the query or how often the daemon runs.
+The ledger is keyed by source item id, so an item is summarized once however
+broad the query or however often the daemon runs. It is written before triage
+and updated after it, which is what makes both halves recoverable — see
+[Crash safety](#crash-safety).
 
 ## Requirements
 
@@ -164,6 +166,34 @@ queue to retry on the next run.
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
 
+### One routine, several report streams
+
+When a routine covers several recurring reports that differ only in what they
+should be called and where they are filed, declare them — that is a lookup, not
+a judgement call, so it should not go to the model:
+
+```yaml
+streams:
+  "Weekly Report DACH TEAM":            # matches the SUBJECT
+    title: Weekly - DACH                # stable name for the note + filename
+    label: EMEA                         # Gmail label for this stream
+  "Channel Business weekly report":
+    title: Weekly - Channel Business
+    label: CHANNELS
+
+output:
+  filename_template: "{title}-{date}"   # -> weekly-dach-2026-07-19.md
+```
+
+Keys match the **subject**, which is the stable identity of a recurring report:
+colleagues reply into these threads, so keying on the sender would miss those.
+Prefix a key with `from:` to match the sender instead.
+
+`title` matters more than it looks — raw subjects carry `RE:`/`FW:` prefixes and
+their own embedded dates, which make for noisy, unsortable filenames
+(`re-turkey-africa-baltics-weekly-updates-472026-2026-07-20.md`). A routine-wide
+fixed `label:` also works when every item belongs under the same one.
+
 **Label safety.** With `pick_label: true` the full catalog of *user* labels is
 passed into the same call that writes the summary, and the model returns a final
 `LABEL: <name>` line. That line is stripped from the note body and the name is
@@ -244,11 +274,65 @@ launchd/                   LaunchAgent template
 state/  logs/              runtime, gitignored
 ```
 
+## Crash safety
+
+This runs unattended on a laptop that sleeps, so the interesting failures are
+interruptions rather than exceptions. Four properties hold:
+
+**An item is never summarized twice.** The ledger entry is written — atomically,
+and fsynced — immediately after the note, before any Gmail action. A crash
+during triage cannot cause a second summary. A crash in the narrower window
+*before* the ledger write leaves an unledgered note, so the item is retried —
+and the retry overwrites its own note rather than writing a second copy, because
+collision is judged by the `item_id` in the note's frontmatter rather than by
+mere filename existence.
+
+**Triage is never silently half-applied.** The entry is first recorded with every
+action `pending`, then updated with what actually succeeded. A failing action
+does not abort the rest of the sequence; it is left in `actions_pending` and
+retried at the start of the next run, by item id rather than by re-querying —
+once `archive` lands, an `in:inbox` query can no longer see the item. Every
+action is idempotent, so replaying a partial sequence is safe, and the retry
+never re-summarizes. `daemon.py run` reports the count.
+
+**A partial write cannot corrupt anything.** Notes and the ledger both go through
+a temp file plus `os.replace`, with the containing directory fsynced so the
+rename itself survives power loss. An unreadable or wrong-shaped ledger raises a
+clear error rather than a traceback — and does not tempt you to delete it, since
+an empty ledger means re-summarizing and re-triaging everything still matched.
+
+**Two runs cannot overlap.** A real run takes an exclusive lock on
+`state/run.lock`. launchd will not overlap a `StartInterval` job with itself, but
+a manual `daemon.py run` alongside the scheduled one would otherwise have both
+processes summarizing the same item. A second run exits cleanly, logging that it
+skipped. Dry runs never take the lock.
+
+`flock` binds to an inode, not a path, so deleting `state/run.lock` mid-run
+leaves the holder guarding an orphan and lets another run lock a freshly created
+file. There is no rendezvous left to defend at that point, so the holder checks
+before each item and stops rather than racing on. Don't delete that file while a
+run is going.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests   # crash-safety suite, no gws/yoetz needed
+python3 tools/validate_examples.py      # the shipped template and examples
+```
+
+Every case in the suite is a bug that actually shipped and was caught in review:
+note-collision ownership, a failed ledger write riding along with the next
+successful one, wrong-shaped JSON, permission preservation, temp sweeping, lock
+exclusion, and partial action failure with ordered retry. CI runs both on 3.9
+and 3.12.
+
 ## Operational notes
 
 - A failure on one message is caught, logged, and does not abort the run; the
   same is true for a failing routine.
 - `state/processed.json` is the dedupe ledger. Delete an entry to force a
   message to be reprocessed. It is gitignored — it is local runtime data.
+- The ledger grows without bound; there is no pruning. At roughly 280 bytes per
+  entry and a few dozen items a month, that is a non-issue for years.
 - Your own `routines/*.yaml` are gitignored too, since queries, addresses and
   vault paths are personal. Only `_template.yaml` and `_example-*.yaml` ship.
