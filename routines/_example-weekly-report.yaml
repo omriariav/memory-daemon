@@ -1,0 +1,34 @@
+# Example routine. The leading underscore means the daemon skips it, so it is
+# safe to keep in the repo. Copy it without the underscore to activate:
+#
+#   cp routines/_example-weekly-report.yaml routines/weekly-report.yaml
+#
+id: weekly-report
+enabled: true
+description: Summarize a recurring weekly report email and file it in the vault.
+
+source:
+  kind: gmail
+  query: 'from:reports@example.com subject:"Weekly Report" (is:unread OR is:starred)'
+  max_results: 20
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  pick_label: true
+  focus_domains:
+    - Revenue
+    - Churn
+    - Product adoption
+  instruction: >-
+    Summarize this email strictly for wins, opportunities, risks, and losses
+    relevant to the focus domains above. Ignore content outside those domains.
+    Use short bullet points grouped by domain; note "none found" for a domain
+    with nothing relevant. Do not editorialize beyond what the email states.
+
+output:
+  vault_dir: /absolute/path/to/your/vault/inbox
+  slug_prefix: weekly-report-summary
+
+actions: [apply_label, mark_read, unstar, archive]

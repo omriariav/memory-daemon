@@ -1,0 +1,67 @@
+# Routine template — copy to routines/<your-id>.yaml and edit.
+# Files starting with "_" are ignored by the daemon.
+# After editing: ./daemon.py validate && ./daemon.py run --routine <your-id> --dry-run
+
+# Unique identifier. Defaults to the filename stem if omitted. Used in logs,
+# in note frontmatter (rule_id), and as the --routine argument.
+id: my-routine
+
+# Set false to keep the file around without running it.
+enabled: true
+
+# Shown by `daemon.py list`.
+description: One line about what this routine scoops.
+
+source:
+  # Only 'gmail' is supported today.
+  kind: gmail
+
+  # Any Gmail search query. Quote it so YAML keeps the inner quotes.
+  # Messages already in state/processed.json are skipped, so a broad query is safe.
+  query: 'from:someone@example.com subject:"Weekly Report" (is:unread OR is:starred)'
+
+  # Cap on messages examined per run. Optional, default 20.
+  max_results: 20
+
+analyze:
+  # yoetz provider/model. Gemini resolves natively in yoetz's registry; OpenAI does not.
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+
+  # Optional, default 4096. Do NOT drop below ~2048: reasoning tokens eat the
+  # budget before visible output and the summary truncates mid-sentence.
+  max_output_tokens: 4096
+
+  # Optional. When true the full user-label catalog is passed to the model and it
+  # returns one `LABEL: <name>` line. The name is validated against the real
+  # catalog before Gmail ever sees it. Required by the apply_label action.
+  pick_label: true
+
+  # Optional. Injected into the prompt and recorded in the note frontmatter.
+  focus_domains:
+    - Domain A
+    - Domain B
+
+  # The actual analysis brief. Be specific about structure and scope.
+  instruction: >-
+    Summarize this email for a product leader. Use short bullet points.
+    Do not editorialize beyond what the email states.
+
+output:
+  # Absolute path. Created if missing. Point it at whatever folder your vault
+  # treats as an inbox so the notes surface in your normal triage flow.
+  vault_dir: /absolute/path/to/your/vault/inbox
+
+  # Filename becomes <slug_prefix>-<email date YYYY-MM-DD>.md,
+  # suffixed with a short message id if that file already exists.
+  slug_prefix: my-routine-summary
+
+  # Optional frontmatter overrides.
+  # kind: email-scoop-summary
+  # tags: [kind/email-scoop-summary, status/inbox]
+
+# Gmail triage applied after the note is written, in order.
+# Valid: apply_label, mark_read, mark_unread, star, unstar, archive
+# apply_label is skipped silently when the model returned no valid label.
+# Use an empty list [] to leave the mailbox untouched.
+actions: [apply_label, mark_read, unstar, archive]
