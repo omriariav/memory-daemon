@@ -1,11 +1,20 @@
 """Routine discovery, loading, and validation."""
+import re
 from pathlib import Path
+from string import Formatter
 
 import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
+from .notes import FILENAME_FIELDS
 
 REQUIRED_TOP_LEVEL = ["id", "source", "analyze", "output"]
+VALID_SOURCE_KINDS = {"gmail", "drive_docs"}
+
+
+def analyze_cfg(routine):
+    cfg = routine.get("analyze")
+    return cfg if isinstance(cfg, dict) else {}
 
 
 class RoutineError(Exception):
@@ -65,10 +74,62 @@ def validate(routine):
             problems.append(f"{rid}: missing required top-level key '{key}'")
 
     source = routine.get("source", {})
-    if source.get("kind") != "gmail":
-        problems.append(f"{rid}: source.kind must be 'gmail' (got {source.get('kind')!r})")
+    kind = source.get("kind")
+    if kind not in VALID_SOURCE_KINDS:
+        problems.append(
+            f"{rid}: source.kind must be one of {', '.join(sorted(VALID_SOURCE_KINDS))} "
+            f"(got {kind!r})"
+        )
     if not source.get("query"):
         problems.append(f"{rid}: source.query is required")
+
+    expand = source.get("expand")
+    if expand is not None:
+        if kind != "gmail":
+            problems.append(f"{rid}: source.expand is only supported for source.kind 'gmail'")
+        if expand.get("kind") != "drive_doc":
+            problems.append(
+                f"{rid}: source.expand.kind must be 'drive_doc' (got {expand.get('kind')!r})"
+            )
+        pattern = expand.get("title_from_subject")
+        if not pattern:
+            problems.append(f"{rid}: source.expand.title_from_subject is required")
+        else:
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                problems.append(f"{rid}: source.expand.title_from_subject is not valid regex — {exc}")
+            else:
+                if "title" not in compiled.groupindex:
+                    problems.append(
+                        f"{rid}: source.expand.title_from_subject must contain a named "
+                        f"group (?P<title>...) — that is what gets matched against Drive"
+                    )
+        tabs = expand.get("tabs")
+        if tabs is not None and (not isinstance(tabs, list) or not tabs):
+            problems.append(f"{rid}: source.expand.tabs must be a non-empty list of tab titles")
+        on_missing = expand.get("on_missing", "body")
+        if on_missing not in ("body", "error"):
+            problems.append(
+                f"{rid}: source.expand.on_missing must be 'body' or 'error' (got {on_missing!r})"
+            )
+
+    if kind == "drive_docs":
+        tabs = source.get("tabs")
+        if tabs is not None and (not isinstance(tabs, list) or not tabs):
+            problems.append(f"{rid}: source.tabs must be a non-empty list of tab titles")
+        # Gmail triage has no meaning for a Drive file, and the label catalog
+        # the model would pick from is the mailbox's.
+        if routine.get("actions"):
+            problems.append(
+                f"{rid}: source.kind 'drive_docs' does not support actions "
+                f"(got {routine['actions']}) — use actions: []"
+            )
+        if analyze_cfg(routine).get("pick_label"):
+            problems.append(
+                f"{rid}: analyze.pick_label requires source.kind 'gmail' — "
+                f"there is no Gmail message to label"
+            )
 
     max_results = source.get("max_results", 20)
     if not isinstance(max_results, int) or max_results < 1:
@@ -97,6 +158,27 @@ def validate(routine):
         problems.append(f"{rid}: output.vault_dir must be an absolute path")
     if not output.get("slug_prefix"):
         problems.append(f"{rid}: output.slug_prefix is required")
+
+    template = output.get("filename_template")
+    if template is not None:
+        allowed = FILENAME_FIELDS
+        try:
+            fields = {f for _, f, _, _ in Formatter().parse(template) if f}
+        except ValueError as exc:
+            problems.append(f"{rid}: output.filename_template is malformed — {exc}")
+        else:
+            unknown = fields - allowed
+            if unknown:
+                problems.append(
+                    f"{rid}: output.filename_template has unknown placeholder(s) "
+                    f"{', '.join('{%s}' % u for u in sorted(unknown))} "
+                    f"(valid: {', '.join('{%s}' % a for a in sorted(allowed))})"
+                )
+            if not fields:
+                problems.append(
+                    f"{rid}: output.filename_template has no placeholders — "
+                    f"every note would overwrite the same filename"
+                )
 
     for action in routine.get("actions", []):
         if action not in VALID_ACTIONS:

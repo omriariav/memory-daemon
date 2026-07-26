@@ -4,25 +4,26 @@ from .shell import run_json, yoetz_bin
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
-def build_prompt(routine, headers, body, label_catalog):
+def build_prompt(routine, item, label_catalog):
     """Assemble the analysis prompt. Label catalog is only injected when asked for."""
     analyze = routine["analyze"]
-    parts = ["You are triaging a business email for a product leader."]
+    parts = ["You are triaging source material for a product leader."]
 
     domains = analyze.get("focus_domains") or []
     if domains:
         parts.append(f"Focus domains: {', '.join(domains)}")
 
     parts.append(f"\nInstruction: {analyze['instruction']}")
+
+    meta = item.get("frontmatter", {})
+    header_lines = [f"Title: {item.get('title', '')}", f"Date: {item.get('date', '')}"]
+    if meta.get("email_from"):
+        header_lines.insert(0, f"From: {meta['email_from']}")
     parts.append(
-        "\n--- Email ---\n"
-        f"From: {headers.get('from', '')}\n"
-        f"Date: {headers.get('date', '')}\n"
-        f"Subject: {headers.get('subject', '')}\n\n"
-        f"{body}"
+        "\n--- Source ---\n" + "\n".join(header_lines) + f"\n\n{item['body']}"
     )
 
-    if analyze.get("pick_label"):
+    if analyze.get("pick_label") and label_catalog:
         labels_block = "\n".join(f"- {name}" for name in label_catalog)
         parts.append(
             "\n--- Labeling task ---\n"
