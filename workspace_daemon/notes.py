@@ -14,6 +14,7 @@ from pathlib import Path
 
 import yaml
 
+from . import state
 from .shell import utc_now_iso
 
 DEFAULT_FILENAME_TEMPLATE = "{slug_prefix}-{date}"
@@ -103,7 +104,13 @@ def render(routine, item, summary, label):
 
 
 def write(routine, item, summary, label):
+    """Write the note atomically and durably.
+
+    The ledger entry that follows is fsynced, so the note must be too — a plain
+    write_text() can leave the ledger pointing at a note that a crash never
+    flushed, and the item is then skipped forever. The temp file is dot-prefixed
+    so a vault watcher never indexes a half-written note.
+    """
     path = target_path(routine, item)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render(routine, item, summary, label))
+    state.write_atomic(path, render(routine, item, summary, label))
     return path

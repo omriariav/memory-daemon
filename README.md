@@ -8,11 +8,13 @@ unstar / archive).
 **Adding a new routine is a drop-in YAML file, never a code change.**
 
 ```
-Gmail query ──▶ gws ──▶ LLM (yoetz) ──▶ markdown note ──▶ Gmail triage ──▶ state
+query ──▶ gws ──▶ LLM (yoetz) ──▶ note ──▶ ledger ──▶ triage ──▶ ledger outcome
 ```
 
-State is keyed by Gmail message id, so a message is processed exactly once no
-matter how broad the query or how often the daemon runs.
+The ledger is keyed by source item id, so an item is summarized once however
+broad the query or however often the daemon runs. It is written before triage
+and updated after it, which is what makes both halves recoverable — see
+[Crash safety](#crash-safety).
 
 ## Requirements
 
@@ -244,11 +246,42 @@ launchd/                   LaunchAgent template
 state/  logs/              runtime, gitignored
 ```
 
+## Crash safety
+
+This runs unattended on a laptop that sleeps, so the interesting failures are
+interruptions rather than exceptions. Four properties hold:
+
+**An item is never summarized twice.** The ledger entry is written — atomically,
+and fsynced — immediately after the note, before any Gmail action. A crash
+during triage cannot cause a second summary of the same item on the next run.
+
+**Triage is never silently half-applied.** The entry is first recorded with every
+action `pending`, then updated with what actually succeeded. A failing action
+does not abort the rest of the sequence; it is left in `actions_pending` and
+retried at the start of the next run, by item id rather than by re-querying —
+once `archive` lands, an `in:inbox` query can no longer see the item. Every
+action is idempotent, so replaying a partial sequence is safe, and the retry
+never re-summarizes. `daemon.py run` reports the count.
+
+**A partial write cannot corrupt anything.** Notes and the ledger both go through
+a temp file plus `os.replace`, with the containing directory fsynced so the
+rename itself survives power loss. An unreadable or wrong-shaped ledger raises a
+clear error rather than a traceback — and does not tempt you to delete it, since
+an empty ledger means re-summarizing and re-triaging everything still matched.
+
+**Two runs cannot overlap.** A real run takes an exclusive lock on
+`state/run.lock`. launchd will not overlap a `StartInterval` job with itself, but
+a manual `daemon.py run` alongside the scheduled one would otherwise have both
+processes summarizing the same item. A second run exits cleanly, logging that it
+skipped. Dry runs never take the lock.
+
 ## Operational notes
 
 - A failure on one message is caught, logged, and does not abort the run; the
   same is true for a failing routine.
 - `state/processed.json` is the dedupe ledger. Delete an entry to force a
   message to be reprocessed. It is gitignored — it is local runtime data.
+- The ledger grows without bound; there is no pruning. At roughly 280 bytes per
+  entry and a few dozen items a month, that is a non-issue for years.
 - Your own `routines/*.yaml` are gitignored too, since queries, addresses and
   vault paths are personal. Only `_template.yaml` and `_example-*.yaml` ship.

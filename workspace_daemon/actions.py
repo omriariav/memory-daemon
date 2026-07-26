@@ -1,7 +1,11 @@
 """Declarative Gmail triage actions.
 
-A routine's `actions:` list is applied in order. `apply_label` is skipped when the
-LLM returned no label (or an unvalidated one).
+A routine's `actions:` list is applied in order. `apply_label` is skipped when
+the LLM returned no label (or an unvalidated one).
+
+Every action is idempotent — adding a label, marking read, unstarring and
+archiving all converge on the same mailbox state however many times they run.
+That is what makes retrying a partially applied sequence safe.
 """
 from . import gmail
 from .shell import log
@@ -25,21 +29,31 @@ def describe(action, label):
 
 
 def apply(message_id, action_list, label):
-    """Run the routine's actions against one message. Returns the applied action names."""
-    applied = []
+    """Run a routine's actions against one message.
+
+    Returns (applied, pending). A failing action does NOT abort the rest — the
+    actions are independent, and stopping early would leave more of the sequence
+    unfinished than necessary. Failures come back as `pending` so the caller can
+    ledger them and retry on a later run.
+    """
+    applied, pending = [], []
     for action in action_list:
-        if action == "apply_label":
-            if not label:
-                log(f"message_id={message_id} apply_label skipped (no validated label)")
-                continue
-            gmail.apply_label(message_id, label)
-        else:
-            handler = _HANDLERS.get(action)
-            if handler is None:
-                log(f"message_id={message_id} unknown action '{action}' ignored")
-                continue
-            handler(message_id)
-        applied.append(action)
+        try:
+            if action == "apply_label":
+                if not label:
+                    log(f"message_id={message_id} apply_label skipped (no validated label)")
+                    continue
+                gmail.apply_label(message_id, label)
+            else:
+                handler = _HANDLERS.get(action)
+                if handler is None:
+                    log(f"message_id={message_id} unknown action '{action}' ignored")
+                    continue
+                handler(message_id)
+            applied.append(action)
+        except Exception as exc:
+            pending.append(action)
+            log(f"message_id={message_id} action '{action}' FAILED, will retry: {exc}")
     if applied:
         log(f"message_id={message_id} applied actions: {', '.join(applied)}")
-    return applied
+    return applied, pending

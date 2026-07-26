@@ -1,5 +1,10 @@
-"""The run loop: match → analyze → write note → triage → record state."""
+"""The run loop: match → analyze → write note → ledger → triage → ledger outcome.
+
+The ledger entry is written before triage and updated after it, so an item is
+never summarized twice and never left with silently unfinished Gmail actions.
+"""
 import re
+from contextlib import ExitStack
 
 from . import actions, config, drive, gmail, llm, notes, state
 from .shell import log, utc_now_iso
@@ -18,13 +23,23 @@ def run(base_dir, routines, dry_run=False):
     In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
     no state write. Source reads still happen so the preview is real.
     """
+    # A dry run mutates nothing and reads through atomic replaces, so it does
+    # not need the lock and must not be blocked by a real run in progress.
+    with ExitStack() as stack:
+        if not dry_run:
+            stack.enter_context(state.RunLock(base_dir))
+        return _run_locked(base_dir, routines, dry_run)
+
+
+def _run_locked(base_dir, routines, dry_run):
     processed = state.Store(base_dir, dry_run=dry_run)
     label_catalog = []
     if _needs_label_catalog(routines):
         label_catalog = gmail.user_labels()
         log(f"fetched {len(label_catalog)} user labels")
 
-    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0, "fallbacks": 0}
+    totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0,
+              "fallbacks": 0, "pending_actions": 0}
     for routine in routines:
         if not routine.get("enabled", True):
             log(f"routine={routine['id']} disabled, skipping")
@@ -190,6 +205,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals):
     if problems:
         raise config.RoutineError("; ".join(problems))
 
+    _retry_pending_actions(routine, processed, dry_run, totals)
+
     source = routine["source"]
     list_candidates, fetch = SOURCES[source["kind"]]
     log(f"routine={rid} querying {source['kind']}: {source['query']}")
@@ -251,12 +268,57 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
         record["expand_fallback"] = item["expand_fallback"]
         totals["fallbacks"] += 1
 
-    # Recorded BEFORE triage, because the note on disk is the expensive,
-    # irreversible half. If an action then fails, the item stays in the mailbox
-    # queue but is already ledgered, so the next run skips it instead of writing
-    # a second copy of the same note. An unarchived email is a visible, cheap
-    # failure; a silent duplicate summary is not.
+    # Two-phase. The note on disk is the expensive, irreversible half, so it is
+    # ledgered immediately — with the whole action list marked pending, so that
+    # dying here leaves the triage recoverable rather than lost. Recording only
+    # after triage would instead risk a duplicate note on the next run.
+    if action_list:
+        record["actions_pending"] = list(action_list)
     processed.record(item["id"], record)
 
     if action_list:
-        actions.apply(item["id"], action_list, label)
+        applied, pending = actions.apply(item["id"], action_list, label)
+        processed.record(item["id"], _with_action_outcome(record, applied, pending))
+        if pending:
+            totals["pending_actions"] += 1
+
+
+def _with_action_outcome(record, applied, pending):
+    """Fold an action result into a ledger entry."""
+    updated = dict(record)
+    updated["actions_applied"] = sorted(set(record.get("actions_applied", [])) | set(applied))
+    if pending:
+        updated["actions_pending"] = pending
+    else:
+        updated.pop("actions_pending", None)
+    return updated
+
+
+def _retry_pending_actions(routine, processed, dry_run, totals):
+    """Re-apply triage that failed on an earlier run.
+
+    Retried by ledger id rather than by re-querying: once `archive` succeeds the
+    item no longer matches an `in:inbox` query, so a query-driven retry could
+    never reach the leftovers. Actions are idempotent, so replaying a partially
+    applied sequence is safe.
+    """
+    rid = routine["id"]
+    if routine["source"]["kind"] != "gmail":
+        return
+    for item_id, entry in processed.items():
+        if entry.get("rule_id") != rid:
+            continue
+        pending = entry.get("actions_pending")
+        if not pending:
+            continue
+        if dry_run:
+            log(f"routine={rid} [dry-run] would retry pending actions on {item_id}: "
+                f"{', '.join(pending)}")
+            continue
+        log(f"routine={rid} retrying pending actions on {item_id}: {', '.join(pending)}")
+        applied, still_pending = actions.apply(item_id, pending, entry.get("gmail_label_applied"))
+        processed.record(item_id, _with_action_outcome(entry, applied, still_pending))
+        if still_pending:
+            totals["pending_actions"] += 1
+        else:
+            log(f"routine={rid} pending actions cleared for {item_id}")

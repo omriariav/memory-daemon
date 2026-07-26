@@ -86,9 +86,17 @@ def cmd_run(args):
 
     mode = " (dry-run — no LLM call, no Gmail mutation, no file write)" if args.dry_run else ""
     log(f"run start: {len(routines)} routine(s){mode}")
-    totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run)
+    try:
+        totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run)
+    except state.AlreadyRunning as exc:
+        # Not an error: launchd firing while a long run is still going is
+        # expected, and the next interval will pick the work up.
+        log(f"run skipped — {exc}")
+        return 0
+
+    verb = "would process" if args.dry_run else "processed"
     summary = (
-        f"{totals['processed']} processed, {totals['skipped']} already-seen, "
+        f"{totals['processed']} {verb}, {totals['skipped']} already-seen, "
         f"{totals['errors']} error(s)"
     )
     if totals.get("fallbacks"):
@@ -97,6 +105,11 @@ def cmd_run(args):
         summary += (
             f", {totals['fallbacks']} summarized from a stub "
             f"(grep expand_fallback state/processed.json)"
+        )
+    if totals.get("pending_actions"):
+        summary += (
+            f", {totals['pending_actions']} with triage still pending "
+            f"(retried automatically next run)"
         )
     log(f"run done: {summary}")
     return 1 if totals["errors"] else 0
