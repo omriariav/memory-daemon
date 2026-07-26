@@ -1,0 +1,189 @@
+# workspace-daemon
+
+A small scheduled automation that scans Gmail for messages matching declarative
+rules, summarizes each match with an LLM, writes a markdown note into an
+Obsidian vault, and then triages the message in Gmail (label / mark read /
+unstar / archive).
+
+**Adding a new routine is a drop-in YAML file, never a code change.**
+
+```
+Gmail query ──▶ gws ──▶ LLM (yoetz) ──▶ markdown note ──▶ Gmail triage ──▶ state
+```
+
+State is keyed by Gmail message id, so a message is processed exactly once no
+matter how broad the query or how often the daemon runs.
+
+## Requirements
+
+| | |
+|---|---|
+| **Python 3.9+** | stdlib only, plus `pyyaml` |
+| **[`gws`](https://github.com/omriariav/workspace-cli)** — workspace-cli, an unofficial Google Workspace CLI | provides Gmail read/search/label/archive. Must be authenticated: `gws auth login` (developed against v1.41.0) |
+| **[`yoetz`](https://github.com/avivsinai/yoetz)** — CLI LLM gateway | `brew install avivsinai/tap/yoetz`, then configure a provider key |
+
+Both binaries are found on `PATH`. To pin them explicitly (useful under
+launchd, which does not inherit a login shell's `PATH`):
+
+```sh
+export WORKSPACE_DAEMON_GWS_BIN=/path/to/gws
+export WORKSPACE_DAEMON_YOETZ_BIN=/path/to/yoetz
+```
+
+```sh
+pip3 install pyyaml
+gws auth login          # Gmail scopes
+yoetz models list       # confirm your provider/model resolves
+```
+
+> **Model note:** keep `max_output_tokens` at 4096 or above. Reasoning models
+> spend the budget on thinking tokens before emitting visible output, and a
+> lower cap truncates the summary mid-sentence.
+
+## Usage
+
+```sh
+./daemon.py list                              # routines, enabled state, last run
+./daemon.py validate                          # check all routine YAML
+./daemon.py run --dry-run                     # preview, zero side effects
+./daemon.py run --routine weekly-report       # run one routine for real
+./daemon.py run                               # run everything enabled
+./daemon.py new                               # interactive scaffold
+```
+
+`--dry-run` makes **no** LLM call, **no** Gmail mutation, and **no** file or
+state write. It still queries Gmail (a read) so the preview reflects reality.
+
+## Adding a routine
+
+1. `cp routines/_template.yaml routines/my-routine.yaml` — or run `./daemon.py new`
+2. Edit the file. Every field is documented inline in the template.
+3. `./daemon.py validate`
+4. `./daemon.py run --routine my-routine --dry-run`
+5. Drop `--dry-run` when the preview looks right.
+
+Files starting with `_` are ignored by the loader, so the template and the
+examples stay inert.
+
+### Routine schema
+
+```yaml
+id: weekly-report              # defaults to the filename stem
+enabled: true
+description: Summarize the weekly report email.
+
+source:
+  kind: gmail                  # only gmail today
+  query: 'from:reports@example.com subject:"Weekly Report" is:unread'
+  max_results: 20              # optional, default 20
+
+analyze:
+  provider: gemini             # yoetz provider
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096      # optional, default 4096 — do not go below ~2048
+  pick_label: true             # optional — let the model choose a Gmail label
+  focus_domains: [Revenue, Churn]   # optional — injected into prompt + frontmatter
+  instruction: >-
+    Summarize strictly for wins, opportunities, risks and losses in the focus
+    domains. Group by domain, say "none found" where nothing applies.
+
+output:
+  vault_dir: /absolute/path/to/vault/inbox
+  slug_prefix: weekly-report-summary
+  # kind: email-scoop-summary                        # optional frontmatter override
+  # tags: [kind/email-scoop-summary, status/inbox]   # optional frontmatter override
+
+actions: [apply_label, mark_read, unstar, archive]
+```
+
+**Actions** run in order after the note is written:
+`apply_label`, `mark_read`, `mark_unread`, `star`, `unstar`, `archive`.
+Use `[]` to leave the mailbox untouched.
+
+**Label safety.** With `pick_label: true` the full catalog of *user* labels is
+passed into the same call that writes the summary, and the model returns a final
+`LABEL: <name>` line. That line is stripped from the note body and the name is
+resolved case-insensitively **against the real catalog** before Gmail sees it. A
+hallucinated label resolves to nothing and `apply_label` is skipped — an
+unvalidated name is never sent to Gmail.
+
+## Output
+
+`<vault_dir>/<slug_prefix>-<email date YYYY-MM-DD>.md`, suffixed with a short
+message id if that file already exists. YAML frontmatter followed by the
+summary:
+
+```yaml
+---
+kind: email-scoop-summary
+rule_id: weekly-report
+source: gmail
+gmail_message_id: 19f94d5c35713ea8
+gmail_thread_id: 19f94d5c35713ea8
+gmail_link: https://mail.google.com/mail/u/0/#inbox/19f94d5c35713ea8
+email_from: reports@example.com
+email_subject: Weekly Report
+email_date: 'Thu, 24 Jul 2026 09:02:11 +0000'
+focus_domains: [Revenue, Churn]
+gmail_label_applied: Reports
+generated_by: workspace-daemon (yoetz + gemini/gemini-3.1-pro-preview)
+generated_at: '2026-07-26T10:29:32Z'
+tags: [kind/email-scoop-summary, status/inbox]
+---
+```
+
+## Scheduling (macOS LaunchAgent)
+
+Hourly, and once at load. Render the template, add your key, load it:
+
+```sh
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+  launchd/com.workspace-daemon.plist.template \
+  > ~/Library/LaunchAgents/com.workspace-daemon.plist
+
+# replace REPLACE_ME with your provider API key
+$EDITOR ~/Library/LaunchAgents/com.workspace-daemon.plist
+
+launchctl unload ~/Library/LaunchAgents/com.workspace-daemon.plist 2>/dev/null
+launchctl load   ~/Library/LaunchAgents/com.workspace-daemon.plist
+launchctl list | grep workspace-daemon
+```
+
+Check on it:
+
+```sh
+tail -f logs/run.log
+tail -f logs/launchd.err.log
+```
+
+Unload with `launchctl unload ~/Library/LaunchAgents/com.workspace-daemon.plist`.
+
+The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
+gitignored — only the template is tracked.
+
+## Layout
+
+```
+daemon.py                  CLI entrypoint
+workspace_daemon/
+  config.py                routine discovery, loading, validation
+  shell.py                 binary resolution, subprocess, logging
+  gmail.py                 gws adapter
+  llm.py                   yoetz adapter, prompt building, label extraction
+  notes.py                 frontmatter + note writing
+  actions.py               declarative Gmail triage actions
+  state.py                 processed.json
+  runner.py                the run loop
+routines/                  one YAML per routine (yours are gitignored)
+launchd/                   LaunchAgent template
+state/  logs/              runtime, gitignored
+```
+
+## Operational notes
+
+- A failure on one message is caught, logged, and does not abort the run; the
+  same is true for a failing routine.
+- `state/processed.json` is the dedupe ledger. Delete an entry to force a
+  message to be reprocessed. It is gitignored — it is local runtime data.
+- Your own `routines/*.yaml` are gitignored too, since queries, addresses and
+  vault paths are personal. Only `_template.yaml` and `_example-*.yaml` ship.

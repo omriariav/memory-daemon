@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template. Render it, fill in the API key, then load it:
+
+    sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+      launchd/com.workspace-daemon.plist.template \
+      > ~/Library/LaunchAgents/com.workspace-daemon.plist
+
+  Then edit ~/Library/LaunchAgents/com.workspace-daemon.plist and replace
+  REPLACE_ME with your provider API key. Never commit a real key.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workspace-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO_DIR__/daemon.py</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/logs/launchd.err.log</string>
+
+    <!-- launchd does not inherit a login shell's PATH, so gws and yoetz must be
+         reachable through the PATH set here (or pinned via WORKSPACE_DAEMON_*_BIN). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
+        <key>GEMINI_API_KEY</key>
+        <string>REPLACE_ME</string>
+    </dict>
+</dict>
+</plist>
