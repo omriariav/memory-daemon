@@ -6,7 +6,7 @@ never summarized twice and never left with silently unfinished Gmail actions.
 import re
 from contextlib import ExitStack
 
-from . import actions, config, drive, gmail, llm, notes, state
+from . import actions, config, drive, gmail, labels, llm, notes, state
 from .shell import log, utc_now_iso
 
 
@@ -19,7 +19,7 @@ def _needs_label_catalog(routines):
     )
 
 
-def run(base_dir, routines, dry_run=False):
+def run(base_dir, routines, dry_run=False, refresh_labels=False):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
@@ -29,15 +29,17 @@ def run(base_dir, routines, dry_run=False):
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
         lock = stack.enter_context(state.RunLock(base_dir)) if not dry_run else None
-        return _run_locked(base_dir, routines, dry_run, lock)
+        return _run_locked(base_dir, routines, dry_run, lock, refresh_labels)
 
 
-def _run_locked(base_dir, routines, dry_run, lock=None):
+def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False):
     processed = state.Store(base_dir, dry_run=dry_run)
+    catalog = None
     label_catalog = []
     if _needs_label_catalog(routines):
-        label_catalog = gmail.user_labels()
-        log(f"fetched {len(label_catalog)} user labels")
+        catalog = labels.Catalog(base_dir, force_refresh=refresh_labels,
+                                 read_only=dry_run)
+        label_catalog = catalog.names()
 
     if not dry_run:
         state.sweep_temp_files(state.state_file(base_dir).parent)
@@ -57,7 +59,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None):
             log(f"routine={routine['id']} disabled, skipping{note}")
             continue
         try:
-            _run_routine(routine, processed, label_catalog, dry_run, totals, lock)
+            _run_routine(routine, processed, label_catalog, dry_run, totals, lock, catalog)
         except state.AlreadyRunning:
             # Losing the lock is a whole-run condition, not one routine's bug:
             # every remaining routine would hit it too. Let it reach the CLI,
@@ -226,7 +228,7 @@ SOURCES = {
 
 # --- run loop ---------------------------------------------------------------
 
-def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
+def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, catalog=None):
     rid = routine["id"]
     problems = config.validate(routine)
     if problems:
@@ -235,9 +237,13 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
     # Fail fast on a mistyped configured label: it is a config error affecting
     # every item, so surfacing it once per routine beats failing each item
     # individually and leaving them all to retry forever.
-    if label_catalog:
+    # `label_catalog` is only ever populated from `catalog`, so testing the
+    # object alone covers both — and unlike the list it stays truthy when the
+    # catalog comes back empty, which is exactly when one routine-level failure
+    # beats a refetch per item.
+    if catalog is not None:
         for name in config.configured_labels(routine):
-            _validated_label(name, label_catalog, rid)
+            _validated_label(name, label_catalog, rid, catalog)
 
     _retry_pending_actions(routine, processed, dry_run, totals)
 
@@ -259,7 +265,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
             # be the only run, and continuing risks double-processing.
             lock.check()
         try:
-            _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals)
+            _process(routine, candidate, fetch, processed, label_catalog, dry_run,
+                     totals, catalog)
             totals["processed"] += 1
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
@@ -268,7 +275,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None):
         log(f"routine={rid} no new matches")
 
 
-def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals):
+def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals,
+             catalog=None):
     rid = routine["id"]
     action_list = routine.get("actions", [])
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
@@ -291,7 +299,7 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     if static:
         # A configured label still goes through the catalog so a typo in the YAML
         # fails loudly here rather than creating a stray Gmail label.
-        label = _validated_label(static, label_catalog, rid)
+        label = _validated_label(static, label_catalog, rid, catalog)
         log(f"routine={rid} id={item['id']} label={label!r} (from config)")
     elif routine["analyze"].get("pick_label"):
         log(f"routine={rid} id={item['id']} label={label!r}")
@@ -354,9 +362,14 @@ def _static_label(routine, item):
     return _stream_for(routine, item).get("label") or routine.get("label")
 
 
-def _validated_label(name, catalog, rid):
-    """Resolve a routine's static label against the live catalog, case-insensitively."""
-    match = {n.lower(): n for n in catalog}.get(name.lower())
+def _validated_label(name, label_catalog, rid, catalog=None):
+    """Resolve a configured label, case-insensitively.
+
+    Goes through the Catalog when there is one so a miss refetches before being
+    reported — a cached catalog must never turn a real label into a false error.
+    """
+    match = (catalog.resolve(name) if catalog
+             else {n.lower(): n for n in label_catalog}.get(name.lower()))
     if not match:
         raise RuntimeError(
             f"routine={rid} label {name!r} does not exist in Gmail; "

@@ -194,6 +194,22 @@ their own embedded dates, which make for noisy, unsortable filenames
 (`re-turkey-africa-baltics-weekly-updates-472026-2026-07-20.md`). A routine-wide
 fixed `label:` also works when every item belongs under the same one.
 
+### Label caching
+
+The user-label catalog is ~940 names and changes maybe monthly, so it is cached
+in `state/labels.json` for 14 days rather than refetched every hour.
+
+The usual trap with a TTL is staleness: create a label, reference it in a
+routine, and get a false `does not exist in Gmail` until the cache expires. A
+miss is therefore self-healing — the catalog refetches once before reporting a
+name as unknown, so the only case that pays for a fetch is the one where the
+cache is provably behind. Force it with `daemon.py run --refresh-labels`. A dry run reads the cache but
+never writes it, keeping the no-state-write promise.
+
+One caveat this does not solve: with `pick_label: true` the model chooses from
+whatever is cached, so a label created in the last 14 days is not offered. It
+degrades to no label rather than an error.
+
 **Label safety.** With `pick_label: true` the full catalog of *user* labels is
 passed into the same call that writes the summary, and the model returns a final
 `LABEL: <name>` line. That line is stripped from the note body and the name is
@@ -316,7 +332,8 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # crash-safety suite, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 53 tests, no gws/yoetz needed
+python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```
 

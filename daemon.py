@@ -88,7 +88,8 @@ def cmd_run(args):
     mode = " (dry-run — no LLM call, no Gmail mutation, no file write)" if args.dry_run else ""
     log(f"run start: {len(routines)} routine(s){mode}")
     try:
-        totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run)
+        totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run,
+                            refresh_labels=args.refresh_labels)
     except state.AlreadyRunning as exc:
         # Not an error: launchd firing while a long run is still going is
         # expected, and the next interval will pick the work up.
@@ -210,6 +211,8 @@ def main(argv=None):
     p_run.add_argument("--routine", help="run only this routine id")
     p_run.add_argument("-n", "--dry-run", action="store_true",
                        help="preview only: no LLM call, no Gmail mutation, no file write")
+    p_run.add_argument("--refresh-labels", action="store_true",
+                       help="refetch the Gmail label catalog instead of using the cache")
     p_run.set_defaults(func=cmd_run)
 
     # launchd sends SIGTERM on unload, logout, or timeout. CPython installs no
