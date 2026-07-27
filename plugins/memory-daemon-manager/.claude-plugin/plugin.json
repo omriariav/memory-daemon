@@ -1,0 +1,18 @@
+{
+  "name": "memory-daemon-manager",
+  "displayName": "Memory Daemon Manager",
+  "description": "Safely manage memory-daemon routines and connector prompt overrides",
+  "version": "0.1.0",
+  "author": {
+    "name": "Memory Daemon contributors",
+    "url": "https://github.com/omriariav/memory-daemon"
+  },
+  "homepage": "https://github.com/omriariav/memory-daemon",
+  "repository": "https://github.com/omriariav/memory-daemon",
+  "keywords": [
+    "memory",
+    "automation",
+    "routines",
+    "prompts"
+  ]
+}

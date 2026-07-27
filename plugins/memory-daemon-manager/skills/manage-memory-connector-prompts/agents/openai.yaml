@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Connector Prompts"
+  short_description: "Safely manage source-wide connector prompts"
+  default_prompt: "Use $manage-memory-connector-prompts to inspect and safely update connector prompt overrides."
