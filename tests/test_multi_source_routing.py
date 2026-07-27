@@ -186,17 +186,204 @@ class MultiSourceRunnerTest(unittest.TestCase):
         self.assertIn("source: gchat", rendered)
 
     def test_due_fallback_cannot_steal_from_inactive_specific_owner(self):
+        fetch = runner.SOURCES["gmail"][1]
+
+        def capped_candidates(source):
+            limit = source.get("max_results", 20)
+            return [
+                {"id": f"gmail-{index}", "title": f"gmail item {index}"}
+                for index in range(1, 4)
+            ][:limit]
+
+        runner.SOURCES["gmail"] = (capped_candidates, fetch)
         specific = multi_routine(self.vault, "specific")
         specific["sources"] = [specific["sources"][0]]
+        specific["sources"][0]["max_results"] = 1
         fallback = multi_routine(
             self.vault, "fallback", routing={"fallback": True}
         )
         fallback["sources"] = [fallback["sources"][0]]
+        fallback["sources"][0]["max_results"] = 3
         totals = runner.run(
             self.base, [specific, fallback], active_ids={"fallback"}, dry_run=True
         )
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(totals["matched"], 0)
+
+    def test_owner_cap_is_processing_budget_not_ownership_boundary(self):
+        fetch = runner.SOURCES["gmail"][1]
+
+        def capped_candidates(source):
+            limit = source.get("max_results", 20)
+            return [
+                {"id": f"gmail-{index}", "title": f"gmail item {index}"}
+                for index in range(1, 4)
+            ][:limit]
+
+        runner.SOURCES["gmail"] = (capped_candidates, fetch)
+        specific = multi_routine(self.vault, "specific")
+        specific["sources"] = [
+            {
+                "kind": "gmail",
+                "query": "from:specific@example.com",
+                "max_results": 1,
+                "actions": [],
+            }
+        ]
+        fallback = multi_routine(
+            self.vault, "fallback", routing={"fallback": True}
+        )
+        fallback["sources"] = [
+            {
+                "kind": "gmail",
+                "query": "is:unread",
+                "max_results": 3,
+                "actions": [],
+            }
+        ]
+
+        totals = runner.run(self.base, [specific, fallback], dry_run=True)
+
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(totals["matched"], 1)
+        self.assertEqual(totals["errors"], 0)
+
+    def test_failed_drive_listing_does_not_block_gmail_fallback(self):
+        fetch = runner.SOURCES["gmail"][1]
+
+        def failed_drive(_source):
+            raise RuntimeError("drive unavailable")
+
+        runner.SOURCES["drive_docs"] = (failed_drive, fetch)
+        specific = multi_routine(self.vault, "specific")
+        specific["sources"] = [
+            {"kind": "drive_docs", "query": "specific documents"}
+        ]
+        fallback = multi_routine(
+            self.vault, "fallback", routing={"fallback": True}
+        )
+        fallback["sources"] = [
+            {"kind": "gmail", "query": "is:unread", "actions": []}
+        ]
+
+        totals = runner.run(
+            self.base, [specific, fallback], active_ids={"fallback"}, dry_run=True
+        )
+
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(totals["matched"], 1)
+        self.assertEqual(totals["errors"], 1)
+
+    def test_failed_specific_listing_blocks_only_overlapping_chat_space(self):
+        fetch = runner.SOURCES["gchat"][1]
+
+        def candidates(source):
+            space = source["spaces"][0]
+            if space == "spaces/FAILED":
+                raise RuntimeError("space unavailable")
+            return [{
+                "id": "gchat:SAFE:thread@1",
+                "title": "safe item",
+                "raw": {
+                    "source_id": "gchat:SAFE:thread",
+                    "space": "spaces/SAFE",
+                },
+            }]
+
+        runner.SOURCES["gchat"] = (candidates, fetch)
+        specific = multi_routine(self.vault, "specific")
+        specific["sources"] = [
+            {"kind": "gchat", "spaces": ["spaces/FAILED"]}
+        ]
+        fallback = multi_routine(
+            self.vault, "fallback", routing={"fallback": True}
+        )
+        fallback["sources"] = [
+            {"kind": "gchat", "spaces": ["spaces/SAFE"]}
+        ]
+
+        totals = runner.run(
+            self.base, [specific, fallback], active_ids={"fallback"}, dry_run=True
+        )
+
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(totals["matched"], 1)
+        self.assertEqual(totals["errors"], 1)
+
+    def test_failed_specific_listing_holds_overlapping_fallback(self):
+        fetch = runner.SOURCES["gmail"][1]
+
+        def candidates(source):
+            if source["query"] == "from:specific@example.com":
+                raise RuntimeError("gmail unavailable")
+            return [{"id": "gmail-1", "title": "gmail item"}]
+
+        runner.SOURCES["gmail"] = (candidates, fetch)
+        specific = multi_routine(self.vault, "specific")
+        specific["sources"] = [
+            {
+                "kind": "gmail",
+                "query": "from:specific@example.com",
+                "actions": [],
+            }
+        ]
+        fallback = multi_routine(
+            self.vault, "fallback", routing={"fallback": True}
+        )
+        fallback["sources"] = [
+            {"kind": "gmail", "query": "is:unread", "actions": []}
+        ]
+
+        totals = runner.run(
+            self.base, [specific, fallback], active_ids={"fallback"}, dry_run=True
+        )
+
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(totals["matched"], 0)
+        self.assertEqual(totals["errors"], 1)
+
+    def test_failed_expanded_scan_keeps_proven_claim_and_holds_overflow(self):
+        fetch = runner.SOURCES["gmail"][1]
+
+        def candidates(source):
+            if (
+                source["query"] == "from:specific@example.com"
+                and source.get("max_results") == 3
+            ):
+                raise RuntimeError("expanded scan unavailable")
+            limit = source.get("max_results", 20)
+            return [
+                {"id": f"gmail-{index}", "title": f"gmail item {index}"}
+                for index in range(1, 4)
+            ][:limit]
+
+        runner.SOURCES["gmail"] = (candidates, fetch)
+        specific = multi_routine(self.vault, "specific")
+        specific["sources"] = [
+            {
+                "kind": "gmail",
+                "query": "from:specific@example.com",
+                "max_results": 1,
+                "actions": [],
+            }
+        ]
+        fallback = multi_routine(
+            self.vault, "fallback", routing={"fallback": True}
+        )
+        fallback["sources"] = [
+            {
+                "kind": "gmail",
+                "query": "is:unread",
+                "max_results": 3,
+                "actions": [],
+            }
+        ]
+
+        totals = runner.run(self.base, [specific, fallback], dry_run=True)
+
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(totals["matched"], 1)
+        self.assertEqual(totals["errors"], 1)
 
 
 class ScheduleStoreTest(unittest.TestCase):
@@ -222,6 +409,9 @@ class ScheduleStoreTest(unittest.TestCase):
         schedule = state.ScheduleStore(self.base)
         schedule.mark_attempted({"r"}, now=1000)
         self.assertTrue(schedule.due(self.routine, now=900))
+
+    def test_omitted_schedule_keeps_legacy_hourly_cadence(self):
+        self.assertEqual(config.schedule_seconds({"id": "legacy"}), 60 * 60)
 
 
 class TickCommandTest(unittest.TestCase):

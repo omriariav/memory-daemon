@@ -156,14 +156,19 @@ sources:
 Even when only the fallback is due, enabled specific routines still list their
 candidates for routing. An item waits for its owner; it is never captured under
 the fallback prompt merely because that fallback ran first. If a specific
-source cannot be listed, the fallback is blocked because ownership cannot be
-proven.
+source cannot be listed, only overlapping candidates are held because ownership
+cannot be proven; a Drive failure, for example, does not stop an unrelated Gmail
+fallback. Ownership discovery also expands lower source caps to the largest
+overlapping cap, while retaining the configured cap as that routine's processing
+budget.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially
 under the existing global lock, and records attempts in
 `state/schedule.json`. A failed dependency is retried on that routine's cadence,
 not on every coordinator wake-up. A dry-run tick never updates schedule state.
+Routines without `schedule.every` retain the legacy hourly cadence; the template
+sets `4h` explicitly for new routines.
 
 See `_example-domain-routine.yaml` and `_example-fallback-sweep.yaml`.
 
@@ -447,7 +452,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 117 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 123 tests, no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```

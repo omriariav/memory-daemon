@@ -10,7 +10,10 @@ from .notes import FILENAME_FIELDS
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
-DEFAULT_SCHEDULE = "4h"
+# Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
+# schedules at that legacy frequency; new routines write their intended cadence
+# explicitly, so installing `tick` never silently slows an existing routine.
+DEFAULT_SCHEDULE = "1h"
 _DURATION = re.compile(r"^(?P<count>[1-9]\d*)(?P<unit>[mhd])$")
 _DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
 
