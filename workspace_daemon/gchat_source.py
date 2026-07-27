@@ -1,0 +1,131 @@
+"""Google Chat source: sweep configured spaces via the `gws` CLI, grouped by thread.
+
+Routine config:
+
+    source:
+      kind: gchat
+      spaces:
+        - spaces/AAAA000000A     # #my-team-space
+      hours: 26                  # lookback window; overlap the schedule slightly
+      max_results: 50            # cap per space
+
+One `gws chat messages --after` call per space returns full message texts, so
+candidates are grouped client-side by thread — fetch does no further API calls
+beyond resolving sender display names (one `gws chat members` per space, cached
+for the run).
+
+Identity has two layers (this is what keeps re-sweeps of an active thread from
+freezing at first capture — the ledger dedupes on the *candidate* id, while the
+memory store dedupes on the stable *source* id):
+
+- candidate id:  gchat:<space>:<thread>@<latest_message_ts>  — changes when a
+  thread gains replies, so the runner reprocesses it
+- source id:     gchat:<space>:<thread>                      — stable anchor;
+  `memory add` updates the same entry in place
+"""
+import datetime
+import json
+import subprocess
+
+from .shell import log
+
+GWS = "gws"
+_member_cache = {}
+
+
+def _gws(args, timeout=60):
+    r = subprocess.run([GWS, *args, "--format", "json"],
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"gws {' '.join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return json.loads(r.stdout)
+
+
+def _after_iso(hours):
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=float(hours))
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _space_id(space):
+    return space.split("/")[-1]
+
+
+def _thread_id(message):
+    return (message.get("thread") or message.get("name", "")).split("/")[-1]
+
+
+def candidates(source):
+    """One candidate per thread that saw traffic inside the window.
+
+    The candidate carries every windowed message of its thread in `raw`, so
+    fetch never re-queries. Messages that arrived before the window (a thread's
+    earlier history) are not included — the summary covers the active slice,
+    and the stable source id folds successive slices into one memory entry.
+    """
+    after = _after_iso(source.get("hours", 26))
+    per_space = int(source.get("max_results", 50))
+    threads = {}
+
+    for space in source.get("spaces", []):
+        d = _gws(["chat", "messages", space, "--after", after, "--max", str(per_space)])
+        for m in d.get("messages") or []:
+            sid = f"gchat:{_space_id(space)}:{_thread_id(m)}"
+            t = threads.setdefault(sid, {"space": space, "messages": []})
+            t["messages"].append(m)
+
+    out = []
+    for sid, t in threads.items():
+        msgs = sorted(t["messages"], key=lambda m: m.get("create_time", ""))
+        latest = msgs[-1].get("create_time", "")
+        first_text = (msgs[0].get("text") or "").replace("\n", " ")
+        out.append({
+            "id": f"{sid}@{latest}",       # version-aware: new replies => new candidate
+            "title": first_text[:90],
+            "raw": {"source_id": sid, "space": t["space"], "messages": msgs},
+        })
+    return out
+
+
+def _member_names(space):
+    """user resource -> display name for one space, cached per run."""
+    if space in _member_cache:
+        return _member_cache[space]
+    names = {}
+    try:
+        d = _gws(["chat", "members", space])
+        rows = d if isinstance(d, list) else d.get("memberships") or d.get("members") or []
+        for r in rows:
+            if r.get("user") and r.get("display_name"):
+                names[r["user"]] = r["display_name"]
+    except Exception as exc:  # cosmetic — raw user ids still identify speakers
+        log(f"gchat members lookup failed for {space} ({exc}); keeping raw ids")
+    _member_cache[space] = names
+    return names
+
+
+def fetch(routine, candidate):
+    """Render the thread's windowed messages as a readable conversation."""
+    raw = candidate["raw"]
+    msgs = raw["messages"]
+    names = _member_names(raw["space"])
+
+    lines = [f"{names.get(m.get('sender'), m.get('sender', '?'))}: {m.get('text', '')}"
+             for m in msgs if (m.get("text") or "").strip()]
+    if not lines:
+        raise RuntimeError("thread has no text content in the window")
+
+    date = (msgs[0].get("create_time") or "")[:10]
+    return {
+        "id": candidate["id"],
+        "source_id": raw["source_id"],  # stable anchor for the memory store
+        "title": candidate["title"] or f"chat thread in {raw['space']}",
+        "date": date,
+        "body": "\n".join(lines),
+        "frontmatter": {
+            "gchat_space": raw["space"],
+            "gchat_thread": raw["source_id"],
+            "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
+                                          for m in msgs}),
+            "message_count": len(msgs),
+        },
+    }

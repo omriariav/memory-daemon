@@ -6,7 +6,7 @@ never summarized twice and never left with silently unfinished Gmail actions.
 import re
 from contextlib import ExitStack
 
-from . import actions, config, drive, gmail, labels, llm, memory_sink, notes, slack_source, state
+from . import actions, config, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
 from .shell import log, utc_now_iso
 
 
@@ -225,6 +225,8 @@ SOURCES = {
     "drive_docs": (_drive_candidates, _drive_fetch),
     "slack": (slack_source.candidates,
               lambda routine, candidate: slack_source.fetch(routine, candidate)),
+    "gchat": (gchat_source.candidates,
+              lambda routine, candidate: gchat_source.fetch(routine, candidate)),
 }
 
 
@@ -251,7 +253,8 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
 
     source = routine["source"]
     list_candidates, fetch = SOURCES[source["kind"]]
-    scope = source.get("query") or ", ".join(source.get("channels", [])) or "mentions"
+    scope = (source.get("query") or ", ".join(source.get("channels", []))
+             or ", ".join(source.get("spaces", [])) or "mentions")
     log(f"routine={rid} querying {source['kind']}: {scope}")
     candidates = list_candidates(source)
     log(f"routine={rid} {len(candidates)} item(s) matched")

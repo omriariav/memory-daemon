@@ -1,0 +1,36 @@
+# Example: sweep Google Chat spaces into a personal-memory store.
+#
+# Fetches via the `gws` CLI (github.com/omriariav/workspace-cli): one
+# `gws chat messages --after` call per space, grouped into threads client-side.
+# Sender names resolve through `gws chat members` (cached per run).
+#
+# Thread identity is two-layer: the ledger key is gchat:<space>:<thread>@<latest>
+# (new replies reprocess the thread), while the memory source id stays
+# gchat:<space>:<thread> so the store updates one entry in place.
+id: example-gchat-to-memory
+enabled: false
+description: Distill Google Chat space threads into memory entries.
+
+source:
+  kind: gchat
+  spaces:
+    - spaces/AAAA000000A   # #my-team-space (full resource name, `gws chat list`)
+  hours: 26
+  max_results: 50
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction: >-
+    You are reading one Google Chat thread from a work space. Summarize it as a
+    compact work record: what was discussed, what was decided or committed to
+    (by whom), open questions, and any facts worth recalling in six months.
+    Be terse and concrete. Never invent owners or decisions. If the thread is
+    pure noise (bot output, social chatter, scheduling back-and-forth), say
+    exactly "NOISE" and nothing else.
+
+memory:
+  store: /absolute/path/to/your/personal-memory
+  type: note
+  tags: [gchat]
