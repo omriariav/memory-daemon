@@ -96,6 +96,33 @@ yoetz models list       # confirm your provider/model resolves
 `--dry-run` makes **no** LLM call, **no** Gmail mutation, and **no** file or
 state write. It still queries Gmail (a read) so the preview reflects reality.
 
+## Codex and Claude Code plugin
+
+This repository is also a marketplace for the dual-compatible
+`memory-daemon-manager` plugin. Its shared skills can inspect, add, edit, and
+remove routine YAML and private connector prompt overrides. Every mutation
+shows a diff first, requires an unchanged plan token, validates the whole
+daemon afterward, and rolls back on validation failure. The skills never run
+the daemon or start its scheduler implicitly. The helper supports macOS and
+Linux; Windows is outside memory-daemon's POSIX/launchd support boundary.
+
+Install for Codex:
+
+```sh
+codex plugin marketplace add omriariav/memory-daemon
+codex plugin add memory-daemon-manager@memory-daemon
+```
+
+Install for Claude Code:
+
+```sh
+claude plugin marketplace add omriariav/memory-daemon
+claude plugin install memory-daemon-manager@memory-daemon
+```
+
+See [`plugins/memory-daemon-manager/README.md`](plugins/memory-daemon-manager/README.md)
+for upgrade, uninstall, and recovery instructions.
+
 ## Domain routines, routing, and cadence
 
 Use `source:` for a compact single-source routine. Use `sources:` when one
@@ -452,7 +479,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 123 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 135 tests, no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```

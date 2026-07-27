@@ -28,7 +28,9 @@ jobs:
         # F821 (undefined name) is the whole reason this step exists: a plain
         # NameError once reached review with green CI, because dry-runs return
         # before the offending line and the unit tests never drove that path.
-        run: python -m pyflakes daemon.py workspace_daemon/ tests/ tools/
+        run: >-
+          python -m pyflakes daemon.py workspace_daemon/ tests/ tools/
+          plugins/memory-daemon-manager/scripts/
 
       - name: Crash-safety tests
         # No gws or yoetz on the runner. The suite must not need them — if a

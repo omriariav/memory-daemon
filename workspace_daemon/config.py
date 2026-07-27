@@ -16,6 +16,7 @@ VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
 DEFAULT_SCHEDULE = "1h"
 _DURATION = re.compile(r"^(?P<count>[1-9]\d*)(?P<unit>[mhd])$")
 _DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+_ROUTINE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def analyze_cfg(routine):
@@ -136,6 +137,14 @@ def validate(routine):
     for key in REQUIRED_TOP_LEVEL:
         if key not in routine:
             problems.append(f"{rid}: missing required top-level key '{key}'")
+    if "id" in routine and (
+        not isinstance(routine["id"], str)
+        or not _ROUTINE_ID.fullmatch(routine["id"])
+    ):
+        problems.append(
+            f"{rid}: id must use lowercase letters, digits, and hyphens "
+            f"(got {routine['id']!r})"
+        )
 
     has_source = "source" in routine
     has_sources = "sources" in routine

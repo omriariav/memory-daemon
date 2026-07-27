@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "memory-daemon",
+  "version": "0.1.0",
+  "description": "Skills for safely administering a local memory-daemon installation",
+  "owner": {
+    "name": "Memory Daemon contributors",
+    "url": "https://github.com/omriariav/memory-daemon"
+  },
+  "plugins": [
+    {
+      "name": "memory-daemon-manager",
+      "displayName": "Memory Daemon Manager",
+      "source": "./plugins/memory-daemon-manager",
+      "description": "Safely manage routines and private connector prompt overrides",
+      "version": "0.1.0",
+      "author": {
+        "name": "Memory Daemon contributors",
+        "url": "https://github.com/omriariav/memory-daemon"
+      },
+      "homepage": "https://github.com/omriariav/memory-daemon",
+      "repository": "https://github.com/omriariav/memory-daemon",
+      "keywords": [
+        "memory",
+        "automation",
+        "routines",
+        "prompts"
+      ],
+      "category": "productivity"
+    }
+  ]
+}

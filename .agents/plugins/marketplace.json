@@ -1,0 +1,20 @@
+{
+  "name": "memory-daemon",
+  "interface": {
+    "displayName": "Memory Daemon"
+  },
+  "plugins": [
+    {
+      "name": "memory-daemon-manager",
+      "source": {
+        "source": "local",
+        "path": "./plugins/memory-daemon-manager"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

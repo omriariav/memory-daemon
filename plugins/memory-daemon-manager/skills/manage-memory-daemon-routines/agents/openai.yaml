@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Memory Daemon Routines"
+  short_description: "Safely add, inspect, edit, or remove routines"
+  default_prompt: "Use $manage-memory-daemon-routines to inspect and safely update my daemon routines."

@@ -1,0 +1,35 @@
+{
+  "name": "memory-daemon-manager",
+  "version": "0.1.0",
+  "description": "Safely manage memory-daemon routines and connector prompt overrides",
+  "author": {
+    "name": "Memory Daemon contributors",
+    "url": "https://github.com/omriariav/memory-daemon"
+  },
+  "homepage": "https://github.com/omriariav/memory-daemon",
+  "repository": "https://github.com/omriariav/memory-daemon",
+  "keywords": [
+    "memory",
+    "automation",
+    "routines",
+    "prompts"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Memory Daemon Manager",
+    "shortDescription": "Manage routines and connector prompts safely",
+    "longDescription": "Inspect, plan, and validate changes to memory-daemon routines and private source-wide connector prompt overrides. Every mutation uses an exact diff and stale-plan guard.",
+    "developerName": "Memory Daemon contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/omriariav/memory-daemon",
+    "defaultPrompt": [
+      "List my memory-daemon routines without exposing source IDs.",
+      "Safely add or edit a routine and show me the diff.",
+      "Tune a connector prompt override without running the daemon."
+    ]
+  }
+}
