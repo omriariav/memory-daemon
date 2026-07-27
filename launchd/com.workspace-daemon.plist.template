@@ -37,8 +37,9 @@
     <key>StandardErrorPath</key>
     <string>__REPO_DIR__/logs/launchd.err.log</string>
 
-    <!-- launchd does not inherit a login shell's PATH, so gws and yoetz must be
-         reachable through the PATH set here (or pinned via WORKSPACE_DAEMON_*_BIN). -->
+    <!-- launchd does not inherit a login shell's PATH, so gws, yoetz and the
+         optional ada mentions helper must be reachable here. Slack itself is
+         built into memory-daemon. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

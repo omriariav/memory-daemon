@@ -1,5 +1,5 @@
 """Slack source: list recent threads in watched channels (plus @mentions) via
-the local `slack-cli` tool, then fetch full threads on demand.
+the repository's built-in Slack CLI, then fetch full threads on demand.
 
 Routine config:
 
@@ -11,11 +11,11 @@ Routine config:
       hours: 26                 # lookback window (overlap a 24h schedule slightly)
       max_results: 30           # cap per channel
 
-`slack-cli` (a separate small tool) owns the token and the Slack Web API calls;
-mentions are delegated by it to the `ada` CLI. Every candidate is identified by
-the canonical thread anchor `slack:<channel>:<thread_ts>`, which doubles as the
-memory-store source id, so re-sweeps of an active thread update one entry in
-place instead of duplicating.
+The built-in CLI owns the token and Slack Web API calls; mentions are delegated
+to the `ada` CLI. Set `SLACK_CLI` only to override the built-in implementation.
+Every candidate is identified by the canonical thread anchor
+`slack:<channel>:<thread_ts>`, which doubles as the memory-store source id, so
+re-sweeps of an active thread update one entry in place instead of duplicating.
 
 Slack has no equivalent of Gmail triage: `actions` are meaningless here and the
 config layer rejects them for this source kind.
@@ -25,14 +25,28 @@ import json
 import math
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 from .shell import log
 
-SLACK_CLI = os.environ.get("SLACK_CLI", os.path.expanduser("~/bin/slack-cli"))
+SLACK_CLI = os.environ.get("SLACK_CLI")
+REPO_DIR = Path(__file__).resolve().parents[1]
 
 
 def _cli(args, timeout=60):
-    r = subprocess.run([SLACK_CLI, *args], capture_output=True, text=True, timeout=timeout)
+    command = (
+        [SLACK_CLI, *args]
+        if SLACK_CLI
+        else [sys.executable, "-m", "workspace_daemon.slack_cli", *args]
+    )
+    r = subprocess.run(
+        command,
+        cwd=str(REPO_DIR),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
     if r.returncode != 0:
         raise RuntimeError(f"slack-cli {args[0]} failed: {(r.stderr or r.stdout).strip()[:200]}")
     d = json.loads(r.stdout)

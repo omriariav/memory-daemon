@@ -20,8 +20,8 @@ Gmail matches can additionally be triaged (label / mark read / unstar / archive)
 may own one source or combine several transports under one domain prompt.
 
 ```
-source (gws / slack-cli) ──▶ LLM (yoetz) ──▶ vault note and/or memory entry
-                                         ──▶ ledger ──▶ triage ──▶ ledger outcome
+source (gws / built-in Slack client) ──▶ LLM (yoetz) ──▶ vault note or memory
+                                                    ──▶ ledger and triage
 ```
 
 See `routines/_example-slack-to-memory.yaml` for the Slack→memory shape.
@@ -63,7 +63,20 @@ and updated after it, which is what makes both halves recoverable — see
 | **[`gws`](https://github.com/omriariav/workspace-cli)** — workspace-cli, an unofficial Google Workspace CLI | provides Gmail read/search/label/archive. Must be authenticated: `gws auth login` (developed against v1.41.0) |
 | **[`yoetz`](https://github.com/avivsinai/yoetz)** — CLI LLM gateway | `brew install avivsinai/tap/yoetz`, then configure a provider key |
 
-Both binaries are found on `PATH`. To pin them explicitly (useful under
+The Slack client is included in this repository. Put its user token in
+`~/.config/memory-daemon/slack.json`:
+
+```json
+{
+  "user_token": "xoxp-replace-me"
+}
+```
+
+Keep that file private (`chmod 600`). Set `MEMORY_DAEMON_SLACK_CONFIG` to use a
+different path. The optional mentions integration shells out to `ada`; ordinary
+channel, DM, and group-DM reads do not.
+
+`gws` and `yoetz` are found on `PATH`. To pin them explicitly (useful under
 launchd, which does not inherit a login shell's `PATH`):
 
 ```sh
@@ -75,6 +88,7 @@ export WORKSPACE_DAEMON_YOETZ_BIN=/path/to/yoetz
 pip3 install pyyaml
 gws auth login          # Gmail scopes
 yoetz models list       # confirm your provider/model resolves
+python3 -m workspace_daemon.slack_cli auth-test
 ```
 
 > **Model note:** keep `max_output_tokens` at 4096 or above. Reasoning models
@@ -427,6 +441,8 @@ workspace_daemon/
   shell.py                 binary resolution, subprocess, logging
   gmail.py                 gws Gmail adapter
   drive.py                 gws Drive/Docs adapter, tab reading, doc lookup
+  slack_cli.py             built-in read-only Slack Web API client
+  slack_source.py          Slack thread discovery and rendering
   llm.py                   yoetz adapter, prompt building, label extraction
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions
