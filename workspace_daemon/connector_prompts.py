@@ -108,8 +108,8 @@ def resolve_instruction(routine):
         store = (routine.get("memory") or {}).get("store")
         if not store:
             raise PromptError(
-                f"analyze.instruction_from_connector needs memory.store — "
-                f"that is the personal-memory instance the connector lives in"
+                "analyze.instruction_from_connector needs memory.store — "
+                "that is the personal-memory instance the connector lives in"
             )
         base, origin = read_connector_body(store, ref)
         log(f"routine={routine.get('id')} prompt from connector {ref!r} ({origin}, "
