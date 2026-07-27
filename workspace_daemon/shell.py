@@ -46,6 +46,13 @@ def yoetz_bin():
     )
 
 
+def ada_bin():
+    return _resolve(
+        "ada", "WORKSPACE_DAEMON_ADA_BIN",
+        "Install and authenticate the Ada CLI.",
+    )
+
+
 _log_file = None
 
 

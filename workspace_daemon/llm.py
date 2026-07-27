@@ -44,6 +44,35 @@ def _source_header_lines(item):
             lines.append(f"Participants in supplied messages: {', '.join(participants)}")
         if meta.get("message_count") is not None:
             lines.append(f"Messages in supplied window: {meta['message_count']}")
+        if meta.get("first_message_at"):
+            lines.append(f"First supplied message: {meta['first_message_at']}")
+        if meta.get("latest_message_at"):
+            lines.append(f"Latest supplied message: {meta['latest_message_at']}")
+
+    if item.get("source_kind") == "slack" or meta.get("slack_channel"):
+        lines.append("Source: Slack")
+        channel = meta.get("slack_channel_name") or meta.get("slack_channel")
+        if channel:
+            lines.append(f"Channel: {channel}")
+        if meta.get("slack_capture_mode"):
+            lines.append(f"Capture mode: {meta['slack_capture_mode']}")
+        if meta.get("slack_summary_period"):
+            lines.append(f"Supplied period: {meta['slack_summary_period']}")
+        if meta.get("slack_participants"):
+            lines.append(
+                "Participants in supplied messages: "
+                + ", ".join(meta["slack_participants"])
+            )
+        if meta.get("message_count") is not None:
+            lines.append(f"Messages in supplied window: {meta['message_count']}")
+        if meta.get("first_message_at"):
+            lines.append(f"First supplied message: {meta['first_message_at']}")
+        if meta.get("latest_message_at"):
+            lines.append(f"Latest supplied message: {meta['latest_message_at']}")
+        if meta.get("message_limit_reached"):
+            lines.append(
+                "Coverage warning: the upstream Slack summary reached its message cap."
+            )
 
     if meta.get("email_from"):
         lines.append(f"From: {meta['email_from']}")

@@ -272,9 +272,14 @@ SOURCES = {
 # --- candidate ownership and run loop --------------------------------------
 
 def _scope(source):
+    slack_channels = [
+        channel
+        for key in ("channels", "ada_channels", "private_channels")
+        for channel in source.get(key, [])
+    ]
     return (
         source.get("query")
-        or ", ".join(source.get("channels", []))
+        or ", ".join(slack_channels)
         or ", ".join(source.get("spaces", []))
         or "mentions"
     )
@@ -321,7 +326,8 @@ def _source_scopes(source):
             return {(kind, "*")}
         values = {
             (kind, channel)
-            for channel in source.get("channels", [])
+            for key in ("channels", "ada_channels", "private_channels")
+            for channel in source.get(key, [])
             if isinstance(channel, str)
         }
         return values or {(kind, "*")}

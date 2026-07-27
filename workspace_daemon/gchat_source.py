@@ -28,6 +28,7 @@ import datetime
 import json
 import subprocess
 
+from .chat_text import redact_secrets, timestamped_line
 from .shell import log
 
 GWS = "gws"
@@ -77,14 +78,55 @@ def candidates(source):
             t["messages"].append(m)
 
     out = []
+    daily = {}
     for sid, t in threads.items():
         msgs = sorted(t["messages"], key=lambda m: m.get("create_time", ""))
+        # Empty attachment/system messages cannot be analyzed. Dropping them
+        # here also prevents titles and dry-run logs from leaking non-content.
+        if not any((m.get("text") or "").strip() for m in msgs):
+            continue
+
+        if source.get("batch_unthreaded") == "daily" and len(msgs) == 1:
+            day = (msgs[0].get("create_time") or "")[:10] or "date-unknown"
+            key = (t["space"], day)
+            daily.setdefault(key, []).extend(msgs)
+            continue
+
         latest = msgs[-1].get("create_time", "")
-        first_text = (msgs[0].get("text") or "").replace("\n", " ")
+        first_text = redact_secrets(
+            (msgs[0].get("text") or "").replace("\n", " ")
+        )
         out.append({
             "id": f"{sid}@{latest}",       # version-aware: new replies => new candidate
             "title": first_text[:90],
             "raw": {"source_id": sid, "space": t["space"], "messages": msgs},
+        })
+
+    # Google Chat assigns every unthreaded room message its own thread id. A
+    # conversational burst would therefore cost one LLM call per sentence.
+    # Opt-in daily batching gives those messages a stable space/day identity;
+    # rerunning later the same day updates one memory entry as the digest grows.
+    for (space, day), msgs in daily.items():
+        msgs.sort(key=lambda m: m.get("create_time", ""))
+        sid = f"gchat:{_space_id(space)}:day:{day}"
+        latest = msgs[-1].get("create_time", "")
+        first_text = next(
+            (
+                redact_secrets((m.get("text") or "").replace("\n", " "))
+                for m in msgs
+                if (m.get("text") or "").strip()
+            ),
+            "",
+        )
+        out.append({
+            "id": f"{sid}@{latest}",
+            "title": first_text[:90] or f"Google Chat digest for {day}",
+            "raw": {
+                "source_id": sid,
+                "space": space,
+                "messages": msgs,
+                "digest_day": day,
+            },
         })
     return out
 
@@ -148,8 +190,15 @@ def fetch(routine, candidate):
         else []
     )
 
-    lines = [f"{names.get(m.get('sender'), m.get('sender', '?'))}: {m.get('text', '')}"
-             for m in msgs if (m.get("text") or "").strip()]
+    lines = [
+        timestamped_line(
+            m.get("create_time"),
+            names.get(m.get("sender"), m.get("sender", "?")),
+            m.get("text", ""),
+        )
+        for m in msgs
+        if (m.get("text") or "").strip()
+    ]
     if not lines:
         raise RuntimeError("thread has no text content in the window")
 
@@ -170,5 +219,8 @@ def fetch(routine, candidate):
             "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
                                           for m in msgs}),
             "message_count": len(msgs),
+            "first_message_at": msgs[0].get("create_time", ""),
+            "latest_message_at": msgs[-1].get("create_time", ""),
+            "digest_day": raw.get("digest_day"),
         },
     }
