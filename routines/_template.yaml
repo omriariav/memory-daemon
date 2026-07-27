@@ -12,7 +12,9 @@ enabled: true
 # Shown by `daemon.py list`.
 description: One line about what this routine scoops.
 
-# Optional cadence for `daemon.py tick`. Default: 4h. Manual `run` ignores it.
+# Optional cadence for `daemon.py tick`. The template chooses 4h explicitly;
+# omitting this block preserves the legacy 1h scheduler cadence. Manual `run`
+# ignores it.
 schedule:
   every: 4h
 

@@ -65,7 +65,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
               "fallbacks": 0, "pending_actions": 0, "ambiguous": 0}
 
     valid = []
-    invalid_specific = False
+    routing_failures = []
     for routine in routines:
         if not routine.get("enabled", True):
             parked = sum(
@@ -90,12 +90,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         except Exception as exc:  # a broken routine must not abort the rest
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
-            if not (routine.get("routing") or {}).get("fallback"):
-                invalid_specific = True
+            routing_failures.extend(_routine_failures(routine))
 
-    claims, failed_specific = _collect_claims(valid, totals)
-    failed_specific = failed_specific or invalid_specific
-    owned = _route_claims(claims, totals)
+    claims, listing_failures = _collect_claims(valid, totals)
+    owned = _route_claims(
+        claims, totals, failures=[*routing_failures, *listing_failures]
+    )
     valid_ids = {routine["id"] for routine in valid}
 
     for routine in active:
@@ -103,13 +103,6 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])
-        if (routine.get("routing") or {}).get("fallback") and failed_specific:
-            totals["errors"] += 1
-            log(
-                f"routine={rid} fallback blocked: a specific routine failed to list "
-                f"its candidates, so ownership cannot be proven"
-            )
-            continue
         _run_owned(
             routine, routine_claims, processed, label_catalog, dry_run,
             totals, lock, catalog,
@@ -295,44 +288,214 @@ def _routing_id(candidate):
     return candidate["id"]
 
 
+_SOURCE_DEFAULT_LIMITS = {
+    "gmail": 20,
+    "drive_docs": 50,
+    "slack": 30,
+    "gchat": 50,
+}
+
+
+def _source_limit(source):
+    return source.get(
+        "max_results", _SOURCE_DEFAULT_LIMITS.get(source.get("kind"), 20)
+    )
+
+
+def _source_scopes(source):
+    """Conservative static scopes used for overlap and failure isolation."""
+    kind = source.get("kind")
+    if kind in {"gmail", "drive_docs"}:
+        # Query intersection cannot be proven statically.
+        return {(kind, "*")}
+    if kind == "gchat":
+        values = {
+            (kind, space)
+            for space in source.get("spaces", [])
+            if isinstance(space, str)
+        }
+        return values or {(kind, "*")}
+    if kind == "slack":
+        if source.get("include_mentions"):
+            # A workspace-wide mention can originate in any channel.
+            return {(kind, "*")}
+        values = {
+            (kind, channel)
+            for channel in source.get("channels", [])
+            if isinstance(channel, str)
+        }
+        return values or {(kind, "*")}
+    return {(kind, "*")} if kind else {
+        (known, "*") for known in config.VALID_SOURCE_KINDS
+    }
+
+
+def _scopes_overlap(left, right):
+    return any(
+        left_kind == right_kind
+        and (left_scope == "*" or right_scope == "*" or left_scope == right_scope)
+        for left_kind, left_scope in left
+        for right_kind, right_scope in right
+    )
+
+
+def _candidate_scopes(source, candidate):
+    """Narrow a listed chat candidate to its actual channel or space."""
+    raw = candidate.get("raw")
+    raw = raw if isinstance(raw, dict) else {}
+    kind = source.get("kind")
+    if kind == "slack" and isinstance(raw.get("channel"), str):
+        return {(kind, raw["channel"])}
+    if kind == "gchat" and isinstance(raw.get("space"), str):
+        return {(kind, raw["space"])}
+    return _source_scopes(source)
+
+
+def _safe_routing_rank(routine):
+    """A conservative rank for malformed routines that failed validation."""
+    routing = routine.get("routing")
+    if not isinstance(routing, dict):
+        return (0, 100)
+    fallback = routing.get("fallback")
+    priority = routing.get("priority", 100)
+    if not isinstance(fallback, bool):
+        fallback = False
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        priority = 100
+    return (1 if fallback else 0, priority)
+
+
+def _failure(routine, source=None, known_ids=None):
+    return {
+        "routine_id": str(routine.get("id", "?")),
+        "rank": _safe_routing_rank(routine),
+        "scopes": _source_scopes(source) if isinstance(source, dict) else {
+            (kind, "*") for kind in config.VALID_SOURCE_KINDS
+        },
+        # An expanded ownership scan may fail after the routine's normal,
+        # capped scan succeeded. Those normal ids are still proven claims.
+        "known_ids": set(known_ids or ()),
+    }
+
+
+def _routine_failures(routine):
+    """Turn an invalid routine into conservative ownership barriers."""
+    source_values = []
+    unknown = False
+    if "source" in routine:
+        source_values.append(routine.get("source"))
+    if "sources" in routine:
+        values = routine.get("sources")
+        if isinstance(values, list):
+            source_values.extend(values)
+        else:
+            unknown = True
+
+    failures = [
+        _failure(routine, source)
+        for source in source_values
+        if isinstance(source, dict) and source.get("kind") in config.VALID_SOURCE_KINDS
+    ]
+    if (
+        unknown
+        or not failures
+        or any(not isinstance(source, dict) for source in source_values)
+        or any(
+            isinstance(source, dict)
+            and source.get("kind") not in config.VALID_SOURCE_KINDS
+            for source in source_values
+        )
+    ):
+        failures.append(_failure(routine))
+    return failures
+
+
+def _ownership_limit(source, sources):
+    """Largest processing cap among source blocks that may overlap."""
+    scopes = _source_scopes(source)
+    return max(
+        (
+            _source_limit(other)
+            for other in sources
+            if _scopes_overlap(scopes, _source_scopes(other))
+        ),
+        default=_source_limit(source),
+    )
+
+
 def _collect_claims(routines, totals):
     """List candidates for the full routing context.
 
     Every enabled routine participates even when it is not due. Otherwise a
     daily fallback could steal an item from a domain routine whose four-hour
-    cadence had not elapsed yet.
+    cadence had not elapsed yet. Candidate processing caps remain per source,
+    but lower caps are expanded for ownership discovery so overflow items wait
+    for their specific owner instead of leaking into a broader fallback.
     """
     claims = {}
-    failed_specific = False
-    for routine in routines:
+    failures = []
+    entries = [
+        (routine, source_index, source)
+        for routine in routines
+        for source_index, source in enumerate(config.sources(routine))
+    ]
+    all_sources = [source for _, _, source in entries]
+
+    for routine, source_index, source in entries:
         rid = routine["id"]
-        fallback = bool((routine.get("routing") or {}).get("fallback"))
-        for source_index, source in enumerate(config.sources(routine)):
-            kind = source["kind"]
-            list_candidates, fetch = SOURCES[kind]
-            log(f"routine={rid} querying {kind}: {_scope(source)}")
+        kind = source["kind"]
+        list_candidates, fetch = SOURCES[kind]
+        log(f"routine={rid} querying {kind}: {_scope(source)}")
+        try:
+            candidates = list_candidates(source)
+        except Exception as exc:
+            totals["errors"] += 1
+            log(f"routine={rid} source={kind} FATAL: {exc}")
+            failures.append(_failure(routine, source))
+            continue
+
+        log(f"routine={rid} source={kind} {len(candidates)} item(s) matched")
+        normal_ids = {_routing_id(candidate) for candidate in candidates}
+
+        discovery = []
+        discovery_limit = _ownership_limit(source, all_sources)
+        if discovery_limit > _source_limit(source):
+            expanded_source = dict(source, max_results=discovery_limit)
+            log(
+                f"routine={rid} source={kind} expanding ownership scan "
+                f"to {discovery_limit}"
+            )
             try:
-                candidates = list_candidates(source)
+                discovery = list_candidates(expanded_source)
             except Exception as exc:
                 totals["errors"] += 1
-                log(f"routine={rid} source={kind} FATAL: {exc}")
-                if not fallback:
-                    failed_specific = True
-                continue
-            log(f"routine={rid} source={kind} {len(candidates)} item(s) matched")
-            for candidate in candidates:
-                key = (kind, _routing_id(candidate))
-                claims.setdefault(key, []).append({
-                    "routine": routine,
-                    "source": source,
-                    "source_index": source_index,
-                    "candidate": candidate,
-                    "fetch": fetch,
-                })
-    return claims, failed_specific
+                log(
+                    f"routine={rid} source={kind} ownership scan FATAL: {exc}"
+                )
+                failures.append(
+                    _failure(routine, source, known_ids=normal_ids)
+                )
+
+        candidates_with_budget = [(candidate, True) for candidate in candidates]
+        candidates_with_budget.extend(
+            (candidate, False)
+            for candidate in discovery
+            if _routing_id(candidate) not in normal_ids
+        )
+        for candidate, processable in candidates_with_budget:
+            key = (kind, _routing_id(candidate))
+            claims.setdefault(key, []).append({
+                "routine": routine,
+                "source": source,
+                "source_index": source_index,
+                "candidate": candidate,
+                "fetch": fetch,
+                "processable": processable,
+            })
+    return claims, failures
 
 
-def _route_claims(claims, totals):
+def _route_claims(claims, totals, failures=()):
     """Choose exactly one routine for every source candidate.
 
     A specific routine always beats a fallback. Explicit lower priority wins
@@ -346,7 +509,13 @@ def _route_claims(claims, totals):
         by_routine = {}
         for claim in candidates:
             rid = claim["routine"]["id"]
-            if rid not in by_routine:
+            if (
+                rid not in by_routine
+                or (
+                    not by_routine[rid].get("processable", True)
+                    and claim.get("processable", True)
+                )
+            ):
                 by_routine[rid] = claim
         unique = list(by_routine.values())
         best_rank = min(config.routing_rank(c["routine"]) for c in unique)
@@ -363,6 +532,29 @@ def _route_claims(claims, totals):
             )
             continue
         claim = winners[0]
+        blockers = {
+            failure["routine_id"]
+            for failure in failures
+            if failure["rank"] <= best_rank
+            and item_id not in failure["known_ids"]
+            and _scopes_overlap(
+                failure["scopes"],
+                _candidate_scopes(claim["source"], claim["candidate"]),
+            )
+        }
+        if blockers:
+            ids = ", ".join(sorted(blockers))
+            log(
+                f"ownership blocked source={kind} id={item_id}: "
+                f"candidate listing failed for {ids}"
+            )
+            continue
+        if not claim.get("processable", True):
+            log(
+                f"ownership held source={kind} id={item_id}: "
+                f"owner {claim['routine']['id']} reached its processing cap"
+            )
+            continue
         owned.setdefault(claim["routine"]["id"], []).append(claim)
     return owned
 
