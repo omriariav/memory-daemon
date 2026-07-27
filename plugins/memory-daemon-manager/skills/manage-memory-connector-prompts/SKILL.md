@@ -14,11 +14,13 @@ jobs on a source should keep their instructions inline in the routine.
 1. Resolve the daemon checkout from a user-provided path or the current project.
    Require an absolute path containing `daemon.py`, `routines/`, and
    `workspace_daemon/`.
-2. Resolve the selected personal-memory store from the user's request or the
+2. Require macOS or Linux. Stop on Windows because memory-daemon depends on
+   POSIX file locking.
+3. Resolve the selected personal-memory store from the user's request or the
    relevant routine's `memory.store`. If several stores are possible, ask.
-3. Resolve `../../scripts/memory_daemon_admin.py` relative to this `SKILL.md`
+4. Resolve `../../scripts/memory_daemon_admin.py` relative to this `SKILL.md`
    and use its absolute path as `ADMIN`.
-4. Read [connector-prompts.md](references/connector-prompts.md) before creating,
+5. Read [connector-prompts.md](references/connector-prompts.md) before creating,
    editing, or removing an override.
 
 Do not move a specialized routine instruction into a connector merely to make

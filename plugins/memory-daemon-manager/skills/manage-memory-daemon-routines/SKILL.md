@@ -14,9 +14,11 @@ routine administration.
 1. Resolve the daemon checkout from a user-provided path or the current project.
    Require an absolute path containing `daemon.py`, `routines/`, and
    `workspace_daemon/`.
-2. Resolve `../../scripts/memory_daemon_admin.py` relative to this `SKILL.md`
+2. Require macOS or Linux. Stop on Windows because memory-daemon depends on
+   POSIX file locking.
+3. Resolve `../../scripts/memory_daemon_admin.py` relative to this `SKILL.md`
    and use its absolute path as `ADMIN`.
-3. Read [routine-schema.md](references/routine-schema.md) before adding or
+4. Read [routine-schema.md](references/routine-schema.md) before adding or
    editing a routine.
 
 Do not infer a different checkout when the target is ambiguous.

@@ -40,17 +40,18 @@ def cmd_list(args):
     if not routines:
         print("no routines defined — run `daemon.py new` to scaffold one")
         return 0
-    width = max(len(r["id"]) for r in routines)
+    display_ids = [str(r.get("id", "")) for r in routines]
+    width = max(len(rid) for rid in display_ids)
     print(
         f"{'ROUTINE'.ljust(width)}  {'ENABLED':<8}  {'EVERY':<7}  "
         f"{'LAST RUN':<21}  DESCRIPTION"
     )
-    for r in routines:
+    for r, display_id in zip(routines, display_ids):
         enabled = "yes" if r.get("enabled", True) else "no"
         every = (r.get("schedule") or {}).get("every", config.DEFAULT_SCHEDULE)
         last = state.last_run(BASE_DIR, r["id"]) or "never"
         desc = r.get("description", "")
-        print(f"{r['id'].ljust(width)}  {enabled:<8}  {every:<7}  {last:<21}  {desc}")
+        print(f"{display_id.ljust(width)}  {enabled:<8}  {every:<7}  {last:<21}  {desc}")
     return 0
 
 

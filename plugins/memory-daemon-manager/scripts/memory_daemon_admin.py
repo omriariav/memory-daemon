@@ -19,6 +19,7 @@ import importlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,14 @@ class ChangePlan:
     display_target: str
     before: Optional[bytes]
     after: Optional[bytes]
+    before_mode: Optional[int]
+    create_mode: int
+
+    @property
+    def after_mode(self):
+        if self.after is None:
+            return None
+        return self.before_mode if self.before is not None else self.create_mode
 
     @property
     def token(self):
@@ -52,6 +61,8 @@ class ChangePlan:
             "target": str(self.target),
             "before": _digest(self.before),
             "after": _digest(self.after),
+            "before_mode": self.before_mode,
+            "after_mode": self.after_mode,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
@@ -84,6 +95,14 @@ def _require_name(value, label):
     return value
 
 
+def _require_posix():
+    if os.name != "posix":
+        raise AdminError(
+            "memory-daemon administration supports POSIX systems only "
+            "(macOS and Linux); the daemon depends on POSIX file locking"
+        )
+
+
 def _repo(value):
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -111,6 +130,15 @@ def _read_utf8(path):
         raise AdminError(f"cannot read {path}: {exc}") from exc
 
 
+def _target_state(path):
+    """Return regular-file bytes and mode, or (None, None) when absent."""
+    if not os.path.lexists(path):
+        return None, None
+    if path.is_symlink() or not path.is_file():
+        raise AdminError(f"refusing to mutate non-regular target: {path}")
+    return _read_utf8(path), stat.S_IMODE(path.stat().st_mode)
+
+
 def _yaml_mapping(raw, source):
     try:
         data = yaml.safe_load(raw.decode("utf-8"))
@@ -133,7 +161,12 @@ def _discover_routines(repo):
     ids = {}
     for path in _routine_files(repo):
         data = _yaml_mapping(_read_utf8(path), path)
-        rid = str(data.get("id") or path.stem)
+        rid = data.get("id", path.stem)
+        if not isinstance(rid, str) or not NAME_RE.fullmatch(rid):
+            raise AdminError(
+                f"{path.name}: routine id must use lowercase letters, digits, "
+                f"and hyphens (got {rid!r})"
+            )
         if rid in ids:
             raise AdminError(
                 f"duplicate routine id {rid!r} in {ids[rid].name} and {path.name}"
@@ -243,7 +276,12 @@ def _load_daemon_config(repo):
 
 def _validate_routine_candidate(repo, rid, raw, target):
     data = _yaml_mapping(raw, target)
-    candidate_id = str(data.get("id") or target.stem)
+    candidate_id = data.get("id")
+    if not isinstance(candidate_id, str) or not NAME_RE.fullmatch(candidate_id):
+        raise AdminError(
+            "candidate routine id must use lowercase letters, digits, and hyphens "
+            f"(got {candidate_id!r})"
+        )
     if candidate_id != rid:
         raise AdminError(
             f"candidate routine id {candidate_id!r} does not match target {rid!r}"
@@ -268,12 +306,18 @@ def _routine_plan(args):
         if rid in existing:
             raise AdminError(f"routine {rid!r} already exists")
         target = repo / "routines" / f"{rid}.yaml"
+        if os.path.lexists(target):
+            raise AdminError(
+                f"refusing to add routine {rid!r}: target path already exists "
+                f"({target.name})"
+            )
         before = None
+        before_mode = None
     else:
         if rid not in existing:
             raise AdminError(f"no routine with id {rid!r}")
         target = existing[rid][0]
-        before = _read_utf8(target)
+        before, before_mode = _target_state(target)
 
     after = None
     if operation != "remove":
@@ -291,6 +335,8 @@ def _routine_plan(args):
         display_target=str(target.relative_to(repo)),
         before=before,
         after=after,
+        before_mode=before_mode,
+        create_mode=0o644,
     )
 
 
@@ -379,7 +425,7 @@ def _prompt_plan(args):
     name = _require_name(args.name, "connector name")
     operation = args.operation
     target, _ = _prompt_paths(store, name)
-    exists = target.is_file()
+    exists = os.path.lexists(target)
 
     if operation == "add" and exists:
         raise AdminError(f"connector override {name!r} already exists; use edit")
@@ -389,7 +435,7 @@ def _prompt_plan(args):
             + ("; use add to create an override of the template" if operation == "edit" else "")
         )
 
-    before = _read_utf8(target) if exists else None
+    before, before_mode = _target_state(target) if exists else (None, None)
     after = None
     if operation != "remove":
         if not args.candidate:
@@ -405,6 +451,8 @@ def _prompt_plan(args):
         display_target=str(target.relative_to(store)),
         before=before,
         after=after,
+        before_mode=before_mode,
+        create_mode=0o600,
     ), repo
 
 
@@ -435,7 +483,7 @@ def _require_remove_confirmation(plan, expected, supplied):
         )
 
 
-def _atomic_write(path, content, mode=None):
+def _atomic_write(path, content, mode, expected_content, expected_mode):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     temp_path = Path(temp_name)
@@ -446,15 +494,13 @@ def _atomic_write(path, content, mode=None):
             os.fsync(handle.fileno())
         if mode is not None:
             os.chmod(temp_path, mode)
+        # Recheck after the temporary file is fully durable, immediately before
+        # replacement. This keeps slow writes from widening the stale-plan race.
+        actual_content, actual_mode = _target_state(path)
+        if actual_content != expected_content or actual_mode != expected_mode:
+            raise AdminError(f"target changed concurrently: {path}")
         os.replace(temp_path, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
+        _fsync_directory(path.parent)
     finally:
         try:
             temp_path.unlink()
@@ -462,15 +508,78 @@ def _atomic_write(path, content, mode=None):
             pass
 
 
-def _set_plan_state(plan, content):
-    if content is None:
+def _atomic_create(path, content, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except FileExistsError as exc:
+        raise AdminError(f"target appeared concurrently: {path}") from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
         try:
-            plan.target.unlink()
+            path.unlink()
         except FileNotFoundError:
             pass
+        raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path):
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
+
+
+def _set_plan_state(plan, content, mode, expected_content, expected_mode):
+    actual_content, actual_mode = _target_state(plan.target)
+    if actual_content != expected_content or actual_mode != expected_mode:
+        raise AdminError(
+            f"target changed concurrently: {plan.display_target}; "
+            "the newer content was preserved"
+        )
+
+    if content is None:
+        plan.target.unlink()
+        _fsync_directory(plan.target.parent)
         return
-    old_mode = plan.target.stat().st_mode & 0o777 if plan.target.exists() else 0o644
-    _atomic_write(plan.target, content, mode=old_mode)
+    if expected_content is None:
+        _atomic_create(plan.target, content, mode)
+    else:
+        _atomic_write(
+            plan.target,
+            content,
+            mode=mode,
+            expected_content=expected_content,
+            expected_mode=expected_mode,
+        )
+
+
+def _preserve_conflict_copy(plan):
+    if plan.before is None:
+        return None
+    plan.target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{plan.target.name}.rollback-conflict-",
+        dir=str(plan.target.parent),
+    )
+    path = Path(name)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(plan.before)
+        handle.flush()
+        os.fsync(handle.fileno())
+    # mkstemp deliberately keeps this recovery copy private (0600), even when
+    # the original routine was world-readable.
+    _fsync_directory(path.parent)
+    return path
 
 
 def _validate_checkout(repo):
@@ -490,11 +599,35 @@ def _validate_checkout(repo):
 
 
 def _apply_and_validate(plan, repo):
-    _set_plan_state(plan, plan.after)
+    _set_plan_state(
+        plan,
+        plan.after,
+        plan.after_mode,
+        expected_content=plan.before,
+        expected_mode=plan.before_mode,
+    )
     try:
         _validate_checkout(repo)
-    except Exception:
-        _set_plan_state(plan, plan.before)
+    except Exception as validation_error:
+        try:
+            _set_plan_state(
+                plan,
+                plan.before,
+                plan.before_mode,
+                expected_content=plan.after,
+                expected_mode=plan.after_mode,
+            )
+        except Exception as rollback_error:
+            conflict = _preserve_conflict_copy(plan)
+            recovery = (
+                f"; original saved to {conflict}"
+                if conflict is not None
+                else "; there was no original file to save"
+            )
+            raise AdminError(
+                f"{validation_error}\nrollback stopped because {rollback_error}"
+                f"{recovery}"
+            ) from validation_error
         raise
     _print_json(
         {
@@ -577,6 +710,7 @@ def main(argv=None):
     _add_prompt_commands(subparsers)
     args = parser.parse_args(argv)
     try:
+        _require_posix()
         args.func(args)
     except AdminError as exc:
         print(f"error: {exc}", file=sys.stderr)

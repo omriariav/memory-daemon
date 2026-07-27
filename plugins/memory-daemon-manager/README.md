@@ -3,6 +3,10 @@
 A dual-compatible Codex and Claude Code plugin for safely administering a local
 memory-daemon checkout.
 
+The administration helper supports macOS and Linux. Windows is not supported
+because memory-daemon relies on POSIX file locking and its scheduler targets
+macOS launchd.
+
 It provides two shared skills:
 
 - `manage-memory-daemon-routines`: list, inspect, add, edit, enable, disable,

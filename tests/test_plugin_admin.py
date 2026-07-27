@@ -1,11 +1,13 @@
 """Behavioral tests for the marketplace administration helper."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -184,6 +186,39 @@ memory:
         )
         self.assertFalse((self.repo / "routines" / "invalid.yaml").exists())
 
+    def test_add_rejects_existing_filename_with_a_different_declared_id(self):
+        occupied = self.repo / "routines" / "foo.yaml"
+        occupied.write_text(routine_yaml("bar"))
+        candidate = self.candidate("candidate.yaml", routine_yaml("foo"))
+        self.run_admin(
+            "routine", "plan", "--repo", self.repo,
+            "--operation", "add", "--id", "foo", "--candidate", candidate,
+            expect=2,
+        )
+        self.assertEqual(occupied.read_text(), routine_yaml("bar"))
+
+    def test_numeric_routine_id_is_rejected_and_list_does_not_crash(self):
+        numeric = routine_yaml("123")
+        candidate = self.candidate("numeric.yaml", numeric)
+        self.run_admin(
+            "routine", "plan", "--repo", self.repo,
+            "--operation", "add", "--id", "numeric", "--candidate", candidate,
+            expect=2,
+        )
+        (self.repo / "routines" / "numeric.yaml").write_text(numeric)
+        validation = subprocess.run(
+            [sys.executable, str(self.repo / "daemon.py"), "validate"],
+            cwd=self.repo, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn("id must use lowercase", validation.stdout)
+        listing = subprocess.run(
+            [sys.executable, str(self.repo / "daemon.py"), "list"],
+            cwd=self.repo, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertIn("123", listing.stdout)
+
     def test_failed_full_validation_rolls_back_change(self):
         (self.repo / "routines" / "already-broken.yaml").write_text(
             "id: already-broken\nsource: {}\n"
@@ -200,6 +235,79 @@ memory:
             expect=2,
         )
         self.assertFalse((self.repo / "routines" / "new-routine.yaml").exists())
+
+    def test_failed_prompt_remove_restores_private_permissions(self):
+        (self.repo / "routines" / "already-broken.yaml").write_text(
+            "id: already-broken\nsource: {}\n"
+        )
+        override = self.store / "memory" / "connectors" / "slack.md"
+        override.parent.mkdir(parents=True)
+        override.write_text(
+            "Keep durable decisions, commitments, incidents, and material facts.\n"
+        )
+        os.chmod(override, 0o600)
+        plan = self.run_admin(
+            "prompt", "plan", "--repo", self.repo, "--store", self.store,
+            "--operation", "remove", "--name", "slack",
+        )
+        self.run_admin(
+            "prompt", "apply", "--repo", self.repo, "--store", self.store,
+            "--operation", "remove", "--name", "slack",
+            "--token", self.token(plan.stdout), "--confirm-target", "slack",
+            expect=2,
+        )
+        self.assertTrue(override.exists())
+        self.assertEqual(override.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_validation_preserves_concurrent_edit_and_conflict_copy(self):
+        target = self.repo / "routines" / "example.yaml"
+        original = routine_yaml("example")
+        target.write_text(original)
+        candidate = self.candidate(
+            "candidate.yaml",
+            routine_yaml("example", "Keep durable decisions, named owners, and dates."),
+        )
+        plan = self.run_admin(
+            "routine", "plan", "--repo", self.repo,
+            "--operation", "edit", "--id", "example", "--candidate", candidate,
+        )
+        (self.repo / "daemon.py").write_text(
+            """\
+#!/usr/bin/env python3
+import sys
+import time
+from pathlib import Path
+Path("validator-started").write_text("started")
+time.sleep(0.5)
+print("forced validation failure", file=sys.stderr)
+raise SystemExit(1)
+"""
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable, str(ADMIN), "routine", "apply",
+                "--repo", str(self.repo), "--operation", "edit",
+                "--id", "example", "--candidate", str(candidate),
+                "--token", self.token(plan.stdout),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        marker = self.repo / "validator-started"
+        deadline = time.time() + 5
+        while not marker.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(marker.exists(), "validator did not start")
+        concurrent = "# concurrent editor\n" + routine_yaml("example")
+        target.write_text(concurrent)
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 2, f"{stdout}\n{stderr}")
+        self.assertEqual(target.read_text(), concurrent)
+        copies = list(target.parent.glob(".example.yaml.rollback-conflict-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), original)
+        self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
 
     def test_routine_list_redacts_queries_and_source_identifiers(self):
         secret_query = "from:private.person@example.test"

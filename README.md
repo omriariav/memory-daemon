@@ -103,7 +103,8 @@ This repository is also a marketplace for the dual-compatible
 remove routine YAML and private connector prompt overrides. Every mutation
 shows a diff first, requires an unchanged plan token, validates the whole
 daemon afterward, and rolls back on validation failure. The skills never run
-the daemon or start its scheduler implicitly.
+the daemon or start its scheduler implicitly. The helper supports macOS and
+Linux; Windows is outside memory-daemon's POSIX/launchd support boundary.
 
 Install for Codex:
 
@@ -478,7 +479,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 131 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 135 tests, no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```
