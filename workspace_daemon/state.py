@@ -27,6 +27,10 @@ def state_file(base_dir):
     return Path(base_dir) / "state" / "processed.json"
 
 
+def schedule_file(base_dir):
+    return Path(base_dir) / "state" / "schedule.json"
+
+
 def load(base_dir):
     path = state_file(base_dir)
     if not path.exists():
@@ -190,6 +194,60 @@ class Store:
             return
         merged = dict(self.entries)
         merged[item_id] = entry
+        write_atomic(self.path, _serialize(merged))
+        self.entries = merged
+
+
+class ScheduleStore:
+    """Small durable record of when each routine was last attempted.
+
+    Cadence is based on attempts, not successes: a broken external dependency
+    should be retried on the routine's declared interval rather than on every
+    coordinator tick. Manual `run` commands never update this state.
+    """
+
+    def __init__(self, base_dir, dry_run=False):
+        self.path = schedule_file(base_dir)
+        self.dry_run = dry_run
+        self.entries = self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise StateError(f"{self.path} is not valid schedule state: {exc}") from exc
+        if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+            raise StateError(f"{self.path} must contain an object of routine records")
+        return data
+
+    def due(self, routine, now=None):
+        from . import config  # avoid a module cycle at import time
+
+        now = time.time() if now is None else float(now)
+        last = (self.entries.get(routine["id"]) or {}).get("last_attempted_epoch")
+        if not isinstance(last, (int, float)):
+            return True
+        elapsed = now - float(last)
+        # Wall clocks can jump backwards after sleep or time synchronization.
+        # Treat that as due rather than freezing the routine until the future
+        # timestamp is reached again.
+        return elapsed < 0 or elapsed >= config.schedule_seconds(routine)
+
+    def mark_attempted(self, routine_ids, now=None):
+        if self.dry_run:
+            return
+        from .shell import utc_now_iso
+
+        now = time.time() if now is None else float(now)
+        merged = dict(self.entries)
+        stamp = utc_now_iso()
+        for rid in routine_ids:
+            merged[rid] = {
+                "last_attempted_at": stamp,
+                "last_attempted_epoch": now,
+            }
         write_atomic(self.path, _serialize(merged))
         self.entries = merged
 

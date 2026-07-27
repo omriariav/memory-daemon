@@ -14,41 +14,58 @@ def _needs_label_catalog(routines):
     """Both LLM-chosen and configured labels are validated against the catalog."""
     return any(
         (r.get("analyze", {}).get("pick_label") or config.configured_labels(r))
-        and r.get("source", {}).get("kind") == "gmail"
+        and any(source.get("kind") == "gmail" for source in config.sources(r))
         for r in routines
     )
 
 
-def run(base_dir, routines, dry_run=False, refresh_labels=False):
+def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
     no state write. Source reads still happen so the preview is real.
+
+    `routines` is the complete routing context. `active_ids` optionally limits
+    which owners may process in this invocation while still letting inactive
+    domain routines protect their candidates from a due fallback sweep.
     """
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
         lock = stack.enter_context(state.RunLock(base_dir)) if not dry_run else None
-        return _run_locked(base_dir, routines, dry_run, lock, refresh_labels)
+        return _run_locked(
+            base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
+        )
 
 
-def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False):
+def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
+                active_ids=None):
+    active_ids = set(active_ids) if active_ids is not None else {
+        r["id"] for r in routines if r.get("enabled", True)
+    }
+    active = [
+        r for r in routines
+        if r.get("enabled", True) and r["id"] in active_ids
+    ]
     processed = state.Store(base_dir, dry_run=dry_run)
     catalog = None
     label_catalog = []
-    if _needs_label_catalog(routines):
+    if _needs_label_catalog(active):
         catalog = labels.Catalog(base_dir, force_refresh=refresh_labels,
                                  read_only=dry_run)
         label_catalog = catalog.names()
 
     if not dry_run:
         state.sweep_temp_files(state.state_file(base_dir).parent)
-        for vault in {r.get("output", {}).get("vault_dir") for r in routines}:
+        for vault in {r.get("output", {}).get("vault_dir") for r in active}:
             if vault:
                 state.sweep_temp_files(vault)
 
     totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0,
-              "fallbacks": 0, "pending_actions": 0}
+              "fallbacks": 0, "pending_actions": 0, "ambiguous": 0}
+
+    valid = []
+    invalid_specific = False
     for routine in routines:
         if not routine.get("enabled", True):
             parked = sum(
@@ -59,15 +76,44 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False):
             log(f"routine={routine['id']} disabled, skipping{note}")
             continue
         try:
-            _run_routine(routine, processed, label_catalog, dry_run, totals, lock, catalog)
-        except state.AlreadyRunning:
-            # Losing the lock is a whole-run condition, not one routine's bug:
-            # every remaining routine would hit it too. Let it reach the CLI,
-            # which reports it as a clean skip rather than N fatal errors.
-            raise
+            problems = config.validate(routine)
+            if problems:
+                raise config.RoutineError("; ".join(problems))
+            if routine["id"] not in active_ids:
+                valid.append(routine)
+                continue
+            if catalog is not None:
+                for name in config.configured_labels(routine):
+                    _validated_label(name, label_catalog, routine["id"], catalog)
+            _retry_pending_actions(routine, processed, dry_run, totals)
+            valid.append(routine)
         except Exception as exc:  # a broken routine must not abort the rest
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
+            if not (routine.get("routing") or {}).get("fallback"):
+                invalid_specific = True
+
+    claims, failed_specific = _collect_claims(valid, totals)
+    failed_specific = failed_specific or invalid_specific
+    owned = _route_claims(claims, totals)
+    valid_ids = {routine["id"] for routine in valid}
+
+    for routine in active:
+        if routine["id"] not in valid_ids:
+            continue
+        rid = routine["id"]
+        routine_claims = owned.get(rid, [])
+        if (routine.get("routing") or {}).get("fallback") and failed_specific:
+            totals["errors"] += 1
+            log(
+                f"routine={rid} fallback blocked: a specific routine failed to list "
+                f"its candidates, so ownership cannot be proven"
+            )
+            continue
+        _run_owned(
+            routine, routine_claims, processed, label_catalog, dry_run,
+            totals, lock, catalog,
+        )
 
     return totals
 
@@ -83,8 +129,7 @@ def _gmail_candidates(source):
     ]
 
 
-def _gmail_fetch(routine, candidate):
-    source = routine["source"]
+def _gmail_fetch(routine, source, candidate):
     message_id = candidate["id"]
     msg = gmail.read_message(message_id)
     headers = msg.get("headers", {})
@@ -95,6 +140,7 @@ def _gmail_fetch(routine, candidate):
 
     item = {
         "id": message_id,
+        "source_kind": "gmail",
         "title": subject,
         "date": date,
         "body": body,
@@ -192,8 +238,7 @@ def _drive_candidates(source):
     return [{"id": f["id"], "title": f.get("name", ""), "raw": f} for f in files]
 
 
-def _drive_fetch(routine, candidate):
-    source = routine["source"]
+def _drive_fetch(routine, source, candidate):
     doc_id = candidate["id"]
     meta = candidate["raw"]
     name = meta.get("name", "")
@@ -207,6 +252,7 @@ def _drive_fetch(routine, candidate):
             log(f"doc={doc_id} tabs not present, skipped: {', '.join(missing)}")
     return {
         "id": doc_id,
+        "source_kind": "drive_docs",
         "title": drive.meeting_title(name),
         "date": drive.date_from_name(name) or (meta.get("modified") or "")[:10],
         "body": body,
@@ -224,43 +270,110 @@ SOURCES = {
     "gmail": (_gmail_candidates, _gmail_fetch),
     "drive_docs": (_drive_candidates, _drive_fetch),
     "slack": (slack_source.candidates,
-              lambda routine, candidate: slack_source.fetch(routine, candidate)),
+              lambda routine, source, candidate: slack_source.fetch(routine, candidate)),
     "gchat": (gchat_source.candidates,
-              lambda routine, candidate: gchat_source.fetch(routine, candidate)),
+              lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
 }
 
 
-# --- run loop ---------------------------------------------------------------
+# --- candidate ownership and run loop --------------------------------------
 
-def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, catalog=None):
+def _scope(source):
+    return (
+        source.get("query")
+        or ", ".join(source.get("channels", []))
+        or ", ".join(source.get("spaces", []))
+        or "mentions"
+    )
+
+
+def _routing_id(candidate):
+    """Stable ownership key, even when a chat candidate is version-aware."""
+    raw = candidate.get("raw")
+    if isinstance(raw, dict) and raw.get("source_id"):
+        return raw["source_id"]
+    return candidate["id"]
+
+
+def _collect_claims(routines, totals):
+    """List candidates for the full routing context.
+
+    Every enabled routine participates even when it is not due. Otherwise a
+    daily fallback could steal an item from a domain routine whose four-hour
+    cadence had not elapsed yet.
+    """
+    claims = {}
+    failed_specific = False
+    for routine in routines:
+        rid = routine["id"]
+        fallback = bool((routine.get("routing") or {}).get("fallback"))
+        for source_index, source in enumerate(config.sources(routine)):
+            kind = source["kind"]
+            list_candidates, fetch = SOURCES[kind]
+            log(f"routine={rid} querying {kind}: {_scope(source)}")
+            try:
+                candidates = list_candidates(source)
+            except Exception as exc:
+                totals["errors"] += 1
+                log(f"routine={rid} source={kind} FATAL: {exc}")
+                if not fallback:
+                    failed_specific = True
+                continue
+            log(f"routine={rid} source={kind} {len(candidates)} item(s) matched")
+            for candidate in candidates:
+                key = (kind, _routing_id(candidate))
+                claims.setdefault(key, []).append({
+                    "routine": routine,
+                    "source": source,
+                    "source_index": source_index,
+                    "candidate": candidate,
+                    "fetch": fetch,
+                })
+    return claims, failed_specific
+
+
+def _route_claims(claims, totals):
+    """Choose exactly one routine for every source candidate.
+
+    A specific routine always beats a fallback. Explicit lower priority wins
+    within either class. Equal-ranked distinct owners are ambiguous and skipped
+    rather than letting routine file order choose the extraction prompt.
+    """
+    owned = {}
+    for (kind, item_id), candidates in claims.items():
+        # Multiple source blocks in one routine may match the same item. That is
+        # one owner; keep the first declared block for deterministic actions.
+        by_routine = {}
+        for claim in candidates:
+            rid = claim["routine"]["id"]
+            if rid not in by_routine:
+                by_routine[rid] = claim
+        unique = list(by_routine.values())
+        best_rank = min(config.routing_rank(c["routine"]) for c in unique)
+        winners = [
+            c for c in unique if config.routing_rank(c["routine"]) == best_rank
+        ]
+        if len(winners) != 1:
+            ids = ", ".join(sorted(c["routine"]["id"] for c in winners))
+            totals["errors"] += 1
+            totals["ambiguous"] += 1
+            log(
+                f"ownership ERROR source={kind} id={item_id}: equal-ranked "
+                f"routines {ids}; skipped"
+            )
+            continue
+        claim = winners[0]
+        owned.setdefault(claim["routine"]["id"], []).append(claim)
+    return owned
+
+
+def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
+               lock=None, catalog=None):
     rid = routine["id"]
-    problems = config.validate(routine)
-    if problems:
-        raise config.RoutineError("; ".join(problems))
-
-    # Fail fast on a mistyped configured label: it is a config error affecting
-    # every item, so surfacing it once per routine beats failing each item
-    # individually and leaving them all to retry forever.
-    # `label_catalog` is only ever populated from `catalog`, so testing the
-    # object alone covers both — and unlike the list it stays truthy when the
-    # catalog comes back empty, which is exactly when one routine-level failure
-    # beats a refetch per item.
-    if catalog is not None:
-        for name in config.configured_labels(routine):
-            _validated_label(name, label_catalog, rid, catalog)
-
-    _retry_pending_actions(routine, processed, dry_run, totals)
-
-    source = routine["source"]
-    list_candidates, fetch = SOURCES[source["kind"]]
-    scope = (source.get("query") or ", ".join(source.get("channels", []))
-             or ", ".join(source.get("spaces", [])) or "mentions")
-    log(f"routine={rid} querying {source['kind']}: {scope}")
-    candidates = list_candidates(source)
-    log(f"routine={rid} {len(candidates)} item(s) matched")
-
+    log(f"routine={rid} {len(claims)} owned item(s)")
     new = 0
-    for candidate in candidates:
+    for claim in claims:
+        candidate = claim["candidate"]
         if candidate["id"] in processed:
             totals["skipped"] += 1
             continue
@@ -271,9 +384,13 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
             # be the only run, and continuing risks double-processing.
             lock.check()
         try:
-            _process(routine, candidate, fetch, processed, label_catalog, dry_run,
-                     totals, catalog)
+            _process(
+                routine, claim["source"], candidate, claim["fetch"], processed,
+                label_catalog, dry_run, totals, catalog,
+            )
             totals["processed"] += 1
+        except state.AlreadyRunning:
+            raise
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
@@ -281,13 +398,14 @@ def _run_routine(routine, processed, label_catalog, dry_run, totals, lock=None, 
         log(f"routine={rid} no new matches")
 
 
-def _process(routine, candidate, fetch, processed, label_catalog, dry_run, totals,
-             catalog=None):
+def _process(routine, source, candidate, fetch, processed, label_catalog,
+             dry_run, totals, catalog=None):
     rid = routine["id"]
-    action_list = routine.get("actions", [])
+    action_list = config.source_actions(routine, source)
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
 
-    item = fetch(routine, candidate)
+    item = fetch(routine, source, candidate)
+    item.setdefault("source_kind", source["kind"])
 
     if dry_run:
         desc = ", ".join(actions.describe(a, "<llm-chosen>") for a in action_list) or "none"
@@ -303,7 +421,7 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
     summary, label = llm.split_label(content, label_catalog)
-    static = _static_label(routine, item)
+    static = _static_label(routine, item) if source["kind"] == "gmail" else None
     if static:
         # A configured label still goes through the catalog so a typo in the YAML
         # fails loudly here rather than creating a stray Gmail label.
@@ -319,6 +437,7 @@ def _process(routine, candidate, fetch, processed, label_catalog, dry_run, total
 
     record = {
         "rule_id": rid,
+        "source_kind": source["kind"],
         "processed_at": utc_now_iso(),
         "output_file": str(path) if path else None,
         "gmail_label_applied": label,
@@ -423,7 +542,7 @@ def _retry_pending_actions(routine, processed, dry_run, totals):
     applied sequence is safe.
     """
     rid = routine["id"]
-    if routine["source"]["kind"] != "gmail":
+    if not any(source.get("kind") == "gmail" for source in config.sources(routine)):
         return
     for item_id, entry in processed.items():
         if entry.get("rule_id") != rid:

@@ -1,0 +1,44 @@
+# A domain routine owns evidence across transports. Gmail actions live on the
+# Gmail source block; chat items share the prompt and memory sink but can never
+# receive mailbox mutations.
+id: product-area
+enabled: true
+description: Product-area decisions and commitments across work sources.
+
+schedule:
+  every: 4h
+
+routing:
+  priority: 50
+
+sources:
+  - kind: gmail
+    query: '{from:product-group@example.com} {is:unread is:starred}'
+    max_results: 20
+    actions: [apply_label]
+
+  - kind: slack
+    channels: [C0123EXAMPLE]
+    hours: 26
+    max_results: 30
+
+  - kind: gchat
+    spaces: [spaces/AAAAEXAMPLE]
+    hours: 26
+    max_results: 50
+
+label: Product Area
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction: >-
+    Capture durable product decisions, legal or technical constraints,
+    commitments with owners, unresolved questions, and material customer
+    evidence. Ignore logistics and social chatter.
+
+memory:
+  store: /absolute/path/to/personal-memory
+  type: note
+  tags: [product-area]

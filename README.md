@@ -16,7 +16,8 @@ distills each match with an LLM, and sinks the result into one or both of:
 
 Gmail matches can additionally be triaged (label / mark read / unstar / archive).
 
-**Adding a new routine is a drop-in YAML file, never a code change.**
+**Adding a new routine is a drop-in YAML file, never a code change.** A routine
+may own one source or combine several transports under one domain prompt.
 
 ```
 source (gws / slack-cli) ──▶ LLM (yoetz) ──▶ vault note and/or memory entry
@@ -83,16 +84,88 @@ yoetz models list       # confirm your provider/model resolves
 ## Usage
 
 ```sh
-./daemon.py list                              # routines, enabled state, last run
+./daemon.py list                              # routines, cadence, enabled state, last run
 ./daemon.py validate                          # check all routine YAML
 ./daemon.py run --dry-run                     # preview, zero side effects
 ./daemon.py run --routine weekly-report       # run one routine for real
 ./daemon.py run                               # run everything enabled
+./daemon.py tick                              # run only routines whose cadence is due
 ./daemon.py new                               # interactive scaffold
 ```
 
 `--dry-run` makes **no** LLM call, **no** Gmail mutation, and **no** file or
 state write. It still queries Gmail (a read) so the preview reflects reality.
+
+## Domain routines, routing, and cadence
+
+Use `source:` for a compact single-source routine. Use `sources:` when one
+domain receives evidence through several transports:
+
+```yaml
+id: product-area
+enabled: true
+schedule: {every: 4h}         # integer + m, h, or d
+routing: {priority: 50}       # lower wins between specific routines
+
+sources:
+  - kind: gmail
+    query: '{from:product-group@example.com} {is:unread is:starred}'
+    actions: [apply_label]    # chat items can never receive this
+  - kind: slack
+    channels: [C0123EXAMPLE]
+    hours: 26
+  - kind: gchat
+    spaces: [spaces/AAAAEXAMPLE]
+    hours: 26
+
+label: Product Area
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  instruction: Keep durable decisions, constraints, and commitments.
+memory:
+  store: /absolute/path/to/personal-memory
+  type: note
+  tags: [product-area]
+```
+
+The legacy routine-level `actions:` key remains valid for `source:` routines.
+With `sources:`, actions belong on the Gmail source block. Validation rejects
+actions on Slack, Google Chat, and Drive sources.
+
+Candidate listing happens before analysis. When several routines match the
+same source item, ownership is resolved before the processed ledger is checked:
+
+1. A specific routine always beats a routine with `routing.fallback: true`.
+2. Within either class, lower `routing.priority` wins (default `100`).
+3. Equal-ranked distinct routines are ambiguous. The item is skipped with an
+   error instead of letting YAML filename order choose its prompt.
+
+This makes a low-frequency, broad inbox sweep safe as a fallback:
+
+```yaml
+id: periodic-inbox-sweep
+schedule: {every: 1d}
+routing: {fallback: true}
+sources:
+  - {kind: gmail, query: '{is:unread is:starred}', actions: []}
+  - {kind: slack, include_mentions: true, hours: 26}
+  - {kind: gchat, spaces: [spaces/AAAAEXAMPLE], hours: 26}
+```
+
+Even when only the fallback is due, enabled specific routines still list their
+candidates for routing. An item waits for its owner; it is never captured under
+the fallback prompt merely because that fallback ran first. If a specific
+source cannot be listed, the fallback is blocked because ownership cannot be
+proven.
+
+`daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
+scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially
+under the existing global lock, and records attempts in
+`state/schedule.json`. A failed dependency is retried on that routine's cadence,
+not on every coordinator wake-up. A dry-run tick never updates schedule state.
+
+See `_example-domain-routine.yaml` and `_example-fallback-sweep.yaml`.
 
 ## Adding a routine
 
@@ -113,7 +186,7 @@ enabled: true
 description: Summarize the weekly report email.
 
 source:
-  kind: gmail                  # only gmail today
+  kind: gmail                  # gmail, drive_docs, slack, or gchat
   query: 'from:reports@example.com subject:"Weekly Report" is:unread'
   max_results: 20              # optional, default 20
 
@@ -282,7 +355,11 @@ tags: [kind/email-scoop-summary, status/inbox]
 
 ## Scheduling (macOS LaunchAgent)
 
-Hourly, and once at load. Render the template, add your key, load it:
+The LaunchAgent is a lightweight coordinator. It wakes every 15 minutes and
+calls `daemon.py tick`; routines that are not due make no source or LLM calls.
+The template deliberately uses `RunAtLoad: false`, so installation itself
+never triggers the first real run. Render the template, add your key, then load
+it:
 
 ```sh
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
@@ -370,7 +447,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 53 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # 117 tests, no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```

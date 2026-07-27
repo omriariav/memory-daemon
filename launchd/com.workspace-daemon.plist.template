@@ -19,17 +19,17 @@
     <array>
         <string>__PYTHON__</string>
         <string>__REPO_DIR__/daemon.py</string>
-        <string>run</string>
+        <string>tick</string>
     </array>
 
     <key>WorkingDirectory</key>
     <string>__REPO_DIR__</string>
 
     <key>StartInterval</key>
-    <integer>3600</integer>
+    <integer>900</integer>
 
     <key>RunAtLoad</key>
-    <true/>
+    <false/>
 
     <key>StandardOutPath</key>
     <string>__REPO_DIR__/logs/launchd.out.log</string>
