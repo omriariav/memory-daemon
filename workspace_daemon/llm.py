@@ -15,6 +15,7 @@ def _source_header_lines(item):
         display_name = meta.get("gchat_space_display_name", "")
         space_type = meta.get("gchat_space_type", "")
         members = meta.get("gchat_space_members") or []
+        member_count = meta.get("gchat_space_member_count")
         participants = meta.get("gchat_participants") or []
 
         lines.append("Source: Google Chat")
@@ -29,10 +30,16 @@ def _source_header_lines(item):
         # large named room, the roster costs tokens without adding useful
         # context, so provide only its size.
         if members:
-            if space_type in {"DIRECT_MESSAGE", "GROUP_CHAT"} or len(members) <= 12:
+            if (
+                space_type == "DIRECT_MESSAGE"
+                or (space_type == "GROUP_CHAT" and len(members) <= 20)
+                or len(members) <= 12
+            ):
                 lines.append(f"Members: {', '.join(members)}")
             else:
                 lines.append(f"Member count: {len(members)}")
+        elif member_count:
+            lines.append(f"Member count: {member_count}")
         if participants:
             lines.append(f"Participants in supplied messages: {', '.join(participants)}")
         if meta.get("message_count") is not None:

@@ -221,6 +221,7 @@ class PromptBuildTest(StoreFixture):
                 "gchat_space_display_name": "",
                 "gchat_space_type": "DIRECT_MESSAGE",
                 "gchat_space_members": ["Jane Doe", "Omri Ariav"],
+                "gchat_space_member_count": 2,
                 "gchat_participants": ["Jane Doe"],
                 "message_count": 1,
             },
@@ -232,6 +233,30 @@ class PromptBuildTest(StoreFixture):
         self.assertIn("Members: Jane Doe, Omri Ariav", prompt)
         self.assertIn("Participants in supplied messages: Jane Doe", prompt)
         self.assertIn("Messages in supplied window: 1", prompt)
+
+    def test_build_prompt_uses_count_for_large_gchat_space(self):
+        self.override()
+        routine = self.routine(instruction_from_connector="slack")
+        item = {
+            "source_kind": "gchat",
+            "title": "An active slice",
+            "date": "2026-07-27",
+            "body": "Jane Doe: A material update.",
+            "frontmatter": {
+                "gchat_space": "spaces/LARGE",
+                "gchat_space_display_name": "Large room",
+                "gchat_space_type": "SPACE",
+                "gchat_space_members": [],
+                "gchat_space_member_count": 250,
+                "gchat_participants": ["Jane Doe"],
+                "message_count": 1,
+            },
+        }
+        with mock.patch.object(connector_prompts, "log"):
+            prompt = llm.build_prompt(routine, item, [])
+        self.assertIn("Space: Large room", prompt)
+        self.assertIn("Member count: 250", prompt)
+        self.assertNotIn("Members:", prompt)
 
 
 if __name__ == "__main__":

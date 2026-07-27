@@ -76,6 +76,26 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(
             item["frontmatter"]["gchat_space_members"], ["Jane Doe", "John Smith"]
         )
+        self.assertEqual(item["frontmatter"]["gchat_space_member_count"], 2)
+
+    def test_large_space_keeps_count_without_copying_roster_into_item(self):
+        cand = self._candidate()
+        members = [
+            {"user": f"users/{index}", "display_name": f"Person {index}"}
+            for index in range(25)
+        ]
+        space = {
+            "name": "spaces/AAA",
+            "display_name": "Large room",
+            "type": "SPACE",
+        }
+        with mock.patch.object(
+            gchat_source, "_gws",
+            side_effect=lambda args: space if args[1] == "get-space" else members,
+        ):
+            item = gchat_source.fetch({}, cand)
+        self.assertEqual(item["frontmatter"]["gchat_space_members"], [])
+        self.assertEqual(item["frontmatter"]["gchat_space_member_count"], 25)
 
     def test_member_lookup_failure_keeps_ids(self):
         cand = self._candidate()

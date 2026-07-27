@@ -31,6 +31,7 @@ import subprocess
 from .shell import log
 
 GWS = "gws"
+MAX_CONTEXT_MEMBERS = 20
 _member_cache = {}
 _space_cache = {}
 
@@ -139,6 +140,13 @@ def fetch(routine, candidate):
     member_context = _member_context(raw["space"])
     space_context = _space_context(raw["space"])
     names = member_context["names"]
+    members = member_context["members"]
+    space_type = space_context.get("type", "")
+    context_members = (
+        members
+        if space_type == "DIRECT_MESSAGE" or len(members) <= MAX_CONTEXT_MEMBERS
+        else []
+    )
 
     lines = [f"{names.get(m.get('sender'), m.get('sender', '?'))}: {m.get('text', '')}"
              for m in msgs if (m.get("text") or "").strip()]
@@ -155,8 +163,9 @@ def fetch(routine, candidate):
         "frontmatter": {
             "gchat_space": raw["space"],
             "gchat_space_display_name": space_context.get("display_name", ""),
-            "gchat_space_type": space_context.get("type", ""),
-            "gchat_space_members": member_context["members"],
+            "gchat_space_type": space_type,
+            "gchat_space_members": context_members,
+            "gchat_space_member_count": len(members),
             "gchat_thread": raw["source_id"],
             "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
                                           for m in msgs}),
