@@ -76,11 +76,12 @@ def slack(method: str, params: Optional[Dict] = None) -> Dict:
     result = subprocess.run(
         [
             "curl", "-sS", "-X", "POST", url,
-            "-H", f"Authorization: Bearer {token()}",
+            "-H", "@-",
         ],
         capture_output=True,
         text=True,
         timeout=30,
+        input=f"Authorization: Bearer {token()}\n",
     )
     if result.returncode != 0:
         die(f"curl failed: {result.stderr.strip()[:200]}")
@@ -102,6 +103,11 @@ def parse_since(args: List[str]) -> Optional[str]:
     """Translate ``--since`` or ``--hours`` to Slack's oldest timestamp."""
     if "--since" in args:
         raw = args[args.index("--since") + 1]
+        if raw.endswith("Z"):
+            # Python 3.9's fromisoformat does not accept the standard UTC
+            # suffix; +00:00 has the same meaning and works on every supported
+            # Python version.
+            raw = raw[:-1] + "+00:00"
         value = datetime.fromisoformat(raw)
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
@@ -129,6 +135,39 @@ def simplify_message(message: Dict, channel: str) -> Dict:
             f"{message.get('thread_ts') or message.get('ts')}"
         ),
     }
+
+
+def paged_messages(
+    method: str,
+    params: Dict,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """Read cursor-paginated Slack messages up to an optional total cap."""
+    if limit is not None and limit < 1:
+        die("message limit must be a positive integer")
+
+    messages = []
+    cursor = None
+    seen_cursors = set()
+    while limit is None or len(messages) < limit:
+        request = dict(params)
+        request["limit"] = min(200, limit - len(messages)) if limit else 200
+        if cursor:
+            request["cursor"] = cursor
+        data = slack(method, request)
+        page = data.get("messages") or []
+        messages.extend(page)
+
+        cursor = (
+            data.get("response_metadata", {}).get("next_cursor") or None
+        )
+        if not cursor:
+            break
+        if cursor in seen_cursors:
+            die(f"{method} returned a repeated pagination cursor")
+        seen_cursors.add(cursor)
+
+    return messages[:limit] if limit is not None else messages
 
 
 def cmd_auth_test(_args: List[str]) -> None:
@@ -178,39 +217,40 @@ def cmd_history(args: List[str]) -> None:
     channel = args[0]
     oldest = parse_since(args)
     limit = int(opt(args, "--limit", 50))
-    data = slack(
+    messages = paged_messages(
         "conversations.history",
-        {"channel": channel, "limit": limit, "oldest": oldest},
+        {"channel": channel, "oldest": oldest},
+        limit=limit,
     )
-    messages = [
+    simplified = [
         simplify_message(message, channel)
-        for message in data.get("messages", [])
+        for message in messages
     ]
     out({
         "ok": True,
         "channel": channel,
-        "count": len(messages),
-        "messages": messages,
+        "count": len(simplified),
+        "messages": simplified,
     })
 
 
 def cmd_replies(args: List[str]) -> None:
     channel, thread_ts = args[0], args[1]
-    data = slack(
+    messages = paged_messages(
         "conversations.replies",
-        {"channel": channel, "ts": thread_ts, "limit": 200},
+        {"channel": channel, "ts": thread_ts},
     )
-    messages = [
+    simplified = [
         simplify_message(message, channel)
-        for message in data.get("messages", [])
+        for message in messages
     ]
     out({
         "ok": True,
         "channel": channel,
         "thread_ts": thread_ts,
-        "count": len(messages),
+        "count": len(simplified),
         "source_id": f"slack:{channel}:{thread_ts}",
-        "messages": messages,
+        "messages": simplified,
     })
 
 

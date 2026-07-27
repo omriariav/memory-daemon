@@ -43,7 +43,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
         <key>GEMINI_API_KEY</key>
         <string>REPLACE_ME</string>
     </dict>

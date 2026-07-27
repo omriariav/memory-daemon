@@ -20,7 +20,7 @@ Gmail matches can additionally be triaged (label / mark read / unstar / archive)
 may own one source or combine several transports under one domain prompt.
 
 ```
-source (gws / built-in Slack client) ──▶ LLM (yoetz) ──▶ vault note or memory
+source (gws / built-in Slack client) ──▶ LLM (yoetz) ──▶ vault note and/or memory
                                                     ──▶ ledger and triage
 ```
 
@@ -68,13 +68,16 @@ The Slack client is included in this repository. Put its user token in
 
 ```json
 {
-  "user_token": "xoxp-replace-me"
+  "user_token": "xoxp-replace-me",
+  "mention_user": "person@example.com"
 }
 ```
 
 Keep that file private (`chmod 600`). Set `MEMORY_DAEMON_SLACK_CONFIG` to use a
-different path. The optional mentions integration shells out to `ada`; ordinary
-channel, DM, and group-DM reads do not.
+different path. `mention_user` is optional; when omitted, the client resolves
+the authenticated user's email and therefore needs `users:read` and
+`users:read.email`. The optional mentions integration shells out to `ada`;
+ordinary channel, DM, and group-DM reads do not.
 
 `gws` and `yoetz` are found on `PATH`. To pin them explicitly (useful under
 launchd, which does not inherit a login shell's `PATH`):
