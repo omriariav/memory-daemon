@@ -66,10 +66,11 @@ def candidates(source):
             sid = m.get("source_id")
             if not sid:
                 continue
-            latest[sid] = max(latest.get(sid, ""), m.get("ts") or "")
+            anchor = sid.split(":")[-1]
+            latest[sid] = max(latest.get(sid, ""), m.get("ts") or anchor)
             if sid not in seen:
                 seen[sid] = {"title": (m.get("text") or "")[:90], "raw": {
-                    "channel": m["channel_id"], "anchor": sid.split(":")[-1],
+                    "channel": m["channel_id"], "anchor": anchor,
                     "source_id": sid, "via_mention": True}}
 
     # Candidate ids are version-aware (anchor@latest_ts): a thread that gained
