@@ -1,0 +1,157 @@
+"""Hybrid Ada/private Slack digest behavior."""
+import unittest
+from unittest import mock
+
+from workspace_daemon import config, slack_source
+
+
+class AdaDigestTest(unittest.TestCase):
+    SUMMARY = {
+        "success": True,
+        "channel_name": "public-project",
+        "message_count": 100,
+        "time_period": "last 30 days",
+        "active_users": [],
+        "important_links": ["https://example.test/spec"],
+        "key_threads": [{
+            "permalink": "https://example.test/thread",
+            "reply_count": 3,
+            "text_preview": "Decision with context",
+            "timestamp": "1783922952.468549",
+            "user": "Ada User",
+        }],
+        "top_messages": [{
+            "permalink": "https://example.test/message",
+            "reply_count": 0,
+            "text": "API token: super-secret",
+            "timestamp": "1784700404.877219",
+            "user": "Another User",
+        }],
+    }
+
+    def test_public_channel_becomes_one_timestamped_curated_candidate(self):
+        with mock.patch.object(
+            slack_source, "_ada_summary", return_value=self.SUMMARY
+        ), mock.patch.object(slack_source, "utc_now_iso", return_value="2026-07-27T12:00:00Z"):
+            candidates = slack_source.candidates({
+                "ada_channels": ["CPUBLIC"],
+                "ada_days": 30,
+            })
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(
+            candidate["raw"]["source_id"],
+            "slack:CPUBLIC:digest:2026-07-27",
+        )
+        item = slack_source.fetch({}, candidate)
+        self.assertEqual(item["frontmatter"]["slack_capture_mode"], "ada-channel-summary")
+        self.assertTrue(item["frontmatter"]["message_limit_reached"])
+        self.assertIn("[2026-", item["body"])
+        self.assertIn("[REDACTED]", item["body"])
+        self.assertNotIn("super-secret", item["body"])
+
+
+class PrivateDigestTest(unittest.TestCase):
+    HISTORY = {
+        "ok": True,
+        "messages": [
+            {
+                "source_id": "slack:CPRIVATE:1784700460.0",
+                "ts": "1784700460.0",
+                "user": "U2",
+                "text": "activation code: 123456",
+                "reply_count": 0,
+            },
+            {
+                "source_id": "slack:CPRIVATE:1784700404.0",
+                "ts": "1784700404.0",
+                "user": "U1",
+                "text": "root",
+                "reply_count": 1,
+            },
+        ],
+    }
+
+    def test_private_messages_are_grouped_by_day_and_threads_expanded(self):
+        with mock.patch.object(
+            slack_source, "_cli", return_value=self.HISTORY
+        ):
+            candidates = slack_source.candidates({
+                "private_channels": ["CPRIVATE"],
+                "hours": 720,
+                "max_results": 100,
+            })
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertIn(":digest:", candidate["raw"]["source_id"])
+
+        thread = {
+            "ok": True,
+            "messages": [
+                {"ts": "1784700404.0", "user": "U1", "text": "root"},
+                {"ts": "1784700410.0", "user": "U2", "text": "reply"},
+            ],
+        }
+        whois = {
+            "ok": True,
+            "users": {
+                "U1": {"real_name": "One"},
+                "U2": {"real_name": "Two"},
+            },
+        }
+        with mock.patch.object(
+            slack_source, "_cli", side_effect=[thread, whois]
+        ):
+            item = slack_source.fetch({}, candidate)
+        self.assertEqual(item["frontmatter"]["message_count"], 3)
+        self.assertEqual(
+            item["frontmatter"]["slack_capture_mode"],
+            "private-daily-digest",
+        )
+        self.assertIn("One: root", item["body"])
+        self.assertIn("Two: reply", item["body"])
+        self.assertIn("[REDACTED]", item["body"])
+        self.assertNotIn("123456", item["body"])
+
+
+class HybridValidationTest(unittest.TestCase):
+    def routine(self, source):
+        return {
+            "id": "hybrid",
+            "source": source,
+            "analyze": {
+                "provider": "gemini",
+                "model": "model",
+                "instruction": "Keep durable decisions and commitments only.",
+            },
+            "memory": {"store": "/tmp/memory", "type": "note"},
+        }
+
+    def test_explicit_public_and_private_lists_are_valid(self):
+        problems = config.validate(self.routine({
+            "kind": "slack",
+            "ada_channels": ["CPUBLIC"],
+            "private_channels": ["CPRIVATE"],
+            "ada_days": 30,
+        }))
+        self.assertEqual(problems, [])
+
+    def test_same_channel_cannot_use_both_ingestion_paths(self):
+        problems = config.validate(self.routine({
+            "kind": "slack",
+            "ada_channels": ["CSAME"],
+            "private_channels": ["CSAME"],
+        }))
+        self.assertTrue(any("appears in both" in problem for problem in problems))
+
+    def test_ada_days_range_is_validated(self):
+        problems = config.validate(self.routine({
+            "kind": "slack",
+            "ada_channels": ["CPUBLIC"],
+            "ada_days": 91,
+        }))
+        self.assertTrue(any("ada_days" in problem for problem in problems))
+
+
+if __name__ == "__main__":
+    unittest.main()

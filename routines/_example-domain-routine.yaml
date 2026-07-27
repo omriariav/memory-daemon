@@ -18,14 +18,20 @@ sources:
     actions: [apply_label]
 
   - kind: slack
-    channels: [C0123EXAMPLE]
+    # Public channels use Ada's curated channel summary. Private channels use
+    # the daemon's user token and are batched into one timestamped digest per
+    # channel/day before Yoetz analyzes them.
+    ada_channels: [C0123PUBLIC]
+    private_channels: [C0456PRIVATE]
     hours: 26
-    max_results: 30
+    ada_days: 2
+    max_results: 500
 
   - kind: gchat
     spaces: [spaces/AAAAEXAMPLE]
     hours: 26
     max_results: 50
+    batch_unthreaded: daily
 
 label: Product Area
 

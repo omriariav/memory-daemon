@@ -49,6 +49,27 @@ class CandidatesTest(unittest.TestCase):
                                return_value={"count": 0, "messages": None}):
             self.assertEqual(gchat_source.candidates({"spaces": ["spaces/AAA"]}), [])
 
+    def test_daily_batches_unthreaded_messages_but_keeps_real_threads(self):
+        messages = {"messages": [
+            msg("t1", "2026-07-27T08:00:00Z", "thread root"),
+            msg("t1", "2026-07-27T09:00:00Z", "thread reply"),
+            msg("solo1", "2026-07-27T10:00:00Z", "first sentence"),
+            msg("solo2", "2026-07-27T10:01:00Z", "second sentence"),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_unthreaded": "daily",
+            })
+        by_sid = {candidate["raw"]["source_id"]: candidate for candidate in out}
+        self.assertEqual(
+            set(by_sid),
+            {"gchat:AAA:t1", "gchat:AAA:day:2026-07-27"},
+        )
+        digest = by_sid["gchat:AAA:day:2026-07-27"]
+        self.assertEqual(len(digest["raw"]["messages"]), 2)
+        self.assertTrue(digest["id"].endswith("@2026-07-27T10:01:00Z"))
+
 
 class FetchTest(unittest.TestCase):
     def setUp(self):
@@ -70,8 +91,13 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(item["source_id"], "gchat:AAA:t1")
         self.assertIn("Jane Doe: first", item["body"])
         self.assertIn("John Smith: reply", item["body"])
+        self.assertIn("[2026-07-27T08:00:00Z]", item["body"])
         self.assertEqual(item["date"], "2026-07-27")
         self.assertEqual(item["frontmatter"]["message_count"], 2)
+        self.assertEqual(
+            item["frontmatter"]["latest_message_at"],
+            "2026-07-27T09:00:00Z",
+        )
         self.assertEqual(item["frontmatter"]["gchat_space_type"], "DIRECT_MESSAGE")
         self.assertEqual(
             item["frontmatter"]["gchat_space_members"], ["Jane Doe", "John Smith"]
@@ -109,6 +135,26 @@ class FetchTest(unittest.TestCase):
         with mock.patch.object(gchat_source, "_gws", return_value=MEMBERS):
             item = gchat_source.fetch({}, cand)
         self.assertEqual(memory_sink.source_id_for(item), "gchat:AAA:t1")
+
+    def test_redacts_verification_code_before_rendering(self):
+        messages = {"messages": [
+            msg(
+                "t1",
+                "2026-07-27T08:00:00Z",
+                "Account verification code: 29423921",
+            ),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            candidate = gchat_source.candidates({"spaces": ["spaces/AAA"]})[0]
+        with mock.patch.object(
+            gchat_source,
+            "_gws",
+            side_effect=lambda args: SPACE if args[1] == "get-space" else MEMBERS,
+        ):
+            item = gchat_source.fetch({}, candidate)
+        self.assertNotIn("29423921", item["title"])
+        self.assertNotIn("29423921", item["body"])
+        self.assertIn("[REDACTED]", item["body"])
 
 
 class SlackVersionedIdTest(unittest.TestCase):

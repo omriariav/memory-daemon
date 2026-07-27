@@ -331,18 +331,48 @@ def _validate_source(routine, source, prefix):
     if kind != "gmail" and action_list:
         problems.append(f"{prefix}: source.kind {kind!r} does not support Gmail actions")
     if kind == "slack":
-        channels = source.get("channels")
-        if (not channels or not isinstance(channels, list)) and not source.get("include_mentions"):
+        channel_keys = ("channels", "ada_channels", "private_channels")
+        configured = []
+        for key in channel_keys:
+            values = source.get(key)
+            if values is None:
+                continue
+            if not isinstance(values, list) or not values:
+                problems.append(f"{prefix}.{key} must be a non-empty list")
+                continue
+            if not all(isinstance(value, str) and value for value in values):
+                problems.append(f"{prefix}.{key} entries must be channel ID strings")
+                continue
+            configured.extend((key, value) for value in values)
+        if not configured and not source.get("include_mentions"):
             problems.append(
-                f"{prefix}: source.kind 'slack' needs a non-empty `channels` list "
-                f"and/or include_mentions: true"
+                f"{prefix}: source.kind 'slack' needs channels, ada_channels, "
+                "private_channels, and/or include_mentions: true"
             )
+        owners = {}
+        for key, channel in configured:
+            previous = owners.setdefault(channel, key)
+            if previous != key:
+                problems.append(
+                    f"{prefix}: Slack channel {channel} appears in both "
+                    f"{previous} and {key}"
+                )
+        ada_days = source.get("ada_days")
+        if ada_days is not None and (
+            not isinstance(ada_days, int)
+            or isinstance(ada_days, bool)
+            or not 1 <= ada_days <= 90
+        ):
+            problems.append(f"{prefix}.ada_days must be an integer from 1 to 90")
     if kind == "gchat":
         spaces = source.get("spaces")
         if not spaces or not isinstance(spaces, list):
             problems.append(f"{prefix}: source.kind 'gchat' needs a non-empty `spaces` list")
         elif not all(str(s).startswith("spaces/") for s in spaces):
             problems.append(f"{prefix}: gchat spaces must be full resource names ('spaces/AAAA...')")
+        batch = source.get("batch_unthreaded")
+        if batch is not None and batch != "daily":
+            problems.append(f"{prefix}.batch_unthreaded must be 'daily' when set")
 
     expand = source.get("expand")
     if expand is not None:
