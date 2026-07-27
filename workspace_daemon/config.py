@@ -176,9 +176,12 @@ def validate(routine):
         problems.append(f"{rid}: source.max_results must be a positive integer")
 
     analyze = routine.get("analyze", {})
-    for key in ("provider", "model", "instruction"):
+    for key in ("provider", "model"):
         if not analyze.get(key):
             problems.append(f"{rid}: analyze.{key} is required")
+    # The instruction may be inline or sourced from a store connector body.
+    from . import connector_prompts
+    problems.extend(connector_prompts.validate(routine))
     tokens = analyze.get("max_output_tokens", 4096)
     if not isinstance(tokens, int) or tokens < 1:
         problems.append(f"{rid}: analyze.max_output_tokens must be a positive integer")

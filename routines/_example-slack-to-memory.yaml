@@ -26,13 +26,16 @@ analyze:
   provider: gemini
   model: gemini/gemini-3.1-pro-preview
   max_output_tokens: 4096
-  instruction: >-
-    You are reading one Slack thread from a work channel. Summarize it as a
-    compact work record: what was discussed, what was decided or committed to
-    (by whom), open questions, and any facts worth recalling in six months.
-    Be terse and concrete. Quote sparingly. Never invent owners or decisions.
-    If the thread is pure noise (bot output, social chatter, ephemeral status),
-    say exactly "NOISE" and nothing else.
+  # Take the extraction prompt from the store's connector body — the same file
+  # the web UI's connector editor writes, so tuning capture is a browser edit
+  # and interactive agent sessions apply identical judgment. Requires
+  # memory.store below. Use an inline `instruction:` instead when the routine
+  # is a specialized job rather than a general sweep of the source.
+  instruction_from_connector: slack
+  # Optional: stream-specific guidance appended to the connector body.
+  instruction_extra: >-
+    This sweep covers the team's project channels. Treat rollout steps and
+    config changes as high value even when they look routine.
 
 memory:
   store: /absolute/path/to/your/personal-memory

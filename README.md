@@ -25,6 +25,30 @@ source (gws / slack-cli) ──▶ LLM (yoetz) ──▶ vault note and/or memor
 
 See `routines/_example-slack-to-memory.yaml` for the Slack→memory shape.
 
+### Where the extraction prompt lives
+
+A routine's `analyze.instruction` can be written inline, or sourced from the
+memory store's connector file:
+
+```yaml
+analyze:
+  instruction_from_connector: slack   # <store>/memory/connectors/slack.md,
+                                      # falling back to <store>/connectors/slack.md
+  instruction_extra: >-               # optional, appended to it
+    Stream-specific guidance for this routine.
+```
+
+The connector body *is* the extraction prompt ("what is memory-worthy in
+Slack"), and personal-memory's web UI edits exactly that file — so prompt
+tuning is a browser edit that the next run picks up, with no config change, and
+interactive agent sessions reading the same connector apply identical judgment.
+
+Use it for **general sweeps of a source**. Keep an inline `instruction` when the
+routine is a **specialized job** on that source (mining a recurring report,
+restructuring meeting transcripts) — the store holds one prompt per source, not
+one per job. Missing connector, unreadable file, or a stub body fails at
+`daemon.py validate` rather than mid-run.
+
 The ledger is keyed by source item id, so an item is summarized once however
 broad the query or however often the daemon runs. It is written before triage
 and updated after it, which is what makes both halves recoverable — see

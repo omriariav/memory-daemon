@@ -1,4 +1,5 @@
 """LLM analysis over the `yoetz` CLI, plus label extraction/validation."""
+from .connector_prompts import resolve_instruction
 from .shell import run_json, yoetz_bin
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
@@ -13,7 +14,7 @@ def build_prompt(routine, item, label_catalog):
     if domains:
         parts.append(f"Focus domains: {', '.join(domains)}")
 
-    parts.append(f"\nInstruction: {analyze['instruction']}")
+    parts.append(f"\nInstruction: {resolve_instruction(routine)}")
 
     meta = item.get("frontmatter", {})
     header_lines = [f"Title: {item.get('title', '')}", f"Date: {item.get('date', '')}"]
