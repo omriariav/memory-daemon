@@ -22,11 +22,17 @@ MEMBERS = [
     {"user": "users/1", "display_name": "Jane Doe"},
     {"user": "users/2", "display_name": "John Smith"},
 ]
+SPACE = {
+    "name": "spaces/AAA",
+    "display_name": "",
+    "type": "DIRECT_MESSAGE",
+}
 
 
 class CandidatesTest(unittest.TestCase):
     def setUp(self):
         gchat_source._member_cache.clear()
+        gchat_source._space_cache.clear()
 
     def test_groups_by_thread_with_versioned_ids(self):
         with mock.patch.object(gchat_source, "_gws", return_value=MESSAGES):
@@ -47,6 +53,7 @@ class CandidatesTest(unittest.TestCase):
 class FetchTest(unittest.TestCase):
     def setUp(self):
         gchat_source._member_cache.clear()
+        gchat_source._space_cache.clear()
 
     def _candidate(self):
         with mock.patch.object(gchat_source, "_gws", return_value=MESSAGES):
@@ -55,13 +62,20 @@ class FetchTest(unittest.TestCase):
 
     def test_renders_conversation_with_names(self):
         cand = self._candidate()
-        with mock.patch.object(gchat_source, "_gws", return_value=MEMBERS):
+        with mock.patch.object(
+            gchat_source, "_gws",
+            side_effect=lambda args: SPACE if args[1] == "get-space" else MEMBERS,
+        ):
             item = gchat_source.fetch({}, cand)
         self.assertEqual(item["source_id"], "gchat:AAA:t1")
         self.assertIn("Jane Doe: first", item["body"])
         self.assertIn("John Smith: reply", item["body"])
         self.assertEqual(item["date"], "2026-07-27")
         self.assertEqual(item["frontmatter"]["message_count"], 2)
+        self.assertEqual(item["frontmatter"]["gchat_space_type"], "DIRECT_MESSAGE")
+        self.assertEqual(
+            item["frontmatter"]["gchat_space_members"], ["Jane Doe", "John Smith"]
+        )
 
     def test_member_lookup_failure_keeps_ids(self):
         cand = self._candidate()

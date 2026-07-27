@@ -208,6 +208,31 @@ class PromptBuildTest(StoreFixture):
         self.assertIn("Focus domains: Tracking", prompt)
         self.assertIn("conversation", prompt)
 
+    def test_build_prompt_embeds_gchat_space_context(self):
+        self.override()
+        routine = self.routine(instruction_from_connector="slack")
+        item = {
+            "source_kind": "gchat",
+            "title": "An active slice",
+            "date": "2026-07-27",
+            "body": "Jane Doe: We decided to proceed.",
+            "frontmatter": {
+                "gchat_space": "spaces/DM1",
+                "gchat_space_display_name": "",
+                "gchat_space_type": "DIRECT_MESSAGE",
+                "gchat_space_members": ["Jane Doe", "Omri Ariav"],
+                "gchat_participants": ["Jane Doe"],
+                "message_count": 1,
+            },
+        }
+        with mock.patch.object(connector_prompts, "log"):
+            prompt = llm.build_prompt(routine, item, [])
+        self.assertIn("Source: Google Chat", prompt)
+        self.assertIn("Conversation type: DIRECT_MESSAGE", prompt)
+        self.assertIn("Members: Jane Doe, Omri Ariav", prompt)
+        self.assertIn("Participants in supplied messages: Jane Doe", prompt)
+        self.assertIn("Messages in supplied window: 1", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
