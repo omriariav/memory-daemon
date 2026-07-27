@@ -1,7 +1,8 @@
 # Example: sweep Slack channels + @mentions into a personal-memory store.
 #
-# Requires two local tools (both token-on-disk, headless-safe):
-#   - slack-cli   (read-only Slack Web API wrapper; set $SLACK_CLI to its path)
+# Requires:
+#   - the built-in read-only Slack client configured at
+#     ~/.config/memory-daemon/slack.json
 #   - a personal-memory instance (github.com/vladimanaev/personal-memory)
 #
 # A `memory:` block can be added to ANY routine (gmail/drive ones too); the
