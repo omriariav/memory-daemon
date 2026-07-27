@@ -12,6 +12,20 @@ enabled: true
 # Shown by `daemon.py list`.
 description: One line about what this routine scoops.
 
+# Optional cadence for `daemon.py tick`. Default: 4h. Manual `run` ignores it.
+schedule:
+  every: 4h
+
+# Optional ownership controls. Specific routines beat `fallback: true`; lower
+# priority wins between routines in the same class. Equal priority is an error.
+# routing:
+#   priority: 100
+#   fallback: false
+
+# Use `source:` for one transport. A domain routine can instead use `sources:`
+# with a list of Gmail / Drive / Slack / Google Chat blocks. In that form,
+# Gmail actions live inside the Gmail source block. See
+# `_example-domain-routine.yaml`.
 source:
   # 'gmail' (Gmail search) or 'drive_docs' (Drive file search).
   kind: gmail

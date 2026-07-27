@@ -116,14 +116,17 @@ def render(routine, item, summary, label):
     frontmatter = {
         "kind": routine["output"].get("kind", "email-scoop-summary"),
         "rule_id": routine["id"],
-        "source": routine["source"]["kind"],
+        "source": item.get(
+            "source_kind",
+            (routine.get("source") or {}).get("kind", "unknown"),
+        ),
         # Source-agnostic identity. target_path() reads this back to tell "my own
         # note from an interrupted run" apart from "a different item, same stem".
         "item_id": str(item["id"]),
     }
     frontmatter.update(item.get("frontmatter", {}))
     frontmatter["focus_domains"] = routine["analyze"].get("focus_domains") or []
-    if routine["source"]["kind"] == "gmail":
+    if frontmatter["source"] == "gmail":
         # Kept unconditionally for Gmail routines (including as an explicit null)
         # so the existing vault frontmatter shape does not change.
         frontmatter["gmail_label_applied"] = label

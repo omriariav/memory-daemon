@@ -5,7 +5,8 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
 
   daemon.py list                       show routines, enabled state, last run
   daemon.py validate                   check all routine YAML
-  daemon.py run [--routine ID] [-n]    process new matches (-n / --dry-run: no side effects)
+  daemon.py run [--routine ID] [-n]    process new matches now
+  daemon.py tick [-n]                  process only routines whose cadence is due
   daemon.py new                        interactive scaffold for a new routine
 """
 import argparse
@@ -40,12 +41,16 @@ def cmd_list(args):
         print("no routines defined — run `daemon.py new` to scaffold one")
         return 0
     width = max(len(r["id"]) for r in routines)
-    print(f"{'ROUTINE'.ljust(width)}  {'ENABLED':<8}  {'LAST RUN':<21}  DESCRIPTION")
+    print(
+        f"{'ROUTINE'.ljust(width)}  {'ENABLED':<8}  {'EVERY':<7}  "
+        f"{'LAST RUN':<21}  DESCRIPTION"
+    )
     for r in routines:
         enabled = "yes" if r.get("enabled", True) else "no"
+        every = (r.get("schedule") or {}).get("every", config.DEFAULT_SCHEDULE)
         last = state.last_run(BASE_DIR, r["id"]) or "never"
         desc = r.get("description", "")
-        print(f"{r['id'].ljust(width)}  {enabled:<8}  {last:<21}  {desc}")
+        print(f"{r['id'].ljust(width)}  {enabled:<8}  {every:<7}  {last:<21}  {desc}")
     return 0
 
 
@@ -78,7 +83,9 @@ def cmd_validate(args):
 
 def cmd_run(args):
     set_log_file(LOG_FILE)
-    routines = config.discover(BASE_DIR, args.routine)
+    routines = config.discover(BASE_DIR)
+    if args.routine and args.routine not in {r["id"] for r in routines}:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
@@ -88,8 +95,11 @@ def cmd_run(args):
     mode = " (dry-run — no LLM call, no Gmail mutation, no file write)" if args.dry_run else ""
     log(f"run start: {len(routines)} routine(s){mode}")
     try:
-        totals = runner.run(BASE_DIR, routines, dry_run=args.dry_run,
-                            refresh_labels=args.refresh_labels)
+        active_ids = {args.routine} if args.routine else None
+        totals = runner.run(
+            BASE_DIR, routines, dry_run=args.dry_run,
+            refresh_labels=args.refresh_labels, active_ids=active_ids,
+        )
     except state.AlreadyRunning as exc:
         # Not an error: launchd firing while a long run is still going is
         # expected, and the next interval will pick the work up.
@@ -114,6 +124,44 @@ def cmd_run(args):
             f"(retried automatically next run)"
         )
     log(f"run done: {summary}")
+    return 1 if totals["errors"] else 0
+
+
+def cmd_tick(args):
+    """Run enabled routines whose individual cadence has elapsed."""
+    set_log_file(LOG_FILE)
+    routines = config.discover(BASE_DIR)
+    problems = [p for r in routines for p in config.validate(r)]
+    if problems:
+        for p in problems:
+            print(f"invalid routine: {p}", file=sys.stderr)
+        return 1
+
+    schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
+    due = [
+        r for r in routines
+        if r.get("enabled", True) and schedule.due(r)
+    ]
+    if not due:
+        log("tick: no routines due")
+        return 0
+
+    due_ids = {r["id"] for r in due}
+    mode = " (dry-run)" if args.dry_run else ""
+    log(f"tick: due={', '.join(sorted(due_ids))}{mode}")
+    try:
+        totals = runner.run(
+            BASE_DIR, routines, dry_run=args.dry_run,
+            refresh_labels=args.refresh_labels, active_ids=due_ids,
+        )
+    except state.AlreadyRunning as exc:
+        log(f"tick skipped — {exc}")
+        return 0
+    schedule.mark_attempted(due_ids)
+    log(
+        f"tick done: {totals['processed']} processed, "
+        f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
+    )
     return 1 if totals["errors"] else 0
 
 
@@ -214,6 +262,19 @@ def main(argv=None):
     p_run.add_argument("--refresh-labels", action="store_true",
                        help="refetch the Gmail label catalog instead of using the cache")
     p_run.set_defaults(func=cmd_run)
+
+    p_tick = sub.add_parser(
+        "tick", help="run only enabled routines whose schedule is due"
+    )
+    p_tick.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="preview due routines without LLM calls, writes, or schedule updates",
+    )
+    p_tick.add_argument(
+        "--refresh-labels", action="store_true",
+        help="refetch the Gmail label catalog instead of using the cache",
+    )
+    p_tick.set_defaults(func=cmd_tick)
 
     # launchd sends SIGTERM on unload, logout, or timeout. CPython installs no
     # handler for it, so the process would die without unwinding — skipping the

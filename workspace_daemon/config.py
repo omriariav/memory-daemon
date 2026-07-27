@@ -8,8 +8,11 @@ import yaml
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
 
-REQUIRED_TOP_LEVEL = ["id", "source", "analyze"]
+REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
+DEFAULT_SCHEDULE = "4h"
+_DURATION = re.compile(r"^(?P<count>[1-9]\d*)(?P<unit>[mhd])$")
+_DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
 
 
 def analyze_cfg(routine):
@@ -28,10 +31,51 @@ def configured_labels(routine):
     names = []
     if routine.get("label"):
         names.append(routine["label"])
-    for cfg in (routine.get("streams") or {}).values():
+    stream_map = routine.get("streams")
+    for cfg in stream_map.values() if isinstance(stream_map, dict) else []:
         if isinstance(cfg, dict) and cfg.get("label"):
             names.append(cfg["label"])
     return names
+
+
+def sources(routine):
+    """Return the routine's source blocks in declared order.
+
+    `source:` remains the compact, backwards-compatible form. New domain
+    routines use `sources:` to combine transports under one prompt and sink.
+    Validation rejects configurations that set both.
+    """
+    if isinstance(routine.get("sources"), list):
+        return routine["sources"]
+    source = routine.get("source")
+    return [source] if isinstance(source, dict) else []
+
+
+def source_actions(routine, source):
+    """Actions for one source block, with legacy routine-level fallback."""
+    if "actions" in source:
+        value = source.get("actions")
+        return value if isinstance(value, list) else []
+    value = routine.get("actions")
+    return value if isinstance(value, list) else []
+
+
+def schedule_seconds(routine):
+    """Configured cadence in seconds. Validation owns malformed values."""
+    every = (routine.get("schedule") or {}).get("every", DEFAULT_SCHEDULE)
+    match = _DURATION.fullmatch(str(every))
+    if not match:
+        raise RoutineError(
+            f"{routine.get('id', '<missing id>')}: schedule.every must look like "
+            f"'15m', '4h', or '1d' (got {every!r})"
+        )
+    return int(match.group("count")) * _DURATION_SECONDS[match.group("unit")]
+
+
+def routing_rank(routine):
+    """Specific routines beat fallbacks; lower explicit priority wins."""
+    routing = routine.get("routing") or {}
+    return (1 if routing.get("fallback", False) else 0, routing.get("priority", 100))
 
 
 class RoutineError(Exception):
@@ -90,92 +134,37 @@ def validate(routine):
         if key not in routine:
             problems.append(f"{rid}: missing required top-level key '{key}'")
 
-    source = routine.get("source", {})
-    kind = source.get("kind")
-    if kind not in VALID_SOURCE_KINDS:
+    has_source = "source" in routine
+    has_sources = "sources" in routine
+    if has_source and has_sources:
+        problems.append(f"{rid}: set `source` or `sources`, not both")
+    source_list = sources(routine)
+    if not has_source and not has_sources:
+        problems.append(f"{rid}: missing required top-level key 'source' or 'sources'")
+    if has_sources and (not isinstance(routine.get("sources"), list) or not source_list):
+        problems.append(f"{rid}: `sources` must be a non-empty list")
+    if has_source and not isinstance(routine.get("source"), dict):
+        problems.append(f"{rid}: `source` must be a mapping")
+    if len(source_list) > 1 and routine.get("actions"):
         problems.append(
-            f"{rid}: source.kind must be one of {', '.join(sorted(VALID_SOURCE_KINDS))} "
-            f"(got {kind!r})"
+            f"{rid}: multi-source routines put `actions` on each Gmail source block"
         )
-    if kind in ("gmail", "drive_docs") and not source.get("query"):
-        problems.append(f"{rid}: source.query is required")
-    if kind == "slack":
-        channels = source.get("channels")
-        if (not channels or not isinstance(channels, list)) and not source.get("include_mentions"):
-            problems.append(
-                f"{rid}: source.kind 'slack' needs a non-empty `channels` list "
-                f"and/or include_mentions: true"
-            )
-        if routine.get("actions"):
-            problems.append(
-                f"{rid}: source.kind 'slack' does not support actions (Gmail triage only)"
-            )
-        if analyze_cfg(routine).get("pick_label"):
-            problems.append(f"{rid}: analyze.pick_label requires source.kind 'gmail'")
-    if kind == "gchat":
-        spaces = source.get("spaces")
-        if not spaces or not isinstance(spaces, list):
-            problems.append(f"{rid}: source.kind 'gchat' needs a non-empty `spaces` list")
-        elif not all(str(s).startswith("spaces/") for s in spaces):
-            problems.append(f"{rid}: gchat spaces must be full resource names ('spaces/AAAA...')")
-        if routine.get("actions"):
-            problems.append(f"{rid}: source.kind 'gchat' does not support actions (Gmail triage only)")
-        if analyze_cfg(routine).get("pick_label"):
-            problems.append(f"{rid}: analyze.pick_label requires source.kind 'gmail'")
+    if "actions" in routine and not isinstance(routine.get("actions"), list):
+        problems.append(f"{rid}: `actions` must be a list")
 
-    expand = source.get("expand")
-    if expand is not None:
-        if kind != "gmail":
-            problems.append(f"{rid}: source.expand is only supported for source.kind 'gmail'")
-        if expand.get("kind") != "drive_doc":
-            problems.append(
-                f"{rid}: source.expand.kind must be 'drive_doc' (got {expand.get('kind')!r})"
-            )
-        pattern = expand.get("title_from_subject")
-        if not pattern:
-            problems.append(f"{rid}: source.expand.title_from_subject is required")
-        else:
-            try:
-                compiled = re.compile(pattern)
-            except re.error as exc:
-                problems.append(f"{rid}: source.expand.title_from_subject is not valid regex — {exc}")
-            else:
-                if "title" not in compiled.groupindex:
-                    problems.append(
-                        f"{rid}: source.expand.title_from_subject must contain a named "
-                        f"group (?P<title>...) — that is what gets matched against Drive"
-                    )
-        tabs = expand.get("tabs")
-        if tabs is not None and (not isinstance(tabs, list) or not tabs):
-            problems.append(f"{rid}: source.expand.tabs must be a non-empty list of tab titles")
-        on_missing = expand.get("on_missing", "body")
-        if on_missing not in ("body", "error"):
-            problems.append(
-                f"{rid}: source.expand.on_missing must be 'body' or 'error' (got {on_missing!r})"
-            )
-
-    if kind == "drive_docs":
-        tabs = source.get("tabs")
-        if tabs is not None and (not isinstance(tabs, list) or not tabs):
-            problems.append(f"{rid}: source.tabs must be a non-empty list of tab titles")
-        # Gmail triage has no meaning for a Drive file, and the label catalog
-        # the model would pick from is the mailbox's.
-        if routine.get("actions"):
-            problems.append(
-                f"{rid}: source.kind 'drive_docs' does not support actions "
-                f"(got {routine['actions']}) — use actions: []"
-            )
-        if analyze_cfg(routine).get("pick_label"):
-            problems.append(
-                f"{rid}: analyze.pick_label requires source.kind 'gmail' — "
-                f"there is no Gmail message to label"
-            )
-
-    max_results = source.get("max_results", 20)
-    if not isinstance(max_results, int) or max_results < 1:
-        problems.append(f"{rid}: source.max_results must be a positive integer")
+    source_dicts = []
+    for index, source in enumerate(source_list):
+        if not isinstance(source, dict):
+            problems.append(f"{rid}: sources[{index}] must be a mapping")
+            continue
+        source_dicts.append(source)
+        prefix = f"{rid}: source" if has_source else f"{rid}: sources[{index}]"
+        problems.extend(_validate_source(routine, source, prefix))
 
     analyze = routine.get("analyze", {})
+    if not isinstance(analyze, dict):
+        problems.append(f"{rid}: `analyze` must be a mapping")
+        analyze = {}
     for key in ("provider", "model"):
         if not analyze.get(key):
             problems.append(f"{rid}: analyze.{key} is required")
@@ -193,8 +182,15 @@ def validate(routine):
     domains = analyze.get("focus_domains")
     if domains is not None and not isinstance(domains, list):
         problems.append(f"{rid}: analyze.focus_domains must be a list")
+    if analyze.get("pick_label") and any(s.get("kind") != "gmail" for s in source_dicts):
+        problems.append(
+            f"{rid}: analyze.pick_label requires every source in the routine to be Gmail"
+        )
 
     output = routine.get("output") or {}
+    if not isinstance(output, dict):
+        problems.append(f"{rid}: `output` must be a mapping")
+        output = {}
     has_memory = isinstance(routine.get("memory"), dict)
     if not output and not has_memory:
         problems.append(f"{rid}: needs an `output:` block, a `memory:` block, or both")
@@ -230,16 +226,11 @@ def validate(routine):
                     f"every note would overwrite the same filename"
                 )
 
-    for action in routine.get("actions", []):
-        if action not in VALID_ACTIONS:
-            problems.append(
-                f"{rid}: unknown action '{action}' (valid: {', '.join(sorted(VALID_ACTIONS))})"
-            )
-
     streams = routine.get("streams")
     configured_label = bool(configured_labels(routine))
+    action_lists = [source_actions(routine, source) for source in source_dicts]
 
-    if "apply_label" in routine.get("actions", []) and not (
+    if any("apply_label" in values for values in action_lists) and not (
         analyze.get("pick_label") or configured_label
     ):
         problems.append(
@@ -268,4 +259,126 @@ def validate(routine):
                         f"{', '.join(sorted(unknown))} (valid: title, label)"
                     )
 
+    schedule = routine.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            problems.append(f"{rid}: `schedule` must be a mapping")
+        else:
+            unknown = set(schedule) - {"every"}
+            if unknown:
+                problems.append(
+                    f"{rid}: schedule has unknown key(s) {', '.join(sorted(unknown))} "
+                    f"(valid: every)"
+                )
+            try:
+                schedule_seconds(routine)
+            except RoutineError as exc:
+                problems.append(str(exc))
+
+    routing = routine.get("routing")
+    if routing is not None:
+        if not isinstance(routing, dict):
+            problems.append(f"{rid}: `routing` must be a mapping")
+        else:
+            unknown = set(routing) - {"fallback", "priority"}
+            if unknown:
+                problems.append(
+                    f"{rid}: routing has unknown key(s) {', '.join(sorted(unknown))} "
+                    f"(valid: fallback, priority)"
+                )
+            if "fallback" in routing and not isinstance(routing["fallback"], bool):
+                problems.append(f"{rid}: routing.fallback must be true or false")
+            priority = routing.get("priority", 100)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                problems.append(f"{rid}: routing.priority must be an integer")
+
+    return problems
+
+
+def _validate_source(routine, source, prefix):
+    """Validate one source block. Messages carry the source's config path."""
+    problems = []
+    kind = source.get("kind")
+    if kind not in VALID_SOURCE_KINDS:
+        problems.append(
+            f"{prefix}.kind must be one of {', '.join(sorted(VALID_SOURCE_KINDS))} "
+            f"(got {kind!r})"
+        )
+    if kind in ("gmail", "drive_docs") and not source.get("query"):
+        problems.append(f"{prefix}.query is required")
+    action_list = source_actions(routine, source)
+    if "actions" in source and not isinstance(source.get("actions"), list):
+        problems.append(f"{prefix}.actions must be a list")
+        action_list = []
+    for action in action_list:
+        if action not in VALID_ACTIONS:
+            problems.append(
+                f"{prefix}: unknown action '{action}' "
+                f"(valid: {', '.join(sorted(VALID_ACTIONS))})"
+            )
+    if kind != "gmail" and action_list:
+        problems.append(f"{prefix}: source.kind {kind!r} does not support Gmail actions")
+    if kind == "slack":
+        channels = source.get("channels")
+        if (not channels or not isinstance(channels, list)) and not source.get("include_mentions"):
+            problems.append(
+                f"{prefix}: source.kind 'slack' needs a non-empty `channels` list "
+                f"and/or include_mentions: true"
+            )
+    if kind == "gchat":
+        spaces = source.get("spaces")
+        if not spaces or not isinstance(spaces, list):
+            problems.append(f"{prefix}: source.kind 'gchat' needs a non-empty `spaces` list")
+        elif not all(str(s).startswith("spaces/") for s in spaces):
+            problems.append(f"{prefix}: gchat spaces must be full resource names ('spaces/AAAA...')")
+
+    expand = source.get("expand")
+    if expand is not None:
+        if not isinstance(expand, dict):
+            problems.append(f"{prefix}.expand must be a mapping")
+            return problems
+        if kind != "gmail":
+            problems.append(f"{prefix}.expand is only supported for source.kind 'gmail'")
+        if expand.get("kind") != "drive_doc":
+            problems.append(
+                f"{prefix}.expand.kind must be 'drive_doc' (got {expand.get('kind')!r})"
+            )
+        pattern = expand.get("title_from_subject")
+        if not pattern:
+            problems.append(f"{prefix}.expand.title_from_subject is required")
+        else:
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                problems.append(f"{prefix}.expand.title_from_subject is not valid regex — {exc}")
+            else:
+                if "title" not in compiled.groupindex:
+                    problems.append(
+                        f"{prefix}.expand.title_from_subject must contain a named "
+                        f"group (?P<title>...) — that is what gets matched against Drive"
+                    )
+        tabs = expand.get("tabs")
+        if tabs is not None and (not isinstance(tabs, list) or not tabs):
+            problems.append(f"{prefix}.expand.tabs must be a non-empty list of tab titles")
+        on_missing = expand.get("on_missing", "body")
+        if on_missing not in ("body", "error"):
+            problems.append(
+                f"{prefix}.expand.on_missing must be 'body' or 'error' (got {on_missing!r})"
+            )
+
+    if kind == "drive_docs":
+        tabs = source.get("tabs")
+        if tabs is not None and (not isinstance(tabs, list) or not tabs):
+            problems.append(f"{prefix}.tabs must be a non-empty list of tab titles")
+        # Gmail triage has no meaning for a Drive file, and the label catalog
+        # the model would pick from is the mailbox's.
+        if analyze_cfg(routine).get("pick_label"):
+            problems.append(
+                f"{prefix}: analyze.pick_label requires source.kind 'gmail' — "
+                f"there is no Gmail message to label"
+            )
+
+    max_results = source.get("max_results", 20)
+    if not isinstance(max_results, int) or max_results < 1:
+        problems.append(f"{prefix}.max_results must be a positive integer")
     return problems

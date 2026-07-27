@@ -1,0 +1,41 @@
+# A fallback may match broad source inboxes, but it loses ownership whenever a
+# specific routine also matches the same source item.
+id: periodic-inbox-sweep
+enabled: true
+description: Low-frequency memory sweep for otherwise-unowned work updates.
+
+schedule:
+  every: 1d
+
+routing:
+  fallback: true
+
+sources:
+  - kind: gmail
+    query: '{is:unread is:starred}'
+    max_results: 50
+    actions: []
+
+  - kind: slack
+    include_mentions: true
+    hours: 26
+    max_results: 50
+
+  - kind: gchat
+    spaces: [spaces/AAAAEXAMPLE]
+    hours: 26
+    max_results: 50
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction: >-
+    Keep only durable decisions, commitments, incidents, feedback, and people
+    or project facts worth recalling later. Discard logistics, notifications,
+    chatter, and pure status without a new fact.
+
+memory:
+  store: /absolute/path/to/personal-memory
+  type: note
+  tags: [periodic-sweep]
