@@ -37,6 +37,8 @@ other text, with exactly these keys:
             commitment, people signal, incident, or fact worth recalling later)
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
           incident, achievement, feedback, meeting, note
+          (use "meeting" only for an actual meeting record; an email report or
+          channel discussion is a "note", "decision", or "event")
   "title": short specific title (<= 90 chars)
   "people": array of kebab-case person slugs, ONLY from this known list: {slugs}
             (leave out anyone not on the list)
@@ -94,7 +96,9 @@ def known_person_slugs(store):
     if store in _slug_cache:
         return _slug_cache[store]
     r = _cli(store, ["slugs", "list", "--kind", "person"])
-    slugs = set(re.findall(r"^\s*([a-z0-9][a-z0-9-]+)\s", r.stdout, re.M)) if r.returncode == 0 else set()
+    # Output rows look like "   3  jane-doe  (last seen 2026-07-01)" — count first;
+    # the "(last seen" suffix distinguishes rows from the trailing summary line.
+    slugs = set(re.findall(r"^\s*\d+\s+([a-z0-9][a-z0-9-]*)\s+\(last seen ", r.stdout, re.M)) if r.returncode == 0 else set()
     _slug_cache[store] = slugs
     return slugs
 

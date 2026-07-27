@@ -20,7 +20,9 @@ place instead of duplicating.
 Slack has no equivalent of Gmail triage: `actions` are meaningless here and the
 config layer rejects them for this source kind.
 """
+import datetime
 import json
+import math
 import os
 import subprocess
 
@@ -55,7 +57,7 @@ def candidates(source):
                     "channel": channel, "anchor": sid.split(":")[-1]}}
 
     if source.get("include_mentions"):
-        d = _cli(["mentions", "--days", str(max(1, int(source.get("hours", 26)) // 24))])
+        d = _cli(["mentions", "--days", str(max(1, math.ceil(int(source.get("hours", 26)) / 24)))])
         for m in d.get("mentions", []):
             sid = m.get("source_id")
             if sid and sid not in seen:
@@ -88,7 +90,6 @@ def fetch(routine, candidate):
     lines = [f"{names.get(m.get('user'), m.get('user', '?'))}: {m.get('text', '')}"
              for m in msgs]
     root_ts = float(anchor)
-    import datetime
     date = datetime.datetime.fromtimestamp(root_ts, datetime.timezone.utc).date().isoformat()
 
     title = candidate["title"] or f"slack thread in {channel}"
