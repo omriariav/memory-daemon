@@ -10,9 +10,10 @@ Routine config:
       max_results: 50            # cap per space
 
 One `gws chat messages --after` call per space returns full message texts, so
-candidates are grouped client-side by thread — fetch does no further API calls
-beyond resolving sender display names (one `gws chat members` per space, cached
-for the run).
+candidates are grouped client-side by thread. Fetch resolves the space name,
+conversation type, and members once per space per process. `gws chat members`
+uses gws's persistent user cache for display names; this module adds a small
+in-process cache so several threads from one space do not repeat API calls.
 
 Identity has two layers (this is what keeps re-sweeps of an active thread from
 freezing at first capture — the ledger dedupes on the *candidate* id, while the
@@ -30,7 +31,9 @@ import subprocess
 from .shell import log
 
 GWS = "gws"
+MAX_CONTEXT_MEMBERS = 20
 _member_cache = {}
+_space_cache = {}
 
 
 def _gws(args, timeout=60):
@@ -86,28 +89,64 @@ def candidates(source):
     return out
 
 
-def _member_names(space):
-    """user resource -> display name for one space, cached per run."""
+def _member_context(space):
+    """Return sender-name mapping plus the space's member names, cached per run."""
     if space in _member_cache:
         return _member_cache[space]
     names = {}
+    members = []
     try:
         d = _gws(["chat", "members", space])
         rows = d if isinstance(d, list) else d.get("memberships") or d.get("members") or []
         for r in rows:
-            if r.get("user") and r.get("display_name"):
-                names[r["user"]] = r["display_name"]
+            user = r.get("user")
+            display = r.get("display_name") or r.get("email") or user
+            if user and display:
+                names[user] = display
+            if display:
+                members.append(display)
     except Exception as exc:  # cosmetic — raw user ids still identify speakers
         log(f"gchat members lookup failed for {space} ({exc}); keeping raw ids")
-    _member_cache[space] = names
-    return names
+    context = {
+        "names": names,
+        "members": sorted(set(members)),
+    }
+    _member_cache[space] = context
+    return context
+
+
+def _space_context(space):
+    """Return live space name/type metadata, cached once per process."""
+    if space in _space_cache:
+        return _space_cache[space]
+    context = {}
+    try:
+        d = _gws(["chat", "get-space", space])
+        if isinstance(d, dict):
+            context = {
+                "display_name": d.get("display_name") or "",
+                "type": d.get("type") or "",
+            }
+    except Exception as exc:  # enrichment only; messages remain processable
+        log(f"gchat space lookup failed for {space} ({exc}); keeping space id")
+    _space_cache[space] = context
+    return context
 
 
 def fetch(routine, candidate):
     """Render the thread's windowed messages as a readable conversation."""
     raw = candidate["raw"]
     msgs = raw["messages"]
-    names = _member_names(raw["space"])
+    member_context = _member_context(raw["space"])
+    space_context = _space_context(raw["space"])
+    names = member_context["names"]
+    members = member_context["members"]
+    space_type = space_context.get("type", "")
+    context_members = (
+        members
+        if space_type == "DIRECT_MESSAGE" or len(members) <= MAX_CONTEXT_MEMBERS
+        else []
+    )
 
     lines = [f"{names.get(m.get('sender'), m.get('sender', '?'))}: {m.get('text', '')}"
              for m in msgs if (m.get("text") or "").strip()]
@@ -123,6 +162,10 @@ def fetch(routine, candidate):
         "body": "\n".join(lines),
         "frontmatter": {
             "gchat_space": raw["space"],
+            "gchat_space_display_name": space_context.get("display_name", ""),
+            "gchat_space_type": space_type,
+            "gchat_space_members": context_members,
+            "gchat_space_member_count": len(members),
             "gchat_thread": raw["source_id"],
             "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
                                           for m in msgs}),
