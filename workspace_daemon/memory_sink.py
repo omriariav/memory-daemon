@@ -104,10 +104,17 @@ def known_person_slugs(store):
 
 
 def source_id_for(item):
-    """Canonical scheme:rest id from the item's provenance, or None."""
+    """Canonical scheme:rest id from the item's provenance, or None.
+
+    Sources that separate ledger identity from memory identity (slack, gchat:
+    version-aware candidate ids) set item["source_id"] explicitly — that stable
+    anchor always wins. Legacy fallbacks derive from provenance frontmatter.
+    """
+    if item.get("source_id"):
+        return item["source_id"]
     meta = item.get("frontmatter", {})
     if str(item.get("id", "")).startswith("slack:"):
-        return item["id"]
+        return item["id"].split("@")[0]
     if meta.get("gmail_thread_id"):
         return f"gmail:{meta['gmail_thread_id']}"
     if meta.get("drive_file_id"):

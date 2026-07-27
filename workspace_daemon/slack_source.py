@@ -47,25 +47,37 @@ def candidates(source):
     per_channel = int(source.get("max_results", 30))
     seen = {}
 
+    latest = {}  # thread anchor -> latest message ts seen in this sweep
+
     for channel in source.get("channels", []):
         d = _cli(["history", channel, "--hours", hours, "--limit", str(per_channel)])
         for m in d.get("messages", []):
             sid = m["source_id"]
+            latest[sid] = max(latest.get(sid, ""), m.get("ts") or "")
             if sid not in seen:
                 text = (m.get("text") or "").replace("\n", " ")
-                seen[sid] = {"id": sid, "title": text[:90], "raw": {
-                    "channel": channel, "anchor": sid.split(":")[-1]}}
+                seen[sid] = {"title": text[:90], "raw": {
+                    "channel": channel, "anchor": sid.split(":")[-1],
+                    "source_id": sid}}
 
     if source.get("include_mentions"):
         d = _cli(["mentions", "--days", str(max(1, math.ceil(int(source.get("hours", 26)) / 24)))])
         for m in d.get("mentions", []):
             sid = m.get("source_id")
-            if sid and sid not in seen:
-                seen[sid] = {"id": sid, "title": (m.get("text") or "")[:90], "raw": {
-                    "channel": m["channel_id"], "anchor": sid.split(":")[-1],
-                    "via_mention": True}}
+            if not sid:
+                continue
+            anchor = sid.split(":")[-1]
+            latest[sid] = max(latest.get(sid, ""), m.get("ts") or anchor)
+            if sid not in seen:
+                seen[sid] = {"title": (m.get("text") or "")[:90], "raw": {
+                    "channel": m["channel_id"], "anchor": anchor,
+                    "source_id": sid, "via_mention": True}}
 
-    return list(seen.values())
+    # Candidate ids are version-aware (anchor@latest_ts): a thread that gained
+    # replies since the last sweep becomes a NEW candidate, so the ledger lets
+    # it through and `memory add` updates the same stable source-id entry in
+    # place. Without this, a thread captured mid-conversation froze forever.
+    return [{"id": f"{sid}@{latest.get(sid, '')}", **c} for sid, c in seen.items()]
 
 
 def fetch(routine, candidate):
@@ -94,7 +106,8 @@ def fetch(routine, candidate):
 
     title = candidate["title"] or f"slack thread in {channel}"
     return {
-        "id": candidate["id"],  # slack:<channel>:<thread_ts> — already canonical
+        "id": candidate["id"],                       # version-aware ledger key
+        "source_id": candidate["raw"]["source_id"],  # stable memory anchor
         "title": title,
         "date": date,
         "body": "\n".join(lines),

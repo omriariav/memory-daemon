@@ -9,7 +9,7 @@ from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
 
 REQUIRED_TOP_LEVEL = ["id", "source", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack"}
+VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
 
 
 def analyze_cfg(routine):
@@ -110,6 +110,16 @@ def validate(routine):
             problems.append(
                 f"{rid}: source.kind 'slack' does not support actions (Gmail triage only)"
             )
+        if analyze_cfg(routine).get("pick_label"):
+            problems.append(f"{rid}: analyze.pick_label requires source.kind 'gmail'")
+    if kind == "gchat":
+        spaces = source.get("spaces")
+        if not spaces or not isinstance(spaces, list):
+            problems.append(f"{rid}: source.kind 'gchat' needs a non-empty `spaces` list")
+        elif not all(str(s).startswith("spaces/") for s in spaces):
+            problems.append(f"{rid}: gchat spaces must be full resource names ('spaces/AAAA...')")
+        if routine.get("actions"):
+            problems.append(f"{rid}: source.kind 'gchat' does not support actions (Gmail triage only)")
         if analyze_cfg(routine).get("pick_label"):
             problems.append(f"{rid}: analyze.pick_label requires source.kind 'gmail'")
 
