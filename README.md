@@ -203,7 +203,7 @@ routing: {fallback: true}
 sources:
   - {kind: gmail, query: '{is:unread is:starred}', actions: []}
   - {kind: slack, include_mentions: true, hours: 26}
-  - {kind: gchat, all_spaces: true, hours: 26, max_results: 0}
+  - {kind: gchat, all_spaces: true, hours: 26, max_results: 0, batch_messages: daily}
 ```
 
 Even when only the fallback is due, enabled specific routines still list their
@@ -214,6 +214,17 @@ cannot be proven; a Drive failure, for example, does not stop an unrelated Gmail
 fallback. Ownership discovery also expands lower source caps to the largest
 overlapping cap, while retaining the configured cap as that routine's processing
 budget.
+
+Broad Google Chat and Slack-mention fallbacks also exclude explicitly configured
+spaces/channels from disabled routines. This lets routines be armed one at a
+time without the fallback capturing a parked domain's traffic under the wrong
+prompt.
+
+For an hourly Google Chat fallback, `batch_messages: daily` creates one stable
+source identity per space and UTC calendar day. New messages and replies update that
+same daily memory instead of changing from a daily singleton to a separate
+thread entry. `batch_unthreaded: daily` remains available when real multi-message
+threads should retain their own stable identities.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially

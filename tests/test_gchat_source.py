@@ -78,6 +78,48 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(len(digest["raw"]["messages"]), 2)
         self.assertTrue(digest["id"].endswith("@2026-07-27T10:01:00Z"))
 
+    def test_daily_message_batch_has_one_stable_space_day_identity(self):
+        first_messages = {"messages": [
+            msg("t1", "2026-07-27T08:00:00Z", "thread root"),
+            msg("t1", "2026-07-27T09:00:00Z", "thread reply"),
+            msg("solo1", "2026-07-27T10:00:00Z", "first sentence"),
+        ]}
+        updated_messages = {"messages": [
+            *first_messages["messages"],
+            msg("solo2", "2026-07-27T10:01:00Z", "second sentence"),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", side_effect=[
+            first_messages, updated_messages,
+        ]):
+            first = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+            })[0]
+            updated = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+            })[0]
+
+        self.assertEqual(
+            first["raw"]["source_id"],
+            "gchat:AAA:day:2026-07-27",
+        )
+        self.assertEqual(first["raw"]["source_id"], updated["raw"]["source_id"])
+        self.assertNotEqual(first["id"], updated["id"])
+        self.assertEqual(len(updated["raw"]["messages"]), 4)
+        self.assertTrue(updated["id"].endswith("@2026-07-27T10:01:00Z"))
+
+    def test_daily_message_batch_drops_empty_system_messages(self):
+        messages = {"messages": [
+            msg("system", "2026-07-27T08:00:00Z", ""),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+            })
+        self.assertEqual(out, [])
+
     def test_all_spaces_uses_recent_and_groups_each_space(self):
         messages = {
             "messages": [
@@ -123,6 +165,29 @@ class CandidatesTest(unittest.TestCase):
             out = gchat_source.candidates({"all_spaces": True})
         self.assertEqual(out[0]["raw"]["space"], "spaces/AAA")
 
+    def test_all_spaces_excludes_reserved_domain_spaces(self):
+        messages = {
+            "messages": [
+                {
+                    **msg("t1", "2026-07-27T08:00:00Z", "owned"),
+                    "space": "spaces/AAA",
+                },
+                {
+                    **msg("t2", "2026-07-27T09:00:00Z", "fallback"),
+                    "space": "spaces/BBB",
+                },
+            ],
+        }
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({
+                "all_spaces": True,
+                "_exclude_spaces": ["spaces/AAA"],
+            })
+        self.assertEqual(
+            {candidate["raw"]["space"] for candidate in out},
+            {"spaces/BBB"},
+        )
+
 
 class ConfigTest(unittest.TestCase):
     @staticmethod
@@ -162,6 +227,14 @@ class ConfigTest(unittest.TestCase):
             "max_per_space": 0,
         }))
         self.assertTrue(any("requires `all_spaces: true`" in problem for problem in problems))
+
+    def test_gchat_batch_modes_are_mutually_exclusive(self):
+        problems = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_unthreaded": "daily",
+            "batch_messages": "daily",
+        }))
+        self.assertTrue(any("set batch_unthreaded or batch_messages" in p for p in problems))
 
 
 class FetchTest(unittest.TestCase):

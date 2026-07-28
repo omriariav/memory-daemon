@@ -26,6 +26,7 @@ sources:
     hours: 26
     max_results: 0        # all messages across active spaces
     max_per_space: 0      # all messages inside each active space
+    batch_messages: daily # stable space/day digest, updated as replies arrive
 
 analyze:
   provider: gemini

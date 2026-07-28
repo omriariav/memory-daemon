@@ -106,7 +106,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         for source in config.sources(routine)
     }
     claims, listing_failures = _collect_claims(
-        valid, totals, source_kinds=active_source_kinds
+        valid, totals, source_kinds=active_source_kinds,
+        routing_context=routines,
     )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
@@ -602,7 +603,7 @@ def _ownership_limit(source, sources):
     )
 
 
-def _collect_claims(routines, totals, source_kinds=None):
+def _collect_claims(routines, totals, source_kinds=None, routing_context=None):
     """List candidates for the full routing context.
 
     Every enabled routine participates for source kinds used by the active
@@ -615,6 +616,7 @@ def _collect_claims(routines, totals, source_kinds=None):
     instead of leaking into a broader fallback.
     """
     source_kinds = set(source_kinds) if source_kinds is not None else None
+    routing_context = routines if routing_context is None else routing_context
     claims = {}
     failures = []
     entries = [
@@ -624,11 +626,24 @@ def _collect_claims(routines, totals, source_kinds=None):
         if source_kinds is None or source.get("kind") in source_kinds
     ]
     all_sources = [source for _, _, source in entries]
+    context_sources = [
+        source
+        for routine in routing_context
+        for source in config.sources(routine)
+        if source_kinds is None or source.get("kind") in source_kinds
+    ]
     claimed_slack_channels = {
         channel
-        for source in all_sources
+        for source in context_sources
         if source.get("kind") == "slack"
         for channel in slack_source.configured_channels(source)
+    }
+    claimed_gchat_spaces = {
+        space
+        for source in context_sources
+        if source.get("kind") == "gchat"
+        for space in source.get("spaces", [])
+        if isinstance(space, str)
     }
 
     for routine, source_index, source in entries:
@@ -643,6 +658,15 @@ def _collect_claims(routines, totals, source_kinds=None):
             listing_source = dict(
                 source,
                 _exclude_mention_channels=sorted(claimed_slack_channels),
+            )
+        if kind == "gchat" and source.get("all_spaces"):
+            # A configured explicit space remains owned even while its domain
+            # routine is disabled or not due. The broad fallback must not race
+            # it now and create memories with the wrong prompt before that
+            # routine is armed.
+            listing_source = dict(
+                listing_source,
+                _exclude_spaces=sorted(claimed_gchat_spaces),
             )
         log(f"routine={rid} querying {kind}: {_scope(source)}")
         try:
