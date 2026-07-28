@@ -7,7 +7,7 @@ import datetime
 import re
 from contextlib import ExitStack
 
-from . import actions, config, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
+from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
 from .shell import log, utc_now_iso
 
 
@@ -30,6 +30,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     which owners may process in this invocation while still letting inactive
     domain routines protect their candidates from a due fallback sweep.
     """
+    contacts.clear_cache()
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:

@@ -94,6 +94,7 @@ class CaptureValidationTest(unittest.TestCase):
 
     def setUp(self):
         memory_sink._slug_cache.clear()
+        memory_sink.contacts.clear_cache()
         memory_sink._slug_cache["/store"] = {"jane-doe"}
         self.routine = {"id": "r", "memory": {"store": "/store", "type": "note",
                                               "extract": False}}
@@ -181,6 +182,24 @@ class CaptureValidationTest(unittest.TestCase):
         tags = calls["args"][calls["args"].index("--tags") + 1]
         self.assertIn("people-unmapped", tags)
         self.assertEqual(out["memory"], "created")
+
+    def test_directory_failure_shells_out_once_across_captures(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(
+            memory_sink.contacts,
+            "run_json",
+            side_effect=RuntimeError("directory unavailable"),
+        ) as directory, mock.patch.object(
+            memory_sink.contacts,
+            "gws_bin",
+            return_value="/bin/gws",
+        ):
+            first, _ = self._run_capture()
+            second, _ = self._run_capture()
+
+        self.assertEqual(first["memory"], "created")
+        self.assertEqual(second["memory"], "created")
+        self.assertEqual(directory.call_count, 1)
 
     def test_not_worthy_skips_store(self):
         out, calls = self._run_capture(

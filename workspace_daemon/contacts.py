@@ -10,6 +10,8 @@ from functools import lru_cache
 
 from .shell import gws_bin, run_json
 
+DIRECTORY_TIMEOUT_SECONDS = 20
+
 
 def _email(value):
     return str(value or "").strip().casefold()
@@ -26,6 +28,36 @@ def _slug(name):
 
 
 @lru_cache(maxsize=512)
+def _resolve_normalized_email(wanted):
+    """Cached directory outcome: ``(person, error)``.
+
+    Exceptions are converted to values so they are cached too. Otherwise an
+    outage is retried once per item, and each subprocess may consume the full
+    timeout before the daemon can continue.
+    """
+    try:
+        result = run_json([
+            gws_bin(), "contacts", "directory-search",
+            "--query", wanted, "--max", "10", "--format", "json",
+        ], timeout=DIRECTORY_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+    exact = [
+        contact
+        for contact in result.get("contacts", [])
+        if wanted in {_email(value) for value in contact.get("emails", [])}
+    ]
+    if len(exact) != 1:
+        return None, None
+
+    name = " ".join(str(exact[0].get("name") or "").split())
+    slug = _slug(name)
+    if not name or not slug:
+        return None, None
+    return {"email": wanted, "name": name, "slug": slug}, None
+
+
 def resolve_email(email):
     """Return a verified ``{email, name, slug}`` for one directory email.
 
@@ -35,21 +67,12 @@ def resolve_email(email):
     wanted = _email(email)
     if not wanted or "@" not in wanted:
         return None
+    person, error = _resolve_normalized_email(wanted)
+    if error:
+        raise RuntimeError(error)
+    return person
 
-    result = run_json([
-        gws_bin(), "contacts", "directory-search",
-        "--query", wanted, "--max", "10", "--format", "json",
-    ])
-    exact = [
-        contact
-        for contact in result.get("contacts", [])
-        if wanted in {_email(value) for value in contact.get("emails", [])}
-    ]
-    if len(exact) != 1:
-        return None
 
-    name = " ".join(str(exact[0].get("name") or "").split())
-    slug = _slug(name)
-    if not name or not slug:
-        return None
-    return {"email": wanted, "name": name, "slug": slug}
+def clear_cache():
+    """Forget directory outcomes at the boundary between daemon runs."""
+    _resolve_normalized_email.cache_clear()

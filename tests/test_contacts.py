@@ -7,7 +7,7 @@ from workspace_daemon import contacts
 
 class DirectoryResolutionTest(unittest.TestCase):
     def setUp(self):
-        contacts.resolve_email.cache_clear()
+        contacts.clear_cache()
 
     def test_accepts_one_exact_email_match_and_slugs_name(self):
         response = {
@@ -31,7 +31,7 @@ class DirectoryResolutionTest(unittest.TestCase):
             "/bin/gws", "contacts", "directory-search",
             "--query", "jose.example@example.com",
             "--max", "10", "--format", "json",
-        ])
+        ], timeout=contacts.DIRECTORY_TIMEOUT_SECONDS)
 
     def test_rejects_fuzzy_result_without_exact_email(self):
         response = {
@@ -67,9 +67,43 @@ class DirectoryResolutionTest(unittest.TestCase):
         }
         with mock.patch.object(contacts, "run_json", return_value=response) as run, \
              mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
-            contacts.resolve_email("cache@example.com")
+            contacts.resolve_email(" CACHE@EXAMPLE.COM ")
             contacts.resolve_email("cache@example.com")
         self.assertEqual(run.call_count, 1)
+
+    def test_failure_is_cached_for_the_run(self):
+        with mock.patch.object(
+            contacts,
+            "run_json",
+            side_effect=RuntimeError("directory unavailable"),
+        ) as run, mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "directory unavailable"):
+                contacts.resolve_email("owner@example.com")
+            with self.assertRaisesRegex(RuntimeError, "directory unavailable"):
+                contacts.resolve_email("OWNER@EXAMPLE.COM")
+
+        self.assertEqual(run.call_count, 1)
+
+    def test_clear_cache_allows_retry_on_next_run(self):
+        response = {
+            "contacts": [
+                {"name": "Owner Example", "emails": ["owner@example.com"]}
+            ]
+        }
+        with mock.patch.object(
+            contacts,
+            "run_json",
+            side_effect=[RuntimeError("temporary"), response],
+        ) as run, mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "temporary"):
+                contacts.resolve_email("owner@example.com")
+            contacts.clear_cache()
+            self.assertEqual(
+                contacts.resolve_email("owner@example.com")["slug"],
+                "owner-example",
+            )
+
+        self.assertEqual(run.call_count, 2)
 
 
 if __name__ == "__main__":
