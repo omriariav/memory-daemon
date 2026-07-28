@@ -20,6 +20,16 @@ def read_message(message_id):
     return run_json([gws_bin(), "gmail", "read", message_id, "--format", "json"])
 
 
+def links(message_id):
+    """HTML links from one message, including parsed Google Docs metadata."""
+    result = run_json(
+        [gws_bin(), "gmail", "links", message_id, "--format", "json"]
+    )
+    if result.get("error"):
+        raise RuntimeError(f"gws gmail links failed: {result['error']}")
+    return result.get("links", [])
+
+
 def _modify(message_id, add=None, remove=None):
     cmd = [gws_bin(), "gmail", "label", message_id]
     if add:

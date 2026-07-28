@@ -3,6 +3,7 @@
 The ledger entry is written before triage and updated after it, so an item is
 never summarized twice and never left with silently unfinished Gmail actions.
 """
+import datetime
 import re
 from contextlib import ExitStack
 
@@ -148,6 +149,14 @@ def _gmail_fetch(routine, source, candidate):
     }
 
     stream = _stream_for(routine, item)
+    report_date = _report_date_from_subject(subject) if stream else None
+    if report_date:
+        # A reply can make Gmail's message date weeks newer than the report it
+        # contains. Recurring streams with an explicit subject date should be
+        # filed and stored under that report period, while the raw email header
+        # remains available in `email_date`.
+        item["date"] = report_date
+        item["frontmatter"]["report_date"] = report_date
     if stream.get("title"):
         # A stable stream name beats the raw subject, which carries RE:/FW:
         # prefixes and its own embedded date — both of which make for noisy,
@@ -172,7 +181,8 @@ def _expand_from_drive(expand, item, subject, date):
 
     The notification email is a stub — for Gemini notes it carries only the
     "Quick notes" tab, and its link to the doc lives solely in the HTML part
-    that gws strips. So the doc is located by title instead of by link.
+    that the plain-text read omits. Resolve that HTML link directly when the
+    installed gws supports it, with precise title/date search as a fallback.
     """
     match = re.search(expand["title_from_subject"], subject)
     title = match.group("title").strip() if match else None
@@ -184,12 +194,32 @@ def _expand_from_drive(expand, item, subject, date):
     # still filed as meeting-notes-<date>-<meeting> rather than the raw subject.
     item["title"] = title
 
-    doc = drive.find_doc(title, name_contains=expand.get("name_contains"), on_date=date)
+    doc = _linked_google_doc(item["id"])
+    lookup = "gmail-link" if doc else "title-date-search"
+    if not doc:
+        doc = drive.find_doc(
+            title,
+            name_contains=expand.get("name_contains"),
+            on_date=date,
+        )
     if not doc:
         _missing(expand, item, f"no Drive doc found for {title!r}")
         return
 
-    body, read = drive.read_tabs(doc["id"], expand.get("tabs"))
+    document = drive.info(doc["id"])
+    doc_title = document.get("title") or doc.get("name", "")
+    meeting_date = drive.date_from_name(doc_title)
+    if meeting_date:
+        # Notification delivery can lag the meeting by a day. The generated
+        # document name records the actual occurrence date and is the same
+        # authority used by standalone Drive-document sources.
+        item["date"] = meeting_date
+        item["frontmatter"]["meeting_date"] = meeting_date
+    body, read = drive.read_tabs(
+        doc["id"],
+        expand.get("tabs"),
+        document=document,
+    )
     if not body.strip():
         _missing(expand, item, f"doc {doc['id']} had no text in the requested tabs")
         return
@@ -199,12 +229,67 @@ def _expand_from_drive(expand, item, subject, date):
         "expanded": True,
         "drive_file_id": doc["id"],
         "drive_link": doc.get("web_link", ""),
-        "doc_title": doc.get("name", ""),
+        "doc_title": doc_title,
         "doc_tabs": read,
+        "doc_lookup": lookup,
     })
-    missing_tabs = [t for t in (expand.get("tabs") or []) if t not in read]
+    if doc.get("linked_tab_ids"):
+        item["frontmatter"]["doc_linked_tab_ids"] = doc["linked_tab_ids"]
+    normalized_read = {" ".join(tab.split()).casefold() for tab in read}
+    missing_tabs = [
+        tab
+        for tab in (expand.get("tabs") or [])
+        if " ".join(tab.split()).casefold() not in normalized_read
+    ]
     if missing_tabs:
         log(f"doc={doc['id']} tabs not present, skipped: {', '.join(missing_tabs)}")
+
+
+def _linked_google_doc(message_id):
+    """Resolve the meeting Doc directly from the notification's HTML links.
+
+    workspace-cli v1.40.1 added this read-only path. Search remains a fallback
+    for old notifications or older CLI installs, but a link is authoritative
+    when present and avoids title punctuation/indexing failures.
+    """
+    try:
+        links = [
+            link
+            for link in gmail.links(message_id)
+            if link.get("google_docs_id")
+        ]
+    except Exception as exc:
+        log(
+            f"WARN message_id={message_id} direct Gmail link lookup failed; "
+            f"falling back to Drive search: {exc}"
+        )
+        return None
+    if not links:
+        return None
+
+    preferred = [
+        link
+        for link in links
+        if (link.get("text") or "").strip().casefold()
+        in {"open meeting notes", "notes by gemini"}
+    ]
+    chosen = (preferred or links)[0]
+    doc_id = chosen["google_docs_id"]
+    distinct = {link["google_docs_id"] for link in links}
+    if len(distinct) > 1:
+        log(
+            f"WARN message_id={message_id} contains {len(distinct)} Google Docs; "
+            f"using meeting-notes link {doc_id}"
+        )
+    return {
+        "id": doc_id,
+        "web_link": chosen.get("href", ""),
+        "linked_tab_ids": sorted({
+            link["tab_id"]
+            for link in links
+            if link.get("google_docs_id") == doc_id and link.get("tab_id")
+        }),
+    }
 
 
 def _missing(expand, item, reason):
@@ -446,14 +531,29 @@ def _collect_claims(routines, totals):
         for source_index, source in enumerate(config.sources(routine))
     ]
     all_sources = [source for _, _, source in entries]
+    claimed_slack_channels = {
+        channel
+        for source in all_sources
+        if source.get("kind") == "slack"
+        for channel in slack_source.configured_channels(source)
+    }
 
     for routine, source_index, source in entries:
         rid = routine["id"]
         kind = source["kind"]
         list_candidates, fetch = SOURCES[kind]
+        listing_source = source
+        if kind == "slack" and source.get("include_mentions"):
+            # Mentions are workspace-wide. Exclude every explicitly owned
+            # channel, including channels owned by another routine whose digest
+            # source id differs from the mention thread's source id.
+            listing_source = dict(
+                source,
+                _exclude_mention_channels=sorted(claimed_slack_channels),
+            )
         log(f"routine={rid} querying {kind}: {_scope(source)}")
         try:
-            candidates = list_candidates(source)
+            candidates = list_candidates(listing_source)
         except Exception as exc:
             totals["errors"] += 1
             log(f"routine={rid} source={kind} FATAL: {exc}")
@@ -466,7 +566,9 @@ def _collect_claims(routines, totals):
         discovery = []
         discovery_limit = _ownership_limit(source, all_sources)
         if discovery_limit > _source_limit(source):
-            expanded_source = dict(source, max_results=discovery_limit)
+            expanded_source = dict(
+                listing_source, max_results=discovery_limit
+            )
             log(
                 f"routine={rid} source={kind} expanding ownership scan "
                 f"to {discovery_limit}"
@@ -604,9 +706,16 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
 
     item = fetch(routine, source, candidate)
     item.setdefault("source_kind", source["kind"])
+    static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
     if dry_run:
-        desc = ", ".join(actions.describe(a, "<llm-chosen>") for a in action_list) or "none"
+        dry_label = (
+            static
+            or ("<llm-chosen>" if routine["analyze"].get("pick_label") else None)
+        )
+        desc = ", ".join(
+            actions.describe(action, dry_label) for action in action_list
+        ) or "none"
         log(f"routine={rid} [dry-run] would analyze {len(item['body'])} chars via "
             f"provider={routine['analyze']['provider']} model={routine['analyze']['model']}")
         if routine.get("output"):
@@ -619,7 +728,6 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
     summary, label = llm.split_label(content, label_catalog)
-    static = _static_label(routine, item) if source["kind"] == "gmail" else None
     if static:
         # A configured label still goes through the catalog so a typo in the YAML
         # fails loudly here rather than creating a stray Gmail label.
@@ -697,6 +805,34 @@ def _stream_for(routine, item):
         if key in haystack:
             return cfg or {}
     return {}
+
+
+_SUBJECT_REPORT_DATE = re.compile(
+    r"(?<!\d)(?P<day>[0-3]?\d)[./-](?P<month>[01]?\d)[./-]"
+    r"(?P<year>20\d{2}|\d{2})(?!\d)"
+)
+
+
+def _report_date_from_subject(subject):
+    """Return a valid D/M/YYYY report date embedded in a subject, if any.
+
+    These recurring business reports use day-first dates. Invalid or vague
+    periods are deliberately ignored so the normalized Gmail date remains the
+    safe fallback.
+    """
+    for match in _SUBJECT_REPORT_DATE.finditer(subject or ""):
+        year = int(match.group("year"))
+        if year < 100:
+            year += 2000
+        try:
+            return datetime.date(
+                year,
+                int(match.group("month")),
+                int(match.group("day")),
+            ).isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def _static_label(routine, item):

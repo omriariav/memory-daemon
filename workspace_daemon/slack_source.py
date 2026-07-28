@@ -98,12 +98,20 @@ def _message_day(ts):
     return value.date().isoformat()
 
 
-def _configured_channels(source):
+def configured_channels(source):
+    """Every channel explicitly assigned to this source block."""
     return {
         channel
         for key in ("channels", "ada_channels", "private_channels")
         for channel in source.get(key, [])
     }
+
+
+def _mention_excluded_channels(source):
+    """Channels covered by a declared ingestion path anywhere in the run."""
+    return configured_channels(source) | set(
+        source.get("_exclude_mention_channels", [])
+    )
 
 
 def _legacy_candidates(source):
@@ -243,8 +251,11 @@ def candidates(source):
             sid = message.get("source_id")
             if not sid:
                 continue
-            # A configured channel digest already contains this mention.
-            if message.get("channel_id") in _configured_channels(source):
+            # A configured channel digest already contains this mention. The
+            # runner supplies channels owned by other routines too, because a
+            # digest and a thread have different source ids and cannot be
+            # deduplicated later by claim routing.
+            if message.get("channel_id") in _mention_excluded_channels(source):
                 continue
             anchor = sid.split(":")[-1]
             latest[sid] = max(

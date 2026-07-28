@@ -124,6 +124,38 @@ class OwnershipRoutingTest(unittest.TestCase):
         self.assertEqual(runner._routing_id(first), runner._routing_id(second))
 
 
+class SlackCrossRoutineOwnershipTest(unittest.TestCase):
+    def test_runner_passes_all_declared_channels_to_mention_sweep(self):
+        owner = {
+            "id": "domain",
+            "source": {"kind": "slack", "ada_channels": ["COWNED"]},
+        }
+        sweep = {
+            "id": "sweep",
+            "source": {"kind": "slack", "include_mentions": True},
+        }
+        observed = []
+
+        def candidates(source):
+            observed.append(source)
+            return []
+
+        saved = runner.SOURCES["slack"]
+        runner.SOURCES["slack"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "slack", saved)
+
+        totals = {"errors": 0}
+        runner._collect_claims([owner, sweep], totals)
+
+        mention_source = next(
+            source for source in observed if source.get("include_mentions")
+        )
+        self.assertEqual(
+            mention_source["_exclude_mention_channels"],
+            ["COWNED"],
+        )
+
+
 class MultiSourceRunnerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
