@@ -6,10 +6,12 @@ Full notes and a speaker-attributed Transcript that the email never links to in
 a machine-readable way.
 """
 import re
+from functools import lru_cache
 
 from .shell import gws_bin, log, run_json
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
+ACCOUNT_TIMEOUT_SECONDS = 20
 
 # "Meeting Title – 2026/07/22 16:59 IDT – Notes by Gemini". The separator is
 # sometimes an en dash and sometimes a hyphen, so match either.
@@ -133,6 +135,35 @@ def info(doc_id):
 def file_info(doc_id):
     """Drive file metadata, including owner email addresses."""
     return run_json([gws_bin(), "drive", "info", doc_id, "--format", "json"])
+
+
+@lru_cache(maxsize=1)
+def _current_user_email_result():
+    """Return the authenticated Drive email and a cached lookup error."""
+    try:
+        result = run_json(
+            [gws_bin(), "drive", "about", "--format", "json"],
+            timeout=ACCOUNT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    email = str((result.get("user") or {}).get("email") or "").strip().casefold()
+    if not email or "@" not in email:
+        return None, "Drive account metadata did not include a valid user email"
+    return email, None
+
+
+def current_user_email():
+    """Authenticated Workspace email, cached for one daemon run."""
+    email, error = _current_user_email_result()
+    if error:
+        raise RuntimeError(error)
+    return email
+
+
+def clear_identity_cache():
+    """Allow the next daemon run to retry the account metadata lookup."""
+    _current_user_email_result.cache_clear()
 
 
 def tabs(doc_id, document=None):

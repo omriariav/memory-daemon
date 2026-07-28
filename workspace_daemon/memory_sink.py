@@ -17,14 +17,15 @@ Validation discipline (nothing model-invented reaches the store unchecked):
 - people slugs are checked against `slugs list --kind person`; unknown ones are
   dropped to a `people-unmapped` tag rather than minting a new identity
 - Drive owner emails are resolved exactly through the Workspace directory;
-  those verified identities may safely mint a new person slug
+  those verified identities may safely mint a new person slug, except for the
+  authenticated user, who remains source metadata rather than a self-link
 - every entry carries a canonical --source-ids, so re-runs update in place
 """
 import json
 import re
 import subprocess
 
-from . import contacts
+from . import contacts, drive
 from .shell import log
 
 MEMORY_TYPES = {
@@ -128,9 +129,23 @@ def source_id_for(item):
 def _verified_owner_people(item, rid):
     """Resolve exact Drive owner emails; return (slugs, unresolved emails)."""
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
+    if not owner_emails:
+        return [], []
+    try:
+        current_user_email = drive.current_user_email()
+    except Exception as exc:
+        log(
+            f"routine={rid} memory WARN Drive owner enrichment skipped: "
+            f"authenticated Workspace identity unavailable: {exc}"
+        )
+        return [], list(dict.fromkeys(owner_emails))
+
     slugs = []
     unresolved = []
     for email in owner_emails:
+        if str(email).strip().casefold() == current_user_email:
+            log(f"routine={rid} memory: skipped authenticated user as Drive owner")
+            continue
         try:
             person = contacts.resolve_email(email)
         except Exception as exc:

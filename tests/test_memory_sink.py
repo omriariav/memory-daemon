@@ -101,7 +101,7 @@ class CaptureValidationTest(unittest.TestCase):
         self.item = {"id": "slack:C1:1.0", "title": "t", "date": "2026-07-27",
                      "frontmatter": {}}
 
-    def _run_capture(self, extraction=None):
+    def _run_capture(self, extraction=None, current_user_email="me@example.com"):
         calls = {}
 
         def fake_cli(store, args, stdin_text=None, timeout=120):
@@ -109,7 +109,21 @@ class CaptureValidationTest(unittest.TestCase):
             calls["stdin"] = stdin_text
             return FakeResult("✓ created 2026-07-27-t\n")
 
+        identity_patch = (
+            mock.patch.object(
+                memory_sink.drive,
+                "current_user_email",
+                side_effect=current_user_email,
+            )
+            if isinstance(current_user_email, Exception)
+            else mock.patch.object(
+                memory_sink.drive,
+                "current_user_email",
+                return_value=current_user_email,
+            )
+        )
         patches = [mock.patch.object(memory_sink, "_cli", side_effect=fake_cli),
+                   identity_patch,
                    mock.patch.object(memory_sink.subprocess, "run",
                                      return_value=FakeResult())]
         if extraction is not None:
@@ -158,6 +172,43 @@ class CaptureValidationTest(unittest.TestCase):
         idx = calls["args"].index("--people")
         self.assertEqual(calls["args"][idx + 1], "owner-example")
         self.assertEqual(out["memory_people"], ["owner-example"])
+
+    def test_authenticated_drive_owner_is_not_added_as_a_person(self):
+        self.item["frontmatter"]["drive_owner_emails"] = [
+            "ME@EXAMPLE.COM",
+            "owner@example.com",
+        ]
+        verified = {
+            "email": "owner@example.com",
+            "name": "Owner Example",
+            "slug": "owner-example",
+        }
+        with mock.patch.object(
+            memory_sink.contacts,
+            "resolve_email",
+            return_value=verified,
+        ) as resolve:
+            out, calls = self._run_capture()
+
+        resolve.assert_called_once_with("owner@example.com")
+        idx = calls["args"].index("--people")
+        self.assertEqual(calls["args"][idx + 1], "owner-example")
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertNotIn("people-unmapped", tags)
+        self.assertEqual(out["memory_people"], ["owner-example"])
+
+    def test_identity_failure_skips_owner_enrichment_and_marks_for_repair(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(memory_sink.contacts, "resolve_email") as resolve:
+            out, calls = self._run_capture(
+                current_user_email=RuntimeError("Drive unavailable"),
+            )
+
+        resolve.assert_not_called()
+        self.assertNotIn("--people", calls["args"])
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("people-unmapped", tags)
+        self.assertEqual(out["memory"], "created")
 
     def test_unresolved_drive_owner_is_tagged_without_failing_capture(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
