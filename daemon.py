@@ -274,7 +274,8 @@ def main(argv=None):
     )
     p_tick.add_argument(
         "-n", "--dry-run", action="store_true",
-        help="preview due routines without LLM calls, writes, or schedule updates",
+        help="preview due routines without LLM/source mutation or data/state "
+             "writes; operational log only",
     )
     p_tick.add_argument(
         "--refresh-labels", action="store_true",
