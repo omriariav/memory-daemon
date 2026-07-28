@@ -2,7 +2,7 @@
 import unittest
 from unittest import mock
 
-from workspace_daemon import gchat_source, memory_sink, slack_source
+from workspace_daemon import config, gchat_source, memory_sink, slack_source
 
 
 def msg(thread, ts, text, sender="users/1"):
@@ -69,6 +69,91 @@ class CandidatesTest(unittest.TestCase):
         digest = by_sid["gchat:AAA:day:2026-07-27"]
         self.assertEqual(len(digest["raw"]["messages"]), 2)
         self.assertTrue(digest["id"].endswith("@2026-07-27T10:01:00Z"))
+
+    def test_all_spaces_uses_recent_and_groups_each_space(self):
+        messages = {
+            "messages": [
+                {
+                    **msg("t1", "2026-07-27T08:00:00Z", "from one"),
+                    "space": "spaces/AAA",
+                    "space_display_name": "One",
+                    "space_type": "SPACE",
+                },
+                {
+                    **msg("t2", "2026-07-27T09:00:00Z", "from two"),
+                    "space": "spaces/BBB",
+                    "space_display_name": "",
+                    "space_type": "DIRECT_MESSAGE",
+                },
+            ],
+        }
+        with mock.patch.object(gchat_source, "_gws", return_value=messages) as gws:
+            out = gchat_source.candidates({
+                "all_spaces": True,
+                "hours": 168,
+                "max_results": 0,
+                "max_per_space": 0,
+            })
+
+        gws.assert_called_once_with([
+            "chat", "recent",
+            "--since", "168h",
+            "--max", "0",
+            "--max-per-space", "0",
+        ], timeout=300)
+        self.assertEqual(
+            {candidate["raw"]["space"] for candidate in out},
+            {"spaces/AAA", "spaces/BBB"},
+        )
+        self.assertEqual(gchat_source._space_cache["spaces/AAA"]["display_name"], "One")
+
+    def test_all_spaces_recovers_space_from_message_name(self):
+        messages = {"messages": [
+            msg("t1", "2026-07-27T08:00:00Z", "hello"),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({"all_spaces": True})
+        self.assertEqual(out[0]["raw"]["space"], "spaces/AAA")
+
+
+class ConfigTest(unittest.TestCase):
+    @staticmethod
+    def routine(source):
+        return {
+            "id": "gchat-sweep",
+            "enabled": True,
+            "source": {"kind": "gchat", **source},
+            "analyze": {
+                "provider": "gemini",
+                "model": "gemini/example",
+                "instruction": "Keep durable facts.",
+            },
+            "memory": {"store": "/tmp/memory", "type": "note"},
+        }
+
+    def test_all_spaces_accepts_unlimited_recent_results(self):
+        problems = config.validate(self.routine({
+            "all_spaces": True,
+            "max_results": 0,
+            "max_per_space": 0,
+        }))
+        self.assertEqual(problems, [])
+
+    def test_gchat_requires_exactly_one_scope(self):
+        missing = config.validate(self.routine({}))
+        both = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "all_spaces": True,
+        }))
+        self.assertTrue(any("exactly one" in problem for problem in missing))
+        self.assertTrue(any("exactly one" in problem for problem in both))
+
+    def test_max_per_space_is_only_for_all_space_sweeps(self):
+        problems = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "max_per_space": 0,
+        }))
+        self.assertTrue(any("requires `all_spaces: true`" in problem for problem in problems))
 
 
 class FetchTest(unittest.TestCase):

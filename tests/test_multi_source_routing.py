@@ -156,6 +156,62 @@ class SlackCrossRoutineOwnershipTest(unittest.TestCase):
         )
 
 
+class GChatFallbackOwnershipTest(unittest.TestCase):
+    def test_specific_space_beats_all_space_fallback(self):
+        specific = {
+            "id": "domain",
+            "source": {"kind": "gchat", "spaces": ["spaces/OWNED"]},
+        }
+        fallback = {
+            "id": "sweep",
+            "routing": {"fallback": True},
+            "source": {
+                "kind": "gchat",
+                "all_spaces": True,
+                "max_results": 0,
+            },
+        }
+
+        def candidate(space):
+            short = space.split("/")[-1]
+            return {
+                "id": f"gchat:{short}:thread@1",
+                "title": short,
+                "raw": {
+                    "source_id": f"gchat:{short}:thread",
+                    "space": space,
+                },
+            }
+
+        def candidates(source):
+            if source.get("all_spaces"):
+                return [candidate("spaces/OWNED"), candidate("spaces/OTHER")]
+            return [candidate("spaces/OWNED")]
+
+        saved = runner.SOURCES["gchat"]
+        runner.SOURCES["gchat"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "gchat", saved)
+
+        totals = {"errors": 0, "ambiguous": 0}
+        claims, failures = runner._collect_claims([specific, fallback], totals)
+        owned = runner._route_claims(claims, totals, failures)
+
+        self.assertEqual(
+            {
+                routine_id: {
+                    claim["candidate"]["raw"]["space"]
+                    for claim in routine_claims
+                }
+                for routine_id, routine_claims in owned.items()
+            },
+            {
+                "domain": {"spaces/OWNED"},
+                "sweep": {"spaces/OTHER"},
+            },
+        )
+        self.assertEqual(totals, {"errors": 0, "ambiguous": 0})
+
+
 class MultiSourceRunnerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
