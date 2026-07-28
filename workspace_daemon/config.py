@@ -366,13 +366,32 @@ def _validate_source(routine, source, prefix):
             problems.append(f"{prefix}.ada_days must be an integer from 1 to 90")
     if kind == "gchat":
         spaces = source.get("spaces")
-        if not spaces or not isinstance(spaces, list):
-            problems.append(f"{prefix}: source.kind 'gchat' needs a non-empty `spaces` list")
-        elif not all(str(s).startswith("spaces/") for s in spaces):
+        all_spaces = source.get("all_spaces", False)
+        if not isinstance(all_spaces, bool):
+            problems.append(f"{prefix}.all_spaces must be true or false")
+        if bool(spaces) == (all_spaces is True):
+            problems.append(
+                f"{prefix}: source.kind 'gchat' needs exactly one of a non-empty "
+                "`spaces` list or `all_spaces: true`"
+            )
+        if spaces is not None and (
+            not isinstance(spaces, list) or not spaces
+        ):
+            problems.append(f"{prefix}.spaces must be a non-empty list")
+        elif spaces and not all(str(s).startswith("spaces/") for s in spaces):
             problems.append(f"{prefix}: gchat spaces must be full resource names ('spaces/AAAA...')")
         batch = source.get("batch_unthreaded")
         if batch is not None and batch != "daily":
             problems.append(f"{prefix}.batch_unthreaded must be 'daily' when set")
+        max_per_space = source.get("max_per_space")
+        if max_per_space is not None and (
+            not isinstance(max_per_space, int)
+            or isinstance(max_per_space, bool)
+            or max_per_space < 0
+        ):
+            problems.append(f"{prefix}.max_per_space must be a non-negative integer")
+        if max_per_space is not None and all_spaces is not True:
+            problems.append(f"{prefix}.max_per_space requires `all_spaces: true`")
 
     expand = source.get("expand")
     if expand is not None:
@@ -421,6 +440,12 @@ def _validate_source(routine, source, prefix):
             )
 
     max_results = source.get("max_results", 20)
-    if not isinstance(max_results, int) or max_results < 1:
-        problems.append(f"{prefix}.max_results must be a positive integer")
+    unlimited_gchat = kind == "gchat" and source.get("all_spaces") is True
+    if (
+        not isinstance(max_results, int)
+        or isinstance(max_results, bool)
+        or max_results < (0 if unlimited_gchat else 1)
+    ):
+        qualifier = "non-negative" if unlimited_gchat else "positive"
+        problems.append(f"{prefix}.max_results must be a {qualifier} integer")
     return problems

@@ -194,7 +194,7 @@ routing: {fallback: true}
 sources:
   - {kind: gmail, query: '{is:unread is:starred}', actions: []}
   - {kind: slack, include_mentions: true, hours: 26}
-  - {kind: gchat, spaces: [spaces/AAAAEXAMPLE], hours: 26}
+  - {kind: gchat, all_spaces: true, hours: 26, max_results: 0}
 ```
 
 Even when only the fallback is due, enabled specific routines still list their

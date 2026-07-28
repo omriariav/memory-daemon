@@ -1,4 +1,4 @@
-"""Google Chat source: sweep configured spaces via the `gws` CLI, grouped by thread.
+"""Google Chat source: sweep Google Chat via the `gws` CLI, grouped by thread.
 
 Routine config:
 
@@ -8,6 +8,11 @@ Routine config:
         - spaces/AAAA000000A     # #my-team-space
       hours: 26                  # lookback window; overlap the schedule slightly
       max_results: 50            # cap per space
+
+For a broad fallback sweep, replace ``spaces`` with ``all_spaces: true``.
+That uses ``gws chat recent``: it cheaply filters the user's entire space list
+by activity time, then reads only spaces active inside the requested window.
+In this mode ``max_results`` is a global message cap and may be 0 for no cap.
 
 One `gws chat messages --after` call per space returns full message texts, so
 candidates are grouped client-side by thread. Fetch resolves the space name,
@@ -58,6 +63,47 @@ def _thread_id(message):
     return (message.get("thread") or message.get("name", "")).split("/")[-1]
 
 
+def _hours_duration(hours):
+    value = float(hours)
+    return f"{int(value) if value.is_integer() else value}h"
+
+
+def _windowed_messages(source):
+    """Yield ``(space, message)`` pairs for explicit or all-space sweeps."""
+    if source.get("all_spaces"):
+        args = [
+            "chat", "recent",
+            "--since", _hours_duration(source.get("hours", 26)),
+            "--max", str(source.get("max_results", 0)),
+            "--max-per-space", str(source.get("max_per_space", 0)),
+        ]
+        data = _gws(args, timeout=300)
+        for message in data.get("messages") or []:
+            space = message.get("space")
+            if not space:
+                name = message.get("name", "")
+                if "/messages/" in name:
+                    space = name.split("/messages/", 1)[0]
+            if not space:
+                continue
+            if space not in _space_cache:
+                _space_cache[space] = {
+                    "display_name": message.get("space_display_name") or "",
+                    "type": message.get("space_type") or "",
+                }
+            yield space, message
+        return
+
+    per_space = int(source.get("max_results", 50))
+    after = _after_iso(source.get("hours", 26))
+    for space in source.get("spaces", []):
+        data = _gws(
+            ["chat", "messages", space, "--after", after, "--max", str(per_space)]
+        )
+        for message in data.get("messages") or []:
+            yield space, message
+
+
 def candidates(source):
     """One candidate per thread that saw traffic inside the window.
 
@@ -66,16 +112,12 @@ def candidates(source):
     earlier history) are not included — the summary covers the active slice,
     and the stable source id folds successive slices into one memory entry.
     """
-    after = _after_iso(source.get("hours", 26))
-    per_space = int(source.get("max_results", 50))
     threads = {}
 
-    for space in source.get("spaces", []):
-        d = _gws(["chat", "messages", space, "--after", after, "--max", str(per_space)])
-        for m in d.get("messages") or []:
-            sid = f"gchat:{_space_id(space)}:{_thread_id(m)}"
-            t = threads.setdefault(sid, {"space": space, "messages": []})
-            t["messages"].append(m)
+    for space, message in _windowed_messages(source):
+        sid = f"gchat:{_space_id(space)}:{_thread_id(message)}"
+        thread = threads.setdefault(sid, {"space": space, "messages": []})
+        thread["messages"].append(message)
 
     out = []
     daily = {}

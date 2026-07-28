@@ -357,6 +357,8 @@ SOURCES = {
 # --- candidate ownership and run loop --------------------------------------
 
 def _scope(source):
+    if source.get("kind") == "gchat" and source.get("all_spaces"):
+        return "all active Google Chat conversations"
     slack_channels = [
         channel
         for key in ("channels", "ada_channels", "private_channels")
@@ -565,7 +567,8 @@ def _collect_claims(routines, totals):
 
         discovery = []
         discovery_limit = _ownership_limit(source, all_sources)
-        if discovery_limit > _source_limit(source):
+        source_limit = _source_limit(source)
+        if source_limit and discovery_limit > source_limit:
             expanded_source = dict(
                 listing_source, max_results=discovery_limit
             )
