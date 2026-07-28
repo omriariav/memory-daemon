@@ -447,10 +447,17 @@ def fetch(routine, candidate):
         )
         for message in messages
     ]
-    root_ts = float(anchor)
-    date = datetime.datetime.fromtimestamp(
-        root_ts, datetime.timezone.utc
-    ).date().isoformat()
+    timestamps = [
+        message.get("ts")
+        for message in messages
+        if message.get("ts")
+    ]
+    first_ts = min(timestamps, key=float) if timestamps else anchor
+    latest_ts = max(timestamps, key=float) if timestamps else anchor
+    # Thread candidates are versioned by their latest reply. File the memory
+    # on that same activity date so a decision made weeks after the root
+    # message is not incorrectly dated as the start of the thread.
+    date = _message_day(latest_ts)
 
     title = candidate["title"] or f"slack thread in {channel}"
     return {
@@ -465,7 +472,7 @@ def fetch(routine, candidate):
             "slack_capture_mode": "thread",
             "slack_participants": sorted(set(names.values())) or user_ids,
             "via_mention": bool(candidate["raw"].get("via_mention")),
-            "first_message_at": slack_timestamp_iso(messages[0].get("ts")),
-            "latest_message_at": slack_timestamp_iso(messages[-1].get("ts")),
+            "first_message_at": slack_timestamp_iso(first_ts),
+            "latest_message_at": slack_timestamp_iso(latest_ts),
         },
     }

@@ -277,6 +277,45 @@ class SlackVersionedIdTest(unittest.TestCase):
         self.assertEqual(item["source_id"], "slack:C1:100.0")
         self.assertEqual(memory_sink.source_id_for(item), "slack:C1:100.0")
 
+    def test_fetch_dates_updated_thread_by_latest_reply(self):
+        root = "1780835023.379039"   # 2026-06-07
+        latest = "1783425442.544349"  # 2026-07-07
+        candidate = {
+            "id": f"slack:C1:{root}@{latest}",
+            "title": "a later decision",
+            "raw": {
+                "channel": "C1",
+                "anchor": root,
+                "source_id": f"slack:C1:{root}",
+                "mode": "thread",
+            },
+        }
+        thread = {"ok": True, "messages": [
+            {"ts": latest, "user": "U2", "text": "decision"},
+            {"ts": root, "user": "U1", "text": "root"},
+        ]}
+        whois = {
+            "ok": True,
+            "users": {
+                "U1": {"real_name": "A"},
+                "U2": {"real_name": "B"},
+            },
+        }
+        with mock.patch.object(
+            slack_source, "_cli", side_effect=[thread, whois]
+        ):
+            item = slack_source.fetch({}, candidate)
+
+        self.assertEqual(item["date"], "2026-07-07")
+        self.assertEqual(
+            item["frontmatter"]["first_message_at"],
+            "2026-06-07T12:23:43.379Z",
+        )
+        self.assertEqual(
+            item["frontmatter"]["latest_message_at"],
+            "2026-07-07T11:57:22.544Z",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
