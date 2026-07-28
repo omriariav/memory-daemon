@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .shell import log
+from .time_utils import is_rfc3339_instant
 
 
 class StateError(Exception):
@@ -29,6 +30,10 @@ def state_file(base_dir):
 
 def schedule_file(base_dir):
     return Path(base_dir) / "state" / "schedule.json"
+
+
+def cursor_file(base_dir):
+    return Path(base_dir) / "state" / "cursors.json"
 
 
 def load(base_dir):
@@ -247,6 +252,73 @@ class ScheduleStore:
             merged[rid] = {
                 "last_attempted_at": stamp,
                 "last_attempted_epoch": now,
+            }
+        write_atomic(self.path, _serialize(merged))
+        self.entries = merged
+
+
+class CursorStore:
+    """Durable last-successful source scans for queue-style catch-up.
+
+    The checkpoint is the instant a scan started, not when it finished. Messages
+    arriving during a long run therefore remain newer than the checkpoint and
+    are eligible next time. Callers add an overlap when reading; the processed
+    ledger absorbs that repeated source slice.
+    """
+
+    def __init__(self, base_dir, dry_run=False):
+        self.path = cursor_file(base_dir)
+        self.dry_run = dry_run
+        self.entries = self._load()
+
+    @staticmethod
+    def key(routine_id, source_id):
+        return f"{routine_id}:{source_id}"
+
+    def _load(self):
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise StateError(f"{self.path} is not valid cursor state: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateError(f"{self.path} must contain an object of source records")
+        for key, record in data.items():
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("kind"), str)
+                or not record["kind"]
+                or not is_rfc3339_instant(record.get("last_successful_scan_at"))
+            ):
+                raise StateError(
+                    f"{self.path}: cursor record {key!r} must contain a "
+                    "non-empty kind and RFC3339 last_successful_scan_at"
+                )
+        return data
+
+    def checkpoint(self, routine_id, source_id, kind):
+        key = self.key(routine_id, source_id)
+        record = self.entries.get(key)
+        if record is None:
+            return None
+        if record.get("kind") != kind:
+            raise StateError(
+                f"{self.path}: cursor record {key!r} has kind "
+                f"{record.get('kind')!r}, expected {kind!r}"
+            )
+        value = record.get("last_successful_scan_at")
+        return value
+
+    def mark_successful(self, sources, checkpoint):
+        """Advance several source cursors in one atomic state write."""
+        if self.dry_run or not sources:
+            return
+        merged = dict(self.entries)
+        for routine_id, source_id, kind in sources:
+            merged[self.key(routine_id, source_id)] = {
+                "kind": kind,
+                "last_successful_scan_at": checkpoint,
             }
         write_atomic(self.path, _serialize(merged))
         self.entries = merged

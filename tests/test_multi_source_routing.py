@@ -645,6 +645,243 @@ class ScheduleStoreTest(unittest.TestCase):
         self.assertEqual(config.schedule_seconds({"id": "legacy"}), 60 * 60)
 
 
+class CursorStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_successful_checkpoint_round_trips_by_source(self):
+        cursors = state.CursorStore(self.base)
+        cursors.mark_successful(
+            [("sweep", "gchat:all-spaces", "gchat")],
+            "2026-07-28T10:00:00Z",
+        )
+
+        loaded = state.CursorStore(self.base)
+        self.assertEqual(
+            loaded.checkpoint("sweep", "gchat:all-spaces", "gchat"),
+            "2026-07-28T10:00:00Z",
+        )
+
+    def test_mismatched_cursor_kind_fails_closed(self):
+        cursors = state.CursorStore(self.base)
+        cursors.mark_successful(
+            [("sweep", "gchat:all-spaces", "slack")],
+            "2026-07-28T10:00:00Z",
+        )
+
+        with self.assertRaisesRegex(state.StateError, "expected 'gchat'"):
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            )
+
+    def test_dry_run_never_writes_cursor_state(self):
+        cursors = state.CursorStore(self.base, dry_run=True)
+        cursors.mark_successful(
+            [("sweep", "gchat:all-spaces", "gchat")],
+            "2026-07-28T10:00:00Z",
+        )
+        self.assertFalse(state.cursor_file(self.base).exists())
+
+    def test_malformed_cursor_record_fails_closed(self):
+        path = state.cursor_file(self.base)
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            '{"sweep:gchat:all-spaces": {'
+            '"kind": "gchat", "last_successful_scan_at": "not-a-timestamp"}}'
+        )
+
+        with self.assertRaisesRegex(state.StateError, "RFC3339"):
+            state.CursorStore(self.base)
+
+
+class CatchUpCursorRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        (self.base / "state").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved_source = runner.SOURCES["gchat"]
+        self.saved_analyze = llm.analyze
+        llm.analyze = lambda routine, prompt: "A compact summary."
+        self.addCleanup(runner.SOURCES.__setitem__, "gchat", self.saved_source)
+        self.addCleanup(setattr, llm, "analyze", self.saved_analyze)
+
+    def routine(self, memory=False):
+        routine = {
+            "id": "sweep",
+            "enabled": True,
+            "source": {
+                "kind": "gchat",
+                "all_spaces": True,
+                "hours": 26,
+                "max_results": 0,
+                "max_per_space": 0,
+                "batch_messages": "daily",
+                "batch_messages_after": "2026-07-28T06:00:00Z",
+                "catch_up": True,
+                "catch_up_overlap": "1h",
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+        }
+        if memory:
+            routine["memory"] = {
+                "store": str(self.base / "memory"),
+                "type": "note",
+            }
+        else:
+            routine["output"] = {
+                "vault_dir": str(self.base / "vault"),
+                "slug_prefix": "sweep",
+            }
+        return routine
+
+    def test_success_uses_bootstrap_then_last_success_with_overlap(self):
+        observed = []
+
+        def candidates(source):
+            observed.append(dict(source))
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        routine = self.routine()
+
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+        ):
+            first = runner.run(self.base, [routine])
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
+        ):
+            second = runner.run(self.base, [routine])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(observed[0]["_since"], "2026-07-28T06:00:00Z")
+        self.assertEqual(observed[1]["_since"], "2026-07-28T09:00:00Z")
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            ),
+            "2026-07-28T12:00:00Z",
+        )
+
+    def test_listing_failure_holds_prior_cursor(self):
+        def candidates(source):
+            raise RuntimeError("source unavailable")
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+        ):
+            totals = runner.run(self.base, [self.routine()])
+
+        self.assertEqual(totals["errors"], 1)
+        self.assertIsNone(
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            )
+        )
+
+    def test_memory_error_is_retried_before_cursor_advances(self):
+        candidate = {
+            "id": "gchat:EXAMPLE:daily:2026-07-28@2026-07-28T09:00:00Z",
+            "title": "durable update",
+            "raw": {"source_id": "gchat:EXAMPLE:daily:2026-07-28"},
+        }
+
+        def candidates(source):
+            return [candidate]
+
+        def fetch(routine, source, value):
+            return {
+                "id": value["id"],
+                "source_id": value["raw"]["source_id"],
+                "source_kind": "gchat",
+                "title": value["title"],
+                "date": "2026-07-28",
+                "body": "Complete daily context.",
+                "frontmatter": {},
+            }
+
+        runner.SOURCES["gchat"] = (candidates, fetch)
+        # Exceptions are allowed to have no message. Presence of the ledger key,
+        # not the truthiness of its text, must trigger the retry.
+        outcomes = [RuntimeError(), {"memory": "created"}]
+
+        with mock.patch.object(memory_sink, "capture", side_effect=outcomes) as capture:
+            with mock.patch.object(
+                runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+            ):
+                first = runner.run(self.base, [self.routine(memory=True)])
+            self.assertEqual(first["errors"], 1)
+            self.assertIsNone(
+                state.CursorStore(self.base).checkpoint(
+                    "sweep", "gchat:all-spaces", "gchat"
+                )
+            )
+
+            with mock.patch.object(
+                runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
+            ):
+                second = runner.run(self.base, [self.routine(memory=True)])
+
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            ),
+            "2026-07-28T12:00:00Z",
+        )
+        record = state.load(self.base)[candidate["id"]]
+        self.assertNotIn("memory_error", record)
+
+    def test_successful_candidate_is_not_reprocessed_on_overlap(self):
+        candidate = {
+            "id": "gchat:EXAMPLE:daily:2026-07-28@2026-07-28T09:00:00Z",
+            "title": "durable update",
+            "raw": {"source_id": "gchat:EXAMPLE:daily:2026-07-28"},
+        }
+
+        def candidates(source):
+            return [candidate]
+
+        def fetch(routine, source, value):
+            return {
+                "id": value["id"],
+                "source_id": value["raw"]["source_id"],
+                "source_kind": "gchat",
+                "title": value["title"],
+                "date": "2026-07-28",
+                "body": "Complete daily context.",
+                "frontmatter": {},
+            }
+
+        runner.SOURCES["gchat"] = (candidates, fetch)
+        with mock.patch.object(
+            memory_sink, "capture", return_value={"memory": "created"},
+        ) as capture:
+            with mock.patch.object(
+                runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+            ):
+                first = runner.run(self.base, [self.routine(memory=True)])
+            with mock.patch.object(
+                runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
+            ):
+                second = runner.run(self.base, [self.routine(memory=True)])
+
+        self.assertEqual(first["processed"], 1)
+        self.assertEqual(second["processed"], 0)
+        self.assertEqual(second["skipped"], 1)
+        self.assertEqual(capture.call_count, 1)
+
+
 class TickCommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

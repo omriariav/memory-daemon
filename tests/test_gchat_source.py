@@ -232,6 +232,27 @@ class CandidatesTest(unittest.TestCase):
         )
         self.assertEqual(gchat_source._space_cache["spaces/AAA"]["display_name"], "One")
 
+    def test_all_spaces_uses_exact_catch_up_cursor(self):
+        with mock.patch.object(
+            gchat_source, "_gws",
+            return_value={"messages": []},
+        ) as gws:
+            out = gchat_source.candidates({
+                "all_spaces": True,
+                "_since": "2026-07-25T09:00:00Z",
+                "hours": 1,
+                "max_results": 0,
+                "max_per_space": 0,
+            })
+
+        self.assertEqual(out, [])
+        gws.assert_called_once_with([
+            "chat", "recent",
+            "--since", "2026-07-25T09:00:00Z",
+            "--max", "0",
+            "--max-per-space", "0",
+        ], timeout=300)
+
     def test_all_spaces_recovers_space_from_message_name(self):
         messages = {"messages": [
             msg("t1", "2026-07-27T08:00:00Z", "hello"),
@@ -342,6 +363,29 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(any("quoted RFC3339" in p for p in iso_space))
         self.assertTrue(any("quoted RFC3339" in p for p in compact_offset))
         self.assertEqual(valid, [])
+
+    def test_catch_up_requires_uncapped_all_space_daily_batch(self):
+        valid = config.validate(self.routine({
+            "all_spaces": True,
+            "batch_messages": "daily",
+            "catch_up": True,
+            "catch_up_overlap": "1h",
+            "max_results": 0,
+            "max_per_space": 0,
+        }))
+        invalid = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "catch_up": True,
+            "catch_up_overlap": "soon",
+            "max_results": 50,
+        }))
+
+        self.assertEqual(valid, [])
+        self.assertTrue(any("requires all_spaces: true" in p for p in invalid))
+        self.assertTrue(any("requires batch_messages: daily" in p for p in invalid))
+        self.assertTrue(any("requires max_results: 0" in p for p in invalid))
+        self.assertTrue(any("requires max_per_space: 0" in p for p in invalid))
+        self.assertTrue(any("catch_up_overlap must look like" in p for p in invalid))
 
 
 class FetchTest(unittest.TestCase):

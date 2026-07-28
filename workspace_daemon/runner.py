@@ -8,7 +8,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
+from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state, time_utils
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -47,6 +47,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
 
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 active_ids=None):
+    scan_started_at = utc_now_iso()
     active_ids = set(active_ids) if active_ids is not None else {
         r["id"] for r in routines if r.get("enabled", True)
     }
@@ -55,6 +56,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         if r.get("enabled", True) and r["id"] in active_ids
     ]
     processed = state.Store(base_dir, dry_run=dry_run)
+    cursors = state.CursorStore(base_dir, dry_run=dry_run)
     catalog = None
     label_catalog = []
     if _needs_label_catalog(active):
@@ -105,9 +107,42 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         if routine["id"] in active_ids
         for source in config.sources(routine)
     }
+    source_overrides = {}
+    catch_up_sources = []
+    for routine in valid:
+        if routine["id"] not in active_ids:
+            continue
+        for source_index, source in enumerate(config.sources(routine)):
+            if source.get("catch_up") is not True:
+                continue
+            kind = source["kind"]
+            cursor_id = f"{kind}:all-spaces"
+            checkpoint = cursors.checkpoint(
+                routine["id"], cursor_id, kind,
+            )
+            if checkpoint:
+                second, _ = time_utils.rfc3339_key(checkpoint)
+                overlap = config.duration_seconds(
+                    source.get("catch_up_overlap", "1h")
+                )
+                since = (
+                    second - datetime.timedelta(seconds=overlap)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                since = source.get("batch_messages_after")
+            if since:
+                source_overrides[(routine["id"], source_index)] = {
+                    "_since": since,
+                }
+                log(
+                    f"routine={routine['id']} source={kind} catch-up since={since}"
+                )
+            catch_up_sources.append((routine["id"], cursor_id, kind))
+
     claims, listing_failures = _collect_claims(
         valid, totals, source_kinds=active_source_kinds,
         routing_context=routines,
+        source_overrides=source_overrides,
     )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
@@ -123,6 +158,20 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             routine, routine_claims, processed, label_catalog, dry_run,
             totals, lock, catalog,
         )
+
+    if catch_up_sources:
+        if totals["errors"] == 0:
+            cursors.mark_successful(catch_up_sources, scan_started_at)
+            mode = "[dry-run] would advance" if dry_run else "advanced"
+            log(
+                f"catch-up cursor {mode} to {scan_started_at} for "
+                f"{len(catch_up_sources)} source(s)"
+            )
+        else:
+            log(
+                f"catch-up cursor held at prior checkpoint due to "
+                f"{totals['errors']} error(s)"
+            )
 
     return totals
 
@@ -603,7 +652,8 @@ def _ownership_limit(source, sources):
     )
 
 
-def _collect_claims(routines, totals, source_kinds=None, routing_context=None):
+def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
+                    source_overrides=None):
     """List candidates for the full routing context.
 
     Every enabled routine participates for source kinds used by the active
@@ -617,6 +667,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None):
     """
     source_kinds = set(source_kinds) if source_kinds is not None else None
     routing_context = routines if routing_context is None else routing_context
+    source_overrides = source_overrides or {}
     claims = {}
     failures = []
     entries = [
@@ -650,13 +701,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None):
         rid = routine["id"]
         kind = source["kind"]
         list_candidates, fetch = SOURCES[kind]
-        listing_source = source
+        override = source_overrides.get((rid, source_index))
+        listing_source = dict(source, **override) if override else source
         if kind == "slack" and source.get("include_mentions"):
             # Mentions are workspace-wide. Exclude every explicitly owned
             # channel, including channels owned by another routine whose digest
             # source id differs from the mention thread's source id.
             listing_source = dict(
-                source,
+                listing_source,
                 _exclude_mention_channels=sorted(claimed_slack_channels),
             )
         if kind == "gchat" and source.get("all_spaces"):
@@ -792,9 +844,19 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     new = 0
     for claim in claims:
         candidate = claim["candidate"]
-        if candidate["id"] in processed:
+        existing = processed.get(candidate["id"])
+        retry_memory = (
+            existing is not None
+            and claim["source"].get("catch_up") is True
+            and "memory_error" in existing
+        )
+        if existing is not None and not retry_memory:
             totals["skipped"] += 1
             continue
+        if retry_memory:
+            log(
+                f"routine={rid} retrying id={candidate['id']} after memory error"
+            )
         new += 1
         totals["matched"] += 1
         if lock:

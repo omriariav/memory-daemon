@@ -228,6 +228,22 @@ threads should retain their own stable identities. Daily candidates are
 re-fetched from the start of their UTC day before analysis, so a short discovery
 window or result cap cannot replace a complete memory with a partial slice.
 
+Set `catch_up: true` on an uncapped all-space daily batch when every message
+must eventually be swept even after sleep or a long outage:
+
+```yaml
+catch_up: true
+catch_up_overlap: 1h
+```
+
+After an error-free run, `state/cursors.json` records when that source scan
+started. The next scan begins one overlap before that checkpoint. The processed
+ledger skips unchanged daily versions, while messages that arrived during the
+previous run remain eligible. A source, analysis, or memory error holds the
+cursor; catch-up items ledgered with a memory error are retried. Before the
+first successful run, `batch_messages_after` is the bootstrap boundary (or the
+configured `hours` window is used when no boundary exists).
+
 When changing an existing routine from thread batching to `batch_messages`,
 set `batch_messages_after` to the last timestamp covered by the old mode:
 
