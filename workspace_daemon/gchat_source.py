@@ -174,11 +174,12 @@ def candidates(source):
 
 
 def _member_context(space):
-    """Return sender-name mapping plus the space's member names, cached per run."""
+    """Return verified member metadata plus display names, cached per run."""
     if space in _member_cache:
         return _member_cache[space]
     names = {}
     members = []
+    people = {}
     try:
         d = _gws(["chat", "members", space])
         rows = d if isinstance(d, list) else d.get("memberships") or d.get("members") or []
@@ -187,6 +188,11 @@ def _member_context(space):
             display = r.get("display_name") or r.get("email") or user
             if user and display:
                 names[user] = display
+                people[user] = {
+                    "email": str(r.get("email") or "").strip().casefold(),
+                    "name": display,
+                    "role": "gchat-member",
+                }
             if display:
                 members.append(display)
     except Exception as exc:  # cosmetic — raw user ids still identify speakers
@@ -194,6 +200,7 @@ def _member_context(space):
     context = {
         "names": names,
         "members": sorted(set(members)),
+        "people": people,
     }
     _member_cache[space] = context
     return context
@@ -225,12 +232,30 @@ def fetch(routine, candidate):
     space_context = _space_context(raw["space"])
     names = member_context["names"]
     members = member_context["members"]
+    member_people = member_context["people"]
     space_type = space_context.get("type", "")
     context_members = (
         members
         if space_type == "DIRECT_MESSAGE" or len(members) <= MAX_CONTEXT_MEMBERS
         else []
     )
+    participant_ids = {
+        m.get("sender") for m in msgs if m.get("sender")
+    }
+    # Small-room membership is useful for resolving people mentioned in a
+    # message even when they did not speak in the supplied window.  In a large
+    # room, constrain identity candidates to actual senders to avoid needless
+    # directory calls and accidental broad attribution.
+    identity_ids = (
+        set(member_people)
+        if len(member_people) <= MAX_CONTEXT_MEMBERS
+        else participant_ids
+    )
+    source_people = [
+        member_people[user]
+        for user in sorted(identity_ids)
+        if user in member_people and member_people[user].get("email")
+    ]
 
     lines = [
         timestamped_line(
@@ -260,6 +285,7 @@ def fetch(routine, candidate):
             "gchat_thread": raw["source_id"],
             "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
                                           for m in msgs}),
+            "source_people": source_people,
             "message_count": len(msgs),
             "first_message_at": msgs[0].get("create_time", ""),
             "latest_message_at": msgs[-1].get("create_time", ""),

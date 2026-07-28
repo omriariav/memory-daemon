@@ -16,9 +16,10 @@ Validation discipline (nothing model-invented reaches the store unchecked):
 - entry type is checked against the store's known types, else falls back
 - people slugs are checked against `slugs list --kind person`; unknown ones are
   dropped to a `people-unmapped` tag rather than minting a new identity
-- Drive owner emails are resolved exactly through the Workspace directory;
-  those verified identities may safely mint a new person slug, except for the
-  authenticated user, who remains source metadata rather than a self-link
+- structured Gmail, Google Chat, and Drive emails are resolved exactly through
+  the Workspace directory; verified identities may safely mint a new person
+  slug, while the authenticated user and aliases resolving to that same person
+  remain source metadata rather than self-links
 - every entry carries a canonical --source-ids, so re-runs update in place
 """
 import json
@@ -33,6 +34,7 @@ MEMORY_TYPES = {
     "incident", "achievement", "feedback", "meeting", "note", "summary",
 }
 AUTO_TAG = "auto-captured"
+MAX_SOURCE_PEOPLE = 20
 EXTRACT_PROMPT = """You are filing a distilled work note into a structured personal memory store.
 
 Read the note below and answer with a SINGLE JSON object, no markdown fence, no
@@ -44,11 +46,15 @@ other text, with exactly these keys:
           (use "meeting" only for an actual meeting record; an email report or
           channel discussion is a "note", "decision", or "event")
   "title": short specific title (<= 90 chars)
-  "people": array of kebab-case person slugs, ONLY from this known list: {slugs}
-            (leave out anyone not on the list)
+  "people": array of kebab-case person slugs, ONLY from the allowed identities
+            below (leave out anyone not listed, and include only people
+            materially involved in the memory)
   "tags": array of 1-4 short kebab-case topic tags
   "body": the memory entry body in ENGLISH — concrete facts, names, numbers,
           dates, decisions, follow-ups. Compact but complete.
+
+Known memory person slugs: {slugs}
+Verified source identities: {verified_people}
 
 --- NOTE ---
 Title: {title}
@@ -126,25 +132,141 @@ def source_id_for(item):
     return None
 
 
-def _verified_owner_people(item, rid):
+def _authenticated_identity(rid):
+    """Verified authenticated person used to enforce self-exclusion."""
+    try:
+        email = drive.current_user_email()
+    except Exception as exc:
+        log(
+            f"routine={rid} memory WARN authenticated Workspace identity "
+            f"unavailable: {exc}"
+        )
+        return {"email": None, "person": None, "safe": False}
+    try:
+        person = contacts.resolve_email(email)
+    except Exception as exc:
+        log(
+            f"routine={rid} memory WARN authenticated person lookup failed "
+            f"for {email}: {exc}"
+        )
+        return {"email": email, "person": None, "safe": False}
+    if not person:
+        log(
+            f"routine={rid} memory WARN authenticated person not found in "
+            f"Workspace directory: {email}"
+        )
+        return {"email": email, "person": None, "safe": False}
+    return {"email": email, "person": person, "safe": True}
+
+
+def _is_authenticated_person(email, person, identity):
+    """True for the login address or alias with the same directory identity."""
+    if email == identity.get("email"):
+        return True
+    authenticated = identity.get("person") or {}
+    return bool(
+        authenticated.get("resource_name")
+        and person
+        and person.get("resource_name") == authenticated["resource_name"]
+    )
+
+
+def _collides_with_authenticated_slug(person, identity):
+    """A different directory person cannot reuse the memory owner's slug."""
+    authenticated = identity.get("person") or {}
+    return bool(
+        person
+        and authenticated.get("slug")
+        and person.get("slug") == authenticated["slug"]
+        and person.get("resource_name") != authenticated.get("resource_name")
+    )
+
+
+def _known_slugs_for_identity(store, identity):
+    """Known store slugs with self removed; fail closed if self is unknown."""
+    if not identity.get("safe"):
+        return set()
+    slugs = set(known_person_slugs(store))
+    slugs.discard(identity["person"]["slug"])
+    return slugs
+
+
+def _verified_owner_people(item, rid, identity):
     """Resolve exact Drive owner emails; return (slugs, unresolved emails)."""
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
     if not owner_emails:
         return [], []
-    try:
-        current_user_email = drive.current_user_email()
-    except Exception as exc:
+    if not identity.get("safe"):
         log(
             f"routine={rid} memory WARN Drive owner enrichment skipped: "
-            f"authenticated Workspace identity unavailable: {exc}"
+            "authenticated person could not be verified"
         )
         return [], list(dict.fromkeys(owner_emails))
 
     slugs = []
     unresolved = []
     for email in owner_emails:
-        if str(email).strip().casefold() == current_user_email:
+        normalized = str(email).strip().casefold()
+        if normalized == identity["email"]:
             log(f"routine={rid} memory: skipped authenticated user as Drive owner")
+            continue
+        try:
+            person = contacts.resolve_email(normalized)
+        except Exception as exc:
+            log(f"routine={rid} memory WARN directory lookup failed for {normalized}: {exc}")
+            unresolved.append(normalized)
+            continue
+        if not person:
+            unresolved.append(normalized)
+            continue
+        if _is_authenticated_person(normalized, person, identity):
+            log(f"routine={rid} memory: skipped authenticated user alias as Drive owner")
+            continue
+        if _collides_with_authenticated_slug(person, identity):
+            log(
+                f"routine={rid} memory WARN Drive owner {normalized} has a "
+                "person-slug collision with the authenticated user"
+            )
+            unresolved.append(normalized)
+            continue
+        slugs.append(person["slug"])
+        log(
+            f"routine={rid} memory: verified Drive owner "
+            f"{person['name']} <{person['email']}> as {person['slug']}"
+        )
+    return list(dict.fromkeys(slugs)), unresolved
+
+
+def _verified_source_people(item, rid, identity):
+    """Resolve exact Gmail/Chat participant emails for safe model attribution."""
+    candidates = item.get("frontmatter", {}).get("source_people") or []
+    candidates = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("email")
+    ]
+    if not candidates:
+        return [], []
+    candidates = candidates[:MAX_SOURCE_PEOPLE]
+    if not identity.get("safe"):
+        unresolved = list(dict.fromkeys(
+            str(candidate["email"]).strip().casefold() for candidate in candidates
+        ))
+        log(
+            f"routine={rid} memory WARN source identity enrichment skipped: "
+            "authenticated person could not be verified"
+        )
+        return [], unresolved
+
+    verified = []
+    unresolved = []
+    seen = set()
+    for candidate in candidates:
+        email = str(candidate["email"]).strip().casefold()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        if email == identity["email"]:
+            log(f"routine={rid} memory: skipped authenticated user as source participant")
             continue
         try:
             person = contacts.resolve_email(email)
@@ -155,21 +277,43 @@ def _verified_owner_people(item, rid):
         if not person:
             unresolved.append(email)
             continue
-        slugs.append(person["slug"])
+        if _is_authenticated_person(email, person, identity):
+            log(
+                f"routine={rid} memory: skipped authenticated user alias "
+                "as source participant"
+            )
+            continue
+        if _collides_with_authenticated_slug(person, identity):
+            log(
+                f"routine={rid} memory WARN source participant {email} has a "
+                "person-slug collision with the authenticated user"
+            )
+            unresolved.append(email)
+            continue
+        verified.append(person)
         log(
-            f"routine={rid} memory: verified Drive owner "
+            f"routine={rid} memory: verified source participant "
             f"{person['name']} <{person['email']}> as {person['slug']}"
         )
-    return list(dict.fromkeys(slugs)), unresolved
+    return verified, unresolved
 
 
-def _extract(routine, item, summary, store):
+def _extract(routine, item, summary, store, verified_people=(), identity=None):
     """Structured second pass over the already-distilled summary."""
     from . import llm  # late import to avoid cycles
 
-    slugs = sorted(known_person_slugs(store))
+    identity = identity or {"safe": False}
+    slugs = sorted(
+        _known_slugs_for_identity(store, identity)
+        | {person["slug"] for person in verified_people}
+    )
+    verified_catalog = ", ".join(
+        f"{person['name']} -> {person['slug']}"
+        for person in verified_people
+    )
     prompt = EXTRACT_PROMPT.format(
         slugs=", ".join(slugs) or "(none known yet)",
+        verified_people=verified_catalog or "(none)",
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
     )
     raw = llm.analyze(routine, prompt).strip()
@@ -204,9 +348,29 @@ def capture(routine, item, summary, dry_run=False):
     entry = {"worthy": True, "type": cfg.get("type", "note"),
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}
     degraded = None
-    if cfg.get("extract", True):
+    extract = cfg.get("extract", True)
+    owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
+    identity = (
+        _authenticated_identity(rid)
+        if extract or owner_emails
+        else {"email": None, "person": None, "safe": False}
+    )
+    if extract:
+        verified_source, unresolved_source = _verified_source_people(
+            item, rid, identity
+        )
+    else:
+        verified_source, unresolved_source = [], []
+    verified_owners, unresolved_owners = _verified_owner_people(
+        item, rid, identity
+    )
+    if extract:
         try:
-            entry.update(_extract(routine, item, summary, store))
+            entry.update(_extract(
+                routine, item, summary, store,
+                verified_people=verified_source,
+                identity=identity,
+            ))
         except Exception as exc:
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
@@ -217,23 +381,44 @@ def capture(routine, item, summary, dry_run=False):
 
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")
-    known = known_person_slugs(store)
-    verified, unresolved = _verified_owner_people(item, rid)
-    allowed = known | set(verified)
+    known = _known_slugs_for_identity(store, identity)
+    source_slugs = {person["slug"] for person in verified_source}
+    allowed = known | source_slugs | set(verified_owners)
     model_people = entry.get("people") or []
     people = list(dict.fromkeys(
-        verified + [p for p in model_people if p in allowed]
+        verified_owners + [p for p in model_people if p in allowed]
     ))
     dropped = [p for p in model_people if p not in allowed]
+    source_people_truncated = bool(
+        item.get("frontmatter", {}).get("source_people_truncated")
+        or len(item.get("frontmatter", {}).get("source_people") or [])
+        > MAX_SOURCE_PEOPLE
+    )
     tags = [t for t in entry.get("tags") or [] if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(t))]
     tags += list(cfg.get("tags") or [])
     tags.append(AUTO_TAG)
-    if dropped or unresolved:
+    if (
+        dropped or unresolved_source or unresolved_owners
+        or source_people_truncated or (extract and not identity.get("safe"))
+    ):
         tags.append("people-unmapped")
         if dropped:
             log(f"routine={rid} memory: dropped unknown slugs {dropped}")
-        if unresolved:
-            log(f"routine={rid} memory: unresolved Drive owners {unresolved}")
+        if unresolved_source:
+            log(
+                f"routine={rid} memory: unresolved source identities "
+                f"{unresolved_source}"
+            )
+        if unresolved_owners:
+            log(
+                f"routine={rid} memory: unresolved Drive owners "
+                f"{unresolved_owners}"
+            )
+        if source_people_truncated:
+            log(
+                f"routine={rid} memory: source identity candidates truncated "
+                f"to {MAX_SOURCE_PEOPLE}"
+            )
     if degraded:
         tags.append("extract-degraded")
     title = (entry.get("title") or item.get("title") or "untitled")[:120]

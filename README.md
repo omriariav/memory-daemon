@@ -305,17 +305,21 @@ source:
 
 For those meetings that is ~2k chars of email versus ~31k of document.
 
-After a successful expansion, the daemon also reads the Drive file owners and
-preserves their email addresses as source metadata. A memory sink resolves each
-exact address through `gws contacts directory-search` and adds the verified
-person slug even when that person is new to the store. The authenticated
-Workspace account is identified through `gws drive about` and excluded: a
-personal memory should link the other people in the meeting, not its own owner.
+The daemon preserves structured identity candidates from source metadata:
+Gmail `From`/`To`/`Cc` addresses, Google Chat membership records, and Drive file
+owners after a successful document expansion. A memory sink resolves each exact
+address through `gws contacts directory-search` before the extraction model may
+link it. Verified Gmail and Chat identities become allowed candidates, and the
+model selects only people materially involved in that memory; Drive owners are
+linked directly. A verified person may be new to the store.
+
+The authenticated Workspace account is identified through `gws drive about`
+and excluded: personal memory should link the other people, not its own owner.
 Fuzzy directory results are never accepted: the returned contact must contain
 the requested email. Directory or account-identity failures do not discard the
-meeting; they skip unsafe owner enrichment and leave `people-unmapped` for later
-repair. This requires Drive metadata and Workspace directory-read access in the
-`gws` authorization.
+capture; they skip unsafe enrichment and add `people-unmapped` for later repair.
+This requires Workspace directory-read access and the source-specific metadata
+scopes in the `gws` authorization.
 
 Picking the **wrong** document is the worst thing this can do — a confident
 summary of somebody else's meeting, filed in your vault. Three guards:

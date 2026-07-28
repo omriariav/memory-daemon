@@ -6,9 +6,12 @@ never summarized twice and never left with silently unfinished Gmail actions.
 import datetime
 import re
 from contextlib import ExitStack
+from email.utils import getaddresses
 
 from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
 from .shell import log, utc_now_iso
+
+MAX_GMAIL_SOURCE_PEOPLE = 20
 
 
 def _needs_label_catalog(routines):
@@ -134,6 +137,32 @@ def _gmail_candidates(source):
     ]
 
 
+def _email_source_people(headers):
+    """Verified-identity candidates from structured Gmail address headers.
+
+    These addresses are not trusted as person slugs by themselves.  The memory
+    sink resolves each exact address through the Workspace directory before it
+    lets the extraction model link the person.
+    """
+    people = []
+    seen = set()
+    for field in ("from", "to", "cc"):
+        value = headers.get(field) or ""
+        for name, email in getaddresses([value]):
+            normalized = email.strip().casefold()
+            if not normalized or "@" not in normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            if len(people) >= MAX_GMAIL_SOURCE_PEOPLE:
+                return people, True
+            people.append({
+                "email": normalized,
+                "name": " ".join(name.split()),
+                "role": field,
+            })
+    return people, False
+
+
 def _gmail_fetch(routine, source, candidate):
     message_id = candidate["id"]
     msg = gmail.read_message(message_id)
@@ -142,6 +171,7 @@ def _gmail_fetch(routine, source, candidate):
     thread_id = candidate["raw"].get("thread_id", message_id)
     subject = headers.get("subject", "")
     date = notes.email_date(headers)
+    source_people, source_people_truncated = _email_source_people(headers)
 
     item = {
         "id": message_id,
@@ -156,6 +186,8 @@ def _gmail_fetch(routine, source, candidate):
             "email_from": headers.get("from", ""),
             "email_subject": subject,
             "email_date": headers.get("date", ""),
+            "source_people": source_people,
+            "source_people_truncated": source_people_truncated,
         },
     }
 

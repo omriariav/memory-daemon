@@ -157,6 +157,81 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(item["frontmatter"]["subject_report_date"], "2026-07-04")
         self.assertTrue(item["frontmatter"]["quoted_history_removed"])
 
+    def test_gmail_exposes_structured_address_headers_for_identity_resolution(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Privacy decision",
+                "from": '"Alice Example" <ALICE@example.com>',
+                "to": "Memory Owner <owner@example.com>, Bob Example <bob@example.com>",
+                "cc": "Bob Again <BOB@example.com>, Carol Example <carol@example.com>",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": "A durable privacy decision.",
+        }
+        r = routine(self.vault, label="EMEA")
+
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "m2", "raw": {"thread_id": "thread-1"}},
+        )
+
+        self.assertEqual(
+            item["frontmatter"]["source_people"],
+            [
+                {
+                    "email": "alice@example.com",
+                    "name": "Alice Example",
+                    "role": "from",
+                },
+                {
+                    "email": "owner@example.com",
+                    "name": "Memory Owner",
+                    "role": "to",
+                },
+                {
+                    "email": "bob@example.com",
+                    "name": "Bob Example",
+                    "role": "to",
+                },
+                {
+                    "email": "carol@example.com",
+                    "name": "Carol Example",
+                    "role": "cc",
+                },
+            ],
+        )
+        self.assertFalse(item["frontmatter"]["source_people_truncated"])
+
+    def test_gmail_identity_candidates_are_capped_with_sender_first(self):
+        recipients = ", ".join(
+            f"Person {index} <person{index}@example.com>"
+            for index in range(runner.MAX_GMAIL_SOURCE_PEOPLE + 5)
+        )
+        people, truncated = runner._email_source_people({
+            "from": "Sender <sender@example.com>",
+            "to": recipients,
+        })
+
+        self.assertEqual(len(people), runner.MAX_GMAIL_SOURCE_PEOPLE)
+        self.assertEqual(people[0]["email"], "sender@example.com")
+        self.assertTrue(truncated)
+
+    def test_gmail_malformed_addresses_do_not_consume_identity_capacity(self):
+        people, truncated = runner._email_source_people({
+            "from": "Malformed, Sender <sender@example.com>",
+        })
+
+        self.assertEqual(
+            people,
+            [{
+                "email": "sender@example.com",
+                "name": "Sender",
+                "role": "from",
+            }],
+        )
+        self.assertFalse(truncated)
+
     def test_message_updates_root_message_keeps_explicit_subject_date(self):
         gmail.read_message = lambda mid: {
             "headers": {

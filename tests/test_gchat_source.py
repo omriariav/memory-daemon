@@ -19,8 +19,16 @@ MESSAGES = {
     "count": 3,
 }
 MEMBERS = [
-    {"user": "users/1", "display_name": "Jane Doe"},
-    {"user": "users/2", "display_name": "John Smith"},
+    {
+        "user": "users/1",
+        "display_name": "Jane Doe",
+        "email": "jane@example.com",
+    },
+    {
+        "user": "users/2",
+        "display_name": "John Smith",
+        "email": "john@example.com",
+    },
 ]
 SPACE = {
     "name": "spaces/AAA",
@@ -188,6 +196,57 @@ class FetchTest(unittest.TestCase):
             item["frontmatter"]["gchat_space_members"], ["Jane Doe", "John Smith"]
         )
         self.assertEqual(item["frontmatter"]["gchat_space_member_count"], 2)
+        self.assertEqual(
+            item["frontmatter"]["source_people"],
+            [
+                {
+                    "email": "jane@example.com",
+                    "name": "Jane Doe",
+                    "role": "gchat-member",
+                },
+                {
+                    "email": "john@example.com",
+                    "name": "John Smith",
+                    "role": "gchat-member",
+                },
+            ],
+        )
+
+    def test_large_space_exposes_only_actual_senders_as_identity_candidates(self):
+        cand = self._candidate()
+        members = [
+            {
+                "user": f"users/{index}",
+                "display_name": f"Person {index}",
+                "email": f"person{index}@example.com",
+            }
+            for index in range(25)
+        ]
+        space = {
+            "name": "spaces/AAA",
+            "display_name": "Large room",
+            "type": "SPACE",
+        }
+        with mock.patch.object(
+            gchat_source, "_gws",
+            side_effect=lambda args: space if args[1] == "get-space" else members,
+        ):
+            item = gchat_source.fetch({}, cand)
+        self.assertEqual(
+            item["frontmatter"]["source_people"],
+            [
+                {
+                    "email": "person1@example.com",
+                    "name": "Person 1",
+                    "role": "gchat-member",
+                },
+                {
+                    "email": "person2@example.com",
+                    "name": "Person 2",
+                    "role": "gchat-member",
+                },
+            ],
+        )
 
     def test_large_space_keeps_count_without_copying_roster_into_item(self):
         cand = self._candidate()
