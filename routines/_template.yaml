@@ -86,7 +86,9 @@ analyze:
     - Domain A
     - Domain B
 
-  # The actual analysis brief. Be specific about structure and scope.
+  # The actual analysis brief. Be specific about structure and scope. Domain
+  # routines should name adjacent domains they do not own, tell the model how
+  # to handle mixed items, and use the exact NOT MEMORY-WORTHY rejection token.
   instruction: >-
     Summarize this email for a product leader. Use short bullet points.
     Do not editorialize beyond what the email states.
