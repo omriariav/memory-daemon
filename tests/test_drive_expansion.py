@@ -56,6 +56,15 @@ class DriveIdentityTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, 1)
 
+    def test_empty_exception_message_remains_a_failure(self):
+        with mock.patch.object(
+            drive,
+            "run_json",
+            side_effect=RuntimeError(),
+        ), mock.patch.object(drive, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaises(RuntimeError):
+                drive.current_user_email()
+
     def test_clear_cache_allows_retry(self):
         response = {"user": {"email": "me@example.com"}}
         with mock.patch.object(

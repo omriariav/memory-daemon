@@ -156,7 +156,7 @@ def _current_user_email_result():
 def current_user_email():
     """Authenticated Workspace email, cached for one daemon run."""
     email, error = _current_user_email_result()
-    if error:
+    if error is not None:
         raise RuntimeError(error)
     return email
 
