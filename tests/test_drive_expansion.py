@@ -61,6 +61,11 @@ class GmailLinkedDocumentTest(unittest.TestCase):
              mock.patch.object(drive, "info", return_value=document), \
              mock.patch.object(
                  drive,
+                 "file_info",
+                 return_value={"owners": ["OWNER@EXAMPLE.COM"]},
+             ), \
+             mock.patch.object(
+                 drive,
                  "read_tabs",
                  return_value=("### Full Notes\n\nDecision", ["Full Notes"]),
              ):
@@ -76,6 +81,10 @@ class GmailLinkedDocumentTest(unittest.TestCase):
         self.assertEqual(item["frontmatter"]["doc_lookup"], "gmail-link")
         self.assertEqual(item["frontmatter"]["doc_tabs"], ["Full Notes"])
         self.assertEqual(item["frontmatter"]["meeting_date"], "2026-07-07")
+        self.assertEqual(
+            item["frontmatter"]["drive_owner_emails"],
+            ["owner@example.com"],
+        )
         self.assertEqual(item["date"], "2026-07-07")
         self.assertEqual(item["body"], "### Full Notes\n\nDecision")
 
@@ -94,6 +103,7 @@ class GmailLinkedDocumentTest(unittest.TestCase):
         with mock.patch.object(gmail, "links", return_value=[]), \
              mock.patch.object(drive, "find_doc", return_value=found) as find_doc, \
              mock.patch.object(drive, "info", return_value=document), \
+             mock.patch.object(drive, "file_info", return_value={"owners": []}), \
              mock.patch.object(
                  drive,
                  "read_tabs",
@@ -112,6 +122,38 @@ class GmailLinkedDocumentTest(unittest.TestCase):
             on_date="2026-07-01",
         )
         self.assertEqual(item["frontmatter"]["doc_lookup"], "title-date-search")
+
+    def test_owner_lookup_failure_does_not_lose_expanded_note(self):
+        links = [{
+            "google_docs_id": "linked-doc",
+            "href": "https://docs.google.test/document/d/linked-doc/edit",
+            "text": "Open meeting notes",
+        }]
+        document = {
+            "title": "Weekly Sync – 2026/07/01 – Notes by Gemini",
+            "tabs": [{"title": "Full Notes"}],
+        }
+        item = self.item()
+
+        with mock.patch.object(gmail, "links", return_value=links), \
+             mock.patch.object(drive, "info", return_value=document), \
+             mock.patch.object(drive, "file_info", side_effect=RuntimeError("denied")), \
+             mock.patch.object(
+                 drive,
+                 "read_tabs",
+                 return_value=("### Full Notes\n\nDecision", ["Full Notes"]),
+             ), \
+             mock.patch.object(runner, "log") as log:
+            runner._expand_from_drive(
+                self.EXPAND,
+                item,
+                "Notes: 'Weekly Sync' 1 Jul 2026",
+                "2026-07-01",
+            )
+
+        self.assertEqual(item["body"], "### Full Notes\n\nDecision")
+        self.assertNotIn("drive_owner_emails", item["frontmatter"])
+        self.assertTrue(any("owner lookup failed" in call.args[0] for call in log.call_args_list))
 
 
 if __name__ == "__main__":

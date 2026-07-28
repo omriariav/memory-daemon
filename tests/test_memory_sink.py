@@ -143,6 +143,45 @@ class CaptureValidationTest(unittest.TestCase):
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "note")
 
+    def test_verified_drive_owner_can_mint_new_person_slug(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        verified = {
+            "email": "owner@example.com",
+            "name": "Owner Example",
+            "slug": "owner-example",
+        }
+        with mock.patch.object(memory_sink.contacts, "resolve_email",
+                               return_value=verified):
+            out, calls = self._run_capture()
+
+        idx = calls["args"].index("--people")
+        self.assertEqual(calls["args"][idx + 1], "owner-example")
+        self.assertEqual(out["memory_people"], ["owner-example"])
+
+    def test_unresolved_drive_owner_is_tagged_without_failing_capture(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(memory_sink.contacts, "resolve_email",
+                               return_value=None):
+            out, calls = self._run_capture()
+
+        self.assertNotIn("--people", calls["args"])
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("people-unmapped", tags)
+        self.assertEqual(out["memory"], "created")
+
+    def test_directory_failure_is_tagged_without_failing_capture(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(
+            memory_sink.contacts,
+            "resolve_email",
+            side_effect=RuntimeError("directory unavailable"),
+        ):
+            out, calls = self._run_capture()
+
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("people-unmapped", tags)
+        self.assertEqual(out["memory"], "created")
+
     def test_not_worthy_skips_store(self):
         out, calls = self._run_capture(
             {"worthy": False, "type": "note", "title": "T", "people": [],

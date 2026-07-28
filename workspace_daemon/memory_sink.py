@@ -16,12 +16,15 @@ Validation discipline (nothing model-invented reaches the store unchecked):
 - entry type is checked against the store's known types, else falls back
 - people slugs are checked against `slugs list --kind person`; unknown ones are
   dropped to a `people-unmapped` tag rather than minting a new identity
+- Drive owner emails are resolved exactly through the Workspace directory;
+  those verified identities may safely mint a new person slug
 - every entry carries a canonical --source-ids, so re-runs update in place
 """
 import json
 import re
 import subprocess
 
+from . import contacts
 from .shell import log
 
 MEMORY_TYPES = {
@@ -122,6 +125,29 @@ def source_id_for(item):
     return None
 
 
+def _verified_owner_people(item, rid):
+    """Resolve exact Drive owner emails; return (slugs, unresolved emails)."""
+    owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
+    slugs = []
+    unresolved = []
+    for email in owner_emails:
+        try:
+            person = contacts.resolve_email(email)
+        except Exception as exc:
+            log(f"routine={rid} memory WARN directory lookup failed for {email}: {exc}")
+            unresolved.append(email)
+            continue
+        if not person:
+            unresolved.append(email)
+            continue
+        slugs.append(person["slug"])
+        log(
+            f"routine={rid} memory: verified Drive owner "
+            f"{person['name']} <{person['email']}> as {person['slug']}"
+        )
+    return list(dict.fromkeys(slugs)), unresolved
+
+
 def _extract(routine, item, summary, store):
     """Structured second pass over the already-distilled summary."""
     from . import llm  # late import to avoid cycles
@@ -177,14 +203,22 @@ def capture(routine, item, summary, dry_run=False):
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")
     known = known_person_slugs(store)
-    people = [p for p in entry.get("people") or [] if p in known]
-    dropped = [p for p in entry.get("people") or [] if p not in known]
+    verified, unresolved = _verified_owner_people(item, rid)
+    allowed = known | set(verified)
+    model_people = entry.get("people") or []
+    people = list(dict.fromkeys(
+        verified + [p for p in model_people if p in allowed]
+    ))
+    dropped = [p for p in model_people if p not in allowed]
     tags = [t for t in entry.get("tags") or [] if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(t))]
     tags += list(cfg.get("tags") or [])
     tags.append(AUTO_TAG)
-    if dropped:
+    if dropped or unresolved:
         tags.append("people-unmapped")
-        log(f"routine={rid} memory: dropped unknown slugs {dropped}")
+        if dropped:
+            log(f"routine={rid} memory: dropped unknown slugs {dropped}")
+        if unresolved:
+            log(f"routine={rid} memory: unresolved Drive owners {unresolved}")
     if degraded:
         tags.append("extract-degraded")
     title = (entry.get("title") or item.get("title") or "untitled")[:120]

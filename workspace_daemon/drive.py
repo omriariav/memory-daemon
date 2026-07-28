@@ -130,6 +130,11 @@ def info(doc_id):
     return run_json([gws_bin(), "docs", "info", doc_id, "--format", "json"])
 
 
+def file_info(doc_id):
+    """Drive file metadata, including owner email addresses."""
+    return run_json([gws_bin(), "drive", "info", doc_id, "--format", "json"])
+
+
 def tabs(doc_id, document=None):
     """Tab titles in document order. Single-tab docs report one entry."""
     document = document or info(doc_id)
