@@ -663,9 +663,18 @@ class CursorStoreTest(unittest.TestCase):
             loaded.checkpoint("sweep", "gchat:all-spaces", "gchat"),
             "2026-07-28T10:00:00Z",
         )
-        self.assertIsNone(
-            loaded.checkpoint("sweep", "gchat:all-spaces", "slack")
+
+    def test_mismatched_cursor_kind_fails_closed(self):
+        cursors = state.CursorStore(self.base)
+        cursors.mark_successful(
+            [("sweep", "gchat:all-spaces", "slack")],
+            "2026-07-28T10:00:00Z",
         )
+
+        with self.assertRaisesRegex(state.StateError, "expected 'gchat'"):
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            )
 
     def test_dry_run_never_writes_cursor_state(self):
         cursors = state.CursorStore(self.base, dry_run=True)

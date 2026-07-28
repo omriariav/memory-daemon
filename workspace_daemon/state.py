@@ -298,11 +298,17 @@ class CursorStore:
         return data
 
     def checkpoint(self, routine_id, source_id, kind):
-        record = self.entries.get(self.key(routine_id, source_id)) or {}
-        if record.get("kind") != kind:
+        key = self.key(routine_id, source_id)
+        record = self.entries.get(key)
+        if record is None:
             return None
+        if record.get("kind") != kind:
+            raise StateError(
+                f"{self.path}: cursor record {key!r} has kind "
+                f"{record.get('kind')!r}, expected {kind!r}"
+            )
         value = record.get("last_successful_scan_at")
-        return value if isinstance(value, str) and value else None
+        return value
 
     def mark_successful(self, sources, checkpoint):
         """Advance several source cursors in one atomic state write."""
