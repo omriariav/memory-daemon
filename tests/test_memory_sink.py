@@ -94,6 +94,7 @@ class CaptureValidationTest(unittest.TestCase):
 
     def setUp(self):
         memory_sink._slug_cache.clear()
+        memory_sink.contacts.clear_cache()
         memory_sink._slug_cache["/store"] = {"jane-doe"}
         self.routine = {"id": "r", "memory": {"store": "/store", "type": "note",
                                               "extract": False}}
@@ -142,6 +143,63 @@ class CaptureValidationTest(unittest.TestCase):
              "tags": [], "body": "b"})
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_verified_drive_owner_can_mint_new_person_slug(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        verified = {
+            "email": "owner@example.com",
+            "name": "Owner Example",
+            "slug": "owner-example",
+        }
+        with mock.patch.object(memory_sink.contacts, "resolve_email",
+                               return_value=verified):
+            out, calls = self._run_capture()
+
+        idx = calls["args"].index("--people")
+        self.assertEqual(calls["args"][idx + 1], "owner-example")
+        self.assertEqual(out["memory_people"], ["owner-example"])
+
+    def test_unresolved_drive_owner_is_tagged_without_failing_capture(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(memory_sink.contacts, "resolve_email",
+                               return_value=None):
+            out, calls = self._run_capture()
+
+        self.assertNotIn("--people", calls["args"])
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("people-unmapped", tags)
+        self.assertEqual(out["memory"], "created")
+
+    def test_directory_failure_is_tagged_without_failing_capture(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(
+            memory_sink.contacts,
+            "resolve_email",
+            side_effect=RuntimeError("directory unavailable"),
+        ):
+            out, calls = self._run_capture()
+
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("people-unmapped", tags)
+        self.assertEqual(out["memory"], "created")
+
+    def test_directory_failure_shells_out_once_across_captures(self):
+        self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
+        with mock.patch.object(
+            memory_sink.contacts,
+            "run_json",
+            side_effect=RuntimeError("directory unavailable"),
+        ) as directory, mock.patch.object(
+            memory_sink.contacts,
+            "gws_bin",
+            return_value="/bin/gws",
+        ):
+            first, _ = self._run_capture()
+            second, _ = self._run_capture()
+
+        self.assertEqual(first["memory"], "created")
+        self.assertEqual(second["memory"], "created")
+        self.assertEqual(directory.call_count, 1)
 
     def test_not_worthy_skips_store(self):
         out, calls = self._run_capture(

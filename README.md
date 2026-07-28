@@ -296,6 +296,15 @@ source:
 
 For those meetings that is ~2k chars of email versus ~31k of document.
 
+After a successful expansion, the daemon also reads the Drive file owners and
+preserves their email addresses as source metadata. A memory sink resolves each
+exact address through `gws contacts directory-search` and adds the verified
+person slug even when that person is new to the store. Fuzzy directory results
+are never accepted: the returned contact must contain the requested email.
+Directory failures do not discard the meeting; they leave `people-unmapped` for
+later repair. This requires Workspace directory-read access in the `gws`
+authorization.
+
 Picking the **wrong** document is the worst thing this can do — a confident
 summary of somebody else's meeting, filed in your vault. Three guards:
 
@@ -444,6 +453,7 @@ workspace_daemon/
   shell.py                 binary resolution, subprocess, logging
   gmail.py                 gws Gmail adapter
   drive.py                 gws Drive/Docs adapter, tab reading, doc lookup
+  contacts.py              exact Workspace-directory identity resolution
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
   llm.py                   yoetz adapter, prompt building, label extraction

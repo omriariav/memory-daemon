@@ -7,7 +7,7 @@ import datetime
 import re
 from contextlib import ExitStack
 
-from . import actions, config, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
+from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state
 from .shell import log, utc_now_iso
 
 
@@ -30,6 +30,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     which owners may process in this invocation while still letting inactive
     domain routines protect their candidates from a due fallback sweep.
     """
+    contacts.clear_cache()
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
@@ -224,6 +225,7 @@ def _expand_from_drive(expand, item, subject, date):
         _missing(expand, item, f"doc {doc['id']} had no text in the requested tabs")
         return
 
+    owner_emails = _drive_owner_emails(doc["id"])
     item["body"] = body
     item["frontmatter"].update({
         "expanded": True,
@@ -233,6 +235,8 @@ def _expand_from_drive(expand, item, subject, date):
         "doc_tabs": read,
         "doc_lookup": lookup,
     })
+    if owner_emails:
+        item["frontmatter"]["drive_owner_emails"] = owner_emails
     if doc.get("linked_tab_ids"):
         item["frontmatter"]["doc_linked_tab_ids"] = doc["linked_tab_ids"]
     normalized_read = {" ".join(tab.split()).casefold() for tab in read}
@@ -243,6 +247,20 @@ def _expand_from_drive(expand, item, subject, date):
     ]
     if missing_tabs:
         log(f"doc={doc['id']} tabs not present, skipped: {', '.join(missing_tabs)}")
+
+
+def _drive_owner_emails(doc_id):
+    """Best-effort owner metadata; identity enrichment must not lose the note."""
+    try:
+        metadata = drive.file_info(doc_id)
+    except Exception as exc:
+        log(f"WARN doc={doc_id} Drive owner lookup failed: {exc}")
+        return []
+    return list(dict.fromkeys(
+        str(owner).strip().casefold()
+        for owner in metadata.get("owners", [])
+        if isinstance(owner, str) and "@" in owner
+    ))
 
 
 def _linked_google_doc(message_id):
@@ -328,19 +346,23 @@ def _drive_fetch(routine, source, candidate):
         missing = [t for t in wanted if t not in read]
         if missing:
             log(f"doc={doc_id} tabs not present, skipped: {', '.join(missing)}")
+    owner_emails = _drive_owner_emails(doc_id)
+    frontmatter = {
+        "drive_file_id": doc_id,
+        "drive_link": meta.get("web_link", ""),
+        "doc_title": name,
+        "doc_tabs": read,
+        "doc_modified": meta.get("modified", ""),
+    }
+    if owner_emails:
+        frontmatter["drive_owner_emails"] = owner_emails
     return {
         "id": doc_id,
         "source_kind": "drive_docs",
         "title": drive.meeting_title(name),
         "date": drive.date_from_name(name) or (meta.get("modified") or "")[:10],
         "body": body,
-        "frontmatter": {
-            "drive_file_id": doc_id,
-            "drive_link": meta.get("web_link", ""),
-            "doc_title": name,
-            "doc_tabs": read,
-            "doc_modified": meta.get("modified", ""),
-        },
+        "frontmatter": frontmatter,
     }
 
 
