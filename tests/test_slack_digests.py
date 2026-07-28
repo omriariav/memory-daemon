@@ -114,6 +114,38 @@ class PrivateDigestTest(unittest.TestCase):
         self.assertNotIn("123456", item["body"])
 
 
+class MentionOwnershipTest(unittest.TestCase):
+    def test_mentions_skip_channels_owned_by_another_routine(self):
+        mentions = {
+            "ok": True,
+            "mentions": [
+                {
+                    "source_id": "slack:COWNED:100.0",
+                    "channel_id": "COWNED",
+                    "ts": "100.0",
+                    "text": "already in the domain digest",
+                },
+                {
+                    "source_id": "slack:CEXTERNAL:200.0",
+                    "channel_id": "CEXTERNAL",
+                    "ts": "200.0",
+                    "text": "keep this external mention",
+                },
+            ],
+        }
+        with mock.patch.object(slack_source, "_cli", return_value=mentions):
+            candidates = slack_source.candidates({
+                "include_mentions": True,
+                "hours": 24,
+                "_exclude_mention_channels": ["COWNED"],
+            })
+
+        self.assertEqual(
+            [candidate["raw"]["channel"] for candidate in candidates],
+            ["CEXTERNAL"],
+        )
+
+
 class HybridValidationTest(unittest.TestCase):
     def routine(self, source):
         return {

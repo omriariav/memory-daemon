@@ -125,10 +125,19 @@ def find_doc(title, name_contains=None, on_date=None, max_results=25):
     return candidates[0]
 
 
-def tabs(doc_id):
+def info(doc_id):
+    """Document metadata, including title and ordered tab metadata."""
+    return run_json([gws_bin(), "docs", "info", doc_id, "--format", "json"])
+
+
+def tabs(doc_id, document=None):
     """Tab titles in document order. Single-tab docs report one entry."""
-    info = run_json([gws_bin(), "docs", "info", doc_id, "--format", "json"])
-    return [t.get("title") for t in info.get("tabs", []) if t.get("title")]
+    document = document or info(doc_id)
+    return [
+        tab.get("title")
+        for tab in document.get("tabs", [])
+        if tab.get("title")
+    ]
 
 
 def read_tab(doc_id, tab):
@@ -139,14 +148,24 @@ def read_tab(doc_id, tab):
     return result.get("text") or ""
 
 
-def read_tabs(doc_id, wanted=None):
+def read_tabs(doc_id, wanted=None, document=None):
     """Concatenate the requested tabs into one labelled document.
 
     `wanted` is a list of tab titles; missing ones are skipped rather than
-    failing, since not every notes doc has every tab. None reads all tabs.
+    failing, since not every notes doc has every tab. Matching ignores case and
+    repeated whitespace because Gemini has emitted both "Full notes" and
+    "Full Notes". None reads all tabs.
     """
-    available = tabs(doc_id)
-    selected = available if not wanted else [t for t in available if t in wanted]
+    available = tabs(doc_id, document=document)
+    by_normalized = {
+        " ".join(title.split()).casefold(): title
+        for title in available
+    }
+    selected = available if not wanted else [
+        by_normalized[key]
+        for requested in wanted
+        if (key := " ".join(requested.split()).casefold()) in by_normalized
+    ]
     parts = []
     for title in selected:
         text = read_tab(doc_id, title).strip()

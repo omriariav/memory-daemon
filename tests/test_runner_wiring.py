@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,6 +93,81 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(note.name, "weekly-dach-2026-07-19.md",
                          "the stream title should drive the filename")
         self.assertIn("stream: Weekly - DACH", note.read_text())
+
+    def test_stream_subject_date_beats_later_reply_date(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Re: Weekly Report DACH TEAM | 4/7/2026",
+                "from": "Someone Else <reply@example.com>",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": "pixel integration is delayed",
+        }
+        streams = {
+            "Weekly Report DACH": {
+                "title": "Weekly - DACH",
+                "label": "EMEA",
+            }
+        }
+        r = routine(self.vault, streams=streams)
+        r["output"]["filename_template"] = "{title}-{date}"
+
+        totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        note = next(self.vault.glob("*.md"))
+        self.assertEqual(note.name, "weekly-dach-2026-07-04.md")
+        self.assertIn("report_date: '2026-07-04'", note.read_text())
+
+    def test_non_stream_email_keeps_header_date(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Unrelated 4/7/2026",
+                "from": "sender@example.com",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": "message",
+        }
+        r = routine(self.vault, label="EMEA")
+        r["output"]["filename_template"] = "{title}-{date}"
+
+        totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        note = next(self.vault.glob("*.md"))
+        self.assertTrue(note.name.endswith("-2026-07-27.md"))
+
+    def test_subject_report_date_parser_is_conservative(self):
+        self.assertEqual(
+            runner._report_date_from_subject("Weekly | 02/07/26"),
+            "2026-07-02",
+        )
+        self.assertEqual(
+            runner._report_date_from_subject("as of 27-07-2026"),
+            "2026-07-27",
+        )
+        self.assertIsNone(
+            runner._report_date_from_subject("week 27")
+        )
+        self.assertIsNone(
+            runner._report_date_from_subject("Weekly | 39/19/2026")
+        )
+
+    def test_dry_run_names_configured_label(self):
+        messages = []
+        with mock.patch.object(runner, "log", side_effect=messages.append):
+            totals = runner.run(
+                self.base,
+                [routine(self.vault, label="EMEA")],
+                dry_run=True,
+            )
+
+        self.assertEqual(totals["errors"], 0)
+        action_line = next(
+            message for message in messages if "would apply:" in message
+        )
+        self.assertIn("apply_label 'EMEA'", action_line)
+        self.assertNotIn("<llm-chosen>", action_line)
 
     def test_pick_label_routine_runs_clean(self):
         llm.analyze = lambda r, p: "a summary\nLABEL: CHANNELS"
