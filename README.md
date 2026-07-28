@@ -103,15 +103,17 @@ python3 -m workspace_daemon.slack_cli auth-test
 ```sh
 ./daemon.py list                              # routines, cadence, enabled state, last run
 ./daemon.py validate                          # check all routine YAML
-./daemon.py run --dry-run                     # preview, zero side effects
+./daemon.py run --dry-run                     # preview; data and state unchanged
 ./daemon.py run --routine weekly-report       # run one routine for real
 ./daemon.py run                               # run everything enabled
 ./daemon.py tick                              # run only routines whose cadence is due
 ./daemon.py new                               # interactive scaffold
 ```
 
-`--dry-run` makes **no** LLM call, **no** Gmail mutation, and **no** file or
-state write. It still queries Gmail (a read) so the preview reflects reality.
+`--dry-run` makes **no** LLM call, **no** source mutation, and **no** vault,
+memory-store, or state write. It still performs real source reads so the preview
+reflects reality, and appends to `logs/run.log` so failed previews remain
+diagnosable.
 
 ## Codex and Claude Code plugin
 

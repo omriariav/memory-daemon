@@ -146,6 +146,12 @@ class RunnerWiringTest(unittest.TestCase):
             runner._report_date_from_subject("as of 27-07-2026"),
             "2026-07-27",
         )
+        self.assertEqual(
+            runner._report_date_from_subject(
+                "Bi Weekly Report - 1st July 2026"
+            ),
+            "2026-07-01",
+        )
         self.assertIsNone(
             runner._report_date_from_subject("week 27")
         )

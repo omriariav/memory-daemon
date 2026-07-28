@@ -93,7 +93,11 @@ def cmd_run(args):
             print(f"invalid routine: {p}", file=sys.stderr)
         return 1
 
-    mode = " (dry-run — no LLM call, no Gmail mutation, no file write)" if args.dry_run else ""
+    mode = (
+        " (dry-run — no LLM call, source mutation, or data/state write; "
+        "operational log only)"
+        if args.dry_run else ""
+    )
     log(f"run start: {len(routines)} routine(s){mode}")
     try:
         active_ids = {args.routine} if args.routine else None
@@ -259,7 +263,8 @@ def main(argv=None):
     p_run = sub.add_parser("run", help="process new matches")
     p_run.add_argument("--routine", help="run only this routine id")
     p_run.add_argument("-n", "--dry-run", action="store_true",
-                       help="preview only: no LLM call, no Gmail mutation, no file write")
+                       help="preview only: no LLM/source mutation or data/state write; "
+                            "operational log only")
     p_run.add_argument("--refresh-labels", action="store_true",
                        help="refetch the Gmail label catalog instead of using the cache")
     p_run.set_defaults(func=cmd_run)
