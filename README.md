@@ -175,6 +175,13 @@ memory:
   tags: [product-area]
 ```
 
+Routing chooses a routine before analysis; an extraction prompt cannot hand an
+item to a sibling routine after ownership is recorded. Give every domain prompt
+an explicit boundary: name adjacent domains it does not own, state how to handle
+mixed items, and require the exact `NOT MEMORY-WORTHY` token when no independently
+in-scope fact remains. This prevents a broad people- or channel-based source
+from permanently claiming material under the wrong domain prompt.
+
 The legacy routine-level `actions:` key remains valid for `source:` routines.
 With `sources:`, actions belong on the Gmail source block. Validation rejects
 actions on Slack, Google Chat, and Drive sources.

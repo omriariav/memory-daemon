@@ -42,7 +42,12 @@ analyze:
   instruction: >-
     Capture durable product decisions, legal or technical constraints,
     commitments with owners, unresolved questions, and material customer
-    evidence. Ignore logistics and social chatter.
+    evidence for this product area. This routine does not own commercial
+    reporting, general organization updates, or adjacent product areas, even
+    when the same people discuss them. For mixed sources, retain only durable
+    facts that are independently in scope and do not mention discarded
+    material. Ignore logistics and social chatter. If nothing remains inside
+    this exact domain boundary, output exactly: NOT MEMORY-WORTHY
 
 memory:
   store: /absolute/path/to/personal-memory
