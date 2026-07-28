@@ -336,10 +336,12 @@ class MultiSourceRunnerTest(unittest.TestCase):
         self.assertEqual(totals["matched"], 1)
         self.assertEqual(totals["errors"], 0)
 
-    def test_failed_drive_listing_does_not_block_gmail_fallback(self):
+    def test_inactive_unrelated_source_kind_is_not_queried(self):
         fetch = runner.SOURCES["gmail"][1]
+        drive_calls = []
 
         def failed_drive(_source):
+            drive_calls.append(True)
             raise RuntimeError("drive unavailable")
 
         runner.SOURCES["drive_docs"] = (failed_drive, fetch)
@@ -360,7 +362,8 @@ class MultiSourceRunnerTest(unittest.TestCase):
 
         self.assertEqual(totals["processed"], 1)
         self.assertEqual(totals["matched"], 1)
-        self.assertEqual(totals["errors"], 1)
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(drive_calls, [])
 
     def test_failed_specific_listing_blocks_only_overlapping_chat_space(self):
         fetch = runner.SOURCES["gchat"][1]

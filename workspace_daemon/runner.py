@@ -23,8 +23,9 @@ def _needs_label_catalog(routines):
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None):
     """Process every enabled routine. Returns a summary dict.
 
-    In dry-run nothing is mutated: no yoetz call, no Gmail write, no file write,
-    no state write. Source reads still happen so the preview is real.
+    In dry-run no source or data state is mutated: no yoetz call, Gmail write,
+    vault/store write, or state write. Source reads still happen so the preview
+    is real; the CLI may append to its operational run log.
 
     `routines` is the complete routing context. `active_ids` optionally limits
     which owners may process in this invocation while still letting inactive
@@ -95,7 +96,15 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
             routing_failures.extend(_routine_failures(routine))
 
-    claims, listing_failures = _collect_claims(valid, totals)
+    active_source_kinds = {
+        source["kind"]
+        for routine in valid
+        if routine["id"] in active_ids
+        for source in config.sources(routine)
+    }
+    claims, listing_failures = _collect_claims(
+        valid, totals, source_kinds=active_source_kinds
+    )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
     )
@@ -539,21 +548,26 @@ def _ownership_limit(source, sources):
     )
 
 
-def _collect_claims(routines, totals):
+def _collect_claims(routines, totals, source_kinds=None):
     """List candidates for the full routing context.
 
-    Every enabled routine participates even when it is not due. Otherwise a
-    daily fallback could steal an item from a domain routine whose four-hour
-    cadence had not elapsed yet. Candidate processing caps remain per source,
-    but lower caps are expanded for ownership discovery so overflow items wait
-    for their specific owner instead of leaking into a broader fallback.
+    Every enabled routine participates for source kinds used by the active
+    routines, even when it is not due. Otherwise a daily fallback could steal
+    an item from a domain routine whose four-hour cadence had not elapsed yet.
+    Unrelated source kinds cannot claim the same ownership key, so querying them
+    only adds latency and lets an irrelevant outage fail a targeted run.
+    Candidate processing caps remain per source, but lower caps are expanded
+    for ownership discovery so overflow items wait for their specific owner
+    instead of leaking into a broader fallback.
     """
+    source_kinds = set(source_kinds) if source_kinds is not None else None
     claims = {}
     failures = []
     entries = [
         (routine, source_index, source)
         for routine in routines
         for source_index, source in enumerate(config.sources(routine))
+        if source_kinds is None or source.get("kind") in source_kinds
     ]
     all_sources = [source for _, _, source in entries]
     claimed_slack_channels = {
@@ -837,23 +851,49 @@ _SUBJECT_REPORT_DATE = re.compile(
     r"(?<!\d)(?P<day>[0-3]?\d)[./-](?P<month>[01]?\d)[./-]"
     r"(?P<year>20\d{2}|\d{2})(?!\d)"
 )
+_SUBJECT_TEXT_REPORT_DATE = re.compile(
+    r"(?<!\d)(?P<day>[0-3]?\d)(?:st|nd|rd|th)?\s+"
+    r"(?P<month>january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+"
+    r"(?P<year>20\d{2}|\d{2})(?!\d)",
+    re.IGNORECASE,
+)
+_MONTH_NUMBER = {
+    name: number
+    for number, name in enumerate(
+        (
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november",
+            "december",
+        ),
+        start=1,
+    )
+}
 
 
 def _report_date_from_subject(subject):
-    """Return a valid D/M/YYYY report date embedded in a subject, if any.
+    """Return a valid day-first report date embedded in a subject, if any.
 
-    These recurring business reports use day-first dates. Invalid or vague
-    periods are deliberately ignored so the normalized Gmail date remains the
-    safe fallback.
+    Supports numeric D/M/YYYY and textual forms such as ``1st July 2026``.
+    Invalid or vague periods are deliberately ignored so the normalized Gmail
+    date remains the safe fallback.
     """
-    for match in _SUBJECT_REPORT_DATE.finditer(subject or ""):
+    matches = [
+        (match, int(match.group("month")))
+        for match in _SUBJECT_REPORT_DATE.finditer(subject or "")
+    ]
+    matches.extend(
+        (match, _MONTH_NUMBER[match.group("month").casefold()])
+        for match in _SUBJECT_TEXT_REPORT_DATE.finditer(subject or "")
+    )
+    for match, month in sorted(matches, key=lambda value: value[0].start()):
         year = int(match.group("year"))
         if year < 100:
             year += 2000
         try:
             return datetime.date(
                 year,
-                int(match.group("month")),
+                month,
                 int(match.group("day")),
             ).isoformat()
         except ValueError:
