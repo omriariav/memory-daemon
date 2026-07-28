@@ -43,6 +43,14 @@ the prior mode. The boundary is exclusive and prevents old thread/day memories
 from being captured again under the new daily namespace. Keep the boundary and
 legacy ledger rows after cutover.
 
+For queue-style delivery on a broad GChat sweep, set `catch_up: true` and
+`catch_up_overlap: 1h`. Catch-up currently requires `all_spaces: true`,
+`batch_messages: daily`, `max_results: 0`, and `max_per_space: 0`. Its durable
+last-successful-scan checkpoint makes the source window expand across sleep or
+outages; the overlap is deduped by candidate version. Do not remove
+`batch_messages_after`: it remains the bootstrap boundary if cursor state must
+be rebuilt.
+
 ## Actions
 
 Only Gmail supports `apply_label`, `mark_read`, `unstar`, and `archive`.

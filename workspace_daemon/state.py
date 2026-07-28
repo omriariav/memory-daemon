@@ -31,6 +31,10 @@ def schedule_file(base_dir):
     return Path(base_dir) / "state" / "schedule.json"
 
 
+def cursor_file(base_dir):
+    return Path(base_dir) / "state" / "cursors.json"
+
+
 def load(base_dir):
     path = state_file(base_dir)
     if not path.exists():
@@ -247,6 +251,58 @@ class ScheduleStore:
             merged[rid] = {
                 "last_attempted_at": stamp,
                 "last_attempted_epoch": now,
+            }
+        write_atomic(self.path, _serialize(merged))
+        self.entries = merged
+
+
+class CursorStore:
+    """Durable last-successful source scans for queue-style catch-up.
+
+    The checkpoint is the instant a scan started, not when it finished. Messages
+    arriving during a long run therefore remain newer than the checkpoint and
+    are eligible next time. Callers add an overlap when reading; the processed
+    ledger absorbs that repeated source slice.
+    """
+
+    def __init__(self, base_dir, dry_run=False):
+        self.path = cursor_file(base_dir)
+        self.dry_run = dry_run
+        self.entries = self._load()
+
+    @staticmethod
+    def key(routine_id, source_id):
+        return f"{routine_id}:{source_id}"
+
+    def _load(self):
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise StateError(f"{self.path} is not valid cursor state: {exc}") from exc
+        if not isinstance(data, dict) or any(
+            not isinstance(value, dict) for value in data.values()
+        ):
+            raise StateError(f"{self.path} must contain an object of source records")
+        return data
+
+    def checkpoint(self, routine_id, source_id, kind):
+        record = self.entries.get(self.key(routine_id, source_id)) or {}
+        if record.get("kind") != kind:
+            return None
+        value = record.get("last_successful_scan_at")
+        return value if isinstance(value, str) and value else None
+
+    def mark_successful(self, sources, checkpoint):
+        """Advance several source cursors in one atomic state write."""
+        if self.dry_run or not sources:
+            return
+        merged = dict(self.entries)
+        for routine_id, source_id, kind in sources:
+            merged[self.key(routine_id, source_id)] = {
+                "kind": kind,
+                "last_successful_scan_at": checkpoint,
             }
         write_atomic(self.path, _serialize(merged))
         self.entries = merged

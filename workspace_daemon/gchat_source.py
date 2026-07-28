@@ -17,7 +17,9 @@ Set ``batch_messages: daily`` to give every space/UTC-day one stable digest sour
 id; hourly reruns then update that digest as messages and replies arrive. Each
 discovered day is re-fetched completely before analysis. Existing routines can
 set ``batch_messages_after`` to an exclusive RFC3339 cutover boundary so content
-handled by the previous batching mode is not captured again.
+handled by the previous batching mode is not captured again. The runner may
+inject an exact ``_since`` checkpoint for ``catch_up: true`` sources; this
+replaces the fixed discovery window without changing daily candidate identity.
 
 One `gws chat messages --after` call per space returns full message texts, so
 candidates are grouped client-side by thread. Fetch resolves the space name,
@@ -125,9 +127,10 @@ def _windowed_messages(source):
     """Yield ``(space, message)`` pairs for explicit or all-space sweeps."""
     excluded_spaces = set(source.get("_exclude_spaces") or ())
     if source.get("all_spaces"):
+        since = source.get("_since") or _hours_duration(source.get("hours", 26))
         args = [
             "chat", "recent",
-            "--since", _hours_duration(source.get("hours", 26)),
+            "--since", since,
             "--max", str(source.get("max_results", 0)),
             "--max-per-space", str(source.get("max_per_space", 0)),
         ]
@@ -151,7 +154,7 @@ def _windowed_messages(source):
         return
 
     per_space = int(source.get("max_results", 50))
-    after = _after_iso(source.get("hours", 26))
+    after = source.get("_since") or _after_iso(source.get("hours", 26))
     for space in source.get("spaces", []):
         if space in excluded_spaces:
             continue

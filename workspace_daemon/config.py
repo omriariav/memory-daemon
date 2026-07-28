@@ -77,6 +77,16 @@ def schedule_seconds(routine):
     return int(match.group("count")) * _DURATION_SECONDS[match.group("unit")]
 
 
+def duration_seconds(value):
+    """Parse a compact positive duration such as ``15m``, ``4h``, or ``1d``."""
+    match = _DURATION.fullmatch(str(value))
+    if not match:
+        raise RoutineError(
+            f"duration must look like '15m', '4h', or '1d' (got {value!r})"
+        )
+    return int(match.group("count")) * _DURATION_SECONDS[match.group("unit")]
+
+
 def routing_rank(routine):
     """Specific routines beat fallbacks; lower explicit priority wins."""
     routing = routine.get("routing") or {}
@@ -173,6 +183,10 @@ def validate(routine):
         source_dicts.append(source)
         prefix = f"{rid}: source" if has_source else f"{rid}: sources[{index}]"
         problems.extend(_validate_source(routine, source, prefix))
+    if sum(source.get("catch_up") is True for source in source_dicts) > 1:
+        problems.append(
+            f"{rid}: only one catch_up source is currently supported per routine"
+        )
 
     analyze = routine.get("analyze", {})
     if not isinstance(analyze, dict):
@@ -421,6 +435,37 @@ def _validate_source(routine, source, prefix):
             if not is_rfc3339_instant(batch_messages_after):
                 problems.append(
                     f"{prefix}.batch_messages_after must be a quoted RFC3339 timestamp"
+                )
+        catch_up = source.get("catch_up", False)
+        if not isinstance(catch_up, bool):
+            problems.append(f"{prefix}.catch_up must be true or false")
+        catch_up_overlap = source.get("catch_up_overlap")
+        if catch_up_overlap is not None and catch_up is not True:
+            problems.append(
+                f"{prefix}.catch_up_overlap requires catch_up: true"
+            )
+        if catch_up is True:
+            if all_spaces is not True:
+                problems.append(
+                    f"{prefix}.catch_up currently requires all_spaces: true"
+                )
+            if batch_messages != "daily":
+                problems.append(
+                    f"{prefix}.catch_up requires batch_messages: daily"
+                )
+            if source.get("max_results") != 0:
+                problems.append(
+                    f"{prefix}.catch_up requires max_results: 0"
+                )
+            if source.get("max_per_space") != 0:
+                problems.append(
+                    f"{prefix}.catch_up requires max_per_space: 0"
+                )
+            try:
+                duration_seconds(catch_up_overlap or "1h")
+            except RoutineError:
+                problems.append(
+                    f"{prefix}.catch_up_overlap must look like '15m', '4h', or '1d'"
                 )
         max_per_space = source.get("max_per_space")
         if max_per_space is not None and (
