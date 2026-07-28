@@ -27,6 +27,65 @@ class DriveTabMatchingTest(unittest.TestCase):
         read.assert_called_once_with("doc-1", "Full Notes")
 
 
+class DriveIdentityTest(unittest.TestCase):
+    def setUp(self):
+        drive.clear_identity_cache()
+
+    def test_current_user_email_is_normalized_and_cached(self):
+        response = {"user": {"email": " ME@EXAMPLE.COM ", "name": "Me"}}
+        with mock.patch.object(drive, "gws_bin", return_value="/bin/gws"), \
+             mock.patch.object(drive, "run_json", return_value=response) as run:
+            self.assertEqual(drive.current_user_email(), "me@example.com")
+            self.assertEqual(drive.current_user_email(), "me@example.com")
+
+        run.assert_called_once_with(
+            ["/bin/gws", "drive", "about", "--format", "json"],
+            timeout=drive.ACCOUNT_TIMEOUT_SECONDS,
+        )
+
+    def test_lookup_failure_is_cached_for_the_run(self):
+        with mock.patch.object(
+            drive,
+            "run_json",
+            side_effect=RuntimeError("Drive unavailable"),
+        ) as run, mock.patch.object(drive, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "Drive unavailable"):
+                drive.current_user_email()
+            with self.assertRaisesRegex(RuntimeError, "Drive unavailable"):
+                drive.current_user_email()
+
+        self.assertEqual(run.call_count, 1)
+
+    def test_empty_exception_message_remains_a_failure(self):
+        with mock.patch.object(
+            drive,
+            "run_json",
+            side_effect=RuntimeError(),
+        ), mock.patch.object(drive, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaises(RuntimeError):
+                drive.current_user_email()
+
+    def test_clear_cache_allows_retry(self):
+        response = {"user": {"email": "me@example.com"}}
+        with mock.patch.object(
+            drive,
+            "run_json",
+            side_effect=[RuntimeError("temporary"), response],
+        ) as run, mock.patch.object(drive, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "temporary"):
+                drive.current_user_email()
+            drive.clear_identity_cache()
+            self.assertEqual(drive.current_user_email(), "me@example.com")
+
+        self.assertEqual(run.call_count, 2)
+
+    def test_missing_email_is_rejected(self):
+        with mock.patch.object(drive, "run_json", return_value={"user": {}}), \
+             mock.patch.object(drive, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "valid user email"):
+                drive.current_user_email()
+
+
 class GmailLinkedDocumentTest(unittest.TestCase):
     EXPAND = {
         "kind": "drive_doc",
