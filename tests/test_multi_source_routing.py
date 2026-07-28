@@ -211,6 +211,46 @@ class GChatFallbackOwnershipTest(unittest.TestCase):
         )
         self.assertEqual(totals, {"errors": 0, "ambiguous": 0})
 
+    def test_disabled_specific_space_is_excluded_from_all_space_fallback(self):
+        specific = {
+            "id": "domain",
+            "enabled": False,
+            "source": {"kind": "gchat", "spaces": ["spaces/OWNED"]},
+            "analyze": {
+                "provider": "gemini",
+                "model": "gemini/example",
+                "instruction": "Keep durable facts.",
+            },
+            "memory": {"store": "/tmp/memory", "type": "note"},
+        }
+        fallback = {
+            "id": "sweep",
+            "routing": {"fallback": True},
+            "source": {"kind": "gchat", "all_spaces": True},
+            "analyze": {
+                "provider": "gemini",
+                "model": "gemini/example",
+                "instruction": "Keep durable facts.",
+            },
+            "memory": {"store": "/tmp/memory", "type": "note"},
+        }
+        observed = []
+
+        def candidates(source):
+            observed.extend(source.get("_exclude_spaces", []))
+            return []
+
+        saved = runner.SOURCES["gchat"]
+        runner.SOURCES["gchat"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "gchat", saved)
+
+        runner.run(
+            Path("/tmp"), [specific, fallback],
+            active_ids={"sweep"}, dry_run=True,
+        )
+
+        self.assertIn("spaces/OWNED", observed)
+
 
 class MultiSourceRunnerTest(unittest.TestCase):
     def setUp(self):

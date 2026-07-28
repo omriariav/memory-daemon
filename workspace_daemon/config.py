@@ -404,6 +404,13 @@ def _validate_source(routine, source, prefix):
         batch = source.get("batch_unthreaded")
         if batch is not None and batch != "daily":
             problems.append(f"{prefix}.batch_unthreaded must be 'daily' when set")
+        batch_messages = source.get("batch_messages")
+        if batch_messages is not None and batch_messages != "daily":
+            problems.append(f"{prefix}.batch_messages must be 'daily' when set")
+        if batch is not None and batch_messages is not None:
+            problems.append(
+                f"{prefix}: set batch_unthreaded or batch_messages, not both"
+            )
         max_per_space = source.get("max_per_space")
         if max_per_space is not None and (
             not isinstance(max_per_space, int)

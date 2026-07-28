@@ -13,6 +13,8 @@ For a broad fallback sweep, replace ``spaces`` with ``all_spaces: true``.
 That uses ``gws chat recent``: it cheaply filters the user's entire space list
 by activity time, then reads only spaces active inside the requested window.
 In this mode ``max_results`` is a global message cap and may be 0 for no cap.
+Set ``batch_messages: daily`` to give every space/UTC-day one stable digest source
+id; hourly reruns then update that digest as messages and replies arrive.
 
 One `gws chat messages --after` call per space returns full message texts, so
 candidates are grouped client-side by thread. Fetch resolves the space name,
@@ -26,7 +28,7 @@ memory store dedupes on the stable *source* id):
 
 - candidate id:  gchat:<space>:<thread>@<latest_message_ts>  — changes when a
   thread gains replies, so the runner reprocesses it
-- source id:     gchat:<space>:<thread>                      — stable anchor;
+- source id:     gchat:<space>:<thread-or-day>               — stable anchor;
   `memory add` updates the same entry in place
 """
 import datetime
@@ -70,6 +72,7 @@ def _hours_duration(hours):
 
 def _windowed_messages(source):
     """Yield ``(space, message)`` pairs for explicit or all-space sweeps."""
+    excluded_spaces = set(source.get("_exclude_spaces") or ())
     if source.get("all_spaces"):
         args = [
             "chat", "recent",
@@ -86,6 +89,8 @@ def _windowed_messages(source):
                     space = name.split("/messages/", 1)[0]
             if not space:
                 continue
+            if space in excluded_spaces:
+                continue
             if space not in _space_cache:
                 _space_cache[space] = {
                     "display_name": message.get("space_display_name") or "",
@@ -97,6 +102,8 @@ def _windowed_messages(source):
     per_space = int(source.get("max_results", 50))
     after = _after_iso(source.get("hours", 26))
     for space in source.get("spaces", []):
+        if space in excluded_spaces:
+            continue
         data = _gws(
             ["chat", "messages", space, "--after", after, "--max", str(per_space)]
         )
@@ -113,8 +120,13 @@ def candidates(source):
     and the stable source id folds successive slices into one memory entry.
     """
     threads = {}
+    all_daily = {}
 
     for space, message in _windowed_messages(source):
+        if source.get("batch_messages") == "daily":
+            day = (message.get("create_time") or "")[:10] or "date-unknown"
+            all_daily.setdefault((space, day), []).append(message)
+            continue
         sid = f"gchat:{_space_id(space)}:{_thread_id(message)}"
         thread = threads.setdefault(sid, {"space": space, "messages": []})
         thread["messages"].append(message)
@@ -148,8 +160,10 @@ def candidates(source):
     # conversational burst would therefore cost one LLM call per sentence.
     # Opt-in daily batching gives those messages a stable space/day identity;
     # rerunning later the same day updates one memory entry as the digest grows.
-    for (space, day), msgs in daily.items():
+    for (space, day), msgs in {**daily, **all_daily}.items():
         msgs.sort(key=lambda m: m.get("create_time", ""))
+        if not any((m.get("text") or "").strip() for m in msgs):
+            continue
         sid = f"gchat:{_space_id(space)}:day:{day}"
         latest = msgs[-1].get("create_time", "")
         first_text = next(

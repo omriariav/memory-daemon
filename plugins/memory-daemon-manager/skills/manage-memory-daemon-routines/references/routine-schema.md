@@ -29,6 +29,13 @@ canonical shapes. The validator is authoritative.
 Keep a channel or space in one specific routine. A fallback may overlap because
 the router assigns each candidate to one owner.
 
+An `all_spaces: true` Google Chat fallback automatically excludes explicit
+spaces configured by domain routines, including disabled routines. For frequent
+fallback sweeps, `batch_messages: daily` gives all messages and replies in one
+space/UTC-day a stable digest identity. Use `batch_unthreaded: daily` only when
+multi-message threads should remain separate; the two batch modes are mutually
+exclusive.
+
 ## Actions
 
 Only Gmail supports `apply_label`, `mark_read`, `unstar`, and `archive`.
