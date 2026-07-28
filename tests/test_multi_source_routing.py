@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import daemon as daemon_cli
-from workspace_daemon import actions, config, llm, runner, state
+from workspace_daemon import actions, config, llm, memory_sink, runner, state
 
 
 def multi_routine(vault, routine_id="domain", **extra):
@@ -146,6 +146,39 @@ class SlackCrossRoutineOwnershipTest(unittest.TestCase):
 
         totals = {"errors": 0}
         runner._collect_claims([owner, sweep], totals)
+
+        mention_source = next(
+            source for source in observed if source.get("include_mentions")
+        )
+        self.assertEqual(
+            mention_source["_exclude_mention_channels"],
+            ["COWNED"],
+        )
+
+    def test_disabled_owner_channel_is_reserved_from_mention_sweep(self):
+        owner = {
+            "id": "domain",
+            "enabled": False,
+            "source": {"kind": "slack", "private_channels": ["COWNED"]},
+        }
+        sweep = {
+            "id": "sweep",
+            "source": {"kind": "slack", "include_mentions": True},
+        }
+        observed = []
+
+        def candidates(source):
+            observed.append(source)
+            return []
+
+        saved = runner.SOURCES["slack"]
+        runner.SOURCES["slack"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "slack", saved)
+
+        totals = {"errors": 0}
+        runner._collect_claims(
+            [sweep], totals, routing_context=[owner, sweep],
+        )
 
         mention_source = next(
             source for source in observed if source.get("include_mentions")
@@ -312,6 +345,73 @@ class MultiSourceRunnerTest(unittest.TestCase):
         rendered = "\n".join(path.read_text() for path in notes)
         self.assertIn("source: gmail", rendered)
         self.assertIn("source: gchat", rendered)
+
+    def test_chat_versions_advance_ledger_but_update_one_memory_source(self):
+        versions = iter([
+            {
+                "id": "gchat:EXAMPLE:daily:2026-07-28@10:00:00Z",
+                "title": "first slice",
+                "raw": {"source_id": "gchat:EXAMPLE:daily:2026-07-28"},
+            },
+            {
+                "id": "gchat:EXAMPLE:daily:2026-07-28@11:00:00Z",
+                "title": "updated slice",
+                "raw": {"source_id": "gchat:EXAMPLE:daily:2026-07-28"},
+            },
+        ])
+
+        def candidates(source):
+            return [next(versions)]
+
+        def fetch(routine, source, candidate):
+            return {
+                "id": candidate["id"],
+                "source_id": candidate["raw"]["source_id"],
+                "source_kind": "gchat",
+                "title": candidate["title"],
+                "date": "2026-07-28",
+                "body": "Complete daily context.",
+                "frontmatter": {},
+            }
+
+        runner.SOURCES["gchat"] = (candidates, fetch)
+        routine = {
+            "id": "digest",
+            "enabled": True,
+            "source": {"kind": "gchat", "spaces": ["spaces/EXAMPLE"]},
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "memory": {"store": str(self.base / "memory"), "type": "note"},
+        }
+        captured_sources = []
+
+        def capture(routine, item, summary, dry_run=False):
+            captured_sources.append(item["source_id"])
+            return {"memory": "updated"}
+
+        with mock.patch.object(memory_sink, "capture", side_effect=capture):
+            first = runner.run(self.base, [routine])
+            second = runner.run(self.base, [routine])
+
+        self.assertEqual(first["processed"], 1)
+        self.assertEqual(second["processed"], 1)
+        self.assertEqual(
+            captured_sources,
+            [
+                "gchat:EXAMPLE:daily:2026-07-28",
+                "gchat:EXAMPLE:daily:2026-07-28",
+            ],
+        )
+        self.assertEqual(
+            set(state.load(self.base)),
+            {
+                "gchat:EXAMPLE:daily:2026-07-28@10:00:00Z",
+                "gchat:EXAMPLE:daily:2026-07-28@11:00:00Z",
+            },
+        )
 
     def test_due_fallback_cannot_steal_from_inactive_specific_owner(self):
         fetch = runner.SOURCES["gmail"][1]

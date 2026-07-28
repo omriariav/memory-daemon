@@ -32,9 +32,16 @@ the router assigns each candidate to one owner.
 An `all_spaces: true` Google Chat fallback automatically excludes explicit
 spaces configured by domain routines, including disabled routines. For frequent
 fallback sweeps, `batch_messages: daily` gives all messages and replies in one
-space/UTC-day a stable digest identity. Use `batch_unthreaded: daily` only when
-multi-message threads should remain separate; the two batch modes are mutually
-exclusive.
+space/UTC-day a stable digest identity. The source re-fetches each discovered
+UTC day completely before analysis, so replacement updates cannot lose earlier
+content. Use `batch_unthreaded: daily` only when multi-message threads should
+remain separate; the two batch modes are mutually exclusive.
+
+When migrating an existing routine to `batch_messages`, set a quoted RFC3339
+`batch_messages_after` boundary equal to the latest source timestamp covered by
+the prior mode. The boundary is exclusive and prevents old thread/day memories
+from being captured again under the new daily namespace. Keep the boundary and
+legacy ledger rows after cutover.
 
 ## Actions
 

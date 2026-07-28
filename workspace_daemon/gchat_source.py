@@ -14,7 +14,10 @@ That uses ``gws chat recent``: it cheaply filters the user's entire space list
 by activity time, then reads only spaces active inside the requested window.
 In this mode ``max_results`` is a global message cap and may be 0 for no cap.
 Set ``batch_messages: daily`` to give every space/UTC-day one stable digest source
-id; hourly reruns then update that digest as messages and replies arrive.
+id; hourly reruns then update that digest as messages and replies arrive. Each
+discovered day is re-fetched completely before analysis. Existing routines can
+set ``batch_messages_after`` to an exclusive RFC3339 cutover boundary so content
+handled by the previous batching mode is not captured again.
 
 One `gws chat messages --after` call per space returns full message texts, so
 candidates are grouped client-side by thread. Fetch resolves the space name,
@@ -28,7 +31,7 @@ memory store dedupes on the stable *source* id):
 
 - candidate id:  gchat:<space>:<thread>@<latest_message_ts>  — changes when a
   thread gains replies, so the runner reprocesses it
-- source id:     gchat:<space>:<thread-or-day>               — stable anchor;
+- source id:     gchat:<space>:<thread-or-day/daily>         — stable anchor;
   `memory add` updates the same entry in place
 """
 import datetime
@@ -37,9 +40,14 @@ import subprocess
 
 from .chat_text import redact_secrets, timestamped_line
 from .shell import log
+from .time_utils import rfc3339_key
 
 GWS = "gws"
 MAX_CONTEXT_MEMBERS = 20
+# The ergonomic `gws chat messages` command treats zero as "return nothing".
+# A very large positive max makes it paginate exhaustively while preserving its
+# flattened, snake_case output shape.
+FULL_DAY_MAX_RESULTS = 9223372036854775807
 _member_cache = {}
 _space_cache = {}
 
@@ -68,6 +76,49 @@ def _thread_id(message):
 def _hours_duration(hours):
     value = float(hours)
     return f"{int(value) if value.is_integer() else value}h"
+
+
+def _full_daily_batches(discovered, cutoff=None):
+    """Re-fetch complete UTC days for every discovered ``(space, day)``.
+
+    Discovery uses a sliding window and may be capped. Reusing a daily source
+    id with only that slice would let the memory store replace a complete
+    digest with a partial one. One exhaustive, paginated history call per
+    discovered space starts just before its earliest relevant UTC day; only
+    discovered days are retained.
+    """
+    days_by_space = {}
+    for space, day in discovered:
+        days_by_space.setdefault(space, set()).add(day)
+
+    cutoff_instant = rfc3339_key(cutoff) if cutoff else None
+    batches = {}
+    for space, days in days_by_space.items():
+        earliest = min(days)
+        start = (
+            datetime.datetime.strptime(earliest, "%Y-%m-%d")
+            .replace(tzinfo=datetime.timezone.utc)
+            - datetime.timedelta(microseconds=1)
+        )
+        after = start.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        data = _gws(
+            [
+                "chat", "messages", space,
+                "--after", after,
+                "--max", str(FULL_DAY_MAX_RESULTS),
+            ],
+            timeout=300,
+        )
+        for message in data.get("messages") or []:
+            timestamp = message.get("create_time") or ""
+            day = timestamp[:10]
+            key = (space, day)
+            if not timestamp or key not in discovered:
+                continue
+            if cutoff_instant and rfc3339_key(timestamp) <= cutoff_instant:
+                continue
+            batches.setdefault(key, []).append(message)
+    return batches
 
 
 def _windowed_messages(source):
@@ -120,17 +171,28 @@ def candidates(source):
     and the stable source id folds successive slices into one memory entry.
     """
     threads = {}
-    all_daily = {}
+    discovered_daily = set()
+    batch_messages = source.get("batch_messages") == "daily"
+    cutoff = source.get("batch_messages_after")
+    cutoff_instant = rfc3339_key(cutoff) if cutoff else None
 
     for space, message in _windowed_messages(source):
-        if source.get("batch_messages") == "daily":
-            day = (message.get("create_time") or "")[:10] or "date-unknown"
-            all_daily.setdefault((space, day), []).append(message)
+        if batch_messages:
+            timestamp = message.get("create_time") or ""
+            if not timestamp:
+                continue
+            if cutoff_instant and rfc3339_key(timestamp) <= cutoff_instant:
+                continue
+            discovered_daily.add((space, timestamp[:10]))
             continue
         sid = f"gchat:{_space_id(space)}:{_thread_id(message)}"
         thread = threads.setdefault(sid, {"space": space, "messages": []})
         thread["messages"].append(message)
 
+    all_daily = (
+        _full_daily_batches(discovered_daily, cutoff)
+        if discovered_daily else {}
+    )
     out = []
     daily = {}
     for sid, t in threads.items():
@@ -160,30 +222,31 @@ def candidates(source):
     # conversational burst would therefore cost one LLM call per sentence.
     # Opt-in daily batching gives those messages a stable space/day identity;
     # rerunning later the same day updates one memory entry as the digest grows.
-    for (space, day), msgs in {**daily, **all_daily}.items():
-        msgs.sort(key=lambda m: m.get("create_time", ""))
-        if not any((m.get("text") or "").strip() for m in msgs):
-            continue
-        sid = f"gchat:{_space_id(space)}:day:{day}"
-        latest = msgs[-1].get("create_time", "")
-        first_text = next(
-            (
-                redact_secrets((m.get("text") or "").replace("\n", " "))
-                for m in msgs
-                if (m.get("text") or "").strip()
-            ),
-            "",
-        )
-        out.append({
-            "id": f"{sid}@{latest}",
-            "title": first_text[:90] or f"Google Chat digest for {day}",
-            "raw": {
-                "source_id": sid,
-                "space": space,
-                "messages": msgs,
-                "digest_day": day,
-            },
-        })
+    for namespace, batches in (("day", daily), ("daily", all_daily)):
+        for (space, day), msgs in batches.items():
+            # Empty system events are not prompt content and must not advance
+            # the candidate version on their own.
+            msgs = sorted(
+                (m for m in msgs if (m.get("text") or "").strip()),
+                key=lambda m: m.get("create_time", ""),
+            )
+            if not msgs:
+                continue
+            sid = f"gchat:{_space_id(space)}:{namespace}:{day}"
+            latest = msgs[-1].get("create_time", "")
+            first_text = redact_secrets(
+                (msgs[0].get("text") or "").replace("\n", " ")
+            )
+            out.append({
+                "id": f"{sid}@{latest}",
+                "title": first_text[:90] or f"Google Chat digest for {day}",
+                "raw": {
+                    "source_id": sid,
+                    "space": space,
+                    "messages": msgs,
+                    "digest_day": day,
+                },
+            })
     return out
 
 
