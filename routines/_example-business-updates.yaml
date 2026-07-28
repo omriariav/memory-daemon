@@ -1,10 +1,9 @@
 # Example: several recurring business reports handled by ONE routine.
 #
-# The idea worth stealing is `streams`. These reports differ only in what they
-# should be called and which Gmail label they belong under — a pure lookup, so
-# it is declared rather than left to the model to judge. Keys match the subject,
-# which is the stable identity of a recurring report: colleagues reply into
-# these threads, so keying on sender would miss those.
+# The idea worth stealing is `streams`. Naming and Gmail labels are pure
+# lookups, and reused-thread behavior is deterministic, so all are declared
+# rather than left to the model to judge. Keys match the subject, which remains
+# stable when colleagues post a fresh report as a reply.
 #
 # Copy without the leading underscore to activate.
 id: business-updates
@@ -31,6 +30,8 @@ streams:
   "Exec Bi Weekly Report":
     title: Biweekly - Exec
     label: ECN
+    # Use this only when every reply in the reused thread is a new report.
+    message_updates: true
 
 analyze:
   provider: gemini

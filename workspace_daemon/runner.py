@@ -160,8 +160,30 @@ def _gmail_fetch(routine, source, candidate):
     }
 
     stream = _stream_for(routine, item)
+    message_updates = bool(stream.get("message_updates"))
+    if message_updates:
+        # Some recurring reports deliberately reuse one Gmail thread: every
+        # reply is a new report, while its body still contains the quoted
+        # history. Keep the new message as the ledger/memory identity and never
+        # let prior weeks leak into the analysis.
+        item["source_id"] = f"gmail:{message_id}"
+        item["body"], removed = _strip_quoted_history(item["body"])
+        if removed:
+            item["frontmatter"]["quoted_history_removed"] = True
+
     report_date = _report_date_from_subject(subject) if stream else None
-    if report_date:
+    # Gmail's root message id equals its thread id. Comparing those identities
+    # recognizes replies without guessing from localized or gateway-modified
+    # subject prefixes such as AW:, SV:, Re[2]:, or [EXTERNAL] Re:.
+    reply_is_new_report = message_updates and message_id != thread_id
+    if reply_is_new_report:
+        # A reused subject can still carry the first report's date weeks later.
+        # For an explicitly message-oriented stream, the reply itself is the
+        # new report, so its Gmail date is the truthful event date.
+        item["frontmatter"]["report_date"] = date
+        if report_date and report_date != date:
+            item["frontmatter"]["subject_report_date"] = report_date
+    elif report_date:
         # A reply can make Gmail's message date weeks newer than the report it
         # contains. Recurring streams with an explicit subject date should be
         # filed and stored under that report period, while the raw email header
@@ -869,6 +891,73 @@ _MONTH_NUMBER = {
         start=1,
     )
 }
+
+
+def _strip_quoted_history(body):
+    """Return only the newest plain-text reply and whether history was removed.
+
+    Gmail's plain-text body includes the complete quoted conversation. That is
+    useful for ordinary correspondence but wrong when each reply is itself a
+    fresh recurring report: the model would merge several weeks. This helper is
+    intentionally opt-in through ``streams.*.message_updates``.
+    """
+    lines = (body or "").splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        lower = stripped.casefold()
+        if re.match(r"^-{2,}\s*original message\s*-{2,}$", stripped, re.I):
+            return "\n".join(lines[:index]).strip(), True
+
+        # Outlook-style quoted headers are strong evidence. A naked `From:`
+        # line in a report is not enough: require the adjacent Sent/Subject
+        # fields as corroboration.
+        if lower.startswith("from:") and _looks_like_quoted_header(lines, index):
+            return "\n".join(lines[:index]).strip(), True
+
+        # Some clients place an underscore rule before the same header block.
+        # The rule alone may be legitimate report formatting, so only remove it
+        # when the following non-empty line begins a corroborated header.
+        if re.match(r"^_{5,}$", stripped):
+            header_index = _next_nonempty_line(lines, index + 1)
+            if (
+                header_index is not None
+                and lines[header_index].strip().casefold().startswith("from:")
+                and _looks_like_quoted_header(lines, header_index)
+            ):
+                return "\n".join(lines[:index]).strip(), True
+
+        # Gmail's "On <date>, <person> wrote:" attribution may wrap across a
+        # few lines. Require the attribution *and* a following quoted `>` line;
+        # `>10% growth` in fresh report content must never be a cutoff by itself.
+        if lower.startswith("on "):
+            for end in range(index, min(len(lines), index + 6)):
+                attribution = " ".join(
+                    part.strip() for part in lines[index:end + 1]
+                )
+                quote_index = _next_nonempty_line(lines, end + 1)
+                if (
+                    re.match(r"^On .+\bwrote:\s*$", attribution, re.I)
+                    and quote_index is not None
+                    and lines[quote_index].lstrip().startswith(">")
+                ):
+                    return "\n".join(lines[:index]).strip(), True
+
+    return (body or "").strip(), False
+
+
+def _next_nonempty_line(lines, start):
+    for index in range(start, len(lines)):
+        if lines[index].strip():
+            return index
+    return None
+
+
+def _looks_like_quoted_header(lines, start):
+    header = " ".join(
+        candidate.strip().casefold()
+        for candidate in lines[start:start + 8]
+    )
+    return " sent:" in f" {header}" and " subject:" in f" {header}"
 
 
 def _report_date_from_subject(subject):

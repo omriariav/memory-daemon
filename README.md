@@ -354,6 +354,10 @@ streams:
   "Channel Business weekly report":
     title: Weekly - Channel Business
     label: CHANNELS
+  "Regional report thread":
+    title: Weekly - Regional
+    label: EMEA
+    message_updates: true                # every reply is a fresh report
 
 output:
   filename_template: "{title}-{date}"   # -> weekly-dach-2026-07-19.md
@@ -367,6 +371,14 @@ Prefix a key with `from:` to match the sender instead.
 their own embedded dates, which make for noisy, unsortable filenames
 (`re-turkey-africa-baltics-weekly-updates-472026-2026-07-20.md`). A routine-wide
 fixed `label:` also works when every item belongs under the same one.
+
+Set `message_updates: true` only when a sender deliberately reuses one thread
+and each new reply is itself a fresh report. In that mode the daemon analyzes
+only the newest reply text (quoted history is removed), dates replies from
+their Gmail header instead of a stale date in the reused subject, and gives
+each message its own memory source ID. The default remains thread-oriented:
+quoted context is preserved, an explicit subject date wins, and memory updates
+the existing thread entry.
 
 ### Label caching
 

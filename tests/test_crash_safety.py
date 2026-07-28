@@ -324,6 +324,26 @@ class TestStreams(unittest.TestCase):
             self.assertTrue(config.validate(self.make(streams)),
                             f"{streams!r} should be rejected")
 
+    def test_message_updates_must_be_boolean(self):
+        from workspace_daemon import config
+        valid = self.make({"A": {"label": "EMEA", "message_updates": True}})
+        invalid = self.make({"A": {"label": "EMEA", "message_updates": "yes"}})
+        self.assertEqual(config.validate(valid), [])
+        self.assertTrue(
+            any("message_updates must be a boolean" in p for p in config.validate(invalid))
+        )
+
+    def test_message_updates_requires_a_gmail_source(self):
+        from workspace_daemon import config
+        r = self.make(
+            {"A": {"message_updates": True}},
+            source={"kind": "slack", "channels": ["CEXAMPLE"]},
+            actions=[],
+        )
+        self.assertTrue(
+            any("message_updates requires a Gmail source" in p for p in config.validate(r))
+        )
+
     def test_validated_label_is_case_insensitive_and_rejects_unknown(self):
         from workspace_daemon import runner
         self.assertEqual(runner._validated_label("emea", ["EMEA", "CHANNELS"], "t"), "EMEA")
