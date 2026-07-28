@@ -15,6 +15,7 @@ class DirectoryResolutionTest(unittest.TestCase):
                 {
                     "name": "José Example",
                     "emails": ["JOSE.EXAMPLE@EXAMPLE.COM"],
+                    "resource_name": "people/jose",
                 }
             ]
         }
@@ -26,6 +27,7 @@ class DirectoryResolutionTest(unittest.TestCase):
             "email": "jose.example@example.com",
             "name": "José Example",
             "slug": "jose-example",
+            "resource_name": "people/jose",
         })
         run.assert_called_once_with([
             "/bin/gws", "contacts", "directory-search",
@@ -54,6 +56,16 @@ class DirectoryResolutionTest(unittest.TestCase):
              mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
             self.assertIsNone(contacts.resolve_email("shared@example.com"))
 
+    def test_rejects_exact_match_without_stable_resource_name(self):
+        response = {
+            "contacts": [
+                {"name": "No Stable ID", "emails": ["person@example.com"]}
+            ]
+        }
+        with mock.patch.object(contacts, "run_json", return_value=response), \
+             mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
+            self.assertIsNone(contacts.resolve_email("person@example.com"))
+
     def test_invalid_email_never_calls_directory(self):
         with mock.patch.object(contacts, "run_json") as run:
             self.assertIsNone(contacts.resolve_email("not-an-email"))
@@ -62,7 +74,11 @@ class DirectoryResolutionTest(unittest.TestCase):
     def test_cached_by_normalized_input(self):
         response = {
             "contacts": [
-                {"name": "Cache Example", "emails": ["cache@example.com"]}
+                {
+                    "name": "Cache Example",
+                    "emails": ["cache@example.com"],
+                    "resource_name": "people/cache",
+                }
             ]
         }
         with mock.patch.object(contacts, "run_json", return_value=response) as run, \
@@ -84,10 +100,27 @@ class DirectoryResolutionTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, 1)
 
+    def test_failure_circuit_breaks_different_emails_for_the_run(self):
+        with mock.patch.object(
+            contacts,
+            "run_json",
+            side_effect=RuntimeError("directory unavailable"),
+        ) as run, mock.patch.object(contacts, "gws_bin", return_value="/bin/gws"):
+            with self.assertRaisesRegex(RuntimeError, "directory unavailable"):
+                contacts.resolve_email("first@example.com")
+            with self.assertRaisesRegex(RuntimeError, "directory unavailable"):
+                contacts.resolve_email("second@example.com")
+
+        self.assertEqual(run.call_count, 1)
+
     def test_clear_cache_allows_retry_on_next_run(self):
         response = {
             "contacts": [
-                {"name": "Owner Example", "emails": ["owner@example.com"]}
+                {
+                    "name": "Owner Example",
+                    "emails": ["owner@example.com"],
+                    "resource_name": "people/owner",
+                }
             ]
         }
         with mock.patch.object(
