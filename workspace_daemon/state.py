@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .shell import log
+from .time_utils import is_rfc3339_instant
 
 
 class StateError(Exception):
@@ -281,10 +282,19 @@ class CursorStore:
             data = json.loads(self.path.read_text())
         except (json.JSONDecodeError, OSError) as exc:
             raise StateError(f"{self.path} is not valid cursor state: {exc}") from exc
-        if not isinstance(data, dict) or any(
-            not isinstance(value, dict) for value in data.values()
-        ):
+        if not isinstance(data, dict):
             raise StateError(f"{self.path} must contain an object of source records")
+        for key, record in data.items():
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("kind"), str)
+                or not record["kind"]
+                or not is_rfc3339_instant(record.get("last_successful_scan_at"))
+            ):
+                raise StateError(
+                    f"{self.path}: cursor record {key!r} must contain a "
+                    "non-empty kind and RFC3339 last_successful_scan_at"
+                )
         return data
 
     def checkpoint(self, routine_id, source_id, kind):

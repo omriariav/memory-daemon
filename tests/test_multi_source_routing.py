@@ -675,6 +675,17 @@ class CursorStoreTest(unittest.TestCase):
         )
         self.assertFalse(state.cursor_file(self.base).exists())
 
+    def test_malformed_cursor_record_fails_closed(self):
+        path = state.cursor_file(self.base)
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            '{"sweep:gchat:all-spaces": {'
+            '"kind": "gchat", "last_successful_scan_at": "not-a-timestamp"}}'
+        )
+
+        with self.assertRaisesRegex(state.StateError, "RFC3339"):
+            state.CursorStore(self.base)
+
 
 class CatchUpCursorRunnerTest(unittest.TestCase):
     def setUp(self):
@@ -790,7 +801,9 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             }
 
         runner.SOURCES["gchat"] = (candidates, fetch)
-        outcomes = [RuntimeError("memory unavailable"), {"memory": "created"}]
+        # Exceptions are allowed to have no message. Presence of the ledger key,
+        # not the truthiness of its text, must trigger the retry.
+        outcomes = [RuntimeError(), {"memory": "created"}]
 
         with mock.patch.object(memory_sink, "capture", side_effect=outcomes) as capture:
             with mock.patch.object(

@@ -848,7 +848,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         retry_memory = (
             existing is not None
             and claim["source"].get("catch_up") is True
-            and bool(existing.get("memory_error"))
+            and "memory_error" in existing
         )
         if existing is not None and not retry_memory:
             totals["skipped"] += 1
