@@ -97,7 +97,7 @@ class RunnerWiringTest(unittest.TestCase):
     def test_stream_subject_date_beats_later_reply_date(self):
         gmail.read_message = lambda mid: {
             "headers": {
-                "subject": "Re: Weekly Report DACH TEAM | 4/7/2026",
+                "subject": "[EXTERNAL] AW: Weekly Report DACH TEAM | 4/7/2026",
                 "from": "Someone Else <reply@example.com>",
                 "date": "Mon, 27 Jul 2026 15:46:29 +0000",
             },
@@ -118,6 +118,94 @@ class RunnerWiringTest(unittest.TestCase):
         note = next(self.vault.glob("*.md"))
         self.assertEqual(note.name, "weekly-dach-2026-07-04.md")
         self.assertIn("report_date: '2026-07-04'", note.read_text())
+
+    def test_message_updates_use_reply_date_body_and_identity(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Re: Weekly Report DACH TEAM | 4/7/2026",
+                "from": "Someone Else <reply@example.com>",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": (
+                "This week's new report.\n\n"
+                "On Mon, Jul 20, 2026, Someone Else\n"
+                "wrote:\n"
+                "> Last week's report.\n"
+                "> Older details."
+            ),
+        }
+        r = routine(
+            self.vault,
+            streams={
+                "Weekly Report DACH": {
+                    "title": "Weekly - DACH",
+                    "label": "EMEA",
+                    "message_updates": True,
+                }
+            },
+        )
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "m2", "raw": {"thread_id": "thread-1"}},
+        )
+
+        self.assertEqual(item["date"], "2026-07-27")
+        self.assertEqual(item["body"], "This week's new report.")
+        self.assertEqual(item["source_id"], "gmail:m2")
+        self.assertEqual(item["frontmatter"]["report_date"], "2026-07-27")
+        self.assertEqual(item["frontmatter"]["subject_report_date"], "2026-07-04")
+        self.assertTrue(item["frontmatter"]["quoted_history_removed"])
+
+    def test_message_updates_root_message_keeps_explicit_subject_date(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Weekly Report DACH TEAM | 4/7/2026",
+                "from": "Sender <sender@example.com>",
+                "date": "Mon, 6 Jul 2026 15:46:29 +0000",
+            },
+            "body": "The original report.",
+        }
+        r = routine(
+            self.vault,
+            streams={
+                "Weekly Report DACH": {
+                    "title": "Weekly - DACH",
+                    "label": "EMEA",
+                    "message_updates": True,
+                }
+            },
+        )
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "thread-1", "raw": {"thread_id": "thread-1"}},
+        )
+
+        self.assertEqual(item["date"], "2026-07-04")
+        self.assertEqual(item["source_id"], "gmail:thread-1")
+        self.assertEqual(item["frontmatter"]["report_date"], "2026-07-04")
+        self.assertNotIn("subject_report_date", item["frontmatter"])
+
+    def test_quote_stripping_preserves_uncorroborated_report_formatting(self):
+        cases = (
+            "Fresh report\nwith details",
+            "Fresh intro\n>10% growth\nNext action",
+            "Threshold\n_____\nNext action",
+            "Section\n-----\nNext action",
+        )
+        for original in cases:
+            with self.subTest(original=original):
+                body, removed = runner._strip_quoted_history(original)
+                self.assertEqual(body, original)
+                self.assertFalse(removed)
+
+    def test_quote_stripping_accepts_explicit_original_message_marker(self):
+        body, removed = runner._strip_quoted_history(
+            "Fresh report\n\n-----Original Message-----\nOld report"
+        )
+        self.assertEqual(body, "Fresh report")
+        self.assertTrue(removed)
 
     def test_non_stream_email_keeps_header_date(self):
         gmail.read_message = lambda mid: {

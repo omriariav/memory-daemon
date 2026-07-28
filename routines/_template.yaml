@@ -130,8 +130,13 @@ actions: [apply_label, mark_read, unstar, archive]
 #          better than the raw subject, which carries RE:/FW: and its own
 #          embedded date. Pair it with filename_template "{title}-{date}".
 #   label  the Gmail label for this stream, validated like `label` above.
+#   message_updates
+#          set true only when every reply in a deliberately reused thread is a
+#          fresh report. Quoted history is removed, reply dates come from the
+#          message header, and memory dedupes per message instead of per thread.
 #
-# Both are pure lookups, so they are declared here rather than left to the model.
+# These are deterministic stream rules, so declare them here rather than
+# leaving naming, filing, or thread semantics to the model.
 # streams:
 #   "Weekly Report DACH TEAM":
 #     title: Weekly - DACH
@@ -139,3 +144,4 @@ actions: [apply_label, mark_read, unstar, archive]
 #   "Channel Business weekly report":
 #     title: Weekly - Channel Business
 #     label: CHANNELS
+#     message_updates: true

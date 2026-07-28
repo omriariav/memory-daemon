@@ -257,9 +257,12 @@ def validate(routine):
         problems.append(f"{rid}: `label` must be a string")
     if streams is not None:
         if not isinstance(streams, dict) or not streams:
-            problems.append(f"{rid}: `streams` must be a non-empty mapping keyed by sender")
+            problems.append(
+                f"{rid}: `streams` must be a non-empty mapping keyed by subject "
+                f"(or `from:<sender>`)"
+            )
         else:
-            allowed = {"title", "label"}
+            allowed = {"title", "label", "message_updates"}
             for sender, cfg in streams.items():
                 if not isinstance(cfg, dict):
                     problems.append(f"{rid}: streams[{sender}] must be a mapping")
@@ -268,8 +271,26 @@ def validate(routine):
                 if unknown:
                     problems.append(
                         f"{rid}: streams[{sender}] has unknown key(s) "
-                        f"{', '.join(sorted(unknown))} (valid: title, label)"
+                        f"{', '.join(sorted(unknown))} "
+                        f"(valid: title, label, message_updates)"
                     )
+                if (
+                    "message_updates" in cfg
+                    and not isinstance(cfg["message_updates"], bool)
+                ):
+                    problems.append(
+                        f"{rid}: streams[{sender}].message_updates must be a boolean"
+                    )
+            uses_message_updates = any(
+                isinstance(cfg, dict) and "message_updates" in cfg
+                for cfg in streams.values()
+            )
+            if uses_message_updates and not any(
+                source.get("kind") == "gmail" for source in source_dicts
+            ):
+                problems.append(
+                    f"{rid}: streams.*.message_updates requires a Gmail source"
+                )
 
     schedule = routine.get("schedule")
     if schedule is not None:
