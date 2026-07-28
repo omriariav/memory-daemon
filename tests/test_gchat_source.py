@@ -88,9 +88,11 @@ class CandidatesTest(unittest.TestCase):
             *first_messages["messages"],
             msg("solo2", "2026-07-27T10:01:00Z", "second sentence"),
         ]}
+        later_window = {"messages": [updated_messages["messages"][-1]]}
         with mock.patch.object(gchat_source, "_gws", side_effect=[
-            first_messages, updated_messages,
-        ]):
+            first_messages, first_messages,
+            later_window, updated_messages,
+        ]) as gws:
             first = gchat_source.candidates({
                 "spaces": ["spaces/AAA"],
                 "batch_messages": "daily",
@@ -102,12 +104,85 @@ class CandidatesTest(unittest.TestCase):
 
         self.assertEqual(
             first["raw"]["source_id"],
-            "gchat:AAA:day:2026-07-27",
+            "gchat:AAA:daily:2026-07-27",
         )
         self.assertEqual(first["raw"]["source_id"], updated["raw"]["source_id"])
         self.assertNotEqual(first["id"], updated["id"])
         self.assertEqual(len(updated["raw"]["messages"]), 4)
         self.assertTrue(updated["id"].endswith("@2026-07-27T10:01:00Z"))
+        # The second discovery saw only the newest slice, but the final
+        # candidate was rebuilt from an exhaustive UTC-day history call.
+        self.assertEqual(
+            gws.call_args_list[-1],
+            mock.call([
+                "chat", "messages", "spaces/AAA",
+                "--after", "2026-07-26T23:59:59.999999Z",
+                "--max", str(gchat_source.FULL_DAY_MAX_RESULTS),
+            ], timeout=300),
+        )
+
+    def test_daily_message_batch_cutover_excludes_legacy_content(self):
+        messages = {"messages": [
+            msg("old", "2026-07-27T08:00:00Z", "legacy thread"),
+            msg("boundary", "2026-07-27T09:00:00Z", "already covered"),
+            msg("new", "2026-07-27T10:00:00Z", "new capture"),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+                "batch_messages_after": "2026-07-27T09:00:00Z",
+            })
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(
+            out[0]["raw"]["source_id"],
+            "gchat:AAA:daily:2026-07-27",
+        )
+        self.assertEqual(
+            [message["text"] for message in out[0]["raw"]["messages"]],
+            ["new capture"],
+        )
+
+    def test_daily_message_batch_cutover_preserves_nanosecond_precision(self):
+        messages = {"messages": [
+            msg(
+                "boundary",
+                "2026-07-27T09:00:00.123456789Z",
+                "already covered",
+            ),
+            msg(
+                "later",
+                "2026-07-27T09:00:00.123456790Z",
+                "one nanosecond later",
+            ),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            out = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+                "batch_messages_after": "2026-07-27T09:00:00.123456789Z",
+            })
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(
+            [message["text"] for message in out[0]["raw"]["messages"]],
+            ["one nanosecond later"],
+        )
+
+    def test_daily_message_batch_system_event_does_not_advance_version(self):
+        messages = {"messages": [
+            msg("content", "2026-07-27T08:00:00Z", "durable update"),
+            msg("system", "2026-07-27T09:00:00Z", ""),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            candidate = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+            })[0]
+
+        self.assertTrue(candidate["id"].endswith("@2026-07-27T08:00:00Z"))
+        self.assertEqual(len(candidate["raw"]["messages"]), 1)
 
     def test_daily_message_batch_drops_empty_system_messages(self):
         messages = {"messages": [
@@ -235,6 +310,38 @@ class ConfigTest(unittest.TestCase):
             "batch_messages": "daily",
         }))
         self.assertTrue(any("set batch_unthreaded or batch_messages" in p for p in problems))
+
+    def test_batch_messages_after_requires_daily_mode_and_rfc3339(self):
+        without_mode = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_messages_after": "2026-07-27T09:00:00Z",
+        }))
+        malformed = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_messages": "daily",
+            "batch_messages_after": "yesterday",
+        }))
+        iso_space = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_messages": "daily",
+            "batch_messages_after": "2026-07-27 09:00:00+00:00",
+        }))
+        compact_offset = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_messages": "daily",
+            "batch_messages_after": "2026-07-27T09:00:00+0000",
+        }))
+        valid = config.validate(self.routine({
+            "spaces": ["spaces/AAA"],
+            "batch_messages": "daily",
+            "batch_messages_after": "2026-07-27T09:00:00Z",
+        }))
+
+        self.assertTrue(any("requires batch_messages: daily" in p for p in without_mode))
+        self.assertTrue(any("quoted RFC3339" in p for p in malformed))
+        self.assertTrue(any("quoted RFC3339" in p for p in iso_space))
+        self.assertTrue(any("quoted RFC3339" in p for p in compact_offset))
+        self.assertEqual(valid, [])
 
 
 class FetchTest(unittest.TestCase):

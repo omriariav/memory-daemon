@@ -224,7 +224,21 @@ For an hourly Google Chat fallback, `batch_messages: daily` creates one stable
 source identity per space and UTC calendar day. New messages and replies update that
 same daily memory instead of changing from a daily singleton to a separate
 thread entry. `batch_unthreaded: daily` remains available when real multi-message
-threads should retain their own stable identities.
+threads should retain their own stable identities. Daily candidates are
+re-fetched from the start of their UTC day before analysis, so a short discovery
+window or result cap cannot replace a complete memory with a partial slice.
+
+When changing an existing routine from thread batching to `batch_messages`,
+set `batch_messages_after` to the last timestamp covered by the old mode:
+
+```yaml
+batch_messages: daily
+batch_messages_after: "2026-07-28T06:46:03Z"
+```
+
+The boundary is exclusive. Pre-boundary messages stay under their legacy source
+ids, while later messages use the new `gchat:<space>:daily:<date>` namespace.
+Remove neither the boundary nor legacy ledger rows after cutover.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially

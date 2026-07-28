@@ -7,6 +7,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
+from .time_utils import is_rfc3339_instant
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
@@ -411,6 +412,16 @@ def _validate_source(routine, source, prefix):
             problems.append(
                 f"{prefix}: set batch_unthreaded or batch_messages, not both"
             )
+        batch_messages_after = source.get("batch_messages_after")
+        if batch_messages_after is not None:
+            if batch_messages != "daily":
+                problems.append(
+                    f"{prefix}.batch_messages_after requires batch_messages: daily"
+                )
+            if not is_rfc3339_instant(batch_messages_after):
+                problems.append(
+                    f"{prefix}.batch_messages_after must be a quoted RFC3339 timestamp"
+                )
         max_per_space = source.get("max_per_space")
         if max_per_space is not None and (
             not isinstance(max_per_space, int)
