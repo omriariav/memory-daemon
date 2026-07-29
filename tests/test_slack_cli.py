@@ -351,8 +351,10 @@ class LaunchdTemplateTest(unittest.TestCase):
         template = (
             Path(__file__).resolve().parents[1]
             / "launchd"
-            / "com.workspace-daemon.plist.template"
+            / "com.memory-daemon.plist.template"
         ).read_text()
+        self.assertIn("<string>com.memory-daemon</string>", template)
+        self.assertIn("__HOME__/.local/node-current/bin", template)
         self.assertIn("__HOME__/.local/bin", template)
 
 

@@ -120,6 +120,7 @@ python3 -m workspace_daemon.slack_cli auth-test
 
 ```sh
 ./daemon.py list                              # routines, cadence, enabled state, last run
+./memory-daemon-status.sh                     # scheduler + health of every routine
 ./daemon.py validate                          # check all routine YAML
 ./daemon.py run --dry-run                     # preview; data and state unchanged
 ./daemon.py run --routine weekly-report       # run one routine for real
@@ -546,26 +547,52 @@ never triggers the first real run. Render the template, add your key, then load
 it:
 
 ```sh
+# The template uses this stable link so Node upgrades do not break launchd.
+# Point it at the version prefix that contains bin/node and bin/npx.
+mkdir -p ~/.local
+ln -sfn "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
+
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
-  launchd/com.workspace-daemon.plist.template \
-  > ~/Library/LaunchAgents/com.workspace-daemon.plist
+  launchd/com.memory-daemon.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon.plist
 
 # replace REPLACE_ME with your provider API key
-$EDITOR ~/Library/LaunchAgents/com.workspace-daemon.plist
+$EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
 
-launchctl unload ~/Library/LaunchAgents/com.workspace-daemon.plist 2>/dev/null
-launchctl load   ~/Library/LaunchAgents/com.workspace-daemon.plist
-launchctl list | grep workspace-daemon
+# One-time cleanup when upgrading from the former workspace-daemon label.
+launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
+mv ~/Library/LaunchAgents/com.workspace-daemon.plist \
+  ~/.Trash/com.workspace-daemon.plist.retired 2>/dev/null || true
+
+launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist 2>/dev/null
+launchctl load   ~/Library/LaunchAgents/com.memory-daemon.plist
+launchctl list | grep memory-daemon
 ```
 
 Check on it:
 
 ```sh
+./memory-daemon-status.sh
 tail -f logs/run.log
 tail -f logs/launchd.err.log
 ```
 
-Unload with `launchctl unload ~/Library/LaunchAgents/com.workspace-daemon.plist`.
+`memory-daemon-status.sh` is read-only. It distinguishes a routine's last
+scheduled attempt from its last captured item, shows when each routine is next
+due, and flags an unfinished last run, memory-sink failures, or pending Gmail
+triage. Copy it to a directory on `PATH` to call it from anywhere:
+
+```sh
+cp ./memory-daemon-status.sh ~/bin/memory-daemon-status.sh
+```
+
+The copied command finds the repository at `~/Code/memory-daemon`; set
+`MEMORY_DAEMON_DIR` if your checkout lives elsewhere. It exits non-zero when
+the LaunchAgent or a routine needs attention, so it can also be used by a
+separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
+installed job uses a different label.
+
+Unload with `launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist`.
 
 The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
 gitignored — only the template is tracked.
@@ -574,6 +601,7 @@ gitignored — only the template is tracked.
 
 ```
 daemon.py                  CLI entrypoint
+memory-daemon-status.sh    scheduler and per-routine health
 workspace_daemon/
   config.py                routine discovery, loading, validation
   shell.py                 binary resolution, subprocess, logging
