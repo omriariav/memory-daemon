@@ -13,10 +13,18 @@ DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
-_ROUTINE_ERROR = re.compile(
-    r"\broutine=(?P<routine>[a-z0-9][a-z0-9-]*)\b.*\b(?:ERROR|FATAL)\b"
+_TICK_DUE = re.compile(
+    r"^tick(?:\[(?P<id>[^\]]+)\])?: due=(?P<ids>.*?)"
+    r"(?P<dry> \(dry-run\))?$"
+)
+_TICK_DONE = re.compile(r"^tick(?:\[(?P<id>[^\]]+)\])? done:")
+_TICK_SKIPPED = re.compile(r"^tick(?:\[(?P<id>[^\]]+)\])? skipped\b")
+_TICK_NOOP = re.compile(
+    r"^tick(?:\[(?P<id>[^\]]+)\])?: no routines due"
+    r"(?P<dry> \(dry-run\))?$"
 )
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
+_LEGACY_TICK_KEY = "<legacy>"
 
 
 def probe_launchd(label=DEFAULT_LAUNCHD_LABEL, uid=None):
@@ -83,7 +91,7 @@ def read_tick_history(path):
         return {"latest": None, "routines": {}}
 
     routine_results = {}
-    active = None
+    active = {}
     latest = None
 
     def close_incomplete(block):
@@ -104,18 +112,19 @@ def read_tick_history(path):
         at = match.group("at")
         message = match.group("message")
 
-        if message.startswith("tick: due="):
-            close_incomplete(active)
-            dry_run = message.endswith(" (dry-run)")
-            raw_ids = message.removeprefix("tick: due=").split(" (dry-run)", 1)[0]
+        due = _TICK_DUE.match(message)
+        if due:
+            key = due.group("id") or _LEGACY_TICK_KEY
+            close_incomplete(active.pop(key, None))
+            dry_run = bool(due.group("dry"))
             due_ids = {
-                value.strip() for value in raw_ids.split(",") if value.strip()
+                value.strip()
+                for value in due.group("ids").split(",")
+                if value.strip()
             }
-            active = {
+            active[key] = {
                 "at": at,
                 "due_ids": due_ids,
-                "error_routines": set(),
-                "mapped_error_count": 0,
                 "dry_run": dry_run,
             }
             if not dry_run:
@@ -126,65 +135,59 @@ def read_tick_history(path):
                 }
             continue
 
-        if active:
-            error = _ROUTINE_ERROR.search(message)
-            if error:
-                active["error_routines"].add(error.group("routine"))
-                active["mapped_error_count"] += 1
-
-            if message.startswith("tick done:"):
-                totals = _TICK_TOTALS.search(message)
-                error_count = int(totals.group("errors")) if totals else None
-                mapped = active["error_routines"]
-                unknown_error = (
-                    error_count is not None
-                    and error_count > active["mapped_error_count"]
-                )
-                if not active["dry_run"]:
-                    for routine_id in active["due_ids"]:
+        done = _TICK_DONE.match(message)
+        if done:
+            key = done.group("id") or _LEGACY_TICK_KEY
+            block = active.pop(key, None)
+            dry_run = message.endswith(" (dry-run)") or bool(
+                block and block["dry_run"]
+            )
+            totals = _TICK_TOTALS.search(message)
+            error_count = int(totals.group("errors")) if totals else None
+            if not dry_run:
+                if block:
+                    for routine_id in block["due_ids"]:
                         routine_results[routine_id] = {
-                            "state": (
-                                "error"
-                                if routine_id in mapped or unknown_error
-                                else "ok"
-                            ),
+                            "state": "error" if error_count else "ok",
                             "at": at,
                         }
-                    latest = {
-                        "state": "error" if error_count else "done",
-                        "at": at,
-                        "message": message,
-                    }
-                active = None
-                continue
+                latest = {
+                    "state": "error" if error_count else "done",
+                    "at": at,
+                    "message": message,
+                }
+            continue
 
-            if message.startswith("tick skipped"):
-                if not active["dry_run"]:
-                    for routine_id in active["due_ids"]:
+        skipped = _TICK_SKIPPED.match(message)
+        if skipped:
+            key = skipped.group("id") or _LEGACY_TICK_KEY
+            block = active.pop(key, None)
+            dry_run = message.endswith(" (dry-run)") or bool(
+                block and block["dry_run"]
+            )
+            if not dry_run:
+                if block:
+                    for routine_id in block["due_ids"]:
                         routine_results[routine_id] = {
                             "state": "skipped",
                             "at": at,
                         }
-                    latest = {
-                        "state": "skipped",
-                        "at": at,
-                        "message": message,
-                    }
-                active = None
-                continue
+                latest = {
+                    "state": "skipped",
+                    "at": at,
+                    "message": message,
+                }
+            continue
 
-        if message.startswith("tick: no routines due"):
-            close_incomplete(active)
-            active = None
-            if not message.endswith(" (dry-run)"):
+        noop = _TICK_NOOP.match(message)
+        if noop:
+            key = noop.group("id") or _LEGACY_TICK_KEY
+            close_incomplete(active.pop(key, None))
+            if not noop.group("dry"):
                 latest = {"state": "idle", "at": at, "message": message}
 
-    if active and not active["dry_run"]:
-        for routine_id in active["due_ids"]:
-            routine_results[routine_id] = {
-                "state": "incomplete",
-                "at": active["at"],
-            }
+    for block in active.values():
+        close_incomplete(block)
     return {"latest": latest, "routines": routine_results}
 
 
@@ -196,6 +199,7 @@ def routine_rows(
     schedule = state.ScheduleStore(base_dir)
     ledger = state.load(base_dir)
     tick_results = tick_history.get("routines", {})
+    latest_tick = tick_history.get("latest") or {}
     rows = []
 
     for routine in routines:
@@ -225,16 +229,22 @@ def routine_rows(
 
         tick_result = tick_results.get(routine_id) or {}
         tick_state = tick_result.get("state")
+        current_tick = (
+            scheduler_running
+            and tick_state == "incomplete"
+            and latest_tick.get("state") == "incomplete"
+            and tick_result.get("at") == latest_tick.get("at")
+        )
         if tick_state == "error":
             issues.append("last run")
         elif tick_state == "skipped":
             issues.append("overlap")
-        elif tick_state == "incomplete" and not scheduler_running:
+        elif tick_state == "incomplete" and not current_tick:
             issues.append("incomplete")
 
         if not enabled:
             status_name = "disabled"
-        elif tick_state == "incomplete" and scheduler_running:
+        elif current_tick:
             status_name = "running"
         elif issues:
             status_name = "attention"
@@ -271,7 +281,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     now = time.time() if now is None else float(now)
     launchd = probe_launchd(label)
     legacy = None
-    if not launchd["loaded"] and label == DEFAULT_LAUNCHD_LABEL:
+    if label == DEFAULT_LAUNCHD_LABEL:
         legacy = probe_launchd(LEGACY_LAUNCHD_LABEL)
     history = read_tick_history(Path(base_dir) / "logs" / "run.log")
     rows = routine_rows(
@@ -299,6 +309,10 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             scheduler_bits.append(f"{launchd['runs']} launches")
         if launchd.get("last_exit") is not None:
             scheduler_bits.append(f"last exit {launchd['last_exit']}")
+        if legacy and legacy["loaded"]:
+            scheduler_bits.append(
+                f"legacy {LEGACY_LAUNCHD_LABEL} is also loaded; migrate it"
+            )
     else:
         scheduler_bits = [launchd["detail"], label]
         if legacy and legacy["loaded"]:
@@ -342,6 +356,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         launchd["loaded"]
         and launchd.get("last_exit") in (None, 0)
         and tick_issue is None
+        and not (legacy and legacy["loaded"])
     )
     routines_healthy = all(row["issues"] == "-" for row in rows)
     latest_healthy = (

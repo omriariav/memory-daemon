@@ -59,7 +59,7 @@ class TickHistoryTest(unittest.TestCase):
     def write(self, text):
         self.log.write_text(text)
 
-    def test_tracks_each_routines_latest_result(self):
+    def test_failed_tick_conservatively_marks_every_due_routine(self):
         self.write(
             "2026-07-29T10:00:00Z tick: due=alpha, beta\n"
             "2026-07-29T10:00:01Z routine=beta source ERROR: unavailable\n"
@@ -68,7 +68,7 @@ class TickHistoryTest(unittest.TestCase):
             "2026-07-29T10:15:00Z tick: no routines due\n"
         )
         history = status.read_tick_history(self.log)
-        self.assertEqual(history["routines"]["alpha"]["state"], "ok")
+        self.assertEqual(history["routines"]["alpha"]["state"], "error")
         self.assertEqual(history["routines"]["beta"]["state"], "error")
         self.assertEqual(history["latest"]["state"], "idle")
 
@@ -115,6 +115,21 @@ class TickHistoryTest(unittest.TestCase):
         self.assertEqual(history["latest"]["state"], "error")
         self.assertEqual(history["latest"]["at"], "2026-07-29T09:00:03Z")
         self.assertEqual(history["routines"]["alpha"]["state"], "error")
+
+    def test_interleaved_dry_run_is_correlated_by_tick_id(self):
+        self.write(
+            "2026-07-29T09:00:00Z tick[real123]: due=alpha\n"
+            "2026-07-29T09:00:01Z tick[dry456]: due=beta (dry-run)\n"
+            "2026-07-29T09:00:02Z tick[real123] done: 0 processed, "
+            "0 already-seen, 1 error(s)\n"
+            "2026-07-29T09:00:03Z tick[dry456] done: 1 processed, "
+            "0 already-seen, 0 error(s) (dry-run)\n"
+        )
+        history = status.read_tick_history(self.log)
+        self.assertEqual(history["latest"]["state"], "error")
+        self.assertEqual(history["latest"]["at"], "2026-07-29T09:00:02Z")
+        self.assertEqual(history["routines"]["alpha"]["state"], "error")
+        self.assertNotIn("beta", history["routines"])
 
 
 class RoutineStatusTest(unittest.TestCase):
@@ -173,7 +188,12 @@ class RoutineStatusTest(unittest.TestCase):
         rows = status.routine_rows(
             self.base,
             self.routines,
-            {"routines": {"alpha": {"state": "incomplete"}}},
+            {
+                "latest": {"state": "incomplete", "at": "now"},
+                "routines": {
+                    "alpha": {"state": "incomplete", "at": "now"}
+                },
+            },
             now=5000,
             scheduler_running=True,
         )
@@ -194,6 +214,23 @@ class RoutineStatusTest(unittest.TestCase):
 
 
 class RenderStatusTest(unittest.TestCase):
+    @staticmethod
+    def probe(current, legacy=None):
+        legacy = legacy or {
+            "loaded": False,
+            "label": "com.workspace-daemon",
+            "detail": "not loaded",
+        }
+
+        def resolve(label):
+            return (
+                current
+                if label == status.DEFAULT_LAUNCHD_LABEL
+                else legacy
+            )
+
+        return resolve
+
     def test_render_is_scannable_and_returns_health(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -217,7 +254,11 @@ class RenderStatusTest(unittest.TestCase):
                 "last_exit": 0,
                 "interval_seconds": 900,
             }
-            with mock.patch.object(status, "probe_launchd", return_value=launchd):
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
                 text, healthy = status.render(
                     base, [routine], now=1100
                 )
@@ -240,7 +281,11 @@ class RenderStatusTest(unittest.TestCase):
                 "last_exit": 0,
                 "interval_seconds": 900,
             }
-            with mock.patch.object(status, "probe_launchd", return_value=launchd):
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
                 text, healthy = status.render(Path(tmp), [], now=1100)
 
         self.assertFalse(healthy)
@@ -263,7 +308,11 @@ class RenderStatusTest(unittest.TestCase):
                 "last_exit": 0,
                 "interval_seconds": 900,
             }
-            with mock.patch.object(status, "probe_launchd", return_value=launchd):
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
                 text, healthy = status.render(base, [], now=3000)
 
         self.assertFalse(healthy)
@@ -291,6 +340,34 @@ class RenderStatusTest(unittest.TestCase):
 
         self.assertFalse(healthy)
         self.assertIn("legacy com.workspace-daemon is still loaded", text)
+
+    def test_both_loaded_jobs_are_unhealthy(self):
+        current = {
+            "loaded": True,
+            "label": "com.memory-daemon",
+            "state": "not running",
+            "runs": 0,
+            "last_exit": 0,
+            "interval_seconds": 900,
+        }
+        legacy = {
+            "loaded": True,
+            "label": "com.workspace-daemon",
+            "state": "not running",
+            "runs": 1,
+            "last_exit": 0,
+            "interval_seconds": 900,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(current, legacy),
+            ):
+                text, healthy = status.render(Path(tmp), [], now=1100)
+
+        self.assertFalse(healthy)
+        self.assertIn("legacy com.workspace-daemon is also loaded", text)
 
 
 class StatusWrapperTest(unittest.TestCase):

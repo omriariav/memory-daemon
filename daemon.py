@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import sys
+import uuid
 from pathlib import Path
 
 import yaml
@@ -145,6 +146,7 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
+    tick_id = uuid.uuid4().hex[:12]
     routines = config.discover(BASE_DIR)
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
@@ -159,24 +161,25 @@ def cmd_tick(args):
     ]
     if not due:
         mode = " (dry-run)" if args.dry_run else ""
-        log(f"tick: no routines due{mode}")
+        log(f"tick[{tick_id}]: no routines due{mode}")
         return 0
 
     due_ids = {r["id"] for r in due}
     mode = " (dry-run)" if args.dry_run else ""
-    log(f"tick: due={', '.join(sorted(due_ids))}{mode}")
+    log(f"tick[{tick_id}]: due={', '.join(sorted(due_ids))}{mode}")
     try:
         totals = runner.run(
             BASE_DIR, routines, dry_run=args.dry_run,
             refresh_labels=args.refresh_labels, active_ids=due_ids,
         )
     except state.AlreadyRunning as exc:
-        log(f"tick skipped — {exc}")
+        log(f"tick[{tick_id}] skipped — {exc}{mode}")
         return 0
     schedule.mark_attempted(due_ids)
     log(
-        f"tick done: {totals['processed']} processed, "
+        f"tick[{tick_id}] done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
+        f"{mode}"
     )
     return 1 if totals["errors"] else 0
 

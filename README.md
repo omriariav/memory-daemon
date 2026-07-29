@@ -550,7 +550,7 @@ it:
 # The template uses this stable link so Node upgrades do not break launchd.
 # Point it at the version prefix that contains bin/node and bin/npx.
 mkdir -p ~/.local
-ln -s "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
+ln -sfn "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
 
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon.plist.template \

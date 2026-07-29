@@ -1314,11 +1314,26 @@ class TickCommandTest(unittest.TestCase):
         with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
              mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
              mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.uuid, "uuid4",
+                 return_value=SimpleNamespace(hex="abc123456789ffff"),
+             ), \
              mock.patch.object(daemon_cli.config, "discover", return_value=[self.routine]), \
-             mock.patch.object(daemon_cli.runner, "run", return_value=totals) as run:
+             mock.patch.object(daemon_cli.runner, "run", return_value=totals) as run, \
+             mock.patch.object(daemon_cli, "log") as log:
             self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
         self.assertEqual(run.call_args.kwargs["active_ids"], {"domain"})
         self.assertIn("domain", state.ScheduleStore(self.base).entries)
+        self.assertEqual(
+            log.call_args_list,
+            [
+                mock.call("tick[abc123456789]: due=domain"),
+                mock.call(
+                    "tick[abc123456789] done: 0 processed, "
+                    "0 already-seen, 0 error(s)"
+                ),
+            ],
+        )
 
     def test_second_tick_inside_interval_does_nothing(self):
         state.ScheduleStore(self.base).mark_attempted({"domain"})
@@ -1337,11 +1352,17 @@ class TickCommandTest(unittest.TestCase):
              mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
              mock.patch.object(daemon_cli, "set_log_file"), \
              mock.patch.object(
+                 daemon_cli.uuid, "uuid4",
+                 return_value=SimpleNamespace(hex="dry123456789ffff"),
+             ), \
+             mock.patch.object(
                  daemon_cli.config, "discover", return_value=[self.routine]
              ), \
              mock.patch.object(daemon_cli, "log") as log:
             self.assertEqual(daemon_cli.cmd_tick(args), 0)
-        log.assert_called_once_with("tick: no routines due (dry-run)")
+        log.assert_called_once_with(
+            "tick[dry123456789]: no routines due (dry-run)"
+        )
 
 
 if __name__ == "__main__":
