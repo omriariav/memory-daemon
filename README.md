@@ -276,9 +276,11 @@ uses the cursor to select new activity, and expands affected threads through
 Slack's replies API. This is necessary because Slack does not return an old
 root from channel history merely because it received a new reply. Set the root
 floor to the beginning of the scope's first run. The reader rebuilds each
-affected UTC activity day before updating its stable memory entry; the API-read
-cost therefore grows with the root-history floor even though unchanged
-candidates never reach the LLM.
+affected UTC activity day before updating its stable memory entry. Candidate
+versions include a content fingerprint, so widening the historical boundaries
+reprocesses a day only when the rebuilt content actually changes. The API-read
+cost grows with the root-history floor even though unchanged candidates never
+reach the LLM.
 
 `catch_up_after` is the exclusive bootstrap boundary before the first
 successful cursor checkpoint. Recurring entries use a distinct

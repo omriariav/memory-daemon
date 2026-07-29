@@ -23,6 +23,7 @@ conversation made of unthreaded sentences reaches Yoetz as one coherent input.
 Mentions outside configured channels remain canonical thread candidates.
 """
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -188,6 +189,27 @@ def _rfc3339_epoch(value):
     return datetime.datetime.fromisoformat(raw).timestamp()
 
 
+def _daily_version(messages):
+    """Content-sensitive version for a rebuilt daily digest."""
+    content = [
+        {
+            "ts": message.get("ts"),
+            "thread_ts": message.get("thread_ts"),
+            "user": message.get("user"),
+            "text": message.get("text"),
+        }
+        for message in messages
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:16]
+
+
 def _catch_up_direct_candidates(source):
     """Lossless activity-day digests, including replies to older roots.
 
@@ -295,7 +317,10 @@ def _catch_up_direct_candidates(source):
                 "",
             )
             out.append({
-                "id": f"{sid}@{latest}",
+                # Latest activity keeps the version legible; the content hash
+                # also changes when a wider root floor reveals older context
+                # without changing the day's latest timestamp.
+                "id": f"{sid}@{latest}:{_daily_version(day_messages)}",
                 "title": first_text[:90] or f"Slack catch-up for {day}",
                 "raw": {
                     "channel": channel,
@@ -434,9 +459,14 @@ def candidates(source):
             days = max(1, math.ceil(int(source.get("hours", 26)) / 24))
         data = _cli(["mentions", "--days", str(days)])
         if data.get("limit_reached"):
-            raise RuntimeError(
-                "Slack mention catch-up reached Ada's result limit; "
-                "run a manual backfill before advancing the cursor"
+            if source.get("catch_up") is True:
+                raise RuntimeError(
+                    "Slack mention catch-up reached Ada's result limit; "
+                    "run a manual backfill before advancing the cursor"
+                )
+            log(
+                "slack mentions WARN: Ada's result limit was reached; "
+                "older mentions may be omitted"
             )
         for message in data.get("mentions", []):
             sid = message.get("source_id")

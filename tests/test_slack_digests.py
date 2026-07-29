@@ -140,6 +140,13 @@ class PrivateDigestTest(unittest.TestCase):
                     "text": "must stay in legacy coverage",
                     "reply_count": 0,
                 },
+                {
+                    "source_id": "slack:CDIRECT:1785227400.0",
+                    "ts": "1785227400.0",  # exactly at the 08:30 cutover
+                    "user": "U5",
+                    "text": "exact boundary stays in legacy coverage",
+                    "reply_count": 0,
+                },
             ],
         }
         thread = {
@@ -179,9 +186,9 @@ class PrivateDigestTest(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         candidate = candidates[0]
-        self.assertEqual(
+        self.assertRegex(
             candidate["id"],
-            "slack:CDIRECT:daily:2026-07-28@1785232800.0",
+            r"^slack:CDIRECT:daily:2026-07-28@1785232800\.0:[0-9a-f]{16}$",
         )
         self.assertEqual(
             candidate["raw"]["source_id"],
@@ -195,6 +202,7 @@ class PrivateDigestTest(unittest.TestCase):
         ])
         self.assertNotIn("pre-cutover root", texts)
         self.assertNotIn("must stay in legacy coverage", texts)
+        self.assertNotIn("exact boundary stays in legacy coverage", texts)
         self.assertEqual(
             cli.call_args_list[0].args[0],
             [
@@ -207,6 +215,61 @@ class PrivateDigestTest(unittest.TestCase):
             cli.call_args_list[1].args[0],
             ["replies", "CDIRECT", "1785225600.0"],
         )
+
+    def test_wider_root_floor_changes_version_when_latest_is_unchanged(self):
+        latest = {
+            "source_id": "slack:CDIRECT:1785232800.0",
+            "ts": "1785232800.0",  # 10:00, activates the day
+            "user": "U1",
+            "text": "latest message",
+            "reply_count": 0,
+        }
+        omitted = {
+            "source_id": "slack:CDIRECT:1785228300.0",
+            "ts": "1785228300.0",  # 08:45, older context now in scope
+            "user": "U2",
+            "text": "newly included older context",
+            "reply_count": 0,
+        }
+        base = {
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "max_results": 0,
+            "catch_up": True,
+            "_since": "2026-07-28T09:30:00Z",
+            "_catch_up_boundary": "2026-07-28T08:30:00Z",
+        }
+
+        with mock.patch.object(
+            slack_source, "_cli", return_value={"ok": True, "messages": [latest]}
+        ):
+            narrow = slack_source.candidates({
+                **base,
+                "reply_roots_after": "2026-07-28T09:00:00Z",
+            })[0]
+        with mock.patch.object(
+            slack_source, "_cli",
+            return_value={"ok": True, "messages": [latest, omitted]},
+        ):
+            wider = slack_source.candidates({
+                **base,
+                "reply_roots_after": "2026-06-28T08:00:00Z",
+            })[0]
+
+        self.assertEqual(
+            narrow["raw"]["source_id"], wider["raw"]["source_id"]
+        )
+        self.assertTrue(
+            narrow["id"].startswith(
+                "slack:CDIRECT:daily:2026-07-28@1785232800.0:"
+            )
+        )
+        self.assertTrue(
+            wider["id"].startswith(
+                "slack:CDIRECT:daily:2026-07-28@1785232800.0:"
+            )
+        )
+        self.assertNotEqual(narrow["id"], wider["id"])
 
     def test_new_reply_versions_an_existing_daily_digest(self):
         history = {
@@ -283,6 +346,22 @@ class MentionOwnershipTest(unittest.TestCase):
                     "catch_up": True,
                     "_since": "2026-07-28T09:00:00Z",
                 })
+
+    def test_fixed_window_mentions_warn_but_do_not_fail_at_ada_limit(self):
+        with mock.patch.object(slack_source, "_cli", return_value={
+            "ok": True,
+            "limit_reached": True,
+            "mentions": [],
+        }), mock.patch.object(slack_source, "log") as log:
+            candidates = slack_source.candidates({
+                "kind": "slack",
+                "include_mentions": True,
+                "hours": 24,
+            })
+
+        self.assertEqual(candidates, [])
+        log.assert_called_once()
+        self.assertIn("older mentions may be omitted", log.call_args.args[0])
 
     def test_catch_up_mention_boundary_is_exclusive(self):
         mentions = {
