@@ -547,12 +547,22 @@ never triggers the first real run. Render the template, add your key, then load
 it:
 
 ```sh
+# The template uses this stable link so Node upgrades do not break launchd.
+# Point it at the version prefix that contains bin/node and bin/npx.
+mkdir -p ~/.local
+ln -s "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
+
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon.plist.template \
   > ~/Library/LaunchAgents/com.memory-daemon.plist
 
 # replace REPLACE_ME with your provider API key
 $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
+
+# One-time cleanup when upgrading from the former workspace-daemon label.
+launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
+mv ~/Library/LaunchAgents/com.workspace-daemon.plist \
+  ~/.Trash/com.workspace-daemon.plist.retired 2>/dev/null || true
 
 launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist 2>/dev/null
 launchctl load   ~/Library/LaunchAgents/com.memory-daemon.plist

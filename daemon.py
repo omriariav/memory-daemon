@@ -158,7 +158,8 @@ def cmd_tick(args):
         if r.get("enabled", True) and schedule.due(r)
     ]
     if not due:
-        log("tick: no routines due")
+        mode = " (dry-run)" if args.dry_run else ""
+        log(f"tick: no routines due{mode}")
         return 0
 
     due_ids = {r["id"] for r in due}

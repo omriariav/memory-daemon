@@ -10,6 +10,8 @@ from . import config, state
 
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
+LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
+TICK_STALE_INTERVALS = 2
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
 _ROUTINE_ERROR = re.compile(
     r"\broutine=(?P<routine>[a-z0-9][a-z0-9-]*)\b.*\b(?:ERROR|FATAL)\b"
@@ -113,25 +115,31 @@ def read_tick_history(path):
                 "at": at,
                 "due_ids": due_ids,
                 "error_routines": set(),
+                "mapped_error_count": 0,
                 "dry_run": dry_run,
             }
-            latest = {
-                "state": "dry-run" if dry_run else "incomplete",
-                "at": at,
-                "message": message,
-            }
+            if not dry_run:
+                latest = {
+                    "state": "incomplete",
+                    "at": at,
+                    "message": message,
+                }
             continue
 
         if active:
             error = _ROUTINE_ERROR.search(message)
             if error:
                 active["error_routines"].add(error.group("routine"))
+                active["mapped_error_count"] += 1
 
             if message.startswith("tick done:"):
                 totals = _TICK_TOTALS.search(message)
                 error_count = int(totals.group("errors")) if totals else None
                 mapped = active["error_routines"]
-                unknown_error = bool(error_count) and not mapped
+                unknown_error = (
+                    error_count is not None
+                    and error_count > active["mapped_error_count"]
+                )
                 if not active["dry_run"]:
                     for routine_id in active["due_ids"]:
                         routine_results[routine_id] = {
@@ -142,14 +150,11 @@ def read_tick_history(path):
                             ),
                             "at": at,
                         }
-                latest = {
-                    "state": "dry-run" if active["dry_run"] else "done",
-                    "at": at,
-                    "message": (
-                        f"{message} (dry-run)"
-                        if active["dry_run"] else message
-                    ),
-                }
+                    latest = {
+                        "state": "error" if error_count else "done",
+                        "at": at,
+                        "message": message,
+                    }
                 active = None
                 continue
 
@@ -160,14 +165,19 @@ def read_tick_history(path):
                             "state": "skipped",
                             "at": at,
                         }
-                latest = {"state": "skipped", "at": at, "message": message}
+                    latest = {
+                        "state": "skipped",
+                        "at": at,
+                        "message": message,
+                    }
                 active = None
                 continue
 
-        if message == "tick: no routines due":
+        if message.startswith("tick: no routines due"):
             close_incomplete(active)
             active = None
-            latest = {"state": "idle", "at": at, "message": message}
+            if not message.endswith(" (dry-run)"):
+                latest = {"state": "idle", "at": at, "message": message}
 
     if active and not active["dry_run"]:
         for routine_id in active["due_ids"]:
@@ -260,6 +270,9 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     """Return ``(text, healthy)`` for the complete local daemon."""
     now = time.time() if now is None else float(now)
     launchd = probe_launchd(label)
+    legacy = None
+    if not launchd["loaded"] and label == DEFAULT_LAUNCHD_LABEL:
+        legacy = probe_launchd(LEGACY_LAUNCHD_LABEL)
     history = read_tick_history(Path(base_dir) / "logs" / "run.log")
     rows = routine_rows(
         base_dir,
@@ -288,12 +301,19 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             scheduler_bits.append(f"last exit {launchd['last_exit']}")
     else:
         scheduler_bits = [launchd["detail"], label]
+        if legacy and legacy["loaded"]:
+            scheduler_bits.append(
+                f"legacy {LEGACY_LAUNCHD_LABEL} is still loaded; migrate it"
+            )
 
     latest = history.get("latest")
+    tick_issue = _tick_issue(launchd, latest, now)
     if latest:
         tick_text = f"{_iso_age(latest['at'], now)} — {latest['message']}"
     else:
         tick_text = "never recorded"
+    if tick_issue:
+        tick_text += f" · ATTENTION: {tick_issue}"
 
     lines = [
         "Memory Daemon",
@@ -321,12 +341,16 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     scheduler_healthy = (
         launchd["loaded"]
         and launchd.get("last_exit") in (None, 0)
+        and tick_issue is None
     )
     routines_healthy = all(row["issues"] == "-" for row in rows)
     latest_healthy = (
         not latest
-        or latest["state"] != "incomplete"
-        or launchd.get("state") == "running"
+        or latest["state"] not in {"error", "incomplete"}
+        or (
+            latest["state"] == "incomplete"
+            and launchd.get("state") == "running"
+        )
     )
     return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
 
@@ -362,6 +386,38 @@ def _iso_age(value, now):
     except (TypeError, ValueError):
         return str(value)
     return _age(parsed, now)
+
+
+def _tick_issue(launchd, latest, now):
+    if not launchd["loaded"]:
+        return None
+    launches = launchd.get("runs")
+    if latest is None:
+        if isinstance(launches, int) and launches > 0:
+            return f"no tick log after {launches} launch(es)"
+        return None
+
+    interval = launchd.get("interval_seconds")
+    if not isinstance(interval, int) or interval <= 0:
+        return None
+    tick_epoch = _iso_epoch(latest.get("at"))
+    if tick_epoch is None:
+        return "last tick timestamp is invalid"
+    stale_after = interval * TICK_STALE_INTERVALS
+    if now - tick_epoch > stale_after:
+        return (
+            f"last tick is stale (expected within {_duration(stale_after)})"
+        )
+    return None
+
+
+def _iso_epoch(value):
+    try:
+        return datetime.datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def _age(value, now):

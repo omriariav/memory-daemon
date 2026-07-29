@@ -1330,6 +1330,19 @@ class TickCommandTest(unittest.TestCase):
             self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
         run.assert_not_called()
 
+    def test_dry_run_noop_is_identified_in_the_operational_log(self):
+        state.ScheduleStore(self.base).mark_attempted({"domain"})
+        args = SimpleNamespace(dry_run=True, refresh_labels=False)
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine]
+             ), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_tick(args), 0)
+        log.assert_called_once_with("tick: no routines due (dry-run)")
+
 
 if __name__ == "__main__":
     unittest.main()
