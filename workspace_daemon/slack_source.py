@@ -497,14 +497,9 @@ def candidates(source):
             days = max(1, math.ceil(int(source.get("hours", 26)) / 24))
         data = _cli(["mentions", "--days", str(days)])
         if data.get("limit_reached"):
-            if source.get("catch_up") is True:
-                raise RuntimeError(
-                    "Slack mention catch-up reached Ada's result limit; "
-                    "run a manual backfill before advancing the cursor"
-                )
-            log(
-                "slack mentions WARN: Ada's result limit was reached; "
-                "older mentions may be omitted"
+            raise RuntimeError(
+                "Slack mention scan reached Ada's result limit; "
+                "run a manual backfill before advancing coverage"
             )
         for message in data.get("mentions", []):
             sid = message.get("source_id")

@@ -194,6 +194,96 @@ class RoutineValidationTest(StoreFixture):
         probs = config.validate(self._routine())
         self.assertEqual(sum("instruction" in p for p in probs), 1)
 
+    def test_connector_sweep_requires_matching_single_source(self):
+        self.override()
+        routine = self._routine(
+            instruction_from_connector="slack",
+            connector_sweep=True,
+        )
+        routine["source"] = {"kind": "gchat", "all_spaces": True}
+        probs = config.validate(routine)
+        self.assertTrue(
+            any("exactly one 'slack' source block" in p for p in probs),
+            probs,
+        )
+
+    def test_gchat_connector_sweep_requires_all_spaces(self):
+        self.override(name="gchat")
+        routine = self._routine(
+            instruction_from_connector="gchat",
+            connector_sweep=True,
+        )
+        routine["source"] = {
+            "kind": "gchat",
+            "spaces": ["spaces/EXAMPLE"],
+        }
+        probs = config.validate(routine)
+        self.assertTrue(
+            any("source.all_spaces: true" in p for p in probs),
+            probs,
+        )
+
+    def test_gchat_connector_sweep_rejects_per_space_cap(self):
+        self.override(name="gchat")
+        routine = self._routine(
+            instruction_from_connector="gchat",
+            connector_sweep=True,
+        )
+        routine["source"] = {
+            "kind": "gchat",
+            "all_spaces": True,
+            "max_results": 0,
+            "max_per_space": 25,
+            "catch_up": True,
+            "batch_messages": "daily",
+        }
+        probs = config.validate(routine)
+        self.assertTrue(
+            any("source.max_per_space: 0" in p for p in probs),
+            probs,
+        )
+
+    def test_slack_connector_sweep_requires_catch_up(self):
+        self.override()
+        routine = self._routine(
+            instruction_from_connector="slack",
+            connector_sweep=True,
+        )
+        routine["source"]["max_results"] = 0
+        probs = config.validate(routine)
+        self.assertTrue(
+            any("source.catch_up: true" in p for p in probs),
+            probs,
+        )
+
+    def test_connector_sweep_must_be_boolean(self):
+        self.override()
+        probs = config.validate(self._routine(
+            instruction_from_connector="slack",
+            connector_sweep="yes",
+        ))
+        self.assertTrue(
+            any("connector_sweep must be true or false" in p for p in probs),
+            probs,
+        )
+
+    def test_connector_sweep_rejects_capped_source(self):
+        self.override(name="gmail")
+        routine = self._routine(
+            instruction_from_connector="gmail",
+            connector_sweep=True,
+        )
+        routine["source"] = {
+            "kind": "gmail",
+            "query": "in:inbox",
+            "max_results": 25,
+        }
+        probs = config.validate(routine)
+        self.assertTrue(
+            any("source.max_results: 0" in p for p in probs),
+            probs,
+        )
+
 
 class PromptBuildTest(StoreFixture):
     def test_build_prompt_embeds_connector_body(self):

@@ -9,9 +9,15 @@ def user_labels():
 
 
 def search(query, max_results=20):
+    limit = int(max_results)
+    args = [gws_bin(), "gmail", "list", "--query", query]
+    if limit == 0:
+        args.append("--all")
+    else:
+        args.extend(["--max", str(limit)])
+    args.extend(["--format", "json"])
     result = run_json(
-        [gws_bin(), "gmail", "list", "--query", query,
-         "--max", str(max_results), "--format", "json"]
+        args
     )
     return result.get("threads", [])
 

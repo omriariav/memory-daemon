@@ -57,6 +57,22 @@ class CandidatesTest(unittest.TestCase):
                                return_value={"count": 0, "messages": None}):
             self.assertEqual(gchat_source.candidates({"spaces": ["spaces/AAA"]}), [])
 
+    def test_zero_max_explicit_space_uses_exhaustive_positive_limit(self):
+        with mock.patch.object(
+            gchat_source, "_gws", return_value={"messages": []}
+        ) as gws:
+            gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "hours": 26,
+                "max_results": 0,
+            })
+
+        gws.assert_called_once_with([
+            "chat", "messages", "spaces/AAA",
+            "--after", mock.ANY,
+            "--max", str(gchat_source.FULL_DAY_MAX_RESULTS),
+        ])
+
     def test_daily_batches_unthreaded_messages_but_keeps_real_threads(self):
         messages = {"messages": [
             msg("t1", "2026-07-27T08:00:00Z", "thread root"),
@@ -212,7 +228,9 @@ class CandidatesTest(unittest.TestCase):
                 },
             ],
         }
-        with mock.patch.object(gchat_source, "_gws", return_value=messages) as gws:
+        with mock.patch.object(
+            gchat_source, "_gws", return_value=messages
+        ) as gws, mock.patch.object(gchat_source, "log") as log:
             out = gchat_source.candidates({
                 "all_spaces": True,
                 "hours": 168,
@@ -231,6 +249,15 @@ class CandidatesTest(unittest.TestCase):
             {"spaces/AAA", "spaces/BBB"},
         )
         self.assertEqual(gchat_source._space_cache["spaces/AAA"]["display_name"], "One")
+        coverage = log.call_args.args[0]
+        self.assertIn(
+            "discovered_space_ids=['spaces/AAA', 'spaces/BBB']",
+            coverage,
+        )
+        self.assertIn(
+            "considered_space_ids=['spaces/AAA', 'spaces/BBB']",
+            coverage,
+        )
 
     def test_all_spaces_uses_exact_catch_up_cursor(self):
         with mock.patch.object(
@@ -274,7 +301,9 @@ class CandidatesTest(unittest.TestCase):
                 },
             ],
         }
-        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+        with mock.patch.object(
+            gchat_source, "_gws", return_value=messages
+        ), mock.patch.object(gchat_source, "log") as log:
             out = gchat_source.candidates({
                 "all_spaces": True,
                 "_exclude_spaces": ["spaces/AAA"],
@@ -282,6 +311,15 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(
             {candidate["raw"]["space"] for candidate in out},
             {"spaces/BBB"},
+        )
+        coverage = log.call_args.args[0]
+        self.assertIn(
+            "excluded_active_space_ids=['spaces/AAA']",
+            coverage,
+        )
+        self.assertIn(
+            "considered_space_ids=['spaces/BBB']",
+            coverage,
         )
 
 

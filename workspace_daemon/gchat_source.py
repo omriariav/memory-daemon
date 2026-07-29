@@ -7,7 +7,7 @@ Routine config:
       spaces:
         - spaces/AAAA000000A     # #my-team-space
       hours: 26                  # lookback window; overlap the schedule slightly
-      max_results: 50            # cap per space
+      max_results: 50            # cap per space; 0 paginates exhaustively
 
 For a broad fallback sweep, replace ``spaces`` with ``all_spaces: true``.
 That uses ``gws chat recent``: it cheaply filters the user's entire space list
@@ -135,7 +135,10 @@ def _windowed_messages(source):
             "--max-per-space", str(source.get("max_per_space", 0)),
         ]
         data = _gws(args, timeout=300)
-        for message in data.get("messages") or []:
+        messages = data.get("messages") or []
+        discovered_spaces = set()
+        considered = []
+        for message in messages:
             space = message.get("space")
             if not space:
                 name = message.get("name", "")
@@ -143,17 +146,33 @@ def _windowed_messages(source):
                     space = name.split("/messages/", 1)[0]
             if not space:
                 continue
+            discovered_spaces.add(space)
             if space in excluded_spaces:
                 continue
+            considered.append((space, message))
             if space not in _space_cache:
                 _space_cache[space] = {
                     "display_name": message.get("space_display_name") or "",
                     "type": message.get("space_type") or "",
                 }
+        excluded_active = discovered_spaces & excluded_spaces
+        considered_spaces = {
+            space for space, _message in considered
+        }
+        log(
+            f"gchat recent coverage since={since} messages={len(messages)} "
+            f"discovered_space_ids={sorted(discovered_spaces)} "
+            f"excluded_active_space_ids={sorted(excluded_active)} "
+            f"considered_space_ids={sorted(considered_spaces)}"
+        )
+        for space, message in considered:
             yield space, message
         return
 
-    per_space = int(source.get("max_results", 50))
+    configured_max = int(source.get("max_results", 50))
+    per_space = (
+        FULL_DAY_MAX_RESULTS if configured_max == 0 else configured_max
+    )
     after = source.get("_since") or _after_iso(source.get("hours", 26))
     for space in source.get("spaces", []):
         if space in excluded_spaces:

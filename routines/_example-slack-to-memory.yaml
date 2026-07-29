@@ -37,6 +37,9 @@ analyze:
   # memory.store below. Use an inline `instruction:` instead when the routine
   # is a specialized job rather than a general sweep of the source.
   instruction_from_connector: slack
+  # Explicitly publish health for this connector's configured coverage. Other
+  # enabled Slack routine scopes hold the safe watermark until they succeed.
+  connector_sweep: true
   # Optional: stream-specific guidance appended to the connector body.
   instruction_extra: >-
     This sweep covers the team's project channels. Treat rollout steps and
