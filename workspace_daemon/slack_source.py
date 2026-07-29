@@ -216,6 +216,27 @@ def _daily_version(messages):
     ).hexdigest()[:16]
 
 
+def _normalize_direct_message(message, channel, day):
+    """Retain unsupported non-text activity instead of silently dropping it."""
+    if (
+        (message.get("text") or "").strip()
+        or int(message.get("reply_count") or 0) > 0
+    ):
+        return message
+    normalized = dict(message)
+    subtype = message.get("subtype")
+    suffix = f"; subtype={subtype}" if subtype else ""
+    normalized["text"] = (
+        "[Slack message contained no extractable text"
+        f"{suffix}]"
+    )
+    log(
+        f"slack direct WARN channel={channel} day={day}: "
+        "retaining activity with a no-text placeholder"
+    )
+    return normalized
+
+
 def _catch_up_direct_candidates(source):
     """Lossless activity-day digests, including replies to older roots.
 
@@ -301,9 +322,11 @@ def _catch_up_direct_candidates(source):
                     ts
                     and float(ts) > boundary_epoch
                     and _message_day(ts) in active_days
-                    and (message.get("text") or "").strip()
                 ):
-                    messages[ts] = message
+                    day = _message_day(ts)
+                    messages[ts] = _normalize_direct_message(
+                        message, channel, day
+                    )
 
         by_day = {}
         for message in messages.values():
@@ -359,6 +382,15 @@ def _direct_digest_candidates(source):
             day = _message_day(message.get("ts"))
             by_day.setdefault(day, []).append(message)
         for day, day_messages in by_day.items():
+            # The bundled CLI renders blocks, attachments, and files into text.
+            # Retain a visible placeholder if an older external CLI still
+            # returns a truly blank, unthreaded message: silently dropping an
+            # unsupported payload would turn a recoverable limitation into
+            # permanent data loss.
+            day_messages = [
+                _normalize_direct_message(message, channel, day)
+                for message in day_messages
+            ]
             day_messages.sort(key=lambda message: message.get("ts") or "")
             sid = f"slack:{channel}:digest:{day}"
             latest = max(

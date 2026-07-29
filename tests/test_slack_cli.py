@@ -112,6 +112,81 @@ class TimestampTest(unittest.TestCase):
         self.assertEqual(actual, f"{expected:.6f}")
 
 
+class MessageSimplificationTest(unittest.TestCase):
+    def test_block_only_message_preserves_visible_text(self):
+        message = {
+            "ts": "1.0",
+            "text": "",
+            "blocks": [{
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "Decision in a block"},
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Open"},
+                    "value": "internal-action-value",
+                },
+            }],
+        }
+
+        simplified = slack_cli.simplify_message(message, "C1")
+
+        self.assertIn("Decision in a block", simplified["text"])
+        self.assertIn("Open", simplified["text"])
+        self.assertNotIn("internal-action-value", simplified["text"])
+        self.assertTrue(simplified["non_text_fallback"])
+
+    def test_file_only_message_preserves_safe_metadata(self):
+        message = {
+            "ts": "1.0",
+            "text": "",
+            "files": [{
+                "id": "F1",
+                "title": "design.png",
+                "mimetype": "image/png",
+                "permalink": "https://example.test/file/F1",
+                "url_private": "https://secret.example.test/F1",
+            }],
+        }
+
+        simplified = slack_cli.simplify_message(message, "C1")
+
+        self.assertIn("design.png (image/png)", simplified["text"])
+        self.assertIn("https://example.test/file/F1", simplified["text"])
+        self.assertNotIn("secret.example.test", simplified["text"])
+
+    def test_attachment_only_message_preserves_visible_fields(self):
+        message = {
+            "ts": "1.0",
+            "text": "",
+            "attachments": [{
+                "fallback": "Deployment status",
+                "fields": [{"title": "State", "value": "Blocked"}],
+                "actions": [{
+                    "text": "Approve",
+                    "value": "opaque-internal-action-value",
+                }],
+            }],
+        }
+
+        simplified = slack_cli.simplify_message(message, "C1")
+
+        self.assertIn("Deployment status", simplified["text"])
+        self.assertIn("State", simplified["text"])
+        self.assertIn("Blocked", simplified["text"])
+        self.assertIn("Approve", simplified["text"])
+        self.assertNotIn("opaque-internal-action-value", simplified["text"])
+
+    def test_unsupported_system_message_gets_visible_placeholder(self):
+        simplified = slack_cli.simplify_message({
+            "ts": "1.0",
+            "text": "",
+            "subtype": "unsupported_event",
+        }, "C1")
+
+        self.assertIn("no extractable text", simplified["text"])
+        self.assertIn("unsupported_event", simplified["text"])
+
+
 class PaginationTest(unittest.TestCase):
     def test_history_follows_cursor_until_requested_limit(self):
         responses = [
