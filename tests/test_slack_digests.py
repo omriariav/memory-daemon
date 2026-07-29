@@ -123,6 +123,94 @@ class PrivateDigestTest(unittest.TestCase):
             {"name": "Two", "email": "two@example.com"},
         ])
 
+    def test_textless_unthreaded_activity_gets_a_safe_placeholder(self):
+        history = {
+            "ok": True,
+            "messages": [{
+                "source_id": "slack:CPRIVATE:1783496058.862689",
+                "ts": "1783496058.862689",
+                "user": "U1",
+                "text": "",
+                "reply_count": 0,
+            }],
+        }
+        with mock.patch.object(
+            slack_source, "_cli", return_value=history
+        ), mock.patch.object(slack_source, "log") as log:
+            candidates = slack_source.candidates({
+                "private_channels": ["CPRIVATE"],
+                "hours": 720,
+                "max_results": 100,
+            })
+
+        self.assertEqual(len(candidates), 1)
+        whois = {
+            "ok": True,
+            "users": {
+                "U1": {
+                    "real_name": "One",
+                    "email": "one@example.com",
+                },
+            },
+        }
+        with mock.patch.object(
+            slack_source, "_cli", return_value=whois
+        ):
+            item = slack_source.fetch({}, candidates[0])
+        self.assertIn("no extractable text", item["body"])
+        self.assertIn("retaining activity", log.call_args.args[0])
+
+    def test_textless_root_with_replies_is_expanded_and_fetched(self):
+        history = {
+            "ok": True,
+            "messages": [{
+                "source_id": "slack:CPRIVATE:1783496058.862689",
+                "ts": "1783496058.862689",
+                "latest_reply": "1783496158.862689",
+                "user": "U1",
+                "text": "",
+                "reply_count": 1,
+            }],
+        }
+        with mock.patch.object(
+            slack_source, "_cli", return_value=history
+        ):
+            candidates = slack_source.candidates({
+                "private_channels": ["CPRIVATE"],
+                "hours": 720,
+                "max_results": 100,
+            })
+
+        thread = {
+            "ok": True,
+            "messages": [
+                history["messages"][0],
+                {
+                    "source_id": "slack:CPRIVATE:1783496058.862689",
+                    "thread_ts": "1783496058.862689",
+                    "ts": "1783496158.862689",
+                    "user": "U2",
+                    "text": "durable reply content",
+                    "reply_count": 0,
+                },
+            ],
+        }
+        whois = {
+            "ok": True,
+            "users": {
+                "U2": {
+                    "real_name": "Two",
+                    "email": "two@example.com",
+                },
+            },
+        }
+        with mock.patch.object(
+            slack_source, "_cli", side_effect=[thread, whois]
+        ):
+            item = slack_source.fetch({}, candidates[0])
+
+        self.assertIn("Two: durable reply content", item["body"])
+
     def test_catch_up_finds_old_root_reply_and_preserves_cutover(self):
         root = {
             "source_id": "slack:CDIRECT:1785225600.0",
@@ -225,6 +313,40 @@ class PrivateDigestTest(unittest.TestCase):
             cli.call_args_list[1].args[0],
             ["replies", "CDIRECT", "1785225600.0"],
         )
+
+    def test_catch_up_retains_textless_unthreaded_activity(self):
+        history = {
+            "ok": True,
+            "messages": [{
+                "source_id": "slack:CDIRECT:1785232800.0",
+                "ts": "1785232800.0",
+                "user": "U1",
+                "text": "",
+                "subtype": "unsupported_event",
+                "reply_count": 0,
+            }],
+        }
+        source = {
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "max_results": 0,
+            "catch_up": True,
+            "_since": "2026-07-28T09:00:00Z",
+            "_catch_up_boundary": "2026-07-28T08:30:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
+        }
+
+        with mock.patch.object(
+            slack_source, "_cli", return_value=history
+        ), mock.patch.object(slack_source, "log") as log:
+            candidates = slack_source.candidates(source)
+
+        self.assertEqual(len(candidates), 1)
+        messages = candidates[0]["raw"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("no extractable text", messages[0]["text"])
+        self.assertIn("unsupported_event", messages[0]["text"])
+        self.assertIn("retaining activity", log.call_args.args[0])
 
     def test_wider_root_floor_changes_version_when_latest_is_unchanged(self):
         latest = {

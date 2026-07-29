@@ -124,13 +124,93 @@ def opt(args: List[str], flag: str, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 
 
+def _structured_text(value) -> List[str]:
+    """Extract human-visible text from Slack blocks and attachments."""
+    parts = []
+    if isinstance(value, list):
+        for child in value:
+            parts.extend(_structured_text(child))
+        return parts
+    if not isinstance(value, dict):
+        return parts
+    for key, child in value.items():
+        if key in {
+            "text", "fallback", "pretext", "title", "alt_text"
+        } and isinstance(child, str):
+            if child.strip():
+                parts.append(child.strip())
+        elif isinstance(child, (dict, list)):
+            parts.extend(_structured_text(child))
+    return parts
+
+
+def _attachment_text(value) -> List[str]:
+    """Extract visible attachment text without internal action values."""
+    parts = _structured_text(value)
+    attachments = value if isinstance(value, list) else [value]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        for field in attachment.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            field_value = field.get("value")
+            if isinstance(field_value, str) and field_value.strip():
+                parts.append(field_value.strip())
+    return parts
+
+
+def _message_text(message: Dict) -> str:
+    """Render text plus safe fallbacks for structured Slack messages."""
+    text = message.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+
+    parts = [
+        *_structured_text(message.get("blocks")),
+        *_attachment_text(message.get("attachments")),
+    ]
+    for slack_file in message.get("files") or []:
+        if not isinstance(slack_file, dict):
+            continue
+        name = (
+            slack_file.get("title")
+            or slack_file.get("name")
+            or slack_file.get("id")
+            or "unnamed file"
+        )
+        kind = slack_file.get("mimetype") or slack_file.get("pretty_type")
+        label = f"{name} ({kind})" if kind else str(name)
+        permalink = slack_file.get("permalink")
+        marker = f"[Shared file: {label}]"
+        if permalink:
+            marker = f"{marker} {permalink}"
+        parts.append(marker)
+
+    unique = []
+    for part in parts:
+        if part not in unique:
+            unique.append(part)
+    if unique:
+        return "\n".join(unique)
+
+    subtype = message.get("subtype")
+    suffix = f"; subtype={subtype}" if subtype else ""
+    return f"[Slack message contained no extractable text{suffix}]"
+
+
 def simplify_message(message: Dict, channel: str) -> Dict:
+    raw_text = message.get("text")
     return {
         "ts": message.get("ts"),
         "thread_ts": message.get("thread_ts"),
         "latest_reply": message.get("latest_reply"),
         "user": message.get("user") or message.get("bot_id", "?"),
-        "text": message.get("text", ""),
+        "text": _message_text(message),
+        "subtype": message.get("subtype"),
+        "non_text_fallback": not (
+            isinstance(raw_text, str) and raw_text.strip()
+        ),
         "reply_count": message.get("reply_count", 0),
         "source_id": (
             f"slack:{channel}:"
