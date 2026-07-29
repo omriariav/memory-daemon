@@ -479,21 +479,18 @@ class MentionOwnershipTest(unittest.TestCase):
                     "_since": "2026-07-28T09:00:00Z",
                 })
 
-    def test_fixed_window_mentions_warn_but_do_not_fail_at_ada_limit(self):
+    def test_fixed_window_mentions_also_fail_closed_at_ada_limit(self):
         with mock.patch.object(slack_source, "_cli", return_value={
             "ok": True,
             "limit_reached": True,
             "mentions": [],
-        }), mock.patch.object(slack_source, "log") as log:
-            candidates = slack_source.candidates({
-                "kind": "slack",
-                "include_mentions": True,
-                "hours": 24,
-            })
-
-        self.assertEqual(candidates, [])
-        log.assert_called_once()
-        self.assertIn("older mentions may be omitted", log.call_args.args[0])
+        }):
+            with self.assertRaisesRegex(RuntimeError, "result limit"):
+                slack_source.candidates({
+                    "kind": "slack",
+                    "include_mentions": True,
+                    "hours": 24,
+                })
 
     def test_catch_up_mention_boundary_is_exclusive(self):
         mentions = {

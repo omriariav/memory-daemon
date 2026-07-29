@@ -68,6 +68,41 @@ def memory_cfg(routine):
     return cfg if isinstance(cfg, dict) else {}
 
 
+def mark_connector_pulled(routine, at, dry_run=False):
+    """Record a successful connector-backed sweep in the memory store.
+
+    The daemon owns source enumeration and its durable catch-up cursor. The
+    connector state is the store-facing health signal, so update it only after
+    the full run succeeds. A failure must remain visible to the runner rather
+    than letting captures land while the store reports stale coverage.
+    """
+    analyze = routine.get("analyze") or {}
+    if analyze.get("connector_sweep") is not True:
+        return False
+    name = analyze.get("instruction_from_connector")
+    cfg = memory_cfg(routine)
+    if not name or not cfg:
+        return False
+    rid = routine.get("id")
+    if dry_run:
+        log(
+            f"routine={rid} [dry-run] would mark connector "
+            f"{name!r} pulled at {at}"
+        )
+        return True
+    r = _cli(
+        cfg["store"],
+        ["connectors", "mark-pulled", name, "--at", at],
+    )
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"connector {name!r} mark-pulled failed: {out[:300]}"
+        )
+    log(f"routine={rid} connector {name!r} marked pulled at {at}")
+    return True
+
+
 def validate(routine):
     """Config problems for the memory block; empty list means valid."""
     cfg = memory_cfg(routine)
@@ -376,7 +411,10 @@ def capture(routine, item, summary, dry_run=False):
             log(f"routine={rid} memory WARN {degraded}")
 
     if not entry.get("worthy", True):
-        log(f"routine={rid} memory: judged not memory-worthy, skipping")
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "judged not memory-worthy, skipping"
+        )
         return {"memory": "skipped_not_worthy"}
 
     # --- validate everything the model returned -----------------------------
@@ -446,7 +484,10 @@ def capture(routine, item, summary, dry_run=False):
         raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
     verdict, entry_id = (m.group(1), m.group(2)) if m else ("unknown", None)
-    log(f"routine={rid} memory {verdict} {entry_id or ''}")
+    log(
+        f"routine={rid} memory {verdict} {entry_id or ''} "
+        f"source_id={source_id}"
+    )
 
     # The store's auto-commit hook only fires inside agent sessions; commit here
     # so daemon writes are versioned too. Best-effort.

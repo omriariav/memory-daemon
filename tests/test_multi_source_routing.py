@@ -704,6 +704,46 @@ class CursorStoreTest(unittest.TestCase):
             state.CursorStore(self.base)
 
 
+class ConnectorCoverageTest(unittest.TestCase):
+    def test_bounded_source_cannot_claim_complete_coverage(self):
+        problem = runner._source_coverage_problem(
+            {"kind": "gmail", "max_results": 25},
+            [],
+        )
+        self.assertIn("bounded max_results=25", problem)
+
+    def test_ada_service_cap_cannot_claim_complete_coverage(self):
+        problem = runner._source_coverage_problem(
+            {"kind": "slack", "max_results": 0},
+            [{
+                "raw": {
+                    "mode": "ada_digest",
+                    "channel": "CEXAMPLE",
+                    "summary": {"message_count": 100},
+                },
+            }],
+        )
+        self.assertIn("Ada 100-message cap", problem)
+
+    def test_gchat_per_space_cap_cannot_claim_complete_coverage(self):
+        problem = runner._source_coverage_problem(
+            {
+                "kind": "gchat",
+                "all_spaces": True,
+                "max_results": 0,
+                "max_per_space": 25,
+            },
+            [],
+        )
+        self.assertIn("bounded max_per_space=25", problem)
+
+    def test_uncapped_source_is_complete(self):
+        self.assertIsNone(runner._source_coverage_problem(
+            {"kind": "gchat", "max_results": 0},
+            [],
+        ))
+
+
 class CatchUpCursorRunnerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -887,6 +927,281 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 "sweep", "gchat:all-spaces", "gchat"
             )
         )
+
+    def test_connector_state_failure_holds_prior_cursor(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        routine = self.routine(memory=True)
+        routine["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled",
+            side_effect=RuntimeError("state unavailable"),
+        ):
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-28T10:00:00Z",
+            ):
+                totals = runner.run(self.base, [routine])
+
+        self.assertEqual(totals["errors"], 1)
+        self.assertIsNone(
+            state.CursorStore(self.base).checkpoint(
+                "sweep", "gchat:all-spaces", "gchat"
+            )
+        )
+
+    def test_successful_noop_marks_connector_pulled(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        routine = self.routine(memory=True)
+        routine["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled", return_value=True
+        ) as mark:
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-28T10:00:00Z",
+            ):
+                totals = runner.run(self.base, [routine])
+
+        self.assertEqual(totals["errors"], 0)
+        mark.assert_called_once_with(
+            routine, "2026-07-28T10:00:00Z", dry_run=False
+        )
+
+    def test_connector_prompt_alone_does_not_claim_full_coverage(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        routine = self.routine(memory=True)
+        routine["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+        }
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled"
+        ) as mark, mock.patch.object(
+            runner, "utc_now_iso",
+            return_value="2026-07-28T10:00:00Z",
+        ):
+            totals = runner.run(self.base, [routine])
+
+        self.assertEqual(totals["errors"], 0)
+        mark.assert_not_called()
+
+    def test_inactive_owner_holds_watermark_until_its_successful_run(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        sweep = self.routine(memory=True)
+        sweep["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        owner = {
+            "id": "domain",
+            "enabled": True,
+            "source": {
+                "kind": "gchat",
+                "spaces": ["spaces/OWNED"],
+                "hours": 168,
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep domain decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "domain-vault"),
+                "slug_prefix": "domain",
+            },
+        }
+
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled", return_value=True
+        ) as mark:
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-28T10:00:00Z",
+            ):
+                first = runner.run(
+                    self.base, [owner, sweep], active_ids={"sweep"}
+                )
+            mark.assert_not_called()
+
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-28T12:00:00Z",
+            ):
+                second = runner.run(
+                    self.base, [owner, sweep], active_ids={"domain"}
+                )
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        mark.assert_called_once_with(
+            sweep, "2026-07-28T10:00:00Z", dry_run=False
+        )
+
+    def test_fixed_window_owner_gap_holds_connector_watermark(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        sweep = self.routine(memory=True)
+        sweep["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        owner = {
+            "id": "domain",
+            "enabled": True,
+            "source": {
+                "kind": "gchat",
+                "spaces": ["spaces/OWNED"],
+                "hours": 168,
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep domain decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "domain-vault"),
+                "slug_prefix": "domain",
+            },
+        }
+
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled", return_value=True
+        ) as mark:
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-28T10:00:00Z",
+            ):
+                seeded = runner.run(self.base, [owner, sweep])
+            self.assertEqual(seeded["errors"], 0)
+            mark.assert_called_once()
+            mark.reset_mock()
+
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-08-10T10:00:00Z",
+            ):
+                after_gap = runner.run(
+                    self.base, [owner, sweep], active_ids={"domain"}
+                )
+
+        self.assertEqual(after_gap["errors"], 0)
+        mark.assert_not_called()
+
+    def test_disabled_owner_prevents_connector_wide_checkpoint(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        sweep = self.routine(memory=True)
+        sweep["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        disabled = {
+            "id": "parked-domain",
+            "enabled": False,
+            "source": {
+                "kind": "gchat",
+                "spaces": ["spaces/PARKED"],
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep domain decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "parked-vault"),
+                "slug_prefix": "parked",
+            },
+        }
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled"
+        ) as mark, mock.patch.object(
+            runner, "utc_now_iso",
+            return_value="2026-07-28T10:00:00Z",
+        ):
+            totals = runner.run(self.base, [disabled, sweep])
+
+        self.assertEqual(totals["errors"], 0)
+        mark.assert_not_called()
+
+    def test_duplicate_connector_sweep_publishers_fail_closed(self):
+        def candidates(source):
+            return []
+
+        runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
+        first = self.routine(memory=True)
+        first["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        second = {
+            **first,
+            "id": "second-sweep",
+            "source": dict(first["source"]),
+            "analyze": dict(first["analyze"]),
+            "memory": dict(first["memory"]),
+        }
+        with mock.patch.object(
+            config, "validate", return_value=[]
+        ), mock.patch.object(
+            memory_sink, "mark_connector_pulled"
+        ) as mark, mock.patch.object(
+            runner, "utc_now_iso",
+            return_value="2026-07-28T10:00:00Z",
+        ):
+            totals = runner.run(self.base, [first, second])
+
+        self.assertEqual(totals["errors"], 1)
+        mark.assert_not_called()
 
     def test_memory_error_is_retried_before_cursor_advances(self):
         candidate = {

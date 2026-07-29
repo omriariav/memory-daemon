@@ -6,6 +6,7 @@ never summarized twice and never left with silently unfinished Gmail actions.
 import datetime
 import hashlib
 import json
+import math
 import re
 from contextlib import ExitStack
 from email.utils import getaddresses
@@ -46,6 +47,19 @@ def _catch_up_cursor_id(source):
         ).hexdigest()[:16]
         return f"slack:configured-scope:{digest}"
     raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
+
+
+def _coverage_cursor_id(source_index, source):
+    """Stable success checkpoint for one configured connector source scope."""
+    scope = {
+        key: value
+        for key, value in source.items()
+        if not str(key).startswith("_")
+    }
+    digest = hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    return f"connector-coverage:{source_index}:{digest}"
 
 
 def _needs_label_catalog(routines):
@@ -177,10 +191,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 )
             catch_up_sources.append((routine["id"], cursor_id, kind))
 
+    source_coverage = {}
     claims, listing_failures = _collect_claims(
         valid, totals, source_kinds=active_source_kinds,
         routing_context=routines,
         source_overrides=source_overrides,
+        source_coverage=source_coverage,
     )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
@@ -197,21 +213,191 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals, lock, catalog,
         )
 
-    if catch_up_sources:
+    coverage_sources = []
+    if totals["errors"] == 0:
+        coverage_sources = _mark_connector_sweeps(
+            routines,
+            valid_ids,
+            active_ids,
+            scan_started_at,
+            dry_run,
+            totals,
+            cursors,
+            source_coverage,
+        )
+
+    successful_sources = [*catch_up_sources, *coverage_sources]
+    if successful_sources:
         if totals["errors"] == 0:
-            cursors.mark_successful(catch_up_sources, scan_started_at)
-            mode = "[dry-run] would advance" if dry_run else "advanced"
-            log(
-                f"catch-up cursor {mode} to {scan_started_at} for "
-                f"{len(catch_up_sources)} source(s)"
-            )
+            cursors.mark_successful(successful_sources, scan_started_at)
+            if catch_up_sources:
+                mode = "[dry-run] would advance" if dry_run else "advanced"
+                log(
+                    f"catch-up cursor {mode} to {scan_started_at} for "
+                    f"{len(catch_up_sources)} source(s)"
+                )
         else:
-            log(
-                f"catch-up cursor held at prior checkpoint due to "
-                f"{totals['errors']} error(s)"
-            )
+            if catch_up_sources:
+                log(
+                    f"catch-up cursor held at prior checkpoint due to "
+                    f"{totals['errors']} error(s)"
+                )
+            if coverage_sources:
+                log(
+                    f"connector coverage checkpoint held at prior state due to "
+                    f"{totals['errors']} error(s)"
+                )
 
     return totals
+
+
+def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
+                           dry_run, totals, cursors, source_coverage):
+    """Advance connector health only to the oldest fully covered scope.
+
+    A connector prompt is reusable by partial routines, so merely reading one
+    does not prove connector-wide coverage.  ``connector_sweep: true`` names
+    the routine that publishes health for the configured source.  Every
+    enabled routine source of that kind participates in the safe watermark:
+    active sources contribute this run's start, while inactive owners retain
+    their prior successful checkpoint.
+    """
+    declarations = {}
+    duplicate_keys = set()
+    connector_kinds = set()
+    for routine in routines:
+        if not routine.get("enabled", True) or routine["id"] not in valid_ids:
+            continue
+        analyze = routine.get("analyze") or {}
+        if analyze.get("connector_sweep") is not True:
+            continue
+        connector = analyze.get("instruction_from_connector")
+        store = memory_sink.memory_cfg(routine).get("store")
+        key = (store, connector)
+        if not store or not connector:
+            continue
+        if key in declarations:
+            duplicate_keys.add(key)
+            totals["errors"] += 1
+            log(
+                f"routine={routine['id']} connector state FATAL: duplicate "
+                f"{connector!r} sweep publisher also declared by "
+                f"{declarations[key]['id']}"
+            )
+            continue
+        declarations[key] = routine
+        connector_kinds.add(connector)
+
+    scan_second, _scan_fraction = time_utils.rfc3339_key(scan_started_at)
+    for routine in routines:
+        rid = routine.get("id", "?")
+        if (
+            not routine.get("enabled", True)
+            or rid not in valid_ids
+            or rid not in active_ids
+        ):
+            continue
+        for source_index, source in enumerate(config.sources(routine)):
+            if source.get("kind") not in connector_kinds:
+                continue
+            coverage_key = (rid, source_index)
+            if (
+                coverage_key not in source_coverage
+                or source_coverage[coverage_key]
+            ):
+                continue
+            window_seconds = _fixed_window_seconds(source)
+            if window_seconds is None:
+                continue
+            cursor_id = _coverage_cursor_id(source_index, source)
+            previous = cursors.checkpoint(
+                rid, cursor_id, source["kind"]
+            )
+            if not previous:
+                continue  # first successful run establishes the bootstrap
+            boundary = scan_second - datetime.timedelta(
+                seconds=window_seconds
+            )
+            if time_utils.rfc3339_key(previous) < (boundary, 0):
+                source_coverage[coverage_key] = (
+                    "fixed-window gap since prior successful scan"
+                )
+
+    coverage_sources = [
+        (
+            routine["id"],
+            _coverage_cursor_id(source_index, source),
+            source["kind"],
+        )
+        for routine in routines
+        if (
+            routine.get("enabled", True)
+            and routine["id"] in valid_ids
+            and routine["id"] in active_ids
+        )
+        for source_index, source in enumerate(config.sources(routine))
+        if (
+            source.get("kind") in connector_kinds
+            and (routine["id"], source_index) in source_coverage
+            and not source_coverage.get((routine["id"], source_index))
+        )
+    ]
+
+    for (store, connector), sweep in declarations.items():
+        if (store, connector) in duplicate_keys:
+            continue
+        stamps = []
+        blockers = []
+        for routine in routines:
+            rid = routine.get("id", "?")
+            for source_index, source in enumerate(config.sources(routine)):
+                if source.get("kind") != connector:
+                    continue
+                cursor_id = _coverage_cursor_id(source_index, source)
+                if not routine.get("enabled", True):
+                    blockers.append(f"{rid}[{source_index}] disabled")
+                    continue
+                if rid not in valid_ids:
+                    blockers.append(f"{rid}[{source_index}] invalid")
+                    continue
+                if rid in active_ids:
+                    coverage_key = (rid, source_index)
+                    if coverage_key not in source_coverage:
+                        blockers.append(
+                            f"{rid}[{source_index}] was not listed"
+                        )
+                    elif source_coverage[coverage_key]:
+                        blockers.append(
+                            f"{rid}[{source_index}] "
+                            f"{source_coverage[coverage_key]}"
+                        )
+                    else:
+                        stamps.append(scan_started_at)
+                    continue
+                checkpoint = cursors.checkpoint(rid, cursor_id, connector)
+                if checkpoint:
+                    stamps.append(checkpoint)
+                else:
+                    blockers.append(f"{rid}[{source_index}] never completed")
+
+        if blockers or not stamps:
+            detail = ", ".join(blockers) if blockers else "no covered sources"
+            log(
+                f"routine={sweep['id']} connector {connector!r} not marked "
+                f"pulled: incomplete configured coverage ({detail})"
+            )
+            continue
+        watermark = min(stamps, key=time_utils.rfc3339_key)
+        try:
+            memory_sink.mark_connector_pulled(
+                sweep, watermark, dry_run=dry_run
+            )
+        except Exception as exc:
+            totals["errors"] += 1
+            log(
+                f"routine={sweep['id']} connector state FATAL: {exc}"
+            )
+    return coverage_sources
 
 
 # --- sources ----------------------------------------------------------------
@@ -694,8 +880,65 @@ def _ownership_limit(source, sources):
     )
 
 
+def _source_coverage_problem(source, candidates):
+    """Why a successful listing still cannot prove the whole scope was read."""
+    if source.get("max_results") != 0:
+        return f"bounded max_results={source.get('max_results')!r}"
+    if (
+        source.get("kind") == "gchat"
+        and source.get("all_spaces") is True
+        and source.get("max_per_space") != 0
+    ):
+        return (
+            f"bounded max_per_space={source.get('max_per_space')!r}"
+        )
+    if source.get("kind") == "slack":
+        capped_ada = sorted({
+            candidate.get("raw", {}).get("channel")
+            for candidate in candidates
+            if (
+                candidate.get("raw", {}).get("mode") == "ada_digest"
+                and int(
+                    candidate.get("raw", {})
+                    .get("summary", {})
+                    .get("message_count") or 0
+                ) >= 100
+            )
+        } - {None})
+        if capped_ada:
+            return (
+                "Ada 100-message cap reached for "
+                + ", ".join(capped_ada)
+            )
+    return None
+
+
+def _fixed_window_seconds(source):
+    """Smallest non-cursor window a source relies on, or None for catch-up."""
+    if source.get("catch_up") is True:
+        return None
+    kind = source.get("kind")
+    hours = float(source.get("hours", 26))
+    if kind == "gchat":
+        return hours * 60 * 60
+    if kind != "slack":
+        return None
+
+    windows = []
+    if any(source.get(key) for key in (
+        "channels", "direct_channels", "private_channels"
+    )):
+        windows.append(hours * 60 * 60)
+    default_days = max(1, min(90, math.ceil(hours / 24)))
+    if source.get("ada_channels"):
+        windows.append(int(source.get("ada_days", default_days)) * 24 * 60 * 60)
+    if source.get("include_mentions"):
+        windows.append(default_days * 24 * 60 * 60)
+    return min(windows) if windows else None
+
+
 def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
-                    source_overrides=None):
+                    source_overrides=None, source_coverage=None):
     """List candidates for the full routing context.
 
     Every enabled routine participates for source kinds used by the active
@@ -710,6 +953,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
     source_kinds = set(source_kinds) if source_kinds is not None else None
     routing_context = routines if routing_context is None else routing_context
     source_overrides = source_overrides or {}
+    source_coverage = {} if source_coverage is None else source_coverage
     claims = {}
     failures = []
     entries = [
@@ -766,11 +1010,15 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         try:
             candidates = list_candidates(listing_source)
         except Exception as exc:
+            source_coverage[(rid, source_index)] = f"listing failed: {exc}"
             totals["errors"] += 1
             log(f"routine={rid} source={kind} FATAL: {exc}")
             failures.append(_failure(routine, source))
             continue
 
+        source_coverage[(rid, source_index)] = _source_coverage_problem(
+            source, candidates
+        )
         log(f"routine={rid} source={kind} {len(candidates)} item(s) matched")
         normal_ids = {_routing_id(candidate) for candidate in candidates}
 

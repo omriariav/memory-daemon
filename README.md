@@ -35,6 +35,8 @@ memory store's connector file:
 analyze:
   instruction_from_connector: slack   # <store>/memory/connectors/slack.md,
                                       # falling back to <store>/connectors/slack.md
+  connector_sweep: true               # only on the routine that owns the
+                                      # configured connector-wide sweep
   instruction_extra: >-               # optional, appended to it
     Stream-specific guidance for this routine.
 ```
@@ -43,6 +45,22 @@ The connector body *is* the extraction prompt ("what is memory-worthy in
 Slack"), and personal-memory's web UI edits exactly that file — so prompt
 tuning is a browser edit that the next run picks up, with no config change, and
 interactive agent sessions reading the same connector apply identical judgment.
+The connector's `fetch:` frontmatter belongs to personal-memory's interactive
+pull workflow; memory-daemon does not use it for source enumeration. The
+routine's `source:`/`sources:` block is authoritative for daemon coverage.
+
+`instruction_from_connector` selects a prompt; it does not by itself claim
+source-wide coverage. Set `connector_sweep: true` only on the routine that owns
+the configured connector-wide sweep. After every enabled routine scope for that
+source has completed successfully—even when every candidate was already seen or
+rejected as noise—the daemon advances `memory connectors mark-pulled` to the
+oldest successful scope checkpoint. A non-due owner therefore holds the safe
+watermark instead of creating a silent gap. Partial and inline specialized
+routines do not advance connector health on their own. Connector coverage
+sources use `max_results: 0`; a bounded source or a reported upstream service
+cap holds the watermark until complete coverage succeeds. Slack and Google Chat
+sweep publishers also require `catch_up: true`; Google Chat requires
+`max_per_space: 0`.
 
 Use it for **general sweeps of a source**. Keep an inline `instruction` when the
 routine is a **specialized job** on that source (mining a recurring report,

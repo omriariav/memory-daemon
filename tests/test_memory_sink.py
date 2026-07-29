@@ -116,6 +116,79 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(memory_sink.validate({"id": "r"}), [])
 
 
+class ConnectorStateTest(unittest.TestCase):
+    def routine(self):
+        return {
+            "id": "sweep",
+            "analyze": {
+                "instruction_from_connector": "gchat",
+                "connector_sweep": True,
+            },
+            "memory": {"store": "/store"},
+        }
+
+    def test_marks_connector_at_scan_start(self):
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult("✓ marked\n")
+        ) as cli:
+            changed = memory_sink.mark_connector_pulled(
+                self.routine(), "2026-07-29T10:00:00Z"
+            )
+        self.assertTrue(changed)
+        cli.assert_called_once_with(
+            "/store",
+            [
+                "connectors", "mark-pulled", "gchat",
+                "--at", "2026-07-29T10:00:00Z",
+            ],
+        )
+
+    def test_dry_run_reports_but_does_not_write(self):
+        with mock.patch.object(memory_sink, "_cli") as cli, \
+             mock.patch.object(memory_sink, "log") as log:
+            changed = memory_sink.mark_connector_pulled(
+                self.routine(), "2026-07-29T10:00:00Z", dry_run=True
+            )
+        self.assertTrue(changed)
+        cli.assert_not_called()
+        self.assertIn("would mark connector", log.call_args.args[0])
+
+    def test_cli_failure_is_a_hard_error(self):
+        failed = FakeResult("bad connector state", returncode=1)
+        with mock.patch.object(memory_sink, "_cli", return_value=failed):
+            with self.assertRaisesRegex(
+                RuntimeError, "mark-pulled failed"
+            ):
+                memory_sink.mark_connector_pulled(
+                    self.routine(), "2026-07-29T10:00:00Z"
+                )
+
+    def test_inline_routine_does_not_touch_connector_state(self):
+        routine = {
+            "id": "specialized",
+            "analyze": {"instruction": "Keep reports."},
+            "memory": {"store": "/store"},
+        }
+        with mock.patch.object(memory_sink, "_cli") as cli:
+            self.assertFalse(
+                memory_sink.mark_connector_pulled(
+                    routine, "2026-07-29T10:00:00Z"
+                )
+            )
+        cli.assert_not_called()
+
+    def test_connector_prompt_without_sweep_declaration_does_not_mark(self):
+        routine = self.routine()
+        routine["analyze"].pop("connector_sweep")
+        with mock.patch.object(memory_sink, "_cli") as cli:
+            self.assertFalse(
+                memory_sink.mark_connector_pulled(
+                    routine, "2026-07-29T10:00:00Z"
+                )
+            )
+        cli.assert_not_called()
+
+
 class CaptureValidationTest(unittest.TestCase):
     """Model output is validated: unknown slugs dropped, bad type falls back."""
 

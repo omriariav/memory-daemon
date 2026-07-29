@@ -213,6 +213,57 @@ def validate(routine):
         problems.append(
             f"{rid}: analyze.pick_label requires every source in the routine to be Gmail"
         )
+    connector_sweep = analyze.get("connector_sweep")
+    if connector_sweep is not None and not isinstance(connector_sweep, bool):
+        problems.append(f"{rid}: analyze.connector_sweep must be true or false")
+    if connector_sweep is True:
+        connector = analyze.get("instruction_from_connector")
+        if not connector:
+            problems.append(
+                f"{rid}: analyze.connector_sweep requires "
+                f"analyze.instruction_from_connector"
+            )
+        elif connector not in VALID_SOURCE_KINDS:
+            problems.append(
+                f"{rid}: analyze.connector_sweep connector {connector!r} "
+                f"does not match a supported source kind"
+            )
+        elif (
+            len(source_dicts) != 1
+            or source_dicts[0].get("kind") != connector
+        ):
+            problems.append(
+                f"{rid}: analyze.connector_sweep requires exactly one "
+                f"{connector!r} source block"
+            )
+        elif (
+            connector == "gchat"
+            and source_dicts[0].get("all_spaces") is not True
+        ):
+            problems.append(
+                f"{rid}: a gchat connector sweep requires source.all_spaces: true"
+            )
+        elif (
+            connector == "gchat"
+            and source_dicts[0].get("max_per_space") != 0
+        ):
+            problems.append(
+                f"{rid}: a gchat connector sweep requires "
+                f"source.max_per_space: 0"
+            )
+        elif (
+            connector in {"gchat", "slack"}
+            and source_dicts[0].get("catch_up") is not True
+        ):
+            problems.append(
+                f"{rid}: a {connector} connector sweep requires "
+                f"source.catch_up: true"
+            )
+        elif source_dicts[0].get("max_results") != 0:
+            problems.append(
+                f"{rid}: analyze.connector_sweep requires source.max_results: 0 "
+                f"so the declared sweep is not capped"
+            )
 
     output = routine.get("output") or {}
     if not isinstance(output, dict):
@@ -585,10 +636,7 @@ def _validate_source(routine, source, prefix):
             )
 
     max_results = source.get("max_results", 20)
-    unlimited_source = (
-        (kind == "gchat" and source.get("all_spaces") is True)
-        or (kind == "slack" and source.get("catch_up") is True)
-    )
+    unlimited_source = kind in {"gmail", "gchat", "slack"}
     if (
         not isinstance(max_results, int)
         or isinstance(max_results, bool)
