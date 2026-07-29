@@ -36,6 +36,10 @@ def _catch_up_cursor_id(source):
             "include_mentions": source.get("include_mentions") is True,
             "catch_up_after": source.get("catch_up_after"),
             "reply_roots_after": source.get("reply_roots_after"),
+            # Candidate/enrichment migrations need a fresh replay from the
+            # declared cutover, even when the prior cursor is already newer
+            # than the affected daily entries.
+            "candidate_schema": slack_source.CATCH_UP_SCHEMA,
         })
         digest = hashlib.sha256(
             json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()

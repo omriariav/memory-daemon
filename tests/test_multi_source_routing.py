@@ -6,7 +6,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 import daemon as daemon_cli
-from workspace_daemon import actions, config, llm, memory_sink, runner, state
+from workspace_daemon import (
+    actions,
+    config,
+    llm,
+    memory_sink,
+    runner,
+    slack_source,
+    state,
+)
 
 
 def multi_routine(vault, routine_id="domain", **extra):
@@ -852,6 +860,16 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             runner._catch_up_cursor_id(routine["source"]),
             runner._catch_up_cursor_id(expanded["source"]),
         )
+
+        # A candidate/enrichment schema upgrade also gets a fresh cursor so
+        # older daily entries outside the live overlap are revisited.
+        original_id = runner._catch_up_cursor_id(routine["source"])
+        with mock.patch.object(
+            slack_source, "CATCH_UP_SCHEMA",
+            slack_source.CATCH_UP_SCHEMA + 1,
+        ):
+            upgraded_id = runner._catch_up_cursor_id(routine["source"])
+        self.assertNotEqual(original_id, upgraded_id)
 
     def test_listing_failure_holds_prior_cursor(self):
         def candidates(source):

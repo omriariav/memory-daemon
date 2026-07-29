@@ -37,6 +37,9 @@ from .shell import ada_bin, log, utc_now_iso
 
 SLACK_CLI = os.environ.get("SLACK_CLI")
 REPO_DIR = Path(__file__).resolve().parents[1]
+# Bump when recurring candidate construction or enrichment changes in a way
+# that requires replaying from catch_up_after rather than only the live overlap.
+CATCH_UP_SCHEMA = 2
 
 
 def _cli(args, timeout=60):
@@ -205,7 +208,7 @@ def _daily_version(messages):
             # Schema 2 adds verified Slack participant identities to fetched
             # items. Bump the version once so existing recurring entries are
             # safely revisited and updated with people links.
-            {"schema": 2, "messages": content},
+            {"schema": CATCH_UP_SCHEMA, "messages": content},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
