@@ -4,16 +4,16 @@
   LaunchAgent template. Render it, fill in the API key, then load it:
 
     sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
-      launchd/com.workspace-daemon.plist.template \
-      > ~/Library/LaunchAgents/com.workspace-daemon.plist
+      launchd/com.memory-daemon.plist.template \
+      > ~/Library/LaunchAgents/com.memory-daemon.plist
 
-  Then edit ~/Library/LaunchAgents/com.workspace-daemon.plist and replace
+  Then edit ~/Library/LaunchAgents/com.memory-daemon.plist and replace
   REPLACE_ME with your provider API key. Never commit a real key.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.workspace-daemon</string>
+    <string>com.memory-daemon</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -37,13 +37,13 @@
     <key>StandardErrorPath</key>
     <string>__REPO_DIR__/logs/launchd.err.log</string>
 
-    <!-- launchd does not inherit a login shell's PATH, so gws, yoetz and the
-         optional ada mentions helper must be reachable here. Slack itself is
-         built into memory-daemon. -->
+    <!-- launchd does not inherit a login shell's PATH, so Node (used by the
+         memory sink), gws, yoetz and the optional ada mentions helper must be
+         reachable here. Slack itself is built into memory-daemon. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.local/node-current/bin:/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
         <key>GEMINI_API_KEY</key>
         <string>REPLACE_ME</string>
     </dict>

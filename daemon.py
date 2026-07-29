@@ -4,6 +4,7 @@
 Every routine is a drop-in file in routines/*.yaml. Adding one is never a code change.
 
   daemon.py list                       show routines, enabled state, last run
+  daemon.py status                     show scheduler and routine health
   daemon.py validate                   check all routine YAML
   daemon.py run [--routine ID] [-n]    process new matches now
   daemon.py tick [-n]                  process only routines whose cadence is due
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from workspace_daemon import config, runner, state
+from workspace_daemon import config, runner, state, status
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -53,6 +54,15 @@ def cmd_list(args):
         desc = r.get("description", "")
         print(f"{display_id.ljust(width)}  {enabled:<8}  {every:<7}  {last:<21}  {desc}")
     return 0
+
+
+# --- status -----------------------------------------------------------------
+
+def cmd_status(args):
+    routines = config.discover(BASE_DIR)
+    text, healthy = status.render(BASE_DIR, routines, label=args.label)
+    print(text)
+    return 0 if healthy else 1
 
 
 # --- validate ---------------------------------------------------------------
@@ -257,6 +267,17 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list", help="show routines, enabled state, last run").set_defaults(func=cmd_list)
+    p_status = sub.add_parser(
+        "status", help="show launchd and per-routine health"
+    )
+    p_status.add_argument(
+        "--label",
+        default=os.environ.get(
+            "MEMORY_DAEMON_LAUNCHD_LABEL", status.DEFAULT_LAUNCHD_LABEL
+        ),
+        help="launchd label (default: %(default)s)",
+    )
+    p_status.set_defaults(func=cmd_status)
     sub.add_parser("validate", help="check all routine YAML").set_defaults(func=cmd_validate)
     sub.add_parser("new", help="interactive scaffold for a new routine").set_defaults(func=cmd_new)
 
