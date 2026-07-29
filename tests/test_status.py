@@ -1,5 +1,6 @@
 """Health-status command regression tests."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -207,3 +208,12 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("ROUTINE", text)
         self.assertIn("example", text)
         self.assertIn("Logs: logs/run.log", text)
+
+
+class StatusWrapperTest(unittest.TestCase):
+    def test_wrapper_is_executable_and_can_run_outside_the_repository(self):
+        wrapper = Path(__file__).resolve().parents[1] / "memory-daemon-status.sh"
+        text = wrapper.read_text()
+        self.assertTrue(os.access(wrapper, os.X_OK))
+        self.assertIn('$HOME/Code/memory-daemon', text)
+        self.assertIn("MEMORY_DAEMON_DIR", text)

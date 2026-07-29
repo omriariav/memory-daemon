@@ -120,7 +120,7 @@ python3 -m workspace_daemon.slack_cli auth-test
 
 ```sh
 ./daemon.py list                              # routines, cadence, enabled state, last run
-./status.sh                                   # scheduler + health of every routine
+./memory-daemon-status.sh                     # scheduler + health of every routine
 ./daemon.py validate                          # check all routine YAML
 ./daemon.py run --dry-run                     # preview; data and state unchanged
 ./daemon.py run --routine weekly-report       # run one routine for real
@@ -562,17 +562,25 @@ launchctl list | grep memory-daemon
 Check on it:
 
 ```sh
-./status.sh
+./memory-daemon-status.sh
 tail -f logs/run.log
 tail -f logs/launchd.err.log
 ```
 
-`status.sh` is read-only. It distinguishes a routine's last scheduled attempt
-from its last captured item, shows when each routine is next due, and flags an
-unfinished last run, memory-sink failures, or pending Gmail triage. It exits
-non-zero when the LaunchAgent or a routine needs attention, so it can also be
-used by a separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass
-`--label`) if the installed job uses a different label.
+`memory-daemon-status.sh` is read-only. It distinguishes a routine's last
+scheduled attempt from its last captured item, shows when each routine is next
+due, and flags an unfinished last run, memory-sink failures, or pending Gmail
+triage. Copy it to a directory on `PATH` to call it from anywhere:
+
+```sh
+cp ./memory-daemon-status.sh ~/bin/memory-daemon-status.sh
+```
+
+The copied command finds the repository at `~/Code/memory-daemon`; set
+`MEMORY_DAEMON_DIR` if your checkout lives elsewhere. It exits non-zero when
+the LaunchAgent or a routine needs attention, so it can also be used by a
+separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
+installed job uses a different label.
 
 Unload with `launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist`.
 
@@ -583,7 +591,7 @@ gitignored — only the template is tracked.
 
 ```
 daemon.py                  CLI entrypoint
-status.sh                  scheduler and per-routine health
+memory-daemon-status.sh    scheduler and per-routine health
 workspace_daemon/
   config.py                routine discovery, loading, validation
   shell.py                 binary resolution, subprocess, logging
