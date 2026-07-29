@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 API = "https://slack.com/api"
 PERMALINK_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})")
+MENTION_MAX_RESULTS = 100
 
 
 def config_path() -> Path:
@@ -307,7 +308,7 @@ def cmd_mentions(args: List[str]) -> None:
             "ada", "slack", "mentions",
             "--user", mention_user(),
             "--days", str(days),
-            "--max-results", "100",
+            "--max-results", str(MENTION_MAX_RESULTS),
             "--json",
         ],
         capture_output=True,
@@ -359,6 +360,14 @@ def cmd_mentions(args: List[str]) -> None:
         "ok": True,
         "days": int(days),
         "count": len(mentions),
+        "max_results": MENTION_MAX_RESULTS,
+        # Ada exposes no pagination cursor. Exactly the requested maximum is
+        # therefore ambiguous and must fail closed in a durable sweep.
+        "limit_reached": (
+            len(mentions) >= MENTION_MAX_RESULTS
+            or bool(data.get("has_more"))
+            or int(data.get("total_count") or 0) > len(mentions)
+        ),
         "via": "ada slack mentions",
         "mentions": mentions,
     })

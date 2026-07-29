@@ -793,6 +793,7 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 "catch_up": True,
                 "catch_up_overlap": "1h",
                 "catch_up_after": "2026-07-28T08:00:00Z",
+                "reply_roots_after": "2026-06-28T08:00:00Z",
             },
             "analyze": {
                 "provider": "gemini",
@@ -817,12 +818,39 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
         self.assertEqual(first["errors"], 0)
         self.assertEqual(second["errors"], 0)
         self.assertEqual(observed[0]["_since"], "2026-07-28T08:00:00Z")
+        self.assertEqual(
+            observed[0]["_catch_up_boundary"],
+            "2026-07-28T08:00:00Z",
+        )
         self.assertEqual(observed[1]["_since"], "2026-07-28T09:00:00Z")
+        cursor_id = runner._catch_up_cursor_id(routine["source"])
         self.assertEqual(
             state.CursorStore(self.base).checkpoint(
-                "slack-sweep", "slack:configured-scope", "slack"
+                "slack-sweep", cursor_id, "slack"
             ),
             "2026-07-28T12:00:00Z",
+        )
+
+        # Expanding the configured channel set gets a new cursor namespace.
+        # It must bootstrap from the declared boundary, not the old scope's
+        # 12:00 checkpoint.
+        expanded = {
+            **routine,
+            "source": {
+                **routine["source"],
+                "direct_channels": ["CEXAMPLE", "CNEW"],
+            },
+        }
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T14:00:00Z",
+        ):
+            third = runner.run(self.base, [expanded])
+
+        self.assertEqual(third["errors"], 0)
+        self.assertEqual(observed[2]["_since"], "2026-07-28T08:00:00Z")
+        self.assertNotEqual(
+            runner._catch_up_cursor_id(routine["source"]),
+            runner._catch_up_cursor_id(expanded["source"]),
         )
 
     def test_listing_failure_holds_prior_cursor(self):

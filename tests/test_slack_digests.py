@@ -113,62 +113,99 @@ class PrivateDigestTest(unittest.TestCase):
         self.assertIn("[REDACTED]", item["body"])
         self.assertNotIn("123456", item["body"])
 
-    def test_catch_up_rebuilds_complete_cursor_day_without_a_cap(self):
-        discovery = {
-            "ok": True,
-            "messages": [{
-                "source_id": "slack:CDIRECT:1785232800.0",
-                "ts": "1785232800.0",
-                "user": "U2",
-                "text": "new after cursor",
-                "reply_count": 0,
-            }],
+    def test_catch_up_finds_old_root_reply_and_preserves_cutover(self):
+        root = {
+            "source_id": "slack:CDIRECT:1785225600.0",
+            "ts": "1785225600.0",          # 08:00, before cutover
+            "latest_reply": "1785232800.0",  # 10:00, after cursor
+            "user": "U1",
+            "text": "pre-cutover root",
+            "reply_count": 2,
         }
-        complete_day = {
+        history = {
             "ok": True,
             "messages": [
-                discovery["messages"][0],
+                root,
                 {
-                    "source_id": "slack:CDIRECT:1785225600.0",
-                    "ts": "1785225600.0",
-                    "user": "U1",
-                    "text": "earlier same-day context",
+                    "source_id": "slack:CDIRECT:1785228600.0",
+                    "ts": "1785228600.0",  # 08:50, before cursor
+                    "user": "U3",
+                    "text": "earlier post-cutover same-day context",
+                    "reply_count": 0,
+                },
+                {
+                    "source_id": "slack:CDIRECT:1785226800.0",
+                    "ts": "1785226800.0",  # 08:20, before cutover
+                    "user": "U4",
+                    "text": "must stay in legacy coverage",
                     "reply_count": 0,
                 },
             ],
         }
+        thread = {
+            "ok": True,
+            "messages": [
+                root,
+                {
+                    "source_id": root["source_id"],
+                    "thread_ts": root["ts"],
+                    "ts": "1785228300.0",  # 08:45, after cutover
+                    "user": "U2",
+                    "text": "earlier reply in the recurring day",
+                },
+                {
+                    "source_id": root["source_id"],
+                    "thread_ts": root["ts"],
+                    "ts": "1785232800.0",  # 10:00, after cursor
+                    "user": "U2",
+                    "text": "new reply to an old root",
+                },
+            ],
+        }
         source = {
+            "kind": "slack",
             "direct_channels": ["CDIRECT"],
-            "_since": "2026-07-28T09:00:00Z",
             "max_results": 0,
+            "catch_up": True,
+            "_since": "2026-07-28T09:00:00Z",
+            "_catch_up_boundary": "2026-07-28T08:30:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
         }
 
         with mock.patch.object(
-            slack_source, "_cli", side_effect=[discovery, complete_day]
+            slack_source, "_cli", side_effect=[history, thread]
         ) as cli:
             candidates = slack_source.candidates(source)
 
         self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
         self.assertEqual(
-            candidates[0]["raw"]["source_id"],
-            "slack:CDIRECT:digest:2026-07-28",
+            candidate["id"],
+            "slack:CDIRECT:daily:2026-07-28@1785232800.0",
         )
-        self.assertEqual(len(candidates[0]["raw"]["messages"]), 2)
+        self.assertEqual(
+            candidate["raw"]["source_id"],
+            "slack:CDIRECT:daily:2026-07-28",
+        )
+        texts = [message["text"] for message in candidate["raw"]["messages"]]
+        self.assertEqual(texts, [
+            "earlier reply in the recurring day",
+            "earlier post-cutover same-day context",
+            "new reply to an old root",
+        ])
+        self.assertNotIn("pre-cutover root", texts)
+        self.assertNotIn("must stay in legacy coverage", texts)
         self.assertEqual(
             cli.call_args_list[0].args[0],
             [
                 "history", "CDIRECT",
-                "--since", "2026-07-28T09:00:00Z",
+                "--since", "2026-06-28T08:00:00Z",
                 "--limit", "0",
             ],
         )
         self.assertEqual(
             cli.call_args_list[1].args[0],
-            [
-                "history", "CDIRECT",
-                "--since", "2026-07-28T00:00:00Z",
-                "--limit", "0",
-            ],
+            ["replies", "CDIRECT", "1785225600.0"],
         )
 
     def test_new_reply_versions_an_existing_daily_digest(self):
@@ -231,6 +268,58 @@ class MentionOwnershipTest(unittest.TestCase):
             ["CEXTERNAL"],
         )
 
+    def test_catch_up_fails_closed_when_ada_mentions_hit_the_limit(self):
+        with mock.patch.object(slack_source, "_cli", return_value={
+            "ok": True,
+            "limit_reached": True,
+            "mentions": [],
+        }), mock.patch.object(
+            slack_source, "utc_now_iso", return_value="2026-07-28T10:00:00Z"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "result limit"):
+                slack_source.candidates({
+                    "kind": "slack",
+                    "include_mentions": True,
+                    "catch_up": True,
+                    "_since": "2026-07-28T09:00:00Z",
+                })
+
+    def test_catch_up_mention_boundary_is_exclusive(self):
+        mentions = {
+            "ok": True,
+            "limit_reached": False,
+            "mentions": [
+                {
+                    "source_id": "slack:C1:1785229200.0",
+                    "channel_id": "C1",
+                    "ts": "1785229200.0",
+                    "text": "exactly at cursor",
+                },
+                {
+                    "source_id": "slack:C2:1785229260.0",
+                    "channel_id": "C2",
+                    "ts": "1785229260.0",
+                    "text": "after cursor",
+                },
+            ],
+        }
+        with mock.patch.object(
+            slack_source, "_cli", return_value=mentions
+        ), mock.patch.object(
+            slack_source, "utc_now_iso", return_value="2026-07-28T10:00:00Z"
+        ):
+            candidates = slack_source.candidates({
+                "kind": "slack",
+                "include_mentions": True,
+                "catch_up": True,
+                "_since": "2026-07-28T09:00:00Z",
+            })
+
+        self.assertEqual(
+            [candidate["raw"]["channel"] for candidate in candidates],
+            ["C2"],
+        )
+
 
 class HybridValidationTest(unittest.TestCase):
     def routine(self, source):
@@ -279,6 +368,7 @@ class HybridValidationTest(unittest.TestCase):
             "catch_up": True,
             "catch_up_overlap": "1h",
             "catch_up_after": "2026-07-28T08:00:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
         }))
         invalid = config.validate(self.routine({
             "kind": "slack",
@@ -294,6 +384,17 @@ class HybridValidationTest(unittest.TestCase):
         self.assertTrue(any("requires max_results: 0" in p for p in invalid))
         self.assertTrue(any("catch_up_overlap must look like" in p for p in invalid))
         self.assertTrue(any("quoted RFC3339" in p for p in invalid))
+
+    def test_reply_root_floor_must_cover_the_bootstrap_boundary(self):
+        problems = config.validate(self.routine({
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "max_results": 0,
+            "catch_up": True,
+            "catch_up_after": "2026-07-28T08:00:00Z",
+            "reply_roots_after": "2026-07-29T08:00:00Z",
+        }))
+        self.assertTrue(any("must not be later" in p for p in problems))
 
 
 if __name__ == "__main__":

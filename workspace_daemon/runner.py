@@ -4,6 +4,8 @@ The ledger entry is written before triage and updated after it, so an item is
 never summarized twice and never left with silently unfinished Gmail actions.
 """
 import datetime
+import hashlib
+import json
 import re
 from contextlib import ExitStack
 from email.utils import getaddresses
@@ -21,7 +23,24 @@ def _catch_up_cursor_id(source):
         # Preserve the cursor id shipped by the original GChat implementation.
         return "gchat:all-spaces"
     if kind == "slack":
-        return "slack:configured-scope"
+        # A cursor is valid only for the exact configured coverage. If a
+        # channel or mentions are added later, the new scope bootstraps from
+        # catch_up_after instead of inheriting a checkpoint that predates it.
+        scope = {
+            key: sorted(source.get(key, []))
+            for key in (
+                "channels", "ada_channels", "direct_channels", "private_channels"
+            )
+        }
+        scope.update({
+            "include_mentions": source.get("include_mentions") is True,
+            "catch_up_after": source.get("catch_up_after"),
+            "reply_roots_after": source.get("reply_roots_after"),
+        })
+        digest = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        return f"slack:configured-scope:{digest}"
     raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
 
 
@@ -145,9 +164,10 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     or source.get("batch_messages_after")
                 )
             if since:
-                source_overrides[(routine["id"], source_index)] = {
-                    "_since": since,
-                }
+                override = {"_since": since}
+                if kind == "slack" and source.get("catch_up_after"):
+                    override["_catch_up_boundary"] = source["catch_up_after"]
+                source_overrides[(routine["id"], source_index)] = override
                 log(
                     f"routine={routine['id']} source={kind} catch-up since={since}"
                 )

@@ -231,6 +231,27 @@ class DirectConversationTest(unittest.TestCase):
         self.assertTrue(payload["channels"][0]["is_im"])
 
 
+class MentionLimitTest(unittest.TestCase):
+    def test_exact_ada_limit_is_reported_as_ambiguous(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"mentions": [{} for _ in range(100)]}),
+            stderr="",
+        )
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "mention_user", return_value="person@example.com"
+        ), mock.patch.object(
+            slack_cli.subprocess, "run", return_value=completed
+        ), redirect_stdout(stream):
+            slack_cli.cmd_mentions(["--days", "1"])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["count"], 100)
+        self.assertEqual(payload["max_results"], 100)
+        self.assertTrue(payload["limit_reached"])
+
+
 class SourceCommandTest(unittest.TestCase):
     def test_source_defaults_to_repository_module(self):
         completed = mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")

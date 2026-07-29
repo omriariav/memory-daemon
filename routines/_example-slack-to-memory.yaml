@@ -25,6 +25,7 @@ source:
   catch_up: true
   catch_up_overlap: 1h   # the ledger skips unchanged overlapping versions
   catch_up_after: "2026-07-28T08:00:00Z" # replace with your prior-run cutover
+  reply_roots_after: "2026-06-28T08:00:00Z" # beginning of first-run coverage
 
 analyze:
   provider: gemini

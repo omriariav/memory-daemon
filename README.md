@@ -268,15 +268,30 @@ max_results: 0
 catch_up: true
 catch_up_overlap: 1h
 catch_up_after: "2026-07-28T08:00:00Z"
+reply_roots_after: "2026-06-28T08:00:00Z"
 ```
 
-The direct channel reader exhausts every history page after the cursor and
-rebuilds a complete UTC-day digest before updating its stable memory entry.
+The direct channel reader exhausts channel history from `reply_roots_after`,
+uses the cursor to select new activity, and expands affected threads through
+Slack's replies API. This is necessary because Slack does not return an old
+root from channel history merely because it received a new reply. Set the root
+floor to the beginning of the scope's first run. The reader rebuilds each
+affected UTC activity day before updating its stable memory entry; the API-read
+cost therefore grows with the root-history floor even though unchanged
+candidates never reach the LLM.
+
 `catch_up_after` is the exclusive bootstrap boundary before the first
-successful cursor checkpoint. Catch-up rejects `ada_channels`, because a
+successful cursor checkpoint. Recurring entries use a distinct
+`slack:<channel>:daily:<date>` namespace, so a partial cutover day cannot replace
+or absorb legacy first-run coverage. Catch-up rejects `ada_channels`, because a
 curated, capped summary cannot prove complete coverage. Mentions still use
-Ada's search integration; if a cursor ever falls more than 90 days behind, the
-run fails closed and asks for a manual backfill instead of silently advancing.
+Ada's search integration; if a cursor falls more than 30 days behind or the
+result reaches Ada's 100-item limit, the run fails closed and asks for a manual
+backfill instead of silently advancing.
+
+The Slack cursor key fingerprints the configured channels, boundaries, and
+mentions flag. Expanding that scope therefore bootstraps from
+`catch_up_after`; it never inherits a checkpoint from a smaller channel set.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially

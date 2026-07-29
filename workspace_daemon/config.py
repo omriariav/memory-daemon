@@ -7,7 +7,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
-from .time_utils import is_rfc3339_instant
+from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
@@ -437,10 +437,44 @@ def _validate_source(routine, source, prefix):
                     f"{prefix}.catch_up requires direct Slack reads; "
                     "move ada_channels to direct_channels"
                 )
+            if source.get("channels"):
+                problems.append(
+                    f"{prefix}.catch_up requires daily direct reads; "
+                    "move channels to direct_channels"
+                )
             if source.get("max_results") != 0:
                 problems.append(
                     f"{prefix}.catch_up requires max_results: 0"
                 )
+            if catch_up_after is None:
+                problems.append(
+                    f"{prefix}.catch_up requires catch_up_after"
+                )
+            direct = (
+                source.get("direct_channels")
+                or source.get("private_channels")
+            )
+            reply_roots_after = source.get("reply_roots_after")
+            if direct and reply_roots_after is None:
+                problems.append(
+                    f"{prefix}.catch_up with direct channels requires "
+                    "reply_roots_after"
+                )
+            elif reply_roots_after is not None:
+                if not is_rfc3339_instant(reply_roots_after):
+                    problems.append(
+                        f"{prefix}.reply_roots_after must be a quoted "
+                        "RFC3339 timestamp"
+                    )
+                elif (
+                    is_rfc3339_instant(catch_up_after)
+                    and rfc3339_key(reply_roots_after)
+                    > rfc3339_key(catch_up_after)
+                ):
+                    problems.append(
+                        f"{prefix}.reply_roots_after must not be later than "
+                        "catch_up_after"
+                    )
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)
