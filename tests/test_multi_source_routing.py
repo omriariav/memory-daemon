@@ -771,6 +771,60 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             "2026-07-28T12:00:00Z",
         )
 
+    def test_slack_uses_its_own_bootstrap_and_cursor_namespace(self):
+        saved_slack = runner.SOURCES["slack"]
+        self.addCleanup(runner.SOURCES.__setitem__, "slack", saved_slack)
+        observed = []
+
+        def candidates(source):
+            observed.append(dict(source))
+            return []
+
+        runner.SOURCES["slack"] = (candidates, saved_slack[1])
+        routine = {
+            "id": "slack-sweep",
+            "enabled": True,
+            "source": {
+                "kind": "slack",
+                "direct_channels": ["CEXAMPLE"],
+                "include_mentions": True,
+                "hours": 26,
+                "max_results": 0,
+                "catch_up": True,
+                "catch_up_overlap": "1h",
+                "catch_up_after": "2026-07-28T08:00:00Z",
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "slack-vault"),
+                "slug_prefix": "slack",
+            },
+        }
+
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+        ):
+            first = runner.run(self.base, [routine])
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
+        ):
+            second = runner.run(self.base, [routine])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(observed[0]["_since"], "2026-07-28T08:00:00Z")
+        self.assertEqual(observed[1]["_since"], "2026-07-28T09:00:00Z")
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "slack-sweep", "slack:configured-scope", "slack"
+            ),
+            "2026-07-28T12:00:00Z",
+        )
+
     def test_listing_failure_holds_prior_cursor(self):
         def candidates(source):
             raise RuntimeError("source unavailable")

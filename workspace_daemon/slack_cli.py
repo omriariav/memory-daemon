@@ -127,6 +127,7 @@ def simplify_message(message: Dict, channel: str) -> Dict:
     return {
         "ts": message.get("ts"),
         "thread_ts": message.get("thread_ts"),
+        "latest_reply": message.get("latest_reply"),
         "user": message.get("user") or message.get("bot_id", "?"),
         "text": message.get("text", ""),
         "reply_count": message.get("reply_count", 0),
@@ -216,7 +217,11 @@ def cmd_channels(args: List[str]) -> None:
 def cmd_history(args: List[str]) -> None:
     channel = args[0]
     oldest = parse_since(args)
-    limit = int(opt(args, "--limit", 50))
+    raw_limit = int(opt(args, "--limit", 50))
+    # A catch-up source must exhaust every page after its durable cursor.
+    # Keep the historical default cap, while making an explicit zero mean
+    # "unbounded" like the other daemon source limits.
+    limit = None if raw_limit == 0 else raw_limit
     messages = paged_messages(
         "conversations.history",
         {"channel": channel, "oldest": oldest},

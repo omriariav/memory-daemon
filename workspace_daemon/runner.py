@@ -14,6 +14,17 @@ from .shell import log, utc_now_iso
 MAX_GMAIL_SOURCE_PEOPLE = 20
 
 
+def _catch_up_cursor_id(source):
+    """Stable cursor namespace for each supported catch-up source shape."""
+    kind = source["kind"]
+    if kind == "gchat":
+        # Preserve the cursor id shipped by the original GChat implementation.
+        return "gchat:all-spaces"
+    if kind == "slack":
+        return "slack:configured-scope"
+    raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
+
+
 def _needs_label_catalog(routines):
     """Both LLM-chosen and configured labels are validated against the catalog."""
     return any(
@@ -116,7 +127,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if source.get("catch_up") is not True:
                 continue
             kind = source["kind"]
-            cursor_id = f"{kind}:all-spaces"
+            cursor_id = _catch_up_cursor_id(source)
             checkpoint = cursors.checkpoint(
                 routine["id"], cursor_id, kind,
             )
@@ -129,7 +140,10 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     second - datetime.timedelta(seconds=overlap)
                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
-                since = source.get("batch_messages_after")
+                since = (
+                    source.get("catch_up_after")
+                    or source.get("batch_messages_after")
+                )
             if since:
                 source_overrides[(routine["id"], source_index)] = {
                     "_since": since,
@@ -497,7 +511,9 @@ def _scope(source):
         return "all active Google Chat conversations"
     slack_channels = [
         channel
-        for key in ("channels", "ada_channels", "private_channels")
+        for key in (
+            "channels", "ada_channels", "direct_channels", "private_channels"
+        )
         for channel in source.get(key, [])
     ]
     return (
@@ -549,7 +565,9 @@ def _source_scopes(source):
             return {(kind, "*")}
         values = {
             (kind, channel)
-            for key in ("channels", "ada_channels", "private_channels")
+            for key in (
+                "channels", "ada_channels", "direct_channels", "private_channels"
+            )
             for channel in source.get(key, [])
             if isinstance(channel, str)
         }

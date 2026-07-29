@@ -366,8 +366,39 @@ def _validate_source(routine, source, prefix):
             )
     if kind != "gmail" and action_list:
         problems.append(f"{prefix}: source.kind {kind!r} does not support Gmail actions")
+
+    catch_up = source.get("catch_up", False)
+    if not isinstance(catch_up, bool):
+        problems.append(f"{prefix}.catch_up must be true or false")
+    catch_up_overlap = source.get("catch_up_overlap")
+    if catch_up_overlap is not None and catch_up is not True:
+        problems.append(
+            f"{prefix}.catch_up_overlap requires catch_up: true"
+        )
+    catch_up_after = source.get("catch_up_after")
+    if catch_up_after is not None:
+        if catch_up is not True:
+            problems.append(f"{prefix}.catch_up_after requires catch_up: true")
+        if not is_rfc3339_instant(catch_up_after):
+            problems.append(
+                f"{prefix}.catch_up_after must be a quoted RFC3339 timestamp"
+            )
+    if catch_up is True:
+        if kind not in {"gchat", "slack"}:
+            problems.append(
+                f"{prefix}.catch_up is supported only for gchat and slack"
+            )
+        try:
+            duration_seconds(catch_up_overlap or "1h")
+        except RoutineError:
+            problems.append(
+                f"{prefix}.catch_up_overlap must look like '15m', '4h', or '1d'"
+            )
+
     if kind == "slack":
-        channel_keys = ("channels", "ada_channels", "private_channels")
+        channel_keys = (
+            "channels", "ada_channels", "direct_channels", "private_channels"
+        )
         configured = []
         for key in channel_keys:
             values = source.get(key)
@@ -383,7 +414,7 @@ def _validate_source(routine, source, prefix):
         if not configured and not source.get("include_mentions"):
             problems.append(
                 f"{prefix}: source.kind 'slack' needs channels, ada_channels, "
-                "private_channels, and/or include_mentions: true"
+                "direct_channels, private_channels, and/or include_mentions: true"
             )
         owners = {}
         for key, channel in configured:
@@ -400,6 +431,16 @@ def _validate_source(routine, source, prefix):
             or not 1 <= ada_days <= 90
         ):
             problems.append(f"{prefix}.ada_days must be an integer from 1 to 90")
+        if catch_up is True:
+            if source.get("ada_channels"):
+                problems.append(
+                    f"{prefix}.catch_up requires direct Slack reads; "
+                    "move ada_channels to direct_channels"
+                )
+            if source.get("max_results") != 0:
+                problems.append(
+                    f"{prefix}.catch_up requires max_results: 0"
+                )
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)
@@ -436,14 +477,6 @@ def _validate_source(routine, source, prefix):
                 problems.append(
                     f"{prefix}.batch_messages_after must be a quoted RFC3339 timestamp"
                 )
-        catch_up = source.get("catch_up", False)
-        if not isinstance(catch_up, bool):
-            problems.append(f"{prefix}.catch_up must be true or false")
-        catch_up_overlap = source.get("catch_up_overlap")
-        if catch_up_overlap is not None and catch_up is not True:
-            problems.append(
-                f"{prefix}.catch_up_overlap requires catch_up: true"
-            )
         if catch_up is True:
             if all_spaces is not True:
                 problems.append(
@@ -460,12 +493,6 @@ def _validate_source(routine, source, prefix):
             if source.get("max_per_space") != 0:
                 problems.append(
                     f"{prefix}.catch_up requires max_per_space: 0"
-                )
-            try:
-                duration_seconds(catch_up_overlap or "1h")
-            except RoutineError:
-                problems.append(
-                    f"{prefix}.catch_up_overlap must look like '15m', '4h', or '1d'"
                 )
         max_per_space = source.get("max_per_space")
         if max_per_space is not None and (
@@ -524,12 +551,15 @@ def _validate_source(routine, source, prefix):
             )
 
     max_results = source.get("max_results", 20)
-    unlimited_gchat = kind == "gchat" and source.get("all_spaces") is True
+    unlimited_source = (
+        (kind == "gchat" and source.get("all_spaces") is True)
+        or (kind == "slack" and source.get("catch_up") is True)
+    )
     if (
         not isinstance(max_results, int)
         or isinstance(max_results, bool)
-        or max_results < (0 if unlimited_gchat else 1)
+        or max_results < (0 if unlimited_source else 1)
     ):
-        qualifier = "non-negative" if unlimited_gchat else "positive"
+        qualifier = "non-negative" if unlimited_source else "positive"
         problems.append(f"{prefix}.max_results must be a {qualifier} integer")
     return problems

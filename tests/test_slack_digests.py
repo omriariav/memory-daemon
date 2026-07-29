@@ -113,6 +113,92 @@ class PrivateDigestTest(unittest.TestCase):
         self.assertIn("[REDACTED]", item["body"])
         self.assertNotIn("123456", item["body"])
 
+    def test_catch_up_rebuilds_complete_cursor_day_without_a_cap(self):
+        discovery = {
+            "ok": True,
+            "messages": [{
+                "source_id": "slack:CDIRECT:1785232800.0",
+                "ts": "1785232800.0",
+                "user": "U2",
+                "text": "new after cursor",
+                "reply_count": 0,
+            }],
+        }
+        complete_day = {
+            "ok": True,
+            "messages": [
+                discovery["messages"][0],
+                {
+                    "source_id": "slack:CDIRECT:1785225600.0",
+                    "ts": "1785225600.0",
+                    "user": "U1",
+                    "text": "earlier same-day context",
+                    "reply_count": 0,
+                },
+            ],
+        }
+        source = {
+            "direct_channels": ["CDIRECT"],
+            "_since": "2026-07-28T09:00:00Z",
+            "max_results": 0,
+        }
+
+        with mock.patch.object(
+            slack_source, "_cli", side_effect=[discovery, complete_day]
+        ) as cli:
+            candidates = slack_source.candidates(source)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            candidates[0]["raw"]["source_id"],
+            "slack:CDIRECT:digest:2026-07-28",
+        )
+        self.assertEqual(len(candidates[0]["raw"]["messages"]), 2)
+        self.assertEqual(
+            cli.call_args_list[0].args[0],
+            [
+                "history", "CDIRECT",
+                "--since", "2026-07-28T09:00:00Z",
+                "--limit", "0",
+            ],
+        )
+        self.assertEqual(
+            cli.call_args_list[1].args[0],
+            [
+                "history", "CDIRECT",
+                "--since", "2026-07-28T00:00:00Z",
+                "--limit", "0",
+            ],
+        )
+
+    def test_new_reply_versions_an_existing_daily_digest(self):
+        history = {
+            "ok": True,
+            "messages": [{
+                "source_id": "slack:CDIRECT:1785225600.0",
+                "ts": "1785225600.0",
+                "latest_reply": "1785232800.0",
+                "user": "U1",
+                "text": "thread root",
+                "reply_count": 1,
+            }],
+        }
+        with mock.patch.object(slack_source, "_cli", return_value=history):
+            candidate = slack_source.candidates({
+                "direct_channels": ["CDIRECT"],
+                "hours": 26,
+                "max_results": 30,
+            })[0]
+
+        self.assertEqual(
+            candidate["id"],
+            "slack:CDIRECT:digest:2026-07-28@1785232800.0",
+        )
+        self.assertEqual(
+            candidate["raw"]["source_id"],
+            "slack:CDIRECT:digest:2026-07-28",
+        )
+
 
 class MentionOwnershipTest(unittest.TestCase):
     def test_mentions_skip_channels_owned_by_another_routine(self):
@@ -183,6 +269,31 @@ class HybridValidationTest(unittest.TestCase):
             "ada_days": 91,
         }))
         self.assertTrue(any("ada_days" in problem for problem in problems))
+
+    def test_direct_slack_catch_up_is_uncapped_and_rejects_ada_summaries(self):
+        valid = config.validate(self.routine({
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "include_mentions": True,
+            "max_results": 0,
+            "catch_up": True,
+            "catch_up_overlap": "1h",
+            "catch_up_after": "2026-07-28T08:00:00Z",
+        }))
+        invalid = config.validate(self.routine({
+            "kind": "slack",
+            "ada_channels": ["CPUBLIC"],
+            "max_results": 100,
+            "catch_up": True,
+            "catch_up_overlap": "soon",
+            "catch_up_after": "yesterday",
+        }))
+
+        self.assertEqual(valid, [])
+        self.assertTrue(any("direct Slack reads" in p for p in invalid))
+        self.assertTrue(any("requires max_results: 0" in p for p in invalid))
+        self.assertTrue(any("catch_up_overlap must look like" in p for p in invalid))
+        self.assertTrue(any("quoted RFC3339" in p for p in invalid))
 
 
 if __name__ == "__main__":

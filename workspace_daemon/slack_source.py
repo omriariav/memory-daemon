@@ -1,4 +1,4 @@
-"""Slack source with public-channel digests, private batching, and mentions.
+"""Slack source with public summaries, direct channel batching, and mentions.
 
 Routine config:
 
@@ -6,6 +6,8 @@ Routine config:
       kind: slack
       ada_channels:             # public channels summarized by Ada
         - C0123PUBLIC
+      direct_channels:          # public/private history, batched by channel/day
+        - C0234DIRECT
       private_channels:         # direct history, batched by channel/day
         - C0456PRIVATE
       channels:                 # legacy per-thread mode
@@ -15,10 +17,10 @@ Routine config:
       ada_days: 2               # Ada accepts whole days, 1..90
       max_results: 1000         # direct-message cap per channel
 
-Ada returns a curated public-channel payload. Private channels are read with
-the user token and grouped into one candidate per UTC day, so a conversation
-made of unthreaded sentences reaches Yoetz as one coherent input. Mentions
-outside configured channels remain canonical thread candidates.
+Ada returns a curated public-channel payload. Direct and legacy private channels
+are read with the user token and grouped into one candidate per UTC day, so a
+conversation made of unthreaded sentences reaches Yoetz as one coherent input.
+Mentions outside configured channels remain canonical thread candidates.
 """
 import datetime
 import json
@@ -30,6 +32,7 @@ from pathlib import Path
 
 from .chat_text import redact_secrets, slack_timestamp_iso, timestamped_line
 from .shell import ada_bin, log, utc_now_iso
+from .time_utils import rfc3339_key
 
 
 SLACK_CLI = os.environ.get("SLACK_CLI")
@@ -102,7 +105,9 @@ def configured_channels(source):
     """Every channel explicitly assigned to this source block."""
     return {
         channel
-        for key in ("channels", "ada_channels", "private_channels")
+        for key in (
+            "channels", "ada_channels", "direct_channels", "private_channels"
+        )
         for channel in source.get(key, [])
     }
 
@@ -114,19 +119,47 @@ def _mention_excluded_channels(source):
     )
 
 
+def _history_args(source, channel, since=None):
+    """Build one direct history command, including an explicit zero cap."""
+    args = ["history", channel]
+    since = since or source.get("_since")
+    if since:
+        args.extend(["--since", str(since)])
+    else:
+        args.extend(["--hours", str(source.get("hours", 26))])
+    args.extend(["--limit", str(source.get("max_results", 30))])
+    return args
+
+
+def _activity_ts(message):
+    """Latest activity Slack exposes on a root or reply."""
+    return max(
+        (
+            value
+            for value in (
+                message.get("ts"),
+                message.get("latest_reply"),
+            )
+            if value
+        ),
+        default="",
+        key=float,
+    )
+
+
 def _legacy_candidates(source):
     """Backwards-compatible one-candidate-per-thread channel ingestion."""
-    hours = str(source.get("hours", 26))
-    per_channel = int(source.get("max_results", 30))
     seen = {}
     latest = {}
     for channel in source.get("channels", []):
-        data = _cli(
-            ["history", channel, "--hours", hours, "--limit", str(per_channel)]
-        )
+        data = _cli(_history_args(source, channel))
         for message in data.get("messages", []):
             sid = message["source_id"]
-            latest[sid] = max(latest.get(sid, ""), message.get("ts") or "")
+            activity = _activity_ts(message)
+            if activity:
+                latest[sid] = max(
+                    filter(None, (latest.get(sid), activity)), key=float
+                )
             if sid not in seen:
                 text = redact_secrets(
                     (message.get("text") or "").replace("\n", " ")
@@ -143,21 +176,44 @@ def _legacy_candidates(source):
     return seen, latest
 
 
-def _private_digest_candidates(source):
-    """One direct-reader candidate per private channel and UTC activity day."""
-    hours = str(source.get("hours", 26))
+def _direct_digest_channels(source):
+    """Configured raw-history channels and their capture-mode labels."""
+    for channel in source.get("direct_channels", []):
+        yield channel, "direct-daily-digest"
+    for channel in source.get("private_channels", []):
+        yield channel, "private-daily-digest"
+
+
+def _direct_digest_candidates(source):
+    """One direct-reader candidate per configured channel and UTC activity day."""
     per_channel = int(source.get("max_results", 30))
     out = []
-    for channel in source.get("private_channels", []):
-        data = _cli(
-            ["history", channel, "--hours", hours, "--limit", str(per_channel)]
-        )
+    for channel, capture_mode in _direct_digest_channels(source):
+        data = _cli(_history_args(source, channel))
         messages = data.get("messages", [])
-        if len(messages) >= per_channel:
+        if per_channel and len(messages) >= per_channel:
             log(
-                f"slack private WARN channel={channel}: history reached "
+                f"slack direct WARN channel={channel}: history reached "
                 f"max_results={per_channel}; older activity may be omitted"
             )
+
+        # A same-day cursor starts after midnight, but updating a stable daily
+        # memory from only that tail would replace its earlier context. Once
+        # activity is discovered on the cursor's own day, re-read from UTC
+        # midnight and rebuild the complete candidate.
+        since = source.get("_since")
+        timestamped = [
+            message for message in messages if message.get("ts")
+        ]
+        if since and timestamped:
+            first_day = min(
+                _message_day(message["ts"]) for message in timestamped
+            )
+            day_start = f"{first_day}T00:00:00Z"
+            if rfc3339_key(day_start) < rfc3339_key(since):
+                data = _cli(_history_args(source, channel, since=day_start))
+                messages = data.get("messages", [])
+
         by_day = {}
         for message in messages:
             day = _message_day(message.get("ts"))
@@ -165,7 +221,11 @@ def _private_digest_candidates(source):
         for day, day_messages in by_day.items():
             day_messages.sort(key=lambda message: message.get("ts") or "")
             sid = f"slack:{channel}:digest:{day}"
-            latest = day_messages[-1].get("ts") or ""
+            latest = max(
+                (_activity_ts(message) for message in day_messages),
+                default="",
+                key=float,
+            )
             first_text = next(
                 (
                     redact_secrets(
@@ -178,11 +238,12 @@ def _private_digest_candidates(source):
             )
             out.append({
                 "id": f"{sid}@{latest}",
-                "title": first_text[:90] or f"Private Slack digest for {day}",
+                "title": first_text[:90] or f"Slack digest for {day}",
                 "raw": {
                     "channel": channel,
                     "source_id": sid,
-                    "mode": "private_digest",
+                    "mode": "direct_digest",
+                    "capture_mode": capture_mode,
                     "digest_day": day,
                     "messages": day_messages,
                 },
@@ -241,16 +302,35 @@ def _ada_digest_candidates(source):
 def candidates(source):
     """List digest candidates plus legacy threads and out-of-channel mentions."""
     out = _ada_digest_candidates(source)
-    out.extend(_private_digest_candidates(source))
+    out.extend(_direct_digest_candidates(source))
     seen, latest = _legacy_candidates(source)
 
     if source.get("include_mentions"):
-        days = max(1, math.ceil(int(source.get("hours", 26)) / 24))
+        since = source.get("_since")
+        cutoff = None
+        if since:
+            raw = since[:-1] + "+00:00" if since.endswith("Z") else since
+            cutoff = datetime.datetime.fromisoformat(raw).timestamp()
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            days = max(1, math.ceil((now - cutoff) / (24 * 60 * 60)))
+            if days > 90:
+                raise RuntimeError(
+                    "Slack mention catch-up exceeds Ada's 90-day search window; "
+                    "run a manual backfill before advancing the cursor"
+                )
+        else:
+            days = max(1, math.ceil(int(source.get("hours", 26)) / 24))
         data = _cli(["mentions", "--days", str(days)])
         for message in data.get("mentions", []):
             sid = message.get("source_id")
             if not sid:
                 continue
+            if cutoff is not None:
+                try:
+                    if float(message.get("ts") or 0) < cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             # A configured channel digest already contains this mention. The
             # runner supplies channels owned by other routines too, because a
             # digest and a thread have different source ids and cannot be
@@ -374,7 +454,7 @@ def _fetch_ada_digest(candidate):
     }
 
 
-def _fetch_private_digest(candidate):
+def _fetch_direct_digest(candidate):
     raw = candidate["raw"]
     channel = raw["channel"]
     messages = []
@@ -394,7 +474,7 @@ def _fetch_private_digest(candidate):
         by_ts.values(), key=lambda message: float(message["ts"])
     )
     if not messages:
-        raise RuntimeError("private channel digest has no text content")
+        raise RuntimeError("direct channel digest has no text content")
     names, user_ids = _resolve_names(messages)
     lines = [
         timestamped_line(
@@ -412,7 +492,7 @@ def _fetch_private_digest(candidate):
         "body": "\n".join(lines),
         "frontmatter": {
             "slack_channel": channel,
-            "slack_capture_mode": "private-daily-digest",
+            "slack_capture_mode": raw["capture_mode"],
             "slack_participants": sorted(set(names.values())) or user_ids,
             "message_count": len(messages),
             "first_message_at": slack_timestamp_iso(messages[0].get("ts")),
@@ -428,8 +508,8 @@ def fetch(routine, candidate):
     mode = candidate.get("raw", {}).get("mode")
     if mode == "ada_digest":
         return _fetch_ada_digest(candidate)
-    if mode == "private_digest":
-        return _fetch_private_digest(candidate)
+    if mode == "direct_digest":
+        return _fetch_direct_digest(candidate)
 
     channel = candidate["raw"]["channel"]
     anchor = candidate["raw"]["anchor"]
