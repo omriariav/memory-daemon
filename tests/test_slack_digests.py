@@ -95,8 +95,14 @@ class PrivateDigestTest(unittest.TestCase):
         whois = {
             "ok": True,
             "users": {
-                "U1": {"real_name": "One"},
-                "U2": {"real_name": "Two"},
+                "U1": {
+                    "real_name": "One",
+                    "email": "one@example.com",
+                },
+                "U2": {
+                    "real_name": "Two",
+                    "email": "two@example.com",
+                },
             },
         }
         with mock.patch.object(
@@ -112,6 +118,10 @@ class PrivateDigestTest(unittest.TestCase):
         self.assertIn("Two: reply", item["body"])
         self.assertIn("[REDACTED]", item["body"])
         self.assertNotIn("123456", item["body"])
+        self.assertEqual(item["frontmatter"]["source_people"], [
+            {"name": "One", "email": "one@example.com"},
+            {"name": "Two", "email": "two@example.com"},
+        ])
 
     def test_catch_up_finds_old_root_reply_and_preserves_cutover(self):
         root = {

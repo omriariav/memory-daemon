@@ -202,7 +202,10 @@ def _daily_version(messages):
     ]
     return hashlib.sha256(
         json.dumps(
-            content,
+            # Schema 2 adds verified Slack participant identities to fetched
+            # items. Bump the version once so existing recurring entries are
+            # safely revisited and updated with people links.
+            {"schema": 2, "messages": content},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -509,22 +512,36 @@ def candidates(source):
     return out
 
 
-def _resolve_names(messages):
+def _resolve_people(messages):
     user_ids = sorted({
         message["user"]
         for message in messages
         if message.get("user", "").startswith("U")
     })
     names = {}
+    source_people = []
     if user_ids:
         try:
+            users = _cli(["whois", *user_ids])["users"]
             names = {
-                uid: (user.get("real_name") or uid)
-                for uid, user in _cli(["whois", *user_ids])["users"].items()
+                uid: (
+                    user.get("real_name")
+                    or user.get("display_name")
+                    or uid
+                )
+                for uid, user in users.items()
             }
+            source_people = [
+                {
+                    "name": names[uid],
+                    "email": user.get("email"),
+                }
+                for uid, user in users.items()
+                if user.get("email")
+            ]
         except Exception as exc:
             log(f"slack whois failed ({exc}); keeping raw user ids")
-    return names, user_ids
+    return names, user_ids, source_people
 
 
 def _fetch_ada_digest(candidate):
@@ -623,7 +640,7 @@ def _fetch_direct_digest(candidate):
     )
     if not messages:
         raise RuntimeError("direct channel digest has no text content")
-    names, user_ids = _resolve_names(messages)
+    names, user_ids, source_people = _resolve_people(messages)
     lines = [
         timestamped_line(
             slack_timestamp_iso(message.get("ts")),
@@ -642,6 +659,7 @@ def _fetch_direct_digest(candidate):
             "slack_channel": channel,
             "slack_capture_mode": raw["capture_mode"],
             "slack_participants": sorted(set(names.values())) or user_ids,
+            "source_people": source_people,
             "message_count": len(messages),
             "first_message_at": slack_timestamp_iso(messages[0].get("ts")),
             "latest_message_at": slack_timestamp_iso(messages[-1].get("ts")),
@@ -666,7 +684,7 @@ def fetch(routine, candidate):
     if not messages:
         raise RuntimeError("empty thread")
 
-    names, user_ids = _resolve_names(messages)
+    names, user_ids, source_people = _resolve_people(messages)
     lines = [
         timestamped_line(
             slack_timestamp_iso(message.get("ts")),
@@ -699,6 +717,7 @@ def fetch(routine, candidate):
             "slack_thread_ts": anchor,
             "slack_capture_mode": "thread",
             "slack_participants": sorted(set(names.values())) or user_ids,
+            "source_people": source_people,
             "via_mention": bool(candidate["raw"].get("via_mention")),
             "first_message_at": slack_timestamp_iso(first_ts),
             "latest_message_at": slack_timestamp_iso(latest_ts),
