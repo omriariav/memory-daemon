@@ -182,6 +182,33 @@ class PaginationTest(unittest.TestCase):
             "next",
         )
 
+    def test_history_zero_limit_reads_every_page(self):
+        responses = [
+            {
+                "ok": True,
+                "messages": [{"ts": "2.0", "text": "two"}],
+                "response_metadata": {"next_cursor": "next"},
+            },
+            {
+                "ok": True,
+                "messages": [{"ts": "1.0", "text": "one"}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        ]
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli,
+            "slack",
+            side_effect=responses,
+        ) as api, redirect_stdout(stream):
+            slack_cli.cmd_history(["C1", "--limit", "0"])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args_list[0].args[1]["limit"], 200)
+        self.assertEqual(api.call_args_list[1].args[1]["limit"], 200)
+
 
 class DirectConversationTest(unittest.TestCase):
     def test_channel_listing_preserves_dm_identity_fields(self):
@@ -202,6 +229,27 @@ class DirectConversationTest(unittest.TestCase):
         payload = json.loads(stream.getvalue())
         self.assertEqual(payload["channels"][0]["user"], "U456")
         self.assertTrue(payload["channels"][0]["is_im"])
+
+
+class MentionLimitTest(unittest.TestCase):
+    def test_exact_ada_limit_is_reported_as_ambiguous(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"mentions": [{} for _ in range(100)]}),
+            stderr="",
+        )
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "mention_user", return_value="person@example.com"
+        ), mock.patch.object(
+            slack_cli.subprocess, "run", return_value=completed
+        ), redirect_stdout(stream):
+            slack_cli.cmd_mentions(["--days", "1"])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["count"], 100)
+        self.assertEqual(payload["max_results"], 100)
+        self.assertTrue(payload["limit_reached"])
 
 
 class SourceCommandTest(unittest.TestCase):

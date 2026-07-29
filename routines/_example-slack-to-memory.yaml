@@ -16,12 +16,16 @@ description: Distill watched Slack channels and mentions into memory entries.
 
 source:
   kind: slack
-  channels:
+  direct_channels:       # raw history; works for known public/private IDs
     - C0123ABCD          # #my-team-channel
     - C0456EFGH          # #my-project-channel (private channels work too)
   include_mentions: true # workspace-wide @mentions of you
-  hours: 26              # lookback; overlap your schedule interval slightly
-  max_results: 30        # per channel
+  hours: 26              # bootstrap fallback before the first cursor
+  max_results: 0         # uncapped direct reads are required for catch-up
+  catch_up: true
+  catch_up_overlap: 1h   # the ledger skips unchanged overlapping versions
+  catch_up_after: "2026-07-28T08:00:00Z" # replace with your prior-run cutover
+  reply_roots_after: "2026-06-28T08:00:00Z" # beginning of first-run coverage
 
 analyze:
   provider: gemini

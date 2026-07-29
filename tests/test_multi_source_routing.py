@@ -6,7 +6,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 import daemon as daemon_cli
-from workspace_daemon import actions, config, llm, memory_sink, runner, state
+from workspace_daemon import (
+    actions,
+    config,
+    llm,
+    memory_sink,
+    runner,
+    slack_source,
+    state,
+)
 
 
 def multi_routine(vault, routine_id="domain", **extra):
@@ -770,6 +778,98 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             ),
             "2026-07-28T12:00:00Z",
         )
+
+    def test_slack_uses_its_own_bootstrap_and_cursor_namespace(self):
+        saved_slack = runner.SOURCES["slack"]
+        self.addCleanup(runner.SOURCES.__setitem__, "slack", saved_slack)
+        observed = []
+
+        def candidates(source):
+            observed.append(dict(source))
+            return []
+
+        runner.SOURCES["slack"] = (candidates, saved_slack[1])
+        routine = {
+            "id": "slack-sweep",
+            "enabled": True,
+            "source": {
+                "kind": "slack",
+                "direct_channels": ["CEXAMPLE"],
+                "include_mentions": True,
+                "hours": 26,
+                "max_results": 0,
+                "catch_up": True,
+                "catch_up_overlap": "1h",
+                "catch_up_after": "2026-07-28T08:00:00Z",
+                "reply_roots_after": "2026-06-28T08:00:00Z",
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "slack-vault"),
+                "slug_prefix": "slack",
+            },
+        }
+
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+        ):
+            first = runner.run(self.base, [routine])
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
+        ):
+            second = runner.run(self.base, [routine])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(observed[0]["_since"], "2026-07-28T08:00:00Z")
+        self.assertEqual(
+            observed[0]["_catch_up_boundary"],
+            "2026-07-28T08:00:00Z",
+        )
+        self.assertEqual(observed[1]["_since"], "2026-07-28T09:00:00Z")
+        cursor_id = runner._catch_up_cursor_id(routine["source"])
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "slack-sweep", cursor_id, "slack"
+            ),
+            "2026-07-28T12:00:00Z",
+        )
+
+        # Expanding the configured channel set gets a new cursor namespace.
+        # It must bootstrap from the declared boundary, not the old scope's
+        # 12:00 checkpoint.
+        expanded = {
+            **routine,
+            "source": {
+                **routine["source"],
+                "direct_channels": ["CEXAMPLE", "CNEW"],
+            },
+        }
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T14:00:00Z",
+        ):
+            third = runner.run(self.base, [expanded])
+
+        self.assertEqual(third["errors"], 0)
+        self.assertEqual(observed[2]["_since"], "2026-07-28T08:00:00Z")
+        self.assertNotEqual(
+            runner._catch_up_cursor_id(routine["source"]),
+            runner._catch_up_cursor_id(expanded["source"]),
+        )
+
+        # A candidate/enrichment schema upgrade also gets a fresh cursor so
+        # older daily entries outside the live overlap are revisited.
+        original_id = runner._catch_up_cursor_id(routine["source"])
+        with mock.patch.object(
+            slack_source, "CATCH_UP_SCHEMA",
+            slack_source.CATCH_UP_SCHEMA + 1,
+        ):
+            upgraded_id = runner._catch_up_cursor_id(routine["source"])
+        self.assertNotEqual(original_id, upgraded_id)
 
     def test_listing_failure_holds_prior_cursor(self):
         def candidates(source):

@@ -4,6 +4,8 @@ The ledger entry is written before triage and updated after it, so an item is
 never summarized twice and never left with silently unfinished Gmail actions.
 """
 import datetime
+import hashlib
+import json
 import re
 from contextlib import ExitStack
 from email.utils import getaddresses
@@ -12,6 +14,38 @@ from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
+
+
+def _catch_up_cursor_id(source):
+    """Stable cursor namespace for each supported catch-up source shape."""
+    kind = source["kind"]
+    if kind == "gchat":
+        # Preserve the cursor id shipped by the original GChat implementation.
+        return "gchat:all-spaces"
+    if kind == "slack":
+        # A cursor is valid only for the exact configured coverage. If a
+        # channel or mentions are added later, the new scope bootstraps from
+        # catch_up_after instead of inheriting a checkpoint that predates it.
+        scope = {
+            key: sorted(source.get(key, []))
+            for key in (
+                "channels", "ada_channels", "direct_channels", "private_channels"
+            )
+        }
+        scope.update({
+            "include_mentions": source.get("include_mentions") is True,
+            "catch_up_after": source.get("catch_up_after"),
+            "reply_roots_after": source.get("reply_roots_after"),
+            # Candidate/enrichment migrations need a fresh replay from the
+            # declared cutover, even when the prior cursor is already newer
+            # than the affected daily entries.
+            "candidate_schema": slack_source.CATCH_UP_SCHEMA,
+        })
+        digest = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        return f"slack:configured-scope:{digest}"
+    raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
 
 
 def _needs_label_catalog(routines):
@@ -116,7 +150,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if source.get("catch_up") is not True:
                 continue
             kind = source["kind"]
-            cursor_id = f"{kind}:all-spaces"
+            cursor_id = _catch_up_cursor_id(source)
             checkpoint = cursors.checkpoint(
                 routine["id"], cursor_id, kind,
             )
@@ -129,11 +163,15 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     second - datetime.timedelta(seconds=overlap)
                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
-                since = source.get("batch_messages_after")
+                since = (
+                    source.get("catch_up_after")
+                    or source.get("batch_messages_after")
+                )
             if since:
-                source_overrides[(routine["id"], source_index)] = {
-                    "_since": since,
-                }
+                override = {"_since": since}
+                if kind == "slack" and source.get("catch_up_after"):
+                    override["_catch_up_boundary"] = source["catch_up_after"]
+                source_overrides[(routine["id"], source_index)] = override
                 log(
                     f"routine={routine['id']} source={kind} catch-up since={since}"
                 )
@@ -497,7 +535,9 @@ def _scope(source):
         return "all active Google Chat conversations"
     slack_channels = [
         channel
-        for key in ("channels", "ada_channels", "private_channels")
+        for key in (
+            "channels", "ada_channels", "direct_channels", "private_channels"
+        )
         for channel in source.get(key, [])
     ]
     return (
@@ -549,7 +589,9 @@ def _source_scopes(source):
             return {(kind, "*")}
         values = {
             (kind, channel)
-            for key in ("channels", "ada_channels", "private_channels")
+            for key in (
+                "channels", "ada_channels", "direct_channels", "private_channels"
+            )
             for channel in source.get(key, [])
             if isinstance(channel, str)
         }
