@@ -841,7 +841,10 @@ def _validate_source(routine, source, prefix):
                     if not isinstance(entry, dict):
                         problems.append(f"{entry_prefix} must be a mapping")
                         continue
-                    if not isinstance(entry.get("recording_id"), str):
+                    if (
+                        not isinstance(entry.get("recording_id"), str)
+                        or not entry["recording_id"]
+                    ):
                         problems.append(f"{entry_prefix}.recording_id is required")
                     for field in (
                         "recordings_file", "transcript_file", "fallback_file"

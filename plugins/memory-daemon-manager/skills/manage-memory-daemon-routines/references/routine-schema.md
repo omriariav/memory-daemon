@@ -35,7 +35,9 @@ For `source.kind: mila`, keep Mila's storage read-only. Point
 may name an explicit transcript plus the old Mila index that owns its UUID and
 timestamps. Calendar matching is mandatory at runtime and only a
 high-confidence match may proceed to memory. Outcome receipts belong under the
-daemon's `state/transcriptions/`, never inside Mila's directory.
+daemon's `state/transcriptions/`, never inside Mila's directory. Inconclusive
+matches retry on the routine cadence and a later success resolves older failed
+versions by stable recording source id.
 
 An `all_spaces: true` Google Chat fallback automatically excludes explicit
 spaces configured by domain routines, including disabled routines. For frequent

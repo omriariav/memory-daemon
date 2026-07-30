@@ -211,6 +211,29 @@ class Store:
         write_atomic(self.path, _serialize(merged))
         self.entries = merged
 
+    def record_resolving(self, item_id, entry, source_id):
+        """Record success and atomically clear rejected versions of one source.
+
+        Versioned sources may produce a new candidate id after their content is
+        corrected while retaining one stable source id. Keeping an older
+        rejection in that case would leave status permanently red even though
+        the source was later captured successfully.
+        """
+        if self.dry_run:
+            return
+        merged = {
+            key: value
+            for key, value in self.entries.items()
+            if not (
+                key != item_id
+                and value.get("calendar_match_rejected")
+                and value.get("source_id") == source_id
+            )
+        }
+        merged[item_id] = entry
+        write_atomic(self.path, _serialize(merged))
+        self.entries = merged
+
 
 class ScheduleStore:
     """Small durable record of when each routine was last attempted.

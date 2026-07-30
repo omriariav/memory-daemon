@@ -167,6 +167,64 @@ class MilaSourceTest(unittest.TestCase):
             ),
         )
 
+    def test_malformed_record_does_not_hide_valid_record(self):
+        malformed = record(
+            "BROKEN",
+            created="not-a-timestamp",
+            duration="not-a-duration",
+            segments=[{"start": 0, "text": "Transcript exists."}],
+        )
+        valid = record(
+            "VALID",
+            source="voiceMemo",
+            audio="Valid.m4a",
+            segments=[{"start": 0, "text": "Valid transcript."}],
+        )
+        self.write_json(
+            self.current / "recordings.json", [malformed, valid]
+        )
+
+        found = mila_source.candidates({
+            "kind": "mila",
+            "recordings_file": str(self.current / "recordings.json"),
+            "max_results": 0,
+        })
+
+        self.assertEqual(
+            {candidate["raw"]["source_id"] for candidate in found},
+            {"mila:BROKEN", "mila:VALID"},
+        )
+        broken = next(
+            candidate
+            for candidate in found
+            if candidate["raw"]["source_id"] == "mila:BROKEN"
+        )
+        self.assertIn("transcript_error", broken["raw"])
+        self.assertIsNone(broken["raw"]["recording_start"])
+
+    def test_manual_recording_must_still_be_completed(self):
+        self.write_json(
+            self.legacy / "recordings.json",
+            [record("PENDING", status="pending")],
+        )
+        transcript = self.current / "manual.srt"
+        transcript.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nNot ready.\n"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "is not completed"):
+            mila_source.candidates({
+                "kind": "mila",
+                "recordings_file": str(self.current / "recordings.json"),
+                "manual_recordings": [{
+                    "recording_id": "PENDING",
+                    "recordings_file": str(
+                        self.legacy / "recordings.json"
+                    ),
+                    "transcript_file": str(transcript),
+                }],
+            })
+
     def test_fetch_reads_calendar_and_ranks_overlapping_event(self):
         indexed = record(
             "NEW",
@@ -216,6 +274,32 @@ class MilaSourceTest(unittest.TestCase):
             ["overlap", "far"],
         )
         self.assertEqual(item["date"], "2026-07-27")
+
+    def test_calendar_candidates_without_ids_are_discarded(self):
+        indexed = record(
+            "NEW",
+            segments=[{"start": 0, "end": 1, "text": "Transcript"}],
+        )
+        self.write_json(self.current / "recordings.json", [indexed])
+        source = {
+            "kind": "mila",
+            "recordings_file": str(self.current / "recordings.json"),
+            "max_results": 0,
+        }
+        candidate = mila_source.candidates(source)[0]
+        event = {
+            "summary": "Missing id",
+            "start": "2026-07-27T19:00:00Z",
+            "end": "2026-07-27T19:30:00Z",
+            "event_type": "default",
+        }
+
+        with mock.patch.object(
+            mila_source, "_raw_calendar_events", return_value=[event]
+        ):
+            item = mila_source.fetch({}, source, candidate)
+
+        self.assertEqual(item["_mila_calendar_candidates"], [])
 
     def test_match_accepts_only_high_confidence_supplied_event(self):
         source = {"match_max_output_tokens": 2048}
@@ -273,6 +357,19 @@ class MilaSourceTest(unittest.TestCase):
                 routine(self.root, source), source, item
             )
 
+        response["content"] = json.dumps({
+            "matched": True,
+            "event_id": None,
+            "confidence": "high",
+            "reason": "Missing identity.",
+        })
+        with mock.patch.object(mila_source, "yoetz_bin", return_value="yoetz"), \
+             mock.patch.object(mila_source, "run_json", return_value=response), \
+             self.assertRaisesRegex(RuntimeError, "non-empty event_id"):
+            mila_source.match_calendar(
+                routine(self.root, source), source, item
+            )
+
     def test_receipts_are_private_current_state_files(self):
         item = {
             "id": "mila:ID@hash",
@@ -293,6 +390,74 @@ class MilaSourceTest(unittest.TestCase):
         self.assertFalse(failed.exists())
         self.assertTrue(processed.exists())
         self.assertEqual(processed.stat().st_mode & 0o777, 0o600)
+
+    def test_dry_and_wet_processing_leave_mila_files_byte_identical(self):
+        legacy_record = record("LEGACY")
+        self.write_json(self.legacy / "recordings.json", [legacy_record])
+        self.write_json(self.current / "recordings.json", [])
+        transcript = self.current / "meeting.srt"
+        fallback = self.current / "meeting.txt"
+        transcript.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\nA decision was made.\n"
+        )
+        fallback.write_text("A decision was made.")
+        source = {
+            "kind": "mila",
+            "recordings_file": str(self.current / "recordings.json"),
+            "manual_recordings": [{
+                "recording_id": "LEGACY",
+                "recordings_file": str(self.legacy / "recordings.json"),
+                "transcript_file": str(transcript),
+                "fallback_file": str(fallback),
+            }],
+            "max_results": 0,
+        }
+        files = [
+            self.current / "recordings.json",
+            self.legacy / "recordings.json",
+            transcript,
+            fallback,
+        ]
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in files
+        }
+        event = {
+            "id": "event-1",
+            "summary": "Intro meeting",
+            "start": "2026-07-27T19:00:00Z",
+            "end": "2026-07-27T19:40:00Z",
+            "event_type": "default",
+            "attendees": [],
+        }
+        match_response = {
+            "content": json.dumps({
+                "matched": True,
+                "event_id": "event-1",
+                "confidence": "high",
+                "reason": "Exact overlap.",
+            })
+        }
+        configured = routine(self.root / "memory", source)
+
+        with mock.patch.object(
+            mila_source, "_raw_calendar_events", return_value=[event]
+        ), mock.patch.object(
+            mila_source, "run_json", return_value=match_response
+        ), mock.patch.object(
+            llm, "analyze", return_value="Durable decision."
+        ), mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry"},
+        ):
+            runner.run(self.root, [configured], dry_run=True)
+            runner.run(self.root, [configured])
+
+        after = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in files
+        }
+        self.assertEqual(after, before)
 
 
 class MilaValidationTest(unittest.TestCase):
@@ -425,3 +590,137 @@ class MilaRunnerTest(unittest.TestCase):
             (self.base / "state" / "transcriptions" / "processed").glob("*.json")
         )
         self.assertEqual(json.loads(receipt.read_text())["memory"], "created")
+
+    def test_rejected_match_is_retried_without_transcript_change(self):
+        rejected = {
+            "matched": False,
+            "event_id": None,
+            "confidence": "medium",
+            "reason": "Ambiguous.",
+        }
+        accepted = {
+            "matched": True,
+            "event_id": "event-1",
+            "confidence": "high",
+            "reason": "Calendar was corrected.",
+        }
+        with self.patched_source(), mock.patch.object(
+            mila_source, "match_calendar",
+            side_effect=[(False, rejected), (True, accepted)],
+        ) as match, mock.patch.object(
+            llm, "analyze", return_value="Summary"
+        ), mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry"},
+        ):
+            first = runner.run(self.base, [self.routine])
+            second = runner.run(self.base, [self.routine])
+
+        ledger = state.load(self.base)
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(match.call_count, 2)
+        self.assertFalse(
+            ledger[self.candidate["id"]].get("calendar_match_rejected")
+        )
+
+    def test_successful_new_version_resolves_rejected_old_version(self):
+        rejected = {
+            "matched": False,
+            "event_id": None,
+            "confidence": "medium",
+            "reason": "Ambiguous.",
+        }
+        accepted = {
+            "matched": True,
+            "event_id": "event-1",
+            "confidence": "high",
+            "reason": "Calendar was corrected.",
+        }
+        with self.patched_source(), mock.patch.object(
+            mila_source, "match_calendar", return_value=(False, rejected)
+        ), mock.patch.object(memory_sink, "capture"):
+            first = runner.run(self.base, [self.routine])
+
+        old_id = self.candidate["id"]
+        self.assertEqual(first["errors"], 0)
+        self.candidate["id"] = "mila:ID@corrected-hash"
+        self.item["id"] = self.candidate["id"]
+
+        with self.patched_source(), mock.patch.object(
+            mila_source, "match_calendar", return_value=(True, accepted)
+        ), mock.patch.object(
+            llm, "analyze", return_value="Summary"
+        ), mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry"},
+        ):
+            second = runner.run(self.base, [self.routine])
+
+        ledger = state.load(self.base)
+        self.assertEqual(second["errors"], 0)
+        self.assertNotIn(old_id, ledger)
+        self.assertIn(self.candidate["id"], ledger)
+        self.assertFalse(
+            ledger[self.candidate["id"]].get("calendar_match_rejected")
+        )
+        self.assertEqual(
+            list(
+                (
+                    self.base / "state" / "transcriptions" / "failed"
+                ).glob("*.json")
+            ),
+            [],
+        )
+        self.assertEqual(
+            len(
+                list(
+                    (
+                        self.base
+                        / "state"
+                        / "transcriptions"
+                        / "processed"
+                    ).glob("*.json")
+                )
+            ),
+            1,
+        )
+
+    def test_receipt_failure_is_isolated_and_retried_without_ledger(self):
+        blocked = (
+            self.base / "state" / "transcriptions" / "processed"
+        )
+        blocked.parent.mkdir(parents=True)
+        blocked.write_text("not a directory")
+        accepted = {
+            "matched": True,
+            "event_id": "event-1",
+            "confidence": "high",
+            "reason": "Exact.",
+        }
+        with self.patched_source(), mock.patch.object(
+            mila_source, "match_calendar", return_value=(True, accepted)
+        ), mock.patch.object(
+            llm, "analyze", return_value="Summary"
+        ), mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry"},
+        ):
+            first = runner.run(self.base, [self.routine])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertNotIn(self.candidate["id"], state.load(self.base))
+
+        blocked.unlink()
+        with self.patched_source(), mock.patch.object(
+            mila_source, "match_calendar", return_value=(True, accepted)
+        ), mock.patch.object(
+            llm, "analyze", return_value="Summary"
+        ), mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "updated", "memory_entry_id": "entry"},
+        ):
+            second = runner.run(self.base, [self.routine])
+
+        self.assertEqual(second["errors"], 0)
+        self.assertIn(self.candidate["id"], state.load(self.base))

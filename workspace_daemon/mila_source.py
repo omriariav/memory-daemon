@@ -195,12 +195,20 @@ def _candidate(record, directory, manual=None):
     }
 
 
+def _completed(record):
+    return record.get("status") == "completed" and not record.get("deletedAt")
+
+
 def candidates(source):
     """List manual recordings first, then completed indexed Mila recordings."""
     found = {}
     for manual in source.get("manual_recordings") or []:
         metadata_file = manual.get("recordings_file") or source["recordings_file"]
         record = _record_by_id(metadata_file, manual["recording_id"])
+        if not _completed(record):
+            raise RuntimeError(
+                f"manual Mila recording {manual['recording_id']} is not completed"
+            )
         candidate = _candidate(record, Path(metadata_file).parent, manual)
         found[candidate["raw"]["source_id"]] = candidate
 
@@ -211,8 +219,7 @@ def candidates(source):
         if (
             not recording_id
             or recording_id in excluded
-            or record.get("status") != "completed"
-            or record.get("deletedAt")
+            or not _completed(record)
         ):
             continue
         source_id = f"mila:{recording_id}"
@@ -225,7 +232,10 @@ def candidates(source):
         except Exception as exc:
             # Keep one item-level failure visible without making a single
             # malformed sidecar prevent every other recording from running.
-            start, end = _recording_interval(record)
+            try:
+                start, end = _recording_interval(record)
+            except Exception:
+                start = end = None
             digest = hashlib.sha256(
                 f"{recording_id}:{exc}".encode("utf-8")
             ).hexdigest()[:16]
@@ -237,14 +247,20 @@ def candidates(source):
                     "recording": record,
                     "transcript_error": str(exc),
                     "content_hash": digest,
-                    "recording_start": start.isoformat().replace("+00:00", "Z"),
-                    "recording_end": end.isoformat().replace("+00:00", "Z"),
+                    "recording_start": (
+                        start.isoformat().replace("+00:00", "Z")
+                        if start else None
+                    ),
+                    "recording_end": (
+                        end.isoformat().replace("+00:00", "Z")
+                        if end else None
+                    ),
                 },
             }
 
     ordered = sorted(
         found.values(),
-        key=lambda item: item["raw"].get("recording_start", ""),
+        key=lambda item: item["raw"].get("recording_start") or "",
         reverse=True,
     )
     limit = int(source.get("max_results", 0))
@@ -290,8 +306,11 @@ def _calendar_candidates(source, record, recording_start, recording_end):
     recording_tokens = _title_tokens(record.get("title"))
     ranked = []
     for event in _raw_calendar_events(source, recording_start):
+        event_id = event.get("id")
         if (
-            event.get("status") == "cancelled"
+            not isinstance(event_id, str)
+            or not event_id.strip()
+            or event.get("status") == "cancelled"
             or event.get("all_day")
             or event.get("response_status") == "declined"
             or event.get("event_type", "default") != "default"
@@ -323,7 +342,7 @@ def _calendar_candidates(source, record, recording_start, recording_end):
             -title_overlap,
         )
         ranked.append((rank, {
-            "id": event.get("id"),
+            "id": event_id,
             "summary": event.get("summary") or "",
             "start": event.get("start"),
             "end": event.get("end"),
@@ -405,7 +424,14 @@ def _match_prompt(item, events):
 
 def match_calendar(routine, source, item):
     """Return ``(accepted, match)``; only a validated high match is accepted."""
-    events = item.get("_mila_calendar_candidates") or []
+    events = [
+        event
+        for event in item.get("_mila_calendar_candidates") or []
+        if (
+            isinstance(event.get("id"), str)
+            and bool(event["id"].strip())
+        )
+    ]
     if not events:
         return False, {
             "matched": False,
@@ -428,8 +454,14 @@ def match_calendar(routine, source, item):
         raise RuntimeError(
             f"calendar matcher returned invalid confidence {confidence!r}"
         )
-    event_ids = {event.get("id") for event in events}
+    event_ids = {event["id"] for event in events}
     event_id = match.get("event_id")
+    if match.get("matched") is True and (
+        not isinstance(event_id, str) or not event_id.strip()
+    ):
+        raise RuntimeError(
+            "calendar matcher returned matched=true without a non-empty event_id"
+        )
     if event_id is not None and event_id not in event_ids:
         raise RuntimeError(
             f"calendar matcher selected an event outside the supplied candidates: "
@@ -438,6 +470,8 @@ def match_calendar(routine, source, item):
     accepted = (
         match.get("matched") is True
         and confidence == "high"
+        and isinstance(event_id, str)
+        and bool(event_id.strip())
         and event_id in event_ids
     )
     match = {
@@ -493,8 +527,12 @@ def dry_run_description(item):
     )
 
 
-def _receipt_path(base_dir, status_name, item_id):
-    safe = _SAFE_RECEIPT.sub("-", item_id).strip("-")
+def _receipt_path(base_dir, status_name, item):
+    # One receipt per stable source, not per transcript hash. A corrected
+    # transcript therefore resolves the old failed receipt instead of leaving
+    # permanent stale attention behind.
+    identity = item.get("source_id") or item["id"]
+    safe = _SAFE_RECEIPT.sub("-", identity).strip("-")
     return (
         Path(base_dir)
         / "state"
@@ -517,7 +555,7 @@ def write_receipt(base_dir, status_name, item, details):
         "updated_at": utc_now_iso(),
         **details,
     }
-    target = _receipt_path(base_dir, status_name, item["id"])
+    target = _receipt_path(base_dir, status_name, item)
     state.write_atomic(
         target,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -526,7 +564,7 @@ def write_receipt(base_dir, status_name, item, details):
     opposite = _receipt_path(
         base_dir,
         "failed" if status_name == "processed" else "processed",
-        item["id"],
+        item,
     )
     try:
         opposite.unlink()

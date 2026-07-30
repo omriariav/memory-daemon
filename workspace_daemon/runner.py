@@ -1250,12 +1250,22 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             )
             and "memory_error" in existing
         )
-        if existing is not None and not retry_memory:
+        retry_calendar = (
+            existing is not None
+            and claim["source"].get("kind") == "mila"
+            and existing.get("calendar_match_rejected") is True
+        )
+        if existing is not None and not retry_memory and not retry_calendar:
             totals["skipped"] += 1
             continue
         if retry_memory:
             log(
                 f"routine={rid} retrying id={candidate['id']} after memory error"
+            )
+        elif retry_calendar:
+            log(
+                f"routine={rid} retrying id={candidate['id']} after "
+                "inconclusive Calendar match"
             )
         new += 1
         totals["matched"] += 1
@@ -1291,10 +1301,21 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                         "mila_recording_start": raw.get("recording_start"),
                     },
                 }
-                mila_source.write_receipt(
-                    base_dir, "failed", placeholder,
-                    {"failure_kind": "transient-error", "error": str(exc)[:500]},
-                )
+                try:
+                    mila_source.write_receipt(
+                        base_dir, "failed", placeholder,
+                        {
+                            "failure_kind": "transient-error",
+                            "error": str(exc)[:500],
+                        },
+                    )
+                except Exception as receipt_exc:
+                    # Receipts are observability, not a reason to let one item
+                    # escape its isolation boundary and abort every routine.
+                    log(
+                        f"routine={rid} receipt ERROR id={candidate['id']}: "
+                        f"{receipt_exc}"
+                    )
     if new == 0:
         log(f"routine={rid} no new matches")
 
@@ -1340,11 +1361,11 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             record = {
                 "rule_id": rid,
                 "source_kind": source["kind"],
+                "source_id": item["source_id"],
                 "processed_at": utc_now_iso(),
                 "calendar_match_rejected": True,
                 "calendar_match": calendar_match,
             }
-            processed.record(item["id"], record)
             if base_dir is not None:
                 mila_source.write_receipt(
                     base_dir, "failed", item,
@@ -1353,6 +1374,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                         "calendar_match": calendar_match,
                     },
                 )
+            processed.record(item["id"], record)
             log(
                 f"routine={rid} id={item['id']} not captured: "
                 f"Calendar match confidence={calendar_match['confidence']} "
@@ -1383,6 +1405,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     record = {
         "rule_id": rid,
         "source_kind": source["kind"],
+        "source_id": item.get("source_id"),
         "processed_at": utc_now_iso(),
         "output_file": str(path) if path else None,
         "gmail_label_applied": label,
@@ -1415,7 +1438,6 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     # after triage would instead risk a duplicate note on the next run.
     if action_list:
         record["actions_pending"] = list(action_list)
-    processed.record(item["id"], record)
     if source["kind"] == "mila" and base_dir is not None:
         receipt_status = "failed" if record.get("memory_error") else "processed"
         details = {
@@ -1429,6 +1451,11 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                 "error": record["memory_error"],
             })
         mila_source.write_receipt(base_dir, receipt_status, item, details)
+        processed.record_resolving(
+            item["id"], record, item["source_id"]
+        )
+    else:
+        processed.record(item["id"], record)
 
     if action_list:
         applied, pending = actions.apply(item["id"], action_list, label)

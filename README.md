@@ -522,7 +522,9 @@ Mila's directory is read-only. The daemon writes small, private receipts under
 `state/transcriptions/processed/` and `state/transcriptions/failed/`; it never
 moves audio or transcript sidecars and never edits `recordings.json` or
 `folders.json`. The status command reports low-confidence matches as needing
-attention.
+attention. An inconclusive match is retried on the routine's next run so a
+corrected Calendar event can resolve it; success atomically clears older
+rejections for that stable recording source.
 
 Candidate IDs include the transcript hash, so a corrected transcript is
 reprocessed. The memory source ID remains `mila:<recording-uuid>`, so that
