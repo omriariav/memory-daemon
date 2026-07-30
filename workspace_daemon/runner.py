@@ -15,6 +15,8 @@ from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
+MAX_GMAIL_THREAD_MESSAGES = 50
+MAX_GMAIL_THREAD_CHARS = 120_000
 
 
 def _catch_up_cursor_id(source):
@@ -411,7 +413,7 @@ def _gmail_candidates(source):
     ]
 
 
-def _email_source_people(headers):
+def _email_source_people(*header_sets):
     """Verified-identity candidates from structured Gmail address headers.
 
     These addresses are not trusted as person slugs by themselves.  The memory
@@ -420,32 +422,110 @@ def _email_source_people(headers):
     """
     people = []
     seen = set()
-    for field in ("from", "to", "cc"):
-        value = headers.get(field) or ""
-        for name, email in getaddresses([value]):
-            normalized = email.strip().casefold()
-            if not normalized or "@" not in normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            if len(people) >= MAX_GMAIL_SOURCE_PEOPLE:
-                return people, True
-            people.append({
-                "email": normalized,
-                "name": " ".join(name.split()),
-                "role": field,
-            })
+    for headers in header_sets:
+        for field in ("from", "to", "cc"):
+            value = headers.get(field) or ""
+            for name, email in getaddresses([value]):
+                normalized = email.strip().casefold()
+                if not normalized or "@" not in normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                if len(people) >= MAX_GMAIL_SOURCE_PEOPLE:
+                    return people, True
+                people.append({
+                    "email": normalized,
+                    "name": " ".join(name.split()),
+                    "role": field,
+                })
     return people, False
+
+
+def _gmail_thread_body(messages):
+    """Render bounded chronological thread context, favoring recent messages.
+
+    Gmail reply bodies commonly quote the entire history. Strip only the
+    corroborated quote markers we already trust, then keep the newest messages
+    that fit below the prompt-safety ceiling. The coverage metadata prevents
+    the model from treating a bounded thread as complete.
+    """
+    rendered_newest_first = []
+    chars = 0
+    body_truncated = False
+    total = len(messages)
+
+    for index in range(total - 1, max(-1, total - MAX_GMAIL_THREAD_MESSAGES - 1), -1):
+        message = messages[index]
+        headers = message.get("headers") or {}
+        message_body, _ = _strip_quoted_history(message.get("body") or "")
+        lines = [f"--- Message {index + 1} of {total} ---"]
+        for label, field in (
+            ("From", "from"),
+            ("To", "to"),
+            ("Cc", "cc"),
+            ("Date", "date"),
+            ("Subject", "subject"),
+        ):
+            value = headers.get(field)
+            if value:
+                lines.append(f"{label}: {value}")
+        segment = "\n".join(lines) + "\n\n" + message_body.strip()
+        separator_cost = 2 if rendered_newest_first else 0
+        remaining = MAX_GMAIL_THREAD_CHARS - chars - separator_cost
+        if remaining <= 0:
+            break
+        if len(segment) > remaining:
+            if rendered_newest_first:
+                break
+            marker = "\n\n[message body truncated by Gmail thread safety limit]"
+            segment = segment[:max(0, remaining - len(marker))].rstrip() + marker
+            body_truncated = True
+        rendered_newest_first.append(segment)
+        chars += len(segment) + separator_cost
+
+    rendered = list(reversed(rendered_newest_first))
+    included = len(rendered)
+    truncated = body_truncated or included < total
+    prefix = ""
+    if truncated:
+        prefix = (
+            f"[Thread coverage: supplied {included} of {total} messages; "
+            "older content may be omitted.]\n\n"
+        )
+    return prefix + "\n\n".join(rendered), included, truncated
 
 
 def _gmail_fetch(routine, source, candidate):
     message_id = candidate["id"]
-    msg = gmail.read_message(message_id)
-    headers = msg.get("headers", {})
-    body = msg.get("body") or ""
     thread_id = candidate["raw"].get("thread_id", message_id)
+    thread_messages = None
+    if source.get("read_thread"):
+        thread = gmail.read_thread(thread_id)
+        thread_messages = thread.get("messages") or []
+        if not thread_messages:
+            raise RuntimeError(f"no content: Gmail thread {thread_id} has no messages")
+        msg = next(
+            (entry for entry in thread_messages if entry.get("id") == message_id),
+            thread_messages[-1],
+        )
+    else:
+        msg = gmail.read_message(message_id)
+    headers = msg.get("headers", {})
+    if thread_messages is not None:
+        body, included, thread_truncated = _gmail_thread_body(thread_messages)
+        # Identity enrichment is capped. Favor the latest participants so a
+        # long-lived thread cannot crowd out the people involved in its current
+        # request with an old distribution list.
+        people_headers = [
+            entry.get("headers") or {} for entry in reversed(thread_messages)
+        ]
+    else:
+        body = msg.get("body") or ""
+        included = None
+        thread_truncated = False
+        people_headers = [headers]
     subject = headers.get("subject", "")
     date = notes.email_date(headers)
-    source_people, source_people_truncated = _email_source_people(headers)
+    source_people, source_people_truncated = _email_source_people(*people_headers)
 
     item = {
         "id": message_id,
@@ -458,12 +538,20 @@ def _gmail_fetch(routine, source, candidate):
             "gmail_thread_id": thread_id,
             "gmail_link": f"https://mail.google.com/mail/u/0/#inbox/{thread_id}",
             "email_from": headers.get("from", ""),
+            "email_to": headers.get("to", ""),
+            "email_cc": headers.get("cc", ""),
             "email_subject": subject,
             "email_date": headers.get("date", ""),
             "source_people": source_people,
             "source_people_truncated": source_people_truncated,
         },
     }
+    if thread_messages is not None:
+        item["frontmatter"].update({
+            "gmail_thread_message_count": len(thread_messages),
+            "gmail_thread_messages_included": included,
+            "gmail_thread_truncated": thread_truncated,
+        })
 
     stream = _stream_for(routine, item)
     message_updates = bool(stream.get("message_updates"))

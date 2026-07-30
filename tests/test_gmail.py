@@ -32,6 +32,18 @@ class SearchTest(unittest.TestCase):
             "--max", "25", "--format", "json",
         ])
 
+    def test_read_thread_uses_thread_endpoint(self):
+        with mock.patch.object(
+            gmail, "run_json", return_value={"messages": []}
+        ) as run_json, mock.patch.object(
+            gmail, "gws_bin", return_value="gws"
+        ):
+            gmail.read_thread("thread-1")
+
+        run_json.assert_called_once_with([
+            "gws", "gmail", "thread", "thread-1", "--format", "json",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

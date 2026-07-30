@@ -410,6 +410,14 @@ Dedupe is keyed on item id, so a broad query is safe from *re*-processing. It is
 not safe from *first*-processing — an unscoped query summarizes everything it
 matches on the first run, which is real money and a flooded vault.
 
+For a general attention sweep, set `read_thread: true` on the Gmail source.
+The daemon then supplies chronological thread context, including From/To/Cc,
+instead of only the latest message. Context is bounded to the newest 50 messages
+and 120,000 characters; truncated input is labeled as partial so the model
+cannot mistake it for complete coverage. A new reply still has a new Gmail
+message id for ledger dedupe, while the memory source id remains the thread id,
+so later replies update the existing thread memory rather than duplicating it.
+
 The pattern that works well: scope on `in:inbox` and end the routine with
 `archive`. The inbox becomes the queue, and archiving is what marks an item
 done. `is:unread` is a trap if you tend to read mail before the daemon runs —

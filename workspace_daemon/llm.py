@@ -76,6 +76,24 @@ def _source_header_lines(item):
 
     if meta.get("email_from"):
         lines.append(f"From: {meta['email_from']}")
+    if meta.get("email_to"):
+        lines.append(f"To: {meta['email_to']}")
+    if meta.get("email_cc"):
+        lines.append(f"Cc: {meta['email_cc']}")
+    if meta.get("gmail_thread_message_count") is not None:
+        included = meta.get(
+            "gmail_thread_messages_included",
+            meta["gmail_thread_message_count"],
+        )
+        lines.append(
+            "Messages in supplied thread: "
+            f"{included} of {meta['gmail_thread_message_count']}"
+        )
+        if meta.get("gmail_thread_truncated"):
+            lines.append(
+                "Coverage warning: older thread messages were omitted by the "
+                "configured safety limit."
+            )
     return lines
 
 

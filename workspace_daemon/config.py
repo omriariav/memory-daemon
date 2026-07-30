@@ -580,6 +580,11 @@ def _validate_source(routine, source, prefix):
             )
     if kind != "gmail" and action_list:
         problems.append(f"{prefix}: source.kind {kind!r} does not support Gmail actions")
+    read_thread = source.get("read_thread")
+    if read_thread is not None and not isinstance(read_thread, bool):
+        problems.append(f"{prefix}.read_thread must be true or false")
+    if kind != "gmail" and read_thread is not None:
+        problems.append(f"{prefix}.read_thread is supported only for gmail")
 
     catch_up = source.get("catch_up", False)
     if not isinstance(catch_up, bool):

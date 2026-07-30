@@ -80,8 +80,8 @@ class SlugCatalogTest(unittest.TestCase):
 
     def test_extraction_policy_keeps_concrete_pending_requests(self):
         response = (
-            '{"worthy":true,"type":"todo","title":"Review roadmap by Sunday",'
-            '"people":[],"tags":[],"body":"Review the roadmap by Sunday."}'
+            '{"worthy":true,"type":"todo","title":"Review roadmap",'
+            '"people":[],"tags":[],"body":"Review the roadmap."}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -90,7 +90,7 @@ class SlugCatalogTest(unittest.TestCase):
             memory_sink._extract(
                 routine,
                 {"title": "Review request", "date": "2026-07-30"},
-                "The product lead was asked to review the roadmap by Sunday.",
+                "The product lead was asked to review the roadmap.",
                 "/store",
             )
 
@@ -98,6 +98,7 @@ class SlugCatalogTest(unittest.TestCase):
         self.assertIn("concrete pending action/request", prompt)
         self.assertIn("worthy as a todo while it remains unresolved", prompt)
         self.assertIn("need not already have been accepted or started", prompt)
+        self.assertIn("Preserve any stated deadline, but do not require one", prompt)
 
 
 class SourceIdTest(unittest.TestCase):
@@ -612,6 +613,22 @@ class CaptureValidationTest(unittest.TestCase):
              "tags": [], "body": "b"})
         self.assertEqual(out, {"memory": "skipped_not_worthy"})
         self.assertEqual(calls, {})
+
+    def test_source_not_worthy_sentinel_skips_extraction_and_store(self):
+        with mock.patch.object(memory_sink, "_extract") as extract, \
+             mock.patch.object(memory_sink, "_cli") as cli, \
+             mock.patch.object(memory_sink.contacts, "resolve_email") as resolve, \
+             mock.patch.object(memory_sink, "log"):
+            out = memory_sink.capture(
+                self.routine,
+                self.item,
+                "  NOT MEMORY-WORTHY\n",
+            )
+
+        self.assertEqual(out, {"memory": "skipped_not_worthy"})
+        extract.assert_not_called()
+        cli.assert_not_called()
+        resolve.assert_not_called()
 
     def test_dry_run_makes_no_calls(self):
         with mock.patch.object(memory_sink, "_cli") as m, \
