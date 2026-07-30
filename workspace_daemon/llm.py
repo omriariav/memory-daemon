@@ -94,6 +94,25 @@ def _source_header_lines(item):
                 "Coverage warning: older thread messages were omitted by the "
                 "configured safety limit."
             )
+    if item.get("source_kind") == "mila" or meta.get("mila_recording_id"):
+        lines.append("Source: Mila transcription")
+        if meta.get("mila_recording_start"):
+            lines.append(f"Recording started: {meta['mila_recording_start']}")
+        if meta.get("mila_recording_end"):
+            lines.append(f"Recording ended: {meta['mila_recording_end']}")
+        if meta.get("calendar_event_title"):
+            lines.append(
+                f"Matched Calendar event: {meta['calendar_event_title']}"
+            )
+        if meta.get("calendar_event_start"):
+            lines.append(
+                f"Calendar event start: {meta['calendar_event_start']}"
+            )
+        if meta.get("calendar_match_confidence"):
+            lines.append(
+                f"Calendar match confidence: "
+                f"{meta['calendar_match_confidence']}"
+            )
     return lines
 
 

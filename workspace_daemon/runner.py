@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, notes, slack_source, state, time_utils
+from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, mila_source, notes, slack_source, state, time_utils
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -212,7 +212,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         routine_claims = owned.get(rid, [])
         _run_owned(
             routine, routine_claims, processed, label_catalog, dry_run,
-            totals, lock, catalog,
+            totals, lock, catalog, base_dir,
         )
 
     coverage_sources = []
@@ -264,6 +264,16 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
     active sources contribute this run's start, while inactive owners retain
     their prior successful checkpoint.
     """
+    active_source_kinds = {
+        source.get("kind")
+        for routine in routines
+        if (
+            routine.get("enabled", True)
+            and routine.get("id") in valid_ids
+            and routine.get("id") in active_ids
+        )
+        for source in config.sources(routine)
+    }
     declarations = {}
     duplicate_keys = set()
     connector_kinds = set()
@@ -274,6 +284,11 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
         if analyze.get("connector_sweep") is not True:
             continue
         connector = analyze.get("instruction_from_connector")
+        # A targeted run of an unrelated source must not publish connector
+        # health from old checkpoints. This could otherwise advance
+        # `last_pulled` even though that connector was never queried.
+        if connector not in active_source_kinds:
+            continue
         store = memory_sink.memory_cfg(routine).get("store")
         key = (store, connector)
         if not store or not connector:
@@ -799,6 +814,7 @@ SOURCES = {
               lambda routine, source, candidate: slack_source.fetch(routine, candidate)),
     "gchat": (gchat_source.candidates,
               lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
+    "mila": (mila_source.candidates, mila_source.fetch),
 }
 
 
@@ -807,6 +823,8 @@ SOURCES = {
 def _scope(source):
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
+    if source.get("kind") == "mila":
+        return source.get("recordings_file") or "Mila recordings"
     slack_channels = [
         channel
         for key in (
@@ -835,6 +853,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "drive_docs": 50,
     "slack": 30,
     "gchat": 50,
+    "mila": 0,
 }
 
 
@@ -1216,7 +1235,7 @@ def _route_claims(claims, totals, failures=()):
 
 
 def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
-               lock=None, catalog=None):
+               lock=None, catalog=None, base_dir=None):
     rid = routine["id"]
     log(f"routine={rid} {len(claims)} owned item(s)")
     new = 0
@@ -1225,7 +1244,10 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         existing = processed.get(candidate["id"])
         retry_memory = (
             existing is not None
-            and claim["source"].get("catch_up") is True
+            and (
+                claim["source"].get("catch_up") is True
+                or claim["source"].get("kind") == "mila"
+            )
             and "memory_error" in existing
         )
         if existing is not None and not retry_memory:
@@ -1244,7 +1266,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         try:
             _process(
                 routine, claim["source"], candidate, claim["fetch"], processed,
-                label_catalog, dry_run, totals, catalog,
+                label_catalog, dry_run, totals, catalog, base_dir,
             )
             totals["processed"] += 1
         except state.AlreadyRunning:
@@ -1252,12 +1274,33 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
+            if (
+                claim["source"].get("kind") == "mila"
+                and not dry_run
+                and base_dir is not None
+            ):
+                raw = candidate.get("raw") or {}
+                placeholder = {
+                    "id": candidate["id"],
+                    "source_id": raw.get("source_id"),
+                    "frontmatter": {
+                        "mila_recording_id": (
+                            raw.get("recording") or {}
+                        ).get("id"),
+                        "mila_content_hash": raw.get("content_hash"),
+                        "mila_recording_start": raw.get("recording_start"),
+                    },
+                }
+                mila_source.write_receipt(
+                    base_dir, "failed", placeholder,
+                    {"failure_kind": "transient-error", "error": str(exc)[:500]},
+                )
     if new == 0:
         log(f"routine={rid} no new matches")
 
 
 def _process(routine, source, candidate, fetch, processed, label_catalog,
-             dry_run, totals, catalog=None):
+             dry_run, totals, catalog=None, base_dir=None):
     rid = routine["id"]
     action_list = config.source_actions(routine, source)
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
@@ -1267,6 +1310,11 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
     if dry_run:
+        if source["kind"] == "mila":
+            log(
+                f"routine={rid} [dry-run] "
+                f"{mila_source.dry_run_description(item)}"
+            )
         dry_label = (
             static
             or ("<llm-chosen>" if routine["analyze"].get("pick_label") else None)
@@ -1282,6 +1330,39 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             memory_sink.capture(routine, item, "<summary>", dry_run=True)
         log(f"routine={rid} [dry-run] would apply: {desc}")
         return
+
+    calendar_match = None
+    if source["kind"] == "mila":
+        accepted, calendar_match = mila_source.match_calendar(
+            routine, source, item
+        )
+        if not accepted:
+            record = {
+                "rule_id": rid,
+                "source_kind": source["kind"],
+                "processed_at": utc_now_iso(),
+                "calendar_match_rejected": True,
+                "calendar_match": calendar_match,
+            }
+            processed.record(item["id"], record)
+            if base_dir is not None:
+                mila_source.write_receipt(
+                    base_dir, "failed", item,
+                    {
+                        "failure_kind": "calendar-match",
+                        "calendar_match": calendar_match,
+                    },
+                )
+            log(
+                f"routine={rid} id={item['id']} not captured: "
+                f"Calendar match confidence={calendar_match['confidence']} "
+                f"reason={calendar_match['reason']}"
+            )
+            return
+        log(
+            f"routine={rid} id={item['id']} Calendar match accepted "
+            f"event={calendar_match['event_id']}"
+        )
 
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
@@ -1335,6 +1416,19 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     if action_list:
         record["actions_pending"] = list(action_list)
     processed.record(item["id"], record)
+    if source["kind"] == "mila" and base_dir is not None:
+        receipt_status = "failed" if record.get("memory_error") else "processed"
+        details = {
+            "calendar_match": calendar_match,
+            "memory": record.get("memory"),
+            "memory_entry_id": record.get("memory_entry_id"),
+        }
+        if record.get("memory_error"):
+            details.update({
+                "failure_kind": "memory-error",
+                "error": record["memory_error"],
+            })
+        mila_source.write_receipt(base_dir, receipt_status, item, details)
 
     if action_list:
         applied, pending = actions.apply(item["id"], action_list, label)

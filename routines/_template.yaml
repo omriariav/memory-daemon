@@ -37,11 +37,11 @@ schedule:
 #   fallback: false
 
 # Use `source:` for one transport. A domain routine can instead use `sources:`
-# with a list of Gmail / Drive / Slack / Google Chat blocks. In that form,
+# with a list of Gmail / Drive / Slack / Google Chat / Mila blocks. In that form,
 # Gmail actions live inside the Gmail source block. See
 # `_example-domain-routine.yaml`.
 source:
-  # 'gmail' (Gmail search) or 'drive_docs' (Drive file search).
+  # 'gmail', 'drive_docs', 'slack', 'gchat', or 'mila'.
   kind: gmail
 
   # Any Gmail search query. Quote it so YAML keeps the inner quotes.

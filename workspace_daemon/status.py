@@ -241,11 +241,16 @@ def routine_rows(
         ]
         memory_errors = sum(bool(entry.get("memory_error")) for entry in entries)
         pending_actions = sum(bool(entry.get("actions_pending")) for entry in entries)
+        calendar_reviews = sum(
+            bool(entry.get("calendar_match_rejected")) for entry in entries
+        )
         issues = []
         if memory_errors:
             issues.append(f"{memory_errors} memory sink")
         if pending_actions:
             issues.append(f"{pending_actions} Gmail triage")
+        if calendar_reviews:
+            issues.append(f"{calendar_reviews} meeting match")
 
         tick_result = tick_results.get(routine_id) or {}
         tick_state = tick_result.get("state")

@@ -1,0 +1,54 @@
+# Read-only Mila transcription ingestion. Mila's directory is a live app store:
+# never move/edit its sidecars or recordings.json from the daemon.
+id: meeting-transcriptions
+enabled: false
+description: Match completed Mila recordings to Calendar and retain durable meeting memory.
+role: specialized
+
+schedule:
+  every: 1h
+
+source:
+  kind: mila
+  recordings_file: /absolute/path/to/mila-recordings/recordings.json
+  max_results: 0
+
+  # Seed already-existing recordings here when enabling the routine against an
+  # established Mila library. New UUIDs remain discoverable regardless of how
+  # many days later an iOS Voice Memo is imported.
+  exclude_recording_ids:
+    - EXISTING-RECORDING-UUID
+
+  # Optional repair/backfill for a transcript copied or renamed outside Mila.
+  # Metadata still comes from a Mila index; the daemon does not guess dates or
+  # hand-edit either index.
+  manual_recordings:
+    - recording_id: LEGACY-RECORDING-UUID
+      recordings_file: /absolute/path/to/old-mila-store/recordings.json
+      transcript_file: /absolute/path/to/copied-meeting.srt
+      fallback_file: /absolute/path/to/copied-meeting.txt
+
+  calendar_timezone: Europe/London
+  calendar_window_days: 3
+  calendar_match_hours: 6
+  max_calendar_candidates: 8
+  calendar_max_results: 250
+  match_max_output_tokens: 2048
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction: >-
+    The source is a meeting transcript and may not be in English. Write the
+    memory in English. Preserve only durable decisions, commitments, action
+    items, deadlines, blockers, material findings, and people/project facts.
+    Attribute an owner or deadline only when stated. Use Calendar metadata only
+    to identify the meeting and its participants; never infer discussion
+    content from the invitation. Ignore small talk and transcription noise.
+    Return exactly NOT MEMORY-WORTHY when nothing durable was discussed.
+
+memory:
+  store: /absolute/path/to/private-memory
+  type: note
+  tags: [meeting, transcription, mila]
