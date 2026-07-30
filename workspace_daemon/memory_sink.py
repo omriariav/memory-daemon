@@ -40,7 +40,11 @@ EXTRACT_PROMPT = """You are filing a distilled work note into a structured perso
 Read the note below and answer with a SINGLE JSON object, no markdown fence, no
 other text, with exactly these keys:
   "worthy": boolean — false if the note contains nothing durable (no decision,
-            commitment, people signal, incident, or fact worth recalling later)
+            commitment, concrete pending action/request, open decision, blocker,
+            people signal, incident, or fact worth recalling later). A concrete
+            request with a named or clearly identified owner and an explicit or
+            clearly bounded deadline is worthy as a todo while it remains
+            unresolved; it need not already have been accepted or started.
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
           incident, achievement, feedback, meeting, note
           (use "meeting" only for an actual meeting record; an email report or

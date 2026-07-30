@@ -78,6 +78,27 @@ class SlugCatalogTest(unittest.TestCase):
         self.assertIn("New Person -> new-person", prompt)
         self.assertIn("new-person", prompt)
 
+    def test_extraction_policy_keeps_concrete_pending_requests(self):
+        response = (
+            '{"worthy":true,"type":"todo","title":"Review roadmap by Sunday",'
+            '"people":[],"tags":[],"body":"Review the roadmap by Sunday."}'
+        )
+        routine = {
+            "analyze": {"provider": "gemini", "model": "m"},
+        }
+        with mock.patch("workspace_daemon.llm.analyze", return_value=response) as analyze:
+            memory_sink._extract(
+                routine,
+                {"title": "Review request", "date": "2026-07-30"},
+                "The product lead was asked to review the roadmap by Sunday.",
+                "/store",
+            )
+
+        prompt = " ".join(analyze.call_args.args[1].split())
+        self.assertIn("concrete pending action/request", prompt)
+        self.assertIn("worthy as a todo while it remains unresolved", prompt)
+        self.assertIn("need not already have been accepted or started", prompt)
+
 
 class SourceIdTest(unittest.TestCase):
     def test_slack_item_id_passes_through(self):
