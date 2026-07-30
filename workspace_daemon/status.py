@@ -30,7 +30,11 @@ _LEGACY_TICK_KEY = "<legacy>"
 def _routine_role(routine):
     """Explicit semantic purpose label; never infer intent from transport."""
     role = routine.get("role")
-    return role if role in config.VALID_ROUTINE_ROLES else "-"
+    return (
+        role
+        if isinstance(role, str) and role in config.VALID_ROUTINE_ROLES
+        else "-"
+    )
 
 
 def _routine_sources(routine):

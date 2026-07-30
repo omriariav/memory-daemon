@@ -254,6 +254,11 @@ class RoutineStatusTest(unittest.TestCase):
                 "source": {"kind": "gchat", "all_spaces": True},
                 "analyze": {"connector_sweep": True},
             },
+            {
+                "id": "invalid",
+                "role": ["domain"],
+                "source": {"kind": "gmail"},
+            },
         ]
         rows = status.routine_rows(
             self.base, routines, {"routines": {}}, now=5000
@@ -263,6 +268,7 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["single-domain"]["role"], "domain")
         self.assertEqual(by_id["multi-utility"]["role"], "specialized")
         self.assertEqual(by_id["legacy"]["role"], "-")
+        self.assertEqual(by_id["invalid"]["role"], "-")
 
     def test_invalid_declared_role_is_rejected(self):
         for invalid in ("guessed", ["domain"]):
