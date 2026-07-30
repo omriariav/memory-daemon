@@ -78,6 +78,24 @@ class MultiSourceValidationTest(unittest.TestCase):
             problems,
         )
 
+    def test_read_thread_rejects_message_oriented_streams(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["read_thread"] = True
+        routine["streams"] = {
+            "Weekly report": {"message_updates": True},
+        }
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any(
+                "read_thread cannot be combined with "
+                "streams.*.message_updates" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
     def test_multi_source_rejects_routine_level_actions(self):
         routine = multi_routine(self.tmp.name)
         routine["actions"] = ["archive"]

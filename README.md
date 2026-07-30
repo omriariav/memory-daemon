@@ -417,6 +417,9 @@ and 120,000 characters; truncated input is labeled as partial so the model
 cannot mistake it for complete coverage. A new reply still has a new Gmail
 message id for ledger dedupe, while the memory source id remains the thread id,
 so later replies update the existing thread memory rather than duplicating it.
+Do not combine this with `streams.*.message_updates: true`: that mode treats
+each reply as an independent recurring report, so validation rejects the two
+thread models together.
 
 The pattern that works well: scope on `in:inbox` and end the routine with
 `archive`. The inbox becomes the queue, and archiving is what marks an item

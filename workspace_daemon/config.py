@@ -511,7 +511,7 @@ def validate(routine):
                         f"{rid}: streams[{sender}].message_updates must be a boolean"
                     )
             uses_message_updates = any(
-                isinstance(cfg, dict) and "message_updates" in cfg
+                isinstance(cfg, dict) and cfg.get("message_updates") is True
                 for cfg in streams.values()
             )
             if uses_message_updates and not any(
@@ -519,6 +519,15 @@ def validate(routine):
             ):
                 problems.append(
                     f"{rid}: streams.*.message_updates requires a Gmail source"
+                )
+            if uses_message_updates and any(
+                source.get("kind") == "gmail"
+                and source.get("read_thread") is True
+                for source in source_dicts
+            ):
+                problems.append(
+                    f"{rid}: Gmail source.read_thread cannot be combined with "
+                    "streams.*.message_updates"
                 )
 
     schedule = routine.get("schedule")

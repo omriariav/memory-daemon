@@ -53,7 +53,8 @@ source:
 
   # Optional. Read bounded chronological context from the whole Gmail thread
   # instead of analyzing only its latest message. Useful for attention sweeps
-  # that must distinguish an open request from one already answered.
+  # that must distinguish an open request from one already answered. Do not
+  # combine with streams.*.message_updates, which treats each reply separately.
   # read_thread: true
 
   # Cap on items examined per run. Optional, default 20.
