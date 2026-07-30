@@ -100,6 +100,33 @@ class TransportTest(unittest.TestCase):
             "Authorization: Bearer secret-token\n",
         )
 
+    def test_rate_limit_preserves_retry_after_header(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"ok": false, "error": "ratelimited"}',
+            stderr="",
+        )
+
+        def rate_limited(command, **_kwargs):
+            header_path = Path(command[command.index("--dump-header") + 1])
+            header_path.write_text(
+                "HTTP/1.1 200 Connection established\r\n\r\n"
+                "HTTP/2 429\r\nRetry-After: 17\r\n\r\n"
+            )
+            return completed
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=rate_limited,
+             ), self.assertRaises(slack_cli.SlackAPIError) as raised:
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(raised.exception.error, "ratelimited")
+        self.assertEqual(raised.exception.http_status, 429)
+        self.assertEqual(raised.exception.retry_after, 17)
+
 
 class TimestampTest(unittest.TestCase):
     def test_python39_compatible_utc_suffix(self):
@@ -304,6 +331,182 @@ class DirectConversationTest(unittest.TestCase):
         payload = json.loads(stream.getvalue())
         self.assertEqual(payload["channels"][0]["user"], "U456")
         self.assertTrue(payload["channels"][0]["is_im"])
+
+    def test_zero_limit_exhausts_channel_pagination(self):
+        responses = [
+            {
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True}],
+                "response_metadata": {"next_cursor": "next"},
+            },
+            {
+                "ok": True,
+                "channels": [{"id": "D2", "is_im": True}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        ]
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "slack", side_effect=responses
+        ) as api, redirect_stdout(stream):
+            slack_cli.cmd_channels([
+                "--types", "public_channel,private_channel,im,mpim",
+                "--limit", "0",
+            ])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [channel["id"] for channel in payload["channels"]],
+            ["C1", "D2"],
+        )
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args_list[0].args[1]["limit"], 200)
+        self.assertEqual(api.call_args_list[1].args[1]["cursor"], "next")
+
+    def test_channel_pagination_fails_on_repeated_cursor(self):
+        responses = [
+            {
+                "ok": True,
+                "channels": [{"id": "C1"}],
+                "response_metadata": {"next_cursor": "same"},
+            },
+            {
+                "ok": True,
+                "channels": [{"id": "C2"}],
+                "response_metadata": {"next_cursor": "same"},
+            },
+        ]
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "slack", side_effect=responses
+        ) as api, redirect_stdout(stream), self.assertRaises(SystemExit):
+            slack_cli.cmd_channels(["--limit", "0"])
+
+        self.assertEqual(api.call_count, 2)
+        self.assertIn("repeated pagination cursor", stream.getvalue())
+
+    def test_joined_uses_membership_scoped_api(self):
+        response = {
+            "ok": True,
+            "channels": [{"id": "C1"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "slack", return_value=response
+        ) as api, redirect_stdout(stream):
+            slack_cli.cmd_joined(["--limit", "0"])
+
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["membership_scoped"])
+        self.assertEqual(api.call_args.args[0], "users.conversations")
+
+
+class CensusCommandTest(unittest.TestCase):
+    def test_rejects_invalid_window_before_calling_slack(self):
+        stream = StringIO()
+        with mock.patch.object(slack_cli, "list_conversations") as listing, \
+             redirect_stdout(stream), self.assertRaises(SystemExit):
+            slack_cli.cmd_census(["--hours", "0"])
+
+        self.assertIn("greater than zero", stream.getvalue())
+        listing.assert_not_called()
+
+    def test_rejects_unsafe_request_rate_before_calling_slack(self):
+        stream = StringIO()
+        with mock.patch.object(slack_cli, "list_conversations") as listing, \
+             redirect_stdout(stream), self.assertRaises(SystemExit):
+            slack_cli.cmd_census(["--requests-per-minute", "51"])
+
+        self.assertIn("between 1 and 50", stream.getvalue())
+        listing.assert_not_called()
+
+    def test_returns_nonzero_when_any_conversation_was_not_checked(self):
+        result = {
+            "cutoff_at": "2026-07-28T10:00:00Z",
+            "cutoff_epoch": 10,
+            "until_at": "2026-07-30T10:00:00Z",
+            "until_epoch": 20,
+            "inventory": [{"id": "C1"}],
+            "active": [],
+            "errors": [{"id": "C1", "error": "not_in_channel"}],
+        }
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "list_conversations", return_value=[{"id": "C1"}]
+        ), mock.patch(
+            "workspace_daemon.slack_census.load_resumable_checkpoint",
+            return_value=None,
+        ), mock.patch(
+            "workspace_daemon.slack_census.run",
+            return_value=result,
+        ), redirect_stdout(stream), self.assertRaises(SystemExit) as stopped:
+            slack_cli.cmd_census([])
+
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertFalse(json.loads(stream.getvalue())["ok"])
+
+    def test_completed_checkpoint_refreshes_conversation_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            checkpoint.write_text(json.dumps({
+                "version": 1,
+                "cutoff_epoch": 10,
+                "cutoff_at": "1970-01-01T00:00:10Z",
+                "inventory": [{"id": "C-OLD"}],
+                "next_index": 1,
+                "active": [{"id": "C-OLD"}],
+                "errors": [],
+                "completed_at": "2026-07-29T10:00:00Z",
+            }))
+            fresh_result = {
+                "cutoff_at": "2026-07-30T10:00:00Z",
+                "cutoff_epoch": 10,
+                "until_at": "2026-07-30T11:00:00Z",
+                "until_epoch": 20,
+                "inventory": [{"id": "C-NEW"}],
+                "active": [],
+                "errors": [],
+            }
+            stream = StringIO()
+            with mock.patch.object(
+                slack_cli,
+                "list_conversations",
+                return_value=[{"id": "C-NEW"}],
+            ) as listing, mock.patch(
+                "workspace_daemon.slack_census.run",
+                return_value=fresh_result,
+            ) as census, redirect_stdout(stream):
+                slack_cli.cmd_census(["--checkpoint", str(checkpoint)])
+
+            listing.assert_called_once()
+            self.assertEqual(census.call_args.args[0], [{"id": "C-NEW"}])
+            self.assertTrue(json.loads(stream.getvalue())["ok"])
+
+    def test_main_renders_corrupt_checkpoint_as_json_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            checkpoint.write_text(json.dumps({
+                "version": 1,
+                "cutoff_epoch": 10,
+                "cutoff_at": "1970-01-01T00:00:10Z",
+                "inventory": [],
+                "next_index": 1,
+                "active": [],
+                "errors": [],
+            }))
+            stream = StringIO()
+            argv = [
+                "slack_cli.py", "census", "--checkpoint", str(checkpoint)
+            ]
+            with mock.patch.object(slack_cli.sys, "argv", argv), \
+                 redirect_stdout(stream), self.assertRaises(SystemExit):
+                slack_cli.main()
+
+            payload = json.loads(stream.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("next_index", payload["error"])
 
 
 class MentionLimitTest(unittest.TestCase):

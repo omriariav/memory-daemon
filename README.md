@@ -314,6 +314,29 @@ The Slack cursor key fingerprints the configured channels, boundaries, and
 mentions flag. Expanding that scope therefore bootstraps from
 `catch_up_after`; it never inherits a checkpoint from a smaller channel set.
 
+To build an initial review list without relying on memory or a hand-maintained
+inventory, run the read-only Slack census:
+
+```sh
+python3 -m workspace_daemon.slack_cli census \
+  --hours 48 \
+  --requests-per-minute 40 \
+  --checkpoint state/slack-census.json
+```
+
+It enumerates conversations joined by the authenticated user, probes each for
+one top-level message in the window, and prints only active conversation
+metadata—never message text. The checkpoint is resumable across laptop sleep
+and contains IDs, names, types, timestamps, and API errors only. The default
+40-request/minute throttle bounds this process's history probes; other clients
+using the same app and workspace still share Slack's method-level rate bucket.
+The census honors Slack's `Retry-After` response when throttled. Reusing the
+path resumes an interrupted census; once a census is complete, the next
+invocation refreshes the inventory and starts a new fixed time window. A new
+reply to a thread whose root predates the census window is not discoverable
+through `conversations.history`; use the normal routine's wider
+`reply_roots_after` scan after choosing the recurring scope.
+
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially
 under the existing global lock, and records attempts in
@@ -577,10 +600,13 @@ tail -f logs/run.log
 tail -f logs/launchd.err.log
 ```
 
-`memory-daemon-status.sh` is read-only. It distinguishes a routine's last
-scheduled attempt from its last captured item, shows when each routine is next
-due, and flags an unfinished last run, memory-sink failures, or pending Gmail
-triage. Copy it to a directory on `PATH` to call it from anywhere:
+`memory-daemon-status.sh` is read-only. It shows each routine's declared role
+(`general`, `domain`, `specialized`, or `partial`) and source connectors,
+distinguishes a last scheduled attempt from a last captured item, shows when
+each routine is next due, and flags an unfinished last run, memory-sink
+failures, or pending Gmail triage. `partial` means a connector sweep still has
+an explicitly bounded scope; legacy routines without `role` display `-`.
+Copy it to a directory on `PATH` to call it from anywhere:
 
 ```sh
 cp ./memory-daemon-status.sh ~/bin/memory-daemon-status.sh

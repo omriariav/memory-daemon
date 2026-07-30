@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,21 @@ from typing import Dict, List, Optional
 API = "https://slack.com/api"
 PERMALINK_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})")
 MENTION_MAX_RESULTS = 100
+
+
+class SlackAPIError(RuntimeError):
+    def __init__(
+        self,
+        method: str,
+        error: str,
+        http_status: Optional[int] = None,
+        retry_after: Optional[int] = None,
+    ):
+        super().__init__(f"{method}: {error}")
+        self.method = method
+        self.error = error
+        self.http_status = http_status
+        self.retry_after = retry_after
 
 
 def config_path() -> Path:
@@ -63,7 +79,7 @@ def token() -> str:
     return value
 
 
-def slack(method: str, params: Optional[Dict] = None) -> Dict:
+def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
     """Call one Slack Web API method via curl.
 
     The system Python on managed Macs may not have a usable certificate bundle;
@@ -74,25 +90,82 @@ def slack(method: str, params: Optional[Dict] = None) -> Dict:
         url += "?" + urllib.parse.urlencode(
             {key: value for key, value in params.items() if value is not None}
         )
-    result = subprocess.run(
-        [
-            "curl", "-sS", "-X", "POST", url,
-            "-H", "@-",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        input=f"Authorization: Bearer {token()}\n",
-    )
-    if result.returncode != 0:
-        die(f"curl failed: {result.stderr.strip()[:200]}")
+    with tempfile.NamedTemporaryFile(
+        prefix="memory-daemon-slack-headers-",
+        delete=False,
+    ) as header_file:
+        header_path = Path(header_file.name)
     try:
-        data = json.loads(result.stdout)
+        result = subprocess.run(
+            [
+                "curl", "-sS", "-X", "POST", url,
+                "--dump-header", str(header_path),
+                "-H", "@-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            input=f"Authorization: Bearer {token()}\n",
+        )
+        try:
+            raw_headers = header_path.read_text(errors="replace")
+        except OSError:
+            raw_headers = ""
+    finally:
+        header_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise SlackAPIError(
+            method, f"curl failed: {result.stderr.strip()[:200]}"
+        )
+    body = result.stdout
+    http_status, retry_after = _response_limits(raw_headers)
+    try:
+        data = json.loads(body)
     except json.JSONDecodeError:
-        die(f"non-JSON response from {method}: {result.stdout[:200]}")
+        raise SlackAPIError(
+            method,
+            f"non-JSON response: {body[:200]}",
+            http_status=http_status,
+            retry_after=retry_after,
+        )
     if not data.get("ok"):
-        die(f"{method}: {data.get('error', 'unknown_error')}")
+        raise SlackAPIError(
+            method,
+            data.get("error", "unknown_error"),
+            http_status=http_status,
+            retry_after=retry_after,
+        )
     return data
+
+
+def _response_limits(raw_headers: str):
+    """Return status and Retry-After from curl's final response header block."""
+    http_status = None
+    retry_after = None
+    blocks = re.split(r"\r?\n\r?\n", raw_headers.strip())
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines or not lines[0].startswith("HTTP/"):
+            continue
+        match = re.match(r"^HTTP/\S+\s+(\d{3})\b", lines[0])
+        http_status = int(match.group(1)) if match else None
+        retry_after = None
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            if separator and name.casefold() == "retry-after":
+                try:
+                    retry_after = int(value.strip())
+                except ValueError:
+                    retry_after = None
+    return http_status, retry_after
+
+
+def slack(method: str, params: Optional[Dict] = None) -> Dict:
+    """CLI-facing API call that renders failures as the standard JSON error."""
+    try:
+        return slack_request(method, params)
+    except SlackAPIError as exc:
+        die(str(exc))
 
 
 def out(payload) -> None:
@@ -260,16 +333,25 @@ def cmd_auth_test(_args: List[str]) -> None:
     })
 
 
-def cmd_channels(args: List[str]) -> None:
-    types = opt(args, "--types", "public_channel,private_channel")
-    limit = int(opt(args, "--limit", 200))
+def list_conversations(
+    method: str,
+    types: str,
+    limit: Optional[int],
+    api=None,
+) -> List[Dict]:
+    """Read cursor-paginated conversation metadata."""
+    api = api or slack
     channels, cursor = [], None
-    while True:
-        data = slack(
-            "conversations.list",
+    seen_cursors = set()
+    while limit is None or len(channels) < limit:
+        request_limit = (
+            min(limit - len(channels), 200) if limit is not None else 200
+        )
+        data = api(
+            method,
             {
                 "types": types,
-                "limit": min(limit, 200),
+                "limit": request_limit,
                 "exclude_archived": "true",
                 "cursor": cursor,
             },
@@ -290,9 +372,103 @@ def cmd_channels(args: List[str]) -> None:
         cursor = (
             data.get("response_metadata", {}).get("next_cursor") or None
         )
-        if not cursor or len(channels) >= limit:
+        if not cursor:
             break
-    out({"ok": True, "count": len(channels), "channels": channels[:limit]})
+        if cursor in seen_cursors:
+            die(f"{method} returned a repeated pagination cursor")
+        seen_cursors.add(cursor)
+    return channels[:limit] if limit is not None else channels
+
+
+def _cmd_conversations(
+    args: List[str],
+    method: str,
+    membership_scoped: bool,
+) -> None:
+    types = opt(args, "--types", "public_channel,private_channel")
+    raw_limit = int(opt(args, "--limit", 200))
+    if raw_limit < 0:
+        die("channel limit must be a non-negative integer")
+    # Match the history command: an explicit zero means exhaustive cursor
+    # pagination. Dynamic sweeps must not silently cover only the first page.
+    limit = None if raw_limit == 0 else raw_limit
+    selected = list_conversations(method, types, limit)
+    out({
+        "ok": True,
+        "count": len(selected),
+        "membership_scoped": membership_scoped,
+        "channels": selected,
+    })
+
+
+def cmd_channels(args: List[str]) -> None:
+    """List workspace channels; useful for explicit channel lookup."""
+    _cmd_conversations(args, "conversations.list", membership_scoped=False)
+
+
+def cmd_joined(args: List[str]) -> None:
+    """List only conversations joined by the authenticated user."""
+    _cmd_conversations(args, "users.conversations", membership_scoped=True)
+
+
+def cmd_census(args: List[str]) -> None:
+    """Find joined conversations with top-level activity in a recent window."""
+    from . import slack_census
+
+    hours = float(opt(args, "--hours", 48))
+    rpm = int(opt(args, "--requests-per-minute", 40))
+    if hours <= 0:
+        die("census hours must be greater than zero")
+    if rpm < 1 or rpm > 50:
+        die("census requests per minute must be between 1 and 50")
+    checkpoint_value = opt(args, "--checkpoint")
+    checkpoint = (
+        Path(checkpoint_value).expanduser()
+        if checkpoint_value
+        else None
+    )
+    existing = slack_census.load_resumable_checkpoint(checkpoint)
+    if existing:
+        conversations = existing["inventory"]
+        cutoff_epoch = float(existing["cutoff_epoch"])
+        until_epoch = existing.get("until_epoch")
+    else:
+        conversations = list_conversations(
+            "users.conversations",
+            "public_channel,private_channel,im,mpim",
+            None,
+            api=slack_request,
+        )
+        started_at = datetime.now(timezone.utc)
+        until_epoch = started_at.timestamp()
+        cutoff_epoch = (started_at - timedelta(hours=hours)).timestamp()
+
+    result = slack_census.run(
+        conversations,
+        slack_request,
+        cutoff_epoch,
+        until_epoch=until_epoch,
+        requests_per_minute=rpm,
+        checkpoint=checkpoint,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    payload = {
+        "ok": not result["errors"],
+        "window_hours": (
+            float(result["until_epoch"]) - float(result["cutoff_epoch"])
+        ) / 3600,
+        "cutoff_at": result["cutoff_at"],
+        "until_at": result["until_at"],
+        "considered": len(result["inventory"]),
+        "active_count": len(result["active"]),
+        "error_count": len(result["errors"]),
+        "active": result["active"],
+        "errors": result["errors"],
+        "checkpoint": str(checkpoint) if checkpoint else None,
+    }
+    out(payload)
+    if result["errors"]:
+        raise SystemExit(1)
 
 
 def cmd_history(args: List[str]) -> None:
@@ -456,6 +632,8 @@ def cmd_mentions(args: List[str]) -> None:
 COMMANDS = {
     "auth-test": cmd_auth_test,
     "channels": cmd_channels,
+    "joined": cmd_joined,
+    "census": cmd_census,
     "history": cmd_history,
     "replies": cmd_replies,
     "whois": cmd_whois,
@@ -473,6 +651,10 @@ def main() -> None:
         die(f"unknown command: {command} (see --help)")
     try:
         handler(args)
+    except SlackAPIError as exc:
+        die(str(exc))
+    except RuntimeError as exc:
+        die(str(exc))
     except (IndexError, ValueError):
         die(f"invalid or missing argument for '{command}' (see --help)")
 

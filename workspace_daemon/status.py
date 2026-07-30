@@ -27,6 +27,26 @@ _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
 _LEGACY_TICK_KEY = "<legacy>"
 
 
+def _routine_role(routine):
+    """Explicit semantic purpose label; never infer intent from transport."""
+    role = routine.get("role")
+    return (
+        role
+        if isinstance(role, str) and role in config.VALID_ROUTINE_ROLES
+        else "-"
+    )
+
+
+def _routine_sources(routine):
+    """Declared connector kinds, in first-seen order."""
+    kinds = list(dict.fromkeys(
+        source.get("kind")
+        for source in config.sources(routine)
+        if source.get("kind")
+    ))
+    return "+".join(kinds) or "-"
+
+
 def probe_launchd(label=DEFAULT_LAUNCHD_LABEL, uid=None):
     """Return selected launchd state without exposing the job environment."""
     uid = os.getuid() if uid is None else uid
@@ -266,6 +286,8 @@ def routine_rows(
         )
         rows.append({
             "routine": routine_id,
+            "role": _routine_role(routine),
+            "sources": _routine_sources(routine),
             "status": status_name,
             "every": every,
             "last_attempt": _age(last_epoch, now),
@@ -336,13 +358,14 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         "",
     ]
     headers = (
-        "ROUTINE", "STATUS", "EVERY", "LAST ATTEMPT",
+        "ROUTINE", "ROLE", "SOURCES", "STATUS", "EVERY", "LAST ATTEMPT",
         "NEXT", "LAST CAPTURE", "ISSUES",
     )
     values = [
         (
-            row["routine"], row["status"], row["every"], row["last_attempt"],
-            row["next"], row["last_capture"], row["issues"],
+            row["routine"], row["role"], row["sources"], row["status"],
+            row["every"], row["last_attempt"], row["next"],
+            row["last_capture"], row["issues"],
         )
         for row in rows
     ]

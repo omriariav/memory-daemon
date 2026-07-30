@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import state, status
+from workspace_daemon import config, state, status
 
 
 class LaunchdStatusTest(unittest.TestCase):
@@ -138,9 +138,18 @@ class RoutineStatusTest(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
         self.routines = [
-            {"id": "alpha", "enabled": True, "schedule": {"every": "1h"}},
-            {"id": "beta", "enabled": True, "schedule": {"every": "4h"}},
-            {"id": "off", "enabled": False, "schedule": {"every": "1d"}},
+            {
+                "id": "alpha", "role": "specialized",
+                "enabled": True, "schedule": {"every": "1h"},
+            },
+            {
+                "id": "beta", "role": "specialized",
+                "enabled": True, "schedule": {"every": "4h"},
+            },
+            {
+                "id": "off", "role": "specialized",
+                "enabled": False, "schedule": {"every": "1d"},
+            },
         ]
         schedule_path = state.schedule_file(self.base)
         schedule_path.parent.mkdir(parents=True)
@@ -183,6 +192,100 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["alpha"]["next"], "due")
         self.assertEqual(by_id["beta"]["status"], "ok")
         self.assertEqual(by_id["off"]["status"], "disabled")
+        self.assertEqual(by_id["alpha"]["role"], "specialized")
+        self.assertEqual(by_id["alpha"]["sources"], "-")
+
+    def test_reports_general_domain_and_source_roles(self):
+        routines = [
+            {
+                "id": "general",
+                "role": "general",
+                "source": {"kind": "gchat", "all_spaces": True},
+                "analyze": {"connector_sweep": True},
+            },
+            {
+                "id": "domain",
+                "role": "domain",
+                "sources": [
+                    {"kind": "gmail"},
+                    {"kind": "gchat"},
+                ],
+            },
+            {
+                "id": "partial",
+                "role": "partial",
+                "source": {
+                    "kind": "slack",
+                    "direct_channels": ["C1"],
+                },
+                "analyze": {
+                    "connector_sweep": True,
+                    "instruction_from_connector": "slack",
+                },
+            },
+        ]
+
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+        by_id = {row["routine"]: row for row in rows}
+
+        self.assertEqual(by_id["general"]["role"], "general")
+        self.assertEqual(by_id["general"]["sources"], "gchat")
+        self.assertEqual(by_id["domain"]["role"], "domain")
+        self.assertEqual(by_id["domain"]["sources"], "gmail+gchat")
+        self.assertEqual(by_id["partial"]["role"], "partial")
+        self.assertEqual(by_id["partial"]["sources"], "slack")
+
+    def test_role_is_explicit_not_inferred_from_source_count(self):
+        routines = [
+            {
+                "id": "single-domain",
+                "role": "domain",
+                "source": {"kind": "gmail"},
+            },
+            {
+                "id": "multi-utility",
+                "role": "specialized",
+                "sources": [{"kind": "gmail"}, {"kind": "gchat"}],
+            },
+            {
+                "id": "legacy",
+                "source": {"kind": "gchat", "all_spaces": True},
+                "analyze": {"connector_sweep": True},
+            },
+            {
+                "id": "invalid",
+                "role": ["domain"],
+                "source": {"kind": "gmail"},
+            },
+        ]
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+        by_id = {row["routine"]: row for row in rows}
+
+        self.assertEqual(by_id["single-domain"]["role"], "domain")
+        self.assertEqual(by_id["multi-utility"]["role"], "specialized")
+        self.assertEqual(by_id["legacy"]["role"], "-")
+        self.assertEqual(by_id["invalid"]["role"], "-")
+
+    def test_invalid_declared_role_is_rejected(self):
+        for invalid in ("guessed", ["domain"]):
+            with self.subTest(role=invalid):
+                problems = config.validate({
+                    "id": "bad-role",
+                    "role": invalid,
+                    "source": {"kind": "gmail", "query": "in:inbox"},
+                    "analyze": {
+                        "provider": "gemini",
+                        "instruction": "Summarize.",
+                    },
+                })
+
+                self.assertTrue(
+                    any("role must be one of" in item for item in problems)
+                )
 
     def test_running_tick_takes_precedence_over_due(self):
         rows = status.routine_rows(
@@ -267,6 +370,8 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("Memory Daemon", text)
         self.assertIn("Scheduler: loaded (idle)", text)
         self.assertIn("ROUTINE", text)
+        self.assertIn("ROLE", text)
+        self.assertIn("SOURCES", text)
         self.assertIn("example", text)
         self.assertIn("Logs: logs/run.log", text)
 
