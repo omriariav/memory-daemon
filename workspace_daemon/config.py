@@ -1,7 +1,9 @@
 """Routine discovery, loading, and validation."""
+import datetime
 import re
 from pathlib import Path
 from string import Formatter
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -18,6 +20,11 @@ VALID_ROUTINE_ROLES = {"general", "domain", "specialized", "partial"}
 DEFAULT_SCHEDULE = "1h"
 _DURATION = re.compile(r"^(?P<count>[1-9]\d*)(?P<unit>[mhd])$")
 _DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+_CLOCK = re.compile(r"^(?P<hour>[01]\d|2[0-3]):(?P<minute>[0-5]\d)$")
+_WEEKDAYS = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3,
+    "fri": 4, "sat": 5, "sun": 6,
+}
 _ROUTINE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
@@ -66,16 +73,163 @@ def source_actions(routine, source):
     return value if isinstance(value, list) else []
 
 
-def schedule_seconds(routine):
-    """Configured cadence in seconds. Validation owns malformed values."""
-    every = (routine.get("schedule") or {}).get("every", DEFAULT_SCHEDULE)
-    match = _DURATION.fullmatch(str(every))
+def _schedule_duration(routine, field, value):
+    """Parse one schedule duration with a field-specific validation error."""
+    rid = routine.get("id", "<missing id>")
+    match = _DURATION.fullmatch(str(value))
     if not match:
         raise RoutineError(
-            f"{routine.get('id', '<missing id>')}: schedule.every must look like "
-            f"'15m', '4h', or '1d' (got {every!r})"
+            f"{rid}: {field} must look like '15m', '4h', or '1d' "
+            f"(got {value!r})"
         )
     return int(match.group("count")) * _DURATION_SECONDS[match.group("unit")]
+
+
+def _work_hours_settings(routine):
+    """Return validated timezone-aware work-hours settings, or ``None``."""
+    schedule = routine.get("schedule") or {}
+    work_hours = schedule.get("work_hours")
+    if work_hours is None:
+        return None
+    rid = routine.get("id", "<missing id>")
+    if not isinstance(work_hours, dict):
+        raise RoutineError(f"{rid}: schedule.work_hours must be a mapping")
+    unknown = set(work_hours) - {
+        "every", "days", "start", "end", "timezone",
+    }
+    if unknown:
+        raise RoutineError(
+            f"{rid}: schedule.work_hours has unknown key(s) "
+            f"{', '.join(sorted(unknown))} "
+            f"(valid: days, end, every, start, timezone)"
+        )
+
+    missing = [
+        field
+        for field in ("every", "days", "start", "end", "timezone")
+        if field not in work_hours
+    ]
+    if missing:
+        raise RoutineError(
+            f"{rid}: schedule.work_hours missing field(s): "
+            f"{', '.join(missing)}"
+        )
+    interval = _schedule_duration(
+        routine, "schedule.work_hours.every", work_hours["every"]
+    )
+    days = work_hours["days"]
+    if (
+        not isinstance(days, list)
+        or not days
+        or any(not isinstance(day, str) or day not in _WEEKDAYS for day in days)
+        or len(set(days)) != len(days)
+    ):
+        raise RoutineError(
+            f"{rid}: schedule.work_hours.days must be a non-empty unique list "
+            f"using {', '.join(_WEEKDAYS)}"
+        )
+    clocks = {}
+    for field in ("start", "end"):
+        value = work_hours[field]
+        match = _CLOCK.fullmatch(value) if isinstance(value, str) else None
+        if not match:
+            raise RoutineError(
+                f"{rid}: schedule.work_hours.{field} must be HH:MM "
+                f"in 24-hour time (got {value!r})"
+            )
+        clocks[field] = datetime.time(
+            int(match.group("hour")), int(match.group("minute"))
+        )
+    if clocks["start"] >= clocks["end"]:
+        raise RoutineError(
+            f"{rid}: schedule.work_hours.start must be earlier than end"
+        )
+    timezone = work_hours["timezone"]
+    if not isinstance(timezone, str) or not timezone:
+        raise RoutineError(
+            f"{rid}: schedule.work_hours.timezone must be an IANA timezone"
+        )
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise RoutineError(
+            f"{rid}: unknown schedule.work_hours.timezone {timezone!r}"
+        ) from exc
+
+    base_interval = _schedule_duration(
+        routine,
+        "schedule.every",
+        schedule.get("every", DEFAULT_SCHEDULE),
+    )
+    if interval > base_interval:
+        raise RoutineError(
+            f"{rid}: schedule.work_hours.every must not be slower than "
+            f"schedule.every"
+        )
+    return {
+        "seconds": interval,
+        "days": {_WEEKDAYS[day] for day in days},
+        "start": clocks["start"],
+        "end": clocks["end"],
+        "zone": zone,
+    }
+
+
+def schedule_seconds(routine, now=None):
+    """Configured cadence in seconds, optionally at a specific epoch."""
+    every = (routine.get("schedule") or {}).get("every", DEFAULT_SCHEDULE)
+    base_interval = _schedule_duration(routine, "schedule.every", every)
+    settings = _work_hours_settings(routine)
+    if settings is not None and now is not None:
+        local = datetime.datetime.fromtimestamp(float(now), settings["zone"])
+        local_time = local.time().replace(tzinfo=None)
+        if (
+            local.weekday() in settings["days"]
+            and settings["start"] <= local_time < settings["end"]
+        ):
+            return settings["seconds"]
+    return base_interval
+
+
+def schedule_label(routine):
+    """Compact human-readable base/work-hours cadence."""
+    schedule = routine.get("schedule") or {}
+    base = schedule.get("every", DEFAULT_SCHEDULE)
+    work_hours = schedule.get("work_hours")
+    if isinstance(work_hours, dict) and work_hours.get("every"):
+        return f"{work_hours['every']} work / {base} off"
+    return base
+
+
+def next_due_epoch(routine, last_attempted_epoch, now):
+    """Earliest due instant across base cadence and upcoming work windows."""
+    now = float(now)
+    last = float(last_attempted_epoch)
+    if last > now:
+        return now
+    base_interval = schedule_seconds(routine)
+    settings = _work_hours_settings(routine)
+    if settings is None:
+        return last + base_interval
+    if now - last >= schedule_seconds(routine, now=now):
+        return now
+
+    candidates = [last + base_interval]
+    local_now = datetime.datetime.fromtimestamp(now, settings["zone"])
+    for offset in range(8):
+        day = local_now.date() + datetime.timedelta(days=offset)
+        if day.weekday() not in settings["days"]:
+            continue
+        start = datetime.datetime.combine(
+            day, settings["start"], tzinfo=settings["zone"]
+        ).timestamp()
+        end = datetime.datetime.combine(
+            day, settings["end"], tzinfo=settings["zone"]
+        ).timestamp()
+        candidate = max(now, start, last + settings["seconds"])
+        if candidate < end:
+            candidates.append(candidate)
+    return min(candidate for candidate in candidates if candidate >= now)
 
 
 def duration_seconds(value):
@@ -372,11 +526,11 @@ def validate(routine):
         if not isinstance(schedule, dict):
             problems.append(f"{rid}: `schedule` must be a mapping")
         else:
-            unknown = set(schedule) - {"every"}
+            unknown = set(schedule) - {"every", "work_hours"}
             if unknown:
                 problems.append(
                     f"{rid}: schedule has unknown key(s) {', '.join(sorted(unknown))} "
-                    f"(valid: every)"
+                    f"(valid: every, work_hours)"
                 )
             try:
                 schedule_seconds(routine)

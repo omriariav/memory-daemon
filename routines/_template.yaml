@@ -21,6 +21,14 @@ role: specialized
 # ignores it.
 schedule:
   every: 4h
+  # Optional faster cadence inside a local work window. Outside it, `every`
+  # remains in force. Same-day windows only; use IANA timezone names.
+  # work_hours:
+  #   every: 15m
+  #   days: [mon, tue, wed, thu, fri]
+  #   start: "08:00"
+  #   end: "18:00"
+  #   timezone: Europe/London
 
 # Optional ownership controls. Specific routines beat `fallback: true`; lower
 # priority wins between routines in the same class. Equal priority is an error.
