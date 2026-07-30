@@ -183,6 +183,47 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["alpha"]["next"], "due")
         self.assertEqual(by_id["beta"]["status"], "ok")
         self.assertEqual(by_id["off"]["status"], "disabled")
+        self.assertEqual(by_id["alpha"]["role"], "specialized")
+        self.assertEqual(by_id["alpha"]["sources"], "-")
+
+    def test_reports_general_domain_and_source_roles(self):
+        routines = [
+            {
+                "id": "general",
+                "source": {"kind": "gchat", "all_spaces": True},
+                "analyze": {"connector_sweep": True},
+            },
+            {
+                "id": "domain",
+                "sources": [
+                    {"kind": "gmail"},
+                    {"kind": "gchat"},
+                ],
+            },
+            {
+                "id": "partial",
+                "source": {
+                    "kind": "slack",
+                    "direct_channels": ["C1"],
+                },
+                "analyze": {
+                    "connector_sweep": True,
+                    "instruction_from_connector": "slack",
+                },
+            },
+        ]
+
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+        by_id = {row["routine"]: row for row in rows}
+
+        self.assertEqual(by_id["general"]["role"], "general")
+        self.assertEqual(by_id["general"]["sources"], "gchat")
+        self.assertEqual(by_id["domain"]["role"], "domain")
+        self.assertEqual(by_id["domain"]["sources"], "gmail+gchat")
+        self.assertEqual(by_id["partial"]["role"], "partial")
+        self.assertEqual(by_id["partial"]["sources"], "slack")
 
     def test_running_tick_takes_precedence_over_due(self):
         rows = status.routine_rows(
@@ -267,6 +308,8 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("Memory Daemon", text)
         self.assertIn("Scheduler: loaded (idle)", text)
         self.assertIn("ROUTINE", text)
+        self.assertIn("ROLE", text)
+        self.assertIn("SOURCES", text)
         self.assertIn("example", text)
         self.assertIn("Logs: logs/run.log", text)
 

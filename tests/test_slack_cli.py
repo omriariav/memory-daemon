@@ -305,6 +305,96 @@ class DirectConversationTest(unittest.TestCase):
         self.assertEqual(payload["channels"][0]["user"], "U456")
         self.assertTrue(payload["channels"][0]["is_im"])
 
+    def test_zero_limit_exhausts_channel_pagination(self):
+        responses = [
+            {
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True}],
+                "response_metadata": {"next_cursor": "next"},
+            },
+            {
+                "ok": True,
+                "channels": [{"id": "D2", "is_im": True}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        ]
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "slack", side_effect=responses
+        ) as api, redirect_stdout(stream):
+            slack_cli.cmd_channels([
+                "--types", "public_channel,private_channel,im,mpim",
+                "--limit", "0",
+            ])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [channel["id"] for channel in payload["channels"]],
+            ["C1", "D2"],
+        )
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args_list[0].args[1]["limit"], 200)
+        self.assertEqual(api.call_args_list[1].args[1]["cursor"], "next")
+
+    def test_joined_uses_membership_scoped_api(self):
+        response = {
+            "ok": True,
+            "channels": [{"id": "C1"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "slack", return_value=response
+        ) as api, redirect_stdout(stream):
+            slack_cli.cmd_joined(["--limit", "0"])
+
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["membership_scoped"])
+        self.assertEqual(api.call_args.args[0], "users.conversations")
+
+
+class CensusCommandTest(unittest.TestCase):
+    def test_rejects_invalid_window_before_calling_slack(self):
+        stream = StringIO()
+        with mock.patch.object(slack_cli, "list_conversations") as listing, \
+             redirect_stdout(stream), self.assertRaises(SystemExit):
+            slack_cli.cmd_census(["--hours", "0"])
+
+        self.assertIn("greater than zero", stream.getvalue())
+        listing.assert_not_called()
+
+    def test_rejects_unsafe_request_rate_before_calling_slack(self):
+        stream = StringIO()
+        with mock.patch.object(slack_cli, "list_conversations") as listing, \
+             redirect_stdout(stream), self.assertRaises(SystemExit):
+            slack_cli.cmd_census(["--requests-per-minute", "51"])
+
+        self.assertIn("between 1 and 50", stream.getvalue())
+        listing.assert_not_called()
+
+    def test_returns_nonzero_when_any_conversation_was_not_checked(self):
+        result = {
+            "cutoff_at": "2026-07-28T10:00:00Z",
+            "inventory": [{"id": "C1"}],
+            "active": [],
+            "errors": [{"id": "C1", "error": "not_in_channel"}],
+        }
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "list_conversations", return_value=[{"id": "C1"}]
+        ), mock.patch(
+            "workspace_daemon.slack_census.load_checkpoint",
+            return_value=None,
+        ), mock.patch(
+            "workspace_daemon.slack_census.run",
+            return_value=result,
+        ), redirect_stdout(stream), self.assertRaises(SystemExit) as stopped:
+            slack_cli.cmd_census([])
+
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertFalse(json.loads(stream.getvalue())["ok"])
+
 
 class MentionLimitTest(unittest.TestCase):
     def test_exact_ada_limit_is_reported_as_ambiguous(self):
