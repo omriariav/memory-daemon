@@ -26,6 +26,11 @@ def read_message(message_id):
     return run_json([gws_bin(), "gmail", "read", message_id, "--format", "json"])
 
 
+def read_thread(thread_id):
+    """Return every message in a Gmail thread, in the API's chronological order."""
+    return run_json([gws_bin(), "gmail", "thread", thread_id, "--format", "json"])
+
+
 def links(message_id):
     """HTML links from one message, including parsed Google Docs metadata."""
     result = run_json(

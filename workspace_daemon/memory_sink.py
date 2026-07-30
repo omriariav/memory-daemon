@@ -42,9 +42,10 @@ other text, with exactly these keys:
   "worthy": boolean — false if the note contains nothing durable (no decision,
             commitment, concrete pending action/request, open decision, blocker,
             people signal, incident, or fact worth recalling later). A concrete
-            request with a named or clearly identified owner and an explicit or
-            clearly bounded deadline is worthy as a todo while it remains
-            unresolved; it need not already have been accepted or started.
+            request with a named or clearly identified owner and a specific
+            deliverable is worthy as a todo while it remains unresolved; it
+            need not already have been accepted or started. Preserve any stated
+            deadline, but do not require one.
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
           incident, achievement, feedback, meeting, note
           (use "meeting" only for an actual meeting record; an email report or
@@ -383,6 +384,13 @@ def capture(routine, item, summary, dry_run=False):
         log(f"routine={rid} [dry-run] would extract + memory-add "
             f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}")
         return {"memory": "dry_run"}
+
+    if summary.strip() == "NOT MEMORY-WORTHY":
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "source analysis judged not memory-worthy, skipping extraction"
+        )
+        return {"memory": "skipped_not_worthy"}
 
     entry = {"worthy": True, "type": cfg.get("type", "note"),
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}

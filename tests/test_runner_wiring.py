@@ -42,6 +42,7 @@ class RunnerWiringTest(unittest.TestCase):
 
         self.saved = {
             "search": gmail.search, "read": gmail.read_message,
+            "read_thread": gmail.read_thread,
             "user_labels": gmail.user_labels, "lab_gmail": labels.gmail,
             "analyze": llm.analyze, "handlers": dict(actions._HANDLERS),
         }
@@ -63,6 +64,7 @@ class RunnerWiringTest(unittest.TestCase):
     def tearDown(self):
         gmail.search = self.saved["search"]
         gmail.read_message = self.saved["read"]
+        gmail.read_thread = self.saved["read_thread"]
         gmail.user_labels = self.saved["user_labels"]
         labels.gmail = self.saved["lab_gmail"]
         llm.analyze = self.saved["analyze"]
@@ -261,6 +263,91 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(item["source_id"], "gmail:thread-1")
         self.assertEqual(item["frontmatter"]["report_date"], "2026-07-04")
         self.assertNotIn("subject_report_date", item["frontmatter"])
+
+    def test_gmail_read_thread_supplies_chronological_context_and_headers(self):
+        gmail.read_message = lambda mid: self.fail("latest-message read should not run")
+        gmail.read_thread = lambda thread_id: {
+            "thread_id": thread_id,
+            "messages": [
+                {
+                    "id": "m1",
+                    "headers": {
+                        "subject": "Proposal review",
+                        "from": "Requester <requester@example.com>",
+                        "to": "Leader <leader@example.com>",
+                        "date": "Mon, 27 Jul 2026 10:00:00 +0000",
+                    },
+                    "body": "Please review the proposal by Friday.",
+                },
+                {
+                    "id": "m2",
+                    "headers": {
+                        "subject": "Re: Proposal review",
+                        "from": "Leader <leader@example.com>",
+                        "to": "Requester <requester@example.com>",
+                        "cc": "Reviewer <reviewer@example.com>",
+                        "date": "Mon, 27 Jul 2026 11:00:00 +0000",
+                    },
+                    "body": (
+                        "Reviewed and approved.\n\n"
+                        "On Mon, Jul 27, 2026, Requester wrote:\n"
+                        "> Please review the proposal by Friday."
+                    ),
+                },
+            ],
+        }
+        r = routine(self.vault)
+        r["source"]["read_thread"] = True
+
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "m2", "raw": {"thread_id": "thread-1"}},
+        )
+
+        self.assertLess(
+            item["body"].index("--- Message 1 of 2 ---"),
+            item["body"].index("--- Message 2 of 2 ---"),
+        )
+        self.assertIn("Please review the proposal by Friday.", item["body"])
+        self.assertIn("Reviewed and approved.", item["body"])
+        self.assertNotIn("> Please review", item["body"])
+        self.assertEqual(item["title"], "Re: Proposal review")
+        self.assertEqual(item["date"], "2026-07-27")
+        self.assertEqual(item["frontmatter"]["email_to"],
+                         "Requester <requester@example.com>")
+        self.assertEqual(item["frontmatter"]["email_cc"],
+                         "Reviewer <reviewer@example.com>")
+        self.assertEqual(item["frontmatter"]["gmail_thread_message_count"], 2)
+        self.assertEqual(item["frontmatter"]["gmail_thread_messages_included"], 2)
+        self.assertFalse(item["frontmatter"]["gmail_thread_truncated"])
+        self.assertEqual(
+            [person["email"] for person in item["frontmatter"]["source_people"]],
+            ["leader@example.com", "requester@example.com", "reviewer@example.com"],
+        )
+
+    def test_gmail_thread_context_bounds_old_messages_and_marks_partial_coverage(self):
+        messages = [
+            {
+                "id": f"m{index}",
+                "headers": {
+                    "from": f"Sender {index} <sender{index}@example.com>",
+                    "date": "Mon, 27 Jul 2026 11:00:00 +0000",
+                },
+                "body": f"Message body {index}",
+            }
+            for index in range(1, runner.MAX_GMAIL_THREAD_MESSAGES + 3)
+        ]
+
+        body, included, truncated = runner._gmail_thread_body(messages)
+
+        self.assertEqual(included, runner.MAX_GMAIL_THREAD_MESSAGES)
+        self.assertTrue(truncated)
+        self.assertIn("Thread coverage: supplied 50 of 52 messages", body)
+        self.assertNotIn("--- Message 1 of 52 ---", body)
+        self.assertNotIn("--- Message 2 of 52 ---", body)
+        self.assertIn("--- Message 3 of 52 ---", body)
+        self.assertIn("--- Message 52 of 52 ---", body)
 
     def test_quote_stripping_preserves_uncorroborated_report_formatting(self):
         cases = (

@@ -348,6 +348,31 @@ class PromptBuildTest(StoreFixture):
         self.assertIn("Member count: 250", prompt)
         self.assertNotIn("Members:", prompt)
 
+    def test_build_prompt_embeds_gmail_recipients_and_thread_coverage(self):
+        self.override()
+        routine = self.routine(instruction_from_connector="slack")
+        item = {
+            "source_kind": "gmail",
+            "title": "Review request",
+            "date": "2026-07-27",
+            "body": "Please review the proposal by Friday.",
+            "frontmatter": {
+                "email_from": "Sender <sender@example.com>",
+                "email_to": "Leader <leader@example.com>",
+                "email_cc": "Reviewer <reviewer@example.com>",
+                "gmail_thread_message_count": 80,
+                "gmail_thread_messages_included": 50,
+                "gmail_thread_truncated": True,
+            },
+        }
+        with mock.patch.object(connector_prompts, "log"):
+            prompt = llm.build_prompt(routine, item, [])
+        self.assertIn("From: Sender <sender@example.com>", prompt)
+        self.assertIn("To: Leader <leader@example.com>", prompt)
+        self.assertIn("Cc: Reviewer <reviewer@example.com>", prompt)
+        self.assertIn("Messages in supplied thread: 50 of 80", prompt)
+        self.assertIn("Coverage warning:", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

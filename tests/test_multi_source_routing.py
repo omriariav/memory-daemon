@@ -64,6 +64,38 @@ class MultiSourceValidationTest(unittest.TestCase):
         self.assertTrue(any("does not support Gmail actions" in p
                             for p in config.validate(routine)))
 
+    def test_read_thread_is_boolean_and_gmail_only(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["read_thread"] = "yes"
+        routine["sources"][1]["read_thread"] = True
+        problems = config.validate(routine)
+        self.assertTrue(
+            any("read_thread must be true or false" in p for p in problems),
+            problems,
+        )
+        self.assertTrue(
+            any("read_thread is supported only for gmail" in p for p in problems),
+            problems,
+        )
+
+    def test_read_thread_rejects_message_oriented_streams(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["read_thread"] = True
+        routine["streams"] = {
+            "Weekly report": {"message_updates": True},
+        }
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any(
+                "read_thread cannot be combined with "
+                "streams.*.message_updates" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
     def test_multi_source_rejects_routine_level_actions(self):
         routine = multi_routine(self.tmp.name)
         routine["actions"] = ["archive"]

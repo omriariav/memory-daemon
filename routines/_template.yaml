@@ -51,6 +51,12 @@ source:
   # in:inbox, is:unread, or newer_than: unless you actually want the backfill.
   query: 'from:someone@example.com subject:"Weekly Report" (is:unread OR is:starred)'
 
+  # Optional. Read bounded chronological context from the whole Gmail thread
+  # instead of analyzing only its latest message. Useful for attention sweeps
+  # that must distinguish an open request from one already answered. Do not
+  # combine with streams.*.message_updates, which treats each reply separately.
+  # read_thread: true
+
   # Cap on items examined per run. Optional, default 20.
   max_results: 20
 
