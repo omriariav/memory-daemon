@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -118,6 +119,23 @@ class TestLedger(unittest.TestCase):
         path.write_text("{}")
         os.chmod(path, 0o600)
         state.Store(self.base).record("A", {"rule_id": "r"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_explicit_permissions_apply_before_atomic_replace(self):
+        path = self.base / "state" / "private.json"
+        observed = []
+        real_replace = os.replace
+
+        def inspect_then_replace(source, destination):
+            observed.append(Path(source).stat().st_mode & 0o777)
+            real_replace(source, destination)
+
+        with mock.patch.object(
+            state.os, "replace", side_effect=inspect_then_replace
+        ):
+            state.write_atomic(path, '{"private": true}\n', mode=0o600)
+
+        self.assertEqual(observed, [0o600])
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_no_temp_file_is_left_behind(self):

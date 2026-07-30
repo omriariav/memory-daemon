@@ -28,15 +28,9 @@ _LEGACY_TICK_KEY = "<legacy>"
 
 
 def _routine_role(routine):
-    """Short, config-derived purpose label for the status table."""
-    analyze = routine.get("analyze") or {}
-    if analyze.get("connector_sweep") is True:
-        if analyze.get("instruction_from_connector") == "slack":
-            return "partial"
-        return "general"
-    if len(config.sources(routine)) > 1:
-        return "domain"
-    return "specialized"
+    """Explicit semantic purpose label; never infer intent from transport."""
+    role = routine.get("role")
+    return role if role in config.VALID_ROUTINE_ROLES else "-"
 
 
 def _routine_sources(routine):

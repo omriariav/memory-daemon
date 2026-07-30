@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,10 +26,18 @@ MENTION_MAX_RESULTS = 100
 
 
 class SlackAPIError(RuntimeError):
-    def __init__(self, method: str, error: str):
+    def __init__(
+        self,
+        method: str,
+        error: str,
+        http_status: Optional[int] = None,
+        retry_after: Optional[int] = None,
+    ):
         super().__init__(f"{method}: {error}")
         self.method = method
         self.error = error
+        self.http_status = http_status
+        self.retry_after = retry_after
 
 
 def config_path() -> Path:
@@ -81,29 +90,74 @@ def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
         url += "?" + urllib.parse.urlencode(
             {key: value for key, value in params.items() if value is not None}
         )
-    result = subprocess.run(
-        [
-            "curl", "-sS", "-X", "POST", url,
-            "-H", "@-",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        input=f"Authorization: Bearer {token()}\n",
-    )
+    with tempfile.NamedTemporaryFile(
+        prefix="memory-daemon-slack-headers-",
+        delete=False,
+    ) as header_file:
+        header_path = Path(header_file.name)
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-sS", "-X", "POST", url,
+                "--dump-header", str(header_path),
+                "-H", "@-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            input=f"Authorization: Bearer {token()}\n",
+        )
+        try:
+            raw_headers = header_path.read_text(errors="replace")
+        except OSError:
+            raw_headers = ""
+    finally:
+        header_path.unlink(missing_ok=True)
     if result.returncode != 0:
         raise SlackAPIError(
             method, f"curl failed: {result.stderr.strip()[:200]}"
         )
+    body = result.stdout
+    http_status, retry_after = _response_limits(raw_headers)
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(body)
     except json.JSONDecodeError:
         raise SlackAPIError(
-            method, f"non-JSON response: {result.stdout[:200]}"
+            method,
+            f"non-JSON response: {body[:200]}",
+            http_status=http_status,
+            retry_after=retry_after,
         )
     if not data.get("ok"):
-        raise SlackAPIError(method, data.get("error", "unknown_error"))
+        raise SlackAPIError(
+            method,
+            data.get("error", "unknown_error"),
+            http_status=http_status,
+            retry_after=retry_after,
+        )
     return data
+
+
+def _response_limits(raw_headers: str):
+    """Return status and Retry-After from curl's final response header block."""
+    http_status = None
+    retry_after = None
+    blocks = re.split(r"\r?\n\r?\n", raw_headers.strip())
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines or not lines[0].startswith("HTTP/"):
+            continue
+        match = re.match(r"^HTTP/\S+\s+(\d{3})\b", lines[0])
+        http_status = int(match.group(1)) if match else None
+        retry_after = None
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            if separator and name.casefold() == "retry-after":
+                try:
+                    retry_after = int(value.strip())
+                except ValueError:
+                    retry_after = None
+    return http_status, retry_after
 
 
 def slack(method: str, params: Optional[Dict] = None) -> Dict:
@@ -288,6 +342,7 @@ def list_conversations(
     """Read cursor-paginated conversation metadata."""
     api = api or slack
     channels, cursor = [], None
+    seen_cursors = set()
     while limit is None or len(channels) < limit:
         request_limit = (
             min(limit - len(channels), 200) if limit is not None else 200
@@ -319,6 +374,9 @@ def list_conversations(
         )
         if not cursor:
             break
+        if cursor in seen_cursors:
+            die(f"{method} returned a repeated pagination cursor")
+        seen_cursors.add(cursor)
     return channels[:limit] if limit is not None else channels
 
 
@@ -369,10 +427,11 @@ def cmd_census(args: List[str]) -> None:
         if checkpoint_value
         else None
     )
-    existing = slack_census.load_checkpoint(checkpoint)
+    existing = slack_census.load_resumable_checkpoint(checkpoint)
     if existing:
         conversations = existing["inventory"]
         cutoff_epoch = float(existing["cutoff_epoch"])
+        until_epoch = existing.get("until_epoch")
     else:
         conversations = list_conversations(
             "users.conversations",
@@ -380,22 +439,26 @@ def cmd_census(args: List[str]) -> None:
             None,
             api=slack_request,
         )
-        cutoff_epoch = (
-            datetime.now(timezone.utc) - timedelta(hours=hours)
-        ).timestamp()
+        started_at = datetime.now(timezone.utc)
+        until_epoch = started_at.timestamp()
+        cutoff_epoch = (started_at - timedelta(hours=hours)).timestamp()
 
     result = slack_census.run(
         conversations,
         slack_request,
         cutoff_epoch,
+        until_epoch=until_epoch,
         requests_per_minute=rpm,
         checkpoint=checkpoint,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
     )
     payload = {
         "ok": not result["errors"],
-        "window_hours": hours,
+        "window_hours": (
+            float(result["until_epoch"]) - float(result["cutoff_epoch"])
+        ) / 3600,
         "cutoff_at": result["cutoff_at"],
+        "until_at": result["until_at"],
         "considered": len(result["inventory"]),
         "active_count": len(result["active"]),
         "error_count": len(result["errors"]),
@@ -589,6 +652,8 @@ def main() -> None:
     try:
         handler(args)
     except SlackAPIError as exc:
+        die(str(exc))
+    except RuntimeError as exc:
         die(str(exc))
     except (IndexError, ValueError):
         die(f"invalid or missing argument for '{command}' (see --help)")

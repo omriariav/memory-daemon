@@ -328,10 +328,14 @@ It enumerates conversations joined by the authenticated user, probes each for
 one top-level message in the window, and prints only active conversation
 metadata—never message text. The checkpoint is resumable across laptop sleep
 and contains IDs, names, types, timestamps, and API errors only. The default
-40-request/minute throttle keeps a Marketplace/internal app below Slack's
-normal history tier. A new reply to a thread whose root predates the census
-window is not discoverable through `conversations.history`; use the normal
-routine's wider `reply_roots_after` scan after choosing the recurring scope.
+40-request/minute throttle bounds this process's history probes; other clients
+using the same app and workspace still share Slack's method-level rate bucket.
+The census honors Slack's `Retry-After` response when throttled. Reusing the
+path resumes an interrupted census; once a census is complete, the next
+invocation refreshes the inventory and starts a new fixed time window. A new
+reply to a thread whose root predates the census window is not discoverable
+through `conversations.history`; use the normal routine's wider
+`reply_roots_after` scan after choosing the recurring scope.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially
@@ -596,13 +600,13 @@ tail -f logs/run.log
 tail -f logs/launchd.err.log
 ```
 
-`memory-daemon-status.sh` is read-only. It shows each routine's role
+`memory-daemon-status.sh` is read-only. It shows each routine's declared role
 (`general`, `domain`, `specialized`, or `partial`) and source connectors,
 distinguishes a last scheduled attempt from a last captured item, shows when
 each routine is next due, and flags an unfinished last run, memory-sink
 failures, or pending Gmail triage. `partial` means a connector sweep still has
-an explicitly bounded scope. Copy it to a directory on `PATH` to call it from
-anywhere:
+an explicitly bounded scope; legacy routines without `role` display `-`.
+Copy it to a directory on `PATH` to call it from anywhere:
 
 ```sh
 cp ./memory-daemon-status.sh ~/bin/memory-daemon-status.sh

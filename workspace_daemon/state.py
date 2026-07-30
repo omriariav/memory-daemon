@@ -81,18 +81,27 @@ def _fsync_dir(path):
         os.close(fd)
 
 
-def write_atomic(path, text):
+def write_atomic(path, text, mode=None):
     """Write via a unique temp file + os.replace so a crash cannot truncate."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else None
+    preserved_mode = path.stat().st_mode & 0o777 if path.exists() else None
+    target_mode = mode if mode is not None else preserved_mode
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        with open(tmp, "w") as f:
+        create_mode = target_mode if target_mode is not None else 0o666
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            create_mode,
+        )
+        with os.fdopen(fd, "w") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        if mode is not None:
-            os.chmod(tmp, mode)  # replacing must not widen the file's permissions
+        if target_mode is not None:
+            # Apply permissions before replace so the destination is never
+            # briefly visible with the process umask's broader default.
+            os.chmod(tmp, target_mode)
         os.replace(tmp, path)
     except BaseException:
         try:

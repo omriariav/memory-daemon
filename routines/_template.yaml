@@ -12,6 +12,10 @@ enabled: true
 # Shown by `daemon.py list`.
 description: One line about what this routine scoops.
 
+# Optional semantic role shown by `memory-daemon-status.sh`. Declare intent
+# explicitly; source count alone cannot distinguish a domain from a utility.
+role: specialized
+
 # Optional cadence for `daemon.py tick`. The template chooses 4h explicitly;
 # omitting this block preserves the legacy 1h scheduler cadence. Manual `run`
 # ignores it.

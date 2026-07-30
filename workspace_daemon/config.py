@@ -11,6 +11,7 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
+VALID_ROUTINE_ROLES = {"general", "domain", "specialized", "partial"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -155,6 +156,14 @@ def validate(routine):
         problems.append(
             f"{rid}: id must use lowercase letters, digits, and hyphens "
             f"(got {routine['id']!r})"
+        )
+    role = routine.get("role")
+    if role is not None and (
+        not isinstance(role, str) or role not in VALID_ROUTINE_ROLES
+    ):
+        problems.append(
+            f"{rid}: role must be one of "
+            f"{', '.join(sorted(VALID_ROUTINE_ROLES))}"
         )
 
     has_source = "source" in routine

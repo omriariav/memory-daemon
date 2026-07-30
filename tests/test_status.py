@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import state, status
+from workspace_daemon import config, state, status
 
 
 class LaunchdStatusTest(unittest.TestCase):
@@ -138,9 +138,18 @@ class RoutineStatusTest(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
         self.routines = [
-            {"id": "alpha", "enabled": True, "schedule": {"every": "1h"}},
-            {"id": "beta", "enabled": True, "schedule": {"every": "4h"}},
-            {"id": "off", "enabled": False, "schedule": {"every": "1d"}},
+            {
+                "id": "alpha", "role": "specialized",
+                "enabled": True, "schedule": {"every": "1h"},
+            },
+            {
+                "id": "beta", "role": "specialized",
+                "enabled": True, "schedule": {"every": "4h"},
+            },
+            {
+                "id": "off", "role": "specialized",
+                "enabled": False, "schedule": {"every": "1d"},
+            },
         ]
         schedule_path = state.schedule_file(self.base)
         schedule_path.parent.mkdir(parents=True)
@@ -190,11 +199,13 @@ class RoutineStatusTest(unittest.TestCase):
         routines = [
             {
                 "id": "general",
+                "role": "general",
                 "source": {"kind": "gchat", "all_spaces": True},
                 "analyze": {"connector_sweep": True},
             },
             {
                 "id": "domain",
+                "role": "domain",
                 "sources": [
                     {"kind": "gmail"},
                     {"kind": "gchat"},
@@ -202,6 +213,7 @@ class RoutineStatusTest(unittest.TestCase):
             },
             {
                 "id": "partial",
+                "role": "partial",
                 "source": {
                     "kind": "slack",
                     "direct_channels": ["C1"],
@@ -224,6 +236,50 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["domain"]["sources"], "gmail+gchat")
         self.assertEqual(by_id["partial"]["role"], "partial")
         self.assertEqual(by_id["partial"]["sources"], "slack")
+
+    def test_role_is_explicit_not_inferred_from_source_count(self):
+        routines = [
+            {
+                "id": "single-domain",
+                "role": "domain",
+                "source": {"kind": "gmail"},
+            },
+            {
+                "id": "multi-utility",
+                "role": "specialized",
+                "sources": [{"kind": "gmail"}, {"kind": "gchat"}],
+            },
+            {
+                "id": "legacy",
+                "source": {"kind": "gchat", "all_spaces": True},
+                "analyze": {"connector_sweep": True},
+            },
+        ]
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+        by_id = {row["routine"]: row for row in rows}
+
+        self.assertEqual(by_id["single-domain"]["role"], "domain")
+        self.assertEqual(by_id["multi-utility"]["role"], "specialized")
+        self.assertEqual(by_id["legacy"]["role"], "-")
+
+    def test_invalid_declared_role_is_rejected(self):
+        for invalid in ("guessed", ["domain"]):
+            with self.subTest(role=invalid):
+                problems = config.validate({
+                    "id": "bad-role",
+                    "role": invalid,
+                    "source": {"kind": "gmail", "query": "in:inbox"},
+                    "analyze": {
+                        "provider": "gemini",
+                        "instruction": "Summarize.",
+                    },
+                })
+
+                self.assertTrue(
+                    any("role must be one of" in item for item in problems)
+                )
 
     def test_running_tick_takes_precedence_over_due(self):
         rows = status.routine_rows(
