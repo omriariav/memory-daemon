@@ -169,7 +169,14 @@ domain receives evidence through several transports:
 ```yaml
 id: product-area
 enabled: true
-schedule: {every: 4h}         # integer + m, h, or d
+schedule:
+  every: 4h                   # base/off-hours cadence; integer + m, h, or d
+  work_hours:                 # optional faster local cadence
+    every: 15m
+    days: [mon, tue, wed, thu, fri]
+    start: "08:00"
+    end: "18:00"
+    timezone: Europe/London
 routing: {priority: 50}       # lower wins between specific routines
 
 sources:
@@ -338,10 +345,13 @@ through `conversations.history`; use the normal routine's wider
 `reply_roots_after` scan after choosing the recurring scope.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
-scheduler entrypoint: it reads `schedule.every`, runs due owners sequentially
-under the existing global lock, and records attempts in
-`state/schedule.json`. A failed dependency is retried on that routine's cadence,
-not on every coordinator wake-up. A dry-run tick never updates schedule state.
+scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
+`schedule.work_hours` override, runs due owners sequentially under the existing
+global lock, and records attempts in `state/schedule.json`. Outside the declared
+days and half-open `start`–`end` window, the base cadence applies. Entering a
+work window can make a routine immediately due; leaving it restores the base
+interval. A failed dependency is retried on that routine's current cadence, not
+on every coordinator wake-up. A dry-run tick never updates schedule state.
 Routines without `schedule.every` retain the legacy hourly cadence; the template
 sets `4h` explicitly for new routines.
 

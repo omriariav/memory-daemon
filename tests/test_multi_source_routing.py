@@ -1,9 +1,11 @@
 """Multi-source routine, ownership, and cadence regression tests."""
+import datetime
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import daemon as daemon_cli
 from workspace_daemon import (
@@ -632,6 +634,27 @@ class ScheduleStoreTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.routine = {"id": "r", "schedule": {"every": "1h"}}
 
+    @staticmethod
+    def epoch(local_time):
+        return datetime.datetime.fromisoformat(local_time).replace(
+            tzinfo=ZoneInfo("Asia/Dubai")
+        ).timestamp()
+
+    def work_hours_routine(self):
+        return {
+            "id": "r",
+            "schedule": {
+                "every": "1h",
+                "work_hours": {
+                    "every": "15m",
+                    "days": ["sun", "mon", "tue", "wed", "thu"],
+                    "start": "08:00",
+                    "end": "20:00",
+                    "timezone": "Asia/Dubai",
+                },
+            },
+        }
+
     def test_first_tick_is_due_then_waits_for_interval(self):
         schedule = state.ScheduleStore(self.base)
         self.assertTrue(schedule.due(self.routine, now=100))
@@ -651,6 +674,88 @@ class ScheduleStoreTest(unittest.TestCase):
 
     def test_omitted_schedule_keeps_legacy_hourly_cadence(self):
         self.assertEqual(config.schedule_seconds({"id": "legacy"}), 60 * 60)
+
+    def test_work_hours_support_a_custom_sunday_through_thursday_week(self):
+        routine = self.work_hours_routine()
+        schedule = state.ScheduleStore(self.base)
+        sunday_start = self.epoch("2026-08-02T08:00:00")
+        schedule.mark_attempted({"r"}, now=sunday_start)
+
+        self.assertFalse(schedule.due(routine, now=sunday_start + 899))
+        self.assertTrue(schedule.due(routine, now=sunday_start + 900))
+
+        friday_start = self.epoch("2026-07-31T08:00:00")
+        schedule.mark_attempted({"r"}, now=friday_start)
+        self.assertFalse(schedule.due(routine, now=friday_start + 3599))
+        self.assertTrue(schedule.due(routine, now=friday_start + 3600))
+
+    def test_entering_work_hours_can_make_a_routine_due_immediately(self):
+        routine = self.work_hours_routine()
+        schedule = state.ScheduleStore(self.base)
+        last = self.epoch("2026-08-02T07:30:00")
+        schedule.mark_attempted({"r"}, now=last)
+
+        self.assertFalse(
+            schedule.due(routine, now=self.epoch("2026-08-02T07:59:00"))
+        )
+        self.assertTrue(
+            schedule.due(routine, now=self.epoch("2026-08-02T08:00:00"))
+        )
+        self.assertEqual(
+            config.next_due_epoch(
+                routine,
+                last,
+                self.epoch("2026-08-02T07:55:00"),
+            ),
+            self.epoch("2026-08-02T08:00:00"),
+        )
+
+    def test_leaving_work_hours_restores_the_base_interval(self):
+        routine = self.work_hours_routine()
+        schedule = state.ScheduleStore(self.base)
+        last = self.epoch("2026-08-02T19:45:00")
+        schedule.mark_attempted({"r"}, now=last)
+
+        self.assertFalse(
+            schedule.due(routine, now=self.epoch("2026-08-02T20:00:00"))
+        )
+        self.assertTrue(
+            schedule.due(routine, now=self.epoch("2026-08-02T20:45:00"))
+        )
+
+    def test_timezone_window_tracks_daylight_saving_time(self):
+        routine = self.work_hours_routine()
+        routine["schedule"]["work_hours"].update({
+            "days": ["mon", "tue", "wed", "thu", "fri"],
+            "timezone": "America/New_York",
+        })
+        summer = datetime.datetime(
+            2026, 7, 30, 12, 30, tzinfo=datetime.timezone.utc
+        ).timestamp()
+        winter = datetime.datetime(
+            2026, 1, 1, 12, 30, tzinfo=datetime.timezone.utc
+        ).timestamp()
+
+        self.assertEqual(config.schedule_seconds(routine, summer), 15 * 60)
+        self.assertEqual(config.schedule_seconds(routine, winter), 60 * 60)
+
+    def test_work_hours_schedule_validation_fails_closed(self):
+        invalid_values = [
+            {"timezone": "Mars/Olympus"},
+            {"timezone": "../UTC"},
+            {"days": ["sun", "sunday"]},
+            {"start": "20:00", "end": "08:00"},
+            {"every": "2h"},
+        ]
+        for replacement in invalid_values:
+            with self.subTest(replacement=replacement):
+                routine = multi_routine(self.base)
+                work_hours = self.work_hours_routine()["schedule"]["work_hours"]
+                routine["schedule"] = {
+                    "every": "1h",
+                    "work_hours": {**work_hours, **replacement},
+                }
+                self.assertTrue(config.validate(routine))
 
 
 class CursorStoreTest(unittest.TestCase):

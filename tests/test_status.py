@@ -1,4 +1,5 @@
 """Health-status command regression tests."""
+import datetime
 import json
 import os
 import subprocess
@@ -6,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from workspace_daemon import config, state, status
 
@@ -236,6 +238,44 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["domain"]["sources"], "gmail+gchat")
         self.assertEqual(by_id["partial"]["role"], "partial")
         self.assertEqual(by_id["partial"]["sources"], "slack")
+
+    def test_reports_work_hours_cadence_and_next_transition(self):
+        routine = {
+            "id": "gchat",
+            "enabled": True,
+            "role": "general",
+            "schedule": {
+                "every": "1h",
+                "work_hours": {
+                    "every": "15m",
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "start": "08:00",
+                    "end": "20:00",
+                    "timezone": "Europe/London",
+                },
+            },
+            "source": {"kind": "gchat", "all_spaces": True},
+        }
+        now = datetime.datetime(
+            2026, 8, 3, 7, 55, tzinfo=ZoneInfo("Europe/London")
+        ).timestamp()
+        last = datetime.datetime(
+            2026, 8, 3, 7, 30, tzinfo=ZoneInfo("Europe/London")
+        ).timestamp()
+        schedule_path = state.schedule_file(self.base)
+        schedule_path.write_text(json.dumps({
+            "gchat": {
+                "last_attempted_epoch": last,
+                "last_attempted_at": "2026-08-02T04:30:00Z",
+            },
+        }))
+
+        row = status.routine_rows(
+            self.base, [routine], {"routines": {}}, now=now
+        )[0]
+
+        self.assertEqual(row["every"], "15m work / 1h off")
+        self.assertEqual(row["next"], "in 5m")
 
     def test_role_is_explicit_not_inferred_from_source_count(self):
         routines = [

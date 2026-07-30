@@ -247,7 +247,10 @@ class ScheduleStore:
         # Wall clocks can jump backwards after sleep or time synchronization.
         # Treat that as due rather than freezing the routine until the future
         # timestamp is reached again.
-        return elapsed < 0 or elapsed >= config.schedule_seconds(routine)
+        return (
+            elapsed < 0
+            or config.next_due_epoch(routine, float(last), now) <= now
+        )
 
     def mark_attempted(self, routine_ids, now=None):
         if self.dry_run:

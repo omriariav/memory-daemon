@@ -274,16 +274,16 @@ def routine_rows(
             status_name = "ok"
 
         if enabled and last_epoch is not None:
-            remaining = last_epoch + config.schedule_seconds(routine) - now
+            remaining = (
+                config.next_due_epoch(routine, last_epoch, now) - now
+            )
             next_run = "due" if remaining <= 0 else f"in {_duration(remaining)}"
         elif enabled:
             next_run = "due"
         else:
             next_run = "-"
 
-        every = (routine.get("schedule") or {}).get(
-            "every", config.DEFAULT_SCHEDULE
-        )
+        every = config.schedule_label(routine)
         rows.append({
             "routine": routine_id,
             "role": _routine_role(routine),
