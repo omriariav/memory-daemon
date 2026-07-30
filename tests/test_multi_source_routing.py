@@ -742,6 +742,7 @@ class ScheduleStoreTest(unittest.TestCase):
     def test_work_hours_schedule_validation_fails_closed(self):
         invalid_values = [
             {"timezone": "Mars/Olympus"},
+            {"timezone": "../UTC"},
             {"days": ["sun", "sunday"]},
             {"start": "20:00", "end": "08:00"},
             {"every": "2h"},

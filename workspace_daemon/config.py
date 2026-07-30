@@ -151,7 +151,7 @@ def _work_hours_settings(routine):
         )
     try:
         zone = ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as exc:
+    except (ZoneInfoNotFoundError, ValueError) as exc:
         raise RoutineError(
             f"{rid}: unknown schedule.work_hours.timezone {timezone!r}"
         ) from exc
