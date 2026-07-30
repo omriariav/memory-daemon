@@ -197,6 +197,38 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["alpha"]["role"], "specialized")
         self.assertEqual(by_id["alpha"]["sources"], "-")
 
+    def test_reports_transcriptions_that_need_manual_calendar_matching(self):
+        state.save(self.base, {
+            "mila:ID@hash": {
+                "rule_id": "meeting-transcriptions",
+                "processed_at": "2026-07-30T10:00:00Z",
+                "calendar_match_rejected": True,
+            },
+        })
+        routines = [{
+            "id": "meeting-transcriptions",
+            "enabled": True,
+            "schedule": {"every": "1h"},
+            "source": {
+                "kind": "mila",
+                "recordings_file": "/tmp/recordings.json",
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "summarize",
+            },
+            "memory": {"store": "/tmp/store", "type": "note"},
+        }]
+
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+
+        self.assertEqual(rows[0]["status"], "attention")
+        self.assertEqual(rows[0]["issues"], "1 meeting match")
+
     def test_reports_general_domain_and_source_roles(self):
         routines = [
             {

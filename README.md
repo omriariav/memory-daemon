@@ -368,6 +368,16 @@ See `_example-domain-routine.yaml` and `_example-fallback-sweep.yaml`.
 Files starting with `_` are ignored by the loader, so the template and the
 examples stay inert.
 
+Keep a new unattended routine at `enabled: false` while testing it against an
+already-running scheduler. An explicit manual preview can run that parked
+routine without arming it:
+
+```sh
+./daemon.py run --routine my-routine --dry-run --include-disabled
+```
+
+The flag requires one `--routine`; it can never run every disabled routine.
+
 ### Routine schema
 
 ```yaml
@@ -376,7 +386,7 @@ enabled: true
 description: Summarize the weekly report email.
 
 source:
-  kind: gmail                  # gmail, drive_docs, slack, or gchat
+  kind: gmail                  # gmail, drive_docs, slack, gchat, or mila
   query: 'from:reports@example.com subject:"Weekly Report" is:unread'
   max_results: 20              # optional, default 20
 
@@ -493,6 +503,39 @@ queue to retry on the next run.
 `name_contains`, `mime_type` and `tabs`. It has no inbox to bound it and no
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
+
+### Mila meeting transcriptions
+
+`source.kind: mila` reads completed recordings without modifying Mila's live
+storage. It uses `recordings.json` as the index, structured segments as the
+preferred transcript, and the paired `.txt` as a fallback. Native Mila meeting
+filenames carry the recording start; for imported Voice Memos, the original
+`createdAt` is the start. This distinction prevents a 30-minute meeting from
+being matched to Calendar 30 minutes late.
+
+Before normal analysis, the source reads nearby Calendar events and asks Yoetz
+to select only from that bounded candidate list. A capture proceeds only when
+the matcher returns `matched: true`, a supplied event ID, and `confidence:
+high`. Medium, low, missing, or invented matches never reach memory.
+
+Mila's directory is read-only. The daemon writes small, private receipts under
+`state/transcriptions/processed/` and `state/transcriptions/failed/`; it never
+moves audio or transcript sidecars and never edits `recordings.json` or
+`folders.json`. The status command reports low-confidence matches as needing
+attention. An inconclusive match is retried on the routine's next run so a
+corrected Calendar event can resolve it; success atomically clears older
+rejections for that stable recording source.
+
+Candidate IDs include the transcript hash, so a corrected transcript is
+reprocessed. The memory source ID remains `mila:<recording-uuid>`, so that
+correction updates the same memory entry. For an established library, list
+already-handled UUIDs in `exclude_recording_ids`; genuinely new recordings are
+still discovered even when an iOS Voice Memo is imported days later.
+
+For a copied or renamed legacy transcript, `manual_recordings` points at the
+explicit `.srt`/`.txt` pair and the Mila index that still owns its metadata.
+That provides a trustworthy UUID and time without hand-editing the active app
+database. See `_example-mila-to-memory.yaml`.
 
 ### One routine, several report streams
 
@@ -657,6 +700,7 @@ workspace_daemon/
   contacts.py              exact Workspace-directory identity resolution
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
+  mila_source.py           read-only Mila + Calendar matching
   llm.py                   yoetz adapter, prompt building, label extraction
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions

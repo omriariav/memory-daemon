@@ -105,6 +105,17 @@ def cmd_run(args):
     routines = config.discover(BASE_DIR)
     if args.routine and args.routine not in {r["id"] for r in routines}:
         raise config.RoutineError(f"no routine with id '{args.routine}'")
+    if args.include_disabled and not args.routine:
+        raise config.RoutineError(
+            "--include-disabled requires --routine so a broad manual run "
+            "cannot accidentally arm parked routines"
+        )
+    if args.include_disabled:
+        routines = [
+            dict(routine, enabled=True)
+            if routine["id"] == args.routine else routine
+            for routine in routines
+        ]
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
@@ -294,6 +305,11 @@ def main(argv=None):
 
     p_run = sub.add_parser("run", help="process new matches")
     p_run.add_argument("--routine", help="run only this routine id")
+    p_run.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="explicitly run the selected disabled routine without arming it",
+    )
     p_run.add_argument("-n", "--dry-run", action="store_true",
                        help="preview only: no LLM/source mutation or data/state write; "
                             "operational log only")

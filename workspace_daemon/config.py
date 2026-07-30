@@ -12,7 +12,7 @@ from .notes import FILENAME_FIELDS
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat"}
+VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila"}
 VALID_ROUTINE_ROLES = {"general", "domain", "specialized", "partial"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
@@ -812,8 +812,90 @@ def _validate_source(routine, source, prefix):
                 f"there is no Gmail message to label"
             )
 
+    if kind == "mila":
+        recordings_file = source.get("recordings_file")
+        if (
+            not isinstance(recordings_file, str)
+            or not recordings_file.startswith("/")
+        ):
+            problems.append(
+                f"{prefix}.recordings_file must be an absolute path"
+            )
+        excluded = source.get("exclude_recording_ids")
+        if excluded is not None and (
+            not isinstance(excluded, list)
+            or any(not isinstance(value, str) or not value for value in excluded)
+        ):
+            problems.append(
+                f"{prefix}.exclude_recording_ids must be a list of recording IDs"
+            )
+        manual = source.get("manual_recordings")
+        if manual is not None:
+            if not isinstance(manual, list) or not manual:
+                problems.append(
+                    f"{prefix}.manual_recordings must be a non-empty list"
+                )
+            else:
+                for index, entry in enumerate(manual):
+                    entry_prefix = f"{prefix}.manual_recordings[{index}]"
+                    if not isinstance(entry, dict):
+                        problems.append(f"{entry_prefix} must be a mapping")
+                        continue
+                    if (
+                        not isinstance(entry.get("recording_id"), str)
+                        or not entry["recording_id"]
+                    ):
+                        problems.append(f"{entry_prefix}.recording_id is required")
+                    for field in (
+                        "recordings_file", "transcript_file", "fallback_file"
+                    ):
+                        value = entry.get(field)
+                        if value is not None and (
+                            not isinstance(value, str)
+                            or not value.startswith("/")
+                        ):
+                            problems.append(
+                                f"{entry_prefix}.{field} must be an absolute path"
+                            )
+                    if not entry.get("transcript_file"):
+                        problems.append(
+                            f"{entry_prefix}.transcript_file is required"
+                        )
+        timezone = source.get("calendar_timezone", "UTC")
+        try:
+            ZoneInfo(timezone)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            problems.append(
+                f"{prefix}.calendar_timezone must be an IANA timezone"
+            )
+        for field, lower, upper in (
+            ("calendar_window_days", 1, 14),
+            ("max_calendar_candidates", 1, 20),
+            ("calendar_max_results", 1, 2500),
+            ("match_max_output_tokens", 256, 8192),
+        ):
+            value = source.get(field)
+            if value is not None and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not lower <= value <= upper
+            ):
+                problems.append(
+                    f"{prefix}.{field} must be an integer from {lower} to {upper}"
+                )
+        match_hours = source.get("calendar_match_hours")
+        if match_hours is not None and (
+            not isinstance(match_hours, (int, float))
+            or isinstance(match_hours, bool)
+            or match_hours <= 0
+            or match_hours > 24
+        ):
+            problems.append(
+                f"{prefix}.calendar_match_hours must be greater than 0 and at most 24"
+            )
+
     max_results = source.get("max_results", 20)
-    unlimited_source = kind in {"gmail", "gchat", "slack"}
+    unlimited_source = kind in {"gmail", "gchat", "slack", "mila"}
     if (
         not isinstance(max_results, int)
         or isinstance(max_results, bool)

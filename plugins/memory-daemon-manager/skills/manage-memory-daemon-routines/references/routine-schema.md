@@ -9,7 +9,7 @@ canonical shapes. The validator is authoritative.
   routines.
 - `enabled`: boolean.
 - Exactly one of:
-  - `source`: one Gmail, Drive, Slack, or Google Chat source.
+  - `source`: one Gmail, Drive, Slack, Google Chat, or Mila source.
   - `sources`: a non-empty list combining transports.
 - `analyze.provider` and `analyze.model`.
 - Exactly one prompt base:
@@ -28,6 +28,16 @@ canonical shapes. The validator is authoritative.
 
 Keep a channel or space in one specific routine. A fallback may overlap because
 the router assigns each candidate to one owner.
+
+For `source.kind: mila`, keep Mila's storage read-only. Point
+`recordings_file` at its absolute `recordings.json` path and use
+`exclude_recording_ids` to baseline an existing library. `manual_recordings`
+may name an explicit transcript plus the old Mila index that owns its UUID and
+timestamps. Calendar matching is mandatory at runtime and only a
+high-confidence match may proceed to memory. Outcome receipts belong under the
+daemon's `state/transcriptions/`, never inside Mila's directory. Inconclusive
+matches retry on the routine cadence and a later success resolves older failed
+versions by stable recording source id.
 
 An `all_spaces: true` Google Chat fallback automatically excludes explicit
 spaces configured by domain routines, including disabled routines. For frequent

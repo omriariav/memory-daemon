@@ -1148,6 +1148,46 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
         self.assertEqual(totals["errors"], 0)
         mark.assert_not_called()
 
+    def test_unrelated_targeted_source_does_not_publish_connector_health(self):
+        sweep = self.routine(memory=True)
+        sweep["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gchat",
+            "connector_sweep": True,
+        }
+        local = {
+            "id": "local",
+            "enabled": True,
+            "source": {
+                "kind": "mila",
+                "recordings_file": "/tmp/recordings.json",
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep meeting decisions.",
+            },
+            "memory": {
+                "store": str(self.base / "memory"),
+                "type": "note",
+            },
+        }
+        saved_mila = runner.SOURCES["mila"]
+        self.addCleanup(runner.SOURCES.__setitem__, "mila", saved_mila)
+        runner.SOURCES["mila"] = (lambda _source: [], saved_mila[1])
+
+        with mock.patch.object(
+            memory_sink, "mark_connector_pulled"
+        ) as mark:
+            totals = runner.run(
+                self.base, [sweep, local], active_ids={"local"}
+            )
+
+        self.assertEqual(totals["errors"], 0)
+        mark.assert_not_called()
+
     def test_inactive_owner_holds_watermark_until_its_successful_run(self):
         def candidates(source):
             return []
@@ -1432,6 +1472,65 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
         self.assertEqual(second["processed"], 0)
         self.assertEqual(second["skipped"], 1)
         self.assertEqual(capture.call_count, 1)
+
+
+class RunCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.routine = multi_routine(self.base / "vault")
+        self.routine["enabled"] = False
+
+    def test_include_disabled_runs_only_the_named_parked_routine(self):
+        args = SimpleNamespace(
+            routine="domain",
+            include_disabled=True,
+            dry_run=True,
+            refresh_labels=False,
+        )
+        totals = {
+            "processed": 1, "skipped": 0, "errors": 0,
+            "matched": 1, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine]
+             ), \
+             mock.patch.object(
+                 daemon_cli.config, "validate", return_value=[]
+             ), \
+             mock.patch.object(
+                 daemon_cli.runner, "run", return_value=totals
+             ) as run:
+            self.assertEqual(daemon_cli.cmd_run(args), 0)
+
+        selected = run.call_args.args[1]
+        self.assertTrue(selected[0]["enabled"])
+        self.assertFalse(self.routine["enabled"])
+        self.assertEqual(run.call_args.kwargs["active_ids"], {"domain"})
+        self.assertTrue(run.call_args.kwargs["dry_run"])
+
+    def test_include_disabled_requires_one_named_routine(self):
+        args = SimpleNamespace(
+            routine=None,
+            include_disabled=True,
+            dry_run=True,
+            refresh_labels=False,
+        )
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine]
+             ):
+            with self.assertRaisesRegex(
+                config.RoutineError, "requires --routine"
+            ):
+                daemon_cli.cmd_run(args)
 
 
 class TickCommandTest(unittest.TestCase):
