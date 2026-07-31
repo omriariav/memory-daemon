@@ -894,6 +894,41 @@ class ConnectorCoverageTest(unittest.TestCase):
             48 * 60 * 60,
         )
 
+    def test_consume_only_flag_preserves_existing_slack_cursor_namespaces(self):
+        source = {
+            "kind": "slack",
+            "active_conversations": {
+                "checkpoint": "state/slack-census.json",
+                "hours": 48,
+                "refresh_every": "1d",
+                "requests_per_minute": 40,
+            },
+            "max_results": 0,
+            "catch_up": True,
+            "catch_up_after": "2026-07-28T08:00:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
+        }
+        consume_only = {
+            **source,
+            "active_conversations": {
+                **source["active_conversations"],
+                "refresh_if_stale": False,
+            },
+        }
+
+        self.assertEqual(
+            runner._catch_up_cursor_id(source),
+            runner._catch_up_cursor_id(consume_only),
+        )
+        self.assertEqual(
+            runner._active_conversation_cursor_id(source),
+            runner._active_conversation_cursor_id(consume_only),
+        )
+        self.assertEqual(
+            runner._coverage_cursor_id(0, source),
+            runner._coverage_cursor_id(0, consume_only),
+        )
+
 
 class CatchUpCursorRunnerTest(unittest.TestCase):
     def setUp(self):
@@ -1222,6 +1257,16 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 "2026-07-31T08:00:00Z",
                 "2026-08-02T08:00:00Z",
             )
+            consume_only_routine = {
+                **routine,
+                "source": {
+                    **routine["source"],
+                    "active_conversations": {
+                        **routine["source"]["active_conversations"],
+                        "refresh_if_stale": False,
+                    },
+                },
+            }
             with mock.patch.object(
                 runner, "utc_now_iso",
                 return_value="2026-08-02T08:00:00Z",
@@ -1229,7 +1274,7 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 slack_source, "utc_now_iso",
                 return_value="2026-08-02T08:00:00Z",
             ):
-                second = runner.run(self.base, [routine])
+                second = runner.run(self.base, [consume_only_routine])
 
             mark.assert_not_called()
 

@@ -35,8 +35,16 @@ def _catch_up_cursor_id(source):
                 "channels", "ada_channels", "direct_channels", "private_channels"
             )
         }
+        active_conversations = source.get("active_conversations")
+        if isinstance(active_conversations, dict):
+            active_conversations = dict(active_conversations)
+            # Whether a stale cache may be refreshed inline changes execution,
+            # not source coverage. Keep the pre-split cursor namespace so the
+            # first consume-only run still validates its new census against
+            # the prior discovery watermark instead of silently bootstrapping.
+            active_conversations.pop("refresh_if_stale", None)
         scope.update({
-            "active_conversations": source.get("active_conversations"),
+            "active_conversations": active_conversations,
             "include_mentions": source.get("include_mentions") is True,
             "catch_up_after": source.get("catch_up_after"),
             "reply_roots_after": source.get("reply_roots_after"),
@@ -64,6 +72,11 @@ def _coverage_cursor_id(source_index, source):
         for key, value in source.items()
         if not str(key).startswith("_")
     }
+    active_conversations = scope.get("active_conversations")
+    if isinstance(active_conversations, dict):
+        active_conversations = dict(active_conversations)
+        active_conversations.pop("refresh_if_stale", None)
+        scope["active_conversations"] = active_conversations
     digest = hashlib.sha256(
         json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]

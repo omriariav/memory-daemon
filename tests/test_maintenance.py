@@ -2,8 +2,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import daemon as daemon_cli
 from workspace_daemon import config, maintenance, runner
 
 
@@ -84,6 +86,17 @@ class MaintenanceRunTest(unittest.TestCase):
 
         self.assertEqual(result["active_count"], 12)
         self.assertIsNone(census.call_args.kwargs["checkpoint"])
+
+    def test_list_uses_schedule_attempt_for_maintenance_last_run(self):
+        schedule = SimpleNamespace(entries={
+            "slack-census": {
+                "last_attempted_at": "2026-07-31T08:00:00Z",
+            },
+        })
+        self.assertEqual(
+            daemon_cli._routine_last_run(census_routine(), schedule),
+            "2026-07-31T08:00:00Z",
+        )
 
     def test_maintenance_runs_before_capture_sources_in_same_tick(self):
         with tempfile.TemporaryDirectory() as tmp:
