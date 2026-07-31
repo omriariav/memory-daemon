@@ -166,9 +166,10 @@ def _save_checkpoint(path, data):
 
 
 def _iso_from_epoch(value):
-    return datetime.datetime.fromtimestamp(
+    rendered = datetime.datetime.fromtimestamp(
         float(value), datetime.timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return rendered.replace(".000000Z", "Z")
 
 
 def run(
@@ -255,7 +256,10 @@ def run(
                     "channel": channel,
                     "oldest": f"{float(cutoff_epoch):.6f}",
                     "latest": f"{float(data['until_epoch']):.6f}",
-                    "inclusive": "false",
+                    # Adjacent census windows deliberately overlap at their
+                    # shared boundary, so activity cannot disappear between
+                    # two exclusive endpoints.
+                    "inclusive": "true",
                     "limit": 1,
                 },
             )

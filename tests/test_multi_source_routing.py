@@ -1103,29 +1103,64 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             "analyze": {
                 "provider": "gemini",
                 "model": "m",
-                "instruction": "Keep durable decisions.",
+                "instruction_from_connector": "slack",
+                "connector_sweep": True,
             },
             "output": {
                 "vault_dir": str(self.base / "slack-vault"),
                 "slug_prefix": "slack",
             },
+            "memory": {
+                "store": str(self.base / "memory"),
+                "type": "note",
+            },
         }
 
-        # Run A at 08:00 legally reuses a snapshot ending 23 hours earlier.
-        write_census(
-            "2026-07-28T09:00:00Z",
-            "2026-07-30T09:00:00Z",
-        )
         with mock.patch.object(
-            runner, "utc_now_iso", return_value="2026-07-31T08:00:00Z",
+            config, "validate", return_value=[]
         ), mock.patch.object(
-            slack_source, "utc_now_iso",
-            return_value="2026-07-31T08:00:00Z",
-        ):
-            first = runner.run(self.base, [routine])
+            memory_sink, "mark_connector_pulled", return_value=True
+        ) as mark:
+            # Run A at 08:00 legally reuses a snapshot ending 23 hours earlier.
+            write_census(
+                "2026-07-28T09:00:00Z",
+                "2026-07-30T09:00:00Z",
+            )
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-07-31T08:00:00Z",
+            ), mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T08:00:00Z",
+            ):
+                first = runner.run(self.base, [routine])
+
+            mark.assert_called_once_with(
+                routine, "2026-07-30T09:00:00Z", dry_run=False
+            )
+            mark.reset_mock()
+
+            # The next 48-hour snapshot starts 23 hours after the boundary
+            # Run A actually consumed. The content cursor alone looks
+            # continuous, but the discovery cursor proves it is unsafe.
+            write_census(
+                "2026-07-31T08:00:00Z",
+                "2026-08-02T08:00:00Z",
+            )
+            with mock.patch.object(
+                runner, "utc_now_iso",
+                return_value="2026-08-02T08:00:00Z",
+            ), mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-08-02T08:00:00Z",
+            ):
+                second = runner.run(self.base, [routine])
+
+            mark.assert_not_called()
 
         cursor_id = runner._catch_up_cursor_id(routine["source"])
         discovery_id = runner._active_conversation_cursor_id(routine["source"])
+        coverage_id = runner._coverage_cursor_id(0, routine["source"])
         cursors = state.CursorStore(self.base)
         self.assertEqual(first["errors"], 0)
         self.assertEqual(
@@ -1136,21 +1171,10 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             cursors.checkpoint("slack-general", discovery_id, "slack"),
             "2026-07-30T09:00:00Z",
         )
-
-        # The next 48-hour snapshot starts 23 hours after the boundary that
-        # Run A actually consumed. The content cursor alone looks continuous,
-        # but the durable discovery cursor proves this snapshot is unsafe.
-        write_census(
-            "2026-07-31T08:00:00Z",
-            "2026-08-02T08:00:00Z",
+        self.assertEqual(
+            cursors.checkpoint("slack-general", coverage_id, "slack"),
+            "2026-07-30T09:00:00Z",
         )
-        with mock.patch.object(
-            runner, "utc_now_iso", return_value="2026-08-02T08:00:00Z",
-        ), mock.patch.object(
-            slack_source, "utc_now_iso",
-            return_value="2026-08-02T08:00:00Z",
-        ):
-            second = runner.run(self.base, [routine])
 
         self.assertEqual(second["errors"], 1)
         held = state.CursorStore(self.base)
@@ -1163,6 +1187,12 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
         self.assertEqual(
             held.checkpoint(
                 "slack-general", discovery_id, "slack"
+            ),
+            "2026-07-30T09:00:00Z",
+        )
+        self.assertEqual(
+            held.checkpoint(
+                "slack-general", coverage_id, "slack"
             ),
             "2026-07-30T09:00:00Z",
         )

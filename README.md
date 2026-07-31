@@ -379,8 +379,11 @@ consumes. Before consuming the next snapshot it compares that boundary with
 the new snapshot's cutoff. This catches discovery gaps even when an earlier
 run reused a cache that was still fresh but hours old. A gap fails closed and
 holds both content and discovery cursors; run a manual broader
-census/backfill before resuming. Slack's history API also cannot discover a
-new reply whose root predates the census window in a conversation that had no
+census/backfill before resuming. Boundaries retain microsecond precision and
+adjacent windows include their shared endpoint, avoiding a timestamp sliver
+between snapshots. Connector health uses this actual snapshot boundary, not
+the later daemon start time. Slack's history API also cannot discover a new
+reply whose root predates the census window in a conversation that had no
 recent top-level message; pin such critical channels explicitly with
 `direct_channels`.
 

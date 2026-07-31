@@ -205,6 +205,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     active_conversation_sources.append(
                         (
                             routine["id"],
+                            source_index,
                             discovery_cursor_id,
                             kind,
                             runtime,
@@ -235,6 +236,30 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         source_overrides=source_overrides,
         source_coverage=source_coverage,
     )
+    active_source_stamps = {}
+    for (
+        routine_id,
+        source_index,
+        _cursor_id,
+        kind,
+        runtime,
+    ) in active_conversation_sources:
+        coverage_key = (routine_id, source_index)
+        until_at = runtime.get("until_at")
+        if until_at:
+            active_source_stamps[coverage_key] = until_at
+        elif (
+            coverage_key in source_coverage
+            and not source_coverage[coverage_key]
+        ):
+            totals["errors"] += 1
+            source_coverage[coverage_key] = (
+                "Slack census did not report its discovery boundary"
+            )
+            log(
+                f"routine={routine_id} source={kind} FATAL: "
+                f"{source_coverage[coverage_key]}"
+            )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
     )
@@ -250,9 +275,9 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals, lock, catalog, base_dir,
         )
 
-    coverage_sources = []
+    coverage_points = []
     if totals["errors"] == 0:
-        coverage_sources = _mark_connector_sweeps(
+        coverage_points = _mark_connector_sweeps(
             routines,
             valid_ids,
             active_ids,
@@ -261,14 +286,21 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals,
             cursors,
             source_coverage,
+            active_source_stamps,
         )
 
-    successful_sources = [*catch_up_sources, *coverage_sources]
     successful_points = [
         (*source, scan_started_at)
-        for source in successful_sources
+        for source in catch_up_sources
     ]
-    for routine_id, cursor_id, kind, runtime in active_conversation_sources:
+    successful_points.extend(coverage_points)
+    for (
+        routine_id,
+        _source_index,
+        cursor_id,
+        kind,
+        runtime,
+    ) in active_conversation_sources:
         until_at = runtime.get("until_at")
         if until_at:
             successful_points.append(
@@ -296,7 +328,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     f"catch-up cursor held at prior checkpoint due to "
                     f"{totals['errors']} error(s)"
                 )
-            if coverage_sources:
+            if coverage_points:
                 log(
                     f"connector coverage checkpoint held at prior state due to "
                     f"{totals['errors']} error(s)"
@@ -306,16 +338,18 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
 
 
 def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
-                           dry_run, totals, cursors, source_coverage):
+                           dry_run, totals, cursors, source_coverage,
+                           active_source_stamps=None):
     """Advance connector health only to the oldest fully covered scope.
 
     A connector prompt is reusable by partial routines, so merely reading one
     does not prove connector-wide coverage.  ``connector_sweep: true`` names
     the routine that publishes health for the configured source.  Every
     enabled routine source of that kind participates in the safe watermark:
-    active sources contribute this run's start, while inactive owners retain
-    their prior successful checkpoint.
+    active sources contribute this run's start (or their actual fixed-snapshot
+    boundary), while inactive owners retain their prior successful checkpoint.
     """
+    active_source_stamps = active_source_stamps or {}
     active_source_kinds = {
         source.get("kind")
         for routine in routines
@@ -357,7 +391,6 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
         declarations[key] = routine
         connector_kinds.add(connector)
 
-    scan_second, _scan_fraction = time_utils.rfc3339_key(scan_started_at)
     for routine in routines:
         rid = routine.get("id", "?")
         if (
@@ -384,7 +417,11 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
             )
             if not previous:
                 continue  # first successful run establishes the bootstrap
-            boundary = scan_second - datetime.timedelta(
+            stamp = active_source_stamps.get(
+                coverage_key, scan_started_at
+            )
+            stamp_second, _ = time_utils.rfc3339_key(stamp)
+            boundary = stamp_second - datetime.timedelta(
                 seconds=window_seconds
             )
             if time_utils.rfc3339_key(previous) < (boundary, 0):
@@ -392,25 +429,28 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
                     "fixed-window gap since prior successful scan"
                 )
 
-    coverage_sources = [
-        (
-            routine["id"],
-            _coverage_cursor_id(source_index, source),
-            source["kind"],
-        )
-        for routine in routines
-        if (
+    coverage_points = []
+    for routine in routines:
+        if not (
             routine.get("enabled", True)
             and routine["id"] in valid_ids
             and routine["id"] in active_ids
-        )
-        for source_index, source in enumerate(config.sources(routine))
-        if (
-            source.get("kind") in connector_kinds
-            and (routine["id"], source_index) in source_coverage
-            and not source_coverage.get((routine["id"], source_index))
-        )
-    ]
+        ):
+            continue
+        for source_index, source in enumerate(config.sources(routine)):
+            coverage_key = (routine["id"], source_index)
+            if not (
+                source.get("kind") in connector_kinds
+                and coverage_key in source_coverage
+                and not source_coverage.get(coverage_key)
+            ):
+                continue
+            coverage_points.append((
+                routine["id"],
+                _coverage_cursor_id(source_index, source),
+                source["kind"],
+                active_source_stamps.get(coverage_key, scan_started_at),
+            ))
 
     for (store, connector), sweep in declarations.items():
         if (store, connector) in duplicate_keys:
@@ -441,7 +481,11 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
                             f"{source_coverage[coverage_key]}"
                         )
                     else:
-                        stamps.append(scan_started_at)
+                        stamps.append(
+                            active_source_stamps.get(
+                                coverage_key, scan_started_at
+                            )
+                        )
                     continue
                 checkpoint = cursors.checkpoint(rid, cursor_id, connector)
                 if checkpoint:
@@ -466,7 +510,7 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
             log(
                 f"routine={sweep['id']} connector state FATAL: {exc}"
             )
-    return coverage_sources
+    return coverage_points
 
 
 # --- sources ----------------------------------------------------------------
