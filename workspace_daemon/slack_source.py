@@ -42,6 +42,9 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 # that requires replaying from catch_up_after rather than only the live overlap.
 CATCH_UP_SCHEMA = 2
 DEFAULT_CENSUS_TIMEOUT = 60 * 60
+MEMBERSHIP_EVENT_SUBTYPES = {
+    "channel_join", "channel_leave", "group_join", "group_leave",
+}
 
 
 def _cli(args, timeout=60):
@@ -192,6 +195,17 @@ def _active_conversation_data(source):
             f"completed_at={data.get('completed_at')}"
         )
     else:
+        if cfg.get("refresh_if_stale", True) is False:
+            reason = (
+                "missing"
+                if checkpoint is None
+                else "stale, incomplete, future-dated, or incompatible"
+            )
+            raise RuntimeError(
+                f"Slack census checkpoint is {reason}; run the configured "
+                "Slack conversation census maintenance routine before this "
+                "consume-only sweep"
+            )
         args = [
             "census",
             "--hours", str(cfg.get("hours", 48)),
@@ -330,6 +344,25 @@ def _activity_ts(message):
     )
 
 
+def _is_membership_event(message):
+    """Slack membership bookkeeping is transport noise, not memory content."""
+    return message.get("subtype") in MEMBERSHIP_EVENT_SUBTYPES
+
+
+def _without_membership_events(messages, channel, context):
+    kept = [
+        message for message in messages
+        if not _is_membership_event(message)
+    ]
+    removed = len(messages) - len(kept)
+    if removed:
+        log(
+            f"slack direct channel={channel} {context}: "
+            f"filtered {removed} membership event(s)"
+        )
+    return kept
+
+
 def _legacy_candidates(source):
     """Backwards-compatible one-candidate-per-thread channel ingestion."""
     seen = {}
@@ -337,6 +370,8 @@ def _legacy_candidates(source):
     for channel in source.get("channels", []):
         data = _cli(_history_args(source, channel))
         for message in data.get("messages", []):
+            if _is_membership_event(message):
+                continue
             sid = message["source_id"]
             activity = _activity_ts(message)
             if activity:
@@ -440,12 +475,22 @@ def _catch_up_direct_candidates(source):
             "--since", root_floor,
             "--limit", "0",
         ]).get("messages", [])
+        membership_roots = sum(_is_membership_event(root) for root in roots)
+        if membership_roots:
+            log(
+                f"slack direct channel={channel} catch-up: "
+                f"filtered {membership_roots} membership event(s)"
+            )
         active_days = set()
         expanded = {}
 
         for root in roots:
             root_ts = root.get("ts")
-            if root_ts and float(root_ts) > since_epoch:
+            if (
+                root_ts
+                and float(root_ts) > since_epoch
+                and not _is_membership_event(root)
+            ):
                 active_days.add(_message_day(root_ts))
 
             latest_reply = root.get("latest_reply")
@@ -464,6 +509,7 @@ def _catch_up_direct_candidates(source):
                     for message in thread
                     if message.get("ts")
                     and float(message["ts"]) > since_epoch
+                    and not _is_membership_event(message)
                 )
 
         if not active_days:
@@ -502,6 +548,7 @@ def _catch_up_direct_candidates(source):
                     ts
                     and float(ts) > boundary_epoch
                     and _message_day(ts) in active_days
+                    and not _is_membership_event(message)
                 ):
                     day = _message_day(ts)
                     messages[ts] = _normalize_direct_message(
@@ -557,6 +604,9 @@ def _direct_digest_candidates(source):
                 f"max_results={per_channel}; older activity may be omitted"
             )
 
+        messages = _without_membership_events(
+            messages, channel, "fixed-window digest"
+        )
         by_day = {}
         for message in messages:
             day = _message_day(message.get("ts"))

@@ -411,22 +411,27 @@ def cmd_joined(args: List[str]) -> None:
     _cmd_conversations(args, "users.conversations", membership_scoped=True)
 
 
-def cmd_census(args: List[str]) -> None:
-    """Find joined conversations with top-level activity in a recent window."""
+def run_census(
+    hours: float = 48,
+    requests_per_minute: int = 40,
+    checkpoint: Optional[Path] = None,
+    progress=None,
+) -> Dict:
+    """Run a fixed-window joined-conversation census and return its report.
+
+    This shared entry point lets the daemon's scheduled maintenance routine
+    stream progress directly into the operational log. The CLI command remains
+    a small JSON-rendering wrapper around the same behavior.
+    """
     from . import slack_census
 
-    hours = float(opt(args, "--hours", 48))
-    rpm = int(opt(args, "--requests-per-minute", 40))
     if hours <= 0:
-        die("census hours must be greater than zero")
-    if rpm < 1 or rpm > 50:
-        die("census requests per minute must be between 1 and 50")
-    checkpoint_value = opt(args, "--checkpoint")
-    checkpoint = (
-        Path(checkpoint_value).expanduser()
-        if checkpoint_value
-        else None
-    )
+        raise ValueError("census hours must be greater than zero")
+    if requests_per_minute < 1 or requests_per_minute > 50:
+        raise ValueError(
+            "census requests per minute must be between 1 and 50"
+        )
+    checkpoint = Path(checkpoint).expanduser() if checkpoint else None
     existing = slack_census.load_resumable_checkpoint(checkpoint)
     restart = False
     if existing:
@@ -461,9 +466,9 @@ def cmd_census(args: List[str]) -> None:
         slack_request,
         cutoff_epoch,
         until_epoch=until_epoch,
-        requests_per_minute=rpm,
+        requests_per_minute=requests_per_minute,
         checkpoint=checkpoint,
-        progress=lambda message: print(message, file=sys.stderr, flush=True),
+        progress=progress,
         resume=not restart,
     )
     fatal = slack_census.fatal_errors(result["errors"])
@@ -482,8 +487,31 @@ def cmd_census(args: List[str]) -> None:
         "errors": result["errors"],
         "checkpoint": str(checkpoint) if checkpoint else None,
     }
+    return payload
+
+
+def cmd_census(args: List[str]) -> None:
+    """Find joined conversations with top-level activity in a recent window."""
+    hours = float(opt(args, "--hours", 48))
+    rpm = int(opt(args, "--requests-per-minute", 40))
+    if hours <= 0:
+        die("census hours must be greater than zero")
+    if rpm < 1 or rpm > 50:
+        die("census requests per minute must be between 1 and 50")
+    checkpoint_value = opt(args, "--checkpoint")
+    checkpoint = (
+        Path(checkpoint_value).expanduser()
+        if checkpoint_value
+        else None
+    )
+    payload = run_census(
+        hours=hours,
+        requests_per_minute=rpm,
+        checkpoint=checkpoint,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
     out(payload)
-    if fatal:
+    if not payload["ok"]:
         raise SystemExit(1)
 
 

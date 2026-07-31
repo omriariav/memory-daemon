@@ -351,6 +351,52 @@ class PrivateDigestTest(unittest.TestCase):
         self.assertIn("unsupported_event", messages[0]["text"])
         self.assertIn("retaining activity", log.call_args.args[0])
 
+    def test_catch_up_removes_membership_events_before_digesting(self):
+        membership = {
+            "source_id": "slack:CDIRECT:1785232800.0",
+            "ts": "1785232800.0",
+            "user": "U1",
+            "text": "<@U1> has joined the channel",
+            "subtype": "channel_join",
+            "reply_count": 0,
+        }
+        durable = {
+            "source_id": "slack:CDIRECT:1785232860.0",
+            "ts": "1785232860.0",
+            "user": "U2",
+            "text": "Decision: use the safer rollout.",
+            "reply_count": 0,
+        }
+        source = {
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "max_results": 0,
+            "catch_up": True,
+            "_since": "2026-07-28T09:00:00Z",
+            "_catch_up_boundary": "2026-07-28T08:30:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
+        }
+
+        with mock.patch.object(
+            slack_source,
+            "_cli",
+            return_value={"ok": True, "messages": [membership, durable]},
+        ):
+            candidates = slack_source.candidates(source)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            [row["text"] for row in candidates[0]["raw"]["messages"]],
+            ["Decision: use the safer rollout."],
+        )
+
+        with mock.patch.object(
+            slack_source,
+            "_cli",
+            return_value={"ok": True, "messages": [membership]},
+        ):
+            self.assertEqual(slack_source.candidates(source), [])
+
     def test_wider_root_floor_changes_version_when_latest_is_unchanged(self):
         latest = {
             "source_id": "slack:CDIRECT:1785232800.0",
@@ -554,6 +600,33 @@ class ActiveConversationSweepTest(unittest.TestCase):
         self.assertEqual(args[:3], ["census", "--hours", "48"])
         self.assertNotIn("--checkpoint", args)
         self.assertEqual(effective["direct_channels"], [])
+
+    def test_consume_only_sweep_fails_on_stale_cache_without_census_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1h",
+                    "requests_per_minute": 40,
+                    "refresh_if_stale": False,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli"
+            ) as cli, self.assertRaisesRegex(
+                RuntimeError, "consume-only sweep"
+            ):
+                slack_source._with_active_conversations(source)
+
+        cli.assert_not_called()
 
     def test_future_completed_timestamp_is_not_treated_as_fresh(self):
         with tempfile.TemporaryDirectory() as tmp:

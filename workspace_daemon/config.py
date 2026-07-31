@@ -13,7 +13,10 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila"}
-VALID_ROUTINE_ROLES = {"general", "domain", "specialized", "partial"}
+VALID_ROUTINE_ROLES = {
+    "general", "domain", "specialized", "partial", "maintenance",
+}
+VALID_MAINTENANCE_KINDS = {"slack_conversation_census"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -62,6 +65,11 @@ def sources(routine):
         return routine["sources"]
     source = routine.get("source")
     return [source] if isinstance(source, dict) else []
+
+
+def is_maintenance(routine):
+    """Whether this routine performs scheduled source maintenance only."""
+    return "maintenance" in routine
 
 
 def source_actions(routine, source):
@@ -299,8 +307,10 @@ def validate(routine):
     """Return a list of human-readable problems; empty means valid."""
     problems = []
     rid = routine.get("id", "<missing id>")
+    maintenance_routine = is_maintenance(routine)
 
-    for key in REQUIRED_TOP_LEVEL:
+    required = ["id"] if maintenance_routine else REQUIRED_TOP_LEVEL
+    for key in required:
         if key not in routine:
             problems.append(f"{rid}: missing required top-level key '{key}'")
     if "id" in routine and (
@@ -319,6 +329,68 @@ def validate(routine):
             f"{rid}: role must be one of "
             f"{', '.join(sorted(VALID_ROUTINE_ROLES))}"
         )
+    elif role == "maintenance" and not maintenance_routine:
+        problems.append(
+            f"{rid}: role: maintenance requires a `maintenance` block"
+        )
+
+    if maintenance_routine:
+        if role != "maintenance":
+            problems.append(
+                f"{rid}: maintenance routines require role: maintenance"
+            )
+        forbidden = [
+            key for key in (
+                "source", "sources", "analyze", "output", "memory",
+                "actions", "routing",
+            )
+            if key in routine
+        ]
+        if forbidden:
+            problems.append(
+                f"{rid}: maintenance routines cannot set "
+                f"{', '.join(sorted(forbidden))}"
+            )
+        maintenance = routine.get("maintenance")
+        if not isinstance(maintenance, dict):
+            problems.append(f"{rid}: `maintenance` must be a mapping")
+        else:
+            unknown = set(maintenance) - {
+                "kind", "checkpoint", "hours", "requests_per_minute",
+            }
+            if unknown:
+                problems.append(
+                    f"{rid}: maintenance has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}"
+                )
+            kind = maintenance.get("kind")
+            if kind not in VALID_MAINTENANCE_KINDS:
+                problems.append(
+                    f"{rid}: maintenance.kind must be one of "
+                    f"{', '.join(sorted(VALID_MAINTENANCE_KINDS))}"
+                )
+            checkpoint = maintenance.get("checkpoint")
+            if not isinstance(checkpoint, str) or not checkpoint:
+                problems.append(f"{rid}: maintenance.checkpoint is required")
+            hours = maintenance.get("hours", 48)
+            if (
+                not isinstance(hours, (int, float))
+                or isinstance(hours, bool)
+                or hours <= 0
+            ):
+                problems.append(f"{rid}: maintenance.hours must be positive")
+            rpm = maintenance.get("requests_per_minute", 40)
+            if (
+                not isinstance(rpm, int)
+                or isinstance(rpm, bool)
+                or not 1 <= rpm <= 50
+            ):
+                problems.append(
+                    f"{rid}: maintenance.requests_per_minute must be an "
+                    "integer from 1 to 50"
+                )
+        problems.extend(_validate_schedule(routine))
+        return problems
 
     has_source = "source" in routine
     has_sources = "sources" in routine
@@ -530,21 +602,7 @@ def validate(routine):
                     "streams.*.message_updates"
                 )
 
-    schedule = routine.get("schedule")
-    if schedule is not None:
-        if not isinstance(schedule, dict):
-            problems.append(f"{rid}: `schedule` must be a mapping")
-        else:
-            unknown = set(schedule) - {"every", "work_hours"}
-            if unknown:
-                problems.append(
-                    f"{rid}: schedule has unknown key(s) {', '.join(sorted(unknown))} "
-                    f"(valid: every, work_hours)"
-                )
-            try:
-                schedule_seconds(routine)
-            except RoutineError as exc:
-                problems.append(str(exc))
+    problems.extend(_validate_schedule(routine))
 
     routing = routine.get("routing")
     if routing is not None:
@@ -563,6 +621,29 @@ def validate(routine):
             if not isinstance(priority, int) or isinstance(priority, bool):
                 problems.append(f"{rid}: routing.priority must be an integer")
 
+    return problems
+
+
+def _validate_schedule(routine):
+    """Validate the cadence shared by capture and maintenance routines."""
+    problems = []
+    rid = routine.get("id", "<missing id>")
+    schedule = routine.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            problems.append(f"{rid}: `schedule` must be a mapping")
+        else:
+            unknown = set(schedule) - {"every", "work_hours"}
+            if unknown:
+                problems.append(
+                    f"{rid}: schedule has unknown key(s) "
+                    f"{', '.join(sorted(unknown))} "
+                    f"(valid: every, work_hours)"
+                )
+            try:
+                schedule_seconds(routine)
+            except RoutineError as exc:
+                problems.append(str(exc))
     return problems
 
 
@@ -648,7 +729,7 @@ def _validate_source(routine, source, prefix):
             else:
                 unknown = set(active_conversations) - {
                     "checkpoint", "hours", "refresh_every",
-                    "requests_per_minute",
+                    "requests_per_minute", "refresh_if_stale",
                 }
                 if unknown:
                     problems.append(
@@ -703,6 +784,14 @@ def _validate_source(routine, source, prefix):
                     problems.append(
                         f"{prefix}.active_conversations.requests_per_minute "
                         "must be an integer from 1 to 50"
+                    )
+                refresh_if_stale = active_conversations.get(
+                    "refresh_if_stale", True
+                )
+                if not isinstance(refresh_if_stale, bool):
+                    problems.append(
+                        f"{prefix}.active_conversations.refresh_if_stale "
+                        "must be true or false"
                     )
         if (
             not configured
