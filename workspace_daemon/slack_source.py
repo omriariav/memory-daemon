@@ -143,6 +143,9 @@ def _completed_epoch(checkpoint):
 
 def _census_window_hours(checkpoint):
     """Return a completed checkpoint's fixed snapshot width, if known."""
+    reported = checkpoint.get("window_hours")
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        return float(reported)
     try:
         cutoff = float(checkpoint["cutoff_epoch"])
         until = float(checkpoint["until_epoch"])
@@ -156,6 +159,9 @@ def _active_conversation_data(source):
     cfg = source.get("active_conversations")
     if not cfg:
         return None
+    gap = source.get("_active_conversation_gap")
+    if gap:
+        raise RuntimeError(str(gap))
     checkpoint_path = _census_path(cfg["checkpoint"])
     checkpoint = slack_census.load_checkpoint(checkpoint_path)
     now = _rfc3339_epoch(utc_now_iso())
@@ -200,6 +206,16 @@ def _active_conversation_data(source):
         mode = "previewing" if source.get("_dry_run") else "refreshing"
         log(f"slack census cache stale or absent; {mode} fixed-window census")
         data = _cli(args, timeout=DEFAULT_CENSUS_TIMEOUT)
+    returned_hours = _census_window_hours(data)
+    if (
+        returned_hours is None
+        or abs(returned_hours - requested_hours) >= (1 / 3600)
+    ):
+        observed = "unknown" if returned_hours is None else f"{returned_hours:g}h"
+        raise RuntimeError(
+            "Slack census returned an incompatible window: "
+            f"requested {requested_hours:g}h, received {observed}"
+        )
     errors = data.get("errors") or []
     fatal = slack_census.fatal_errors(errors)
     if fatal:

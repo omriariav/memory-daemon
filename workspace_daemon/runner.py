@@ -188,6 +188,27 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 override = {"_since": since}
                 if kind == "slack" and source.get("catch_up_after"):
                     override["_catch_up_boundary"] = source["catch_up_after"]
+                if (
+                    checkpoint
+                    and kind == "slack"
+                    and source.get("active_conversations")
+                ):
+                    scan_second, _ = time_utils.rfc3339_key(scan_started_at)
+                    census_hours = float(
+                        source["active_conversations"].get("hours", 48)
+                    )
+                    discovery_floor = scan_second - datetime.timedelta(
+                        hours=census_hours
+                    )
+                    if time_utils.rfc3339_key(checkpoint) < (
+                        discovery_floor, 0
+                    ):
+                        override["_active_conversation_gap"] = (
+                            "Slack active-conversation coverage gap exceeds "
+                            f"the {census_hours:g}h discovery window; run a "
+                            "manual broader census/backfill before advancing "
+                            "this routine"
+                        )
                 source_overrides[(routine["id"], source_index)] = override
                 log(
                     f"routine={routine['id']} source={kind} catch-up since={since}"

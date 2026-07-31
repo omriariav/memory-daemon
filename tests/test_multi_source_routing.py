@@ -1058,6 +1058,54 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             upgraded_id = runner._catch_up_cursor_id(routine["source"])
         self.assertNotEqual(original_id, upgraded_id)
 
+    def test_slack_active_conversation_gap_fails_and_holds_cursor(self):
+        routine = {
+            "id": "slack-general",
+            "enabled": True,
+            "source": {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(self.base / "state" / "census.json"),
+                    "hours": 48,
+                    "refresh_every": "1d",
+                    "requests_per_minute": 40,
+                },
+                "max_results": 0,
+                "catch_up": True,
+                "catch_up_overlap": "1h",
+                "catch_up_after": "2026-07-28T08:00:00Z",
+                "reply_roots_after": "2026-07-28T08:00:00Z",
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "slack-vault"),
+                "slug_prefix": "slack",
+            },
+        }
+        cursor_id = runner._catch_up_cursor_id(routine["source"])
+        cursors = state.CursorStore(self.base)
+        cursors.mark_successful(
+            [("slack-general", cursor_id, "slack")],
+            "2026-07-28T10:00:00Z",
+        )
+
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-31T10:00:00Z",
+        ):
+            totals = runner.run(self.base, [routine])
+
+        self.assertEqual(totals["errors"], 1)
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "slack-general", cursor_id, "slack"
+            ),
+            "2026-07-28T10:00:00Z",
+        )
+
     def test_listing_failure_holds_prior_cursor(self):
         def candidates(source):
             raise RuntimeError("source unavailable")

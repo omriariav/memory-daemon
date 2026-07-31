@@ -180,6 +180,7 @@ def run(
     checkpoint=None,
     progress=None,
     sleep=time.sleep,
+    resume=True,
 ):
     """Probe one recent top-level message per conversation.
 
@@ -191,7 +192,7 @@ def run(
         raise ValueError("requests_per_minute must be between 1 and 50")
     progress = progress or (lambda _message: None)
     checkpoint = Path(checkpoint) if checkpoint else None
-    existing = load_resumable_checkpoint(checkpoint)
+    existing = load_resumable_checkpoint(checkpoint) if resume else None
 
     inventory = [
         {

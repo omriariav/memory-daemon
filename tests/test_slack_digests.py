@@ -527,6 +527,7 @@ class ActiveConversationSweepTest(unittest.TestCase):
             self._checkpoint(checkpoint)
             census = {
                 "ok": True,
+                "window_hours": 48,
                 "cutoff_at": "2026-07-30T10:00:00Z",
                 "active": [],
                 "errors": [],
@@ -578,6 +579,7 @@ class ActiveConversationSweepTest(unittest.TestCase):
                 slack_source, "_cli",
                 return_value={
                     "ok": True,
+                    "window_hours": 48,
                     "cutoff_at": "2026-07-29T09:00:00Z",
                     "active": [],
                     "errors": [],
@@ -608,6 +610,7 @@ class ActiveConversationSweepTest(unittest.TestCase):
                 slack_source, "_cli",
                 return_value={
                     "ok": True,
+                    "window_hours": 24,
                     "cutoff_at": "2026-07-29T09:00:00Z",
                     "active": [],
                     "errors": [],
@@ -644,6 +647,7 @@ class ActiveConversationSweepTest(unittest.TestCase):
                 slack_source, "_cli",
                 return_value={
                     "ok": True,
+                    "window_hours": 48,
                     "cutoff_at": "2026-07-29T09:00:00Z",
                     "active": [],
                     "errors": [],
@@ -652,6 +656,37 @@ class ActiveConversationSweepTest(unittest.TestCase):
                 slack_source._with_active_conversations(source)
 
         self.assertEqual(cli.call_args.args[0][0], "census")
+
+    def test_refreshed_census_window_is_revalidated_before_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1h",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli",
+                return_value={
+                    "ok": True,
+                    "window_hours": 1,
+                    "cutoff_at": "2026-07-31T08:00:00Z",
+                    "active": [],
+                    "errors": [],
+                },
+            ), self.assertRaisesRegex(
+                RuntimeError, "requested 48h, received 1h"
+            ):
+                slack_source._with_active_conversations(source)
 
 
 class MentionOwnershipTest(unittest.TestCase):

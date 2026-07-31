@@ -476,6 +476,45 @@ class CensusCommandTest(unittest.TestCase):
         self.assertEqual(payload["error_count"], 1)
         self.assertEqual(payload["fatal_error_count"], 0)
 
+    def test_changed_window_restarts_incompatible_partial_checkpoint(self):
+        partial = {
+            "cutoff_at": "2026-07-30T09:00:00Z",
+            "cutoff_epoch": 100,
+            "until_at": "2026-07-30T10:00:00Z",
+            "until_epoch": 3700,
+            "inventory": [{"id": "C-OLD"}],
+            "next_index": 1,
+            "active": [],
+            "errors": [],
+        }
+        refreshed = {
+            "cutoff_at": "2026-07-29T10:00:00Z",
+            "cutoff_epoch": 100,
+            "until_at": "2026-07-31T10:00:00Z",
+            "until_epoch": 172900,
+            "inventory": [{"id": "C-NEW"}],
+            "active": [],
+            "errors": [],
+        }
+        stream = StringIO()
+        with mock.patch(
+            "workspace_daemon.slack_census.load_resumable_checkpoint",
+            return_value=partial,
+        ), mock.patch.object(
+            slack_cli, "list_conversations", return_value=[{"id": "C-NEW"}]
+        ) as listing, mock.patch(
+            "workspace_daemon.slack_census.run", return_value=refreshed
+        ) as census, redirect_stdout(stream):
+            slack_cli.cmd_census([
+                "--hours", "48",
+                "--checkpoint", "/tmp/census.json",
+            ])
+
+        listing.assert_called_once()
+        self.assertFalse(census.call_args.kwargs["resume"])
+        self.assertEqual(census.call_args.args[0], [{"id": "C-NEW"}])
+        self.assertTrue(json.loads(stream.getvalue())["ok"])
+
     def test_completed_checkpoint_refreshes_conversation_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / "census.json"

@@ -366,15 +366,21 @@ A completed checkpoint is reused until `refresh_every` elapses. Refreshes are
 fixed-window snapshots and are resumable on real runs; dry runs never write the
 checkpoint. `refresh_every` must not exceed `hours`, and changing `hours`
 invalidates an otherwise fresh cache. Freshness is measured from the snapshot's
-upper boundary, not from when a long census happened to finish. Stale
-inaccessible conversation rows are reported as warnings, while permission,
-authentication, and other coverage errors fail the sweep closed. The active set
-is read through the normal direct-history path, so both incoming and outgoing
-messages are eligible and ledgered daily versions prevent unchanged overlap
-from reaching the model twice. Slack's history API cannot discover a new reply
-whose root predates the census window in a conversation that had no recent
-top-level message; pin such critical channels explicitly with
-`direct_channels`.
+upper boundary, not from when a long census happened to finish. An interrupted
+checkpoint built for a different window is restarted rather than resumed.
+Stale inaccessible conversation rows are reported as warnings, while
+permission, authentication, and other coverage errors fail the sweep closed.
+The active set is read through the normal direct-history path, so both incoming
+and outgoing messages are eligible and ledgered daily versions prevent
+unchanged overlap from reaching the model twice.
+
+If the daemon has not completed this source within the configured census
+window, it fails closed and holds its cursor: a quiet conversation that was
+active only during that gap can no longer be discovered safely. Run a manual
+broader census/backfill before resuming. Slack's history API also cannot
+discover a new reply whose root predates the census window in a conversation
+that had no recent top-level message; pin such critical channels explicitly
+with `direct_channels`.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
