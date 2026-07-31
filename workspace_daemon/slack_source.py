@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 from .chat_text import redact_secrets, slack_timestamp_iso, timestamped_line
+from . import slack_census
 from .shell import ada_bin, log, utc_now_iso
 
 
@@ -40,6 +41,7 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 # Bump when recurring candidate construction or enrichment changes in a way
 # that requires replaying from catch_up_after rather than only the live overlap.
 CATCH_UP_SCHEMA = 2
+DEFAULT_CENSUS_TIMEOUT = 60 * 60
 
 
 def _cli(args, timeout=60):
@@ -113,6 +115,122 @@ def configured_channels(source):
         )
         for channel in source.get(key, [])
     }
+
+
+def _census_path(value):
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_DIR / path
+
+
+def _duration_seconds(value):
+    raw = str(value)
+    unit = raw[-1:] if raw else ""
+    if not raw[:-1].isdigit() or unit not in {"m", "h", "d"}:
+        raise RuntimeError(
+            "Slack active-conversation refresh_every must look like "
+            "'15m', '4h', or '1d'"
+        )
+    return int(raw[:-1]) * {"m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def _completed_epoch(checkpoint):
+    completed = checkpoint.get("completed_at")
+    if not completed:
+        return None
+    raw = completed[:-1] + "+00:00" if completed.endswith("Z") else completed
+    return datetime.datetime.fromisoformat(raw).timestamp()
+
+
+def _active_conversation_data(source):
+    """Load or refresh the fixed-window census feeding a broad Slack sweep."""
+    cfg = source.get("active_conversations")
+    if not cfg:
+        return None
+    checkpoint_path = _census_path(cfg["checkpoint"])
+    checkpoint = slack_census.load_checkpoint(checkpoint_path)
+    now = _rfc3339_epoch(utc_now_iso())
+    completed = _completed_epoch(checkpoint) if checkpoint else None
+    refresh_seconds = _duration_seconds(cfg.get("refresh_every", "1d"))
+    fresh = (
+        checkpoint is not None
+        and completed is not None
+        and completed <= now
+        and now - completed < refresh_seconds
+    )
+    if fresh:
+        data = checkpoint
+        log(
+            "slack census cache fresh: "
+            f"active={len(data.get('active') or [])} "
+            f"completed_at={data.get('completed_at')}"
+        )
+    else:
+        args = [
+            "census",
+            "--hours", str(cfg.get("hours", 48)),
+            "--requests-per-minute",
+            str(cfg.get("requests_per_minute", 40)),
+        ]
+        if not source.get("_dry_run"):
+            args.extend(["--checkpoint", str(checkpoint_path)])
+        mode = "previewing" if source.get("_dry_run") else "refreshing"
+        log(f"slack census cache stale or absent; {mode} fixed-window census")
+        data = _cli(args, timeout=DEFAULT_CENSUS_TIMEOUT)
+    errors = data.get("errors") or []
+    fatal = slack_census.fatal_errors(errors)
+    if fatal:
+        raise RuntimeError(
+            "Slack census has fatal coverage errors: "
+            + ", ".join(
+                f"{row.get('id', '?')}={row.get('error', 'unknown')}"
+                for row in fatal[:10]
+            )
+        )
+    if errors:
+        log(
+            "slack census WARN ignored stale/unreadable conversations: "
+            + ", ".join(
+                f"{row.get('id', '?')}={row.get('error', 'unknown')}"
+                for row in errors[:10]
+            )
+        )
+    return data
+
+
+def _with_active_conversations(source):
+    """Materialize census-selected IDs as direct-history channels."""
+    data = _active_conversation_data(source)
+    if data is None:
+        return source
+    excluded = set(source.get("_exclude_channels") or ())
+    active = [
+        row["id"]
+        for row in data.get("active") or []
+        if row.get("id") and row["id"] not in excluded
+    ]
+    merged = list(dict.fromkeys([
+        *source.get("direct_channels", []),
+        *source.get("private_channels", []),
+        *active,
+    ]))
+    effective = dict(source)
+    effective["direct_channels"] = merged
+    effective.pop("private_channels", None)
+
+    # A conversation can first enter the census after the global catch-up
+    # cursor has moved beyond its recent messages. Re-read from the census
+    # floor; stable daily source IDs and content versions absorb the overlap.
+    cutoff = data.get("cutoff_at")
+    if cutoff and source.get("_since"):
+        effective["_since"] = min(
+            (source["_since"], cutoff),
+            key=_rfc3339_epoch,
+        )
+    log(
+        f"slack active-conversation scope: selected={len(active)} "
+        f"excluded_owned={len(excluded)} total_direct={len(merged)}"
+    )
+    return effective
 
 
 def _mention_excluded_channels(source):
@@ -473,6 +591,7 @@ def _ada_digest_candidates(source):
 
 def candidates(source):
     """List digest candidates plus legacy threads and out-of-channel mentions."""
+    source = _with_active_conversations(source)
     out = _ada_digest_candidates(source)
     if source.get("catch_up"):
         out.extend(_catch_up_direct_candidates(source))

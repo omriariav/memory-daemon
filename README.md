@@ -344,6 +344,35 @@ reply to a thread whose root predates the census window is not discoverable
 through `conversations.history`; use the normal routine's wider
 `reply_roots_after` scan after choosing the recurring scope.
 
+The census can also feed a recurring fallback directly. This discovers joined
+public channels, private channels, DMs, and group DMs with recent top-level
+activity, while explicit channels declared by domain routines remain excluded:
+
+```yaml
+kind: slack
+active_conversations:
+  checkpoint: state/slack-census.json
+  hours: 48
+  refresh_every: 1d
+  requests_per_minute: 40
+max_results: 0
+catch_up: true
+catch_up_overlap: 1h
+catch_up_after: "2026-07-28T08:00:00Z"
+reply_roots_after: "2026-06-28T08:00:00Z"
+```
+
+A completed checkpoint is reused until `refresh_every` elapses. Refreshes are
+fixed-window snapshots and are resumable on real runs; dry runs never write the
+checkpoint. Stale inaccessible conversation rows are reported as warnings,
+while permission, authentication, and other coverage errors fail the sweep
+closed. The active set is read through the normal direct-history path, so both
+incoming and outgoing messages are eligible and ledgered daily versions prevent
+unchanged overlap from reaching the model twice. Slack's history API cannot
+discover a new reply whose root predates the census window in a conversation
+that had no recent top-level message; pin such critical channels explicitly
+with `direct_channels`.
+
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
 `schedule.work_hours` override, runs due owners sequentially under the existing

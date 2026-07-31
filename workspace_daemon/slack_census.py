@@ -9,6 +9,22 @@ from . import state
 
 
 CENSUS_VERSION = 1
+IGNORABLE_CONVERSATION_ERRORS = {
+    # Slack can retain stale DM/channel rows in users.conversations after the
+    # conversation is no longer readable. They are not evidence that the
+    # remainder of the fixed-window census is incomplete.
+    "channel_not_found",
+    "is_archived",
+    "not_in_channel",
+}
+
+
+def fatal_errors(errors):
+    """Errors that make a completed census unsafe to consume."""
+    return [
+        row for row in errors
+        if row.get("error") not in IGNORABLE_CONVERSATION_ERRORS
+    ]
 
 
 def _checkpoint_error(path, detail):

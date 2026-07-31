@@ -21,6 +21,21 @@ class CensusTest(unittest.TestCase):
         {"id": "G3", "name": "mpdm-a--b", "is_mpim": True, "is_private": True},
     ]
 
+    def test_only_stale_conversation_errors_are_nonfatal(self):
+        errors = [
+            {"id": "D1", "error": "channel_not_found"},
+            {"id": "C2", "error": "is_archived"},
+            {"id": "G3", "error": "not_in_channel"},
+        ]
+        self.assertEqual(slack_census.fatal_errors(errors), [])
+        self.assertEqual(
+            slack_census.fatal_errors([
+                *errors,
+                {"id": "C4", "error": "missing_scope"},
+            ]),
+            [{"id": "C4", "error": "missing_scope"}],
+        )
+
     def test_rejects_checkpoint_with_out_of_range_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / "census.json"

@@ -639,10 +639,63 @@ def _validate_source(routine, source, prefix):
                 problems.append(f"{prefix}.{key} entries must be channel ID strings")
                 continue
             configured.extend((key, value) for value in values)
-        if not configured and not source.get("include_mentions"):
+        active_conversations = source.get("active_conversations")
+        if active_conversations is not None:
+            if not isinstance(active_conversations, dict):
+                problems.append(
+                    f"{prefix}.active_conversations must be a mapping"
+                )
+            else:
+                unknown = set(active_conversations) - {
+                    "checkpoint", "hours", "refresh_every",
+                    "requests_per_minute",
+                }
+                if unknown:
+                    problems.append(
+                        f"{prefix}.active_conversations has unknown key(s): "
+                        f"{', '.join(sorted(unknown))}"
+                    )
+                checkpoint = active_conversations.get("checkpoint")
+                if not isinstance(checkpoint, str) or not checkpoint:
+                    problems.append(
+                        f"{prefix}.active_conversations.checkpoint is required"
+                    )
+                hours = active_conversations.get("hours", 48)
+                if (
+                    not isinstance(hours, (int, float))
+                    or isinstance(hours, bool)
+                    or hours <= 0
+                ):
+                    problems.append(
+                        f"{prefix}.active_conversations.hours must be positive"
+                    )
+                refresh = active_conversations.get("refresh_every", "1d")
+                try:
+                    duration_seconds(refresh)
+                except RoutineError:
+                    problems.append(
+                        f"{prefix}.active_conversations.refresh_every must "
+                        "look like '15m', '4h', or '1d'"
+                    )
+                rpm = active_conversations.get("requests_per_minute", 40)
+                if (
+                    not isinstance(rpm, int)
+                    or isinstance(rpm, bool)
+                    or not 1 <= rpm <= 50
+                ):
+                    problems.append(
+                        f"{prefix}.active_conversations.requests_per_minute "
+                        "must be an integer from 1 to 50"
+                    )
+        if (
+            not configured
+            and not source.get("include_mentions")
+            and not active_conversations
+        ):
             problems.append(
                 f"{prefix}: source.kind 'slack' needs channels, ada_channels, "
-                "direct_channels, private_channels, and/or include_mentions: true"
+                "direct_channels, private_channels, active_conversations, "
+                "and/or include_mentions: true"
             )
         owners = {}
         for key, channel in configured:
@@ -681,6 +734,7 @@ def _validate_source(routine, source, prefix):
             direct = (
                 source.get("direct_channels")
                 or source.get("private_channels")
+                or source.get("active_conversations")
             )
             reply_roots_after = source.get("reply_roots_after")
             if direct and reply_roots_after is None:

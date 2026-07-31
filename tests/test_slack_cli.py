@@ -422,7 +422,7 @@ class CensusCommandTest(unittest.TestCase):
         self.assertIn("between 1 and 50", stream.getvalue())
         listing.assert_not_called()
 
-    def test_returns_nonzero_when_any_conversation_was_not_checked(self):
+    def test_returns_nonzero_for_fatal_conversation_coverage_error(self):
         result = {
             "cutoff_at": "2026-07-28T10:00:00Z",
             "cutoff_epoch": 10,
@@ -430,7 +430,7 @@ class CensusCommandTest(unittest.TestCase):
             "until_epoch": 20,
             "inventory": [{"id": "C1"}],
             "active": [],
-            "errors": [{"id": "C1", "error": "not_in_channel"}],
+            "errors": [{"id": "C1", "error": "missing_scope"}],
         }
         stream = StringIO()
         with mock.patch.object(
@@ -445,7 +445,36 @@ class CensusCommandTest(unittest.TestCase):
             slack_cli.cmd_census([])
 
         self.assertEqual(stopped.exception.code, 1)
-        self.assertFalse(json.loads(stream.getvalue())["ok"])
+        payload = json.loads(stream.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["fatal_error_count"], 1)
+
+    def test_stale_conversation_error_remains_visible_but_nonfatal(self):
+        result = {
+            "cutoff_at": "2026-07-28T10:00:00Z",
+            "cutoff_epoch": 10,
+            "until_at": "2026-07-30T10:00:00Z",
+            "until_epoch": 20,
+            "inventory": [{"id": "D1"}],
+            "active": [],
+            "errors": [{"id": "D1", "error": "channel_not_found"}],
+        }
+        stream = StringIO()
+        with mock.patch.object(
+            slack_cli, "list_conversations", return_value=[{"id": "D1"}]
+        ), mock.patch(
+            "workspace_daemon.slack_census.load_resumable_checkpoint",
+            return_value=None,
+        ), mock.patch(
+            "workspace_daemon.slack_census.run",
+            return_value=result,
+        ), redirect_stdout(stream):
+            slack_cli.cmd_census([])
+
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["error_count"], 1)
+        self.assertEqual(payload["fatal_error_count"], 0)
 
     def test_completed_checkpoint_refreshes_conversation_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:

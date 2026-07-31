@@ -36,6 +36,7 @@ def _catch_up_cursor_id(source):
             )
         }
         scope.update({
+            "active_conversations": source.get("active_conversations"),
             "include_mentions": source.get("include_mentions") is True,
             "catch_up_after": source.get("catch_up_after"),
             "reply_roots_after": source.get("reply_roots_after"),
@@ -192,6 +193,18 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     f"routine={routine['id']} source={kind} catch-up since={since}"
                 )
             catch_up_sources.append((routine["id"], cursor_id, kind))
+
+    # Source adapters may need to distinguish a real run from a read-only
+    # preview. Keep this runtime-only flag out of routine files and cursor
+    # fingerprints (underscore-prefixed fields are deliberately ignored).
+    for routine in valid:
+        for source_index, source in enumerate(config.sources(routine)):
+            if source.get("kind") not in active_source_kinds:
+                continue
+            override = source_overrides.setdefault(
+                (routine["id"], source_index), {}
+            )
+            override["_dry_run"] = dry_run
 
     source_coverage = {}
     claims, listing_failures = _collect_claims(
@@ -823,6 +836,8 @@ SOURCES = {
 def _scope(source):
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
+    if source.get("kind") == "slack" and source.get("active_conversations"):
+        return "recently active Slack conversations"
     if source.get("kind") == "mila":
         return source.get("recordings_file") or "Mila recordings"
     slack_channels = [
@@ -1103,6 +1118,13 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             listing_source = dict(
                 listing_source,
                 _exclude_mention_channels=sorted(claimed_slack_channels),
+            )
+        if kind == "slack" and source.get("active_conversations"):
+            # The census-fed general sweep is workspace-wide. Explicit domain
+            # and specialized channels remain owned by their declared routine.
+            listing_source = dict(
+                listing_source,
+                _exclude_channels=sorted(claimed_slack_channels),
             )
         if kind == "gchat" and source.get("all_spaces"):
             # A configured explicit space remains owned even while its domain

@@ -452,8 +452,9 @@ def cmd_census(args: List[str]) -> None:
         checkpoint=checkpoint,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
     )
+    fatal = slack_census.fatal_errors(result["errors"])
     payload = {
-        "ok": not result["errors"],
+        "ok": not fatal,
         "window_hours": (
             float(result["until_epoch"]) - float(result["cutoff_epoch"])
         ) / 3600,
@@ -462,12 +463,13 @@ def cmd_census(args: List[str]) -> None:
         "considered": len(result["inventory"]),
         "active_count": len(result["active"]),
         "error_count": len(result["errors"]),
+        "fatal_error_count": len(fatal),
         "active": result["active"],
         "errors": result["errors"],
         "checkpoint": str(checkpoint) if checkpoint else None,
     }
     out(payload)
-    if result["errors"]:
+    if fatal:
         raise SystemExit(1)
 
 
