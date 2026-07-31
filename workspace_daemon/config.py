@@ -661,21 +661,38 @@ def _validate_source(routine, source, prefix):
                         f"{prefix}.active_conversations.checkpoint is required"
                     )
                 hours = active_conversations.get("hours", 48)
+                valid_hours = (
+                    isinstance(hours, (int, float))
+                    and not isinstance(hours, bool)
+                    and hours > 0
+                )
                 if (
-                    not isinstance(hours, (int, float))
-                    or isinstance(hours, bool)
-                    or hours <= 0
+                    not valid_hours
                 ):
                     problems.append(
                         f"{prefix}.active_conversations.hours must be positive"
                     )
                 refresh = active_conversations.get("refresh_every", "1d")
                 try:
-                    duration_seconds(refresh)
+                    refresh_seconds = duration_seconds(refresh)
                 except RoutineError:
+                    refresh_seconds = None
                     problems.append(
                         f"{prefix}.active_conversations.refresh_every must "
                         "look like '15m', '4h', or '1d'"
+                    )
+                if (
+                    valid_hours
+                    and refresh_seconds is not None
+                    and refresh_seconds > float(hours) * 60 * 60
+                ):
+                    problems.append(
+                        f"{prefix}.active_conversations.refresh_every must "
+                        "not exceed its hours window"
+                    )
+                if source.get("catch_up") is not True:
+                    problems.append(
+                        f"{prefix}.active_conversations requires catch_up: true"
                     )
                 rpm = active_conversations.get("requests_per_minute", 40)
                 if (

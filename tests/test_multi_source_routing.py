@@ -880,6 +880,16 @@ class ConnectorCoverageTest(unittest.TestCase):
             [],
         ))
 
+    def test_active_slack_census_is_a_fixed_window_even_with_catch_up(self):
+        self.assertEqual(
+            runner._fixed_window_seconds({
+                "kind": "slack",
+                "active_conversations": {"hours": 48},
+                "catch_up": True,
+            }),
+            48 * 60 * 60,
+        )
+
 
 class CatchUpCursorRunnerTest(unittest.TestCase):
     def setUp(self):

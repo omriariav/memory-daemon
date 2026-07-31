@@ -141,6 +141,16 @@ def _completed_epoch(checkpoint):
     return datetime.datetime.fromisoformat(raw).timestamp()
 
 
+def _census_window_hours(checkpoint):
+    """Return a completed checkpoint's fixed snapshot width, if known."""
+    try:
+        cutoff = float(checkpoint["cutoff_epoch"])
+        until = float(checkpoint["until_epoch"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (until - cutoff) / (60 * 60)
+
+
 def _active_conversation_data(source):
     """Load or refresh the fixed-window census feeding a broad Slack sweep."""
     cfg = source.get("active_conversations")
@@ -150,12 +160,26 @@ def _active_conversation_data(source):
     checkpoint = slack_census.load_checkpoint(checkpoint_path)
     now = _rfc3339_epoch(utc_now_iso())
     completed = _completed_epoch(checkpoint) if checkpoint else None
+    snapshot_end = (
+        float(checkpoint["until_epoch"])
+        if checkpoint and checkpoint.get("until_epoch") is not None
+        else None
+    )
+    requested_hours = float(cfg.get("hours", 48))
+    cached_hours = _census_window_hours(checkpoint) if checkpoint else None
+    window_matches = (
+        cached_hours is not None
+        and abs(cached_hours - requested_hours) < (1 / 3600)
+    )
     refresh_seconds = _duration_seconds(cfg.get("refresh_every", "1d"))
     fresh = (
         checkpoint is not None
         and completed is not None
+        and snapshot_end is not None
         and completed <= now
-        and now - completed < refresh_seconds
+        and snapshot_end <= now
+        and now - snapshot_end < refresh_seconds
+        and window_matches
     )
     if fresh:
         data = checkpoint

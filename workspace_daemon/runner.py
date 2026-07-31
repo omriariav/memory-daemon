@@ -1038,6 +1038,13 @@ def _source_coverage_problem(source, candidates):
 def _fixed_window_seconds(source):
     """Smallest non-cursor window a source relies on, or None for catch-up."""
     if source.get("catch_up") is True:
+        if source.get("kind") == "slack" and source.get("active_conversations"):
+            # Content reads are cursor-backed, but discovering which joined
+            # conversations to read still depends on a fixed census window.
+            return (
+                float(source["active_conversations"].get("hours", 48))
+                * 60 * 60
+            )
         return None
     kind = source.get("kind")
     hours = float(source.get("hours", 26))
