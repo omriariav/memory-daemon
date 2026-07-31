@@ -21,6 +21,21 @@ class CensusTest(unittest.TestCase):
         {"id": "G3", "name": "mpdm-a--b", "is_mpim": True, "is_private": True},
     ]
 
+    def test_only_stale_conversation_errors_are_nonfatal(self):
+        errors = [
+            {"id": "D1", "error": "channel_not_found"},
+            {"id": "C2", "error": "is_archived"},
+            {"id": "G3", "error": "not_in_channel"},
+        ]
+        self.assertEqual(slack_census.fatal_errors(errors), [])
+        self.assertEqual(
+            slack_census.fatal_errors([
+                *errors,
+                {"id": "C4", "error": "missing_scope"},
+            ]),
+            [{"id": "C4", "error": "missing_scope"}],
+        )
+
     def test_rejects_checkpoint_with_out_of_range_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / "census.json"
@@ -90,7 +105,8 @@ class CensusTest(unittest.TestCase):
         result = slack_census.run(
             self.CONVERSATIONS,
             api,
-            cutoff_epoch=10,
+            cutoff_epoch=10.123456,
+            until_epoch=20.654321,
             requests_per_minute=50,
             sleep=lambda _seconds: None,
         )
@@ -103,9 +119,14 @@ class CensusTest(unittest.TestCase):
         self.assertNotIn("sensitive-body", json.dumps(result))
         self.assertEqual(len(calls), 3)
         self.assertEqual(calls[0][1]["limit"], 1)
+        self.assertEqual(calls[0][1]["oldest"], "10.123456")
+        self.assertEqual(calls[0][1]["latest"], "20.654321")
+        self.assertEqual(calls[0][1]["inclusive"], "true")
         self.assertEqual(
-            calls[0][1]["latest"],
-            f"{result['until_epoch']:.6f}",
+            result["cutoff_at"], "1970-01-01T00:00:10.123456Z"
+        )
+        self.assertEqual(
+            result["until_at"], "1970-01-01T00:00:20.654321Z"
         )
 
     def test_checkpoint_resumes_after_interruption(self):

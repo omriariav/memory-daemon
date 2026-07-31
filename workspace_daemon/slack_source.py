@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 from .chat_text import redact_secrets, slack_timestamp_iso, timestamped_line
+from . import slack_census
 from .shell import ada_bin, log, utc_now_iso
 
 
@@ -40,6 +41,7 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 # Bump when recurring candidate construction or enrichment changes in a way
 # that requires replaying from catch_up_after rather than only the live overlap.
 CATCH_UP_SCHEMA = 2
+DEFAULT_CENSUS_TIMEOUT = 60 * 60
 
 
 def _cli(args, timeout=60):
@@ -113,6 +115,184 @@ def configured_channels(source):
         )
         for channel in source.get(key, [])
     }
+
+
+def _census_path(value):
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_DIR / path
+
+
+def _duration_seconds(value):
+    raw = str(value)
+    unit = raw[-1:] if raw else ""
+    if not raw[:-1].isdigit() or unit not in {"m", "h", "d"}:
+        raise RuntimeError(
+            "Slack active-conversation refresh_every must look like "
+            "'15m', '4h', or '1d'"
+        )
+    return int(raw[:-1]) * {"m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def _completed_epoch(checkpoint):
+    completed = checkpoint.get("completed_at")
+    if not completed:
+        return None
+    raw = completed[:-1] + "+00:00" if completed.endswith("Z") else completed
+    return datetime.datetime.fromisoformat(raw).timestamp()
+
+
+def _census_window_hours(checkpoint):
+    """Return a completed checkpoint's fixed snapshot width, if known."""
+    reported = checkpoint.get("window_hours")
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        return float(reported)
+    try:
+        cutoff = float(checkpoint["cutoff_epoch"])
+        until = float(checkpoint["until_epoch"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (until - cutoff) / (60 * 60)
+
+
+def _active_conversation_data(source):
+    """Load or refresh the fixed-window census feeding a broad Slack sweep."""
+    cfg = source.get("active_conversations")
+    if not cfg:
+        return None
+    checkpoint_path = _census_path(cfg["checkpoint"])
+    checkpoint = slack_census.load_checkpoint(checkpoint_path)
+    now = _rfc3339_epoch(utc_now_iso())
+    completed = _completed_epoch(checkpoint) if checkpoint else None
+    snapshot_end = (
+        float(checkpoint["until_epoch"])
+        if checkpoint and checkpoint.get("until_epoch") is not None
+        else None
+    )
+    requested_hours = float(cfg.get("hours", 48))
+    cached_hours = _census_window_hours(checkpoint) if checkpoint else None
+    window_matches = (
+        cached_hours is not None
+        and abs(cached_hours - requested_hours) < (1 / 3600)
+    )
+    refresh_seconds = _duration_seconds(cfg.get("refresh_every", "1d"))
+    fresh = (
+        checkpoint is not None
+        and completed is not None
+        and snapshot_end is not None
+        and completed <= now
+        and snapshot_end <= now
+        and now - snapshot_end < refresh_seconds
+        and window_matches
+    )
+    if fresh:
+        data = checkpoint
+        log(
+            "slack census cache fresh: "
+            f"active={len(data.get('active') or [])} "
+            f"completed_at={data.get('completed_at')}"
+        )
+    else:
+        args = [
+            "census",
+            "--hours", str(cfg.get("hours", 48)),
+            "--requests-per-minute",
+            str(cfg.get("requests_per_minute", 40)),
+        ]
+        if not source.get("_dry_run"):
+            args.extend(["--checkpoint", str(checkpoint_path)])
+        mode = "previewing" if source.get("_dry_run") else "refreshing"
+        log(f"slack census cache stale or absent; {mode} fixed-window census")
+        data = _cli(args, timeout=DEFAULT_CENSUS_TIMEOUT)
+    returned_hours = _census_window_hours(data)
+    if (
+        returned_hours is None
+        or abs(returned_hours - requested_hours) >= (1 / 3600)
+    ):
+        observed = "unknown" if returned_hours is None else f"{returned_hours:g}h"
+        raise RuntimeError(
+            "Slack census returned an incompatible window: "
+            f"requested {requested_hours:g}h, received {observed}"
+        )
+    errors = data.get("errors") or []
+    fatal = slack_census.fatal_errors(errors)
+    if fatal:
+        raise RuntimeError(
+            "Slack census has fatal coverage errors: "
+            + ", ".join(
+                f"{row.get('id', '?')}={row.get('error', 'unknown')}"
+                for row in fatal[:10]
+            )
+        )
+    if errors:
+        log(
+            "slack census WARN ignored stale/unreadable conversations: "
+            + ", ".join(
+                f"{row.get('id', '?')}={row.get('error', 'unknown')}"
+                for row in errors[:10]
+            )
+        )
+    runtime = source.get("_active_conversation_runtime")
+    if runtime is not None:
+        cutoff_at = data.get("cutoff_at")
+        until_at = data.get("until_at")
+        if not isinstance(cutoff_at, str) or not isinstance(until_at, str):
+            raise RuntimeError(
+                "Slack census did not report valid discovery boundaries"
+            )
+        cutoff_epoch = _rfc3339_epoch(cutoff_at)
+        until_epoch = _rfc3339_epoch(until_at)
+        previous_until = runtime.get("previous_until")
+        if previous_until:
+            previous_epoch = _rfc3339_epoch(previous_until)
+            if until_epoch < previous_epoch:
+                raise RuntimeError(
+                    "Slack census snapshot predates the last consumed "
+                    "discovery boundary"
+                )
+            if previous_epoch < cutoff_epoch:
+                raise RuntimeError(
+                    "Slack active-conversation coverage has a gap between "
+                    f"{previous_until} and {cutoff_at}; run a manual broader "
+                    "census/backfill before advancing this routine"
+                )
+        runtime["until_at"] = until_at
+    return data
+
+
+def _with_active_conversations(source):
+    """Materialize census-selected IDs as direct-history channels."""
+    data = _active_conversation_data(source)
+    if data is None:
+        return source
+    excluded = set(source.get("_exclude_channels") or ())
+    active = [
+        row["id"]
+        for row in data.get("active") or []
+        if row.get("id") and row["id"] not in excluded
+    ]
+    merged = list(dict.fromkeys([
+        *source.get("direct_channels", []),
+        *source.get("private_channels", []),
+        *active,
+    ]))
+    effective = dict(source)
+    effective["direct_channels"] = merged
+    effective.pop("private_channels", None)
+
+    # A conversation can first enter the census after the global catch-up
+    # cursor has moved beyond its recent messages. Re-read from the census
+    # floor; stable daily source IDs and content versions absorb the overlap.
+    cutoff = data.get("cutoff_at")
+    if cutoff and source.get("_since"):
+        effective["_since"] = min(
+            (source["_since"], cutoff),
+            key=_rfc3339_epoch,
+        )
+    log(
+        f"slack active-conversation scope: selected={len(active)} "
+        f"excluded_owned={len(excluded)} total_direct={len(merged)}"
+    )
+    return effective
 
 
 def _mention_excluded_channels(source):
@@ -473,6 +653,7 @@ def _ada_digest_candidates(source):
 
 def candidates(source):
     """List digest candidates plus legacy threads and out-of-channel mentions."""
+    source = _with_active_conversations(source)
     out = _ada_digest_candidates(source)
     if source.get("catch_up"):
         out.extend(_catch_up_direct_candidates(source))

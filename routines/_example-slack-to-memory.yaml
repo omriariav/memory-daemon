@@ -16,6 +16,14 @@ description: Distill watched Slack channels and mentions into memory entries.
 
 source:
   kind: slack
+  # To sweep every recently active joined channel/DM instead of maintaining an
+  # allowlist, replace direct_channels/include_mentions with this daily census.
+  # It stores metadata only; the selected conversations are then read directly.
+  # active_conversations:
+  #   checkpoint: state/slack-census.json
+  #   hours: 48
+  #   refresh_every: 1d
+  #   requests_per_minute: 40
   direct_channels:       # raw history; works for known public/private IDs
     - C0123ABCD          # #my-team-channel
     - C0456EFGH          # #my-project-channel (private channels work too)

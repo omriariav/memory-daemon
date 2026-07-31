@@ -36,6 +36,7 @@ def _catch_up_cursor_id(source):
             )
         }
         scope.update({
+            "active_conversations": source.get("active_conversations"),
             "include_mentions": source.get("include_mentions") is True,
             "catch_up_after": source.get("catch_up_after"),
             "reply_roots_after": source.get("reply_roots_after"),
@@ -49,6 +50,11 @@ def _catch_up_cursor_id(source):
         ).hexdigest()[:16]
         return f"slack:configured-scope:{digest}"
     raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
+
+
+def _active_conversation_cursor_id(source):
+    """Durable upper boundary of the last consumed Slack census snapshot."""
+    return f"{_catch_up_cursor_id(source)}:discovery"
 
 
 def _coverage_cursor_id(source_index, source):
@@ -159,6 +165,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     }
     source_overrides = {}
     catch_up_sources = []
+    active_conversation_sources = []
     for routine in valid:
         if routine["id"] not in active_ids:
             continue
@@ -187,11 +194,40 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 override = {"_since": since}
                 if kind == "slack" and source.get("catch_up_after"):
                     override["_catch_up_boundary"] = source["catch_up_after"]
+                if kind == "slack" and source.get("active_conversations"):
+                    discovery_cursor_id = _active_conversation_cursor_id(source)
+                    runtime = {
+                        "previous_until": cursors.checkpoint(
+                            routine["id"], discovery_cursor_id, kind,
+                        ),
+                    }
+                    override["_active_conversation_runtime"] = runtime
+                    active_conversation_sources.append(
+                        (
+                            routine["id"],
+                            source_index,
+                            discovery_cursor_id,
+                            kind,
+                            runtime,
+                        )
+                    )
                 source_overrides[(routine["id"], source_index)] = override
                 log(
                     f"routine={routine['id']} source={kind} catch-up since={since}"
                 )
             catch_up_sources.append((routine["id"], cursor_id, kind))
+
+    # Source adapters may need to distinguish a real run from a read-only
+    # preview. Keep this runtime-only flag out of routine files and cursor
+    # fingerprints (underscore-prefixed fields are deliberately ignored).
+    for routine in valid:
+        for source_index, source in enumerate(config.sources(routine)):
+            if source.get("kind") not in active_source_kinds:
+                continue
+            override = source_overrides.setdefault(
+                (routine["id"], source_index), {}
+            )
+            override["_dry_run"] = dry_run
 
     source_coverage = {}
     claims, listing_failures = _collect_claims(
@@ -200,6 +236,30 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         source_overrides=source_overrides,
         source_coverage=source_coverage,
     )
+    active_source_stamps = {}
+    for (
+        routine_id,
+        source_index,
+        _cursor_id,
+        kind,
+        runtime,
+    ) in active_conversation_sources:
+        coverage_key = (routine_id, source_index)
+        until_at = runtime.get("until_at")
+        if until_at:
+            active_source_stamps[coverage_key] = until_at
+        elif (
+            coverage_key in source_coverage
+            and not source_coverage[coverage_key]
+        ):
+            totals["errors"] += 1
+            source_coverage[coverage_key] = (
+                "Slack census did not report its discovery boundary"
+            )
+            log(
+                f"routine={routine_id} source={kind} FATAL: "
+                f"{source_coverage[coverage_key]}"
+            )
     owned = _route_claims(
         claims, totals, failures=[*routing_failures, *listing_failures]
     )
@@ -215,9 +275,9 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals, lock, catalog, base_dir,
         )
 
-    coverage_sources = []
+    coverage_points = []
     if totals["errors"] == 0:
-        coverage_sources = _mark_connector_sweeps(
+        coverage_points = _mark_connector_sweeps(
             routines,
             valid_ids,
             active_ids,
@@ -226,12 +286,36 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals,
             cursors,
             source_coverage,
+            active_source_stamps,
         )
 
-    successful_sources = [*catch_up_sources, *coverage_sources]
-    if successful_sources:
+    successful_points = [
+        (*source, scan_started_at)
+        for source in catch_up_sources
+    ]
+    successful_points.extend(coverage_points)
+    for (
+        routine_id,
+        _source_index,
+        cursor_id,
+        kind,
+        runtime,
+    ) in active_conversation_sources:
+        until_at = runtime.get("until_at")
+        if until_at:
+            successful_points.append(
+                (routine_id, cursor_id, kind, until_at)
+            )
+        elif totals["errors"] == 0:
+            totals["errors"] += 1
+            log(
+                f"routine={routine_id} source={kind} FATAL: "
+                "Slack census did not report its discovery boundary"
+            )
+
+    if successful_points:
         if totals["errors"] == 0:
-            cursors.mark_successful(successful_sources, scan_started_at)
+            cursors.mark_successful_at(successful_points)
             if catch_up_sources:
                 mode = "[dry-run] would advance" if dry_run else "advanced"
                 log(
@@ -244,7 +328,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     f"catch-up cursor held at prior checkpoint due to "
                     f"{totals['errors']} error(s)"
                 )
-            if coverage_sources:
+            if coverage_points:
                 log(
                     f"connector coverage checkpoint held at prior state due to "
                     f"{totals['errors']} error(s)"
@@ -254,16 +338,18 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
 
 
 def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
-                           dry_run, totals, cursors, source_coverage):
+                           dry_run, totals, cursors, source_coverage,
+                           active_source_stamps=None):
     """Advance connector health only to the oldest fully covered scope.
 
     A connector prompt is reusable by partial routines, so merely reading one
     does not prove connector-wide coverage.  ``connector_sweep: true`` names
     the routine that publishes health for the configured source.  Every
     enabled routine source of that kind participates in the safe watermark:
-    active sources contribute this run's start, while inactive owners retain
-    their prior successful checkpoint.
+    active sources contribute this run's start (or their actual fixed-snapshot
+    boundary), while inactive owners retain their prior successful checkpoint.
     """
+    active_source_stamps = active_source_stamps or {}
     active_source_kinds = {
         source.get("kind")
         for routine in routines
@@ -305,7 +391,6 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
         declarations[key] = routine
         connector_kinds.add(connector)
 
-    scan_second, _scan_fraction = time_utils.rfc3339_key(scan_started_at)
     for routine in routines:
         rid = routine.get("id", "?")
         if (
@@ -332,7 +417,11 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
             )
             if not previous:
                 continue  # first successful run establishes the bootstrap
-            boundary = scan_second - datetime.timedelta(
+            stamp = active_source_stamps.get(
+                coverage_key, scan_started_at
+            )
+            stamp_second, _ = time_utils.rfc3339_key(stamp)
+            boundary = stamp_second - datetime.timedelta(
                 seconds=window_seconds
             )
             if time_utils.rfc3339_key(previous) < (boundary, 0):
@@ -340,25 +429,28 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
                     "fixed-window gap since prior successful scan"
                 )
 
-    coverage_sources = [
-        (
-            routine["id"],
-            _coverage_cursor_id(source_index, source),
-            source["kind"],
-        )
-        for routine in routines
-        if (
+    coverage_points = []
+    for routine in routines:
+        if not (
             routine.get("enabled", True)
             and routine["id"] in valid_ids
             and routine["id"] in active_ids
-        )
-        for source_index, source in enumerate(config.sources(routine))
-        if (
-            source.get("kind") in connector_kinds
-            and (routine["id"], source_index) in source_coverage
-            and not source_coverage.get((routine["id"], source_index))
-        )
-    ]
+        ):
+            continue
+        for source_index, source in enumerate(config.sources(routine)):
+            coverage_key = (routine["id"], source_index)
+            if not (
+                source.get("kind") in connector_kinds
+                and coverage_key in source_coverage
+                and not source_coverage.get(coverage_key)
+            ):
+                continue
+            coverage_points.append((
+                routine["id"],
+                _coverage_cursor_id(source_index, source),
+                source["kind"],
+                active_source_stamps.get(coverage_key, scan_started_at),
+            ))
 
     for (store, connector), sweep in declarations.items():
         if (store, connector) in duplicate_keys:
@@ -389,7 +481,11 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
                             f"{source_coverage[coverage_key]}"
                         )
                     else:
-                        stamps.append(scan_started_at)
+                        stamps.append(
+                            active_source_stamps.get(
+                                coverage_key, scan_started_at
+                            )
+                        )
                     continue
                 checkpoint = cursors.checkpoint(rid, cursor_id, connector)
                 if checkpoint:
@@ -414,7 +510,7 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
             log(
                 f"routine={sweep['id']} connector state FATAL: {exc}"
             )
-    return coverage_sources
+    return coverage_points
 
 
 # --- sources ----------------------------------------------------------------
@@ -823,6 +919,8 @@ SOURCES = {
 def _scope(source):
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
+    if source.get("kind") == "slack" and source.get("active_conversations"):
+        return "recently active Slack conversations"
     if source.get("kind") == "mila":
         return source.get("recordings_file") or "Mila recordings"
     slack_channels = [
@@ -1023,6 +1121,13 @@ def _source_coverage_problem(source, candidates):
 def _fixed_window_seconds(source):
     """Smallest non-cursor window a source relies on, or None for catch-up."""
     if source.get("catch_up") is True:
+        if source.get("kind") == "slack" and source.get("active_conversations"):
+            # Content reads are cursor-backed, but discovering which joined
+            # conversations to read still depends on a fixed census window.
+            return (
+                float(source["active_conversations"].get("hours", 48))
+                * 60 * 60
+            )
         return None
     kind = source.get("kind")
     hours = float(source.get("hours", 26))
@@ -1103,6 +1208,13 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             listing_source = dict(
                 listing_source,
                 _exclude_mention_channels=sorted(claimed_slack_channels),
+            )
+        if kind == "slack" and source.get("active_conversations"):
+            # The census-fed general sweep is workspace-wide. Explicit domain
+            # and specialized channels remain owned by their declared routine.
+            listing_source = dict(
+                listing_source,
+                _exclude_channels=sorted(claimed_slack_channels),
             )
         if kind == "gchat" and source.get("all_spaces"):
             # A configured explicit space remains owned even while its domain

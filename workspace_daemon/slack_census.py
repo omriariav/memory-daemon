@@ -9,6 +9,22 @@ from . import state
 
 
 CENSUS_VERSION = 1
+IGNORABLE_CONVERSATION_ERRORS = {
+    # Slack can retain stale DM/channel rows in users.conversations after the
+    # conversation is no longer readable. They are not evidence that the
+    # remainder of the fixed-window census is incomplete.
+    "channel_not_found",
+    "is_archived",
+    "not_in_channel",
+}
+
+
+def fatal_errors(errors):
+    """Errors that make a completed census unsafe to consume."""
+    return [
+        row for row in errors
+        if row.get("error") not in IGNORABLE_CONVERSATION_ERRORS
+    ]
 
 
 def _checkpoint_error(path, detail):
@@ -150,9 +166,10 @@ def _save_checkpoint(path, data):
 
 
 def _iso_from_epoch(value):
-    return datetime.datetime.fromtimestamp(
+    rendered = datetime.datetime.fromtimestamp(
         float(value), datetime.timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return rendered.replace(".000000Z", "Z")
 
 
 def run(
@@ -164,6 +181,7 @@ def run(
     checkpoint=None,
     progress=None,
     sleep=time.sleep,
+    resume=True,
 ):
     """Probe one recent top-level message per conversation.
 
@@ -175,7 +193,7 @@ def run(
         raise ValueError("requests_per_minute must be between 1 and 50")
     progress = progress or (lambda _message: None)
     checkpoint = Path(checkpoint) if checkpoint else None
-    existing = load_resumable_checkpoint(checkpoint)
+    existing = load_resumable_checkpoint(checkpoint) if resume else None
 
     inventory = [
         {
@@ -238,7 +256,10 @@ def run(
                     "channel": channel,
                     "oldest": f"{float(cutoff_epoch):.6f}",
                     "latest": f"{float(data['until_epoch']):.6f}",
-                    "inclusive": "false",
+                    # Adjacent census windows deliberately overlap at their
+                    # shared boundary, so activity cannot disappear between
+                    # two exclusive endpoints.
+                    "inclusive": "true",
                     "limit": 1,
                 },
             )

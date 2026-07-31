@@ -1,5 +1,8 @@
 """Hybrid Ada/private Slack digest behavior."""
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import config, slack_source
@@ -432,6 +435,260 @@ class PrivateDigestTest(unittest.TestCase):
         )
 
 
+class ActiveConversationSweepTest(unittest.TestCase):
+    def _checkpoint(self, path):
+        path.write_text(json.dumps({
+            "version": 1,
+            "cutoff_epoch": 1785225600,
+            "cutoff_at": "2026-07-28T08:00:00Z",
+            "until_epoch": 1785398400,
+            "until_at": "2026-07-30T08:00:00Z",
+            "inventory": [
+                {"id": "CACTIVE"},
+                {"id": "COWNED"},
+                {"id": "DSTALE"},
+            ],
+            "next_index": 3,
+            "active": [
+                {
+                    "id": "CACTIVE",
+                    "name": "active",
+                    "type": "public_channel",
+                    "latest_ts": "1785390000.0",
+                },
+                {
+                    "id": "COWNED",
+                    "name": "domain-owned",
+                    "type": "private_channel",
+                    "latest_ts": "1785391000.0",
+                },
+            ],
+            "errors": [
+                {"id": "DSTALE", "error": "channel_not_found"},
+            ],
+            "completed_at": "2026-07-30T08:01:00Z",
+        }))
+
+    def test_fresh_census_feeds_direct_sweep_and_excludes_owned_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            history = {
+                "ok": True,
+                "messages": [{
+                    "source_id": "slack:CACTIVE:1785390000.0",
+                    "ts": "1785390000.0",
+                    "user": "U1",
+                    "text": "message from either direction",
+                    "reply_count": 0,
+                }],
+            }
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1d",
+                    "requests_per_minute": 40,
+                },
+                "max_results": 0,
+                "catch_up": True,
+                "_since": "2026-07-30T07:00:00Z",
+                "_catch_up_boundary": "2026-07-28T08:00:00Z",
+                "reply_roots_after": "2026-07-28T08:00:00Z",
+                "_exclude_channels": ["COWNED"],
+            }
+
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-30T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli", return_value=history
+            ) as cli:
+                candidates = slack_source.candidates(source)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            candidates[0]["raw"]["source_id"],
+            "slack:CACTIVE:daily:2026-07-30",
+        )
+        self.assertEqual(
+            cli.call_args_list[0].args[0],
+            [
+                "history", "CACTIVE",
+                "--since", "2026-07-28T08:00:00Z",
+                "--limit", "0",
+            ],
+        )
+
+    def test_stale_census_preview_does_not_pass_checkpoint_to_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            census = {
+                "ok": True,
+                "window_hours": 48,
+                "cutoff_at": "2026-07-30T10:00:00Z",
+                "active": [],
+                "errors": [],
+            }
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1h",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli", return_value=census
+            ) as cli:
+                effective = slack_source._with_active_conversations(source)
+
+        args = cli.call_args.args[0]
+        self.assertEqual(args[:3], ["census", "--hours", "48"])
+        self.assertNotIn("--checkpoint", args)
+        self.assertEqual(effective["direct_channels"], [])
+
+    def test_future_completed_timestamp_is_not_treated_as_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            data = json.loads(checkpoint.read_text())
+            data["completed_at"] = "2026-08-01T09:00:00Z"
+            checkpoint.write_text(json.dumps(data))
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1d",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli",
+                return_value={
+                    "ok": True,
+                    "window_hours": 48,
+                    "cutoff_at": "2026-07-29T09:00:00Z",
+                    "active": [],
+                    "errors": [],
+                },
+            ) as cli:
+                slack_source._with_active_conversations(source)
+
+        self.assertEqual(cli.call_args.args[0][0], "census")
+
+    def test_changed_window_invalidates_otherwise_fresh_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 24,
+                    "refresh_every": "1d",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-30T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli",
+                return_value={
+                    "ok": True,
+                    "window_hours": 24,
+                    "cutoff_at": "2026-07-29T09:00:00Z",
+                    "active": [],
+                    "errors": [],
+                },
+            ) as cli:
+                slack_source._with_active_conversations(source)
+
+        self.assertEqual(
+            cli.call_args.args[0][:3],
+            ["census", "--hours", "24"],
+        )
+
+    def test_snapshot_boundary_controls_freshness_not_completion_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            data = json.loads(checkpoint.read_text())
+            data["completed_at"] = "2026-07-31T08:59:00Z"
+            checkpoint.write_text(json.dumps(data))
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1d",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli",
+                return_value={
+                    "ok": True,
+                    "window_hours": 48,
+                    "cutoff_at": "2026-07-29T09:00:00Z",
+                    "active": [],
+                    "errors": [],
+                },
+            ) as cli:
+                slack_source._with_active_conversations(source)
+
+        self.assertEqual(cli.call_args.args[0][0], "census")
+
+    def test_refreshed_census_window_is_revalidated_before_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+            self._checkpoint(checkpoint)
+            source = {
+                "kind": "slack",
+                "active_conversations": {
+                    "checkpoint": str(checkpoint),
+                    "hours": 48,
+                    "refresh_every": "1h",
+                    "requests_per_minute": 40,
+                },
+                "_dry_run": True,
+            }
+            with mock.patch.object(
+                slack_source, "utc_now_iso",
+                return_value="2026-07-31T09:00:00Z",
+            ), mock.patch.object(
+                slack_source, "_cli",
+                return_value={
+                    "ok": True,
+                    "window_hours": 1,
+                    "cutoff_at": "2026-07-31T08:00:00Z",
+                    "active": [],
+                    "errors": [],
+                },
+            ), self.assertRaisesRegex(
+                RuntimeError, "requested 48h, received 1h"
+            ):
+                slack_source._with_active_conversations(source)
+
+
 class MentionOwnershipTest(unittest.TestCase):
     def test_mentions_skip_channels_owned_by_another_routine(self):
         mentions = {
@@ -603,6 +860,50 @@ class HybridValidationTest(unittest.TestCase):
             "reply_roots_after": "2026-07-29T08:00:00Z",
         }))
         self.assertTrue(any("must not be later" in p for p in problems))
+
+    def test_active_conversation_catch_up_configuration_is_validated(self):
+        valid = config.validate(self.routine({
+            "kind": "slack",
+            "active_conversations": {
+                "checkpoint": "state/slack-census.json",
+                "hours": 48,
+                "refresh_every": "1d",
+                "requests_per_minute": 40,
+            },
+            "max_results": 0,
+            "catch_up": True,
+            "catch_up_after": "2026-07-28T08:00:00Z",
+            "reply_roots_after": "2026-07-28T08:00:00Z",
+        }))
+        invalid = config.validate(self.routine({
+            "kind": "slack",
+            "active_conversations": {
+                "hours": 0,
+                "refresh_every": "sometimes",
+                "requests_per_minute": 80,
+            },
+        }))
+
+        self.assertEqual(valid, [])
+        self.assertTrue(any("checkpoint is required" in p for p in invalid))
+        self.assertTrue(any(".hours must be positive" in p for p in invalid))
+        self.assertTrue(any(".refresh_every" in p for p in invalid))
+        self.assertTrue(any(".requests_per_minute" in p for p in invalid))
+
+        non_overlapping = config.validate(self.routine({
+            "kind": "slack",
+            "active_conversations": {
+                "checkpoint": "state/slack-census.json",
+                "hours": 1,
+                "refresh_every": "1d",
+            },
+        }))
+        self.assertTrue(
+            any("requires catch_up: true" in p for p in non_overlapping)
+        )
+        self.assertTrue(
+            any("must not exceed its hours window" in p for p in non_overlapping)
+        )
 
 
 if __name__ == "__main__":

@@ -344,6 +344,49 @@ reply to a thread whose root predates the census window is not discoverable
 through `conversations.history`; use the normal routine's wider
 `reply_roots_after` scan after choosing the recurring scope.
 
+The census can also feed a recurring fallback directly. This discovers joined
+public channels, private channels, DMs, and group DMs with recent top-level
+activity, while explicit channels declared by domain routines remain excluded:
+
+```yaml
+kind: slack
+active_conversations:
+  checkpoint: state/slack-census.json
+  hours: 48
+  refresh_every: 1d
+  requests_per_minute: 40
+max_results: 0
+catch_up: true
+catch_up_overlap: 1h
+catch_up_after: "2026-07-28T08:00:00Z"
+reply_roots_after: "2026-06-28T08:00:00Z"
+```
+
+A completed checkpoint is reused until `refresh_every` elapses. Refreshes are
+fixed-window snapshots and are resumable on real runs; dry runs never write the
+checkpoint. `refresh_every` must not exceed `hours`, and changing `hours`
+invalidates an otherwise fresh cache. Freshness is measured from the snapshot's
+upper boundary, not from when a long census happened to finish. An interrupted
+checkpoint built for a different window is restarted rather than resumed.
+Stale inaccessible conversation rows are reported as warnings, while
+permission, authentication, and other coverage errors fail the sweep closed.
+The active set is read through the normal direct-history path, so both incoming
+and outgoing messages are eligible and ledgered daily versions prevent
+unchanged overlap from reaching the model twice.
+
+The daemon durably records the upper boundary of each census snapshot it
+consumes. Before consuming the next snapshot it compares that boundary with
+the new snapshot's cutoff. This catches discovery gaps even when an earlier
+run reused a cache that was still fresh but hours old. A gap fails closed and
+holds both content and discovery cursors; run a manual broader
+census/backfill before resuming. Boundaries retain microsecond precision and
+adjacent windows include their shared endpoint, avoiding a timestamp sliver
+between snapshots. Connector health uses this actual snapshot boundary, not
+the later daemon start time. Slack's history API also cannot discover a new
+reply whose root predates the census window in a conversation that had no
+recent top-level message; pin such critical channels explicitly with
+`direct_channels`.
+
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
 `schedule.work_hours` override, runs due owners sequentially under the existing

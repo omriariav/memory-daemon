@@ -428,7 +428,20 @@ def cmd_census(args: List[str]) -> None:
         else None
     )
     existing = slack_census.load_resumable_checkpoint(checkpoint)
+    restart = False
     if existing:
+        try:
+            existing_hours = (
+                float(existing["until_epoch"])
+                - float(existing["cutoff_epoch"])
+            ) / 3600
+        except (KeyError, TypeError, ValueError):
+            existing_hours = None
+        restart = (
+            existing_hours is None
+            or abs(existing_hours - hours) >= (1 / 3600)
+        )
+    if existing and not restart:
         conversations = existing["inventory"]
         cutoff_epoch = float(existing["cutoff_epoch"])
         until_epoch = existing.get("until_epoch")
@@ -451,9 +464,11 @@ def cmd_census(args: List[str]) -> None:
         requests_per_minute=rpm,
         checkpoint=checkpoint,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
+        resume=not restart,
     )
+    fatal = slack_census.fatal_errors(result["errors"])
     payload = {
-        "ok": not result["errors"],
+        "ok": not fatal,
         "window_hours": (
             float(result["until_epoch"]) - float(result["cutoff_epoch"])
         ) / 3600,
@@ -462,12 +477,13 @@ def cmd_census(args: List[str]) -> None:
         "considered": len(result["inventory"]),
         "active_count": len(result["active"]),
         "error_count": len(result["errors"]),
+        "fatal_error_count": len(fatal),
         "active": result["active"],
         "errors": result["errors"],
         "checkpoint": str(checkpoint) if checkpoint else None,
     }
     out(payload)
-    if result["errors"]:
+    if fatal:
         raise SystemExit(1)
 
 
