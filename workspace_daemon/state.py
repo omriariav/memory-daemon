@@ -347,10 +347,17 @@ class CursorStore:
 
     def mark_successful(self, sources, checkpoint):
         """Advance several source cursors in one atomic state write."""
+        self.mark_successful_at([
+            (*source, checkpoint)
+            for source in sources
+        ])
+
+    def mark_successful_at(self, sources):
+        """Atomically advance source cursors that have distinct checkpoints."""
         if self.dry_run or not sources:
             return
         merged = dict(self.entries)
-        for routine_id, source_id, kind in sources:
+        for routine_id, source_id, kind, checkpoint in sources:
             merged[self.key(routine_id, source_id)] = {
                 "kind": kind,
                 "last_successful_scan_at": checkpoint,

@@ -1,5 +1,6 @@
 """Multi-source routine, ownership, and cadence regression tests."""
 import datetime
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from workspace_daemon import (
     runner,
     slack_source,
     state,
+    time_utils,
 )
 
 
@@ -823,10 +825,12 @@ class CursorStoreTest(unittest.TestCase):
 
     def test_dry_run_never_writes_cursor_state(self):
         cursors = state.CursorStore(self.base, dry_run=True)
-        cursors.mark_successful(
-            [("sweep", "gchat:all-spaces", "gchat")],
-            "2026-07-28T10:00:00Z",
-        )
+        cursors.mark_successful_at([
+            (
+                "sweep", "gchat:all-spaces", "gchat",
+                "2026-07-28T10:00:00Z",
+            ),
+        ])
         self.assertFalse(state.cursor_file(self.base).exists())
 
     def test_malformed_cursor_record_fails_closed(self):
@@ -1058,14 +1062,34 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             upgraded_id = runner._catch_up_cursor_id(routine["source"])
         self.assertNotEqual(original_id, upgraded_id)
 
-    def test_slack_active_conversation_gap_fails_and_holds_cursor(self):
+    def test_slack_cached_snapshot_gap_fails_and_holds_both_cursors(self):
+        census_path = self.base / "state" / "census.json"
+
+        def write_census(cutoff, until):
+            census_path.write_text(json.dumps({
+                "version": 1,
+                "cutoff_epoch": (
+                    time_utils.rfc3339_key(cutoff)[0].timestamp()
+                ),
+                "cutoff_at": cutoff,
+                "until_epoch": (
+                    time_utils.rfc3339_key(until)[0].timestamp()
+                ),
+                "until_at": until,
+                "inventory": [],
+                "next_index": 0,
+                "active": [],
+                "errors": [],
+                "completed_at": until,
+            }))
+
         routine = {
             "id": "slack-general",
             "enabled": True,
             "source": {
                 "kind": "slack",
                 "active_conversations": {
-                    "checkpoint": str(self.base / "state" / "census.json"),
+                    "checkpoint": str(census_path),
                     "hours": 48,
                     "refresh_every": "1d",
                     "requests_per_minute": 40,
@@ -1086,24 +1110,61 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 "slug_prefix": "slack",
             },
         }
+
+        # Run A at 08:00 legally reuses a snapshot ending 23 hours earlier.
+        write_census(
+            "2026-07-28T09:00:00Z",
+            "2026-07-30T09:00:00Z",
+        )
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-31T08:00:00Z",
+        ), mock.patch.object(
+            slack_source, "utc_now_iso",
+            return_value="2026-07-31T08:00:00Z",
+        ):
+            first = runner.run(self.base, [routine])
+
         cursor_id = runner._catch_up_cursor_id(routine["source"])
+        discovery_id = runner._active_conversation_cursor_id(routine["source"])
         cursors = state.CursorStore(self.base)
-        cursors.mark_successful(
-            [("slack-general", cursor_id, "slack")],
-            "2026-07-28T10:00:00Z",
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(
+            cursors.checkpoint("slack-general", cursor_id, "slack"),
+            "2026-07-31T08:00:00Z",
+        )
+        self.assertEqual(
+            cursors.checkpoint("slack-general", discovery_id, "slack"),
+            "2026-07-30T09:00:00Z",
         )
 
+        # The next 48-hour snapshot starts 23 hours after the boundary that
+        # Run A actually consumed. The content cursor alone looks continuous,
+        # but the durable discovery cursor proves this snapshot is unsafe.
+        write_census(
+            "2026-07-31T08:00:00Z",
+            "2026-08-02T08:00:00Z",
+        )
         with mock.patch.object(
-            runner, "utc_now_iso", return_value="2026-07-31T10:00:00Z",
+            runner, "utc_now_iso", return_value="2026-08-02T08:00:00Z",
+        ), mock.patch.object(
+            slack_source, "utc_now_iso",
+            return_value="2026-08-02T08:00:00Z",
         ):
-            totals = runner.run(self.base, [routine])
+            second = runner.run(self.base, [routine])
 
-        self.assertEqual(totals["errors"], 1)
+        self.assertEqual(second["errors"], 1)
+        held = state.CursorStore(self.base)
         self.assertEqual(
-            state.CursorStore(self.base).checkpoint(
+            held.checkpoint(
                 "slack-general", cursor_id, "slack"
             ),
-            "2026-07-28T10:00:00Z",
+            "2026-07-31T08:00:00Z",
+        )
+        self.assertEqual(
+            held.checkpoint(
+                "slack-general", discovery_id, "slack"
+            ),
+            "2026-07-30T09:00:00Z",
         )
 
     def test_listing_failure_holds_prior_cursor(self):

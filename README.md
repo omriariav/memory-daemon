@@ -374,13 +374,15 @@ The active set is read through the normal direct-history path, so both incoming
 and outgoing messages are eligible and ledgered daily versions prevent
 unchanged overlap from reaching the model twice.
 
-If the daemon has not completed this source within the configured census
-window, it fails closed and holds its cursor: a quiet conversation that was
-active only during that gap can no longer be discovered safely. Run a manual
-broader census/backfill before resuming. Slack's history API also cannot
-discover a new reply whose root predates the census window in a conversation
-that had no recent top-level message; pin such critical channels explicitly
-with `direct_channels`.
+The daemon durably records the upper boundary of each census snapshot it
+consumes. Before consuming the next snapshot it compares that boundary with
+the new snapshot's cutoff. This catches discovery gaps even when an earlier
+run reused a cache that was still fresh but hours old. A gap fails closed and
+holds both content and discovery cursors; run a manual broader
+census/backfill before resuming. Slack's history API also cannot discover a
+new reply whose root predates the census window in a conversation that had no
+recent top-level message; pin such critical channels explicitly with
+`direct_channels`.
 
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware

@@ -52,6 +52,11 @@ def _catch_up_cursor_id(source):
     raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
 
 
+def _active_conversation_cursor_id(source):
+    """Durable upper boundary of the last consumed Slack census snapshot."""
+    return f"{_catch_up_cursor_id(source)}:discovery"
+
+
 def _coverage_cursor_id(source_index, source):
     """Stable success checkpoint for one configured connector source scope."""
     scope = {
@@ -160,6 +165,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     }
     source_overrides = {}
     catch_up_sources = []
+    active_conversation_sources = []
     for routine in valid:
         if routine["id"] not in active_ids:
             continue
@@ -188,27 +194,22 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 override = {"_since": since}
                 if kind == "slack" and source.get("catch_up_after"):
                     override["_catch_up_boundary"] = source["catch_up_after"]
-                if (
-                    checkpoint
-                    and kind == "slack"
-                    and source.get("active_conversations")
-                ):
-                    scan_second, _ = time_utils.rfc3339_key(scan_started_at)
-                    census_hours = float(
-                        source["active_conversations"].get("hours", 48)
-                    )
-                    discovery_floor = scan_second - datetime.timedelta(
-                        hours=census_hours
-                    )
-                    if time_utils.rfc3339_key(checkpoint) < (
-                        discovery_floor, 0
-                    ):
-                        override["_active_conversation_gap"] = (
-                            "Slack active-conversation coverage gap exceeds "
-                            f"the {census_hours:g}h discovery window; run a "
-                            "manual broader census/backfill before advancing "
-                            "this routine"
+                if kind == "slack" and source.get("active_conversations"):
+                    discovery_cursor_id = _active_conversation_cursor_id(source)
+                    runtime = {
+                        "previous_until": cursors.checkpoint(
+                            routine["id"], discovery_cursor_id, kind,
+                        ),
+                    }
+                    override["_active_conversation_runtime"] = runtime
+                    active_conversation_sources.append(
+                        (
+                            routine["id"],
+                            discovery_cursor_id,
+                            kind,
+                            runtime,
                         )
+                    )
                 source_overrides[(routine["id"], source_index)] = override
                 log(
                     f"routine={routine['id']} source={kind} catch-up since={since}"
@@ -263,9 +264,26 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         )
 
     successful_sources = [*catch_up_sources, *coverage_sources]
-    if successful_sources:
+    successful_points = [
+        (*source, scan_started_at)
+        for source in successful_sources
+    ]
+    for routine_id, cursor_id, kind, runtime in active_conversation_sources:
+        until_at = runtime.get("until_at")
+        if until_at:
+            successful_points.append(
+                (routine_id, cursor_id, kind, until_at)
+            )
+        elif totals["errors"] == 0:
+            totals["errors"] += 1
+            log(
+                f"routine={routine_id} source={kind} FATAL: "
+                "Slack census did not report its discovery boundary"
+            )
+
+    if successful_points:
         if totals["errors"] == 0:
-            cursors.mark_successful(successful_sources, scan_started_at)
+            cursors.mark_successful_at(successful_points)
             if catch_up_sources:
                 mode = "[dry-run] would advance" if dry_run else "advanced"
                 log(

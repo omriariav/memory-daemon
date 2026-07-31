@@ -159,9 +159,6 @@ def _active_conversation_data(source):
     cfg = source.get("active_conversations")
     if not cfg:
         return None
-    gap = source.get("_active_conversation_gap")
-    if gap:
-        raise RuntimeError(str(gap))
     checkpoint_path = _census_path(cfg["checkpoint"])
     checkpoint = slack_census.load_checkpoint(checkpoint_path)
     now = _rfc3339_epoch(utc_now_iso())
@@ -234,6 +231,31 @@ def _active_conversation_data(source):
                 for row in errors[:10]
             )
         )
+    runtime = source.get("_active_conversation_runtime")
+    if runtime is not None:
+        cutoff_at = data.get("cutoff_at")
+        until_at = data.get("until_at")
+        if not isinstance(cutoff_at, str) or not isinstance(until_at, str):
+            raise RuntimeError(
+                "Slack census did not report valid discovery boundaries"
+            )
+        cutoff_epoch = _rfc3339_epoch(cutoff_at)
+        until_epoch = _rfc3339_epoch(until_at)
+        previous_until = runtime.get("previous_until")
+        if previous_until:
+            previous_epoch = _rfc3339_epoch(previous_until)
+            if until_epoch < previous_epoch:
+                raise RuntimeError(
+                    "Slack census snapshot predates the last consumed "
+                    "discovery boundary"
+                )
+            if previous_epoch < cutoff_epoch:
+                raise RuntimeError(
+                    "Slack active-conversation coverage has a gap between "
+                    f"{previous_until} and {cutoff_at}; run a manual broader "
+                    "census/backfill before advancing this routine"
+                )
+        runtime["until_at"] = until_at
     return data
 
 
