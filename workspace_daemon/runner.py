@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, memory_sink, mila_source, notes, slack_source, state, time_utils
+from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -35,8 +35,16 @@ def _catch_up_cursor_id(source):
                 "channels", "ada_channels", "direct_channels", "private_channels"
             )
         }
+        active_conversations = source.get("active_conversations")
+        if isinstance(active_conversations, dict):
+            active_conversations = dict(active_conversations)
+            # Whether a stale cache may be refreshed inline changes execution,
+            # not source coverage. Keep the pre-split cursor namespace so the
+            # first consume-only run still validates its new census against
+            # the prior discovery watermark instead of silently bootstrapping.
+            active_conversations.pop("refresh_if_stale", None)
         scope.update({
-            "active_conversations": source.get("active_conversations"),
+            "active_conversations": active_conversations,
             "include_mentions": source.get("include_mentions") is True,
             "catch_up_after": source.get("catch_up_after"),
             "reply_roots_after": source.get("reply_roots_after"),
@@ -64,6 +72,11 @@ def _coverage_cursor_id(source_index, source):
         for key, value in source.items()
         if not str(key).startswith("_")
     }
+    active_conversations = scope.get("active_conversations")
+    if isinstance(active_conversations, dict):
+        active_conversations = dict(active_conversations)
+        active_conversations.pop("refresh_if_stale", None)
+        scope["active_conversations"] = active_conversations
     digest = hashlib.sha256(
         json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
@@ -147,6 +160,9 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if routine["id"] not in active_ids:
                 valid.append(routine)
                 continue
+            if config.is_maintenance(routine):
+                valid.append(routine)
+                continue
             if catalog is not None:
                 for name in config.configured_labels(routine):
                     _validated_label(name, label_catalog, routine["id"], catalog)
@@ -156,6 +172,23 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             totals["errors"] += 1
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
             routing_failures.extend(_routine_failures(routine))
+
+    # Maintenance shares the global run lock and executes before capture
+    # sources. If a daily census and its consumer are due in the same tick,
+    # the consumer sees the newly completed fixed-window snapshot.
+    for routine in valid:
+        if (
+            routine["id"] not in active_ids
+            or not config.is_maintenance(routine)
+        ):
+            continue
+        try:
+            maintenance.run(base_dir, routine, dry_run=dry_run)
+        except Exception as exc:
+            totals["errors"] += 1
+            log(
+                f"routine={routine['id']} maintenance FATAL: {exc}"
+            )
 
     active_source_kinds = {
         source["kind"]
@@ -167,10 +200,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     catch_up_sources = []
     active_conversation_sources = []
     for routine in valid:
-        if routine["id"] not in active_ids:
-            continue
+        routine_active = routine["id"] in active_ids
         for source_index, source in enumerate(config.sources(routine)):
-            if source.get("catch_up") is not True:
+            if (
+                source.get("catch_up") is not True
+                or source.get("kind") not in active_source_kinds
+            ):
                 continue
             kind = source["kind"]
             cursor_id = _catch_up_cursor_id(source)
@@ -194,7 +229,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 override = {"_since": since}
                 if kind == "slack" and source.get("catch_up_after"):
                     override["_catch_up_boundary"] = source["catch_up_after"]
-                if kind == "slack" and source.get("active_conversations"):
+                if (
+                    routine_active
+                    and kind == "slack"
+                    and source.get("active_conversations")
+                ):
                     discovery_cursor_id = _active_conversation_cursor_id(source)
                     runtime = {
                         "previous_until": cursors.checkpoint(
@@ -213,9 +252,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     )
                 source_overrides[(routine["id"], source_index)] = override
                 log(
-                    f"routine={routine['id']} source={kind} catch-up since={since}"
+                    f"routine={routine['id']} source={kind} "
+                    f"{'catch-up' if routine_active else 'routing catch-up'} "
+                    f"since={since}"
                 )
-            catch_up_sources.append((routine["id"], cursor_id, kind))
+            if routine_active:
+                catch_up_sources.append((routine["id"], cursor_id, kind))
 
     # Source adapters may need to distinguish a real run from a read-only
     # preview. Keep this runtime-only flag out of routine files and cursor
@@ -266,7 +308,10 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     valid_ids = {routine["id"] for routine in valid}
 
     for routine in active:
-        if routine["id"] not in valid_ids:
+        if (
+            routine["id"] not in valid_ids
+            or config.is_maintenance(routine)
+        ):
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])

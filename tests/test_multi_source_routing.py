@@ -894,6 +894,41 @@ class ConnectorCoverageTest(unittest.TestCase):
             48 * 60 * 60,
         )
 
+    def test_consume_only_flag_preserves_existing_slack_cursor_namespaces(self):
+        source = {
+            "kind": "slack",
+            "active_conversations": {
+                "checkpoint": "state/slack-census.json",
+                "hours": 48,
+                "refresh_every": "1d",
+                "requests_per_minute": 40,
+            },
+            "max_results": 0,
+            "catch_up": True,
+            "catch_up_after": "2026-07-28T08:00:00Z",
+            "reply_roots_after": "2026-06-28T08:00:00Z",
+        }
+        consume_only = {
+            **source,
+            "active_conversations": {
+                **source["active_conversations"],
+                "refresh_if_stale": False,
+            },
+        }
+
+        self.assertEqual(
+            runner._catch_up_cursor_id(source),
+            runner._catch_up_cursor_id(consume_only),
+        )
+        self.assertEqual(
+            runner._active_conversation_cursor_id(source),
+            runner._active_conversation_cursor_id(consume_only),
+        )
+        self.assertEqual(
+            runner._coverage_cursor_id(0, source),
+            runner._coverage_cursor_id(0, consume_only),
+        )
+
 
 class CatchUpCursorRunnerTest(unittest.TestCase):
     def setUp(self):
@@ -1062,6 +1097,81 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             upgraded_id = runner._catch_up_cursor_id(routine["source"])
         self.assertNotEqual(original_id, upgraded_id)
 
+    def test_inactive_slack_owner_gets_routing_cursor_without_advancing_it(self):
+        saved_slack = runner.SOURCES["slack"]
+        self.addCleanup(runner.SOURCES.__setitem__, "slack", saved_slack)
+        observed = {}
+
+        def candidates(source):
+            observed[source["direct_channels"][0]] = dict(source)
+            return []
+
+        runner.SOURCES["slack"] = (candidates, saved_slack[1])
+        active = {
+            "id": "active",
+            "enabled": True,
+            "source": {
+                "kind": "slack",
+                "direct_channels": ["CACTIVE"],
+                "hours": 26,
+                "max_results": 0,
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "active-vault"),
+                "slug_prefix": "active",
+            },
+        }
+        owner = {
+            "id": "owner",
+            "enabled": True,
+            "source": {
+                "kind": "slack",
+                "direct_channels": ["COWNER"],
+                "hours": 26,
+                "max_results": 0,
+                "catch_up": True,
+                "catch_up_overlap": "1h",
+                "catch_up_after": "2026-07-28T08:00:00Z",
+                "reply_roots_after": "2026-06-28T08:00:00Z",
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "Keep durable decisions.",
+            },
+            "output": {
+                "vault_dir": str(self.base / "owner-vault"),
+                "slug_prefix": "owner",
+            },
+        }
+
+        with mock.patch.object(
+            runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
+        ):
+            totals = runner.run(
+                self.base, [active, owner], active_ids={"active"}
+            )
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(
+            observed["COWNER"]["_since"], "2026-07-28T08:00:00Z"
+        )
+        self.assertEqual(
+            observed["COWNER"]["_catch_up_boundary"],
+            "2026-07-28T08:00:00Z",
+        )
+        cursor_id = runner._catch_up_cursor_id(owner["source"])
+        self.assertIsNone(
+            state.CursorStore(self.base).checkpoint(
+                "owner", cursor_id, "slack"
+            )
+        )
+
     def test_slack_cached_snapshot_gap_fails_and_holds_both_cursors(self):
         census_path = self.base / "state" / "census.json"
 
@@ -1147,6 +1257,16 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 "2026-07-31T08:00:00Z",
                 "2026-08-02T08:00:00Z",
             )
+            consume_only_routine = {
+                **routine,
+                "source": {
+                    **routine["source"],
+                    "active_conversations": {
+                        **routine["source"]["active_conversations"],
+                        "refresh_if_stale": False,
+                    },
+                },
+            }
             with mock.patch.object(
                 runner, "utc_now_iso",
                 return_value="2026-08-02T08:00:00Z",
@@ -1154,7 +1274,7 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
                 slack_source, "utc_now_iso",
                 return_value="2026-08-02T08:00:00Z",
             ):
-                second = runner.run(self.base, [routine])
+                second = runner.run(self.base, [consume_only_routine])
 
             mark.assert_not_called()
 

@@ -37,6 +37,16 @@ DEFAULT_ACTIONS = ["apply_label", "mark_read", "unstar", "archive"]
 
 # --- list -------------------------------------------------------------------
 
+def _routine_last_run(routine, schedule):
+    """Return the latest meaningful run marker for the routine type."""
+    if config.is_maintenance(routine):
+        return (
+            (schedule.entries.get(routine["id"]) or {})
+            .get("last_attempted_at")
+        )
+    return state.last_run(BASE_DIR, routine["id"])
+
+
 def cmd_list(args):
     routines = config.discover(BASE_DIR)
     if not routines:
@@ -44,6 +54,7 @@ def cmd_list(args):
         return 0
     display_ids = [str(r.get("id", "")) for r in routines]
     cadence_labels = [config.schedule_label(r) for r in routines]
+    schedule = state.ScheduleStore(BASE_DIR)
     width = max(len(rid) for rid in display_ids)
     cadence_width = max(7, *(len(label) for label in cadence_labels))
     print(
@@ -55,7 +66,7 @@ def cmd_list(args):
         routines, display_ids, cadence_labels
     ):
         enabled = "yes" if r.get("enabled", True) else "no"
-        last = state.last_run(BASE_DIR, r["id"]) or "never"
+        last = _routine_last_run(r, schedule) or "never"
         desc = r.get("description", "")
         print(
             f"{display_id.ljust(width)}  {enabled:<8}  "

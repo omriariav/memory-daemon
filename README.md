@@ -344,9 +344,25 @@ reply to a thread whose root predates the census window is not discoverable
 through `conversations.history`; use the normal routine's wider
 `reply_roots_after` scan after choosing the recurring scope.
 
-The census can also feed a recurring fallback directly. This discovers joined
-public channels, private channels, DMs, and group DMs with recent top-level
-activity, while explicit channels declared by domain routines remain excluded:
+For unattended use, schedule the metadata refresh as its own daily maintenance
+routine (see `routines/_example-slack-census.yaml`):
+
+```yaml
+id: example-slack-census
+enabled: false
+role: maintenance
+schedule:
+  every: 1d
+maintenance:
+  kind: slack_conversation_census
+  checkpoint: state/slack-census.json
+  hours: 48
+  requests_per_minute: 40
+```
+
+The frequent fallback consumes that checkpoint. This discovers joined public
+channels, private channels, DMs, and group DMs with recent top-level activity,
+while explicit channels declared by domain routines remain excluded:
 
 ```yaml
 kind: slack
@@ -355,6 +371,7 @@ active_conversations:
   hours: 48
   refresh_every: 1d
   requests_per_minute: 40
+  refresh_if_stale: false
 max_results: 0
 catch_up: true
 catch_up_overlap: 1h
@@ -362,12 +379,16 @@ catch_up_after: "2026-07-28T08:00:00Z"
 reply_roots_after: "2026-06-28T08:00:00Z"
 ```
 
-A completed checkpoint is reused until `refresh_every` elapses. Refreshes are
-fixed-window snapshots and are resumable on real runs; dry runs never write the
-checkpoint. `refresh_every` must not exceed `hours`, and changing `hours`
-invalidates an otherwise fresh cache. Freshness is measured from the snapshot's
-upper boundary, not from when a long census happened to finish. An interrupted
-checkpoint built for a different window is restarted rather than resumed.
+A completed checkpoint is reusable until `refresh_every` elapses. With
+`refresh_if_stale: false`, a missing, stale, incomplete, future-dated, or
+incompatible checkpoint fails the content sweep loudly; it never hides a long
+census inside a frequent run. The daily maintenance routine writes fixed-window
+snapshots and is resumable on real runs; its dry run performs the real metadata
+reads but writes no checkpoint. `refresh_every` must not exceed `hours`, and
+changing `hours` invalidates an otherwise fresh cache. Freshness is measured
+from the snapshot's upper boundary, not from when a long census happened to
+finish. An interrupted checkpoint built for a different window is restarted
+rather than resumed.
 Stale inaccessible conversation rows are reported as warnings, while
 permission, authentication, and other coverage errors fail the sweep closed.
 The active set is read through the normal direct-history path, so both incoming
@@ -796,7 +817,7 @@ run is going.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests   # 135 tests, no gws/yoetz needed
+python3 -m unittest discover -s tests   # no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
 ```
