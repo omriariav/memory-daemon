@@ -17,6 +17,7 @@ from .shell import log, utc_now_iso
 MAX_GMAIL_SOURCE_PEOPLE = 20
 MAX_GMAIL_THREAD_MESSAGES = 50
 MAX_GMAIL_THREAD_CHARS = 120_000
+GMAIL_CHAT_FOLLOWUP_QUERY = 'in:inbox from:me to:me subject:"Fwd: Chat"'
 
 
 def _catch_up_cursor_id(source):
@@ -189,6 +190,30 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             log(
                 f"routine={routine['id']} maintenance FATAL: {exc}"
             )
+
+    # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
+    # follow-up queue. Unlike ordinary capture, completion is observed by an
+    # item's disappearance from that queue, so reconcile tracked items even
+    # when the broad source query has no new candidates.
+    for routine in valid:
+        if (
+            routine["id"] not in active_ids
+            or config.is_maintenance(routine)
+        ):
+            continue
+        for source in config.sources(routine):
+            if source.get("self_forwarded_chat_followups") is not True:
+                continue
+            try:
+                _reconcile_gmail_chat_followups(
+                    routine, processed, dry_run=dry_run,
+                )
+            except Exception as exc:
+                totals["errors"] += 1
+                log(
+                    f"routine={routine['id']} Gmail follow-up reconciliation "
+                    f"FATAL: {exc}"
+                )
 
     active_source_kinds = {
         source["kind"]
@@ -569,6 +594,30 @@ def _gmail_candidates(source):
     ]
 
 
+def _address_set(value):
+    return {
+        email.strip().casefold()
+        for _, email in getaddresses([value or ""])
+        if "@" in email
+    }
+
+
+def _gmail_chat_followup_state(headers, labels):
+    """Identify Gmail's manually self-forwarded Google Chat queue item."""
+    subject = (headers.get("subject") or "").strip().casefold()
+    normalized_labels = {
+        str(label).strip().upper() for label in labels or [] if str(label).strip()
+    }
+    senders = _address_set(headers.get("from"))
+    recipients = _address_set(headers.get("to"))
+    manual = (
+        (subject == "fwd: chat" or subject.startswith("fwd: chat "))
+        and bool(senders & recipients)
+        and "SENT" in normalized_labels
+    )
+    return manual, manual and "INBOX" in normalized_labels
+
+
 def _email_source_people(*header_sets):
     """Verified-identity candidates from structured Gmail address headers.
 
@@ -681,6 +730,14 @@ def _gmail_fetch(routine, source, candidate):
         people_headers = [headers]
     subject = headers.get("subject", "")
     date = notes.email_date(headers)
+    gmail_labels = sorted({str(label) for label in msg.get("labels") or []})
+    manual_chat_followup, chat_followup_active = _gmail_chat_followup_state(
+        headers, gmail_labels,
+    )
+    managed_chat_followup = (
+        source.get("self_forwarded_chat_followups") is True
+        and manual_chat_followup
+    )
     source_people, source_people_truncated = _email_source_people(*people_headers)
 
     item = {
@@ -698,6 +755,10 @@ def _gmail_fetch(routine, source, candidate):
             "email_cc": headers.get("cc", ""),
             "email_subject": subject,
             "email_date": headers.get("date", ""),
+            "gmail_labels": gmail_labels,
+            "gmail_manual_chat_followup": manual_chat_followup,
+            "gmail_chat_followup_managed": managed_chat_followup,
+            "gmail_chat_followup_active": chat_followup_active,
             "source_people": source_people,
             "source_people_truncated": source_people_truncated,
         },
@@ -1404,6 +1465,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             and (
                 claim["source"].get("catch_up") is True
                 or claim["source"].get("kind") == "mila"
+                or existing.get("gmail_followup_open") is True
             )
             and "memory_error" in existing
         )
@@ -1567,6 +1629,17 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         "output_file": str(path) if path else None,
         "gmail_label_applied": label,
     }
+    meta = item.get("frontmatter") or {}
+    if (
+        meta.get("gmail_chat_followup_managed") is True
+        and meta.get("gmail_chat_followup_active") is True
+    ):
+        record.update({
+            "gmail_manual_chat_followup": True,
+            "gmail_followup_open": True,
+            "gmail_followup_title": item.get("title", ""),
+            "gmail_thread_id": meta.get("gmail_thread_id"),
+        })
 
     # Memory sink runs after the vault note: the note is the expensive half and
     # the memory add is idempotent by source id, so a crash between the two is
@@ -1576,6 +1649,15 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             outcome = memory_sink.capture(routine, item, summary)
             if outcome:
                 record.update(outcome)
+            if (
+                meta.get("gmail_chat_followup_managed") is True
+                and meta.get("gmail_chat_followup_active") is True
+                and (outcome or {}).get("memory") == "skipped_not_worthy"
+            ):
+                raise RuntimeError(
+                    "an active self-forwarded Chat follow-up was rejected "
+                    "as not memory-worthy"
+                )
         except Exception as exc:
             # Memory failure must not abort Gmail triage; the ledger records it
             # for a manual re-run.
@@ -1824,3 +1906,74 @@ def _retry_pending_actions(routine, processed, dry_run, totals):
             totals["pending_actions"] += 1
         else:
             log(f"routine={rid} pending actions cleared for {item_id}")
+
+
+def _reconcile_gmail_chat_followups(routine, processed, dry_run=False):
+    """Resolve tracked Chat follow-ups once their Gmail queue item is archived."""
+    rid = routine["id"]
+    tracked = [
+        (item_id, entry)
+        for item_id, entry in processed.items()
+        if (
+            entry.get("rule_id") == rid
+            and entry.get("gmail_followup_open") is True
+        )
+    ]
+    if not tracked:
+        return 0
+
+    active_threads = {
+        item.get("thread_id") or item.get("message_id")
+        for item in gmail.search(GMAIL_CHAT_FOLLOWUP_QUERY, 0)
+    }
+    resolved = 0
+    failures = []
+    for item_id, entry in tracked:
+        thread_id = entry.get("gmail_thread_id") or item_id
+        if thread_id in active_threads:
+            continue
+        memory_entry_id = entry.get("memory_entry_id")
+        if not memory_entry_id:
+            failures.append(
+                f"tracked follow-up {item_id} left Inbox before its memory "
+                "todo was created"
+            )
+            continue
+        if dry_run:
+            log(
+                f"routine={rid} [dry-run] would resolve archived Gmail "
+                f"follow-up {item_id} (memory={memory_entry_id})"
+            )
+            resolved += 1
+            continue
+
+        try:
+            outcome = memory_sink.resolve_followup(
+                routine,
+                memory_entry_id=memory_entry_id,
+                thread_id=thread_id,
+                title=entry.get("gmail_followup_title") or "Chat follow-up",
+            )
+        except Exception as exc:
+            failures.append(f"{item_id}: {exc}")
+            continue
+        updated = dict(entry)
+        updated.update({
+            "gmail_followup_open": False,
+            "gmail_followup_resolved_at": utc_now_iso(),
+            "gmail_followup_resolution_entry_id": outcome.get(
+                "memory_entry_id"
+            ),
+        })
+        processed.record(item_id, updated)
+        resolved += 1
+        log(
+            f"routine={rid} resolved archived Gmail follow-up {item_id} "
+            f"via {outcome.get('memory_entry_id') or 'memory'}"
+        )
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} follow-up(s) remain unresolved: "
+            + "; ".join(failures[:3])
+        )
+    return resolved

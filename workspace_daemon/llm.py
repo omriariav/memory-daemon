@@ -80,6 +80,19 @@ def _source_header_lines(item):
         lines.append(f"To: {meta['email_to']}")
     if meta.get("email_cc"):
         lines.append(f"Cc: {meta['email_cc']}")
+    if meta.get("gmail_labels"):
+        lines.append(f"Gmail labels: {', '.join(meta['gmail_labels'])}")
+    if meta.get("gmail_chat_followup_managed"):
+        if meta.get("gmail_chat_followup_active"):
+            lines.append(
+                "Attention signal: the memory owner manually forwarded this "
+                "Chat message to their own Inbox and it remains open."
+            )
+        else:
+            lines.append(
+                "Attention signal: this manually forwarded Chat message is no "
+                "longer in the memory owner's Inbox."
+            )
     if meta.get("gmail_thread_message_count") is not None:
         included = meta.get(
             "gmail_thread_messages_included",

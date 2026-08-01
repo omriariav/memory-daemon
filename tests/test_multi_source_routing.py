@@ -98,6 +98,57 @@ class MultiSourceValidationTest(unittest.TestCase):
             problems,
         )
 
+    def test_self_forwarded_chat_followups_require_gmail_and_memory(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["self_forwarded_chat_followups"] = True
+        routine["sources"][1]["self_forwarded_chat_followups"] = True
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("supported only for gmail" in problem for problem in problems),
+            problems,
+        )
+        self.assertTrue(
+            any("requires a memory block" in problem for problem in problems),
+            problems,
+        )
+
+    def test_self_forwarded_chat_followup_flag_must_be_boolean(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["self_forwarded_chat_followups"] = "yes"
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("must be true or false" in problem for problem in problems),
+            problems,
+        )
+
+    def test_self_forwarded_chat_followups_require_queue_query(self):
+        routine = multi_routine(self.tmp.name)
+        routine["memory"] = {"store": self.tmp.name, "type": "note"}
+        routine["sources"][0]["self_forwarded_chat_followups"] = True
+        routine["sources"][0]["query"] = "in:inbox newer_than:1d"
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("requires query branch" in problem for problem in problems),
+            problems,
+        )
+
+        routine["sources"][0]["query"] = (
+            '{in:inbox newer_than:1d} '
+            '{in:inbox from:me to:me subject:"Fwd: Chat"}'
+        )
+        self.assertFalse(
+            any(
+                "requires query branch" in problem
+                for problem in config.validate(routine)
+            )
+        )
+
     def test_multi_source_rejects_routine_level_actions(self):
         routine = multi_routine(self.tmp.name)
         routine["actions"] = ["archive"]

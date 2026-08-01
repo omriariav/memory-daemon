@@ -395,6 +395,95 @@ class CaptureValidationTest(unittest.TestCase):
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "todo")
 
+    def test_active_self_forwarded_chat_is_always_a_distinct_todo(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": True,
+            "gmail_chat_followup_active": True,
+        })
+        _, calls = self._run_capture({
+            "worthy": False,
+            "owner_attention": False,
+            "type": "note",
+            "title": "Follow up on the discussion",
+            "people": [],
+            "tags": [],
+            "body": "The owner intentionally queued this discussion.",
+        })
+
+        args = calls["args"]
+        self.assertEqual(args[args.index("--type") + 1], "todo")
+        self.assertIn("--force-new", args)
+        tags = args[args.index("--tags") + 1]
+        self.assertIn("gmail-followup", tags)
+
+    def test_active_chat_followup_survives_source_not_worthy_sentinel(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": True,
+            "gmail_chat_followup_active": True,
+        })
+        _, calls = self._run_capture(
+            {
+                "worthy": False,
+                "owner_attention": False,
+                "type": "note",
+                "title": "Follow up on the queued Chat message",
+                "people": [],
+                "tags": [],
+                "body": "Follow up on the source-linked conversation.",
+            },
+            summary="NOT MEMORY-WORTHY",
+        )
+
+        args = calls["args"]
+        self.assertEqual(args[args.index("--type") + 1], "todo")
+        self.assertIn("--force-new", args)
+
+    def test_archived_self_forward_is_not_forced_to_todo(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": True,
+            "gmail_chat_followup_active": False,
+        })
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": False,
+            "type": "note",
+            "title": "Discussion context",
+            "people": [],
+            "tags": [],
+            "body": "The discussion remains useful context.",
+        })
+
+        args = calls["args"]
+        self.assertEqual(args[args.index("--type") + 1], "note")
+        self.assertNotIn("--force-new", args)
+
+    def test_unmanaged_self_forward_is_not_forced_to_todo(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": False,
+            "gmail_chat_followup_active": True,
+        })
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": False,
+            "type": "note",
+            "title": "Discussion context",
+            "people": [],
+            "tags": [],
+            "body": "The discussion remains useful context.",
+        })
+
+        args = calls["args"]
+        self.assertEqual(args[args.index("--type") + 1], "note")
+        self.assertNotIn("--force-new", args)
+
     def test_verified_drive_owner_can_mint_new_person_slug(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
         verified = {
@@ -749,6 +838,83 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(out, {"memory": "dry_run"})
         m.assert_not_called()
         e.assert_not_called()
+
+    def test_active_followup_dry_run_reports_forced_todo(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": True,
+            "gmail_chat_followup_active": True,
+        })
+        with mock.patch.object(memory_sink, "_cli") as cli, \
+             mock.patch.object(memory_sink, "log") as log:
+            out = memory_sink.capture(
+                self.routine, self.item, "summary", dry_run=True
+            )
+
+        self.assertEqual(out, {"memory": "dry_run"})
+        cli.assert_not_called()
+        self.assertIn("type=todo", log.call_args.args[0])
+        self.assertIn("active Chat follow-up", log.call_args.args[0])
+
+
+class FollowupResolutionTest(unittest.TestCase):
+    def test_resolution_creates_idempotent_timeline_successor(self):
+        calls = {}
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls.update({"store": store, "args": args, "body": stdin_text})
+            return FakeResult("✓ created 2026-08-01-completed-follow-up\n")
+
+        routine = {
+            "id": "gmail-sweep",
+            "memory": {"store": "/store", "type": "note"},
+        }
+        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+             mock.patch.object(memory_sink.subprocess, "run"):
+            outcome = memory_sink.resolve_followup(
+                routine,
+                memory_entry_id="2026-07-31-open-follow-up",
+                thread_id="thread-1",
+                title="Fwd: Chat with a colleague",
+                completed_on="2026-08-01",
+            )
+
+        args = calls["args"]
+        self.assertEqual(args[args.index("--type") + 1], "note")
+        self.assertEqual(
+            args[args.index("--source-ids") + 1],
+            "gmail:thread-1:followup-completed",
+        )
+        self.assertEqual(
+            args[args.index("--follows") + 1],
+            "2026-07-31-open-follow-up",
+        )
+        self.assertIn("--force-new", args)
+        self.assertIn("no longer in the Gmail Inbox", calls["body"])
+        self.assertEqual(
+            outcome["memory_entry_id"],
+            "2026-08-01-completed-follow-up",
+        )
+
+    def test_resolution_requires_store_entry_id(self):
+        routine = {
+            "id": "gmail-sweep",
+            "memory": {"store": "/store", "type": "note"},
+        }
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult("completed\n")
+        ), mock.patch.object(memory_sink.subprocess, "run") as commit:
+            with self.assertRaisesRegex(RuntimeError, "returned no entry id"):
+                memory_sink.resolve_followup(
+                    routine,
+                    memory_entry_id="2026-07-31-open-follow-up",
+                    thread_id="thread-1",
+                    title="Fwd: Chat with a colleague",
+                    completed_on="2026-08-01",
+                )
+
+        commit.assert_not_called()
 
 
 if __name__ == "__main__":
