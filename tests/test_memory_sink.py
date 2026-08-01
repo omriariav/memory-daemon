@@ -99,6 +99,10 @@ class SlugCatalogTest(unittest.TestCase):
         self.assertIn("worthy as a todo while it remains unresolved", prompt)
         self.assertIn("need not already have been accepted or started", prompt)
         self.assertIn("Preserve any stated deadline, but do not require one", prompt)
+        self.assertIn('"owner_attention": boolean', prompt)
+        self.assertIn("A third party's deadline, commitment, or unresolved work", prompt)
+        self.assertIn(memory_sink.NO_OWNER_ACTION_MARKER, prompt)
+        self.assertIn('use "todo" or "pending-decision" only when owner_attention is true', prompt)
 
 
 class SourceIdTest(unittest.TestCase):
@@ -223,7 +227,12 @@ class CaptureValidationTest(unittest.TestCase):
         self.item = {"id": "slack:C1:1.0", "title": "t", "date": "2026-07-27",
                      "frontmatter": {}}
 
-    def _run_capture(self, extraction=None, current_user_email="me@example.com"):
+    def _run_capture(
+        self,
+        extraction=None,
+        current_user_email="me@example.com",
+        summary="summary text",
+    ):
         calls = {}
 
         def fake_cli(store, args, stdin_text=None, timeout=120):
@@ -260,7 +269,7 @@ class CaptureValidationTest(unittest.TestCase):
             for p in patches:
                 p.start()
             try:
-                out = memory_sink.capture(self.routine, self.item, "summary text")
+                out = memory_sink.capture(self.routine, self.item, summary)
             finally:
                 for p in patches:
                     p.stop()
@@ -283,6 +292,108 @@ class CaptureValidationTest(unittest.TestCase):
              "tags": [], "body": "b"})
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_third_party_todo_is_downgraded_when_owner_attention_is_false(self):
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": False,
+            "type": "todo",
+            "title": "External delivery",
+            "people": [],
+            "tags": [],
+            "body": "Another person owns the delivery.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_actionable_type_requires_explicit_boolean_owner_attention(self):
+        invalid_values = [
+            ("missing", None),
+            ("null", None),
+            ("zero", 0),
+            ("one", 1),
+            ("true-string", "true"),
+            ("false-string", "false"),
+            ("list", []),
+            ("object", {}),
+        ]
+        for label, value in invalid_values:
+            with self.subTest(owner_attention=label):
+                extraction = {
+                    "worthy": True,
+                    "type": "todo",
+                    "title": "Uncertain owner",
+                    "people": [],
+                    "tags": [],
+                    "body": "Ownership was not classified reliably.",
+                }
+                if label != "missing":
+                    extraction["owner_attention"] = value
+                _, calls = self._run_capture(extraction)
+
+                idx = calls["args"].index("--type")
+                self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_fyi_marker_downgrades_pending_decision_without_new_field(self):
+        _, calls = self._run_capture(
+            {
+                "worthy": True,
+                "type": "pending-decision",
+                "title": "External choice",
+                "people": [],
+                "tags": [],
+                "body": "Another person owns the choice.",
+            },
+            summary=(
+                f"{memory_sink.NO_OWNER_ACTION_MARKER}\n"
+                "Another person must make the decision."
+            ),
+        )
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_owner_todo_remains_todo_when_owner_attention_is_true(self):
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": True,
+            "type": "todo",
+            "title": "Owner follow-up",
+            "people": [],
+            "tags": [],
+            "body": "The memory owner must follow up.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
+
+    def test_quoted_fyi_marker_does_not_downgrade_owner_todo(self):
+        _, calls = self._run_capture(
+            {
+                "worthy": True,
+                "owner_attention": True,
+                "type": "todo",
+                "title": "Owner follow-up",
+                "people": [],
+                "tags": [],
+                "body": "The memory owner must follow up.",
+            },
+            summary=(
+                f'The policy text says "{memory_sink.NO_OWNER_ACTION_MARKER}" '
+                "but the memory owner explicitly accepted this follow-up."
+            ),
+        )
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
+
+    def test_extract_false_configured_todo_does_not_require_new_field(self):
+        self.routine["memory"]["type"] = "todo"
+        _, calls = self._run_capture()
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
 
     def test_verified_drive_owner_can_mint_new_person_slug(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
