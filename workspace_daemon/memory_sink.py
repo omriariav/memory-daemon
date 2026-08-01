@@ -35,7 +35,7 @@ MEMORY_TYPES = {
 }
 AUTO_TAG = "auto-captured"
 MAX_SOURCE_PEOPLE = 20
-NO_OWNER_ACTION_MARKER = "FYI: no action assigned to the memory owner"
+NO_OWNER_ACTION_MARKER = "FYI: no action assigned to the memory owner."
 EXTRACT_PROMPT = """You are filing a distilled work note into a structured personal memory store.
 
 Read the note below and answer with a SINGLE JSON object, no markdown fence, no
@@ -51,7 +51,8 @@ other text, with exactly these keys:
             or accepted an action, must make a decision, or is expected to
             follow up. A third party's deadline, commitment, or unresolved work
             can still be worthy FYI context, but set this false and use "note".
-            If the note says "{no_owner_action_marker}", set this false.
+            If the note contains the standalone line
+            "{no_owner_action_marker}", set this false.
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
           incident, achievement, feedback, meeting, note
           (use "meeting" only for an actual meeting record; an email report or
@@ -372,6 +373,12 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
     return data
 
 
+def _has_no_owner_action_marker(summary):
+    """True only for the canonical standalone FYI marker, never quoted prose."""
+    marker = NO_OWNER_ACTION_MARKER.casefold()
+    return any(line.strip().casefold() == marker for line in summary.splitlines())
+
+
 def capture(routine, item, summary, dry_run=False):
     """Distill `summary` into one memory entry and store it via the CLI.
 
@@ -403,6 +410,7 @@ def capture(routine, item, summary, dry_run=False):
     entry = {"worthy": True, "type": cfg.get("type", "note"),
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}
     degraded = None
+    extraction_succeeded = False
     extract = cfg.get("extract", True)
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
     identity = (
@@ -426,6 +434,7 @@ def capture(routine, item, summary, dry_run=False):
                 verified_people=verified_source,
                 identity=identity,
             ))
+            extraction_succeeded = True
         except Exception as exc:
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
@@ -439,14 +448,18 @@ def capture(routine, item, summary, dry_run=False):
 
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")
-    owner_attention_denied = (
-        entry.get("owner_attention") is False
-        or NO_OWNER_ACTION_MARKER.casefold() in summary.casefold()
+    has_no_owner_marker = _has_no_owner_action_marker(summary)
+    owner_attention_denied = has_no_owner_marker or (
+        extraction_succeeded and entry.get("owner_attention") is not True
     )
     if etype in {"todo", "pending-decision"} and owner_attention_denied:
+        reason = (
+            "the source contains the standalone no-owner-action marker"
+            if has_no_owner_marker
+            else "structured extraction did not affirm owner attention"
+        )
         log(
-            f"routine={rid} memory: downgraded {etype} to note because "
-            "the source explicitly assigns no action to the memory owner"
+            f"routine={rid} memory: downgraded {etype} to note because {reason}"
         )
         etype = "note"
     known = _known_slugs_for_identity(store, identity)
