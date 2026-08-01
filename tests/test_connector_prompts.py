@@ -363,6 +363,10 @@ class PromptBuildTest(StoreFixture):
                 "gmail_thread_message_count": 80,
                 "gmail_thread_messages_included": 50,
                 "gmail_thread_truncated": True,
+                "gmail_labels": ["INBOX", "SENT", "STARRED"],
+                "gmail_manual_chat_followup": True,
+                "gmail_chat_followup_managed": True,
+                "gmail_chat_followup_active": True,
             },
         }
         with mock.patch.object(connector_prompts, "log"):
@@ -372,6 +376,9 @@ class PromptBuildTest(StoreFixture):
         self.assertIn("Cc: Reviewer <reviewer@example.com>", prompt)
         self.assertIn("Messages in supplied thread: 50 of 80", prompt)
         self.assertIn("Coverage warning:", prompt)
+        self.assertIn("Gmail labels: INBOX, SENT, STARRED", prompt)
+        self.assertIn("manually forwarded this Chat message", prompt)
+        self.assertIn("it remains open", prompt)
 
 
 if __name__ == "__main__":

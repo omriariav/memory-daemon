@@ -22,6 +22,7 @@ Validation discipline (nothing model-invented reaches the store unchecked):
   remain source metadata rather than self-links
 - every entry carries a canonical --source-ids, so re-runs update in place
 """
+import datetime
 import json
 import re
 import subprocess
@@ -392,15 +393,33 @@ def capture(routine, item, summary, dry_run=False):
     store = cfg["store"]
     rid = routine.get("id")
     source_id = source_id_for(item)
+    meta = item.get("frontmatter") or {}
+    active_chat_followup = (
+        meta.get("gmail_chat_followup_managed") is True
+        and meta.get("gmail_manual_chat_followup") is True
+        and meta.get("gmail_chat_followup_active") is True
+    )
 
     if dry_run:
         # Honor the daemon's dry-run contract: no LLM call, no store write. The
         # extraction verdict can't be previewed without the real summary anyway.
-        log(f"routine={rid} [dry-run] would extract + memory-add "
-            f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}")
+        if active_chat_followup:
+            log(
+                f"routine={rid} [dry-run] would extract + force-new "
+                f"memory-add (type=todo; active Chat follow-up) "
+                f"source_id={source_id}"
+            )
+        else:
+            log(f"routine={rid} [dry-run] would extract + memory-add "
+                f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}")
         return {"memory": "dry_run"}
 
-    if summary.strip() == "NOT MEMORY-WORTHY":
+    if summary.strip() == "NOT MEMORY-WORTHY" and active_chat_followup:
+        summary = (
+            "The memory owner manually forwarded this Chat message to their "
+            "Gmail Inbox for follow-up. Review the source-linked conversation."
+        )
+    if summary.strip() == "NOT MEMORY-WORTHY" and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
             "source analysis judged not memory-worthy, skipping extraction"
@@ -439,7 +458,7 @@ def capture(routine, item, summary, dry_run=False):
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
 
-    if not entry.get("worthy", True):
+    if not entry.get("worthy", True) and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
             "judged not memory-worthy, skipping"
@@ -462,6 +481,12 @@ def capture(routine, item, summary, dry_run=False):
             f"routine={rid} memory: downgraded {etype} to note because {reason}"
         )
         etype = "note"
+    if active_chat_followup and etype != "todo":
+        log(
+            f"routine={rid} memory: classified active self-forwarded Chat "
+            f"follow-up as todo instead of {etype}"
+        )
+        etype = "todo"
     known = _known_slugs_for_identity(store, identity)
     source_slugs = {person["slug"] for person in verified_source}
     allowed = known | source_slugs | set(verified_owners)
@@ -477,6 +502,8 @@ def capture(routine, item, summary, dry_run=False):
     )
     tags = [t for t in entry.get("tags") or [] if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(t))]
     tags += list(cfg.get("tags") or [])
+    if active_chat_followup:
+        tags.append("gmail-followup")
     tags.append(AUTO_TAG)
     if (
         dropped or unresolved_source or unresolved_owners
@@ -515,6 +542,11 @@ def capture(routine, item, summary, dry_run=False):
         # No canonical id -> the store's near-dup guard may interject; force-new
         # would risk duplicates, so let the guard win and report it.
         log(f"routine={rid} memory WARN: no source id derived; relying on near-dup guard")
+    if active_chat_followup:
+        # The underlying Chat fact may already exist in memory, but the user's
+        # explicit follow-up intent is a separate actionable record. Source-id
+        # matching still makes later retries update this same todo in place.
+        args.append("--force-new")
 
     if dry_run:
         log(f"routine={rid} [dry-run] would memory-add type={etype} title={title!r} "
@@ -524,19 +556,78 @@ def capture(routine, item, summary, dry_run=False):
     r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0:
+        # Some store failures happen after the entry file was written. Preserve
+        # any such write before surfacing the error for an idempotent retry.
+        _commit_store(store, f"memory: {rid} auto-capture")
         raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
     verdict, entry_id = (m.group(1), m.group(2)) if m else ("unknown", None)
+    _commit_store(store, f"memory: {rid} auto-capture")
+    if active_chat_followup and not entry_id:
+        raise RuntimeError(
+            "memory add returned no entry id for active Gmail follow-up: "
+            f"{out.strip()[:300]}"
+        )
     log(
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"
     )
 
+    return {"memory": verdict, "memory_entry_id": entry_id, "memory_people": people}
+
+
+def resolve_followup(routine, memory_entry_id, thread_id, title,
+                     completed_on=None):
+    """Resolve an archived Gmail follow-up with a timeline successor note."""
+    cfg = memory_cfg(routine)
+    if not cfg:
+        raise RuntimeError("Gmail follow-up reconciliation requires a memory sink")
+    rid = routine.get("id")
+    completed_on = completed_on or datetime.date.today().isoformat()
+    clean_title = re.sub(r"^Fwd:\s*", "", title or "Chat follow-up", flags=re.I)
+    resolution_title = f"Completed follow-up: {clean_title}"[:120]
+    source_id = f"gmail:{thread_id}:followup-completed"
+    body = (
+        "The manually forwarded Chat message is no longer in the Gmail Inbox, "
+        "which is the configured completion signal for this follow-up. Read or "
+        "star state alone did not resolve it."
+    )
+    args = [
+        "add",
+        "--type", "note",
+        "--title", resolution_title,
+        "--date", completed_on,
+        "--tags", f"gmail,gmail-followup,follow-up-completed,{AUTO_TAG}",
+        "--source-ids", source_id,
+        "--follows", memory_entry_id,
+        "--force-new",
+    ]
+    result = _cli(cfg["store"], args, stdin_text=body, timeout=300)
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"memory follow-up resolution failed: {output.strip()[:300]}"
+        )
+    match = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", output)
+    if not match:
+        raise RuntimeError(
+            "memory follow-up resolution returned no entry id: "
+            f"{output.strip()[:300]}"
+        )
+    verdict, entry_id = match.group(1), match.group(2)
+    log(
+        f"routine={rid} memory follow-up {verdict} {entry_id or ''} "
+        f"source_id={source_id} follows={memory_entry_id}"
+    )
+    _commit_store(cfg["store"], f"memory: {rid} follow-up completed")
+    return {"memory": verdict, "memory_entry_id": entry_id}
+
+
+def _commit_store(store, message):
+    """Best-effort nested-git commit for unattended store writes."""
     # The store's auto-commit hook only fires inside agent sessions; commit here
-    # so daemon writes are versioned too. Best-effort.
+    # so daemon writes are versioned too.
     subprocess.run(["git", "-C", f"{store}/memory", "add", "-A", "."],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", f"{store}/memory", "commit", "-q", "-m",
-                    f"memory: {rid} auto-capture"], capture_output=True, timeout=30)
-
-    return {"memory": verdict, "memory_entry_id": entry_id, "memory_people": people}
+                    message], capture_output=True, timeout=30)

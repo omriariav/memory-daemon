@@ -422,6 +422,13 @@ def validate(routine):
         problems.append(
             f"{rid}: only one catch_up source is currently supported per routine"
         )
+    if sum(
+        source.get("self_forwarded_chat_followups") is True
+        for source in source_dicts
+    ) > 1:
+        problems.append(
+            f"{rid}: only one self_forwarded_chat_followups source is supported"
+        )
 
     analyze = routine.get("analyze", {})
     if not isinstance(analyze, dict):
@@ -675,6 +682,25 @@ def _validate_source(routine, source, prefix):
         problems.append(f"{prefix}.read_thread must be true or false")
     if kind != "gmail" and read_thread is not None:
         problems.append(f"{prefix}.read_thread is supported only for gmail")
+
+    chat_followups = source.get("self_forwarded_chat_followups")
+    if chat_followups is not None and not isinstance(chat_followups, bool):
+        problems.append(
+            f"{prefix}.self_forwarded_chat_followups must be true or false"
+        )
+    if kind != "gmail" and chat_followups is not None:
+        problems.append(
+            f"{prefix}.self_forwarded_chat_followups is supported only for gmail"
+        )
+    if chat_followups is True and not isinstance(routine.get("memory"), dict):
+        problems.append(
+            f"{prefix}.self_forwarded_chat_followups requires a memory block"
+        )
+    if chat_followups is True and action_list:
+        problems.append(
+            f"{prefix}.self_forwarded_chat_followups requires actions: [] "
+            "so only the user can complete the Inbox queue"
+        )
 
     catch_up = source.get("catch_up", False)
     if not isinstance(catch_up, bool):

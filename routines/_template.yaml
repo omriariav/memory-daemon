@@ -57,6 +57,15 @@ source:
   # combine with streams.*.message_updates, which treats each reply separately.
   # read_thread: true
 
+  # Optional Gmail follow-up lifecycle. Google Chat's "forward to inbox"
+  # produces a self-addressed SENT + INBOX message whose subject starts
+  # "Fwd: Chat". When enabled, that queue item is always captured as a distinct
+  # todo; removing it from Inbox creates a timeline successor that resolves the
+  # todo. Read/unstar alone does not resolve it. The daemon enumerates this queue
+  # separately without a result cap, so the normal query need not include it.
+  # This mode requires a memory sink and actions: []: only the user completes it.
+  # self_forwarded_chat_followups: true
+
   # Cap on items examined per run. Optional, default 20.
   max_results: 20
 
