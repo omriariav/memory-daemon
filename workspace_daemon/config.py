@@ -696,14 +696,11 @@ def _validate_source(routine, source, prefix):
         problems.append(
             f"{prefix}.self_forwarded_chat_followups requires a memory block"
         )
-    if chat_followups is True:
-        query = " ".join(str(source.get("query") or "").casefold().split())
-        required_query = 'in:inbox from:me to:me subject:"fwd: chat"'
-        if required_query not in query:
-            problems.append(
-                f"{prefix}.self_forwarded_chat_followups requires query branch "
-                f"{required_query!r}"
-            )
+    if chat_followups is True and action_list:
+        problems.append(
+            f"{prefix}.self_forwarded_chat_followups requires actions: [] "
+            "so only the user can complete the Inbox queue"
+        )
 
     catch_up = source.get("catch_up", False)
     if not isinstance(catch_up, bool):

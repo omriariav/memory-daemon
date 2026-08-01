@@ -588,10 +588,31 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
 # full content on demand. Listing stays cheap so dedupe can skip most work.
 
 def _gmail_candidates(source):
-    return [
-        {"id": t["message_id"], "title": t.get("subject", ""), "raw": t}
-        for t in gmail.search(source["query"], source.get("max_results", 20))
-    ]
+    threads = gmail.search(source["query"], source.get("max_results", 20))
+    if source.get("self_forwarded_chat_followups") is True:
+        # The Inbox is the queue, so processed items can remain there for a long
+        # time. Enumerate it separately and without a cap; otherwise the first
+        # page of already-seen items can permanently starve older follow-ups.
+        followups = []
+        for thread in gmail.search(GMAIL_CHAT_FOLLOWUP_QUERY, 0):
+            marked = dict(thread)
+            marked["_gmail_chat_followup_candidate"] = True
+            followups.append(marked)
+        threads = followups + list(threads)
+
+    candidates = []
+    seen = set()
+    for thread in threads:
+        message_id = thread["message_id"]
+        if message_id in seen:
+            continue
+        seen.add(message_id)
+        candidates.append({
+            "id": message_id,
+            "title": thread.get("subject", ""),
+            "raw": thread,
+        })
+    return candidates
 
 
 def _address_set(value):
@@ -734,6 +755,16 @@ def _gmail_fetch(routine, source, candidate):
     manual_chat_followup, chat_followup_active = _gmail_chat_followup_state(
         headers, gmail_labels,
     )
+    queue_candidate = (
+        (candidate.get("raw") or {}).get("_gmail_chat_followup_candidate")
+        is True
+    )
+    if source.get("self_forwarded_chat_followups") is True and queue_candidate:
+        # The dedicated Gmail query already established from:me, to:me,
+        # subject and Inbox state. Trust it when aliases prevent raw From/To
+        # headers from intersecting exactly.
+        manual_chat_followup = True
+        chat_followup_active = True
     managed_chat_followup = (
         source.get("self_forwarded_chat_followups") is True
         and manual_chat_followup
@@ -1397,8 +1428,22 @@ def _route_claims(claims, totals, failures=()):
     """
     owned = {}
     for (kind, item_id), candidates in claims.items():
+        managed_followups = [
+            claim for claim in candidates
+            if (
+                claim["source"].get("self_forwarded_chat_followups") is True
+                and (claim["candidate"].get("raw") or {}).get(
+                    "_gmail_chat_followup_candidate"
+                ) is True
+            )
+        ]
+        if managed_followups:
+            # A self-forward is an explicit queue action, not merely another
+            # copy of the underlying conversation. Its lifecycle-aware source
+            # owns the Gmail item even if another source also matched it.
+            candidates = managed_followups
         # Multiple source blocks in one routine may match the same item. That is
-        # one owner; keep the first declared block for deterministic actions.
+        # one owner; prefer a processable claim, then declaration order.
         by_routine = {}
         for claim in candidates:
             rid = claim["routine"]["id"]

@@ -556,15 +556,22 @@ def capture(routine, item, summary, dry_run=False):
     r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0:
+        # Some store failures happen after the entry file was written. Preserve
+        # any such write before surfacing the error for an idempotent retry.
+        _commit_store(store, f"memory: {rid} auto-capture")
         raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
     verdict, entry_id = (m.group(1), m.group(2)) if m else ("unknown", None)
+    _commit_store(store, f"memory: {rid} auto-capture")
+    if active_chat_followup and not entry_id:
+        raise RuntimeError(
+            "memory add returned no entry id for active Gmail follow-up: "
+            f"{out.strip()[:300]}"
+        )
     log(
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"
     )
-
-    _commit_store(store, f"memory: {rid} auto-capture")
 
     return {"memory": verdict, "memory_entry_id": entry_id, "memory_people": people}
 

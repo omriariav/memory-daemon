@@ -484,6 +484,21 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(args[args.index("--type") + 1], "note")
         self.assertNotIn("--force-new", args)
 
+    def test_active_followup_requires_store_entry_id(self):
+        self.item["frontmatter"].update({
+            "gmail_thread_id": "thread-1",
+            "gmail_manual_chat_followup": True,
+            "gmail_chat_followup_managed": True,
+            "gmail_chat_followup_active": True,
+        })
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult("capture completed\n")
+        ), mock.patch.object(memory_sink, "_commit_store") as commit:
+            with self.assertRaisesRegex(RuntimeError, "returned no entry id"):
+                memory_sink.capture(self.routine, self.item, "summary text")
+
+        commit.assert_called_once_with("/store", "memory: r auto-capture")
+
     def test_verified_drive_owner_can_mint_new_person_slug(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
         verified = {

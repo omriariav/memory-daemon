@@ -125,28 +125,38 @@ class MultiSourceValidationTest(unittest.TestCase):
             problems,
         )
 
-    def test_self_forwarded_chat_followups_require_queue_query(self):
+    def test_self_forwarded_chat_followups_require_read_only_actions(self):
         routine = multi_routine(self.tmp.name)
         routine["memory"] = {"store": self.tmp.name, "type": "note"}
         routine["sources"][0]["self_forwarded_chat_followups"] = True
-        routine["sources"][0]["query"] = "in:inbox newer_than:1d"
 
         problems = config.validate(routine)
 
         self.assertTrue(
-            any("requires query branch" in problem for problem in problems),
+            any("requires actions: []" in problem for problem in problems),
             problems,
         )
 
-        routine["sources"][0]["query"] = (
-            '{in:inbox newer_than:1d} '
-            '{in:inbox from:me to:me subject:"Fwd: Chat"}'
-        )
+        routine["sources"][0]["actions"] = []
         self.assertFalse(
             any(
-                "requires query branch" in problem
+                "requires actions: []" in problem
                 for problem in config.validate(routine)
             )
+        )
+
+    def test_self_forwarded_chat_followups_reject_legacy_actions(self):
+        routine = multi_routine(self.tmp.name)
+        routine["source"] = routine.pop("sources")[0]
+        routine["actions"] = routine["source"].pop("actions")
+        routine["source"]["self_forwarded_chat_followups"] = True
+        routine["memory"] = {"store": self.tmp.name, "type": "note"}
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("requires actions: []" in problem for problem in problems),
+            problems,
         )
 
     def test_multi_source_rejects_routine_level_actions(self):
@@ -206,6 +216,51 @@ class OwnershipRoutingTest(unittest.TestCase):
         )
         self.assertEqual(owned, {})
         self.assertEqual(totals, {"errors": 1, "ambiguous": 1})
+
+    def test_managed_followup_claim_beats_ordinary_same_routine_claim(self):
+        routine = {"id": "gmail-sweep"}
+        ordinary = self.claim(routine)
+        managed = self.claim(routine)
+        managed["source"] = {
+            "kind": "gmail",
+            "query": "in:inbox",
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        }
+        managed["candidate"]["raw"] = {
+            "_gmail_chat_followup_candidate": True,
+        }
+        totals = {"errors": 0, "ambiguous": 0}
+
+        owned = runner._route_claims(
+            {("gmail", "same"): [ordinary, managed]}, totals,
+        )
+
+        self.assertIs(owned["gmail-sweep"][0], managed)
+
+    def test_explicit_followup_queue_beats_ordinary_specialized_claim(self):
+        specialized = self.claim({"id": "specialized"})
+        managed = self.claim({
+            "id": "gmail-sweep",
+            "routing": {"fallback": True},
+        })
+        managed["source"] = {
+            "kind": "gmail",
+            "query": "in:inbox",
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        }
+        managed["candidate"]["raw"] = {
+            "_gmail_chat_followup_candidate": True,
+        }
+        totals = {"errors": 0, "ambiguous": 0}
+
+        owned = runner._route_claims(
+            {("gmail", "same"): [specialized, managed]}, totals,
+        )
+
+        self.assertEqual(list(owned), ["gmail-sweep"])
+        self.assertIs(owned["gmail-sweep"][0], managed)
 
     def test_chat_versions_share_one_routing_identity(self):
         first = {

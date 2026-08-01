@@ -239,6 +239,92 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertTrue(meta["gmail_chat_followup_active"])
         self.assertEqual(meta["gmail_labels"], ["INBOX", "SENT", "STARRED"])
 
+    def test_managed_followup_queue_is_uncapped_and_deduplicated(self):
+        calls = []
+
+        def search(query, max_results=20):
+            calls.append((query, max_results))
+            if query == runner.GMAIL_CHAT_FOLLOWUP_QUERY:
+                return [
+                    {
+                        "message_id": "followup-new",
+                        "thread_id": "thread-new",
+                        "subject": "Fwd: Chat with a colleague",
+                    },
+                    {
+                        "message_id": "followup-old",
+                        "thread_id": "thread-old",
+                        "subject": "Fwd: Chat in a project space",
+                    },
+                ]
+            return [
+                {
+                    "message_id": "followup-new",
+                    "thread_id": "thread-new",
+                    "subject": "Fwd: Chat with a colleague",
+                },
+                {
+                    "message_id": "ordinary",
+                    "thread_id": "ordinary",
+                    "subject": "A recent message",
+                },
+            ]
+
+        gmail.search = search
+        source = {
+            "kind": "gmail",
+            "query": "newer_than:1d",
+            "max_results": 1,
+            "self_forwarded_chat_followups": True,
+        }
+
+        candidates = runner._gmail_candidates(source)
+
+        self.assertEqual(
+            calls,
+            [
+                ("newer_than:1d", 1),
+                (runner.GMAIL_CHAT_FOLLOWUP_QUERY, 0),
+            ],
+        )
+        self.assertEqual(
+            [candidate["id"] for candidate in candidates],
+            ["followup-new", "followup-old", "ordinary"],
+        )
+        self.assertTrue(
+            candidates[0]["raw"]["_gmail_chat_followup_candidate"]
+        )
+        self.assertTrue(
+            candidates[1]["raw"]["_gmail_chat_followup_candidate"]
+        )
+
+    def test_dedicated_queue_query_handles_self_aliases(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Fwd: Chat with a colleague",
+                "from": "owner-primary@example.com",
+                "to": "owner-alias@example.com",
+                "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+            },
+            "labels": ["INBOX", "SENT"],
+            "body": "Please follow up on the proposal.",
+        }
+        r = routine(self.vault)
+        r["source"]["self_forwarded_chat_followups"] = True
+        candidate = {
+            "id": "m2",
+            "raw": {
+                "thread_id": "thread-1",
+                "_gmail_chat_followup_candidate": True,
+            },
+        }
+
+        item = runner._gmail_fetch(r, r["source"], candidate)
+
+        self.assertTrue(item["frontmatter"]["gmail_manual_chat_followup"])
+        self.assertTrue(item["frontmatter"]["gmail_chat_followup_managed"])
+        self.assertTrue(item["frontmatter"]["gmail_chat_followup_active"])
+
     def test_gmail_marks_archived_self_forward_as_inactive(self):
         gmail.read_message = lambda mid: {
             "headers": {
