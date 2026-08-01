@@ -589,20 +589,12 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
 
 def _gmail_candidates(source):
     threads = gmail.search(source["query"], source.get("max_results", 20))
-    if source.get("self_forwarded_chat_followups") is True:
-        # The Inbox is the queue, so processed items can remain there for a long
-        # time. Enumerate it separately and without a cap; otherwise the first
-        # page of already-seen items can permanently starve older follow-ups.
-        followups = []
-        for thread in gmail.search(GMAIL_CHAT_FOLLOWUP_QUERY, 0):
-            marked = dict(thread)
-            marked["_gmail_chat_followup_candidate"] = True
-            followups.append(marked)
-        threads = followups + list(threads)
-
     candidates = []
     seen = set()
     for thread in threads:
+        thread = dict(thread)
+        if source.get("_gmail_chat_followup_listing") is True:
+            thread["_gmail_chat_followup_candidate"] = True
         message_id = thread["message_id"]
         if message_id in seen:
             continue
@@ -1164,10 +1156,11 @@ def _safe_routing_rank(routine):
     return (1 if fallback else 0, priority)
 
 
-def _failure(routine, source=None, known_ids=None):
+def _failure(routine, source=None, known_ids=None, ownership_class="ordinary"):
     return {
         "routine_id": str(routine.get("id", "?")),
         "rank": _safe_routing_rank(routine),
+        "ownership_class": ownership_class,
         "scopes": _source_scopes(source) if isinstance(source, dict) else {
             (kind, "*") for kind in config.VALID_SOURCE_KINDS
         },
@@ -1190,11 +1183,20 @@ def _routine_failures(routine):
         else:
             unknown = True
 
-    failures = [
-        _failure(routine, source)
-        for source in source_values
-        if isinstance(source, dict) and source.get("kind") in config.VALID_SOURCE_KINDS
-    ]
+    failures = []
+    for source in source_values:
+        if not (
+            isinstance(source, dict)
+            and source.get("kind") in config.VALID_SOURCE_KINDS
+        ):
+            continue
+        failures.append(_failure(routine, source))
+        if source.get("self_forwarded_chat_followups") is True:
+            failures.append(
+                _failure(
+                    routine, source, ownership_class="gmail_followup",
+                )
+            )
     if (
         unknown
         or not failures
@@ -1362,61 +1364,167 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 listing_source,
                 _exclude_spaces=sorted(claimed_gchat_spaces),
             )
-        log(f"routine={rid} querying {kind}: {_scope(source)}")
-        try:
-            candidates = list_candidates(listing_source)
-        except Exception as exc:
-            source_coverage[(rid, source_index)] = f"listing failed: {exc}"
-            totals["errors"] += 1
-            log(f"routine={rid} source={kind} FATAL: {exc}")
-            failures.append(_failure(routine, source))
-            continue
+        listing_specs = [{
+            "label": kind,
+            "listing_source": listing_source,
+            "claim_source": source,
+            "ownership_class": "ordinary",
+            "expand_ownership": True,
+        }]
+        if (
+            kind == "gmail"
+            and source.get("self_forwarded_chat_followups") is True
+        ):
+            # Keep the normal Gmail sweep and the explicit Inbox queue as two
+            # independent reads. A failure in either one must not erase the
+            # successful candidates from the other.
+            listing_specs = [
+                {
+                    "label": "gmail",
+                    "listing_source": dict(
+                        listing_source,
+                        self_forwarded_chat_followups=False,
+                    ),
+                    "claim_source": dict(
+                        source,
+                        self_forwarded_chat_followups=False,
+                    ),
+                    "ownership_class": "ordinary",
+                    "expand_ownership": True,
+                },
+                {
+                    "label": "gmail follow-up queue",
+                    "listing_source": dict(
+                        listing_source,
+                        query=GMAIL_CHAT_FOLLOWUP_QUERY,
+                        max_results=0,
+                        _gmail_chat_followup_listing=True,
+                    ),
+                    "claim_source": source,
+                    "ownership_class": "gmail_followup",
+                    "expand_ownership": False,
+                },
+            ]
 
-        source_coverage[(rid, source_index)] = _source_coverage_problem(
-            source, candidates
-        )
-        log(f"routine={rid} source={kind} {len(candidates)} item(s) matched")
-        normal_ids = {_routing_id(candidate) for candidate in candidates}
-
-        discovery = []
-        discovery_limit = _ownership_limit(source, all_sources)
-        source_limit = _source_limit(source)
-        if source_limit and discovery_limit > source_limit:
-            expanded_source = dict(
-                listing_source, max_results=discovery_limit
-            )
-            log(
-                f"routine={rid} source={kind} expanding ownership scan "
-                f"to {discovery_limit}"
-            )
+        coverage_problems = []
+        for spec in listing_specs:
+            spec_label = spec["label"]
+            spec_source = spec["listing_source"]
+            claim_source = spec["claim_source"]
+            ownership_class = spec["ownership_class"]
+            log(f"routine={rid} querying {spec_label}: {_scope(spec_source)}")
             try:
-                discovery = list_candidates(expanded_source)
+                candidates = list_candidates(spec_source)
             except Exception as exc:
+                coverage_problems.append(f"{spec_label} listing failed: {exc}")
                 totals["errors"] += 1
-                log(
-                    f"routine={rid} source={kind} ownership scan FATAL: {exc}"
-                )
+                log(f"routine={rid} source={spec_label} FATAL: {exc}")
                 failures.append(
-                    _failure(routine, source, known_ids=normal_ids)
+                    _failure(
+                        routine, source,
+                        ownership_class=ownership_class,
+                    )
                 )
+                continue
 
-        candidates_with_budget = [(candidate, True) for candidate in candidates]
-        candidates_with_budget.extend(
-            (candidate, False)
-            for candidate in discovery
-            if _routing_id(candidate) not in normal_ids
+            if ownership_class == "ordinary":
+                problem = _source_coverage_problem(source, candidates)
+                if problem:
+                    coverage_problems.append(problem)
+            log(
+                f"routine={rid} source={spec_label} "
+                f"{len(candidates)} item(s) matched"
+            )
+            normal_ids = {_routing_id(candidate) for candidate in candidates}
+
+            discovery = []
+            discovery_limit = _ownership_limit(source, all_sources)
+            source_limit = _source_limit(source)
+            if (
+                spec["expand_ownership"]
+                and source_limit
+                and discovery_limit > source_limit
+            ):
+                expanded_source = dict(
+                    spec_source, max_results=discovery_limit
+                )
+                log(
+                    f"routine={rid} source={spec_label} expanding ownership "
+                    f"scan to {discovery_limit}"
+                )
+                try:
+                    discovery = list_candidates(expanded_source)
+                except Exception as exc:
+                    totals["errors"] += 1
+                    log(
+                        f"routine={rid} source={spec_label} ownership scan "
+                        f"FATAL: {exc}"
+                    )
+                    failures.append(
+                        _failure(
+                            routine, source, known_ids=normal_ids,
+                            ownership_class=ownership_class,
+                        )
+                    )
+
+            candidates_with_budget = [
+                (candidate, True) for candidate in candidates
+            ]
+            candidates_with_budget.extend(
+                (candidate, False)
+                for candidate in discovery
+                if _routing_id(candidate) not in normal_ids
+            )
+            for candidate, processable in candidates_with_budget:
+                key = (kind, _routing_id(candidate))
+                claims.setdefault(key, []).append({
+                    "routine": routine,
+                    "source": claim_source,
+                    "source_index": source_index,
+                    "candidate": candidate,
+                    "fetch": fetch,
+                    "processable": processable,
+                })
+
+        source_coverage[(rid, source_index)] = (
+            "; ".join(dict.fromkeys(coverage_problems))
+            if coverage_problems else None
         )
-        for candidate, processable in candidates_with_budget:
-            key = (kind, _routing_id(candidate))
-            claims.setdefault(key, []).append({
-                "routine": routine,
-                "source": source,
-                "source_index": source_index,
-                "candidate": candidate,
-                "fetch": fetch,
-                "processable": processable,
-            })
     return claims, failures
+
+
+def _is_managed_followup_claim(claim):
+    return (
+        claim["source"].get("self_forwarded_chat_followups") is True
+        and (claim["candidate"].get("raw") or {}).get(
+            "_gmail_chat_followup_candidate"
+        ) is True
+    )
+
+
+def _could_be_gmail_followup(claim):
+    return (
+        claim["source"].get("kind") == "gmail"
+        and str(claim["candidate"].get("title") or "")
+        .strip().casefold().startswith("fwd: chat")
+    )
+
+
+def _failure_blocks_claim(failure, claim, best_rank, managed):
+    failure_class = failure.get("ownership_class", "ordinary")
+    if managed:
+        # Ordinary Gmail ownership is irrelevant once the explicit queue has
+        # proved this item is a managed follow-up.
+        return (
+            failure_class == "gmail_followup"
+            and failure["rank"] <= best_rank
+        )
+    if failure_class == "gmail_followup":
+        # When queue discovery failed, never let an ordinary Gmail listing
+        # ledger a potential self-forward first. Managed ownership outranks
+        # ordinary ownership regardless of routine rank.
+        return _could_be_gmail_followup(claim)
+    return failure["rank"] <= best_rank
 
 
 def _route_claims(claims, totals, failures=()):
@@ -1429,13 +1537,7 @@ def _route_claims(claims, totals, failures=()):
     owned = {}
     for (kind, item_id), candidates in claims.items():
         managed_followups = [
-            claim for claim in candidates
-            if (
-                claim["source"].get("self_forwarded_chat_followups") is True
-                and (claim["candidate"].get("raw") or {}).get(
-                    "_gmail_chat_followup_candidate"
-                ) is True
-            )
+            claim for claim in candidates if _is_managed_followup_claim(claim)
         ]
         if managed_followups:
             # A self-forward is an explicit queue action, not merely another
@@ -1473,7 +1575,9 @@ def _route_claims(claims, totals, failures=()):
         blockers = {
             failure["routine_id"]
             for failure in failures
-            if failure["rank"] <= best_rank
+            if _failure_blocks_claim(
+                failure, claim, best_rank, bool(managed_followups)
+            )
             and item_id not in failure["known_ids"]
             and _scopes_overlap(
                 failure["scopes"],
@@ -1505,6 +1609,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     for claim in claims:
         candidate = claim["candidate"]
         existing = processed.get(candidate["id"])
+        upgrade_followup = (
+            existing is not None
+            and _is_managed_followup_claim(claim)
+            and existing.get("gmail_manual_chat_followup") is not True
+        )
         retry_memory = (
             existing is not None
             and (
@@ -1519,10 +1628,20 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             and claim["source"].get("kind") == "mila"
             and existing.get("calendar_match_rejected") is True
         )
-        if existing is not None and not retry_memory and not retry_calendar:
+        if (
+            existing is not None
+            and not retry_memory
+            and not retry_calendar
+            and not upgrade_followup
+        ):
             totals["skipped"] += 1
             continue
-        if retry_memory:
+        if upgrade_followup:
+            log(
+                f"routine={rid} upgrading id={candidate['id']} to managed "
+                "Gmail follow-up lifecycle"
+            )
+        elif retry_memory:
             log(
                 f"routine={rid} retrying id={candidate['id']} after memory error"
             )

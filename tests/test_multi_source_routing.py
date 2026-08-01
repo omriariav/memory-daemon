@@ -262,6 +262,96 @@ class OwnershipRoutingTest(unittest.TestCase):
         self.assertEqual(list(owned), ["gmail-sweep"])
         self.assertIs(owned["gmail-sweep"][0], managed)
 
+    def test_failed_managed_listing_blocks_ordinary_followup_claim(self):
+        specialized = {
+            "id": "specialized",
+            "source": {
+                "kind": "gmail",
+                "query": "specialized",
+                "max_results": 0,
+            },
+        }
+        managed = {
+            "id": "gmail-sweep",
+            "routing": {"fallback": True},
+            "source": {
+                "kind": "gmail",
+                "query": "general",
+                "max_results": 0,
+                "self_forwarded_chat_followups": True,
+                "actions": [],
+            },
+        }
+
+        def candidates(source):
+            if source.get("_gmail_chat_followup_listing"):
+                raise RuntimeError("queue unavailable")
+            if source["query"] == "specialized":
+                return [{
+                    "id": "message-1",
+                    "title": "Fwd: Chat with a colleague",
+                    "raw": {},
+                }]
+            return []
+
+        saved = runner.SOURCES["gmail"]
+        runner.SOURCES["gmail"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "gmail", saved)
+        totals = {"errors": 0, "ambiguous": 0}
+
+        claims, failures = runner._collect_claims(
+            [specialized, managed], totals,
+        )
+        owned = runner._route_claims(claims, totals, failures)
+
+        self.assertEqual(owned, {})
+        self.assertEqual(totals["errors"], 1)
+
+    def test_failed_ordinary_listing_does_not_block_managed_followup(self):
+        specialized = {
+            "id": "specialized",
+            "source": {
+                "kind": "gmail",
+                "query": "specialized",
+                "max_results": 0,
+            },
+        }
+        managed = {
+            "id": "gmail-sweep",
+            "routing": {"fallback": True},
+            "source": {
+                "kind": "gmail",
+                "query": "general",
+                "max_results": 0,
+                "self_forwarded_chat_followups": True,
+                "actions": [],
+            },
+        }
+
+        def candidates(source):
+            if source["query"] == "specialized":
+                raise RuntimeError("ordinary source unavailable")
+            if source.get("_gmail_chat_followup_listing"):
+                return [{
+                    "id": "message-1",
+                    "title": "Fwd: Chat with a colleague",
+                    "raw": {"_gmail_chat_followup_candidate": True},
+                }]
+            return []
+
+        saved = runner.SOURCES["gmail"]
+        runner.SOURCES["gmail"] = (candidates, saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "gmail", saved)
+        totals = {"errors": 0, "ambiguous": 0}
+
+        claims, failures = runner._collect_claims(
+            [specialized, managed], totals,
+        )
+        owned = runner._route_claims(claims, totals, failures)
+
+        self.assertEqual(list(owned), ["gmail-sweep"])
+        self.assertEqual(totals["errors"], 1)
+
     def test_chat_versions_share_one_routing_identity(self):
         first = {
             "id": "gchat:SPACE:THREAD@2026-07-27T10:00:00Z",

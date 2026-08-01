@@ -271,14 +271,16 @@ class RunnerWiringTest(unittest.TestCase):
             ]
 
         gmail.search = search
-        source = {
-            "kind": "gmail",
+        r = routine(self.vault, actions=[])
+        r["source"].update({
             "query": "newer_than:1d",
             "max_results": 1,
             "self_forwarded_chat_followups": True,
-        }
+            "actions": [],
+        })
+        totals = {"errors": 0}
 
-        candidates = runner._gmail_candidates(source)
+        claims, failures = runner._collect_claims([r], totals)
 
         self.assertEqual(
             calls,
@@ -288,15 +290,25 @@ class RunnerWiringTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [candidate["id"] for candidate in candidates],
-            ["followup-new", "followup-old", "ordinary"],
+            set(claims),
+            {
+                ("gmail", "followup-new"),
+                ("gmail", "followup-old"),
+                ("gmail", "ordinary"),
+            },
         )
+        followup_claims = claims[("gmail", "followup-new")]
+        self.assertEqual(len(followup_claims), 2)
         self.assertTrue(
-            candidates[0]["raw"]["_gmail_chat_followup_candidate"]
+            any(
+                claim["candidate"]["raw"].get(
+                    "_gmail_chat_followup_candidate"
+                )
+                for claim in followup_claims
+            )
         )
-        self.assertTrue(
-            candidates[1]["raw"]["_gmail_chat_followup_candidate"]
-        )
+        self.assertEqual(failures, [])
+        self.assertEqual(totals["errors"], 0)
 
     def test_dedicated_queue_query_handles_self_aliases(self):
         gmail.read_message = lambda mid: {
@@ -480,6 +492,60 @@ class RunnerWiringTest(unittest.TestCase):
         record = self.ledger()["m1"]
         self.assertNotIn("memory_error", record)
         self.assertTrue(record["gmail_followup_open"])
+        self.assertEqual(
+            record["memory_entry_id"], "2026-08-01-follow-up"
+        )
+
+    def test_managed_followup_upgrades_an_ordinary_ledger_record(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "specialized",
+            "source_kind": "gmail",
+            "processed_at": "2026-08-01T16:00:00Z",
+            "memory_entry_id": "2026-08-01-ordinary-note",
+        })
+        candidate = {
+            "message_id": "m1",
+            "thread_id": "thread-1",
+            "subject": "Fwd: Chat with a colleague",
+        }
+        gmail.search = lambda query, max_results=20: [candidate]
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": candidate["subject"],
+                "from": "owner@example.com",
+                "to": "owner@example.com",
+                "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+            },
+            "labels": ["SENT", "INBOX", "STARRED"],
+            "body": "Please follow up on the proposal.",
+        }
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=[],
+        )
+        r["source"].update({
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        })
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={
+                "memory": "updated",
+                "memory_entry_id": "2026-08-01-follow-up",
+            },
+        ) as capture:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        capture.assert_called_once()
+        record = self.ledger()["m1"]
+        self.assertEqual(record["rule_id"], "wiring")
+        self.assertTrue(record["gmail_followup_open"])
+        self.assertTrue(record["gmail_manual_chat_followup"])
         self.assertEqual(
             record["memory_entry_id"], "2026-08-01-follow-up"
         )
