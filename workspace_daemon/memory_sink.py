@@ -35,6 +35,7 @@ MEMORY_TYPES = {
 }
 AUTO_TAG = "auto-captured"
 MAX_SOURCE_PEOPLE = 20
+NO_OWNER_ACTION_MARKER = "FYI: no action assigned to the memory owner"
 EXTRACT_PROMPT = """You are filing a distilled work note into a structured personal memory store.
 
 Read the note below and answer with a SINGLE JSON object, no markdown fence, no
@@ -46,10 +47,16 @@ other text, with exactly these keys:
             deliverable is worthy as a todo while it remains unresolved; it
             need not already have been accepted or started. Preserve any stated
             deadline, but do not require one.
+  "owner_attention": boolean — true only when the memory owner explicitly owns
+            or accepted an action, must make a decision, or is expected to
+            follow up. A third party's deadline, commitment, or unresolved work
+            can still be worthy FYI context, but set this false and use "note".
+            If the note says "{no_owner_action_marker}", set this false.
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
           incident, achievement, feedback, meeting, note
           (use "meeting" only for an actual meeting record; an email report or
-          channel discussion is a "note", "decision", or "event")
+          channel discussion is a "note", "decision", or "event"; use "todo"
+          or "pending-decision" only when owner_attention is true)
   "title": short specific title (<= 90 chars)
   "people": array of kebab-case person slugs, ONLY from the allowed identities
             below (leave out anyone not listed, and include only people
@@ -354,6 +361,7 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
     prompt = EXTRACT_PROMPT.format(
         slugs=", ".join(slugs) or "(none known yet)",
         verified_people=verified_catalog or "(none)",
+        no_owner_action_marker=NO_OWNER_ACTION_MARKER,
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
     )
     raw = llm.analyze(routine, prompt).strip()
@@ -431,6 +439,16 @@ def capture(routine, item, summary, dry_run=False):
 
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")
+    owner_attention_denied = (
+        entry.get("owner_attention") is False
+        or NO_OWNER_ACTION_MARKER.casefold() in summary.casefold()
+    )
+    if etype in {"todo", "pending-decision"} and owner_attention_denied:
+        log(
+            f"routine={rid} memory: downgraded {etype} to note because "
+            "the source explicitly assigns no action to the memory owner"
+        )
+        etype = "note"
     known = _known_slugs_for_identity(store, identity)
     source_slugs = {person["slug"] for person in verified_source}
     allowed = known | source_slugs | set(verified_owners)
