@@ -517,6 +517,11 @@ directions. Google completion creates a following memory note, while memory
 resolution completes the Google task. Historical completed Google tasks are
 not imported during bootstrap. A configured `exclude_tags` match is an ongoing
 opt-out: even an already-linked entry is skipped without changing either side.
+Google Tasks does not expose a creation timestamp. On first import, the sync
+therefore uses the task's authoritative `updated` date for the memory entry and
+records the full initial `updated` timestamp in the generated metadata. Both
+values remain stable on later edits instead of being replaced by the run date.
+A new association fails closed if Google does not return a valid timestamp.
 
 If both sides changed since the previous checkpoint, neither is overwritten.
 The run reports a conflict and fails closed. A retry after an interrupted write

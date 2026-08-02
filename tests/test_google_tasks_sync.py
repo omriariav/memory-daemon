@@ -113,6 +113,15 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertEqual(report["create_memory"], 1)
         self.assertEqual(report["create_google"], 1)
         self.assertEqual(report["conflicts"], 0)
+        import_plan = next(
+            row for row in report["planned"]
+            if row["action"] == "create_memory"
+        )
+        self.assertEqual(import_plan["memory_date"], "2026-08-02")
+        self.assertEqual(
+            import_plan["source_updated"],
+            "2026-08-02T08:00:00.000Z",
+        )
         self.assertTrue(report["ok"])
 
     def test_exact_title_links_instead_of_duplicating(self):
@@ -125,6 +134,11 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertEqual(report["link_memory"], 1)
         self.assertNotIn("create_memory", report)
         self.assertNotIn("create_google", report)
+        self.assertEqual(report["planned"][0]["memory_date"], "2026-08-02")
+        self.assertEqual(
+            report["planned"][0]["source_updated"],
+            "2026-08-02T08:00:00.000Z",
+        )
 
     def test_exact_title_with_different_content_is_a_conflict(self):
         self.write_entry(entry_text(title="Google task"))
@@ -224,6 +238,42 @@ class GoogleTasksSyncTest(unittest.TestCase):
         report = self.run_dry({f"{LIST_ID}:{TASK_ID}": completed})
 
         self.assertEqual(report["complete_memory"], 1)
+        self.assertTrue(report["ok"])
+
+    def test_google_update_dry_plan_shows_source_and_preserved_memory_dates(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        baseline_task = task(notes="Old notes.")
+        self.write_entry(entry_text(
+            title=baseline_task["title"],
+            body=google_tasks_sync._memory_body(baseline_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(baseline_task),
+                    "memory_hash": google_tasks_sync._memory_hash(entry),
+                    "terminal": False,
+                },
+            },
+        }))
+        changed = task(
+            notes="New Google notes.",
+            updated="2026-08-03T09:30:00.000Z",
+        )
+
+        report = self.run_dry({f"{LIST_ID}:{TASK_ID}": changed})
+
+        self.assertEqual(report["update_memory"], 1)
+        plan = report["planned"][0]
+        self.assertEqual(plan["source_updated"], "2026-08-03T09:30:00.000Z")
+        self.assertEqual(plan["memory_date"], "2026-08-02")
         self.assertTrue(report["ok"])
 
     def test_both_sides_changed_is_fail_closed_conflict(self):
@@ -786,6 +836,11 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertEqual(report["link_memory"], 1)
         self.assertNotIn("create_memory", report)
         self.assertNotIn("create_google", report)
+        self.assertEqual(report["planned"][0]["memory_date"], "2026-08-02")
+        self.assertEqual(
+            report["planned"][0]["source_updated"],
+            "2026-08-02T08:00:00.000Z",
+        )
         self.assertTrue(report["ok"])
 
     def test_two_origin_markers_cannot_claim_the_same_memory_todo(self):
@@ -862,12 +917,140 @@ class GoogleTasksSyncTest(unittest.TestCase):
 
         fields = google_tasks_sync._memory_to_google(entry)
 
-        self.assertEqual(body, "[Google Tasks]\nList: Incoming")
+        self.assertEqual(
+            body,
+            "[Google Tasks]\n"
+            "List: Incoming\n"
+            "Initial Google updated: 2026-08-02T08:00:00.000Z",
+        )
         self.assertEqual(
             fields["notes"],
             "Synced from personal memory: 2026-08-02-task",
         )
         self.assertTrue(google_tasks_sync._content_aligned(google, entry))
+
+    def test_initial_import_uses_and_records_google_updated_timestamp(self):
+        google = task(updated="2026-05-26T10:52:05.411Z")
+
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="created 2026-05-26-google-task",
+                stderr="",
+            ),
+        ) as memory_cli:
+            entry_id = google_tasks_sync._memory_upsert(
+                self.store,
+                google,
+                self.tasklists[LIST_ID],
+                google_tasks_sync._source_id(LIST_ID, TASK_ID),
+            )
+
+        self.assertEqual(entry_id, "2026-05-26-google-task")
+        args = memory_cli.call_args.args[1]
+        self.assertEqual(args[args.index("--date") + 1], "2026-05-26")
+        body = args[args.index("--body") + 1]
+        self.assertIn(
+            "Initial Google updated: 2026-05-26T10:52:05.411Z",
+            body,
+        )
+
+    def test_unlinked_lookalike_metadata_cannot_spoof_initial_timestamp(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        lookalike_body = (
+            "[Google Tasks]\n"
+            "List: User-authored\n"
+            "Initial Google updated: 2020-01-01T00:00:00.000Z"
+        )
+        existing = {
+            "id": "2026-08-02-local-task",
+            "date": "2026-08-02",
+            "type": "todo",
+            "title": "Local task",
+            "body": lookalike_body,
+            "tags": ["work"],
+            "source_ids": [],
+            "follows": [],
+            "resolved": False,
+        }
+        created = task(
+            title="Local task",
+            notes=lookalike_body,
+            updated="2026-08-02T08:00:00.000Z",
+        )
+
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="updated 2026-08-02-local-task",
+                stderr="",
+            ),
+        ) as memory_cli:
+            google_tasks_sync._memory_upsert(
+                self.store,
+                created,
+                self.tasklists[LIST_ID],
+                source_id,
+                existing["id"],
+                existing_entry=existing,
+            )
+
+        args = memory_cli.call_args.args[1]
+        body = args[args.index("--body") + 1]
+        self.assertEqual(body.count("Initial Google updated:"), 2)
+        self.assertTrue(body.startswith(lookalike_body))
+        self.assertTrue(body.endswith(
+            "Initial Google updated: 2026-08-02T08:00:00.000Z"
+        ))
+
+    def test_later_google_update_preserves_initial_timestamp_and_memory_date(self):
+        initial = task(updated="2026-05-26T10:52:05.411Z")
+        existing = {
+            "id": "2026-05-26-google-task",
+            "date": "2026-05-26",
+            "type": "todo",
+            "title": initial["title"],
+            "body": google_tasks_sync._memory_body(initial, "Incoming"),
+            "tags": ["google-tasks"],
+            "source_ids": [google_tasks_sync._source_id(LIST_ID, TASK_ID)],
+            "follows": [],
+            "resolved": False,
+        }
+        changed = task(
+            notes="Changed later.",
+            updated="2026-08-02T10:40:20.253Z",
+        )
+
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="updated 2026-05-26-google-task",
+                stderr="",
+            ),
+        ) as memory_cli:
+            google_tasks_sync._memory_upsert(
+                self.store,
+                changed,
+                self.tasklists[LIST_ID],
+                google_tasks_sync._source_id(LIST_ID, TASK_ID),
+                existing["id"],
+                existing_entry=existing,
+            )
+
+        args = memory_cli.call_args.args[1]
+        self.assertEqual(args[args.index("--date") + 1], "2026-05-26")
+        body = args[args.index("--body") + 1]
+        self.assertIn(
+            "Initial Google updated: 2026-05-26T10:52:05.411Z",
+            body,
+        )
+        self.assertNotIn("Initial Google updated: 2026-08-02", body)
 
     def test_user_notes_starting_with_marker_round_trip_unchanged(self):
         google = task(notes="[Google Tasks]\nUser-authored details")
@@ -1268,6 +1451,121 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertIn("no longer selected", report["errors"][0]["error"])
         self.assertNotIn("create_google", report)
         self.assertFalse(report["ok"])
+
+    def test_pending_link_dry_plan_shows_source_and_preserved_memory_dates(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        self.write_entry(entry_text())
+        entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        google = task(
+            title="Local task",
+            notes=(
+                "Do the local work.\n\n"
+                "Synced from personal memory: 2026-08-02-local-task"
+            ),
+        )
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(google),
+                    "memory_hash": google_tasks_sync._memory_hash(entry),
+                    "terminal": False,
+                    "pending_link": True,
+                },
+            },
+        }))
+
+        report = self.run_dry({f"{LIST_ID}:{TASK_ID}": google})
+
+        self.assertEqual(report["link_memory"], 1)
+        plan = report["planned"][0]
+        self.assertEqual(plan["source_updated"], "2026-08-02T08:00:00.000Z")
+        self.assertEqual(plan["memory_date"], "2026-08-02")
+        self.assertTrue(report["ok"])
+
+    def test_missing_updated_new_import_fails_before_any_write(self):
+        google = task()
+        google.pop("updated")
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": google},
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_cli"
+        ) as memory_cli, mock.patch.object(
+            google_tasks_sync, "_gws"
+        ) as gws:
+            with self.assertRaisesRegex(RuntimeError, "valid updated timestamp"):
+                google_tasks_sync.run(
+                    self.cfg,
+                    checkpoint_path=self.checkpoint,
+                    dry_run=False,
+                )
+
+        memory_cli.assert_not_called()
+        gws.assert_not_called()
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_invalid_updated_exact_link_fails_before_any_write(self):
+        self.write_entry(entry_text(
+            title="Google task",
+            body="Concrete task notes.",
+        ))
+        google = task(updated="not-a-timestamp")
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": google},
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_cli"
+        ) as memory_cli, mock.patch.object(
+            google_tasks_sync, "_gws"
+        ) as gws:
+            with self.assertRaisesRegex(RuntimeError, "valid updated timestamp"):
+                google_tasks_sync.run(
+                    self.cfg,
+                    checkpoint_path=self.checkpoint,
+                    dry_run=True,
+                )
+
+        memory_cli.assert_not_called()
+        gws.assert_not_called()
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_outbound_create_without_updated_never_records_checkpoint(self):
+        self.write_entry(entry_text())
+        created = task(title="Local task")
+        created.pop("updated")
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync, "_open_tasks", return_value={}
+        ), mock.patch.object(
+            google_tasks_sync, "_create_google", return_value=created
+        ) as create, mock.patch.object(
+            google_tasks_sync, "_memory_cli"
+        ) as memory_cli:
+            with self.assertRaisesRegex(RuntimeError, "valid updated timestamp"):
+                google_tasks_sync.run(
+                    self.cfg,
+                    checkpoint_path=self.checkpoint,
+                    dry_run=False,
+                )
+
+        create.assert_called_once()
+        memory_cli.assert_not_called()
+        self.assertFalse(self.checkpoint.exists())
 
     def test_normal_mapping_without_canonical_memory_source_fails_closed(self):
         google = task(title="Local task", notes="Do the local work.")
