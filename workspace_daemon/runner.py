@@ -1543,6 +1543,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 if processed is not None:
                     already_complete = any(
                         entry.get("memory_source_id") == source_id
+                        and entry.get("memory_operator_confirmed") is True
                         and entry.get("memory") != "skipped_not_worthy"
                         and "memory_error" not in entry
                         for _, entry in processed.items()
@@ -1561,6 +1562,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     "raw": {
                         "thread_id": thread_id,
                         "_operator_confirmed_replay": True,
+                        "_gmail_routed_thread": True,
                     },
                 }
                 replay_source = dict(
