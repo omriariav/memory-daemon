@@ -296,6 +296,39 @@ class MultiSourceValidationTest(unittest.TestCase):
             problems,
         )
 
+    def test_every_source_effective_profile_requires_a_sink(self):
+        routine = multi_routine(self.tmp.name)
+        routine.pop("output")
+        routine["sources"] = [
+            {
+                "kind": "gmail",
+                "query": 'from:reports@example.com',
+                "handler": "reports",
+                "actions": [],
+            },
+            {
+                "kind": "gmail",
+                "query": "newer_than:1d",
+                "actions": [],
+            },
+        ]
+        routine["handlers"] = {
+            "reports": {
+                "memory": {"store": self.tmp.name, "type": "note"},
+            }
+        }
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("sources[1] needs an `output:`" in p for p in problems),
+            problems,
+        )
+        self.assertFalse(
+            any("sources[0]" in p and "needs an `output:`" in p for p in problems),
+            problems,
+        )
+
 
 class OwnershipRoutingTest(unittest.TestCase):
     @staticmethod

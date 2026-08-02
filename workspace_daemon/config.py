@@ -577,11 +577,26 @@ def validate(routine):
         problems.append(f"{rid}: `output` must be a mapping")
         output = {}
     has_memory = isinstance(routine.get("memory"), dict)
-    handler_has_sink = any(
-        effective.get("output") or isinstance(effective.get("memory"), dict)
-        for effective in execution_routines(routine)
-    )
-    if not output and not has_memory and not handler_has_sink:
+    effective_routines = execution_routines(routine)
+    missing_sinks = [
+        (index, source.get("handler"))
+        for index, (source, effective) in enumerate(
+            zip(source_dicts, effective_routines)
+        )
+        if not effective.get("output")
+        and not isinstance(effective.get("memory"), dict)
+    ]
+    if missing_sinks:
+        multiple = len(source_dicts) > 1
+        for index, handler_id in missing_sinks:
+            owner = f"sources[{index}]" if multiple else "source"
+            if handler_id:
+                owner += f" handler {handler_id!r}"
+            problems.append(
+                f"{rid}: {owner} needs an `output:` block, a `memory:` "
+                "block, or both"
+            )
+    elif not source_dicts and not output and not has_memory:
         problems.append(f"{rid}: needs an `output:` block, a `memory:` block, or both")
     if output:
         if not output.get("vault_dir"):
