@@ -2499,6 +2499,7 @@ class RunCommandTest(unittest.TestCase):
 
     def test_manual_overlap_log_names_every_skipped_routine(self):
         self.routine["enabled"] = True
+        alpha = dict(self.routine, id="alpha")
         args = SimpleNamespace(
             routine=None,
             include_disabled=False,
@@ -2510,7 +2511,8 @@ class RunCommandTest(unittest.TestCase):
              mock.patch.object(daemon_cli, "set_log_file"), \
              mock.patch.object(daemon_cli.config, "secure_routine_files"), \
              mock.patch.object(
-                 daemon_cli.config, "discover", return_value=[self.routine]
+                 daemon_cli.config, "discover",
+                 return_value=[self.routine, alpha],
              ), \
              mock.patch.object(daemon_cli.config, "validate", return_value=[]), \
              mock.patch.object(
@@ -2522,7 +2524,8 @@ class RunCommandTest(unittest.TestCase):
 
         self.assertIn(
             mock.call(
-                "run group=run skipped routines=domain — run.lock held"
+                "run group=run skipped routines=alpha, domain — "
+                "run.lock held"
             ),
             log.call_args_list,
         )
