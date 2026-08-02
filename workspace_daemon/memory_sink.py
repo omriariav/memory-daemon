@@ -420,7 +420,12 @@ def _operator_confirmed(cfg, source_id):
 
 def is_operator_confirmed(routine, item):
     """Whether the owner explicitly approved this exact source for memory."""
-    return _operator_confirmed(memory_cfg(routine), source_id_for(item))
+    return is_operator_confirmed_source_id(routine, source_id_for(item))
+
+
+def is_operator_confirmed_source_id(routine, source_id):
+    """Whether an exact canonical source id has an explicit owner override."""
+    return _operator_confirmed(memory_cfg(routine), source_id)
 
 
 def _operator_confirmed_summary(routine, item):

@@ -704,6 +704,56 @@ class RunnerWiringTest(unittest.TestCase):
             "2026-08-01-durable-product-context",
         )
 
+    def test_new_operator_confirmation_replays_archived_not_worthy_thread(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        gmail.read_thread = lambda thread_id: {
+            "messages": [{
+                "id": "m1",
+                "headers": {
+                    "subject": "Durable product context",
+                    "from": "owner@example.com",
+                    "to": "memory@example.com",
+                    "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+                },
+                "body": "The product behavior changed.",
+            }],
+        }
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            side_effect=[
+                {"memory": "skipped_not_worthy"},
+                {
+                    "memory": "created",
+                    "memory_entry_id": "2026-08-01-durable-product-context",
+                },
+            ],
+        ) as capture:
+            first = runner.run(self.base, [r])
+            gmail.search = lambda query, max_results=20: []
+            r["memory"]["operator_confirmed_source_ids"] = ["gmail:m1"]
+            second = runner.run(self.base, [r])
+            third = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(third["processed"], 0)
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(self.applied, ["archive"])
+        record = self.ledger()["m1"]
+        self.assertTrue(record["memory_operator_confirmed"])
+        self.assertEqual(record["memory_source_id"], "gmail:m1")
+        self.assertEqual(record["memory"], "created")
+        self.assertEqual(
+            record["memory_entry_id"],
+            "2026-08-01-durable-product-context",
+        )
+
     def test_managed_followup_upgrades_an_ordinary_ledger_record(self):
         processed = state.Store(self.base)
         processed.record("m1", {

@@ -201,6 +201,7 @@ memory:
   tags: [product-area]
   # Exact, explicit user overrides for known false-negative source verdicts.
   # Only these canonical ids bypass worthiness vetoes; all others stay filtered.
+  # A previously triaged Gmail thread is replayed directly with no Gmail actions.
   operator_confirmed_source_ids: [gmail:example-thread-id]
 ```
 

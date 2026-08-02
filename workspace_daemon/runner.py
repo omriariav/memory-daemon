@@ -302,6 +302,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         routing_context=routines,
         source_overrides=source_overrides,
         source_coverage=source_coverage,
+        processed=processed,
     )
     active_source_stamps = {}
     for (
@@ -1313,7 +1314,8 @@ def _fixed_window_seconds(source):
 
 
 def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
-                    source_overrides=None, source_coverage=None):
+                    source_overrides=None, source_coverage=None,
+                    processed=None):
     """List candidates for the full routing context.
 
     Every enabled routine participates for source kinds used by the active
@@ -1356,6 +1358,17 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         if source.get("kind") == "gchat"
         for space in source.get("spaces", [])
         if isinstance(space, str)
+    }
+    first_gmail_source = {
+        routine["id"]: next(
+            (
+                index
+                for index, source in enumerate(config.sources(routine))
+                if source.get("kind") == "gmail"
+            ),
+            None,
+        )
+        for routine in routines
     }
 
     for routine, source_index, source in entries:
@@ -1431,6 +1444,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             ]
 
         coverage_problems = []
+        listed_routing_ids = set()
         for spec in listing_specs:
             spec_label = spec["label"]
             spec_source = spec["listing_source"]
@@ -1460,6 +1474,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 f"{len(candidates)} item(s) matched"
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
+            listed_routing_ids.update(normal_ids)
 
             discovery = []
             discovery_limit = _ownership_limit(source, all_sources)
@@ -1510,6 +1525,65 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     "processable": processable,
                 })
 
+        if kind == "gmail" and source_index == first_gmail_source[rid]:
+            # An explicit owner override may be added after a prior run
+            # archived/read the Gmail item out of its original query. Replay
+            # the exact thread directly, with actions disabled, so the memory
+            # decision can be repaired without repeating mailbox mutations.
+            confirmed = (
+                memory_sink.memory_cfg(routine)
+                .get("operator_confirmed_source_ids")
+                or []
+            )
+            replayed = 0
+            for source_id in confirmed:
+                if not source_id.startswith("gmail:"):
+                    continue
+                already_complete = False
+                if processed is not None:
+                    already_complete = any(
+                        entry.get("memory_source_id") == source_id
+                        and entry.get("memory") != "skipped_not_worthy"
+                        and "memory_error" not in entry
+                        for _, entry in processed.items()
+                    )
+                if already_complete:
+                    continue
+                thread_id = source_id.split(":", 1)[1]
+                if thread_id in listed_routing_ids:
+                    # The ordinary claim below can perform the ledger upgrade;
+                    # a second synthetic claim would needlessly force a full
+                    # thread prefetch during routing.
+                    continue
+                candidate = {
+                    "id": thread_id,
+                    "title": "operator-confirmed Gmail thread",
+                    "raw": {
+                        "thread_id": thread_id,
+                        "_operator_confirmed_replay": True,
+                    },
+                }
+                replay_source = dict(
+                    source,
+                    read_thread=True,
+                    actions=[],
+                )
+                key = (kind, thread_id)
+                claims.setdefault(key, []).append({
+                    "routine": routine,
+                    "source": replay_source,
+                    "source_index": source_index,
+                    "candidate": candidate,
+                    "fetch": fetch,
+                    "processable": True,
+                })
+                replayed += 1
+            if replayed:
+                log(
+                    f"routine={rid} source=gmail added {replayed} "
+                    "operator-confirmed replay candidate(s)"
+                )
+
         source_coverage[(rid, source_index)] = (
             "; ".join(dict.fromkeys(coverage_problems))
             if coverage_problems else None
@@ -1524,6 +1598,16 @@ def _is_managed_followup_claim(claim):
             "_gmail_chat_followup_candidate"
         ) is True
     )
+
+
+def _claim_source_id(claim):
+    """Canonical source id available from a cheap, unfetched candidate."""
+    raw = claim["candidate"].get("raw") or {}
+    if raw.get("source_id"):
+        return raw["source_id"]
+    if claim["source"].get("kind") == "gmail" and raw.get("thread_id"):
+        return f"gmail:{raw['thread_id']}"
+    return None
 
 
 def _could_be_gmail_followup(claim):
@@ -1670,6 +1754,18 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             and _is_managed_followup_claim(claim)
             and existing.get("gmail_manual_chat_followup") is not True
         )
+        upgrade_operator_confirmation = (
+            existing is not None
+            and existing.get("memory") == "skipped_not_worthy"
+            and memory_sink.is_operator_confirmed_source_id(
+                routine,
+                (
+                    memory_sink.source_id_for(prefetched_item)
+                    if prefetched_item is not None
+                    else _claim_source_id(claim)
+                ),
+            )
+        )
         retry_memory = (
             existing is not None
             and (
@@ -1690,6 +1786,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             and not retry_memory
             and not retry_calendar
             and not upgrade_followup
+            and not upgrade_operator_confirmation
         ):
             totals["skipped"] += 1
             continue
@@ -1697,6 +1794,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             log(
                 f"routine={rid} upgrading id={candidate['id']} to managed "
                 "Gmail follow-up lifecycle"
+            )
+        elif upgrade_operator_confirmation:
+            log(
+                f"routine={rid} replaying id={candidate['id']} after "
+                "explicit memory confirmation"
             )
         elif retry_memory:
             log(
@@ -1856,6 +1958,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         "output_file": str(path) if path else None,
         "gmail_label_applied": label,
     }
+    memory_source_id = memory_sink.source_id_for(item)
+    if memory_source_id:
+        record["memory_source_id"] = memory_source_id
     meta = item.get("frontmatter") or {}
     operator_confirmed = memory_sink.is_operator_confirmed(routine, item)
     if operator_confirmed:
