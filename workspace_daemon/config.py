@@ -29,6 +29,7 @@ _WEEKDAYS = {
     "fri": 4, "sat": 5, "sun": 6,
 }
 _ROUTINE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+HANDLER_OVERRIDE_KEYS = {"analyze", "output", "memory", "label", "streams"}
 
 
 def analyze_cfg(routine):
@@ -52,6 +53,63 @@ def configured_labels(routine):
         if isinstance(cfg, dict) and cfg.get("label"):
             names.append(cfg["label"])
     return names
+
+
+def routine_for_source(routine, source):
+    """Return the execution profile selected by one deterministic source.
+
+    A medium routine may list narrow source queries before its general source
+    and attach a named ``handler`` to each narrow query. Candidate ownership is
+    still resolved from source metadata before content reaches an LLM; this
+    helper only overlays the prompt and sinks used after that deterministic
+    choice. The routine id deliberately remains unchanged so scheduling,
+    connector health, and the processed ledger stay medium-scoped.
+
+    Mapping overrides are shallow. ``analyze`` has one important convenience:
+    selecting an inline instruction replaces an inherited connector prompt (and
+    vice versa), so a specialized handler cannot accidentally receive both.
+    """
+    handler_id = source.get("handler") if isinstance(source, dict) else None
+    if not isinstance(handler_id, str) or not handler_id:
+        return routine
+    handlers = routine.get("handlers")
+    if not isinstance(handlers, dict):
+        return routine
+    profile = handlers.get(handler_id)
+    if not isinstance(profile, dict):
+        return routine
+
+    effective = dict(routine)
+    effective["_handler_id"] = handler_id
+    for key in ("analyze", "output", "memory"):
+        if key not in profile:
+            continue
+        base = routine.get(key)
+        override = profile[key]
+        if not isinstance(override, dict):
+            effective[key] = override
+            continue
+        merged = dict(base) if isinstance(base, dict) else {}
+        if key == "analyze":
+            if override.get("instruction"):
+                merged.pop("instruction_from_connector", None)
+                merged.pop("instruction_extra", None)
+                # Connector health belongs to the medium routine, not to the
+                # specialized extraction profile selected for one item.
+                merged.pop("connector_sweep", None)
+            elif override.get("instruction_from_connector"):
+                merged.pop("instruction", None)
+        merged.update(override)
+        effective[key] = merged
+    for key in ("label", "streams"):
+        if key in profile:
+            effective[key] = profile[key]
+    return effective
+
+
+def execution_routines(routine):
+    """Effective per-source profiles used by one scheduled routine."""
+    return [routine_for_source(routine, source) for source in sources(routine)]
 
 
 def sources(routine):
@@ -417,7 +475,10 @@ def validate(routine):
             continue
         source_dicts.append(source)
         prefix = f"{rid}: source" if has_source else f"{rid}: sources[{index}]"
-        problems.extend(_validate_source(routine, source, prefix))
+        problems.extend(
+            _validate_source(routine_for_source(routine, source), source, prefix)
+        )
+    problems.extend(_validate_handlers(routine, source_dicts))
     if sum(source.get("catch_up") is True for source in source_dicts) > 1:
         problems.append(
             f"{rid}: only one catch_up source is currently supported per routine"
@@ -471,19 +532,23 @@ def validate(routine):
                 f"does not match a supported source kind"
             )
         elif (
-            len(source_dicts) != 1
-            or source_dicts[0].get("kind") != connector
+            not source_dicts
+            or any(source.get("kind") != connector for source in source_dicts)
         ):
             problems.append(
-                f"{rid}: analyze.connector_sweep requires exactly one "
-                f"{connector!r} source block"
+                f"{rid}: analyze.connector_sweep requires every source block "
+                f"to use {connector!r}"
             )
         elif (
             connector == "gchat"
-            and source_dicts[0].get("all_spaces") is not True
+            and (
+                len(source_dicts) != 1
+                or source_dicts[0].get("all_spaces") is not True
+            )
         ):
             problems.append(
-                f"{rid}: a gchat connector sweep requires source.all_spaces: true"
+                f"{rid}: a gchat connector sweep requires exactly one source "
+                "with all_spaces: true"
             )
         elif (
             connector == "gchat"
@@ -495,16 +560,16 @@ def validate(routine):
             )
         elif (
             connector in {"gchat", "slack"}
-            and source_dicts[0].get("catch_up") is not True
+            and any(source.get("catch_up") is not True for source in source_dicts)
         ):
             problems.append(
-                f"{rid}: a {connector} connector sweep requires "
-                f"source.catch_up: true"
+                f"{rid}: a {connector} connector sweep requires catch_up: true "
+                "on every source"
             )
-        elif source_dicts[0].get("max_results") != 0:
+        elif any(source.get("max_results") != 0 for source in source_dicts):
             problems.append(
-                f"{rid}: analyze.connector_sweep requires source.max_results: 0 "
-                f"so the declared sweep is not capped"
+                f"{rid}: analyze.connector_sweep requires max_results: 0 on "
+                "every source so the declared sweep is not capped"
             )
 
     output = routine.get("output") or {}
@@ -512,7 +577,11 @@ def validate(routine):
         problems.append(f"{rid}: `output` must be a mapping")
         output = {}
     has_memory = isinstance(routine.get("memory"), dict)
-    if not output and not has_memory:
+    handler_has_sink = any(
+        effective.get("output") or isinstance(effective.get("memory"), dict)
+        for effective in execution_routines(routine)
+    )
+    if not output and not has_memory and not handler_has_sink:
         problems.append(f"{rid}: needs an `output:` block, a `memory:` block, or both")
     if output:
         if not output.get("vault_dir"):
@@ -548,15 +617,20 @@ def validate(routine):
 
     streams = routine.get("streams")
     configured_label = bool(configured_labels(routine))
-    action_lists = [source_actions(routine, source) for source in source_dicts]
-
-    if any("apply_label" in values for values in action_lists) and not (
-        analyze.get("pick_label") or configured_label
-    ):
-        problems.append(
-            f"{rid}: action 'apply_label' needs `label:`, a `streams:` entry "
-            f"with a label, or analyze.pick_label: true"
-        )
+    for source in source_dicts:
+        effective = routine_for_source(routine, source)
+        action_list = source_actions(effective, source)
+        effective_analyze = analyze_cfg(effective)
+        effective_label = bool(configured_labels(effective))
+        if "apply_label" in action_list and not (
+            effective_analyze.get("pick_label") or effective_label
+        ):
+            handler = source.get("handler")
+            suffix = f" handler {handler!r}" if handler else ""
+            problems.append(
+                f"{rid}:{suffix} action 'apply_label' needs `label:`, a "
+                f"`streams:` entry with a label, or analyze.pick_label: true"
+            )
     if configured_label and analyze.get("pick_label"):
         problems.append(
             f"{rid}: set a configured label OR analyze.pick_label, not both"
@@ -628,6 +702,89 @@ def validate(routine):
             if not isinstance(priority, int) or isinstance(priority, bool):
                 problems.append(f"{rid}: routing.priority must be an integer")
 
+    return problems
+
+
+def _validate_handlers(routine, source_dicts):
+    """Validate named execution profiles and their deterministic references."""
+    rid = routine.get("id", "<missing id>")
+    handlers = routine.get("handlers")
+    references = [
+        (index, source.get("handler"), source)
+        for index, source in enumerate(source_dicts)
+        if source.get("handler") is not None
+    ]
+    if handlers is None:
+        return [
+            f"{rid}: sources[{index}].handler references {handler!r}, but "
+            "the routine has no `handlers` mapping"
+            for index, handler, _ in references
+        ]
+    if not isinstance(handlers, dict) or not handlers:
+        return [f"{rid}: `handlers` must be a non-empty mapping"]
+
+    problems = []
+    valid_profiles = {}
+    for handler_id, profile in handlers.items():
+        if not isinstance(handler_id, str) or not _ROUTINE_ID.fullmatch(handler_id):
+            problems.append(
+                f"{rid}: handler id must use lowercase letters, digits, and "
+                f"hyphens (got {handler_id!r})"
+            )
+            continue
+        if not isinstance(profile, dict):
+            problems.append(f"{rid}: handlers[{handler_id}] must be a mapping")
+            continue
+        unknown = set(profile) - HANDLER_OVERRIDE_KEYS
+        if unknown:
+            problems.append(
+                f"{rid}: handlers[{handler_id}] has unknown key(s) "
+                f"{', '.join(sorted(unknown))} (valid: "
+                f"{', '.join(sorted(HANDLER_OVERRIDE_KEYS))})"
+            )
+            continue
+        for key in ("analyze", "output", "memory"):
+            if key in profile and not isinstance(profile[key], dict):
+                problems.append(
+                    f"{rid}: handlers[{handler_id}].{key} must be a mapping"
+                )
+        valid_profiles[handler_id] = profile
+
+    used = set()
+    multiple = len(source_dicts) > 1
+    for index, handler_id, source in references:
+        prefix = f"sources[{index}]" if multiple else "source"
+        if not isinstance(handler_id, str) or not handler_id:
+            problems.append(f"{rid}: {prefix}.handler must be a handler id string")
+            continue
+        if handler_id not in handlers:
+            problems.append(
+                f"{rid}: {prefix}.handler references unknown handler "
+                f"{handler_id!r}"
+            )
+            continue
+        used.add(handler_id)
+        if handler_id not in valid_profiles:
+            continue
+
+        # Reuse the complete routine validator on the materialized profile.
+        # Removing `handlers` and the selector prevents recursion, while a
+        # single source makes every error describe the exact executable shape.
+        effective = dict(routine_for_source(routine, source))
+        effective.pop("handlers", None)
+        effective.pop("_handler_id", None)
+        effective.pop("sources", None)
+        effective_source = dict(source)
+        effective_source.pop("handler", None)
+        effective["source"] = effective_source
+        for problem in validate(effective):
+            problems.append(f"{rid}: handler {handler_id!r}: {problem}")
+
+    unused = sorted(set(valid_profiles) - used)
+    if unused:
+        problems.append(
+            f"{rid}: unused handler(s): {', '.join(unused)}"
+        )
     return problems
 
 

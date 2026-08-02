@@ -1,0 +1,89 @@
+# One scheduled Gmail routine with deterministic specialized handlers.
+#
+# Source queries run before any LLM call. When several queries match the same
+# thread, the first source block wins, so put narrow handlers first and the
+# general connector sweep last. The selected handler changes extraction,
+# sinks, and labels; scheduling, connector health, and ledger identity remain
+# owned by this one medium routine.
+id: gmail-medium-sweep
+enabled: false
+description: General Gmail sweep with exact meeting-note and report handling.
+role: general
+
+schedule:
+  every: 1h
+
+sources:
+  - kind: gmail
+    query: 'from:meeting-notes@example.com in:inbox'
+    max_results: 0
+    handler: meeting-notes
+    expand:
+      kind: drive_doc
+      title_from_subject: "Notes: '(?P<title>.+)'"
+      name_contains: Meeting notes
+      tabs: [Full notes, Transcript]
+      on_missing: body
+    actions: [apply_label, mark_read, unstar, archive]
+
+  - kind: gmail
+    query: 'in:inbox subject:"Weekly product report"'
+    max_results: 0
+    handler: business-report
+    actions: [apply_label]
+
+  # The broad fallback belongs inside this routine, not in a competing routine.
+  - kind: gmail
+    query: '{newer_than:1d is:unread is:starred}'
+    read_thread: true
+    max_results: 0
+    self_forwarded_chat_followups: true
+    actions: []
+
+handlers:
+  meeting-notes:
+    analyze:
+      instruction: >-
+        Extract decisions, named action items, open questions, and compact
+        context from this known meeting record. Never invent an owner.
+      pick_label: true
+    output:
+      vault_dir: /absolute/path/to/your/vault/inbox
+      slug_prefix: meeting-notes
+      kind: meeting-notes
+      filename_template: "{slug_prefix}-{date}-{title}"
+    memory:
+      type: meeting
+      tags: [meeting-notes]
+
+  business-report:
+    analyze:
+      instruction: >-
+        Mine this known recurring report for durable product decisions,
+        constraints, evidence, and commitments. Do not write a generic business
+        summary. Return exactly NOT MEMORY-WORTHY when no durable signal exists.
+    streams:
+      "Weekly product report":
+        title: Weekly Product Report
+        label: Product Reports
+        message_updates: true
+    output:
+      vault_dir: /absolute/path/to/your/vault/inbox
+      slug_prefix: business-update
+      kind: business-update
+      filename_template: "{title}-{date}"
+    memory:
+      type: note
+      tags: [business-update]
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction_from_connector: gmail
+  connector_sweep: true
+
+memory:
+  store: /absolute/path/to/personal-memory
+  type: note
+  tags: [gmail, general-sweep]

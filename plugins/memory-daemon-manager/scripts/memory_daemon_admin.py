@@ -179,6 +179,8 @@ def _discover_routines(repo):
 def _routine_source_summary(source):
     kind = source.get("kind", "unknown")
     summary = {"kind": kind}
+    if isinstance(source.get("handler"), str):
+        summary["handler"] = source["handler"]
     if kind in {"gmail", "drive_docs"}:
         summary["query_configured"] = bool(source.get("query"))
     if kind == "slack":

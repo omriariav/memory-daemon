@@ -81,6 +81,27 @@ interactive use of that source.
 Do not invent memory types. Use a type accepted by
 `workspace_daemon/memory_sink.py`, and keep store and vault paths absolute.
 
+## Deterministic medium handlers
+
+Prefer one scheduled routine per medium when source-specific jobs can be
+identified exactly. Put narrow Gmail queries before the general query and set
+`handler: <id>` on each narrow source block. Define those ids under the
+routine's `handlers:` mapping. Candidate matching and handler selection happen
+before any LLM call; the prompt interprets a known source type rather than
+guessing what type it is.
+
+A handler may override `analyze`, `output`, `memory`, `label`, and `streams`.
+The three mapping blocks merge shallowly with routine defaults, so a handler can
+inherit provider/model or memory.store. An inline handler instruction replaces
+an inherited connector prompt and its general-only extra guidance. Gmail
+actions remain on the matching source block.
+
+Within one routine, the first matching source block wins. Put deterministic
+handlers first and the unhandled general connector source last. The ledger and
+scheduler retain the medium routine id; successful handler executions also
+record `handler_id` for auditability. Use
+`routines/_example-medium-handlers.yaml` as the canonical shape.
+
 ## Safe editing
 
 Copy an existing routine to a scratch file before editing so comments, quoting,

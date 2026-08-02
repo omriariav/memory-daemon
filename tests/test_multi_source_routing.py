@@ -174,6 +174,128 @@ class MultiSourceValidationTest(unittest.TestCase):
         self.assertTrue(any("routing.fallback" in p for p in problems), problems)
         self.assertTrue(any("routing.priority" in p for p in problems), problems)
 
+    def test_named_handler_inherits_defaults_and_satisfies_source_actions(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"] = [
+            {
+                "kind": "gmail",
+                "query": 'from:notes@example.com',
+                "max_results": 0,
+                "handler": "meeting-notes",
+                "actions": ["apply_label", "archive"],
+            },
+            {
+                "kind": "gmail",
+                "query": "newer_than:1d",
+                "max_results": 0,
+                "actions": [],
+            },
+        ]
+        routine["handlers"] = {
+            "meeting-notes": {
+                "analyze": {
+                    "instruction": "Extract decisions and commitments.",
+                    "pick_label": True,
+                },
+                "memory": {"type": "meeting", "tags": ["meeting"]},
+            }
+        }
+        routine["memory"] = {"store": self.tmp.name, "type": "note"}
+
+        self.assertEqual(config.validate(routine), [])
+        effective = config.routine_for_source(routine, routine["sources"][0])
+        self.assertEqual(effective["_handler_id"], "meeting-notes")
+        self.assertEqual(effective["analyze"]["provider"], "gemini")
+        self.assertEqual(effective["analyze"]["model"], "m")
+        self.assertEqual(
+            effective["analyze"]["instruction"],
+            "Extract decisions and commitments.",
+        )
+        self.assertEqual(effective["memory"]["store"], self.tmp.name)
+        self.assertEqual(effective["memory"]["type"], "meeting")
+
+    def test_inline_handler_replaces_inherited_connector_prompt_metadata(self):
+        routine = multi_routine(self.tmp.name)
+        routine["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gmail",
+            "instruction_extra": "General-only guidance.",
+            "connector_sweep": True,
+        }
+        routine["handlers"] = {
+            "special": {
+                "analyze": {"instruction": "Specialized guidance."},
+            }
+        }
+        routine["sources"][0]["handler"] = "special"
+
+        effective = config.routine_for_source(routine, routine["sources"][0])
+
+        self.assertEqual(effective["analyze"]["instruction"], "Specialized guidance.")
+        self.assertNotIn("instruction_from_connector", effective["analyze"])
+        self.assertNotIn("instruction_extra", effective["analyze"])
+        self.assertNotIn("connector_sweep", effective["analyze"])
+
+    def test_handler_references_and_profiles_fail_closed(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][0]["handler"] = "missing"
+        problems = config.validate(routine)
+        self.assertTrue(any("no `handlers` mapping" in p for p in problems), problems)
+
+        routine["handlers"] = {
+            "missing": {"actions": ["archive"]},
+            "unused": {"analyze": {"instruction": "Never selected."}},
+        }
+        problems = config.validate(routine)
+        self.assertTrue(any("unknown key(s) actions" in p for p in problems), problems)
+        self.assertTrue(any("unused handler(s): unused" in p for p in problems), problems)
+
+    def test_connector_sweep_accepts_uncapped_same_medium_handler_sources(self):
+        store = Path(self.tmp.name)
+        connector = store / "memory" / "connectors" / "gmail.md"
+        connector.parent.mkdir(parents=True)
+        connector.write_text(
+            "Keep durable decisions, commitments, blockers, and reusable facts."
+        )
+        routine = multi_routine(self.tmp.name)
+        routine["sources"] = [
+            {
+                "kind": "gmail",
+                "query": 'from:reports@example.com',
+                "max_results": 0,
+                "handler": "reports",
+                "actions": [],
+            },
+            {
+                "kind": "gmail",
+                "query": "newer_than:1d",
+                "max_results": 0,
+                "actions": [],
+            },
+        ]
+        routine["handlers"] = {
+            "reports": {
+                "analyze": {"instruction": "Extract durable report facts."},
+            }
+        }
+        routine["analyze"] = {
+            "provider": "gemini",
+            "model": "m",
+            "instruction_from_connector": "gmail",
+            "connector_sweep": True,
+        }
+        routine["memory"] = {"store": self.tmp.name, "type": "note"}
+
+        self.assertEqual(config.validate(routine), [])
+
+        routine["sources"][0]["max_results"] = 20
+        problems = config.validate(routine)
+        self.assertTrue(
+            any("max_results: 0 on every source" in p for p in problems),
+            problems,
+        )
+
 
 class OwnershipRoutingTest(unittest.TestCase):
     @staticmethod
@@ -261,6 +383,64 @@ class OwnershipRoutingTest(unittest.TestCase):
         )
 
         self.assertIs(owned["gmail-sweep"][0], managed)
+
+    def test_operator_replay_uses_unhandled_general_source_not_first_handler(self):
+        routine = {
+            "id": "gmail-general",
+            "sources": [
+                {
+                    "kind": "gmail",
+                    "query": "known meeting",
+                    "max_results": 0,
+                    "handler": "meeting-notes",
+                    "actions": ["archive"],
+                },
+                {
+                    "kind": "gmail",
+                    "query": "general inbox",
+                    "max_results": 0,
+                    "actions": [],
+                },
+            ],
+            "handlers": {
+                "meeting-notes": {
+                    "analyze": {"instruction": "Meeting extraction."},
+                }
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "General extraction.",
+            },
+            "memory": {
+                "store": "/tmp/memory",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:confirmed-thread"],
+            },
+        }
+        processed = SimpleNamespace(
+            items=lambda: [(
+                "old-message",
+                {
+                    "memory_source_id": "gmail:confirmed-thread",
+                    "memory": "skipped_not_worthy",
+                    "processed_at": "2026-08-01T00:00:00Z",
+                },
+            )]
+        )
+        saved = runner.SOURCES["gmail"]
+        runner.SOURCES["gmail"] = (lambda _source: [], saved[1])
+        self.addCleanup(runner.SOURCES.__setitem__, "gmail", saved)
+        totals = {"errors": 0}
+
+        claims, failures = runner._collect_claims(
+            [routine], totals, processed=processed,
+        )
+
+        self.assertEqual(failures, [])
+        replay = claims[("gmail", "confirmed-thread")][0]
+        self.assertNotIn("handler", replay["source"])
+        self.assertEqual(replay["source"]["actions"], [])
 
     def test_explicit_followup_queue_beats_ordinary_specialized_claim(self):
         specialized = self.claim({"id": "specialized"})

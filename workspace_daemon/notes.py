@@ -124,6 +124,8 @@ def render(routine, item, summary, label):
         # note from an interrupted run" apart from "a different item, same stem".
         "item_id": str(item["id"]),
     }
+    if routine.get("_handler_id"):
+        frontmatter["handler_id"] = routine["_handler_id"]
     frontmatter.update(item.get("frontmatter", {}))
     frontmatter["focus_domains"] = routine["analyze"].get("focus_domains") or []
     if frontmatter["source"] == "gmail":

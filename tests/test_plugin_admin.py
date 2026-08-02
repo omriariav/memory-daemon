@@ -318,6 +318,7 @@ id: redacted
 sources:
   - kind: gmail
     query: '{secret_query}'
+    handler: recurring-report
     actions: []
   - kind: slack
     channels: [{channel}]
@@ -334,6 +335,7 @@ memory:
         self.assertNotIn(channel, result.stdout)
         row = json.loads(result.stdout)["routines"][0]
         self.assertTrue(row["sources"][0]["query_configured"])
+        self.assertEqual(row["sources"][0]["handler"], "recurring-report")
         self.assertEqual(row["sources"][1]["channel_count"], 1)
 
     def test_prompt_override_lifecycle_preserves_template_and_other_memory(self):

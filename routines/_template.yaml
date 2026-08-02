@@ -37,9 +37,12 @@ schedule:
 #   fallback: false
 
 # Use `source:` for one transport. A domain routine can instead use `sources:`
-# with a list of Gmail / Drive / Slack / Google Chat / Mila blocks. In that form,
-# Gmail actions live inside the Gmail source block. See
-# `_example-domain-routine.yaml`.
+# with a list of Gmail / Drive / Slack / Google Chat / Mila blocks. A general
+# medium routine may also put narrow deterministic queries first, add
+# `handler: <id>` to them, and keep its broad default source last. The named
+# handler changes prompt/sinks after source matching, before any LLM call. See
+# `_example-medium-handlers.yaml`. In either multi-source form, Gmail actions
+# live inside the Gmail source block.
 source:
   # 'gmail', 'drive_docs', 'slack', 'gchat', or 'mila'.
   kind: gmail
@@ -143,6 +146,25 @@ output:
 # A failing action does not abort the others: it is recorded as pending and
 # retried at the start of the next run. Use [] to leave the mailbox untouched.
 actions: [apply_label, mark_read, unstar, archive]
+
+# OPTIONAL — named execution profiles selected deterministically by a source
+# block's `handler:` value. Profiles may override `analyze`, `output`, `memory`,
+# `label`, and `streams`. Mapping fields inherit omitted values from the routine:
+# a handler can replace only the instruction while keeping provider/model and
+# can replace only memory type/tags while keeping memory.store. Put specialized
+# source blocks before the unhandled general block; first match wins inside one
+# routine. Keep actions on the source block so mutations follow the same match.
+# handlers:
+#   meeting-notes:
+#     analyze:
+#       instruction: Extract decisions, named actions, and open questions.
+#       pick_label: true
+#     output:
+#       vault_dir: /absolute/path/to/your/vault/inbox
+#       slug_prefix: meeting-notes
+#     memory:
+#       type: meeting
+#       tags: [meeting-notes]
 
 # OPTIONAL — a fixed Gmail label for every item, instead of letting the model
 # choose one. Mutually exclusive with analyze.pick_label. Still validated
