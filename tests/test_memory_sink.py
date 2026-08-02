@@ -370,7 +370,7 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(calls["args"][idx + 1], "note")
 
     def test_third_party_todo_is_downgraded_when_owner_attention_is_false(self):
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": True,
             "owner_attention": False,
             "type": "todo",
@@ -431,7 +431,7 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(calls["args"][idx + 1], "note")
 
     def test_owner_todo_remains_todo_when_owner_attention_is_true(self):
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": True,
             "owner_attention": True,
             "type": "todo",
@@ -479,7 +479,7 @@ class CaptureValidationTest(unittest.TestCase):
             "gmail_chat_followup_active": True,
             "gmail_followup_predecessor_entry_id": "original-entry",
         })
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": False,
             "owner_attention": False,
             "type": "note",
@@ -505,6 +505,10 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertIn(
             "manually forwarded this Chat conversation",
             calls["stdin"],
+        )
+        self.assertEqual(
+            outcome["memory_source_id"],
+            "gmail:thread-1:followup-open",
         )
 
     def test_active_chat_followup_survives_source_not_worthy_sentinel(self):

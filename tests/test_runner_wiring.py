@@ -844,6 +844,18 @@ class RunnerWiringTest(unittest.TestCase):
             memory_sink, "capture", side_effect=outcomes
         ) as capture:
             first = runner.run(self.base, [r])
+            failed_record = self.ledger()["m1"]
+            self.assertEqual(
+                failed_record["memory_source_id"],
+                "gmail:thread-1:followup-open",
+            )
+            self.assertEqual(
+                failed_record["gmail_canonical_memory_source_id"],
+                "gmail:thread-1",
+            )
+            self.assertNotIn(
+                "gmail_followup_predecessor_entry_id", failed_record
+            )
             second = runner.run(self.base, [r])
 
         self.assertEqual(first["errors"], 1)
@@ -1292,6 +1304,220 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertTrue(record["gmail_manual_chat_followup"])
         self.assertEqual(
             record["memory_entry_id"], "2026-08-01-follow-up"
+        )
+
+    def test_managed_followup_retry_preserves_predecessor_linkage(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "specialized",
+            "source_kind": "gmail",
+            "processed_at": "2026-08-01T16:00:00Z",
+            "memory_entry_id": "2026-08-01-ordinary-note",
+        })
+        candidate = {
+            "message_id": "m1",
+            "thread_id": "thread-1",
+            "subject": "Fwd: Chat with a colleague",
+        }
+        gmail.search = lambda query, max_results=20: [candidate]
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": candidate["subject"],
+                "from": "owner@example.com",
+                "to": "owner@example.com",
+                "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+            },
+            "labels": ["SENT", "INBOX", "STARRED"],
+            "body": "Please follow up on the proposal.",
+        }
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=[],
+        )
+        r["source"].update({
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        })
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            side_effect=[
+                RuntimeError("store unavailable"),
+                {
+                    "memory": "created",
+                    "memory_entry_id": "2026-08-01-follow-up",
+                },
+            ],
+        ) as capture:
+            first = runner.run(self.base, [r])
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 2)
+        for call in capture.call_args_list:
+            self.assertEqual(
+                call.args[1]["frontmatter"][
+                    "gmail_followup_predecessor_entry_id"
+                ],
+                "2026-08-01-ordinary-note",
+            )
+        record = self.ledger()["m1"]
+        self.assertEqual(
+            record["gmail_followup_predecessor_entry_id"],
+            "2026-08-01-ordinary-note",
+        )
+        self.assertEqual(
+            record["memory_source_id"],
+            "gmail:thread-1:followup-open",
+        )
+
+    def test_managed_followup_finds_predecessor_by_stable_thread_source(self):
+        processed = state.Store(self.base)
+        processed.record("older-message", {
+            "rule_id": "specialized",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:thread-1",
+            "processed_at": "2026-08-01T16:00:00Z",
+            "memory_entry_id": "2026-08-01-ordinary-note",
+        })
+        candidate = {
+            "message_id": "newer-message",
+            "thread_id": "thread-1",
+            "subject": "Fwd: Chat with a colleague",
+        }
+        gmail.search = lambda query, max_results=20: [candidate]
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": candidate["subject"],
+                "from": "owner@example.com",
+                "to": "owner@example.com",
+                "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+            },
+            "labels": ["SENT", "INBOX", "STARRED"],
+            "body": "Please follow up on the proposal.",
+        }
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=[],
+        )
+        r["source"].update({
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        })
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={
+                "memory": "created",
+                "memory_entry_id": "2026-08-01-follow-up",
+            },
+        ) as capture:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(
+            capture.call_args.args[1]["frontmatter"][
+                "gmail_followup_predecessor_entry_id"
+            ],
+            "2026-08-01-ordinary-note",
+        )
+
+    def test_archived_failed_followup_replays_as_followup_then_resolves(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "specialized",
+            "source_kind": "gmail",
+            "processed_at": "2026-08-01T16:00:00Z",
+            "memory_source_id": "gmail:thread-1",
+            "memory_entry_id": "2026-08-01-ordinary-note",
+        })
+        candidate = {
+            "message_id": "m1",
+            "thread_id": "thread-1",
+            "subject": "Fwd: Chat with a colleague",
+        }
+        gmail.search = lambda query, max_results=20: [candidate]
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": candidate["subject"],
+                "from": "owner@example.com",
+                "to": "owner@example.com",
+                "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+            },
+            "labels": ["SENT", "INBOX", "STARRED"],
+            "body": "Please follow up on the proposal.",
+        }
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=[],
+        )
+        r["source"].update({
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        })
+
+        with mock.patch.object(
+            memory_sink, "capture", side_effect=RuntimeError("store unavailable")
+        ):
+            first = runner.run(self.base, [r])
+        self.assertEqual(first["errors"], 1)
+
+        gmail.search = lambda query, max_results=20: []
+        gmail.read_thread = lambda thread_id: {
+            "messages": [{
+                "id": "newer-message",
+                "headers": {
+                    "subject": candidate["subject"],
+                    "from": "owner@example.com",
+                    "to": "owner@example.com",
+                    "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+                },
+                "labels": ["SENT"],
+                "body": "Please follow up on the proposal.",
+            }],
+        }
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={
+                "memory": "created",
+                "memory_entry_id": "2026-08-01-follow-up",
+                "memory_source_id": "gmail:thread-1:followup-open",
+            },
+        ) as capture, mock.patch.object(
+            memory_sink,
+            "resolve_followup",
+            return_value={
+                "memory": "created",
+                "memory_entry_id": "2026-08-02-follow-up-completed",
+            },
+        ) as resolve:
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(second["errors"], 0)
+        replayed_item = capture.call_args.args[1]
+        self.assertTrue(
+            replayed_item["frontmatter"]["gmail_chat_followup_active"]
+        )
+        self.assertEqual(
+            replayed_item["frontmatter"][
+                "gmail_followup_predecessor_entry_id"
+            ],
+            "2026-08-01-ordinary-note",
+        )
+        resolve.assert_called_once()
+        self.assertNotIn("m1", self.ledger())
+        record = self.ledger()["newer-message"]
+        self.assertFalse(record["gmail_followup_open"])
+        self.assertEqual(
+            record["memory_source_id"],
+            "gmail:thread-1:followup-open",
         )
 
     def test_followup_reconciliation_dry_run_writes_nothing(self):
