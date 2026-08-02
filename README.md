@@ -194,6 +194,7 @@ python3 -m workspace_daemon.slack_cli auth-test
 ./daemon.py run --routine weekly-report       # run one routine for real
 ./daemon.py run                               # run everything enabled
 ./daemon.py tick                              # run only routines whose cadence is due
+./run.sh                                      # load scheduler + start one due-routine tick
 ./daemon.py new                               # interactive scaffold
 ```
 
@@ -834,8 +835,8 @@ tags: [kind/email-scoop-summary, status/inbox]
 The LaunchAgent is a lightweight coordinator. It wakes every 15 minutes and
 calls `daemon.py tick`; routines that are not due make no source or LLM calls.
 The template deliberately uses `RunAtLoad: false`, so installation itself
-never triggers the first real run. Render the template, add your key, then load
-it:
+never triggers the first real run. Render the template and add your key, but
+leave activation to the explicit `run.sh` step below:
 
 ```sh
 # The template uses this stable link so Node upgrades do not break launchd.
@@ -854,11 +855,21 @@ $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
 launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
 mv ~/Library/LaunchAgents/com.workspace-daemon.plist \
   ~/.Trash/com.workspace-daemon.plist.retired 2>/dev/null || true
-
-launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist 2>/dev/null
-launchctl load   ~/Library/LaunchAgents/com.memory-daemon.plist
-launchctl list | grep memory-daemon
 ```
+
+Do not load the plist directly during installation: `StartInterval` would make
+it run about 15 minutes later even with `RunAtLoad: false`. When you explicitly
+want to turn the daemon on and choose its first tick, run:
+
+```sh
+./run.sh
+```
+
+The helper validates every routine, loads the configured LaunchAgent when
+necessary, and clears any launchd disable override before starting one
+coordinator tick immediately. That tick runs every **enabled**
+routine that is due; the helper never changes a routine's `enabled` setting.
+It is safe to call again when the scheduler is already loaded.
 
 Check on it:
 
