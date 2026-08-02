@@ -61,7 +61,7 @@ class TickHistoryTest(unittest.TestCase):
     def write(self, text):
         self.log.write_text(text)
 
-    def test_failed_tick_conservatively_marks_every_due_routine(self):
+    def test_failed_tick_attributes_logged_error_to_its_routine(self):
         self.write(
             "2026-07-29T10:00:00Z tick: due=alpha, beta\n"
             "2026-07-29T10:00:01Z routine=beta source ERROR: unavailable\n"
@@ -70,9 +70,25 @@ class TickHistoryTest(unittest.TestCase):
             "2026-07-29T10:15:00Z tick: no routines due\n"
         )
         history = status.read_tick_history(self.log)
-        self.assertEqual(history["routines"]["alpha"]["state"], "error")
+        self.assertEqual(history["routines"]["alpha"]["state"], "ok")
         self.assertEqual(history["routines"]["beta"]["state"], "error")
+        self.assertEqual(history["routines"]["beta"]["errors"], 1)
         self.assertEqual(history["latest"]["state"], "idle")
+
+    def test_multiple_errors_are_counted_per_routine(self):
+        self.write(
+            "2026-07-29T10:00:00Z tick: due=alpha, beta\n"
+            "2026-07-29T10:00:01Z routine=alpha ERROR id=one: failed\n"
+            "2026-07-29T10:00:02Z routine=beta source=gmail FATAL: failed\n"
+            "2026-07-29T10:00:03Z routine=beta ERROR id=two: failed\n"
+            "2026-07-29T10:00:04Z tick done: 0 processed, 0 already-seen, "
+            "3 error(s)\n"
+        )
+
+        history = status.read_tick_history(self.log)
+
+        self.assertEqual(history["routines"]["alpha"]["errors"], 1)
+        self.assertEqual(history["routines"]["beta"]["errors"], 2)
 
     def test_unfinished_tick_marks_its_routines_incomplete(self):
         self.write("2026-07-29T10:00:00Z tick: due=alpha, beta\n")
@@ -230,6 +246,31 @@ class RoutineStatusTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["status"], "attention")
         self.assertEqual(rows[0]["issues"], "1 meeting match")
+
+    def test_reports_attributed_last_run_error_count(self):
+        rows = status.routine_rows(
+            self.base,
+            self.routines,
+            {
+                "routines": {
+                    "alpha": {
+                        "state": "error",
+                        "at": "2026-07-29T10:00:00Z",
+                        "errors": 3,
+                    },
+                    "beta": {
+                        "state": "ok",
+                        "at": "2026-07-29T10:00:00Z",
+                    },
+                },
+            },
+            now=5000,
+        )
+        by_id = {row["routine"]: row for row in rows}
+
+        self.assertEqual(by_id["alpha"]["status"], "attention")
+        self.assertEqual(by_id["alpha"]["issues"], "3 last-run errors")
+        self.assertNotIn("last run", by_id["beta"]["issues"])
 
     def test_reports_general_domain_and_source_roles(self):
         routines = [

@@ -24,6 +24,9 @@ _TICK_NOOP = re.compile(
     r"(?P<dry> \(dry-run\))?$"
 )
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
+_ROUTINE_ERROR = re.compile(
+    r"^routine=(?P<id>\S+)\b.*\b(?:ERROR|FATAL)\b"
+)
 _LEGACY_TICK_KEY = "<legacy>"
 
 
@@ -146,6 +149,7 @@ def read_tick_history(path):
                 "at": at,
                 "due_ids": due_ids,
                 "dry_run": dry_run,
+                "routine_errors": {},
             }
             if not dry_run:
                 latest = {
@@ -166,17 +170,44 @@ def read_tick_history(path):
             error_count = int(totals.group("errors")) if totals else None
             if not dry_run:
                 if block:
+                    routine_errors = block.get("routine_errors", {})
+                    attributed_count = sum(routine_errors.values())
+                    attribution_complete = (
+                        error_count is not None
+                        and error_count > 0
+                        and attributed_count >= error_count
+                    )
                     for routine_id in block["due_ids"]:
+                        routine_error_count = routine_errors.get(
+                            routine_id, 0
+                        )
+                        failed = bool(error_count) and (
+                            not attribution_complete
+                            or routine_error_count > 0
+                        )
                         routine_results[routine_id] = {
-                            "state": "error" if error_count else "ok",
+                            "state": "error" if failed else "ok",
                             "at": at,
                         }
+                        if failed and attribution_complete:
+                            routine_results[routine_id]["errors"] = (
+                                routine_error_count
+                            )
                 latest = {
                     "state": "error" if error_count else "done",
                     "at": at,
                     "message": message,
                 }
             continue
+
+        routine_error = _ROUTINE_ERROR.match(message)
+        if routine_error:
+            routine_id = routine_error.group("id")
+            for block in active.values():
+                if block["dry_run"] or routine_id not in block["due_ids"]:
+                    continue
+                counts = block["routine_errors"]
+                counts[routine_id] = counts.get(routine_id, 0) + 1
 
         skipped = _TICK_SKIPPED.match(message)
         if skipped:
@@ -261,7 +292,12 @@ def routine_rows(
             and tick_result.get("at") == latest_tick.get("at")
         )
         if tick_state == "error":
-            issues.append("last run")
+            error_count = tick_result.get("errors")
+            if isinstance(error_count, int) and error_count > 0:
+                suffix = "error" if error_count == 1 else "errors"
+                issues.append(f"{error_count} last-run {suffix}")
+            else:
+                issues.append("last run")
         elif tick_state == "skipped":
             issues.append("overlap")
         elif tick_state == "incomplete" and not current_tick:
