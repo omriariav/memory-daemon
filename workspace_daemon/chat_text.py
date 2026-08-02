@@ -10,11 +10,15 @@ _CODE_RE = re.compile(
     r")(\d{4,12})\b"
 )
 _CREDENTIAL_RE = re.compile(
-    r"(?i)\b("
+    r"(?im)\b("
     r"(?:api[-_ ]?(?:key|token)|access[-_ ]?token|auth(?:entication)?[-_ ]?token|"
-    r"password|client[-_ ]?secret)"
+    r"password(?:\s+(?:temporary|temp))?|client[-_ ]?secret|"
+    r"user(?:name|[ -]name)|card(?:[ -](?:number|no\.?|#))|"
+    r"pin(?:\s+(?:code|number))?|מספר\s+כרטיס|שם\s+משתמש|"
+    r"סיסמ[הת]?(?:\s+זמנית)?|"
+    r"קוד\s+(?:אישי|כניסה|הפעלה)(?:\s+זמני(?:ת)?)?)"
     r"\s*(?:is|:|=)\s*"
-    r")([^\s,;]+)"
+    r")([^\r\n]+)"
 )
 
 
