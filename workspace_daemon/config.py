@@ -16,7 +16,9 @@ VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila"}
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
 }
-VALID_MAINTENANCE_KINDS = {"slack_conversation_census"}
+VALID_MAINTENANCE_KINDS = {
+    "google_tasks_sync", "slack_conversation_census",
+}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -428,15 +430,24 @@ def validate(routine):
         if not isinstance(maintenance, dict):
             problems.append(f"{rid}: `maintenance` must be a mapping")
         else:
-            unknown = set(maintenance) - {
-                "kind", "checkpoint", "hours", "requests_per_minute",
-            }
+            kind = maintenance.get("kind")
+            allowed = (
+                {
+                    "kind", "checkpoint", "hours", "requests_per_minute",
+                }
+                if kind == "slack_conversation_census"
+                else {
+                    "kind", "checkpoint", "store", "tasklists",
+                    "outbound_tasklist", "outbound_since", "exclude_tags",
+                    "max_tasks",
+                }
+            )
+            unknown = set(maintenance) - allowed
             if unknown:
                 problems.append(
                     f"{rid}: maintenance has unknown key(s) "
                     f"{', '.join(sorted(unknown))}"
                 )
-            kind = maintenance.get("kind")
             if kind not in VALID_MAINTENANCE_KINDS:
                 problems.append(
                     f"{rid}: maintenance.kind must be one of "
@@ -445,23 +456,85 @@ def validate(routine):
             checkpoint = maintenance.get("checkpoint")
             if not isinstance(checkpoint, str) or not checkpoint:
                 problems.append(f"{rid}: maintenance.checkpoint is required")
-            hours = maintenance.get("hours", 48)
-            if (
-                not isinstance(hours, (int, float))
-                or isinstance(hours, bool)
-                or hours <= 0
-            ):
-                problems.append(f"{rid}: maintenance.hours must be positive")
-            rpm = maintenance.get("requests_per_minute", 40)
-            if (
-                not isinstance(rpm, int)
-                or isinstance(rpm, bool)
-                or not 1 <= rpm <= 50
-            ):
-                problems.append(
-                    f"{rid}: maintenance.requests_per_minute must be an "
-                    "integer from 1 to 50"
-                )
+            if kind == "slack_conversation_census":
+                hours = maintenance.get("hours", 48)
+                if (
+                    not isinstance(hours, (int, float))
+                    or isinstance(hours, bool)
+                    or hours <= 0
+                ):
+                    problems.append(f"{rid}: maintenance.hours must be positive")
+                rpm = maintenance.get("requests_per_minute", 40)
+                if (
+                    not isinstance(rpm, int)
+                    or isinstance(rpm, bool)
+                    or not 1 <= rpm <= 50
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.requests_per_minute must be an "
+                        "integer from 1 to 50"
+                    )
+            elif kind == "google_tasks_sync":
+                store = maintenance.get("store")
+                if not isinstance(store, str) or not store.startswith("/"):
+                    problems.append(
+                        f"{rid}: maintenance.store must be an absolute path"
+                    )
+                tasklists = maintenance.get("tasklists", "all")
+                if tasklists != "all" and (
+                    not isinstance(tasklists, list)
+                    or not tasklists
+                    or any(not isinstance(value, str) or not value for value in tasklists)
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.tasklists must be 'all' or a "
+                        "non-empty list of task-list ids"
+                    )
+                outbound = maintenance.get("outbound_tasklist")
+                if not isinstance(outbound, str) or not outbound:
+                    problems.append(
+                        f"{rid}: maintenance.outbound_tasklist is required"
+                    )
+                elif isinstance(tasklists, list) and outbound not in tasklists:
+                    problems.append(
+                        f"{rid}: maintenance.outbound_tasklist must be included "
+                        "in maintenance.tasklists"
+                    )
+                outbound_since = maintenance.get("outbound_since")
+                if outbound_since is None:
+                    problems.append(
+                        f"{rid}: maintenance.outbound_since is required"
+                    )
+                else:
+                    try:
+                        parsed_since = datetime.date.fromisoformat(outbound_since)
+                    except (TypeError, ValueError):
+                        parsed_since = None
+                    if parsed_since is None or parsed_since.isoformat() != outbound_since:
+                        problems.append(
+                            f"{rid}: maintenance.outbound_since must be YYYY-MM-DD"
+                        )
+                exclude_tags = maintenance.get("exclude_tags", [])
+                if (
+                    not isinstance(exclude_tags, list)
+                    or any(
+                        not isinstance(value, str)
+                        or not _ROUTINE_ID.fullmatch(value)
+                        for value in exclude_tags
+                    )
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.exclude_tags must be kebab-case tags"
+                    )
+                max_tasks = maintenance.get("max_tasks", 10000)
+                if (
+                    not isinstance(max_tasks, int)
+                    or isinstance(max_tasks, bool)
+                    or max_tasks < 1
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.max_tasks must be a positive integer"
+                    )
         problems.extend(_validate_schedule(routine))
         return problems
 

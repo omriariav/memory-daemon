@@ -1,0 +1,35 @@
+# Bidirectional, model-free Google Tasks ↔ personal-memory todo sync.
+#
+# Open Google tasks are imported from every selected list. New open memory
+# todos on or after outbound_since are created in outbound_tasklist. Stable
+# Google task source ids and the private checkpoint prevent duplicates; if both
+# sides changed since the last successful sync, neither side is overwritten.
+id: google-tasks-sync
+enabled: false
+description: Sync Google Tasks with private-memory todos.
+role: maintenance
+
+schedule:
+  # Outside the work window (including non-working days), run daily.
+  every: 1d
+  work_hours:
+    every: 1h
+    days: [sun, mon, tue, wed, thu]
+    start: "08:00"
+    end: "20:00"
+    timezone: Asia/Jerusalem
+
+maintenance:
+  kind: google_tasks_sync
+  checkpoint: state/google-tasks-sync.json
+  store: /absolute/path/to/personal-memory
+  # Use "all" or an explicit list of stable Google Task-list ids.
+  tasklists: all
+  # New, unlinked private-memory todos are created in this list.
+  outbound_tasklist: replace-with-task-list-id
+  # A bootstrap boundary prevents historical open todos from flooding Tasks.
+  outbound_since: "2026-01-01"
+  # Any memory todo carrying one of these tags remains local-only.
+  exclude_tags: [no-google-tasks]
+  # Fail closed instead of silently truncating an unusually large list.
+  max_tasks: 10000
