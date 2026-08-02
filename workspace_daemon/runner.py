@@ -1282,6 +1282,18 @@ def _source_coverage_problem(source, candidates):
     return None
 
 
+def _latest_memory_record(processed, source_id):
+    """Newest ledger outcome for one stable memory source id, if any."""
+    if processed is None:
+        return None
+    matching = [
+        (entry.get("processed_at") or "", item_id, entry)
+        for item_id, entry in processed.items()
+        if entry.get("memory_source_id") == source_id
+    ]
+    return max(matching, default=(None, None, None))[-1]
+
+
 def _fixed_window_seconds(source):
     """Smallest non-cursor window a source relies on, or None for catch-up."""
     if source.get("catch_up") is True:
@@ -1539,15 +1551,15 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             for source_id in confirmed:
                 if not source_id.startswith("gmail:"):
                     continue
-                already_complete = False
-                if processed is not None:
-                    already_complete = any(
-                        entry.get("memory_source_id") == source_id
-                        and entry.get("memory_operator_confirmed") is True
-                        and entry.get("memory") != "skipped_not_worthy"
-                        and "memory_error" not in entry
-                        for _, entry in processed.items()
+                latest = _latest_memory_record(processed, source_id)
+                already_complete = bool(
+                    latest
+                    and latest.get("memory") not in (
+                        None,
+                        "skipped_not_worthy",
                     )
+                    and "memory_error" not in latest
+                )
                 if already_complete:
                     continue
                 thread_id = source_id.split(":", 1)[1]
