@@ -136,6 +136,12 @@ def mark_connector_pulled(routine, at, dry_run=False):
 
 def validate(routine):
     """Config problems for the memory block; empty list means valid."""
+    raw = routine.get("memory")
+    if raw is not None and (not isinstance(raw, dict) or not raw):
+        return [
+            f"{routine.get('id', '<missing id>')}: `memory` must be a "
+            "non-empty mapping"
+        ]
     cfg = memory_cfg(routine)
     if not cfg:
         return []

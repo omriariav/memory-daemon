@@ -87,9 +87,15 @@ def _coverage_cursor_id(source_index, source):
 def _needs_label_catalog(routines):
     """Both LLM-chosen and configured labels are validated against the catalog."""
     return any(
-        (r.get("analyze", {}).get("pick_label") or config.configured_labels(r))
-        and any(source.get("kind") == "gmail" for source in config.sources(r))
+        (
+            effective.get("analyze", {}).get("pick_label")
+            or config.configured_labels(effective)
+        )
+        and source.get("kind") == "gmail"
         for r in routines
+        for source, effective in zip(
+            config.sources(r), config.execution_routines(r)
+        )
     )
 
 
@@ -136,7 +142,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
 
     if not dry_run:
         state.sweep_temp_files(state.state_file(base_dir).parent)
-        for vault in {r.get("output", {}).get("vault_dir") for r in active}:
+        vaults = {
+            effective.get("output", {}).get("vault_dir")
+            for routine in active
+            for effective in config.execution_routines(routine)
+            if isinstance(effective.get("output"), dict)
+        }
+        for vault in vaults:
             if vault:
                 state.sweep_temp_files(vault)
 
@@ -165,8 +177,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 valid.append(routine)
                 continue
             if catalog is not None:
-                for name in config.configured_labels(routine):
-                    _validated_label(name, label_catalog, routine["id"], catalog)
+                for effective in config.execution_routines(routine):
+                    for name in config.configured_labels(effective):
+                        _validated_label(
+                            name, label_catalog, routine["id"], catalog
+                        )
             _retry_pending_actions(routine, processed, dry_run, totals)
             valid.append(routine)
         except Exception as exc:  # a broken routine must not abort the rest
@@ -1371,14 +1386,24 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         for space in source.get("spaces", [])
         if isinstance(space, str)
     }
-    first_gmail_source = {
+    operator_replay_gmail_source = {
         routine["id"]: next(
             (
                 index
                 for index, source in enumerate(config.sources(routine))
-                if source.get("kind") == "gmail"
+                if (
+                    source.get("kind") == "gmail"
+                    and not source.get("handler")
+                )
             ),
-            None,
+            next(
+                (
+                    index
+                    for index, source in enumerate(config.sources(routine))
+                    if source.get("kind") == "gmail"
+                ),
+                None,
+            ),
         )
         for routine in routines
     }
@@ -1537,7 +1562,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     "processable": processable,
                 })
 
-        if kind == "gmail" and source_index == first_gmail_source[rid]:
+        if (
+            kind == "gmail"
+            and source_index == operator_replay_gmail_source[rid]
+        ):
             # An explicit owner override may be added after a prior run
             # archived/read the Gmail item out of its original query. Replay
             # the exact thread directly, with actions disabled, so the memory
@@ -1667,17 +1695,14 @@ def _route_claims(claims, totals, failures=()):
             # owns the Gmail item even if another source also matched it.
             candidates = managed_followups
         # Multiple source blocks in one routine may match the same item. That is
-        # one owner; prefer a processable claim, then declaration order.
+        # one owner, and declaration order is deterministic handler precedence.
+        # Never replace an earlier ownership-only claim with a later broad
+        # processable one: doing so would let a capped specialized query leak
+        # overflow into the general prompt. The item waits for its first owner.
         by_routine = {}
         for claim in candidates:
             rid = claim["routine"]["id"]
-            if (
-                rid not in by_routine
-                or (
-                    not by_routine[rid].get("processable", True)
-                    and claim.get("processable", True)
-                )
-            ):
+            if rid not in by_routine:
                 by_routine[rid] = claim
         unique = list(by_routine.values())
         best_rank = min(config.routing_rank(c["routine"]) for c in unique)
@@ -1742,6 +1767,13 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     log(f"routine={rid} {len(claims)} owned item(s)")
     new = 0
     for claim in claims:
+        effective = config.routine_for_source(routine, claim["source"])
+        handler_id = effective.get("_handler_id")
+        if handler_id:
+            log(
+                f"routine={rid} deterministic handler={handler_id} "
+                f"source={claim['source'].get('kind')}"
+            )
         candidate = claim["candidate"]
         prefetched_item = None
         if (
@@ -1750,7 +1782,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         ):
             try:
                 prefetched_item = claim["fetch"](
-                    routine, claim["source"], candidate
+                    effective, claim["source"], candidate
                 )
             except Exception as exc:
                 totals["errors"] += 1
@@ -1772,7 +1804,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             existing is not None
             and existing.get("memory") == "skipped_not_worthy"
             and memory_sink.is_operator_confirmed_source_id(
-                routine,
+                effective,
                 (
                     memory_sink.source_id_for(prefetched_item)
                     if prefetched_item is not None
@@ -1831,7 +1863,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             lock.check()
         try:
             _process(
-                routine, claim["source"], candidate, claim["fetch"], processed,
+                effective, claim["source"], candidate, claim["fetch"], processed,
                 label_catalog, dry_run, totals, catalog, base_dir,
                 prefetched_item,
             )
@@ -1881,8 +1913,13 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
              prefetched_item=None):
     rid = routine["id"]
+    handler_id = routine.get("_handler_id")
     action_list = config.source_actions(routine, source)
-    log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
+    handler_note = f" handler={handler_id}" if handler_id else ""
+    log(
+        f"routine={rid}{handler_note} new match id={candidate['id']} "
+        f"title={candidate['title']!r}"
+    )
 
     item = (
         prefetched_item
@@ -1928,6 +1965,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                 "calendar_match_rejected": True,
                 "calendar_match": calendar_match,
             }
+            if handler_id:
+                record["handler_id"] = handler_id
             if base_dir is not None:
                 mila_source.write_receipt(
                     base_dir, "failed", item,
@@ -1972,6 +2011,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         "output_file": str(path) if path else None,
         "gmail_label_applied": label,
     }
+    if handler_id:
+        record["handler_id"] = handler_id
     memory_source_id = memory_sink.source_id_for(item)
     if memory_source_id:
         record["memory_source_id"] = memory_source_id

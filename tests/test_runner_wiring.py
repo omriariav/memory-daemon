@@ -104,6 +104,198 @@ class RunnerWiringTest(unittest.TestCase):
                          "the stream title should drive the filename")
         self.assertIn("stream: Weekly - DACH", note.read_text())
 
+    def test_same_medium_routine_selects_deterministic_handler_before_llm(self):
+        prompts = []
+
+        def search(query, max_results=20):
+            if query == "known meeting sender":
+                return [{
+                    "message_id": "older-match",
+                    "thread_id": "shared-thread",
+                    "subject": "Known meeting note",
+                }]
+            return [{
+                "message_id": "newest-reply",
+                "thread_id": "shared-thread",
+                "subject": "Re: Known meeting note",
+            }]
+
+        gmail.search = search
+        gmail.read_thread = lambda _tid: {
+            "messages": [
+                {
+                    "id": "older-match",
+                    "headers": {
+                        "subject": "Known meeting note",
+                        "from": "Notes <notes@example.com>",
+                        "date": "Sat, 1 Aug 2026 08:00:00 +0000",
+                    },
+                    "labels": ["INBOX"],
+                    "body": "Original meeting record.",
+                },
+                {
+                    "id": "newest-reply",
+                    "headers": {
+                        "subject": "Re: Known meeting note",
+                        "from": "Owner <owner@example.com>",
+                        "date": "Sat, 1 Aug 2026 09:00:00 +0000",
+                    },
+                    "labels": ["INBOX", "UNREAD"],
+                    "body": "Latest meeting context.",
+                },
+            ]
+        }
+        llm.analyze = lambda _routine, prompt: (
+            prompts.append(prompt) or "Meeting summary"
+        )
+        r = {
+            "id": "gmail-general",
+            "enabled": True,
+            "sources": [
+                {
+                    "kind": "gmail",
+                    "query": "known meeting sender",
+                    "max_results": 0,
+                    "handler": "meeting-notes",
+                    "actions": ["apply_label", "archive"],
+                },
+                {
+                    "kind": "gmail",
+                    "query": "general inbox",
+                    "max_results": 0,
+                    "actions": [],
+                },
+            ],
+            "handlers": {
+                "meeting-notes": {
+                    "analyze": {"instruction": "SPECIAL MEETING INSTRUCTION"},
+                    "label": "EMEA",
+                    "output": {"kind": "meeting-note"},
+                }
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "GENERAL GMAIL INSTRUCTION",
+            },
+            "output": {
+                "vault_dir": str(self.vault),
+                "slug_prefix": "gmail",
+            },
+        }
+
+        totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("SPECIAL MEETING INSTRUCTION", prompts[0])
+        self.assertNotIn("GENERAL GMAIL INSTRUCTION", prompts[0])
+        self.assertIn("label:EMEA", self.applied)
+        self.assertIn("archive", self.applied)
+        record = self.ledger()["newest-reply"]
+        self.assertEqual(record["rule_id"], "gmail-general")
+        self.assertEqual(record["handler_id"], "meeting-notes")
+        note = next(self.vault.glob("*.md")).read_text()
+        self.assertIn("kind: meeting-note", note)
+        self.assertIn("rule_id: gmail-general", note)
+        self.assertIn("handler_id: meeting-notes", note)
+
+    def test_unmatched_item_uses_medium_routine_default_prompt(self):
+        prompts = []
+        gmail.search = lambda query, max_results=20: (
+            [] if query == "known report" else [{
+                "message_id": "general-message",
+                "thread_id": "general-thread",
+                "subject": "Ordinary durable update",
+            }]
+        )
+        gmail.read_message = lambda _mid: {
+            "headers": {
+                "subject": "Ordinary durable update",
+                "from": "Colleague <colleague@example.com>",
+                "date": "Sat, 1 Aug 2026 09:00:00 +0000",
+            },
+            "body": "A durable general update.",
+        }
+        llm.analyze = lambda _routine, prompt: prompts.append(prompt) or "summary"
+        r = {
+            "id": "gmail-general",
+            "enabled": True,
+            "sources": [
+                {
+                    "kind": "gmail",
+                    "query": "known report",
+                    "max_results": 0,
+                    "handler": "business-report",
+                    "actions": [],
+                },
+                {
+                    "kind": "gmail",
+                    "query": "general inbox",
+                    "max_results": 0,
+                    "actions": [],
+                },
+            ],
+            "handlers": {
+                "business-report": {
+                    "analyze": {"instruction": "SPECIAL REPORT INSTRUCTION"},
+                }
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "GENERAL GMAIL INSTRUCTION",
+            },
+            "output": {
+                "vault_dir": str(self.vault),
+                "slug_prefix": "gmail",
+            },
+        }
+
+        totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("GENERAL GMAIL INSTRUCTION", prompts[0])
+        self.assertNotIn("SPECIAL REPORT INSTRUCTION", prompts[0])
+        self.assertNotIn("handler_id", self.ledger()["general-message"])
+
+    def test_handler_only_vault_participates_in_temp_file_cleanup(self):
+        gmail.search = lambda _query, _max_results=20: []
+        handler_vault = self.base / "handler-vault"
+        r = {
+            "id": "gmail-general",
+            "enabled": True,
+            "source": {
+                "kind": "gmail",
+                "query": "known source",
+                "max_results": 0,
+                "handler": "known",
+                "actions": [],
+            },
+            "handlers": {
+                "known": {
+                    "analyze": {"instruction": "Known-source extraction."},
+                    "output": {
+                        "vault_dir": str(handler_vault),
+                        "slug_prefix": "known",
+                    },
+                }
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "General extraction.",
+            },
+        }
+
+        with mock.patch.object(state, "sweep_temp_files") as sweep:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        sweep.assert_any_call(str(handler_vault))
+
     def test_stream_subject_date_beats_later_reply_date(self):
         gmail.read_message = lambda mid: {
             "headers": {

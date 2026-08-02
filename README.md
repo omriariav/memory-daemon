@@ -17,7 +17,9 @@ distills each match with an LLM, and sinks the result into one or both of:
 Gmail matches can additionally be triaged (label / mark read / unstar / archive).
 
 **Adding a new routine is a drop-in YAML file, never a code change.** A routine
-may own one source or combine several transports under one domain prompt.
+may own one source, combine several transports under one domain prompt, or keep
+one scheduler per medium while deterministic source queries select specialized
+handlers inside it.
 
 ```
 source (gws / built-in Slack client) ──▶ LLM (yoetz) ──▶ vault note and/or memory
@@ -72,6 +74,72 @@ The ledger is keyed by source item id, so an item is summarized once however
 broad the query or however often the daemon runs. It is written before triage
 and updated after it, which is what makes both halves recoverable — see
 [Crash safety](#crash-safety).
+
+### Deterministic handlers inside a medium sweep
+
+Known source types should not be guessed by an extraction model. A broad Gmail
+sweep can keep exact sender/subject queries for meeting notes, recurring reports,
+or other deterministic queues and select a named handler for each:
+
+```yaml
+sources:
+  - kind: gmail
+    query: 'from:meeting-notes@example.com in:inbox'
+    max_results: 0
+    handler: meeting-notes
+    actions: [apply_label, mark_read, archive]
+
+  - kind: gmail
+    query: '{newer_than:1d is:unread is:starred}'
+    max_results: 0
+    actions: []
+
+handlers:
+  meeting-notes:
+    analyze:
+      instruction: Extract decisions, named actions, and open questions.
+      pick_label: true
+    output:
+      vault_dir: /absolute/path/to/vault/inbox
+      slug_prefix: meeting-notes
+    memory:
+      type: meeting
+      tags: [meeting-notes]
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  instruction_from_connector: gmail
+  connector_sweep: true
+memory:
+  store: /absolute/path/to/personal-memory
+  type: note
+  tags: [gmail, general-sweep]
+```
+
+Source blocks are evaluated in declaration order. If several blocks in the
+same routine match one thread, the first block owns it; put narrow deterministic
+queries first and the general source last. Handler source blocks require
+`max_results: 0`, because a capped exact query cannot prove that overflow items
+belong to the fallback. The deliberate exception is Gmail's managed
+self-forwarded Chat queue: an active queue claim beats ordinary source order so
+its todo lifecycle cannot be lost. That lifecycle must use the routine-level
+default profile, not a handler. These choices happen before any LLM call.
+
+The selected handler may override `analyze`, `output`, `memory`, `label`, and
+`streams`; provider/model, store paths, and other omitted mapping fields are
+inherited from the medium routine. An inline handler instruction replaces the
+general connector prompt rather than appending to it. Exact
+`operator_confirmed_source_ids` remain routine-level because an archived source
+must be replayable through the default source even after its original handler
+query no longer returns it.
+
+Gmail actions remain on the source block, so mailbox mutation is tied to the
+same deterministic match. Logs, vault frontmatter, and ledger records include
+`handler_id`, while scheduling, connector health, and `rule_id` remain attached
+to the single medium routine. See
+[`_example-medium-handlers.yaml`](routines/_example-medium-handlers.yaml) for a
+complete meeting-note plus recurring-report example.
 
 ## Requirements
 
