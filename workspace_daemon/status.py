@@ -270,7 +270,10 @@ def routine_rows(
         if not enabled:
             status_name = "disabled"
         elif current_tick:
-            status_name = "running"
+            # The tick selects a batch. Its routines may be fetching,
+            # processing, already finished, or still waiting their turn, so
+            # membership alone is not proof of active execution.
+            status_name = "in-tick"
         elif issues:
             status_name = "attention"
         elif schedule.due(routine, now=now):

@@ -361,7 +361,7 @@ class RoutineStatusTest(unittest.TestCase):
                     any("role must be one of" in item for item in problems)
                 )
 
-    def test_running_tick_takes_precedence_over_due(self):
+    def test_current_tick_membership_does_not_claim_active_execution(self):
         rows = status.routine_rows(
             self.base,
             self.routines,
@@ -375,7 +375,7 @@ class RoutineStatusTest(unittest.TestCase):
             scheduler_running=True,
         )
         alpha = next(row for row in rows if row["routine"] == "alpha")
-        self.assertEqual(alpha["status"], "running")
+        self.assertEqual(alpha["status"], "in-tick")
 
     def test_abandoned_tick_requires_attention(self):
         rows = status.routine_rows(
