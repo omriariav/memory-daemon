@@ -197,6 +197,25 @@ class OwnershipRoutingTest(unittest.TestCase):
         self.assertEqual(list(owned), ["specific"])
         self.assertEqual(totals, {"errors": 0, "ambiguous": 0})
 
+    def test_gmail_ownership_uses_thread_id_not_matching_message_id(self):
+        specific = {"id": "privacy"}
+        fallback = {"id": "general", "routing": {"fallback": True}}
+        privacy_claim = self.claim(specific, "privacy-message")
+        general_claim = self.claim(fallback, "latest-reply")
+        privacy_claim["candidate"]["raw"] = {"thread_id": "shared-thread"}
+        general_claim["candidate"]["raw"] = {"thread_id": "shared-thread"}
+        claims = {}
+        for claim in (privacy_claim, general_claim):
+            key = ("gmail", runner._routing_id(claim["candidate"]))
+            claims.setdefault(key, []).append(claim)
+
+        totals = {"errors": 0, "ambiguous": 0}
+        owned = runner._route_claims(claims, totals)
+
+        self.assertEqual(list(claims), [("gmail", "shared-thread")])
+        self.assertEqual(list(owned), ["privacy"])
+        self.assertEqual(totals, {"errors": 0, "ambiguous": 0})
+
     def test_lower_priority_wins(self):
         first = {"id": "first", "routing": {"priority": 10}}
         second = {"id": "second", "routing": {"priority": 20}}

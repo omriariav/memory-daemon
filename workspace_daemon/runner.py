@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils
+from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -601,7 +601,7 @@ def _gmail_candidates(source):
         seen.add(message_id)
         candidates.append({
             "id": message_id,
-            "title": thread.get("subject", ""),
+            "title": chat_text.redact_secrets(thread.get("subject", "")),
             "raw": thread,
         })
     return candidates
@@ -741,7 +741,11 @@ def _gmail_fetch(routine, source, candidate):
         included = None
         thread_truncated = False
         people_headers = [headers]
-    subject = headers.get("subject", "")
+    # Gmail can carry credentials in ordinary text (HR onboarding emails are a
+    # common example). Redact before the body or subject can reach a model,
+    # logs, notes, or the memory store. The original message remains in Gmail.
+    body = chat_text.redact_secrets(body)
+    subject = chat_text.redact_secrets(headers.get("subject", ""))
     date = notes.email_date(headers)
     gmail_labels = sorted({str(label) for label in msg.get("labels") or []})
     manual_chat_followup, chat_followup_active = _gmail_chat_followup_state(
@@ -1072,6 +1076,14 @@ def _routing_id(candidate):
     raw = candidate.get("raw")
     if isinstance(raw, dict) and raw.get("source_id"):
         return raw["source_id"]
+    if isinstance(raw, dict) and raw.get("thread_id"):
+        # Gmail queries may match different messages in the same thread. For
+        # example, a Privacy query can match an earlier counsel reply while a
+        # general Inbox query returns a newer non-Privacy reply. Memory is
+        # thread-anchored, so ownership must be thread-anchored too or the
+        # fallback can race the specialized routine and create a duplicate
+        # with the wrong prompt.
+        return raw["thread_id"]
     return candidate["id"]
 
 

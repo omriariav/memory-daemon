@@ -12,7 +12,8 @@ _CODE_RE = re.compile(
 _CREDENTIAL_RE = re.compile(
     r"(?i)\b("
     r"(?:api[-_ ]?(?:key|token)|access[-_ ]?token|auth(?:entication)?[-_ ]?token|"
-    r"password|client[-_ ]?secret)"
+    r"password|client[-_ ]?secret|user(?:name|[ -]name)|card(?:[ -](?:number|no\.?))|"
+    r"pin|מספר\s+כרטיס|שם\s+משתמש|סיסמ[הת]?|קוד\s+(?:אישי|כניסה|הפעלה))"
     r"\s*(?:is|:|=)\s*"
     r")([^\s,;]+)"
 )

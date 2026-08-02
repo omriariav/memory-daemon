@@ -213,6 +213,36 @@ class RunnerWiringTest(unittest.TestCase):
         )
         self.assertFalse(item["frontmatter"]["source_people_truncated"])
 
+    def test_gmail_redacts_hr_credentials_before_analysis(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Benefits access for a new employee",
+                "from": "People Operations <people@example.com>",
+                "to": "owner@example.com",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": (
+                "The benefit account is ready.\n"
+                "מספר כרטיס: 2609920051590860\n"
+                "שם משתמש: employee@example.com\n"
+                "סיסמה: secret-value\n"
+                "Keep the onboarding fact."
+            ),
+        }
+        r = routine(self.vault, label="EMEA")
+
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "m2", "raw": {"thread_id": "thread-1"}},
+        )
+
+        self.assertNotIn("2609920051590860", item["body"])
+        self.assertNotIn("employee@example.com", item["body"])
+        self.assertNotIn("secret-value", item["body"])
+        self.assertEqual(item["body"].count("[REDACTED]"), 3)
+        self.assertIn("Keep the onboarding fact.", item["body"])
+
     def test_gmail_marks_active_self_forwarded_chat_as_followup(self):
         gmail.read_message = lambda mid: {
             "headers": {
@@ -292,12 +322,12 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(
             set(claims),
             {
-                ("gmail", "followup-new"),
-                ("gmail", "followup-old"),
+                ("gmail", "thread-new"),
+                ("gmail", "thread-old"),
                 ("gmail", "ordinary"),
             },
         )
-        followup_claims = claims[("gmail", "followup-new")]
+        followup_claims = claims[("gmail", "thread-new")]
         self.assertEqual(len(followup_claims), 2)
         self.assertTrue(
             any(
