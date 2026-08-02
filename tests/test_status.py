@@ -192,8 +192,10 @@ class RoutineStatusTest(unittest.TestCase):
             by_id["alpha"]["issues"], "1 memory sink, 1 Gmail triage"
         )
         self.assertEqual(by_id["alpha"]["next"], "due")
-        self.assertEqual(by_id["beta"]["status"], "ok")
+        self.assertEqual(by_id["beta"]["status"], "waiting")
+        self.assertEqual(by_id["beta"]["armed"], "yes")
         self.assertEqual(by_id["off"]["status"], "disabled")
+        self.assertEqual(by_id["off"]["armed"], "no")
         self.assertEqual(by_id["alpha"]["role"], "specialized")
         self.assertEqual(by_id["alpha"]["sources"], "-")
 
@@ -440,11 +442,12 @@ class RenderStatusTest(unittest.TestCase):
 
         self.assertTrue(healthy)
         self.assertIn("Memory Daemon", text)
-        self.assertIn("Scheduler: loaded (idle)", text)
+        self.assertIn("Scheduler: armed · idle", text)
         self.assertIn("Next coordinator run: within 15m", text)
         self.assertIn("ROUTINE", text)
         self.assertIn("ROLE", text)
         self.assertIn("SOURCES", text)
+        self.assertIn("ARMED", text)
         self.assertIn("example", text)
         self.assertIn("Logs: logs/run.log", text)
 

@@ -886,6 +886,10 @@ distinguishes a last scheduled attempt from a last captured item, shows when
 each routine is next due, and flags an unfinished last run, memory-sink
 failures, or pending Gmail triage. `partial` means a connector sweep still has
 an explicitly bounded scope; legacy routines without `role` display `-`.
+The `ARMED` column says whether a routine is enabled independently of its
+current `STATUS`: `running`, `due`, `waiting`, `attention`, or `disabled`. An
+armed scheduler is loaded and will keep checking its schedule; `tick running`
+means its coordinator process is executing now.
 Copy it to a directory on `PATH` to call it from anywhere:
 
 ```sh
