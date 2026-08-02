@@ -83,12 +83,15 @@ English that preserves the source's concrete product facts, questions, current
 behavior, constraints, decisions, and actions. Do not invent missing context.
 Never reproduce credentials, secrets, or unrelated sensitive personal data.
 
-Title: {title}
-Date: {date}
-
 --- SOURCE ---
+{source_header}
+
 {body}
 """
+
+OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
+    r"^(?:gmail|gchat|slack|gdrive|mila):[^\s]+$"
+)
 
 
 def memory_cfg(routine):
@@ -153,11 +156,16 @@ def validate(routine):
     confirmed = cfg.get("operator_confirmed_source_ids")
     if confirmed is not None and (
         not isinstance(confirmed, list)
-        or any(not isinstance(value, str) or not value.strip() for value in confirmed)
+        or any(
+            not isinstance(value, str)
+            or value != value.strip()
+            or not OPERATOR_CONFIRMED_SOURCE_ID_RE.fullmatch(value)
+            for value in confirmed
+        )
     ):
         problems.append(
             f"{rid}: memory.operator_confirmed_source_ids must be a list "
-            "of non-empty source-id strings"
+            "of canonical source ids (gmail:, gchat:, slack:, gdrive:, or mila:)"
         )
     return problems
 
@@ -410,13 +418,21 @@ def _operator_confirmed(cfg, source_id):
     )
 
 
+def is_operator_confirmed(routine, item):
+    """Whether the owner explicitly approved this exact source for memory."""
+    return _operator_confirmed(memory_cfg(routine), source_id_for(item))
+
+
 def _operator_confirmed_summary(routine, item):
     """Re-summarize one exact source after an explicit owner override."""
     from . import llm  # late import to avoid cycles
 
+    source_header = llm.source_header_lines(item) + [
+        f"Title: {item.get('title', '')}",
+        f"Date: {item.get('date', '')}",
+    ]
     prompt = OPERATOR_CONFIRMED_PROMPT.format(
-        title=item.get("title", ""),
-        date=item.get("date", ""),
+        source_header="\n".join(source_header),
         body=item.get("body", ""),
     )
     summary = llm.analyze(routine, prompt).strip()
@@ -440,7 +456,7 @@ def capture(routine, item, summary, dry_run=False):
     store = cfg["store"]
     rid = routine.get("id")
     source_id = source_id_for(item)
-    operator_confirmed = _operator_confirmed(cfg, source_id)
+    operator_confirmed = is_operator_confirmed(routine, item)
     meta = item.get("frontmatter") or {}
     active_chat_followup = (
         meta.get("gmail_chat_followup_managed") is True

@@ -1676,6 +1676,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 claim["source"].get("catch_up") is True
                 or claim["source"].get("kind") == "mila"
                 or existing.get("gmail_followup_open") is True
+                or existing.get("memory_operator_confirmed") is True
             )
             and "memory_error" in existing
         )
@@ -1856,6 +1857,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         "gmail_label_applied": label,
     }
     meta = item.get("frontmatter") or {}
+    operator_confirmed = memory_sink.is_operator_confirmed(routine, item)
+    if operator_confirmed:
+        record["memory_operator_confirmed"] = True
     if (
         meta.get("gmail_chat_followup_managed") is True
         and meta.get("gmail_chat_followup_active") is True
@@ -1870,6 +1874,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     # Memory sink runs after the vault note: the note is the expensive half and
     # the memory add is idempotent by source id, so a crash between the two is
     # healed by the next run re-capturing into the same entry.
+    operator_memory_failed = False
     if memory_sink.memory_cfg(routine):
         try:
             outcome = memory_sink.capture(routine, item, summary)
@@ -1885,11 +1890,18 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     "as not memory-worthy"
                 )
         except Exception as exc:
-            # Memory failure must not abort Gmail triage; the ledger records it
-            # for a manual re-run.
+            # Ordinary memory failures remain non-blocking for Gmail triage.
+            # An operator-confirmed source is different: retain its source
+            # state and retry until the explicitly requested memory exists.
             record["memory_error"] = str(exc)[:300]
+            operator_memory_failed = operator_confirmed
             totals["errors"] += 1
             log(f"routine={rid} memory ERROR: {exc}")
+            if operator_memory_failed and action_list:
+                log(
+                    f"routine={rid} id={item['id']} withholding Gmail actions "
+                    "until operator-confirmed memory capture succeeds"
+                )
     if item.get("expand_fallback"):
         # Queryable: `grep expand_fallback state/processed.json` lists every
         # item summarized from a stub, so they can be deleted and re-run once
@@ -1901,8 +1913,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     # ledgered immediately — with the whole action list marked pending, so that
     # dying here leaves the triage recoverable rather than lost. Recording only
     # after triage would instead risk a duplicate note on the next run.
-    if action_list:
-        record["actions_pending"] = list(action_list)
+    actions_to_apply = [] if operator_memory_failed else action_list
+    if actions_to_apply:
+        record["actions_pending"] = list(actions_to_apply)
     if source["kind"] == "mila" and base_dir is not None:
         receipt_status = "failed" if record.get("memory_error") else "processed"
         details = {
@@ -1922,8 +1935,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     else:
         processed.record(item["id"], record)
 
-    if action_list:
-        applied, pending = actions.apply(item["id"], action_list, label)
+    if actions_to_apply:
+        applied, pending = actions.apply(item["id"], actions_to_apply, label)
         processed.record(item["id"], _with_action_outcome(record, applied, pending))
         if pending:
             totals["pending_actions"] += 1

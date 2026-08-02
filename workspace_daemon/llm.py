@@ -5,7 +5,7 @@ from .shell import run_json, yoetz_bin
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
-def _source_header_lines(item):
+def source_header_lines(item):
     """Render source metadata that materially changes how the model reads an item."""
     meta = item.get("frontmatter", {})
     lines = []
@@ -141,7 +141,7 @@ def build_prompt(routine, item, label_catalog):
     parts.append(f"\nInstruction: {resolve_instruction(routine)}")
 
     header_lines = [f"Title: {item.get('title', '')}", f"Date: {item.get('date', '')}"]
-    header_lines = _source_header_lines(item) + header_lines
+    header_lines = source_header_lines(item) + header_lines
     parts.append(
         "\n--- Source ---\n" + "\n".join(header_lines) + f"\n\n{item['body']}"
     )

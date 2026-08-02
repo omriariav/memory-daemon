@@ -664,6 +664,46 @@ class RunnerWiringTest(unittest.TestCase):
             record["memory_entry_id"], "2026-08-01-follow-up"
         )
 
+    def test_operator_confirmed_memory_failure_retries_before_gmail_actions(self):
+        r = routine(
+            self.vault,
+            memory={
+                "store": "/store",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:m1"],
+            },
+            actions=["archive"],
+        )
+        outcomes = [
+            RuntimeError("store unavailable"),
+            {
+                "memory": "created",
+                "memory_entry_id": "2026-08-01-durable-product-context",
+            },
+        ]
+
+        with mock.patch.object(
+            memory_sink, "capture", side_effect=outcomes
+        ) as capture:
+            first = runner.run(self.base, [r])
+            first_record = self.ledger()["m1"]
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertTrue(first_record["memory_operator_confirmed"])
+        self.assertIn("memory_error", first_record)
+        self.assertNotIn("actions_pending", first_record)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 2)
+        record = self.ledger()["m1"]
+        self.assertTrue(record["memory_operator_confirmed"])
+        self.assertNotIn("memory_error", record)
+        self.assertEqual(
+            record["memory_entry_id"],
+            "2026-08-01-durable-product-context",
+        )
+
     def test_managed_followup_upgrades_an_ordinary_ledger_record(self):
         processed = state.Store(self.base)
         processed.record("m1", {
