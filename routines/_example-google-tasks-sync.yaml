@@ -31,5 +31,7 @@ maintenance:
   outbound_since: "2026-01-01"
   # Any memory todo carrying one of these tags remains local-only.
   exclude_tags: [no-google-tasks]
+  # Optional existing person slugs that identity enrichment must never link.
+  identity_exclude_people: []
   # Fail closed instead of silently truncating an unusually large list.
   max_tasks: 10000

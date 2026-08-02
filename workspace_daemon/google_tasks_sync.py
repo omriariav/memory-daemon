@@ -32,6 +32,7 @@ ORIGIN_ID_RE = re.compile(
 SOURCE_RE = re.compile(r"^google-tasks:([^:]+):([^:]+)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ENTRY_ID_RE = re.compile(r"(?:created|updated)\s+([a-z0-9][a-z0-9-]*)", re.I)
+PERSON_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+$")
 
 
 def _today():
@@ -57,6 +58,22 @@ def _source_parts(source_id):
 def _slug(value):
     rendered = re.sub(r"[^a-z0-9]+", "-", str(value).casefold()).strip("-")
     return rendered or "unnamed"
+
+
+def _memory_title_slug(value):
+    """Mirror personal-memory's ASCII title slug without its empty fallback."""
+    return re.sub(
+        r"[^a-z0-9]+", "-", str(value).lower()
+    ).strip("-")[:60]
+
+
+def _explicit_memory_id(task, source_id):
+    """Return a safe explicit id only when the store's title slug is empty."""
+    title = str(task.get("title") or "Untitled task")
+    if _memory_title_slug(title):
+        return None
+    suffix = hashlib.sha256(source_id.encode()).hexdigest()[:12]
+    return f"{_memory_entry_date(task)}-google-task-{suffix}"
 
 
 def _task_from_payload(payload):
@@ -131,6 +148,7 @@ def _load_memory_entries(store):
             "title": str(data.get("title") or ""),
             "body": body,
             "tags": [str(value) for value in (data.get("tags") or [])],
+            "people": [str(value) for value in (data.get("people") or [])],
             "source_ids": [
                 str(value) for value in (data.get("source_ids") or [])
             ],
@@ -146,8 +164,128 @@ def _load_memory_entries(store):
     return entries
 
 
+def _shared_entry_ids(store):
+    """Return ids materialized in any non-private personal-memory graph."""
+    parent = Path(store) / "memory-graphs"
+    if not parent.exists():
+        return set()
+    shared = set()
+    for graph in sorted(path for path in parent.iterdir() if path.is_dir()):
+        entries = graph / "entries"
+        if not entries.exists():
+            continue
+        for path in sorted(entries.rglob("*.md")):
+            data, _body = _frontmatter(path)
+            shared.add(str(data["id"]))
+    return shared
+
+
 def _clean_google_notes(notes):
     return ORIGIN_RE.sub("", str(notes or "")).strip()
+
+
+def _known_people(entries):
+    """Return reusable person slugs already present in the private graph."""
+    return sorted({
+        person
+        for entry in entries.values()
+        for person in entry.get("people", [])
+        if PERSON_SLUG_RE.fullmatch(person)
+    })
+
+
+def _memory_by_google_source(entries):
+    """Build a one-to-one canonical Google source map or fail closed."""
+    by_source = {}
+    for entry in entries.values():
+        google_sources = list(dict.fromkeys(
+            source_id
+            for source_id in entry["source_ids"]
+            if _source_parts(source_id)
+        ))
+        if len(google_sources) > 1:
+            raise RuntimeError(
+                f"memory entry {entry['id']!r} has multiple Google Tasks "
+                f"identities: {', '.join(google_sources)}"
+            )
+        for source_id in google_sources:
+            previous = by_source.get(source_id)
+            if previous and previous["id"] != entry["id"]:
+                raise RuntimeError(
+                    f"Google Tasks source id {source_id!r} is linked to "
+                    f"multiple memory entries: {previous['id']}, {entry['id']}"
+                )
+            by_source[source_id] = entry
+    return by_source
+
+
+def _task_people(task, people, excluded=()):
+    """Conservatively match task text to existing person slugs.
+
+    Full names may match case-insensitively. A first name is accepted only when
+    it identifies exactly one catalog person, is at least four characters, and
+    appears capitalized (or all-caps) in the source text. No new slug is minted.
+    """
+    text = "\n".join((
+        str(task.get("title") or ""),
+        _clean_google_notes(task.get("notes")),
+    ))
+    excluded = set(excluded or [])
+    # Exclusions may suppress a result, but must never make an ambiguous first
+    # name appear unique by shrinking the catalog used for confidence.
+    catalog = list(people)
+    matched = set()
+    by_first = {}
+    full_hits = []
+    for slug in catalog:
+        parts = slug.split("-")
+        by_first.setdefault(parts[0], []).append(slug)
+        full_name = r"[\s-]+".join(re.escape(part) for part in parts)
+        for hit in re.finditer(
+            rf"(?<![A-Za-z0-9]){full_name}(?![A-Za-z0-9])",
+            text,
+            re.IGNORECASE,
+        ):
+            full_hits.append((hit.start(), hit.end(), slug))
+    overlap_groups = []
+    for hit in sorted(full_hits):
+        if not overlap_groups or hit[0] >= max(row[1] for row in overlap_groups[-1]):
+            overlap_groups.append([hit])
+        else:
+            overlap_groups[-1].append(hit)
+    for group in overlap_groups:
+        containers = [
+            candidate
+            for candidate in group
+            if all(
+                candidate[0] <= other[0] and other[1] <= candidate[1]
+                for other in group
+            )
+        ]
+        if len(containers) != 1:
+            continue
+        _start, _end, slug = containers[0]
+        if slug not in excluded:
+            matched.add(slug)
+    for first, slugs in by_first.items():
+        if len(first) < 4 or len(slugs) != 1:
+            continue
+        displayed = re.escape(first.capitalize())
+        uppercase = re.escape(first.upper())
+        first_hits = re.finditer(
+            rf"(?<![A-Za-z0-9])(?:{displayed}|{uppercase})(?![A-Za-z0-9])",
+            text,
+        )
+        for hit in first_hits:
+            inside_full_name = any(
+                other_start <= hit.start()
+                and hit.end() <= other_end
+                for other_start, other_end, _other_slug in full_hits
+            )
+            if not inside_full_name and slugs[0] not in excluded:
+                matched.add(slugs[0])
+                break
+    return sorted(matched)
 
 
 def _origin_memory_id(notes):
@@ -290,6 +428,7 @@ def _memory_guard_hash(entry):
         "title": entry["title"],
         "body": entry["body"],
         "tags": entry["tags"],
+        "people": entry.get("people", []),
         "source_ids": entry["source_ids"],
         "follows": entry["follows"],
         "resolved": bool(entry.get("resolved")),
@@ -409,7 +548,7 @@ def _verified_durable_entry(store, source_id, expected):
                 f"durable memory entry {entry['id']!r} does not match the "
                 f"requested {field}"
             )
-    for field in ("follows", "source_ids"):
+    for field in ("follows", "people", "source_ids"):
         wanted = set(expected.get(field) or [])
         if not wanted.issubset(set(entry[field])):
             raise RuntimeError(
@@ -456,6 +595,7 @@ def _memory_upsert(
     )
     memory_date = _memory_entry_date(task, existing_entry)
     tags = f"google-tasks,google-tasks-{_slug(tasklist['title'])}"
+    explicit_id = None if update_id else _explicit_memory_id(task, source_id)
     args = [
         "add", "--title", str(task.get("title") or "Untitled task"),
         "--type", "todo", "--date", memory_date,
@@ -468,13 +608,38 @@ def _memory_upsert(
         # The canonical Google source id is the dedupe boundary. Two distinct
         # tasks may be semantically similar and must not be collapsed by the
         # store's generic near-duplicate guard.
+        if explicit_id:
+            args.extend(["--id", explicit_id])
         args.append("--force-new")
     result = _memory_cli(store, args)
     return _memory_result_id(result, store, source_id, {
-        "id": update_id,
+        "id": update_id or explicit_id,
         "title": str(task.get("title") or "Untitled task"),
         "type": "todo",
         "body": body,
+        "source_ids": [source_id],
+    })
+
+
+def _memory_enrich_people(store, entry, source_id, people):
+    """Add verified existing person slugs without changing synced task fields."""
+    missing = sorted(set(people) - set(entry.get("people", [])))
+    if not missing:
+        return entry["id"]
+    result = _memory_cli(store, [
+        "add", "--title", entry["title"],
+        "--type", entry["type"], "--date", entry["date"],
+        "--people", ",".join(missing),
+        "--source-ids", source_id,
+        "--body", entry["body"],
+        "--update", entry["id"],
+    ])
+    return _memory_result_id(result, store, source_id, {
+        "id": entry["id"],
+        "title": entry["title"],
+        "type": entry["type"],
+        "body": entry["body"],
+        "people": missing,
         "source_ids": [source_id],
     })
 
@@ -587,6 +752,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
     max_tasks = int(cfg.get("max_tasks", 10000))
     google_tasks = _open_tasks(tasklists, max_tasks)
     memory_entries = _load_memory_entries(store)
+    known_people = _known_people(memory_entries)
     report = {
         "ok": True,
         "tasklist_count": len(tasklists),
@@ -660,26 +826,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                 ),
             })
 
-    memory_by_source = {}
-    for entry in memory_entries.values():
-        google_sources = list(dict.fromkeys(
-            source_id
-            for source_id in entry["source_ids"]
-            if _source_parts(source_id)
-        ))
-        if len(google_sources) > 1:
-            raise RuntimeError(
-                f"memory entry {entry['id']!r} has multiple Google Tasks "
-                f"identities: {', '.join(google_sources)}"
-            )
-        for source_id in google_sources:
-            previous = memory_by_source.get(source_id)
-            if previous and previous["id"] != entry["id"]:
-                raise RuntimeError(
-                    f"Google Tasks source id {source_id!r} is linked to "
-                    f"multiple memory entries: {previous['id']}, {entry['id']}"
-                )
-            memory_by_source[source_id] = entry
+    memory_by_source = _memory_by_google_source(memory_entries)
 
     # A checkpoint identity reserves its memory todo even when the remote task
     # is unavailable. Validate the one-to-one graph anchor before any refetch;
@@ -789,6 +936,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
     linked_memory_ids = set(mapped_memory_ids)
     google_titles = {}
     excluded = set(cfg.get("exclude_tags") or [])
+    identity_deferred_keys = set()
 
     for key, task in sorted(google_tasks.items()):
         memory_write_this_item = False
@@ -971,6 +1119,12 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                 })
                 continue
             else:
+                explicit_id = _explicit_memory_id(task, source_id)
+                people = _task_people(
+                    task,
+                    known_people,
+                    cfg.get("identity_exclude_people") or [],
+                )
                 _plan(
                     report,
                     "create_memory",
@@ -980,6 +1134,8 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                     due=_due_date(task),
                     source_updated=_task_updated(task),
                     memory_date=_memory_entry_date(task),
+                    **({"memory_id": explicit_id} if explicit_id else {}),
+                    **({"people": people} if people else {}),
                 )
                 if not dry_run:
                     _assert_google_unchanged(list_id, task_id, task)
@@ -991,6 +1147,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                         "title": str(task.get("title") or "Untitled task"),
                         "body": _memory_body(task, tasklists[list_id]["title"]),
                         "tags": ["google-tasks"],
+                        "people": [],
                         "source_ids": [source_id],
                         "follows": [],
                         "resolved": False,
@@ -1152,11 +1309,14 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                 memory_id=entry["id"],
                 title=entry["title"],
             )
+            if dry_run:
+                identity_deferred_keys.add(key)
             if not dry_run:
                 _assert_pair_unchanged(store, entry, task)
                 _gws(["complete", list_id, task_id])
                 task = _task_from_payload(_gws(["get", list_id, task_id]))
                 task["tasklist_id"] = list_id
+                google_tasks[key] = task
                 current_google_hash = _google_hash(task)
 
         if not mapping:
@@ -1296,11 +1456,14 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                     memory_id=entry["id"],
                     title=entry["title"],
                 )
+                if dry_run:
+                    identity_deferred_keys.add(key)
                 if not dry_run:
                     _assert_pair_unchanged(store, entry, task)
                     _gws(["complete", list_id, task_id])
                     task = _task_from_payload(_gws(["get", list_id, task_id]))
                     task["tasklist_id"] = list_id
+                    google_tasks[key] = task
                     current_google_hash = _google_hash(task)
             elif not entry["resolved"] and not google_completed:
                 fields = _memory_to_google(entry)
@@ -1325,10 +1488,13 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                     title=entry["title"],
                     due=fields["due"],
                 )
+                if dry_run:
+                    identity_deferred_keys.add(key)
                 if not dry_run:
                     _assert_pair_unchanged(store, entry, task)
                     task = _update_google(list_id, task_id, fields)
                     task["tasklist_id"] = list_id
+                    google_tasks[key] = task
                     current_google_hash = _google_hash(task)
 
         if not dry_run:
@@ -1384,6 +1550,10 @@ def run(cfg, checkpoint_path=None, dry_run=False):
         current_entry = _assert_memory_unchanged(store, entry)
         _assert_outbound_eligible(current_entry, excluded)
         task = _create_google(outbound_list, entry)
+        # Raw ``gws tasks create/get`` payloads do not carry the list id. Keep
+        # the same synthetic shape as ``_open_tasks`` for the later identity
+        # enrichment pass and for any checkpoint bookkeeping in this run.
+        task["tasklist_id"] = outbound_list
         _task_updated(task)
         task_id = str(task.get("id") or "")
         if not task_id:
@@ -1423,6 +1593,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
             ),
             source_ids=[*entry["source_ids"], source_id],
         )
+        google_tasks[key] = task
         mappings[key] = {
             "memory_id": entry["id"],
             "source_id": source_id,
@@ -1432,6 +1603,89 @@ def run(cfg, checkpoint_path=None, dry_run=False):
             "pending_link": False,
         }
         _save_checkpoint(checkpoint_path, checkpoint)
+
+    # Person links are memory-only enrichment. They are deliberately outside
+    # the bidirectional content hash, so adding a person can never trigger a
+    # Google Tasks write. Run this pass only after a conflict-free sync plan;
+    # partial or disputed task state must remain entirely untouched.
+    if not report["errors"] and report["conflicts"] == 0:
+        durable_entries = (
+            _load_memory_entries(store) if not dry_run else memory_entries
+        )
+        durable_people = _known_people(durable_entries)
+        durable_by_source = _memory_by_google_source(durable_entries)
+        shared_entry_ids = _shared_entry_ids(store)
+        excluded_people = cfg.get("identity_exclude_people") or []
+        for key, task in sorted(google_tasks.items()):
+            if key in identity_deferred_keys:
+                continue
+            source_id = _source_id(task["tasklist_id"], str(task["id"]))
+            entry = durable_by_source.get(source_id)
+            if (
+                not entry
+                or entry["type"] != "todo"
+                or excluded.intersection(entry["tags"])
+            ):
+                continue
+            mapping = mappings.get(key)
+            if mapping and mapping.get("memory_id") != entry["id"]:
+                raise RuntimeError(
+                    f"concurrent Google Tasks source reassignment detected "
+                    f"for {source_id!r}; people enrichment aborted"
+                )
+            people = _task_people(task, durable_people, excluded_people)
+            missing = sorted(set(people) - set(entry.get("people", [])))
+            if not missing:
+                continue
+            if entry["id"] in shared_entry_ids:
+                _plan(
+                    report,
+                    "skip_shared_people_enrichment",
+                    task=key,
+                    memory_id=entry["id"],
+                    title=entry["title"],
+                    reason="entry is materialized in a non-private graph",
+                )
+                continue
+            _plan(
+                report,
+                "enrich_memory_people",
+                task=key,
+                memory_id=entry["id"],
+                title=entry["title"],
+                people=missing,
+            )
+            if not dry_run:
+                _assert_google_unchanged(
+                    task["tasklist_id"], str(task["id"]), task
+                )
+                current_entries = _load_memory_entries(store)
+                current_by_source = _memory_by_google_source(current_entries)
+                current_entry = current_by_source.get(source_id)
+                if not current_entry or current_entry["id"] != entry["id"]:
+                    raise RuntimeError(
+                        f"concurrent Google Tasks source reassignment detected "
+                        f"for {source_id!r}; people enrichment aborted"
+                    )
+                if _memory_guard_hash(current_entry) != _memory_guard_hash(entry):
+                    raise RuntimeError(
+                        f"concurrent memory change detected for {entry['id']!r}; "
+                        "people enrichment aborted"
+                    )
+                current_people = set(_known_people(current_entries))
+                if not set(missing).issubset(current_people):
+                    raise RuntimeError(
+                        "person catalog changed before Google Tasks people "
+                        "enrichment; write aborted"
+                    )
+                if entry["id"] in _shared_entry_ids(store):
+                    raise RuntimeError(
+                        f"memory entry {entry['id']!r} gained shared graph "
+                        "membership; people enrichment aborted"
+                    )
+                _memory_enrich_people(store, entry, source_id, missing)
+                _commit_store(str(store), "memory: enrich Google Task people")
+                entry["people"] = sorted(set(entry["people"]) | set(missing))
 
     report["ok"] = not report["errors"] and report["conflicts"] == 0
     if not dry_run and report["ok"]:

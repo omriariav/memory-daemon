@@ -34,17 +34,19 @@ def entry_text(
     tags=None,
     source_ids=None,
     follows=None,
+    people=None,
 ):
     source_ids = source_ids or []
     follows = follows or []
     tags = tags or ["work"]
+    people = people or []
     lines = [
         "---",
         f"id: {entry_id}",
         f"date: '{date}'",
         f"type: {entry_type}",
         f"title: {json.dumps(title)}",
-        "people: []",
+        f"people: {json.dumps(people)}",
         "teams: []",
         f"tags: {json.dumps(tags)}",
     ]
@@ -123,6 +125,145 @@ class GoogleTasksSyncTest(unittest.TestCase):
             "2026-08-02T08:00:00.000Z",
         )
         self.assertTrue(report["ok"])
+
+    def test_non_ascii_title_gets_stable_source_derived_memory_id(self):
+        google = task(title="לשלם למטפלות")
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        expected_id = google_tasks_sync._explicit_memory_id(google, source_id)
+
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout=f"created {expected_id}",
+                stderr="",
+            ),
+        ) as memory_cli:
+            entry_id = google_tasks_sync._memory_upsert(
+                self.store,
+                google,
+                self.tasklists[LIST_ID],
+                source_id,
+            )
+
+        self.assertEqual(entry_id, expected_id)
+        self.assertRegex(
+            expected_id,
+            r"^2026-08-02-google-task-[a-f0-9]{12}$",
+        )
+        args = memory_cli.call_args.args[1]
+        self.assertEqual(args[args.index("--id") + 1], expected_id)
+
+    def test_distinct_non_ascii_tasks_get_distinct_memory_ids(self):
+        first = google_tasks_sync._explicit_memory_id(
+            task(title="משימה אחת"),
+            google_tasks_sync._source_id(LIST_ID, "one"),
+        )
+        second = google_tasks_sync._explicit_memory_id(
+            task(title="משימה שתיים"),
+            google_tasks_sync._source_id(LIST_ID, "two"),
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_unicode_casefold_does_not_hide_empty_store_slug(self):
+        google = task(title="ß")
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+
+        self.assertRegex(
+            google_tasks_sync._explicit_memory_id(google, source_id),
+            r"^2026-08-02-google-task-[a-f0-9]{12}$",
+        )
+
+    def test_ascii_title_keeps_store_generated_readable_id(self):
+        google = task(title="Review the plan")
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="created 2026-08-02-review-the-plan",
+                stderr="",
+            ),
+        ) as memory_cli:
+            google_tasks_sync._memory_upsert(
+                self.store,
+                google,
+                self.tasklists[LIST_ID],
+                source_id,
+            )
+
+        self.assertNotIn("--id", memory_cli.call_args.args[1])
+
+    def test_identity_matching_reuses_only_conservative_existing_slugs(self):
+        people = [
+            "alice-chen",
+            "bruno-martin",
+            "carol-williams",
+            "dana-lee",
+            "dana-kim",
+            "or-example-person",
+        ]
+        google = task(
+            title="Complete Alice Chen onboarding with Bruno",
+            notes="Ask CAROL for input. Dana and Or can review later.",
+        )
+
+        self.assertEqual(
+            google_tasks_sync._task_people(google, people),
+            ["alice-chen", "bruno-martin", "carol-williams"],
+        )
+
+    def test_identity_matching_never_mints_unknown_or_ambiguous_people(self):
+        google = task(
+            title="Follow up with Dana and Aditi",
+            notes="or ask the team if Alex can help",
+        )
+
+        self.assertEqual(
+            google_tasks_sync._task_people(
+                google,
+                ["dana-lee", "dana-kim", "or-example-person"],
+            ),
+            [],
+        )
+
+    def test_identity_exclusion_never_makes_ambiguous_first_name_unique(self):
+        google = task(title="Ask Dana for a review")
+
+        self.assertEqual(
+            google_tasks_sync._task_people(
+                google,
+                ["dana-lee", "dana-kim"],
+                excluded=["dana-lee"],
+            ),
+            [],
+        )
+
+    def test_identity_matching_prefers_longest_overlapping_full_name(self):
+        google = task(title="Ask Alice Chen Smith to review")
+
+        self.assertEqual(
+            google_tasks_sync._task_people(
+                google,
+                ["alice-chen", "alice-chen-smith", "chen-smith"],
+            ),
+            ["alice-chen-smith"],
+        )
+
+    def test_identity_matching_rejects_partially_overlapping_full_names(self):
+        google = task(title="Ask John Smith Jones to review")
+
+        self.assertEqual(
+            google_tasks_sync._task_people(
+                google,
+                ["john-smith", "smith-jones"],
+            ),
+            [],
+        )
 
     def test_exact_title_links_instead_of_duplicating(self):
         self.write_entry(entry_text(
@@ -678,6 +819,289 @@ class GoogleTasksSyncTest(unittest.TestCase):
             json.loads(self.checkpoint.read_text()),
         )
 
+    def test_dry_run_plans_people_enrichment_without_google_write(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Complete Alice Chen onboarding")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["alice-chen"],
+        ), name="catalog.md")
+        memory_entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": memory_entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(memory_entry),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        report = self.run_dry({f"{LIST_ID}:{TASK_ID}": current_task})
+
+        self.assertEqual(report["enrich_memory_people"], 1)
+        self.assertEqual(report["planned"], [{
+            "action": "enrich_memory_people",
+            "task": f"{LIST_ID}:{TASK_ID}",
+            "memory_id": "2026-08-02-local-task",
+            "title": "Complete Alice Chen onboarding",
+            "people": ["alice-chen"],
+        }])
+        self.assertNotIn("update_google", report)
+        self.assertTrue(report["ok"])
+
+    def test_real_people_enrichment_is_memory_only_and_committed(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        memory_entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": memory_entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(memory_entry),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+        ), mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ) as google_guard, mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_commit_store"
+        ) as commit, mock.patch.object(
+            google_tasks_sync, "_update_google"
+        ) as update_google:
+            report = google_tasks_sync.run(
+                self.cfg,
+                checkpoint_path=self.checkpoint,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["enrich_memory_people"], 1)
+        enrich.assert_called_once_with(
+            self.store,
+            mock.ANY,
+            source_id,
+            ["bruno-martin"],
+        )
+        google_guard.assert_called_once()
+        update_google.assert_not_called()
+        commit.assert_called_once_with(
+            str(self.store), "memory: enrich Google Task people"
+        )
+        self.assertTrue(report["ok"])
+
+    def test_local_google_update_uses_post_write_text_for_identity(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        before = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title="Ask the team to review",
+            body=google_tasks_sync._memory_body(before, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        current = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        baseline = dict(current, title=before["title"])
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": current["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(before),
+                    "memory_hash": google_tasks_sync._memory_hash(baseline),
+                    "terminal": False,
+                },
+            },
+        }))
+        updated = {
+            **before,
+            "title": current["title"],
+            "notes": google_tasks_sync._memory_to_google(current)["notes"],
+            "updated": "2026-08-02T09:00:00.000Z",
+        }
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": before},
+        ), mock.patch.object(
+            google_tasks_sync, "_assert_pair_unchanged"
+        ), mock.patch.object(
+            google_tasks_sync, "_update_google", return_value=updated
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ) as identity_guard:
+            report = google_tasks_sync.run(
+                self.cfg,
+                checkpoint_path=self.checkpoint,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["update_google"], 1)
+        self.assertNotIn("enrich_memory_people", report)
+        enrich.assert_not_called()
+        identity_guard.assert_not_called()
+        self.assertTrue(report["ok"])
+
+    def test_local_completion_enriches_against_post_completion_snapshot(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        before = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=before["title"],
+            body=google_tasks_sync._memory_body(before, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        baseline = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": baseline["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(before),
+                    "memory_hash": google_tasks_sync._memory_hash(baseline),
+                    "terminal": False,
+                },
+            },
+        }))
+        self.write_entry(entry_text(
+            entry_id="2026-08-02-completed-task",
+            title="Completed: Ask Bruno to review",
+            body="Completed locally.",
+            entry_type="note",
+            follows=[baseline["id"]],
+        ), name="completion.md")
+        completed = task(
+            title=before["title"],
+            status="completed",
+            completed="2026-08-02T09:00:00.000Z",
+            updated="2026-08-02T09:00:00.000Z",
+        )
+
+        def check_post_completion(_list_id, _task_id, observed):
+            self.assertEqual(observed["status"], "completed")
+            return observed
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": before},
+        ), mock.patch.object(
+            google_tasks_sync, "_assert_pair_unchanged"
+        ), mock.patch.object(
+            google_tasks_sync, "_gws", return_value=completed
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_assert_google_unchanged",
+            side_effect=check_post_completion,
+        ) as google_guard, mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_commit_store"
+        ) as commit:
+            report = google_tasks_sync.run(
+                self.cfg,
+                checkpoint_path=self.checkpoint,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["complete_google"], 1)
+        self.assertEqual(report["enrich_memory_people"], 1)
+        google_guard.assert_called_once()
+        enrich.assert_called_once_with(
+            self.store,
+            mock.ANY,
+            source_id,
+            ["bruno-martin"],
+        )
+        commit.assert_called_once_with(
+            str(self.store), "memory: enrich Google Task people"
+        )
+        self.assertTrue(report["ok"])
+
+    def test_people_enrichment_is_not_part_of_bidirectional_content_hash(self):
+        entry = {
+            "type": "todo",
+            "title": "Task",
+            "body": "Body",
+            "resolved": False,
+            "people": [],
+        }
+
+        self.assertEqual(
+            google_tasks_sync._memory_hash(entry),
+            google_tasks_sync._memory_hash({
+                **entry,
+                "people": ["alice-chen"],
+            }),
+        )
+
     def test_real_import_writes_mapping_and_commits_memory(self):
         current_task = task()
         with mock.patch.object(
@@ -718,6 +1142,9 @@ class GoogleTasksSyncTest(unittest.TestCase):
                 "Synced from personal memory: 2026-08-02-local-task"
             ),
         }
+        # Match the raw gws create/get response: unlike _open_tasks, it does
+        # not include our synthetic tasklist_id field.
+        created.pop("tasklist_id")
         with mock.patch.object(
             google_tasks_sync, "_tasklists", return_value=self.tasklists
         ), mock.patch.object(
@@ -1146,7 +1573,7 @@ class GoogleTasksSyncTest(unittest.TestCase):
 
     def test_post_link_exclusion_skips_changes_on_both_sides(self):
         source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
-        baseline_task = task()
+        baseline_task = task(title="Ask Bruno to review")
         baseline_body = google_tasks_sync._memory_body(baseline_task, "Incoming")
         self.write_entry(entry_text(
             title=baseline_task["title"],
@@ -1154,6 +1581,14 @@ class GoogleTasksSyncTest(unittest.TestCase):
             tags=["work", "no-google-tasks"],
             source_ids=[source_id],
         ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
         baseline_entry = google_tasks_sync._load_memory_entries(self.store)[
             "2026-08-02-local-task"
         ]
@@ -1171,7 +1606,7 @@ class GoogleTasksSyncTest(unittest.TestCase):
         }))
 
         report = self.run_dry({
-            f"{LIST_ID}:{TASK_ID}": task(title="Changed in Google"),
+            f"{LIST_ID}:{TASK_ID}": task(title="Ask Bruno about an update"),
         })
 
         self.assertEqual(report["skip_excluded"], 1)
@@ -1179,7 +1614,336 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertNotIn("update_google", report)
         self.assertNotIn("complete_memory", report)
         self.assertNotIn("complete_google", report)
+        self.assertNotIn("enrich_memory_people", report)
         self.assertTrue(report["ok"])
+
+    def test_real_post_link_exclusion_never_enriches_people(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            tags=["work", "no-google-tasks"],
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(entry),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ) as google_guard, mock.patch.object(
+            google_tasks_sync, "_commit_store"
+        ) as commit:
+            report = google_tasks_sync.run(
+                self.cfg,
+                checkpoint_path=self.checkpoint,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["skip_excluded"], 1)
+        self.assertNotIn("enrich_memory_people", report)
+        enrich.assert_not_called()
+        google_guard.assert_not_called()
+        commit.assert_not_called()
+        self.assertTrue(report["ok"])
+
+    def test_enrichment_rechecks_person_catalog_immediately_before_write(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        initial_entries = google_tasks_sync._load_memory_entries(self.store)
+        durable_entries = {
+            entry_id: entry
+            for entry_id, entry in initial_entries.items()
+            if entry_id != "2026-07-01-known-person-context"
+        }
+        target = initial_entries["2026-08-02-local-task"]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": target["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(target),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_load_memory_entries",
+            side_effect=[initial_entries, initial_entries, durable_entries],
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ) as google_guard:
+            with self.assertRaisesRegex(RuntimeError, "person catalog changed"):
+                google_tasks_sync.run(
+                    self.cfg,
+                    checkpoint_path=self.checkpoint,
+                    dry_run=False,
+                )
+
+        enrich.assert_not_called()
+        google_guard.assert_called_once()
+
+    def test_enrichment_revalidates_durable_source_ownership(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        initial_entries = google_tasks_sync._load_memory_entries(self.store)
+        target = initial_entries["2026-08-02-local-task"]
+        checkpoint = {
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": target["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(target),
+                    "terminal": False,
+                },
+            },
+        }
+        cases = {
+            "duplicate": {
+                **initial_entries,
+                "2026-08-02-concurrent-duplicate": {
+                    **target,
+                    "id": "2026-08-02-concurrent-duplicate",
+                },
+            },
+            "reassigned": {
+                target["id"]: {**target, "source_ids": []},
+                "2026-08-02-concurrent-owner": {
+                    **target,
+                    "id": "2026-08-02-concurrent-owner",
+                },
+            },
+        }
+
+        for name, durable_entries in cases.items():
+            with self.subTest(name=name):
+                self.checkpoint.write_text(json.dumps(checkpoint))
+                with mock.patch.object(
+                    google_tasks_sync,
+                    "_tasklists",
+                    return_value=self.tasklists,
+                ), mock.patch.object(
+                    google_tasks_sync,
+                    "_open_tasks",
+                    return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+                ), mock.patch.object(
+                    google_tasks_sync,
+                    "_load_memory_entries",
+                    side_effect=[initial_entries, initial_entries, durable_entries],
+                ), mock.patch.object(
+                    google_tasks_sync, "_assert_google_unchanged"
+                ), mock.patch.object(
+                    google_tasks_sync, "_memory_enrich_people"
+                ) as enrich:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "multiple memory entries|source reassignment",
+                    ):
+                        google_tasks_sync.run(
+                            self.cfg,
+                            checkpoint_path=self.checkpoint,
+                            dry_run=False,
+                        )
+
+                enrich.assert_not_called()
+
+    def test_shared_graph_task_is_never_identity_enriched(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        target_text = entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        )
+        self.write_entry(target_text)
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        shared = (
+            self.store
+            / "memory-graphs"
+            / "example-team"
+            / "entries"
+            / "2026"
+            / "08"
+        )
+        shared.mkdir(parents=True)
+        (shared / "2026-08-02-local-task.md").write_text(target_text)
+        entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(entry),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        dry_report = self.run_dry({f"{LIST_ID}:{TASK_ID}": current_task})
+        self.assertEqual(dry_report["skip_shared_people_enrichment"], 1)
+        self.assertNotIn("enrich_memory_people", dry_report)
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich, mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ) as google_guard:
+            report = google_tasks_sync.run(
+                self.cfg,
+                checkpoint_path=self.checkpoint,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["skip_shared_people_enrichment"], 1)
+        self.assertNotIn("enrich_memory_people", report)
+        enrich.assert_not_called()
+        google_guard.assert_not_called()
+        self.assertTrue(report["ok"])
+
+    def test_new_shared_membership_aborts_people_enrichment(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        current_task = task(title="Ask Bruno to review")
+        self.write_entry(entry_text(
+            title=current_task["title"],
+            body=google_tasks_sync._memory_body(current_task, "Incoming"),
+            source_ids=[source_id],
+        ))
+        self.write_entry(entry_text(
+            entry_id="2026-07-01-known-person-context",
+            title="Known person context",
+            body="Existing context.",
+            date="2026-07-01",
+            entry_type="note",
+            people=["bruno-martin"],
+        ), name="catalog.md")
+        entry = google_tasks_sync._load_memory_entries(self.store)[
+            "2026-08-02-local-task"
+        ]
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": entry["id"],
+                    "source_id": source_id,
+                    "google_hash": google_tasks_sync._google_hash(current_task),
+                    "memory_hash": google_tasks_sync._memory_hash(entry),
+                    "terminal": False,
+                },
+            },
+        }))
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_open_tasks",
+            return_value={f"{LIST_ID}:{TASK_ID}": current_task},
+        ), mock.patch.object(
+            google_tasks_sync,
+            "_shared_entry_ids",
+            side_effect=[set(), {entry["id"]}],
+        ), mock.patch.object(
+            google_tasks_sync, "_assert_google_unchanged"
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_enrich_people"
+        ) as enrich:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "gained shared graph membership",
+            ):
+                google_tasks_sync.run(
+                    self.cfg,
+                    checkpoint_path=self.checkpoint,
+                    dry_run=False,
+                )
+
+        enrich.assert_not_called()
 
     def test_real_blank_note_import_establishes_mapping_without_conflict(self):
         current_task = task(notes="")
@@ -1383,6 +2147,7 @@ class GoogleTasksSyncTest(unittest.TestCase):
         ]
         cases = [
             {"tags": ["work", "no-google-tasks"]},
+            {"people": ["alice-chen"]},
             {
                 "source_ids": [
                     google_tasks_sync._source_id("other-list", "other-task")
