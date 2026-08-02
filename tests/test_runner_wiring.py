@@ -1279,6 +1279,13 @@ class RunnerWiringTest(unittest.TestCase):
 
         self.assertEqual(totals["errors"], 0)
         capture.assert_called_once()
+        captured_item = capture.call_args.args[1]
+        self.assertEqual(
+            captured_item["frontmatter"][
+                "gmail_followup_predecessor_entry_id"
+            ],
+            "2026-08-01-ordinary-note",
+        )
         record = self.ledger()["m1"]
         self.assertEqual(record["rule_id"], "wiring")
         self.assertTrue(record["gmail_followup_open"])

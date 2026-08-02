@@ -2039,6 +2039,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 effective, claim["source"], candidate, claim["fetch"], processed,
                 label_catalog, dry_run, totals, catalog, base_dir,
                 prefetched_item,
+                followup_predecessor_entry_id=(
+                    existing.get("memory_entry_id")
+                    if upgrade_followup and existing is not None
+                    else None
+                ),
             )
             if totals["errors"] > errors_before:
                 hold_claim(claim)
@@ -2096,7 +2101,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
 
 def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
-             prefetched_item=None):
+             prefetched_item=None, followup_predecessor_entry_id=None):
     rid = routine["id"]
     handler_id = routine.get("_handler_id")
     action_list = config.source_actions(routine, source)
@@ -2111,6 +2116,13 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         if prefetched_item is not None
         else fetch(routine, source, candidate)
     )
+    if followup_predecessor_entry_id:
+        item = dict(item)
+        meta = dict(item.get("frontmatter") or {})
+        meta["gmail_followup_predecessor_entry_id"] = (
+            followup_predecessor_entry_id
+        )
+        item["frontmatter"] = meta
     item.setdefault("source_kind", source["kind"])
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
