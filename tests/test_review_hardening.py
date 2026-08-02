@@ -41,6 +41,31 @@ class GmailCatchUpTest(unittest.TestCase):
         self.assertTrue(any("fixed temporal operator" in p for p in problems))
         self.assertTrue(any("max_results: 0" in p for p in problems))
 
+    def test_grouping_cannot_hide_temporal_operators(self):
+        for field, value in (
+            ("query", "{newer_than:1d in:inbox}"),
+            ("queue_query", "(older_than:2d is:unread)"),
+            ("exclude_query", "{-before:2026/08/01}"),
+        ):
+            source = {
+                "kind": "gmail", "query": "in:anywhere", "catch_up": True,
+                "catch_up_after": "2026-08-01T00:00:00Z", "max_results": 0,
+                field: value,
+            }
+            routine = {
+                "id": "gmail", "source": source,
+                "analyze": {
+                    "provider": "gemini", "model": "m", "instruction": "x",
+                },
+                "memory": {"store": "/tmp/store"},
+            }
+            problems = config.validate(routine)
+            self.assertTrue(
+                any("timeless" in problem or "temporal" in problem
+                    for problem in problems),
+                (field, problems),
+            )
+
 
 class ConfigSchemaTest(unittest.TestCase):
     def test_unknown_keys_fail_closed_at_each_level(self):
@@ -139,6 +164,50 @@ class CursorIsolationTest(unittest.TestCase):
         self.assertEqual(totals["errors"], 1)
         self.assertEqual(totals["skipped"], 1)
 
+    def test_failed_owner_holds_every_overlapping_claimant_cursor(self):
+        candidate = {
+            "id": "m1", "title": "durable",
+            "raw": {"thread_id": "t1"},
+        }
+
+        def source(query):
+            return {
+                "kind": "gmail", "query": query, "catch_up": True,
+                "catch_up_after": "2026-08-01T00:00:00Z", "max_results": 0,
+            }
+
+        owner = self.routine("owner", source("from:owner@example.com"))
+        owner["routing"] = {"priority": 1}
+        fallback = self.routine("fallback", source("in:anywhere"))
+        fallback["routing"] = {"fallback": True}
+
+        def fetch(_routine, _source, value):
+            return {
+                "id": value["id"], "source_id": "gmail:t1",
+                "source_kind": "gmail", "title": value["title"],
+                "date": "2026-08-02", "body": "body", "frontmatter": {},
+            }
+
+        with mock.patch.dict(
+            runner.SOURCES,
+            {"gmail": (lambda _source: [candidate], fetch)},
+        ), mock.patch.object(
+            config, "validate", return_value=[],
+        ), mock.patch.object(
+            runner.llm, "analyze",
+            side_effect=RuntimeError("could not resolve host"),
+        ):
+            totals = runner.run(self.base, [owner, fallback])
+
+        cursors = state.CursorStore(self.base)
+        self.assertEqual(totals["errors"], 1)
+        for routine in (owner, fallback):
+            self.assertIsNone(cursors.checkpoint(
+                routine["id"],
+                runner._catch_up_cursor_id(routine["source"]),
+                "gmail",
+            ))
+
 
 class MemorySinkProofTest(unittest.TestCase):
     def test_structured_extraction_rejects_missing_and_unknown_fields(self):
@@ -218,6 +287,10 @@ class PrivateStateTest(unittest.TestCase):
             shell._log_file = None
             self.assertTrue(path.with_name("run.log.1").exists())
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(
+                os.stat(path.with_name("run.log.lock")).st_mode & 0o777,
+                0o600,
+            )
             shifted_backup = path.with_name("run.log.3")
             self.assertEqual(os.stat(shifted_backup).st_mode & 0o777, 0o600)
 

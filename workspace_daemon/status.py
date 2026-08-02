@@ -10,6 +10,7 @@ from . import config, state
 
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
+MAINTENANCE_LAUNCHD_LABEL = "com.memory-daemon-maintenance"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
@@ -280,6 +281,9 @@ def routine_rows(
             if entry.get("processed_at")
         ]
         memory_errors = sum(bool(entry.get("memory_error")) for entry in entries)
+        expansion_fallbacks = sum(
+            bool(entry.get("expand_fallback")) for entry in entries
+        )
         pending_actions = sum(bool(entry.get("actions_pending")) for entry in entries)
         calendar_reviews = sum(
             bool(entry.get("calendar_match_rejected")) for entry in entries
@@ -287,6 +291,8 @@ def routine_rows(
         issues = []
         if memory_errors:
             issues.append(f"{memory_errors} memory sink")
+        if expansion_fallbacks:
+            issues.append(f"{expansion_fallbacks} source expansion")
         if pending_actions:
             issues.append(f"{pending_actions} Gmail triage")
         if calendar_reviews:
@@ -356,16 +362,24 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     """Return ``(text, healthy)`` for the complete local daemon."""
     now = time.time() if now is None else float(now)
     launchd = probe_launchd(label)
+    maintenance = (
+        probe_launchd(MAINTENANCE_LAUNCHD_LABEL)
+        if label == DEFAULT_LAUNCHD_LABEL else None
+    )
     legacy = None
     if label == DEFAULT_LAUNCHD_LABEL:
         legacy = probe_launchd(LEGACY_LAUNCHD_LABEL)
     history = read_tick_history(Path(base_dir) / "logs" / "run.log")
+    scheduler_running = (
+        launchd.get("state") == "running"
+        or bool(maintenance and maintenance.get("state") == "running")
+    )
     rows = routine_rows(
         base_dir,
         routines,
         history,
         now=now,
-        scheduler_running=launchd.get("state") == "running",
+        scheduler_running=scheduler_running,
     )
 
     if launchd["loaded"]:
@@ -414,9 +428,14 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         "Memory Daemon",
         f"Scheduler: {' · '.join(scheduler_bits)}",
         f"Next coordinator run: {_next_coordinator_run(launchd, legacy)}",
-        f"Last tick: {tick_text}",
-        "",
     ]
+    if maintenance is not None:
+        maintenance_bits = _scheduler_bits(maintenance)
+        lines.extend([
+            f"Maintenance scheduler: {' · '.join(maintenance_bits)}",
+            f"Next maintenance run: {_next_coordinator_run(maintenance)}",
+        ])
+    lines.extend([f"Last tick: {tick_text}", ""])
     headers = (
         "ROUTINE", "ROLE", "SOURCES", "ARMED", "STATUS", "EVERY",
         "LAST ATTEMPT", "NEXT", "LAST CAPTURE", "ISSUES",
@@ -432,12 +451,19 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     lines.extend(_table(headers, values))
     lines.extend([
         "",
-        "Logs: logs/run.log · logs/launchd.err.log",
+        "Logs: logs/run.log (rotated, owner-only)",
     ])
 
     scheduler_healthy = (
         launchd["loaded"]
         and launchd.get("last_exit") in (None, 0)
+        and (
+            maintenance is None
+            or (
+                maintenance.get("loaded")
+                and maintenance.get("last_exit") in (None, 0)
+            )
+        )
         and tick_issue is None
         and not (legacy and legacy["loaded"])
     )
@@ -447,10 +473,29 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         or latest["state"] not in {"error", "incomplete"}
         or (
             latest["state"] == "incomplete"
-            and launchd.get("state") == "running"
+            and scheduler_running
         )
     )
     return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
+
+
+def _scheduler_bits(job):
+    """Compact state for the independent maintenance LaunchAgent."""
+    if not job.get("loaded"):
+        return [f"not armed ({job.get('detail', 'not loaded')})", job.get("label", "?")]
+    state_name = job.get("state") or "loaded"
+    if state_name == "not running":
+        state_name = "idle"
+    bits = ["armed", "tick running" if state_name == "running" else state_name]
+    if job.get("pid") is not None:
+        bits.append(f"pid {job['pid']}")
+    if job.get("interval_seconds") is not None:
+        bits.append(f"checks every {_duration(job['interval_seconds'])}")
+    if job.get("runs") is not None:
+        bits.append(f"{job['runs']} launches")
+    if job.get("last_exit") is not None:
+        bits.append(f"last exit {job['last_exit']}")
+    return bits
 
 
 def _next_coordinator_run(launchd, legacy=None):

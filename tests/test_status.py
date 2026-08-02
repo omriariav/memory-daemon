@@ -194,6 +194,11 @@ class RoutineStatusTest(unittest.TestCase):
                 "processed_at": "1970-01-01T00:16:41Z",
                 "actions_pending": ["archive"],
             },
+            "three": {
+                "rule_id": "alpha",
+                "processed_at": "1970-01-01T00:16:42Z",
+                "expand_fallback": "meeting document unavailable",
+            },
         })
         rows = status.routine_rows(
             self.base,
@@ -205,7 +210,8 @@ class RoutineStatusTest(unittest.TestCase):
 
         self.assertEqual(by_id["alpha"]["status"], "attention")
         self.assertEqual(
-            by_id["alpha"]["issues"], "1 memory sink, 1 Gmail triage"
+            by_id["alpha"]["issues"],
+            "1 memory sink, 1 source expansion, 1 Gmail triage",
         )
         self.assertEqual(by_id["alpha"]["next"], "due")
         self.assertEqual(by_id["beta"]["status"], "waiting")
@@ -433,19 +439,23 @@ class RoutineStatusTest(unittest.TestCase):
 
 class RenderStatusTest(unittest.TestCase):
     @staticmethod
-    def probe(current, legacy=None):
+    def probe(current, legacy=None, maintenance=None):
         legacy = legacy or {
             "loaded": False,
             "label": "com.workspace-daemon",
             "detail": "not loaded",
         }
+        maintenance = maintenance or {
+            **current,
+            "label": status.MAINTENANCE_LAUNCHD_LABEL,
+        }
 
         def resolve(label):
-            return (
-                current
-                if label == status.DEFAULT_LAUNCHD_LABEL
-                else legacy
-            )
+            if label == status.DEFAULT_LAUNCHD_LABEL:
+                return current
+            if label == status.MAINTENANCE_LAUNCHD_LABEL:
+                return maintenance
+            return legacy
 
         return resolve
 
@@ -556,7 +566,12 @@ class RenderStatusTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(
-                status, "probe_launchd", side_effect=[current, legacy]
+                status, "probe_launchd",
+                side_effect=[
+                    current,
+                    {**current, "label": status.MAINTENANCE_LAUNCHD_LABEL},
+                    legacy,
+                ],
             ):
                 text, healthy = status.render(Path(tmp), [], now=1100)
 
@@ -673,7 +688,7 @@ class RenderStatusTest(unittest.TestCase):
                 with mock.patch.object(
                     status,
                     "probe_launchd",
-                    side_effect=[unavailable, unavailable],
+                    side_effect=[unavailable, unavailable, unavailable],
                 ):
                     text, _ = status.render(Path(tmp), [], now=1100)
 

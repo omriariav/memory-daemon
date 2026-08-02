@@ -1291,6 +1291,22 @@ class ScheduleStoreTest(unittest.TestCase):
         schedule.mark_attempted({"r"}, now=100)
         self.assertFalse(state.schedule_file(self.base).exists())
 
+    def test_independent_schedulers_merge_attempts_instead_of_clobbering(self):
+        capture = state.ScheduleStore(self.base)
+        maintenance = state.ScheduleStore(self.base)
+
+        capture.mark_attempted({"capture"}, now=100)
+        maintenance.mark_attempted({"maintenance"}, now=200)
+
+        entries = state.ScheduleStore(self.base).entries
+        self.assertEqual(entries["capture"]["last_attempted_epoch"], 100)
+        self.assertEqual(entries["maintenance"]["last_attempted_epoch"], 200)
+        self.assertEqual(
+            state.schedule_file(self.base).with_name("schedule.lock").stat().st_mode
+            & 0o777,
+            0o600,
+        )
+
     def test_clock_jump_backwards_does_not_freeze_routine(self):
         schedule = state.ScheduleStore(self.base)
         schedule.mark_attempted({"r"}, now=1000)

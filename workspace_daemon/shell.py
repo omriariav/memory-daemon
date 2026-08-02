@@ -1,9 +1,11 @@
 """Subprocess helpers, binary resolution, and logging shared by adapters."""
 import datetime
+import fcntl
 import json
 import os
 import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -65,6 +67,17 @@ LOG_ROTATE_BYTES = 20 * 1024 * 1024
 LOG_BACKUPS = 5
 
 
+@contextmanager
+def _log_guard(path):
+    """Serialize rotation and appends across the two LaunchAgents."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def _rotate_log(path):
     try:
         if not path.exists() or path.stat().st_size < LOG_ROTATE_BYTES:
@@ -91,15 +104,16 @@ def set_log_file(path):
     _log_file = Path(path)
     _log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(_log_file.parent, 0o700)
-    if _log_file.exists():
-        os.chmod(_log_file, 0o600)
-    for index in range(1, LOG_BACKUPS + 1):
-        backup = _log_file.with_name(f"{_log_file.name}.{index}")
-        if backup.exists():
-            os.chmod(backup, 0o600)
-    _rotate_log(_log_file)
-    if _log_file.exists():
-        os.chmod(_log_file, 0o600)
+    with _log_guard(_log_file):
+        if _log_file.exists():
+            os.chmod(_log_file, 0o600)
+        for index in range(1, LOG_BACKUPS + 1):
+            backup = _log_file.with_name(f"{_log_file.name}.{index}")
+            if backup.exists():
+                os.chmod(backup, 0o600)
+        _rotate_log(_log_file)
+        if _log_file.exists():
+            os.chmod(_log_file, 0o600)
 
 
 def utc_now_iso():
@@ -110,9 +124,12 @@ def log(msg):
     line = f"{utc_now_iso()} {msg}"
     print(line, flush=True)
     if _log_file:
-        fd = os.open(_log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as f:
-            f.write(line + "\n")
+        with _log_guard(_log_file):
+            fd = os.open(
+                _log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+            )
+            with os.fdopen(fd, "a") as f:
+                f.write(line + "\n")
 
 
 def run(cmd, timeout=120, check=True):

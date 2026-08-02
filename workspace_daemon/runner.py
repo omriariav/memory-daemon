@@ -151,7 +151,8 @@ def _needs_label_catalog(routines):
     )
 
 
-def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None):
+def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
+        lock_name="run"):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -167,7 +168,10 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
-        lock = stack.enter_context(state.RunLock(base_dir)) if not dry_run else None
+        lock = (
+            stack.enter_context(state.RunLock(base_dir, name=lock_name))
+            if not dry_run else None
+        )
         return _run_locked(
             base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
         )
@@ -1485,27 +1489,15 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         for space in source.get("spaces", [])
         if isinstance(space, str)
     }
-    operator_replay_gmail_source = {
-        routine["id"]: next(
-            (
-                index
-                for index, source in enumerate(config.sources(routine))
-                if (
-                    source.get("kind") == "gmail"
-                    and not source.get("handler")
-                )
-            ),
-            next(
-                (
-                    index
-                    for index, source in enumerate(config.sources(routine))
-                    if source.get("kind") == "gmail"
-                ),
-                None,
-            ),
-        )
+    gmail_sources = {
+        routine["id"]: [
+            (index, source)
+            for index, source in enumerate(config.sources(routine))
+            if source.get("kind") == "gmail"
+        ]
         for routine in routines
     }
+    gmail_listed_ids = {routine["id"]: set() for routine in routines}
 
     for routine, source_index, source in entries:
         rid = routine["id"]
@@ -1611,6 +1603,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
             listed_routing_ids.update(normal_ids)
+            if kind == "gmail":
+                gmail_listed_ids[rid].update(normal_ids)
 
             discovery = []
             discovery_limit = _ownership_limit(source, all_sources)
@@ -1661,74 +1655,104 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     "processable": processable,
                 })
 
-        if (
-            kind == "gmail"
-            and source_index == operator_replay_gmail_source[rid]
-        ):
-            # An explicit owner override may be added after a prior run
-            # archived/read the Gmail item out of its original query. Replay
-            # the exact thread directly, with actions disabled, so the memory
-            # decision can be repaired without repeating mailbox mutations.
-            confirmed = (
-                memory_sink.memory_cfg(routine)
-                .get("operator_confirmed_source_ids")
-                or []
-            )
-            replayed = 0
-            for source_id in confirmed:
-                if not source_id.startswith("gmail:"):
-                    continue
-                latest = _latest_memory_record(processed, source_id)
-                already_complete = bool(
-                    latest
-                    and latest.get("memory") not in (
-                        None,
-                        "skipped_not_worthy",
-                    )
-                    and "memory_error" not in latest
-                )
-                if already_complete:
-                    continue
-                thread_id = source_id.split(":", 1)[1]
-                if thread_id in listed_routing_ids:
-                    # The ordinary claim below can perform the ledger upgrade;
-                    # a second synthetic claim would needlessly force a full
-                    # thread prefetch during routing.
-                    continue
-                candidate = {
-                    "id": thread_id,
-                    "title": "operator-confirmed Gmail thread",
-                    "raw": {
-                        "thread_id": thread_id,
-                        "_operator_confirmed_replay": True,
-                        "_gmail_routed_thread": True,
-                    },
-                }
-                replay_source = dict(
-                    source,
-                    read_thread=True,
-                    actions=[],
-                )
-                key = (kind, thread_id)
-                claims.setdefault(key, []).append({
-                    "routine": routine,
-                    "source": replay_source,
-                    "source_index": source_index,
-                    "candidate": candidate,
-                    "fetch": fetch,
-                    "processable": True,
-                })
-                replayed += 1
-            if replayed:
-                log(
-                    f"routine={rid} source=gmail added {replayed} "
-                    "operator-confirmed replay candidate(s)"
-                )
-
         source_coverage[(rid, source_index)] = (
             "; ".join(dict.fromkeys(coverage_problems))
             if coverage_problems else None
         )
+
+    # Query results are not a recovery mechanism: older daemon versions could
+    # archive a Gmail thread even when its memory sink failed.  Re-open those
+    # exact threads from the ledger and retry the sink without repeating Gmail
+    # actions.  The same mechanism supports explicit operator overrides after
+    # an item has fallen out of its original query.
+    for routine in routines:
+        rid = routine["id"]
+        available = gmail_sources.get(rid) or []
+        if not available:
+            continue
+
+        def replay_source_for(handler_id):
+            if handler_id:
+                for index, candidate_source in available:
+                    if candidate_source.get("handler") == handler_id:
+                        return index, candidate_source
+            for index, candidate_source in available:
+                if not candidate_source.get("handler"):
+                    return index, candidate_source
+            return available[0]
+
+        requested = {}
+        for source_id in (
+            memory_sink.memory_cfg(routine)
+            .get("operator_confirmed_source_ids")
+            or []
+        ):
+            if not source_id.startswith("gmail:"):
+                continue
+            latest = _latest_memory_record(processed, source_id)
+            already_complete = bool(
+                latest
+                and latest.get("memory") not in (None, "skipped_not_worthy")
+                and "memory_error" not in latest
+            )
+            if already_complete:
+                continue
+            requested[source_id] = {
+                "operator_confirmed": True,
+                "handler_id": (latest or {}).get("handler_id"),
+            }
+
+        latest_by_source = {}
+        for item_id, entry in processed.items() if processed is not None else []:
+            if (
+                entry.get("rule_id") != rid
+                or entry.get("source_kind") != "gmail"
+            ):
+                continue
+            source_id = entry.get("memory_source_id") or entry.get("source_id")
+            if not isinstance(source_id, str) or not source_id.startswith("gmail:"):
+                continue
+            marker = (entry.get("processed_at") or "", item_id)
+            if marker > latest_by_source.get(source_id, (("", ""), None))[0]:
+                latest_by_source[source_id] = (marker, entry)
+        for source_id, (_, entry) in latest_by_source.items():
+            if "memory_error" not in entry:
+                continue
+            replay = requested.setdefault(source_id, {})
+            replay["memory_error"] = True
+            replay.setdefault("handler_id", entry.get("handler_id"))
+
+        replayed = 0
+        for source_id, replay in requested.items():
+            thread_id = source_id.split(":", 1)[1]
+            if not thread_id or thread_id in gmail_listed_ids[rid]:
+                continue
+            source_index, source = replay_source_for(replay.get("handler_id"))
+            raw = {
+                "thread_id": thread_id,
+                "_gmail_routed_thread": True,
+            }
+            title = "failed Gmail memory capture"
+            if replay.get("operator_confirmed"):
+                raw["_operator_confirmed_replay"] = True
+                title = "operator-confirmed Gmail thread"
+            if replay.get("memory_error"):
+                raw["_memory_error_replay"] = True
+            candidate = {"id": thread_id, "title": title, "raw": raw}
+            claims.setdefault(("gmail", thread_id), []).append({
+                "routine": routine,
+                "source": dict(source, read_thread=True, actions=[]),
+                "source_index": source_index,
+                "candidate": candidate,
+                "fetch": SOURCES["gmail"][1],
+                "processable": True,
+            })
+            replayed += 1
+        if replayed:
+            log(
+                f"routine={rid} source=gmail added {replayed} durable replay "
+                "candidate(s)"
+            )
     return claims, failures
 
 
@@ -1818,6 +1842,10 @@ def _route_claims(claims, totals, failures=()):
             )
             continue
         claim = winners[0]
+        claimant_source_keys = {
+            (candidate["routine"]["id"], candidate["source_index"])
+            for candidate in candidates
+        }
         blockers = {
             failure["routine_id"]
             for failure in failures
@@ -1856,6 +1884,10 @@ def _route_claims(claims, totals, failures=()):
             raw["_gmail_routed_thread"] = True
             candidate["raw"] = raw
             claim["candidate"] = candidate
+        # Cursor safety follows the item, not only its selected owner. Every
+        # source that listed this ownership key stays behind it until the
+        # winning prompt and sinks complete successfully.
+        claim["_claimant_source_keys"] = claimant_source_keys
         owned.setdefault(claim["routine"]["id"], []).append(claim)
     return owned
 
@@ -1866,6 +1898,14 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     shared_circuit = {} if shared_circuit is None else shared_circuit
     failed_source_keys = set()
     circuit_reported = False
+
+    def hold_claim(claim):
+        keys = claim.get("_claimant_source_keys")
+        if keys:
+            failed_source_keys.update(keys)
+        else:
+            failed_source_keys.add((rid, claim["source_index"]))
+
     log(f"routine={rid} {len(claims)} owned item(s)")
     new = 0
     for claim in claims:
@@ -1888,7 +1928,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 )
             except Exception as exc:
                 totals["errors"] += 1
-                failed_source_keys.add((rid, claim["source_index"]))
+                hold_claim(claim)
                 log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
                 continue
             candidate = dict(
@@ -1943,7 +1983,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             totals["skipped"] += 1
             continue
         if shared_circuit and not dry_run:
-            failed_source_keys.add((rid, claim["source_index"]))
+            hold_claim(claim)
             totals["skipped"] += 1
             if not circuit_reported:
                 log(
@@ -1990,7 +2030,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 prefetched_item,
             )
             if totals["errors"] > errors_before:
-                failed_source_keys.add((rid, claim["source_index"]))
+                hold_claim(claim)
             if (
                 isinstance(outcome_record, dict)
                 and outcome_record.get("memory_error")
@@ -2002,7 +2042,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             raise
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
-            failed_source_keys.add((rid, claim["source_index"]))
+            hold_claim(claim)
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):
                 shared_circuit["error"] = str(exc)[:300]

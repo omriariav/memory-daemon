@@ -1,19 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  LaunchAgent template. Render it, fill in the API key, then load it:
-
-    sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
-      launchd/com.memory-daemon.plist.template \
-      > ~/Library/LaunchAgents/com.memory-daemon.plist
-
-  Then edit ~/Library/LaunchAgents/com.memory-daemon.plist and replace
-  REPLACE_ME with your provider API key. Never commit a real key.
--->
+<!-- Separate maintenance coordinator: long metadata scans must not occupy the
+     latency-sensitive capture LaunchAgent. Render beside the primary plist. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.memory-daemon</string>
+    <string>com.memory-daemon-maintenance</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -21,7 +13,7 @@
         <string>__REPO_DIR__/daemon.py</string>
         <string>tick</string>
         <string>--group</string>
-        <string>capture</string>
+        <string>maintenance</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -39,15 +31,10 @@
     <key>StandardErrorPath</key>
     <string>/dev/null</string>
 
-    <!-- launchd does not inherit a login shell's PATH, so Node (used by the
-         memory sink), gws, yoetz and the optional ada mentions helper must be
-         reachable here. Slack itself is built into memory-daemon. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>__HOME__/.local/node-current/bin:/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
-        <key>GEMINI_API_KEY</key>
-        <string>REPLACE_ME</string>
     </dict>
 </dict>
 </plist>

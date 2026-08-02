@@ -310,15 +310,25 @@ class ScheduleStore:
         from .shell import utc_now_iso
 
         now = time.time() if now is None else float(now)
-        merged = dict(self.entries)
-        stamp = utc_now_iso()
-        for rid in routine_ids:
-            merged[rid] = {
-                "last_attempted_at": stamp,
-                "last_attempted_epoch": now,
-            }
-        write_atomic(self.path, _serialize(merged), mode=0o600)
-        self.entries = merged
+        # Capture and long-running census ticks use separate process locks.
+        # Serialize their short schedule updates and reload inside the lock so
+        # neither process can overwrite the other's newer routine timestamps.
+        lock_path = self.path.with_name("schedule.lock")
+        ensure_private_dir(lock_path.parent)
+        with os.fdopen(
+            os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+"
+        ) as handle:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            merged = dict(self._load())
+            stamp = utc_now_iso()
+            for rid in routine_ids:
+                merged[rid] = {
+                    "last_attempted_at": stamp,
+                    "last_attempted_epoch": now,
+                }
+            write_atomic(self.path, _serialize(merged), mode=0o600)
+            self.entries = merged
 
 
 class CursorStore:
@@ -408,8 +418,10 @@ class RunLock:
     whole-snapshot ledger writes clobber each other.
     """
 
-    def __init__(self, base_dir):
-        self.path = Path(base_dir) / "state" / "run.lock"
+    def __init__(self, base_dir, name="run"):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(name)):
+            raise ValueError(f"invalid run-lock name {name!r}")
+        self.path = Path(base_dir) / "state" / f"{name}.lock"
         self._fh = None
 
     def __enter__(self):

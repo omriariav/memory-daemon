@@ -26,6 +26,9 @@ import datetime
 import json
 import re
 import subprocess
+from pathlib import Path
+
+import yaml
 
 from . import contacts, drive
 from .shell import log, npx_bin
@@ -189,6 +192,79 @@ def _cli(store, args, stdin_text=None, timeout=120):
         cwd=store, capture_output=True, text=True, timeout=timeout,
         input=stdin_text,
     )
+
+
+def _verify_written_entry(store, source_id, etype, title, people, tags, body):
+    """Return the exact persisted entry id after an ambiguous CLI result.
+
+    personal-memory can exit non-zero after its durable write (for example if
+    a later indexing or rule step fails). Trusting only the exit status causes
+    an endless retry, while trusting any file carrying the source id could hide
+    a failed update. Verify the complete payload in every materialization of
+    the one matching id before treating the write as successful.
+    """
+    if not source_id:
+        return None
+    root = Path(store)
+    entry_roots = [root / "memory" / "entries"]
+    graphs = root / "memory-graphs"
+    if graphs.is_dir():
+        entry_roots.extend(
+            path / "entries"
+            for path in graphs.iterdir()
+            if path.is_dir()
+        )
+
+    expected_people = set(people)
+    expected_tags = set(tags)
+    matches = {}
+    try:
+        paths = [
+            path
+            for entry_root in entry_roots
+            if entry_root.is_dir()
+            for path in entry_root.rglob("*.md")
+            if path.is_file()
+        ]
+        for path in paths:
+            raw = path.read_text(encoding="utf-8")
+            if not raw.startswith("---"):
+                continue
+            parts = raw.split("---", 2)
+            if len(parts) != 3:
+                continue
+            frontmatter = yaml.safe_load(parts[1]) or {}
+            if not isinstance(frontmatter, dict):
+                continue
+            source_ids = frontmatter.get("source_ids") or []
+            if not isinstance(source_ids, list) or any(
+                not isinstance(value, str) for value in source_ids
+            ):
+                continue
+            if source_id not in source_ids:
+                continue
+            stored_people = frontmatter.get("people") or []
+            stored_tags = frontmatter.get("tags") or []
+            if not isinstance(stored_people, list) or not isinstance(
+                stored_tags, list
+            ):
+                continue
+            entry_id = frontmatter.get("id")
+            valid = bool(
+                isinstance(entry_id, str)
+                and frontmatter.get("type") == etype
+                and frontmatter.get("title") == title
+                and expected_people.issubset(set(stored_people))
+                and expected_tags.issubset(set(stored_tags))
+                and parts[2].strip() == body.strip()
+            )
+            matches.setdefault(entry_id, []).append(valid)
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        return None
+    if len(matches) != 1:
+        return None
+    entry_id, materializations = next(iter(matches.items()))
+    return entry_id if entry_id and all(materializations) else None
 
 
 _slug_cache = {}
@@ -692,19 +768,30 @@ def capture(routine, item, summary, dry_run=False):
 
     r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        # Some store failures happen after the entry file was written. Preserve
-        # any such write before surfacing the error for an idempotent retry.
-        _commit_store(store, f"memory: {rid} auto-capture")
-        raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
+    # Some store failures happen after the entry file was written. Preserve
+    # any such write before deciding whether the result is an error.
     _commit_store(store, f"memory: {rid} auto-capture")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
-    if not m:
-        raise RuntimeError(
-            "memory add returned no entry id or recognized verdict: "
-            f"{out.strip()[:300]}"
+    if r.returncode == 0 and m:
+        verdict, entry_id = m.group(1), m.group(2)
+    else:
+        entry_id = _verify_written_entry(
+            store, source_id, etype, title, people,
+            list(dict.fromkeys(tags)), body,
         )
-    verdict, entry_id = m.group(1), m.group(2)
+        if entry_id:
+            verdict = "verified"
+            log(
+                f"routine={rid} memory WARN ambiguous CLI result was "
+                f"verified on disk for source_id={source_id}"
+            )
+        elif r.returncode != 0:
+            raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
+        else:
+            raise RuntimeError(
+                "memory add returned no entry id or recognized verdict: "
+                f"{out.strip()[:300]}"
+            )
     log(
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"

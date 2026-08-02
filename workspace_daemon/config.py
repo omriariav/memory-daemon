@@ -31,6 +31,10 @@ _WEEKDAYS = {
     "fri": 4, "sat": 5, "sun": 6,
 }
 _ROUTINE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_GMAIL_TEMPORAL_OPERATOR = re.compile(
+    r"(?<![A-Za-z0-9_])(?:newer_than|older_than|after|before)\s*:",
+    flags=re.I,
+)
 HANDLER_OVERRIDE_KEYS = {"analyze", "output", "memory", "label", "streams"}
 TOP_LEVEL_KEYS = {
     "id", "enabled", "description", "role", "schedule", "source", "sources",
@@ -1111,11 +1115,7 @@ def _validate_source(routine, source, prefix):
             problems.append(f"{prefix}.catch_up requires max_results: 0")
         if catch_up_after is None:
             problems.append(f"{prefix}.catch_up requires catch_up_after")
-        if re.search(
-            r"(?:^|\s)(?:newer_than|older_than|after|before):",
-            str(source.get("query", "")),
-            flags=re.I,
-        ):
+        if _GMAIL_TEMPORAL_OPERATOR.search(str(source.get("query", ""))):
             problems.append(
                 f"{prefix}.catch_up query must not contain a fixed temporal "
                 "operator; the daemon appends its durable after: cursor"
@@ -1125,11 +1125,7 @@ def _validate_source(routine, source, prefix):
             not isinstance(queue_query, str) or not queue_query.strip()
         ):
             problems.append(f"{prefix}.queue_query must be a non-empty string")
-        if queue_query and re.search(
-            r"(?:^|\s)(?:newer_than|older_than|after|before):",
-            queue_query,
-            flags=re.I,
-        ):
+        if queue_query and _GMAIL_TEMPORAL_OPERATOR.search(queue_query):
             problems.append(
                 f"{prefix}.queue_query must be timeless so unread/starred "
                 "items survive sleep and outages"
@@ -1139,11 +1135,7 @@ def _validate_source(routine, source, prefix):
             not isinstance(exclude_query, str) or not exclude_query.strip()
         ):
             problems.append(f"{prefix}.exclude_query must be a non-empty string")
-        if exclude_query and re.search(
-            r"(?:^|\s)(?:newer_than|older_than|after|before):",
-            exclude_query,
-            flags=re.I,
-        ):
+        if exclude_query and _GMAIL_TEMPORAL_OPERATOR.search(exclude_query):
             problems.append(f"{prefix}.exclude_query must be timeless")
     elif source.get("queue_query") is not None:
         problems.append(f"{prefix}.queue_query requires catch_up: true")

@@ -854,13 +854,16 @@ tags: [kind/email-scoop-summary, status/inbox]
 ---
 ```
 
-## Scheduling (macOS LaunchAgent)
+## Scheduling (macOS LaunchAgents)
 
-The LaunchAgent is a lightweight coordinator. It wakes every 15 minutes and
-calls `daemon.py tick`; routines that are not due make no source or LLM calls.
-The template deliberately uses `RunAtLoad: false`, so installation itself
-never triggers the first real run. Render the template and add your key, but
-leave activation to the explicit `run.sh` step below:
+Two lightweight coordinators wake every 15 minutes. The capture job runs Gmail,
+Google Chat, Slack, and local capture routines; the maintenance job runs
+metadata work such as the long Slack conversation census. Separating them means
+a census cannot delay a due 15-minute capture. Routines that are not due make
+no source or LLM calls. Both templates deliberately use `RunAtLoad: false`, so
+installation itself never triggers a real run. Render both templates, add the
+provider key only to the capture plist, and leave activation to the explicit
+`run.sh` step below:
 
 ```sh
 # The template uses this stable link so Node upgrades do not break launchd.
@@ -871,9 +874,15 @@ ln -sfn "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon.plist.template \
   > ~/Library/LaunchAgents/com.memory-daemon.plist
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+  launchd/com.memory-daemon-maintenance.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
 
-# replace REPLACE_ME with your provider API key
+# Replace REPLACE_ME with your provider API key, then keep both rendered
+# definitions private. The maintenance job does not receive the provider key.
 $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
+chmod 600 ~/Library/LaunchAgents/com.memory-daemon.plist \
+  ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
 
 # One-time cleanup when upgrading from the former workspace-daemon label.
 launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
@@ -889,25 +898,25 @@ want to turn the daemon on and choose its first tick, run:
 ./run.sh
 ```
 
-The helper validates every routine, loads the configured LaunchAgent when
-necessary, and clears any launchd disable override before starting one
-coordinator tick immediately. That tick runs every **enabled**
-routine that is due; the helper never changes a routine's `enabled` setting.
-It is safe to call again when the scheduler is already loaded.
+The helper validates every routine, reloads both LaunchAgents from their current
+plists, clears launchd disable overrides, and starts one capture and one
+maintenance coordinator tick immediately. Each tick runs every **enabled**
+routine in its group that is due; the helper never changes a routine's
+`enabled` setting. It is safe to call again when the schedulers are loaded.
 
 Check on it:
 
 ```sh
 ./memory-daemon-status.sh
 tail -f logs/run.log
-tail -f logs/launchd.err.log
 ```
 
 Operational logs rotate at 20 MiB with five backups. Runtime state, logs, and
 non-example routine files are written owner-only (`0600`) under owner-only
 directories (`0700`).
 
-`memory-daemon-status.sh` is read-only. It shows each routine's declared role
+`memory-daemon-status.sh` is read-only. It reports both coordinators and shows
+each routine's declared role
 (`general`, `domain`, `specialized`, `partial`, or `maintenance`) and source
 connectors,
 distinguishes a last scheduled attempt from a last captured item, shows when
@@ -932,7 +941,12 @@ the LaunchAgent or a routine needs attention, so it can also be used by a
 separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
 installed job uses a different label.
 
-Unload with `launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist`.
+Rollback both jobs with:
+
+```sh
+launchctl bootout gui/$(id -u)/com.memory-daemon
+launchctl bootout gui/$(id -u)/com.memory-daemon-maintenance
+```
 
 The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
 gitignored — only the template is tracked.
@@ -958,7 +972,7 @@ workspace_daemon/
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
-launchd/                   LaunchAgent template
+launchd/                   capture + maintenance LaunchAgent templates
 state/  logs/              runtime, gitignored
 ```
 

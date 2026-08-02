@@ -29,6 +29,8 @@ class RunScriptTest(unittest.TestCase):
         status.chmod(0o755)
         self.plist = self.root / "com.memory-daemon.plist"
         self.plist.write_text("plist", encoding="utf-8")
+        self.maintenance_plist = self.root / "com.memory-daemon-maintenance.plist"
+        self.maintenance_plist.write_text("plist", encoding="utf-8")
         self.log = self.root / "launchctl.log"
         self.launchctl = self.root / "launchctl"
 
@@ -58,6 +60,7 @@ class RunScriptTest(unittest.TestCase):
             "MEMORY_DAEMON_DIR": str(self.repo),
             "MEMORY_DAEMON_LAUNCHD_DOMAIN": "gui/123",
             "MEMORY_DAEMON_PLIST": str(self.plist),
+            "MEMORY_DAEMON_MAINTENANCE_PLIST": str(self.maintenance_plist),
             "MEMORY_DAEMON_LAUNCHCTL": str(self.launchctl),
             "LAUNCHCTL_TEST_LOG": str(self.log),
             **extra_env,
@@ -87,11 +90,15 @@ class RunScriptTest(unittest.TestCase):
                 "print gui/123/com.memory-daemon",
                 "enable gui/123/com.memory-daemon",
                 f"bootstrap gui/123 {self.plist}",
+                "print gui/123/com.memory-daemon-maintenance",
+                "enable gui/123/com.memory-daemon-maintenance",
+                f"bootstrap gui/123 {self.maintenance_plist}",
                 "kickstart gui/123/com.memory-daemon",
+                "kickstart gui/123/com.memory-daemon-maintenance",
             ],
         )
 
-    def test_loaded_scheduler_is_not_bootstrapped_again(self):
+    def test_loaded_scheduler_is_reloaded_from_current_plist(self):
         self.write_launchctl(loaded=True)
 
         result = self.run_helper()
@@ -101,8 +108,15 @@ class RunScriptTest(unittest.TestCase):
             self.launchctl_calls(),
             [
                 "print gui/123/com.memory-daemon",
+                "bootout gui/123/com.memory-daemon",
                 "enable gui/123/com.memory-daemon",
+                f"bootstrap gui/123 {self.plist}",
+                "print gui/123/com.memory-daemon-maintenance",
+                "bootout gui/123/com.memory-daemon-maintenance",
+                "enable gui/123/com.memory-daemon-maintenance",
+                f"bootstrap gui/123 {self.maintenance_plist}",
                 "kickstart gui/123/com.memory-daemon",
+                "kickstart gui/123/com.memory-daemon-maintenance",
             ],
         )
 
@@ -114,10 +128,7 @@ class RunScriptTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("LaunchAgent plist not found", result.stderr)
-        self.assertEqual(
-            self.launchctl_calls(),
-            ["print gui/123/com.memory-daemon"],
-        )
+        self.assertFalse(self.log.exists())
 
     def test_validation_failure_does_not_call_launchctl(self):
         self.write_launchctl(loaded=False)
@@ -138,6 +149,7 @@ class RunScriptTest(unittest.TestCase):
             self.launchctl_calls(),
             [
                 "print gui/123/com.memory-daemon",
+                "bootout gui/123/com.memory-daemon",
                 "enable gui/123/com.memory-daemon",
             ],
         )
@@ -169,7 +181,13 @@ class RunScriptTest(unittest.TestCase):
             self.launchctl_calls(),
             [
                 "print gui/123/com.memory-daemon",
+                "bootout gui/123/com.memory-daemon",
                 "enable gui/123/com.memory-daemon",
+                f"bootstrap gui/123 {self.plist}",
+                "print gui/123/com.memory-daemon-maintenance",
+                "bootout gui/123/com.memory-daemon-maintenance",
+                "enable gui/123/com.memory-daemon-maintenance",
+                f"bootstrap gui/123 {self.maintenance_plist}",
                 "kickstart gui/123/com.memory-daemon",
             ],
         )

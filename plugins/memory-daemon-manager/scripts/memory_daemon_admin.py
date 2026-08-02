@@ -52,7 +52,10 @@ class ChangePlan:
     def after_mode(self):
         if self.after is None:
             return None
-        return self.before_mode if self.before is not None else self.create_mode
+        # Routine definitions and connector prompts can contain private source
+        # identifiers, queries, and paths.  Editing a legacy world-readable
+        # file is also an opportunity to repair its permissions.
+        return self.create_mode
 
     @property
     def token(self):
@@ -368,7 +371,7 @@ def _routine_plan(args):
         before=before,
         after=after,
         before_mode=before_mode,
-        create_mode=0o644,
+        create_mode=0o600,
     )
 
 

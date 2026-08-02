@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import sys
+import traceback
 import uuid
 from pathlib import Path
 from time import time as current_epoch
@@ -133,7 +134,7 @@ def cmd_run(args):
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
-            print(f"invalid routine: {p}", file=sys.stderr)
+            log(f"invalid routine: {p}")
         return 1
 
     mode = (
@@ -185,13 +186,25 @@ def cmd_tick(args):
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
-            print(f"invalid routine: {p}", file=sys.stderr)
+            log(f"invalid routine: {p}")
         return 1
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
-    due = [
+    group = getattr(args, "group", "all")
+    selected = [
         r for r in routines
-        if r.get("enabled", True) and schedule.due(r)
+        if (
+            r.get("enabled", True)
+            and (
+                group == "all"
+                or (group == "capture" and not config.is_maintenance(r))
+                or (group == "maintenance" and config.is_maintenance(r))
+            )
+        )
+    ]
+    due = [
+        r for r in selected
+        if schedule.due(r)
     ]
     if not due:
         mode = " (dry-run)" if args.dry_run else ""
@@ -209,10 +222,30 @@ def cmd_tick(args):
     # can take tens of minutes). Persist each group's attempt immediately, so
     # the next tick cannot repeat capture merely because maintenance was slow.
     groups = [
-        {r["id"] for r in due if not config.is_maintenance(r)},
-        {r["id"] for r in due if config.is_maintenance(r)},
+        (
+            {r["id"] for r in due if not config.is_maintenance(r)},
+            "run",
+        ),
+        (
+            {
+                r["id"] for r in due
+                if config.is_maintenance(r)
+                and (r.get("maintenance") or {}).get("kind")
+                != "slack_conversation_census"
+            },
+            "run",
+        ),
+        (
+            {
+                r["id"] for r in due
+                if config.is_maintenance(r)
+                and (r.get("maintenance") or {}).get("kind")
+                == "slack_conversation_census"
+            },
+            "slack-census",
+        ),
     ]
-    for group_ids in groups:
+    for group_ids, lock_name in groups:
         if not group_ids:
             continue
         # Cadence is measured from the attempt's start. A 40-minute census on
@@ -222,10 +255,11 @@ def cmd_tick(args):
             group_totals = runner.run(
                 BASE_DIR, routines, dry_run=args.dry_run,
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
+                lock_name=lock_name,
             )
         except state.AlreadyRunning as exc:
             log(f"tick[{tick_id}] skipped — {exc}{mode}")
-            return 0
+            continue
         schedule.mark_attempted(group_ids, now=group_started_epoch)
         for key, value in group_totals.items():
             if isinstance(value, (int, float)):
@@ -363,6 +397,10 @@ def main(argv=None):
         "tick", help="run only enabled routines whose schedule is due"
     )
     p_tick.add_argument(
+        "--group", choices=("all", "capture", "maintenance"), default="all",
+        help="run all due routines, capture only, or maintenance only",
+    )
+    p_tick.add_argument(
         "-n", "--dry-run", action="store_true",
         help="preview due routines without LLM/source mutation or data/state "
              "writes; operational log only",
@@ -383,14 +421,19 @@ def main(argv=None):
     try:
         return args.func(args)
     except (config.RoutineError, MissingBinary, state.StateError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        log(f"error: {exc}")
         return 1
     except KeyboardInterrupt:
-        print("\naborted", file=sys.stderr)
+        log("aborted")
         return 130
     except SystemExit as exc:
         log(f"terminated by signal (exit {exc.code})")
         raise
+    except Exception as exc:
+        # launchd stdout/stderr intentionally go to /dev/null; unexpected
+        # failures must still leave a private, actionable traceback.
+        log(f"unhandled ERROR: {exc}\n{traceback.format_exc().rstrip()}")
+        return 1
 
 
 if __name__ == "__main__":
