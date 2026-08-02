@@ -359,6 +359,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     lines = [
         "Memory Daemon",
         f"Scheduler: {' · '.join(scheduler_bits)}",
+        f"Next coordinator run: {_next_coordinator_run(launchd, legacy)}",
         f"Last tick: {tick_text}",
         "",
     ]
@@ -396,6 +397,44 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         )
     )
     return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
+
+
+def _next_coordinator_run(launchd, legacy=None):
+    """Describe launchd's next opportunity without inventing an exact time."""
+    if launchd.get("loaded") and legacy and legacy.get("loaded"):
+        return "multiple schedulers loaded; schedule ambiguous"
+    if launchd.get("loaded"):
+        return _loaded_coordinator_run(launchd)
+    if legacy and legacy.get("loaded"):
+        return f"legacy scheduler: {_loaded_coordinator_run(legacy)}"
+
+    details = [launchd.get("detail")]
+    if legacy is not None:
+        details.append(legacy.get("detail"))
+    if any(detail != "not loaded" for detail in details):
+        return "schedule unavailable"
+    return "not scheduled"
+
+
+def _loaded_coordinator_run(launchd):
+    """Describe the next opportunity for one known-loaded launchd job."""
+
+    interval = launchd.get("interval_seconds")
+    interval_text = (
+        _exact_duration(interval)
+        if isinstance(interval, int) and interval > 0
+        else None
+    )
+    if launchd.get("state") == "running":
+        if interval_text:
+            return (
+                "after current tick "
+                f"(then within {interval_text})"
+            )
+        return "current tick running; future schedule unavailable"
+    if interval_text:
+        return f"within {interval_text}"
+    return "schedule unavailable"
 
 
 def _table(headers, rows):
@@ -485,3 +524,16 @@ def _duration(seconds):
     days, remainder = divmod(seconds, 86400)
     hours = remainder // 3600
     return f"{days}d{hours}h" if hours else f"{days}d"
+
+
+def _exact_duration(seconds):
+    """Format an interval without rounding down an asserted upper bound."""
+    remaining = max(0, int(seconds))
+    parts = []
+    for suffix, unit in (("d", 86400), ("h", 3600), ("m", 60)):
+        value, remaining = divmod(remaining, unit)
+        if value:
+            parts.append(f"{value}{suffix}")
+    if remaining or not parts:
+        parts.append(f"{remaining}s")
+    return "".join(parts)

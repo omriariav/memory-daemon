@@ -441,6 +441,7 @@ class RenderStatusTest(unittest.TestCase):
         self.assertTrue(healthy)
         self.assertIn("Memory Daemon", text)
         self.assertIn("Scheduler: loaded (idle)", text)
+        self.assertIn("Next coordinator run: within 15m", text)
         self.assertIn("ROUTINE", text)
         self.assertIn("ROLE", text)
         self.assertIn("SOURCES", text)
@@ -517,6 +518,122 @@ class RenderStatusTest(unittest.TestCase):
 
         self.assertFalse(healthy)
         self.assertIn("legacy com.workspace-daemon is still loaded", text)
+        self.assertIn(
+            "Next coordinator run: legacy scheduler: within 15m",
+            text,
+        )
+
+    def test_running_scheduler_reports_next_eligible_interval(self):
+        launchd = {
+            "loaded": True,
+            "label": "com.memory-daemon",
+            "state": "running",
+            "pid": 4321,
+            "runs": 1,
+            "last_exit": None,
+            "interval_seconds": 900,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
+                text, _ = status.render(Path(tmp), [], now=1100)
+
+        self.assertIn(
+            "Next coordinator run: after current tick "
+            "(then within 15m)",
+            text,
+        )
+
+    def test_arbitrary_interval_bound_is_never_rounded_down(self):
+        for state_name, expected in (
+            ("not running", "Next coordinator run: within 1m1s"),
+            (
+                "running",
+                "Next coordinator run: after current tick (then within 1m1s)",
+            ),
+        ):
+            with self.subTest(state=state_name), tempfile.TemporaryDirectory() as tmp:
+                launchd = {
+                    "loaded": True,
+                    "label": "com.memory-daemon",
+                    "state": state_name,
+                    "pid": 4321 if state_name == "running" else None,
+                    "runs": 1,
+                    "last_exit": None,
+                    "interval_seconds": 61,
+                }
+                with mock.patch.object(
+                    status,
+                    "probe_launchd",
+                    side_effect=self.probe(launchd),
+                ):
+                    text, _ = status.render(Path(tmp), [], now=1100)
+
+            self.assertIn(expected, text)
+
+    def test_loaded_scheduler_without_interval_reports_unknown_schedule(self):
+        launchd = {
+            "loaded": True,
+            "label": "com.memory-daemon",
+            "state": "not running",
+            "pid": None,
+            "runs": 0,
+            "last_exit": None,
+            "interval_seconds": None,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
+                text, _ = status.render(Path(tmp), [], now=1100)
+
+        self.assertIn("Next coordinator run: schedule unavailable", text)
+
+    def test_running_scheduler_without_interval_limits_claim_to_current_tick(self):
+        launchd = {
+            "loaded": True,
+            "label": "com.memory-daemon",
+            "state": "running",
+            "pid": 4321,
+            "runs": 1,
+            "last_exit": None,
+            "interval_seconds": None,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd),
+            ):
+                text, _ = status.render(Path(tmp), [], now=1100)
+
+        self.assertIn(
+            "Next coordinator run: current tick running; "
+            "future schedule unavailable",
+            text,
+        )
+
+    def test_launchctl_probe_failure_does_not_claim_job_is_unscheduled(self):
+        for detail in ("launchctl unavailable", "launchctl timed out"):
+            with self.subTest(detail=detail), tempfile.TemporaryDirectory() as tmp:
+                unavailable = {
+                    "loaded": False,
+                    "label": "com.memory-daemon",
+                    "detail": detail,
+                }
+                with mock.patch.object(
+                    status,
+                    "probe_launchd",
+                    side_effect=[unavailable, unavailable],
+                ):
+                    text, _ = status.render(Path(tmp), [], now=1100)
+
+            self.assertIn("Next coordinator run: schedule unavailable", text)
 
     def test_both_loaded_jobs_are_unhealthy(self):
         current = {
@@ -545,6 +662,11 @@ class RenderStatusTest(unittest.TestCase):
 
         self.assertFalse(healthy)
         self.assertIn("legacy com.workspace-daemon is also loaded", text)
+        self.assertIn(
+            "Next coordinator run: multiple schedulers loaded; "
+            "schedule ambiguous",
+            text,
+        )
 
 
 class StatusWrapperTest(unittest.TestCase):
