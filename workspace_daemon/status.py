@@ -276,7 +276,7 @@ def routine_rows(
         elif schedule.due(routine, now=now):
             status_name = "due"
         else:
-            status_name = "ok"
+            status_name = "waiting"
 
         if enabled and last_epoch is not None:
             remaining = (
@@ -293,6 +293,7 @@ def routine_rows(
             "routine": routine_id,
             "role": _routine_role(routine),
             "sources": _routine_sources(routine),
+            "armed": "yes" if enabled else "no",
             "status": status_name,
             "every": every,
             "last_attempt": _age(last_epoch, now),
@@ -325,7 +326,12 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             # StartInterval jobs exit between checks; that is healthy idle
             # behavior, not a stopped persistent service.
             state_name = "idle"
-        scheduler_bits = [f"loaded ({state_name})"]
+        # Arming (loaded in launchd) and active execution are separate facts.
+        # StartInterval jobs are normally idle between their short-lived ticks.
+        scheduler_bits = ["armed"]
+        scheduler_bits.append(
+            "tick running" if state_name == "running" else state_name
+        )
         if launchd.get("pid") is not None:
             scheduler_bits.append(f"pid {launchd['pid']}")
         if launchd.get("interval_seconds") is not None:
@@ -341,7 +347,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
                 f"legacy {LEGACY_LAUNCHD_LABEL} is also loaded; migrate it"
             )
     else:
-        scheduler_bits = [launchd["detail"], label]
+        scheduler_bits = [f"not armed ({launchd['detail']})", label]
         if legacy and legacy["loaded"]:
             scheduler_bits.append(
                 f"legacy {LEGACY_LAUNCHD_LABEL} is still loaded; migrate it"
@@ -364,14 +370,14 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         "",
     ]
     headers = (
-        "ROUTINE", "ROLE", "SOURCES", "STATUS", "EVERY", "LAST ATTEMPT",
-        "NEXT", "LAST CAPTURE", "ISSUES",
+        "ROUTINE", "ROLE", "SOURCES", "ARMED", "STATUS", "EVERY",
+        "LAST ATTEMPT", "NEXT", "LAST CAPTURE", "ISSUES",
     )
     values = [
         (
-            row["routine"], row["role"], row["sources"], row["status"],
-            row["every"], row["last_attempt"], row["next"],
-            row["last_capture"], row["issues"],
+            row["routine"], row["role"], row["sources"], row["armed"],
+            row["status"], row["every"], row["last_attempt"],
+            row["next"], row["last_capture"], row["issues"],
         )
         for row in rows
     ]
