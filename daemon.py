@@ -148,6 +148,17 @@ def _execution_groups(routines, active_ids):
     ]
 
 
+def _manual_execution_groups(routines, active_ids):
+    """Refresh census first, then preserve the runner's maintenance ordering."""
+    capture, maintenance, census = _execution_groups(routines, active_ids)
+    capture_ids, _ = capture
+    maintenance_ids, _ = maintenance
+    return [
+        census,
+        (capture_ids | maintenance_ids, "run"),
+    ]
+
+
 def _empty_totals():
     return {
         "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
@@ -199,7 +210,9 @@ def cmd_run(args):
     )
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
-    for group_ids, lock_name in _execution_groups(routines, active_ids):
+    for group_ids, lock_name in _manual_execution_groups(
+        routines, active_ids
+    ):
         if not group_ids:
             continue
         try:
@@ -296,7 +309,11 @@ def cmd_tick(args):
                 lock_name=lock_name,
             )
         except state.AlreadyRunning as exc:
-            log(f"{tick_name} skipped — {exc}{mode}")
+            skipped_ids = ", ".join(sorted(group_ids))
+            log(
+                f"{tick_name} skipped routines={skipped_ids} — "
+                f"{exc}{mode}"
+            )
             continue
         schedule.mark_attempted(group_ids, now=group_started_epoch)
         _merge_totals(totals, group_totals)

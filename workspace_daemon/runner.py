@@ -245,9 +245,10 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
             routing_failures.extend(_routine_failures(routine))
 
-    # Maintenance shares the global run lock and executes before capture
-    # sources. If a daily census and its consumer are due in the same tick,
-    # the consumer sees the newly completed fixed-window snapshot.
+    # Within one lock group, maintenance executes before capture sources. The
+    # coordinator refreshes Slack census separately under slack-census.lock:
+    # manual all-routine runs do that first, while scheduled capture consumes
+    # the last completed snapshot without waiting for a long census.
     for routine in valid:
         if (
             routine["id"] not in active_ids

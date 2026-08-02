@@ -23,7 +23,9 @@ _TICK_DUE = re.compile(
     r"(?P<dry> \(dry-run\))?$"
 )
 _TICK_DONE = re.compile(_TICK_PREFIX + r" done:")
-_TICK_SKIPPED = re.compile(_TICK_PREFIX + r" skipped\b")
+_TICK_SKIPPED = re.compile(
+    _TICK_PREFIX + r" skipped(?: routines=(?P<ids>.*?))?(?: —|$)"
+)
 _TICK_NOOP = re.compile(
     _TICK_PREFIX + r": no routines due"
     r"(?P<dry> \(dry-run\))?$"
@@ -246,18 +248,30 @@ def read_tick_history(path):
         if skipped:
             group = tick_group(skipped)
             key = tick_key(skipped)
-            block = active.pop(key, None)
+            block = active.get(key)
             dry_run = message.endswith(" (dry-run)") or bool(
                 block and block["dry_run"]
             )
             if not dry_run:
                 if block:
-                    for routine_id in block["due_ids"]:
+                    explicit_ids = {
+                        value.strip()
+                        for value in (skipped.group("ids") or "").split(",")
+                        if value.strip()
+                    }
+                    skipped_ids = (
+                        block["due_ids"] & explicit_ids
+                        if explicit_ids else set(block["due_ids"])
+                    )
+                    for routine_id in skipped_ids:
                         routine_results[routine_id] = {
                             "state": "skipped",
                             "at": at,
                             "group": block["group"],
                         }
+                    block["due_ids"].difference_update(skipped_ids)
+                    if not block["due_ids"]:
+                        active.pop(key, None)
                 record_latest(group, {
                     "state": "skipped",
                     "at": at,

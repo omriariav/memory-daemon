@@ -2447,6 +2447,10 @@ class RunCommandTest(unittest.TestCase):
             self.assertEqual(daemon_cli.cmd_run(args), 0)
 
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["active_ids"] for call in run.call_args_list],
+            [{"census"}, {"domain"}],
+        )
         calls = {
             frozenset(call.kwargs["active_ids"]): call.kwargs["lock_name"]
             for call in run.call_args_list
@@ -2617,6 +2621,51 @@ class TickCommandTest(unittest.TestCase):
         attempts = state.ScheduleStore(self.base).entries
         self.assertEqual(attempts["domain"]["last_attempted_epoch"], 1000.0)
         self.assertEqual(attempts["census"]["last_attempted_epoch"], 2000.0)
+
+    def test_tick_logs_only_the_lock_group_that_was_skipped(self):
+        census = {
+            "id": "census",
+            "enabled": True,
+            "role": "maintenance",
+            "schedule": {"every": "1d"},
+            "maintenance": {
+                "kind": "slack_conversation_census",
+                "checkpoint": "state/census.json",
+            },
+        }
+        totals = {
+            "processed": 1, "skipped": 0, "errors": 0,
+            "matched": 1, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.uuid, "uuid4",
+                 return_value=SimpleNamespace(hex="partial12345ffff"),
+             ), \
+             mock.patch.object(
+                 daemon_cli.config, "discover",
+                 return_value=[self.routine, census],
+             ), \
+             mock.patch.object(
+                 daemon_cli.runner, "run",
+                 side_effect=[state.AlreadyRunning("run.lock held"), totals],
+             ), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
+
+        self.assertIn(
+            mock.call(
+                "tick[partial12345] skipped routines=domain — "
+                "run.lock held"
+            ),
+            log.call_args_list,
+        )
+        attempts = state.ScheduleStore(self.base).entries
+        self.assertNotIn("domain", attempts)
+        self.assertIn("census", attempts)
 
     def test_second_tick_inside_interval_does_nothing(self):
         state.ScheduleStore(self.base).mark_attempted({"domain"})

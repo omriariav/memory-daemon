@@ -169,6 +169,28 @@ class TickHistoryTest(unittest.TestCase):
         )
         self.assertEqual(history["routines"]["alpha"]["group"], "capture")
 
+    def test_partial_overlap_marks_only_the_skipped_lock_group(self):
+        self.write(
+            "2026-07-29T09:00:00Z tick[maint](maintenance): "
+            "due=google-tasks, slack-census\n"
+            "2026-07-29T09:00:01Z tick[maint](maintenance) skipped "
+            "routines=slack-census — state/slack-census.lock is held\n"
+            "2026-07-29T09:00:02Z tick[maint](maintenance) done: "
+            "1 processed, 0 already-seen, 0 error(s)\n"
+        )
+
+        history = status.read_tick_history(self.log)
+
+        self.assertEqual(
+            history["routines"]["google-tasks"]["state"], "ok"
+        )
+        self.assertEqual(
+            history["routines"]["slack-census"]["state"], "skipped"
+        )
+        self.assertEqual(
+            history["latest_by_group"]["maintenance"]["state"], "done"
+        )
+
 
 class RoutineStatusTest(unittest.TestCase):
     def setUp(self):

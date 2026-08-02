@@ -1007,17 +1007,19 @@ rename itself survives power loss. An unreadable or wrong-shaped ledger raises a
 clear error rather than a traceback — and does not tempt you to delete it, since
 an empty ledger means re-summarizing and re-triaging everything still matched.
 
-**Two runs cannot overlap.** A real run takes an exclusive lock on
-`state/run.lock`. launchd will not overlap a `StartInterval` job with itself, but
-a manual `daemon.py run` alongside the scheduled one would otherwise have both
-processes summarizing the same item. A second run exits cleanly, logging that it
-skipped. Dry runs never take the lock.
+**Work that mutates the same state cannot overlap.** Capture and most
+maintenance work take `state/run.lock`. The long Slack conversation census uses
+its own `state/slack-census.lock`, so it cannot block frequent capture and can
+overlap it safely; its checkpoint is replaced atomically. Manual and scheduled
+runs use the same lock mapping. A second run in an occupied lock group exits
+cleanly and logs exactly which routines it skipped, while independent groups
+continue. Dry runs never take either lock.
 
-`flock` binds to an inode, not a path, so deleting `state/run.lock` mid-run
-leaves the holder guarding an orphan and lets another run lock a freshly created
-file. There is no rendezvous left to defend at that point, so the holder checks
-before each item and stops rather than racing on. Don't delete that file while a
-run is going.
+`flock` binds to an inode, not a path, so deleting an active file under
+`state/*.lock` leaves the holder guarding an orphan and lets another run lock a
+freshly created file. There is no rendezvous left to defend at that point, so
+the holder checks before each item and stops rather than racing on. Don't delete
+lock files while their work is running.
 
 ## Tests
 
