@@ -670,6 +670,55 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(totals["errors"], 0)
 
+    def test_managed_followup_listing_does_not_inherit_general_queue(self):
+        calls = []
+
+        def search(query, max_results=20):
+            calls.append((query, max_results))
+            if query == runner.GMAIL_CHAT_FOLLOWUP_QUERY:
+                return [{
+                    "message_id": "actual-forward",
+                    "thread_id": "actual-forward",
+                    "subject": "Fwd: Chat with a colleague",
+                }]
+            return [{
+                "message_id": "ordinary-unread",
+                "thread_id": "ordinary-unread",
+                "subject": "Ordinary unread email",
+            }]
+
+        gmail.search = search
+        r = routine(self.vault, actions=[])
+        r["source"].update({
+            "query": "in:anywhere",
+            "queue_query": "in:inbox {is:unread is:starred}",
+            "exclude_query": "-category:promotions",
+            "_since": "2026-08-01T00:00:00Z",
+            "max_results": 0,
+            "self_forwarded_chat_followups": True,
+            "actions": [],
+        })
+        totals = {"errors": 0}
+
+        claims, failures = runner._collect_claims([r], totals)
+
+        self.assertEqual(calls[-1], (runner.GMAIL_CHAT_FOLLOWUP_QUERY, 0))
+        self.assertIn("in:inbox {is:unread is:starred}", calls[0][0])
+        actual = claims[("gmail", "actual-forward")]
+        self.assertTrue(
+            actual[0]["candidate"]["raw"][
+                "_gmail_chat_followup_candidate"
+            ]
+        )
+        ordinary = claims[("gmail", "ordinary-unread")]
+        self.assertFalse(
+            (ordinary[0]["candidate"].get("raw") or {}).get(
+                "_gmail_chat_followup_candidate", False
+            )
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(totals["errors"], 0)
+
     def test_dedicated_queue_query_handles_self_aliases(self):
         gmail.read_message = lambda mid: {
             "headers": {
