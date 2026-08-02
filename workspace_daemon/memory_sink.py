@@ -301,6 +301,18 @@ def source_id_for(item):
     return None
 
 
+def followup_source_id_for(item):
+    """Stable id for the actionable record created from a Gmail Chat forward.
+
+    A forwarded Chat message can already have a durable Gmail memory under the
+    canonical thread source id.  Reusing that id would update the durable entry
+    in place, even with ``--force-new``.  The follow-up is a separate fact about
+    the owner's intent, so it needs a separate id and lifecycle.
+    """
+    thread_id = (item.get("frontmatter") or {}).get("gmail_thread_id")
+    return f"gmail:{thread_id}:followup-open" if thread_id else None
+
+
 def _authenticated_identity(rid):
     """Verified authenticated person used to enforce self-exclusion."""
     try:
@@ -582,13 +594,24 @@ def capture(routine, item, summary, dry_run=False):
         return None
     store = cfg["store"]
     rid = routine.get("id")
-    source_id = source_id_for(item)
-    operator_confirmed = is_operator_confirmed(routine, item)
     meta = item.get("frontmatter") or {}
     active_chat_followup = (
         meta.get("gmail_chat_followup_managed") is True
         and meta.get("gmail_manual_chat_followup") is True
         and meta.get("gmail_chat_followup_active") is True
+    )
+    canonical_source_id = source_id_for(item)
+    source_id = (
+        followup_source_id_for(item)
+        if active_chat_followup
+        else canonical_source_id
+    )
+    if active_chat_followup and not source_id:
+        raise RuntimeError(
+            "active Gmail Chat follow-up is missing gmail_thread_id"
+        )
+    operator_confirmed = is_operator_confirmed_source_id(
+        routine, canonical_source_id
     )
 
     if dry_run:
@@ -744,6 +767,13 @@ def capture(routine, item, summary, dry_run=False):
         tags.append("extract-degraded")
     title = (entry.get("title") or item.get("title") or "untitled")[:120]
     body = entry.get("body") or summary
+    if active_chat_followup:
+        followup_line = (
+            "The memory owner manually forwarded this Chat conversation to "
+            "Gmail Inbox for follow-up."
+        )
+        if followup_line not in body:
+            body = f"{followup_line}\n\n{body}"
 
     args = ["add", "--type", etype, "--title", title, "--date", item.get("date", "")]
     if people:
@@ -757,8 +787,12 @@ def capture(routine, item, summary, dry_run=False):
         log(f"routine={rid} memory WARN: no source id derived; relying on near-dup guard")
     if active_chat_followup:
         # The underlying Chat fact may already exist in memory, but the user's
-        # explicit follow-up intent is a separate actionable record. Source-id
-        # matching still makes later retries update this same todo in place.
+        # explicit follow-up intent is a separate actionable record. Its
+        # dedicated source id makes retries idempotent without overwriting the
+        # durable source entry.
+        predecessor = meta.get("gmail_followup_predecessor_entry_id")
+        if isinstance(predecessor, str) and predecessor.strip():
+            args += ["--follows", predecessor.strip()]
         args.append("--force-new")
 
     if dry_run:
@@ -797,7 +831,12 @@ def capture(routine, item, summary, dry_run=False):
         f"source_id={source_id}"
     )
 
-    return {"memory": verdict, "memory_entry_id": entry_id, "memory_people": people}
+    return {
+        "memory": verdict,
+        "memory_entry_id": entry_id,
+        "memory_people": people,
+        "memory_source_id": source_id,
+    }
 
 
 def resolve_followup(routine, memory_entry_id, thread_id, title,

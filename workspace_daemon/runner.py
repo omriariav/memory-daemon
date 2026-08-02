@@ -263,30 +263,6 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 f"routine={routine['id']} maintenance FATAL: {exc}"
             )
 
-    # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
-    # follow-up queue. Unlike ordinary capture, completion is observed by an
-    # item's disappearance from that queue, so reconcile tracked items even
-    # when the broad source query has no new candidates.
-    for routine in valid:
-        if (
-            routine["id"] not in active_ids
-            or config.is_maintenance(routine)
-        ):
-            continue
-        for source in config.sources(routine):
-            if source.get("self_forwarded_chat_followups") is not True:
-                continue
-            try:
-                _reconcile_gmail_chat_followups(
-                    routine, processed, dry_run=dry_run,
-                )
-            except Exception as exc:
-                totals["errors"] += 1
-                log(
-                    f"routine={routine['id']} Gmail follow-up reconciliation "
-                    f"FATAL: {exc}"
-                )
-
     active_source_kinds = {
         source["kind"]
         for routine in valid
@@ -434,6 +410,30 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             routine, routine_claims, processed, label_catalog, dry_run,
             totals, lock, catalog, base_dir, shared_circuit,
         ))
+
+    # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
+    # follow-up queue. Reconcile after capture so an archived item whose prior
+    # sink attempt failed can first recreate its todo, then close it in this
+    # same run. This still runs when the broad source query had no new items.
+    for routine in valid:
+        if (
+            routine["id"] not in active_ids
+            or config.is_maintenance(routine)
+        ):
+            continue
+        for source in config.sources(routine):
+            if source.get("self_forwarded_chat_followups") is not True:
+                continue
+            try:
+                _reconcile_gmail_chat_followups(
+                    routine, processed, dry_run=dry_run,
+                )
+            except Exception as exc:
+                totals["errors"] += 1
+                log(
+                    f"routine={routine['id']} Gmail follow-up reconciliation "
+                    f"FATAL: {exc}"
+                )
 
     for key in failed_source_keys:
         if key in source_coverage and not source_coverage[key]:
@@ -1713,7 +1713,20 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 or entry.get("source_kind") != "gmail"
             ):
                 continue
-            source_id = entry.get("memory_source_id") or entry.get("source_id")
+            managed_followup = (
+                entry.get("gmail_manual_chat_followup") is True
+            )
+            source_id = (
+                entry.get("gmail_canonical_memory_source_id")
+                if managed_followup else None
+            )
+            if not source_id and managed_followup and entry.get("gmail_thread_id"):
+                source_id = f"gmail:{entry['gmail_thread_id']}"
+            source_id = (
+                source_id
+                or entry.get("memory_source_id")
+                or entry.get("source_id")
+            )
             if not isinstance(source_id, str) or not source_id.startswith("gmail:"):
                 continue
             marker = (entry.get("processed_at") or "", item_id)
@@ -1725,6 +1738,11 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             replay = requested.setdefault(source_id, {})
             replay["memory_error"] = True
             replay.setdefault("handler_id", entry.get("handler_id"))
+            if entry.get("gmail_manual_chat_followup") is True:
+                replay["managed_followup"] = True
+                replay["predecessor_entry_id"] = entry.get(
+                    "gmail_followup_predecessor_entry_id"
+                )
 
         replayed = 0
         for source_id, replay in requested.items():
@@ -1742,10 +1760,20 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 title = "operator-confirmed Gmail thread"
             if replay.get("memory_error"):
                 raw["_memory_error_replay"] = True
+            if replay.get("managed_followup"):
+                raw["_gmail_chat_followup_candidate"] = True
+                raw["_gmail_followup_replay"] = True
+                if replay.get("predecessor_entry_id"):
+                    raw["_gmail_followup_predecessor_entry_id"] = (
+                        replay["predecessor_entry_id"]
+                    )
             candidate = {"id": thread_id, "title": title, "raw": raw}
+            replay_source = dict(source, read_thread=True, actions=[])
+            if replay.get("managed_followup"):
+                replay_source["self_forwarded_chat_followups"] = True
             claims.setdefault(("gmail", thread_id), []).append({
                 "routine": routine,
-                "source": dict(source, read_thread=True, actions=[]),
+                "source": replay_source,
                 "source_index": source_index,
                 "candidate": candidate,
                 "fetch": SOURCES["gmail"][1],
@@ -1777,6 +1805,48 @@ def _claim_source_id(claim):
     if claim["source"].get("kind") == "gmail" and raw.get("thread_id"):
         return f"gmail:{raw['thread_id']}"
     return None
+
+
+def _gmail_followup_predecessor(processed, claim, existing=None):
+    """Durable memory entry that an actionable Gmail follow-up succeeds.
+
+    Gmail ledger identity is message-scoped while memory identity is
+    thread-scoped.  Prefer a predecessor persisted by an earlier failed
+    attempt, then find the newest ordinary memory record for the stable thread
+    source id.  Managed rows are excluded so a retry never follows itself.
+    """
+    if existing is not None:
+        persisted = existing.get("gmail_followup_predecessor_entry_id")
+        if isinstance(persisted, str) and persisted.strip():
+            return persisted.strip()
+        if (
+            existing.get("gmail_manual_chat_followup") is not True
+            and existing.get("memory_entry_id")
+        ):
+            return existing["memory_entry_id"]
+    candidate_predecessor = (
+        (claim["candidate"].get("raw") or {}).get(
+            "_gmail_followup_predecessor_entry_id"
+        )
+    )
+    if (
+        isinstance(candidate_predecessor, str)
+        and candidate_predecessor.strip()
+    ):
+        return candidate_predecessor.strip()
+    source_id = _claim_source_id(claim)
+    if processed is None or not source_id:
+        return None
+    matching = [
+        (entry.get("processed_at") or "", item_id, entry["memory_entry_id"])
+        for item_id, entry in processed.items()
+        if (
+            entry.get("memory_source_id") == source_id
+            and entry.get("gmail_manual_chat_followup") is not True
+            and entry.get("memory_entry_id")
+        )
+    ]
+    return max(matching, default=(None, None, None))[-1]
 
 
 def _could_be_gmail_followup(claim):
@@ -1949,6 +2019,12 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             )
             claim = dict(claim, candidate=candidate)
         existing = processed.get(candidate["id"])
+        managed_followup_claim = _is_managed_followup_claim(claim)
+        followup_predecessor = (
+            _gmail_followup_predecessor(processed, claim, existing)
+            if managed_followup_claim
+            else None
+        )
         upgrade_followup = (
             existing is not None
             and _is_managed_followup_claim(claim)
@@ -2039,6 +2115,8 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 effective, claim["source"], candidate, claim["fetch"], processed,
                 label_catalog, dry_run, totals, catalog, base_dir,
                 prefetched_item,
+                followup_predecessor_entry_id=followup_predecessor,
+                managed_followup_claim=managed_followup_claim,
             )
             if totals["errors"] > errors_before:
                 hold_claim(claim)
@@ -2096,7 +2174,8 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
 
 def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
-             prefetched_item=None):
+             prefetched_item=None, followup_predecessor_entry_id=None,
+             managed_followup_claim=False):
     rid = routine["id"]
     handler_id = routine.get("_handler_id")
     action_list = config.source_actions(routine, source)
@@ -2111,6 +2190,25 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         if prefetched_item is not None
         else fetch(routine, source, candidate)
     )
+    if followup_predecessor_entry_id or managed_followup_claim:
+        item = dict(item)
+        meta = dict(item.get("frontmatter") or {})
+        if followup_predecessor_entry_id:
+            meta["gmail_followup_predecessor_entry_id"] = (
+                followup_predecessor_entry_id
+            )
+        if managed_followup_claim:
+            meta.update({
+                "gmail_manual_chat_followup": True,
+                "gmail_chat_followup_managed": True,
+                "gmail_chat_followup_active": True,
+            })
+            meta.setdefault(
+                "gmail_thread_id",
+                (candidate.get("raw") or {}).get("thread_id"),
+            )
+        item["frontmatter"] = meta
+    meta = item.get("frontmatter") or {}
     item.setdefault("source_kind", source["kind"])
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
@@ -2198,7 +2296,15 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     }
     if handler_id:
         record["handler_id"] = handler_id
-    memory_source_id = memory_sink.source_id_for(item)
+    canonical_memory_source_id = memory_sink.source_id_for(item)
+    active_followup = (
+        meta.get("gmail_chat_followup_managed") is True
+        and meta.get("gmail_chat_followup_active") is True
+    )
+    memory_source_id = (
+        memory_sink.followup_source_id_for(item)
+        if active_followup else canonical_memory_source_id
+    )
     if memory_source_id:
         record["memory_source_id"] = memory_source_id
     meta = item.get("frontmatter") or {}
@@ -2215,6 +2321,15 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             "gmail_followup_title": item.get("title", ""),
             "gmail_thread_id": meta.get("gmail_thread_id"),
         })
+        if canonical_memory_source_id:
+            record["gmail_canonical_memory_source_id"] = (
+                canonical_memory_source_id
+            )
+        predecessor = meta.get("gmail_followup_predecessor_entry_id")
+        if isinstance(predecessor, str) and predecessor.strip():
+            record["gmail_followup_predecessor_entry_id"] = (
+                predecessor.strip()
+            )
 
     # Memory sink runs after the vault note: the note is the expensive half and
     # the memory add is idempotent by source id, so a crash between the two is

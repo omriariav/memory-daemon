@@ -117,6 +117,13 @@ class SourceIdTest(unittest.TestCase):
         item = {"id": "m1", "frontmatter": {"gmail_thread_id": "t9"}}
         self.assertEqual(memory_sink.source_id_for(item), "gmail:t9")
 
+    def test_gmail_followup_has_distinct_stable_source_id(self):
+        item = {"id": "m1", "frontmatter": {"gmail_thread_id": "t9"}}
+        self.assertEqual(
+            memory_sink.followup_source_id_for(item),
+            "gmail:t9:followup-open",
+        )
+
     def test_drive_file_id(self):
         item = {"id": "d1", "frontmatter": {"drive_file_id": "f7"}}
         self.assertEqual(memory_sink.source_id_for(item), "gdrive:f7")
@@ -363,7 +370,7 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(calls["args"][idx + 1], "note")
 
     def test_third_party_todo_is_downgraded_when_owner_attention_is_false(self):
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": True,
             "owner_attention": False,
             "type": "todo",
@@ -424,7 +431,7 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(calls["args"][idx + 1], "note")
 
     def test_owner_todo_remains_todo_when_owner_attention_is_true(self):
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": True,
             "owner_attention": True,
             "type": "todo",
@@ -470,8 +477,9 @@ class CaptureValidationTest(unittest.TestCase):
             "gmail_manual_chat_followup": True,
             "gmail_chat_followup_managed": True,
             "gmail_chat_followup_active": True,
+            "gmail_followup_predecessor_entry_id": "original-entry",
         })
-        _, calls = self._run_capture({
+        outcome, calls = self._run_capture({
             "worthy": False,
             "owner_attention": False,
             "type": "note",
@@ -483,9 +491,25 @@ class CaptureValidationTest(unittest.TestCase):
 
         args = calls["args"]
         self.assertEqual(args[args.index("--type") + 1], "todo")
+        self.assertEqual(
+            args[args.index("--source-ids") + 1],
+            "gmail:thread-1:followup-open",
+        )
+        self.assertEqual(
+            args[args.index("--follows") + 1],
+            "original-entry",
+        )
         self.assertIn("--force-new", args)
         tags = args[args.index("--tags") + 1]
         self.assertIn("gmail-followup", tags)
+        self.assertIn(
+            "manually forwarded this Chat conversation",
+            calls["stdin"],
+        )
+        self.assertEqual(
+            outcome["memory_source_id"],
+            "gmail:thread-1:followup-open",
+        )
 
     def test_active_chat_followup_survives_source_not_worthy_sentinel(self):
         self.item["frontmatter"].update({
