@@ -87,7 +87,9 @@ class TestLedger(unittest.TestCase):
     def test_failed_write_is_not_committed_by_a_later_one(self):
         store = state.Store(self.base)
         original = state.write_atomic
-        state.write_atomic = lambda p, t: (_ for _ in ()).throw(OSError("disk full"))
+        state.write_atomic = lambda p, t, **_kwargs: (_ for _ in ()).throw(
+            OSError("disk full")
+        )
         try:
             with self.assertRaises(OSError):
                 store.record("A", {"rule_id": "r"})

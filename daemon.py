@@ -17,6 +17,7 @@ import signal
 import sys
 import uuid
 from pathlib import Path
+from time import time as current_epoch
 
 import yaml
 
@@ -113,6 +114,8 @@ def cmd_validate(args):
 
 def cmd_run(args):
     set_log_file(LOG_FILE)
+    if not args.dry_run:
+        config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
     if args.routine and args.routine not in {r["id"] for r in routines}:
         raise config.RoutineError(f"no routine with id '{args.routine}'")
@@ -175,6 +178,8 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
+    if not args.dry_run:
+        config.secure_routine_files(BASE_DIR)
     tick_id = uuid.uuid4().hex[:12]
     routines = config.discover(BASE_DIR)
     problems = [p for r in routines for p in config.validate(r)]
@@ -196,15 +201,35 @@ def cmd_tick(args):
     due_ids = {r["id"] for r in due}
     mode = " (dry-run)" if args.dry_run else ""
     log(f"tick[{tick_id}]: due={', '.join(sorted(due_ids))}{mode}")
-    try:
-        totals = runner.run(
-            BASE_DIR, routines, dry_run=args.dry_run,
-            refresh_labels=args.refresh_labels, active_ids=due_ids,
-        )
-    except state.AlreadyRunning as exc:
-        log(f"tick[{tick_id}] skipped — {exc}{mode}")
-        return 0
-    schedule.mark_attempted(due_ids)
+    totals = {
+        "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
+        "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
+    }
+    # Run latency-sensitive capture before long maintenance (the Slack census
+    # can take tens of minutes). Persist each group's attempt immediately, so
+    # the next tick cannot repeat capture merely because maintenance was slow.
+    groups = [
+        {r["id"] for r in due if not config.is_maintenance(r)},
+        {r["id"] for r in due if config.is_maintenance(r)},
+    ]
+    for group_ids in groups:
+        if not group_ids:
+            continue
+        # Cadence is measured from the attempt's start. A 40-minute census on
+        # a one-day schedule must not silently become a 24h40m schedule.
+        group_started_epoch = current_epoch()
+        try:
+            group_totals = runner.run(
+                BASE_DIR, routines, dry_run=args.dry_run,
+                refresh_labels=args.refresh_labels, active_ids=group_ids,
+            )
+        except state.AlreadyRunning as exc:
+            log(f"tick[{tick_id}] skipped — {exc}{mode}")
+            return 0
+        schedule.mark_attempted(group_ids, now=group_started_epoch)
+        for key, value in group_totals.items():
+            if isinstance(value, (int, float)):
+                totals[key] = totals.get(key, 0) + value
     log(
         f"tick[{tick_id}] done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
@@ -280,7 +305,13 @@ def cmd_new(args):
             print(f"    {p}", file=sys.stderr)
         return 1
 
-    path.write_text(yaml.safe_dump(routine, sort_keys=False, allow_unicode=True, width=100))
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    state.write_atomic(
+        path,
+        yaml.safe_dump(routine, sort_keys=False, allow_unicode=True, width=100),
+        mode=0o600,
+    )
     print(f"\nwrote {path}")
     print(f"preview it with: ./daemon.py run --routine {routine_id} --dry-run")
     return 0

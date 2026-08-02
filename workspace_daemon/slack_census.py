@@ -114,6 +114,17 @@ def _validate_checkpoint(path, data):
                     path, f"conversation {item_id} has duplicate results"
                 )
             result_ids.add(item_id)
+            roots = row.get("active_thread_roots")
+            if roots is not None and (
+                not isinstance(roots, list)
+                or any(not isinstance(root, str) or not root for root in roots)
+                or len(set(roots)) != len(roots)
+            ):
+                _checkpoint_error(
+                    path,
+                    f"{field}[{index}].active_thread_roots must be a list "
+                    "of unique non-empty timestamp strings",
+                )
     if "completed_at" in data:
         if not isinstance(data["completed_at"], str) or not data["completed_at"]:
             _checkpoint_error(path, "completed_at must be a non-empty string")
@@ -178,12 +189,13 @@ def run(
     cutoff_epoch,
     until_epoch=None,
     requests_per_minute=40,
+    thread_root_days=30,
     checkpoint=None,
     progress=None,
     sleep=time.sleep,
     resume=True,
 ):
-    """Probe one recent top-level message per conversation.
+    """Discover recent roots and recent replies to older thread roots.
 
     The checkpoint contains only IDs, names, type metadata, timestamps, and API
     errors—never message text. It makes a long inventory safe across laptop
@@ -191,6 +203,8 @@ def run(
     """
     if requests_per_minute < 1 or requests_per_minute > 50:
         raise ValueError("requests_per_minute must be between 1 and 50")
+    if not _finite_number(thread_root_days) or float(thread_root_days) <= 0:
+        raise ValueError("thread_root_days must be positive")
     progress = progress or (lambda _message: None)
     checkpoint = Path(checkpoint) if checkpoint else None
     existing = load_resumable_checkpoint(checkpoint) if resume else None
@@ -240,6 +254,7 @@ def run(
             "next_index": 0,
             "active": [],
             "errors": [],
+            "thread_root_days": float(thread_root_days),
         }
         _save_checkpoint(checkpoint, data)
 
@@ -250,19 +265,35 @@ def run(
         conversation = inventory[index]
         channel = conversation["id"]
         try:
-            response = api(
-                "conversations.history",
-                {
-                    "channel": channel,
-                    "oldest": f"{float(cutoff_epoch):.6f}",
-                    "latest": f"{float(data['until_epoch']):.6f}",
-                    # Adjacent census windows deliberately overlap at their
-                    # shared boundary, so activity cannot disappear between
-                    # two exclusive endpoints.
-                    "inclusive": "true",
-                    "limit": 1,
-                },
+            # Slack history is keyed by root timestamp, so a 48-hour query
+            # cannot reveal a new reply on a week-old thread. Scan a bounded
+            # root horizon and compare both root ts and latest_reply against
+            # the actual activity window.
+            root_cutoff = min(
+                float(cutoff_epoch),
+                float(data["until_epoch"]) - float(thread_root_days) * 86400,
             )
+            messages = []
+            cursor = None
+            while True:
+                params = {
+                    "channel": channel,
+                    "oldest": f"{root_cutoff:.6f}",
+                    "latest": f"{float(data['until_epoch']):.6f}",
+                    "inclusive": "true",
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                response = api("conversations.history", params)
+                messages.extend(response.get("messages") or [])
+                cursor = (
+                    (response.get("response_metadata") or {}).get("next_cursor")
+                    or None
+                )
+                if not cursor:
+                    break
+                sleep(delay)
         except Exception as exc:
             error = getattr(exc, "error", None) or str(exc)
             if error == "ratelimited":
@@ -280,15 +311,35 @@ def run(
                 continue
             data["errors"].append({"id": channel, "error": error})
         else:
-            messages = response.get("messages") or []
-            if messages:
+            activity = [
+                message for message in messages
+                if any(
+                    float(cutoff_epoch) <= float(stamp) <= float(data["until_epoch"])
+                    for stamp in (message.get("ts"), message.get("latest_reply"))
+                    if stamp is not None
+                )
+            ]
+            if activity:
+                latest_ts = max(
+                    str(message.get("latest_reply") or message.get("ts") or "")
+                    for message in activity
+                )
                 data["active"].append({
                     "id": channel,
                     "name": conversation.get("name"),
                     "user": conversation.get("user"),
                     "type": conversation_type(conversation),
                     "is_private": conversation.get("is_private"),
-                    "latest_ts": messages[0].get("ts"),
+                    "latest_ts": latest_ts,
+                    "active_thread_roots": [
+                        str(message["ts"])
+                        for message in messages
+                        if message.get("ts") is not None
+                        and message.get("latest_reply") is not None
+                        and float(cutoff_epoch)
+                        <= float(message["latest_reply"])
+                        <= float(data["until_epoch"])
+                    ],
                 })
 
         index += 1

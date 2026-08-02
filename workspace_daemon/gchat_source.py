@@ -37,14 +37,17 @@ memory store dedupes on the stable *source* id):
   `memory add` updates the same entry in place
 """
 import datetime
+import hashlib
 import json
 import subprocess
 
 from .chat_text import redact_secrets, timestamped_line
-from .shell import log
+from .shell import gws_bin, log
 from .time_utils import rfc3339_key
 
-GWS = "gws"
+# Bump only when candidate construction changes in a way that needs a replay
+# from the declared batching cutover rather than the ordinary live overlap.
+CATCH_UP_SCHEMA = 1
 MAX_CONTEXT_MEMBERS = 20
 # The ergonomic `gws chat messages` command treats zero as "return nothing".
 # A very large positive max makes it paginate exhaustively while preserving its
@@ -55,7 +58,7 @@ _space_cache = {}
 
 
 def _gws(args, timeout=60):
-    r = subprocess.run([GWS, *args, "--format", "json"],
+    r = subprocess.run([gws_bin(), *args, "--format", "json"],
                        capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(f"gws {' '.join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:200]}")
@@ -73,6 +76,75 @@ def _space_id(space):
 
 def _thread_id(message):
     return (message.get("thread") or message.get("name", "")).split("/")[-1]
+
+
+def _message_content(message):
+    """Renderable message text plus safe attachment metadata.
+
+    Attachment bodies and URLs are deliberately excluded; names and MIME types
+    are enough for the model to understand that a file/image was shared.
+    """
+    parts = []
+    text = (message.get("text") or "").strip()
+    if text:
+        parts.append(text)
+    attachments = message.get("attachments") or message.get("attachment") or []
+    if isinstance(attachments, dict):
+        attachments = [attachments]
+    for attachment in attachments if isinstance(attachments, list) else []:
+        if not isinstance(attachment, dict):
+            continue
+        name = (
+            attachment.get("content_name")
+            or attachment.get("name")
+            or "attachment"
+        )
+        mime = attachment.get("content_type") or attachment.get("mime_type") or ""
+        detail = f"{name} ({mime})" if mime else str(name)
+        parts.append(f"[Attachment: {detail}]")
+    if not parts and (message.get("cards_v2") or message.get("cards")):
+        parts.append("[Rich card attachment]")
+    return redact_secrets("\n".join(parts))
+
+
+def _message_version(message):
+    return message.get("last_update_time") or message.get("create_time") or ""
+
+
+def _batch_version(messages):
+    latest = max((_message_version(message) for message in messages), default="")
+    payload = [
+        {
+            "name": message.get("name"),
+            "created": message.get("create_time"),
+            "updated": message.get("last_update_time"),
+            "sender": message.get("sender"),
+            "content": _message_content(message),
+        }
+        for message in messages
+    ]
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:12]
+    return f"{latest}:{digest}"
+
+
+def _sessions(messages, gap_minutes):
+    if not gap_minutes:
+        return [messages]
+    batches = []
+    for message in messages:
+        if not batches:
+            batches.append([message])
+            continue
+        previous = batches[-1][-1]
+        current_at, _ = rfc3339_key(message.get("create_time") or "")
+        previous_at, _ = rfc3339_key(previous.get("create_time") or "")
+        if (current_at - previous_at).total_seconds() >= gap_minutes * 60:
+            batches.append([message])
+        else:
+            batches[-1].append(message)
+    return batches
 
 
 def _hours_duration(hours):
@@ -219,9 +291,7 @@ def candidates(source):
     daily = {}
     for sid, t in threads.items():
         msgs = sorted(t["messages"], key=lambda m: m.get("create_time", ""))
-        # Empty attachment/system messages cannot be analyzed. Dropping them
-        # here also prevents titles and dry-run logs from leaking non-content.
-        if not any((m.get("text") or "").strip() for m in msgs):
+        if not any(_message_content(m) for m in msgs):
             continue
 
         if source.get("batch_unthreaded") == "daily" and len(msgs) == 1:
@@ -230,12 +300,10 @@ def candidates(source):
             daily.setdefault(key, []).extend(msgs)
             continue
 
-        latest = msgs[-1].get("create_time", "")
-        first_text = redact_secrets(
-            (msgs[0].get("text") or "").replace("\n", " ")
-        )
+        version = _batch_version(msgs)
+        first_text = _message_content(msgs[0]).replace("\n", " ")
         out.append({
-            "id": f"{sid}@{latest}",       # version-aware: new replies => new candidate
+            "id": f"{sid}@{version}",
             "title": first_text[:90],
             "raw": {"source_id": sid, "space": t["space"], "messages": msgs},
         })
@@ -249,26 +317,33 @@ def candidates(source):
             # Empty system events are not prompt content and must not advance
             # the candidate version on their own.
             msgs = sorted(
-                (m for m in msgs if (m.get("text") or "").strip()),
+                (m for m in msgs if _message_content(m)),
                 key=lambda m: m.get("create_time", ""),
             )
             if not msgs:
                 continue
-            sid = f"gchat:{_space_id(space)}:{namespace}:{day}"
-            latest = msgs[-1].get("create_time", "")
-            first_text = redact_secrets(
-                (msgs[0].get("text") or "").replace("\n", " ")
-            )
-            out.append({
-                "id": f"{sid}@{latest}",
-                "title": first_text[:90] or f"Google Chat digest for {day}",
-                "raw": {
-                    "source_id": sid,
-                    "space": space,
-                    "messages": msgs,
-                    "digest_day": day,
-                },
-            })
+            sessions = _sessions(msgs, source.get("session_gap_minutes"))
+            for session_index, session in enumerate(sessions):
+                session_suffix = ""
+                if session_index > 0:
+                    first_at = session[0].get("create_time") or "unknown"
+                    session_suffix = f":session:{first_at}"
+                sid = (
+                    f"gchat:{_space_id(space)}:{namespace}:{day}"
+                    f"{session_suffix}"
+                )
+                version = _batch_version(session)
+                first_text = _message_content(session[0]).replace("\n", " ")
+                out.append({
+                    "id": f"{sid}@{version}",
+                    "title": first_text[:90] or f"Google Chat digest for {day}",
+                    "raw": {
+                        "source_id": sid,
+                        "space": space,
+                        "messages": session,
+                        "digest_day": day,
+                    },
+                })
     return out
 
 
@@ -360,10 +435,10 @@ def fetch(routine, candidate):
         timestamped_line(
             m.get("create_time"),
             names.get(m.get("sender"), m.get("sender", "?")),
-            m.get("text", ""),
+            _message_content(m),
         )
         for m in msgs
-        if (m.get("text") or "").strip()
+        if _message_content(m)
     ]
     if not lines:
         raise RuntimeError("thread has no text content in the window")

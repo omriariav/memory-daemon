@@ -66,6 +66,7 @@ def run(base_dir, routine, dry_run=False):
     )
     report = slack_cli.run_census(
         hours=float(cfg.get("hours", 48)),
+        thread_root_days=float(cfg.get("thread_root_days", 30)),
         requests_per_minute=int(cfg.get("requests_per_minute", 40)),
         checkpoint=checkpoint,
         progress=lambda message: log(f"routine={routine_id} {message}"),

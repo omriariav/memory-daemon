@@ -60,8 +60,8 @@ class SlugCatalogTest(unittest.TestCase):
             "resource_name": "people/new-person",
         }]
         response = (
-            '{"worthy":true,"type":"note","title":"T",'
-            '"people":["new-person"],"tags":[],"body":"b"}'
+            '{"worthy":true,"owner_attention":false,"type":"note","title":"T",'
+            '"people":["new-person"],"tags":["context"],"body":"b"}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -80,8 +80,9 @@ class SlugCatalogTest(unittest.TestCase):
 
     def test_extraction_policy_keeps_concrete_pending_requests(self):
         response = (
-            '{"worthy":true,"type":"todo","title":"Review roadmap",'
-            '"people":[],"tags":[],"body":"Review the roadmap."}'
+            '{"worthy":true,"owner_attention":true,"type":"todo",'
+            '"title":"Review roadmap","people":[],"tags":["roadmap"],'
+            '"body":"Review the roadmap."}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -1014,7 +1015,9 @@ class FollowupResolutionTest(unittest.TestCase):
             "memory": {"store": "/store", "type": "note"},
         }
         with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
-             mock.patch.object(memory_sink.subprocess, "run"):
+             mock.patch.object(
+                 memory_sink.subprocess, "run", return_value=FakeResult()
+             ):
             outcome = memory_sink.resolve_followup(
                 routine,
                 memory_entry_id="2026-07-31-open-follow-up",

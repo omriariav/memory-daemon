@@ -186,7 +186,9 @@ class MultiSourceValidationTest(unittest.TestCase):
             },
             {
                 "kind": "gmail",
-                "query": "newer_than:1d",
+                "query": "in:inbox",
+                "catch_up": True,
+                "catch_up_after": "2026-07-01T00:00:00Z",
                 "max_results": 0,
                 "actions": [],
             },
@@ -304,7 +306,9 @@ class MultiSourceValidationTest(unittest.TestCase):
             },
             {
                 "kind": "gmail",
-                "query": "newer_than:1d",
+                "query": "in:inbox",
+                "catch_up": True,
+                "catch_up_after": "2026-07-01T00:00:00Z",
                 "max_results": 0,
                 "actions": [],
             },
@@ -1570,6 +1574,7 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
 
         runner.SOURCES["gchat"] = (candidates, self.saved_source[1])
         routine = self.routine()
+        cursor_id = runner._catch_up_cursor_id(routine["source"])
 
         with mock.patch.object(
             runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
@@ -1586,7 +1591,7 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
         self.assertEqual(observed[1]["_since"], "2026-07-28T09:00:00Z")
         self.assertEqual(
             state.CursorStore(self.base).checkpoint(
-                "sweep", "gchat:all-spaces", "gchat"
+                "sweep", cursor_id, "gchat"
             ),
             "2026-07-28T12:00:00Z",
         )
@@ -2257,6 +2262,8 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             }
 
         runner.SOURCES["gchat"] = (candidates, fetch)
+        routine = self.routine(memory=True)
+        cursor_id = runner._catch_up_cursor_id(routine["source"])
         # Exceptions are allowed to have no message. Presence of the ledger key,
         # not the truthiness of its text, must trigger the retry.
         outcomes = [RuntimeError(), {"memory": "created"}]
@@ -2265,24 +2272,24 @@ class CatchUpCursorRunnerTest(unittest.TestCase):
             with mock.patch.object(
                 runner, "utc_now_iso", return_value="2026-07-28T10:00:00Z",
             ):
-                first = runner.run(self.base, [self.routine(memory=True)])
+                first = runner.run(self.base, [routine])
             self.assertEqual(first["errors"], 1)
             self.assertIsNone(
                 state.CursorStore(self.base).checkpoint(
-                    "sweep", "gchat:all-spaces", "gchat"
+                    "sweep", cursor_id, "gchat"
                 )
             )
 
             with mock.patch.object(
                 runner, "utc_now_iso", return_value="2026-07-28T12:00:00Z",
             ):
-                second = runner.run(self.base, [self.routine(memory=True)])
+                second = runner.run(self.base, [routine])
 
         self.assertEqual(second["errors"], 0)
         self.assertEqual(capture.call_count, 2)
         self.assertEqual(
             state.CursorStore(self.base).checkpoint(
-                "sweep", "gchat:all-spaces", "gchat"
+                "sweep", cursor_id, "gchat"
             ),
             "2026-07-28T12:00:00Z",
         )
@@ -2425,6 +2432,54 @@ class TickCommandTest(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_tick_runs_capture_before_maintenance_and_marks_it_immediately(self):
+        maintenance_routine = {
+            "id": "census",
+            "enabled": True,
+            "role": "maintenance",
+            "schedule": {"every": "1d"},
+            "maintenance": {
+                "kind": "slack_conversation_census",
+                "checkpoint": "state/census.json",
+            },
+        }
+        totals = {
+            "processed": 0, "skipped": 0, "errors": 0,
+            "matched": 0, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        order = []
+
+        def run(_base, _routines, **kwargs):
+            active = kwargs["active_ids"]
+            order.append(active)
+            if active == {"census"}:
+                self.assertIn("domain", state.ScheduleStore(self.base).entries)
+            return totals
+
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(
+                 daemon_cli, "current_epoch", side_effect=[1000.0, 2000.0]
+             ), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(daemon_cli.config, "secure_routine_files"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover",
+                 return_value=[self.routine, maintenance_routine],
+             ), mock.patch.object(daemon_cli.config, "validate", return_value=[]), \
+             mock.patch.object(daemon_cli.runner, "run", side_effect=run), \
+             mock.patch.object(daemon_cli, "log"):
+            self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
+
+        self.assertEqual(order, [{"domain"}, {"census"}])
+        self.assertEqual(
+            set(state.ScheduleStore(self.base).entries), {"domain", "census"}
+        )
+        attempts = state.ScheduleStore(self.base).entries
+        self.assertEqual(attempts["domain"]["last_attempted_epoch"], 1000.0)
+        self.assertEqual(attempts["census"]["last_attempted_epoch"], 2000.0)
 
     def test_second_tick_inside_interval_does_nothing(self):
         state.ScheduleStore(self.base).mark_attempted({"domain"})

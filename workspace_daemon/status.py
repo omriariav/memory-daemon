@@ -109,7 +109,16 @@ def read_tick_history(path):
     if not path.exists():
         return {"latest": None, "routines": {}}
     try:
-        lines = path.read_text(errors="replace").splitlines()
+        # Status is interactive and must stay bounded even after years of
+        # unattended operation. Rotation normally keeps this small; tailing is
+        # a second line of defence for legacy/unrotated logs.
+        max_bytes = 32 * 1024 * 1024
+        with path.open("rb") as handle:
+            size = path.stat().st_size
+            if size > max_bytes:
+                handle.seek(-max_bytes, 2)
+                handle.readline()  # discard a partial first line
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return {"latest": None, "routines": {}}
 

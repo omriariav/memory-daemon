@@ -113,13 +113,13 @@ class CensusTest(unittest.TestCase):
 
         self.assertEqual(
             [(row["id"], row["type"]) for row in result["active"]],
-            [("C1", "public_channel"), ("G3", "mpim")],
+            [("C1", "public_channel")],
         )
         self.assertNotIn("secret", json.dumps(result))
         self.assertNotIn("sensitive-body", json.dumps(result))
         self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0][1]["limit"], 1)
-        self.assertEqual(calls[0][1]["oldest"], "10.123456")
+        self.assertEqual(calls[0][1]["limit"], 200)
+        self.assertLess(float(calls[0][1]["oldest"]), 10.123456)
         self.assertEqual(calls[0][1]["latest"], "20.654321")
         self.assertEqual(calls[0][1]["inclusive"], "true")
         self.assertEqual(
@@ -128,6 +128,28 @@ class CensusTest(unittest.TestCase):
         self.assertEqual(
             result["until_at"], "1970-01-01T00:00:20.654321Z"
         )
+
+    def test_reply_to_old_root_makes_conversation_active(self):
+        def api(_method, _params):
+            return {
+                "ok": True,
+                "messages": [{
+                    "ts": "100.0",
+                    "latest_reply": "950.0",
+                    "text": "must not be stored",
+                }],
+            }
+
+        result = slack_census.run(
+            [self.CONVERSATIONS[0]],
+            api,
+            cutoff_epoch=900,
+            until_epoch=1000,
+            thread_root_days=30,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(result["active"][0]["latest_ts"], "950.0")
+        self.assertNotIn("must not be stored", json.dumps(result))
 
     def test_checkpoint_resumes_after_interruption(self):
         with tempfile.TemporaryDirectory() as tmp:

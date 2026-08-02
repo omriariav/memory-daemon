@@ -34,9 +34,13 @@ sources:
 
   # The broad fallback belongs inside this routine, not in a competing routine.
   - kind: gmail
-    query: '{newer_than:1d is:unread is:starred}'
+    query: '{in:inbox in:sent}'
+    queue_query: 'in:inbox {is:unread is:starred}'
     read_thread: true
     max_results: 0
+    catch_up: true
+    catch_up_overlap: 1h
+    catch_up_after: "2026-08-01T00:00:00Z"
     self_forwarded_chat_followups: true
     actions: []
 

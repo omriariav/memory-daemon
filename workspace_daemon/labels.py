@@ -61,6 +61,7 @@ class Catalog:
                 self.path,
                 json.dumps({"fetched_at": self._fetched_at, "labels": self._names},
                            indent=2, sort_keys=True) + "\n",
+                mode=0o600,
             )
         except OSError as exc:
             # A cache is an optimisation; failing to persist it must not fail a run.

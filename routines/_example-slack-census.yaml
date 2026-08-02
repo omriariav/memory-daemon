@@ -1,7 +1,7 @@
 # Example: refresh the metadata-only active Slack conversation inventory.
 #
 # This routine makes no LLM call and reads no message content beyond Slack's
-# one-message activity probe. A separate Slack content routine consumes the
+# bounded thread-root activity probe. A separate Slack content routine consumes the
 # completed checkpoint with active_conversations.refresh_if_stale: false.
 id: example-slack-census
 enabled: false
@@ -15,4 +15,5 @@ maintenance:
   kind: slack_conversation_census
   checkpoint: state/slack-census.json
   hours: 48
+  thread_root_days: 30
   requests_per_minute: 40

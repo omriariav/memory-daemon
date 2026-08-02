@@ -60,7 +60,7 @@ oldest successful scope checkpoint. A non-due owner therefore holds the safe
 watermark instead of creating a silent gap. Partial and inline specialized
 routines do not advance connector health on their own. Connector coverage
 sources use `max_results: 0`; a bounded source or a reported upstream service
-cap holds the watermark until complete coverage succeeds. Slack and Google Chat
+cap holds the watermark until complete coverage succeeds. Gmail, Slack, and Google Chat
 sweep publishers also require `catch_up: true`; Google Chat requires
 `max_per_space: 0`.
 
@@ -171,6 +171,8 @@ launchd, which does not inherit a login shell's `PATH`):
 ```sh
 export WORKSPACE_DAEMON_GWS_BIN=/path/to/gws
 export WORKSPACE_DAEMON_YOETZ_BIN=/path/to/yoetz
+export WORKSPACE_DAEMON_ADA_BIN=/path/to/ada
+export WORKSPACE_DAEMON_NPX_BIN=/stable/node/bin/npx
 ```
 
 ```sh
@@ -335,11 +337,12 @@ catch_up: true
 catch_up_overlap: 1h
 ```
 
-After an error-free run, `state/cursors.json` records when that source scan
+After each source completes successfully, `state/cursors.json` records when that source scan
 started. The next scan begins one overlap before that checkpoint. The processed
 ledger skips unchanged daily versions, while messages that arrived during the
 previous run remain eligible. A source, analysis, or memory error holds the
-cursor; catch-up items ledgered with a memory error are retried. Before the
+affected source's cursor without holding successful unrelated sources; catch-up
+items ledgered with a memory error are retried. Before the
 first successful run, `batch_messages_after` is the bootstrap boundary (or the
 configured `hours` window is used when no boundary exists).
 
@@ -354,6 +357,26 @@ batch_messages_after: "2026-07-28T06:46:03Z"
 The boundary is exclusive. Pre-boundary messages stay under their legacy source
 ids, while later messages use the new `gchat:<space>:daily:<date>` namespace.
 Remove neither the boundary nor legacy ledger rows after cutover.
+
+Set `session_gap_minutes` (for example, `120`) on daily GChat or direct Slack
+digests to split long-separated conversation bursts into distinct durable
+memories. The first session keeps the historical daily source id; later
+sessions get stable `:session:<first-message-time>` suffixes.
+
+Gmail supports the same durable cursor. Keep the catch-up `query` free of
+`newer_than:`, `older_than:`, `after:`, and `before:`; the daemon appends its
+own `after:` boundary. Use a timeless `queue_query` for Inbox items that must
+remain eligible regardless of age:
+
+```yaml
+kind: gmail
+query: '{in:inbox in:sent}'
+queue_query: 'in:inbox {is:unread is:starred}'
+max_results: 0
+catch_up: true
+catch_up_overlap: 1h
+catch_up_after: "2026-08-01T00:00:00Z"
+```
 
 Slack supports the same durable queue for explicitly configured channels and
 workspace-wide mentions. Use `direct_channels` for public or private channels
@@ -404,8 +427,9 @@ python3 -m workspace_daemon.slack_cli census \
   --checkpoint state/slack-census.json
 ```
 
-It enumerates conversations joined by the authenticated user, probes each for
-one top-level message in the window, and prints only active conversation
+It enumerates conversations joined by the authenticated user, scans a bounded
+thread-root horizon (30 days by default), and detects both new roots and new
+replies to older roots. It prints only active conversation and thread-root
 metadata—never message text. The checkpoint is resumable across laptop sleep
 and contains IDs, names, types, timestamps, and API errors only. The default
 40-request/minute throttle bounds this process's history probes; other clients
@@ -879,6 +903,10 @@ tail -f logs/run.log
 tail -f logs/launchd.err.log
 ```
 
+Operational logs rotate at 20 MiB with five backups. Runtime state, logs, and
+non-example routine files are written owner-only (`0600`) under owner-only
+directories (`0700`).
+
 `memory-daemon-status.sh` is read-only. It shows each routine's declared role
 (`general`, `domain`, `specialized`, `partial`, or `maintenance`) and source
 connectors,
@@ -954,6 +982,10 @@ retried at the start of the next run, by item id rather than by re-querying —
 once `archive` lands, an `in:inbox` query can no longer see the item. Every
 action is idempotent, so replaying a partial sequence is safe, and the retry
 never re-summarizes. `daemon.py run` reports the count.
+
+Configured memory sinks and source expansion are mutation barriers: Gmail
+actions are withheld and the item is retried until the memory entry and any
+required expanded document are successfully persisted.
 
 **A partial write cannot corrupt anything.** Notes and the ledger both go through
 a temp file plus `os.replace`, with the containing directory fsynced so the

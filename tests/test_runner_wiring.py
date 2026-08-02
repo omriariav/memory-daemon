@@ -896,6 +896,51 @@ class RunnerWiringTest(unittest.TestCase):
             "2026-08-01-durable-product-context",
         )
 
+    def test_ordinary_memory_failure_also_withholds_and_retries_gmail_actions(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        outcomes = [
+            RuntimeError("store unavailable"),
+            {"memory": "created", "memory_entry_id": "entry-1"},
+        ]
+        with mock.patch.object(memory_sink, "capture", side_effect=outcomes):
+            first = runner.run(self.base, [r])
+            self.assertEqual(self.applied, [])
+            self.assertIn("memory_error", self.ledger()["m1"])
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertNotIn("memory_error", self.ledger()["m1"])
+
+    def test_incomplete_drive_expansion_withholds_gmail_actions_and_retries(self):
+        r = routine(self.vault, actions=["archive"])
+        original_fetch = runner.SOURCES["gmail"]
+        attempts = 0
+
+        def fetch(_routine, _source, candidate):
+            nonlocal attempts
+            attempts += 1
+            item = original_fetch[1](_routine, _source, candidate)
+            if attempts == 1:
+                item["expand_fallback"] = "meeting document unavailable"
+            return item
+
+        runner.SOURCES["gmail"] = (original_fetch[0], fetch)
+        first = runner.run(self.base, [r])
+        self.assertEqual(self.applied, [])
+        self.assertIn("expand_fallback", self.ledger()["m1"])
+        second = runner.run(self.base, [r])
+
+        self.assertEqual(first["fallbacks"], 1)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertNotIn("expand_fallback", self.ledger()["m1"])
+
     def test_new_operator_confirmation_replays_archived_not_worthy_thread(self):
         r = routine(
             self.vault,

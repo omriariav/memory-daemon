@@ -471,14 +471,45 @@ class PrivateDigestTest(unittest.TestCase):
                 "max_results": 30,
             })[0]
 
-        self.assertEqual(
-            candidate["id"],
-            "slack:CDIRECT:digest:2026-07-28@1785232800.0",
-        )
+        self.assertTrue(candidate["id"].startswith(
+            "slack:CDIRECT:digest:2026-07-28@1785232800.0:"
+        ))
         self.assertEqual(
             candidate["raw"]["source_id"],
             "slack:CDIRECT:digest:2026-07-28",
         )
+
+    def test_direct_digest_splits_unrelated_sessions_after_long_gap(self):
+        history = {
+            "ok": True,
+            "messages": [
+                {
+                    "source_id": "slack:CDIRECT:1785225600.0",
+                    "ts": "1785225600.0", "user": "U1", "text": "morning",
+                },
+                {
+                    "source_id": "slack:CDIRECT:1785227400.0",
+                    "ts": "1785227400.0", "user": "U2", "text": "follow-up",
+                },
+                {
+                    "source_id": "slack:CDIRECT:1785247200.0",
+                    "ts": "1785247200.0", "user": "U1", "text": "new topic",
+                },
+            ],
+        }
+        with mock.patch.object(slack_source, "_cli", return_value=history):
+            candidates = slack_source.candidates({
+                "direct_channels": ["CDIRECT"],
+                "hours": 26,
+                "max_results": 30,
+                "session_gap_minutes": 120,
+            })
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(sum(
+            ":session:" in candidate["raw"]["source_id"]
+            for candidate in candidates
+        ), 1)
 
 
 class ActiveConversationSweepTest(unittest.TestCase):

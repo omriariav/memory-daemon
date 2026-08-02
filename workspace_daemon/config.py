@@ -32,6 +32,31 @@ _WEEKDAYS = {
 }
 _ROUTINE_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 HANDLER_OVERRIDE_KEYS = {"analyze", "output", "memory", "label", "streams"}
+TOP_LEVEL_KEYS = {
+    "id", "enabled", "description", "role", "schedule", "source", "sources",
+    "handlers", "analyze", "output", "memory", "actions", "routing", "label",
+    "streams", "maintenance", "_source_file",
+}
+ANALYZE_KEYS = {
+    "provider", "model", "instruction", "instruction_from_connector",
+    "instruction_extra", "connector_sweep", "max_output_tokens",
+    "focus_domains", "pick_label",
+}
+OUTPUT_KEYS = {"vault_dir", "slug_prefix", "filename_template", "kind", "tags"}
+SOURCE_KEYS = {
+    "kind", "query", "queue_query", "exclude_query", "max_results", "actions",
+    "read_thread", "handler",
+    "self_forwarded_chat_followups", "catch_up", "catch_up_overlap",
+    "catch_up_after", "channels", "ada_channels", "direct_channels",
+    "private_channels", "include_mentions", "ada_days", "active_conversations",
+    "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
+    "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
+    "session_gap_minutes",
+    "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
+    "manual_recordings", "calendar_timezone", "calendar_window_days",
+    "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
+    "calendar_match_hours",
+}
 
 
 def analyze_cfg(routine):
@@ -334,6 +359,21 @@ def routines_dir(base_dir):
     return Path(base_dir) / "routines"
 
 
+def secure_routine_files(base_dir):
+    """Make private runtime routines owner-only without touching examples."""
+    directory = routines_dir(base_dir)
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        for path in directory.glob("*.yaml"):
+            if not path.name.startswith("_"):
+                path.chmod(0o600)
+    except OSError as exc:
+        raise RoutineError(
+            f"cannot secure private routine configuration under {directory}: {exc}"
+        ) from exc
+
+
 def discover(base_dir, routine_id=None):
     """Load every routines/*.yaml (files starting with _ are templates, skipped).
 
@@ -377,6 +417,11 @@ def validate(routine):
     """Return a list of human-readable problems; empty means valid."""
     problems = []
     rid = routine.get("id", "<missing id>")
+    unknown_top = set(routine) - TOP_LEVEL_KEYS
+    if unknown_top:
+        problems.append(
+            f"{rid}: unknown top-level key(s) {', '.join(sorted(unknown_top))}"
+        )
     if "_handler_id" in routine:
         problems.append(
             f"{rid}: `_handler_id` is reserved runtime metadata and cannot "
@@ -434,6 +479,7 @@ def validate(routine):
             allowed = (
                 {
                     "kind", "checkpoint", "hours", "requests_per_minute",
+                    "thread_root_days",
                 }
                 if kind == "slack_conversation_census"
                 else {
@@ -473,6 +519,15 @@ def validate(routine):
                     problems.append(
                         f"{rid}: maintenance.requests_per_minute must be an "
                         "integer from 1 to 50"
+                    )
+                root_days = maintenance.get("thread_root_days", 30)
+                if (
+                    not isinstance(root_days, (int, float))
+                    or isinstance(root_days, bool)
+                    or root_days <= 0
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.thread_root_days must be positive"
                     )
             elif kind == "google_tasks_sync":
                 store = maintenance.get("store")
@@ -580,10 +635,6 @@ def validate(routine):
             _validate_source(routine_for_source(routine, source), source, prefix)
         )
     problems.extend(_validate_handlers(routine, source_dicts))
-    if sum(source.get("catch_up") is True for source in source_dicts) > 1:
-        problems.append(
-            f"{rid}: only one catch_up source is currently supported per routine"
-        )
     if sum(
         source.get("self_forwarded_chat_followups") is True
         for source in source_dicts
@@ -596,6 +647,12 @@ def validate(routine):
     if not isinstance(analyze, dict):
         problems.append(f"{rid}: `analyze` must be a mapping")
         analyze = {}
+    unknown_analyze = set(analyze) - ANALYZE_KEYS
+    if unknown_analyze:
+        problems.append(
+            f"{rid}: analyze has unknown key(s) "
+            f"{', '.join(sorted(unknown_analyze))}"
+        )
     for key in ("provider", "model"):
         if not analyze.get(key):
             problems.append(f"{rid}: analyze.{key} is required")
@@ -667,7 +724,17 @@ def validate(routine):
                 f"{rid}: a {connector} connector sweep requires catch_up: true "
                 "on every source"
             )
-        elif any(source.get("max_results") != 0 for source in source_dicts):
+        elif (
+            connector == "gmail"
+            and not any(source.get("catch_up") is True for source in source_dicts)
+        ):
+            problems.append(
+                f"{rid}: a gmail connector sweep requires at least one "
+                "catch_up source for incremental incoming/outgoing coverage"
+            )
+        if source_dicts and any(
+            source.get("max_results") != 0 for source in source_dicts
+        ):
             problems.append(
                 f"{rid}: analyze.connector_sweep requires max_results: 0 on "
                 "every source so the declared sweep is not capped"
@@ -677,6 +744,12 @@ def validate(routine):
     if not isinstance(output, dict):
         problems.append(f"{rid}: `output` must be a mapping")
         output = {}
+    unknown_output = set(output) - OUTPUT_KEYS
+    if unknown_output:
+        problems.append(
+            f"{rid}: output has unknown key(s) "
+            f"{', '.join(sorted(unknown_output))}"
+        )
     effective_routines = execution_routines(routine)
     missing_sinks = [
         (index, source.get("handler"))
@@ -704,6 +777,11 @@ def validate(routine):
             problems.append(f"{rid}: output.vault_dir must be an absolute path")
         if not output.get("slug_prefix"):
             problems.append(f"{rid}: output.slug_prefix is required")
+        if "tags" in output and (
+            not isinstance(output["tags"], list)
+            or any(not isinstance(tag, str) or not tag for tag in output["tags"])
+        ):
+            problems.append(f"{rid}: output.tags must be a list of strings")
 
     from . import memory_sink
     problems.extend(memory_sink.validate(routine))
@@ -950,6 +1028,11 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
+    unknown_source = set(source) - SOURCE_KEYS
+    if unknown_source:
+        problems.append(
+            f"{prefix} has unknown key(s) {', '.join(sorted(unknown_source))}"
+        )
     kind = source.get("kind")
     if kind not in VALID_SOURCE_KINDS:
         problems.append(
@@ -1012,9 +1095,9 @@ def _validate_source(routine, source, prefix):
                 f"{prefix}.catch_up_after must be a quoted RFC3339 timestamp"
             )
     if catch_up is True:
-        if kind not in {"gchat", "slack"}:
+        if kind not in {"gmail", "gchat", "slack"}:
             problems.append(
-                f"{prefix}.catch_up is supported only for gchat and slack"
+                f"{prefix}.catch_up is supported only for gmail, gchat, and slack"
             )
         try:
             duration_seconds(catch_up_overlap or "1h")
@@ -1022,6 +1105,48 @@ def _validate_source(routine, source, prefix):
             problems.append(
                 f"{prefix}.catch_up_overlap must look like '15m', '4h', or '1d'"
             )
+
+    if kind == "gmail" and catch_up is True:
+        if source.get("max_results") != 0:
+            problems.append(f"{prefix}.catch_up requires max_results: 0")
+        if catch_up_after is None:
+            problems.append(f"{prefix}.catch_up requires catch_up_after")
+        if re.search(
+            r"(?:^|\s)(?:newer_than|older_than|after|before):",
+            str(source.get("query", "")),
+            flags=re.I,
+        ):
+            problems.append(
+                f"{prefix}.catch_up query must not contain a fixed temporal "
+                "operator; the daemon appends its durable after: cursor"
+            )
+        queue_query = source.get("queue_query")
+        if queue_query is not None and (
+            not isinstance(queue_query, str) or not queue_query.strip()
+        ):
+            problems.append(f"{prefix}.queue_query must be a non-empty string")
+        if queue_query and re.search(
+            r"(?:^|\s)(?:newer_than|older_than|after|before):",
+            queue_query,
+            flags=re.I,
+        ):
+            problems.append(
+                f"{prefix}.queue_query must be timeless so unread/starred "
+                "items survive sleep and outages"
+            )
+        exclude_query = source.get("exclude_query")
+        if exclude_query is not None and (
+            not isinstance(exclude_query, str) or not exclude_query.strip()
+        ):
+            problems.append(f"{prefix}.exclude_query must be a non-empty string")
+        if exclude_query and re.search(
+            r"(?:^|\s)(?:newer_than|older_than|after|before):",
+            exclude_query,
+            flags=re.I,
+        ):
+            problems.append(f"{prefix}.exclude_query must be timeless")
+    elif source.get("queue_query") is not None:
+        problems.append(f"{prefix}.queue_query requires catch_up: true")
 
     if kind == "slack":
         channel_keys = (
@@ -1245,6 +1370,21 @@ def _validate_source(routine, source, prefix):
         if max_per_space is not None and all_spaces is not True:
             problems.append(f"{prefix}.max_per_space requires `all_spaces: true`")
 
+    session_gap = source.get("session_gap_minutes")
+    if session_gap is not None:
+        if kind not in {"gchat", "slack"}:
+            problems.append(
+                f"{prefix}.session_gap_minutes is supported only for gchat and slack"
+            )
+        if (
+            not isinstance(session_gap, int)
+            or isinstance(session_gap, bool)
+            or not 15 <= session_gap <= 1440
+        ):
+            problems.append(
+                f"{prefix}.session_gap_minutes must be an integer from 15 to 1440"
+            )
+
     expand = source.get("expand")
     if expand is not None:
         if not isinstance(expand, dict):
@@ -1252,6 +1392,14 @@ def _validate_source(routine, source, prefix):
             return problems
         if kind != "gmail":
             problems.append(f"{prefix}.expand is only supported for source.kind 'gmail'")
+        unknown_expand = set(expand) - {
+            "kind", "title_from_subject", "tabs", "on_missing", "name_contains",
+        }
+        if unknown_expand:
+            problems.append(
+                f"{prefix}.expand has unknown key(s) "
+                f"{', '.join(sorted(unknown_expand))}"
+            )
         if expand.get("kind") != "drive_doc":
             problems.append(
                 f"{prefix}.expand.kind must be 'drive_doc' (got {expand.get('kind')!r})"

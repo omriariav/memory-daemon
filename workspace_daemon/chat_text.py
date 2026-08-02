@@ -20,6 +20,14 @@ _CREDENTIAL_RE = re.compile(
     r"\s*(?:is|:|=)\s*"
     r")([^\r\n]+)"
 )
+_TOKEN_RE = re.compile(
+    r"(?i)\b(?:"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"xox[a-z]-[A-Za-z0-9-]{20,}|"
+    r"AIza[A-Za-z0-9_-]{30,}|"
+    r"bearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}"
+    r")\b"
+)
 
 
 def redact_secrets(text):
@@ -31,7 +39,8 @@ def redact_secrets(text):
     """
     value = str(text or "")
     value = _CODE_RE.sub(r"\1[REDACTED]", value)
-    return _CREDENTIAL_RE.sub(r"\1[REDACTED]", value)
+    value = _CREDENTIAL_RE.sub(r"\1[REDACTED]", value)
+    return _TOKEN_RE.sub("[REDACTED]", value)
 
 
 def slack_timestamp_iso(value):

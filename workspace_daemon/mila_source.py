@@ -7,8 +7,8 @@ moves or edits audio, transcript sidecars, ``recordings.json``, or
 
 Candidate identity has two layers:
 
-* candidate id: ``mila:<recording-uuid>@<content-hash>`` — a corrected
-  transcript is reconsidered;
+* candidate id: ``mila:<recording-uuid>@<capture-hash>`` — a corrected
+  transcript or changed matching metadata is reconsidered;
 * memory source id: ``mila:<recording-uuid>`` — corrections update the same
   memory instead of creating duplicates.
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import state
+from .chat_text import redact_secrets
 from .shell import gws_bin, log, run_json, utc_now_iso, yoetz_bin
 
 
@@ -176,19 +177,40 @@ def _candidate(record, directory, manual=None):
         raise RuntimeError(
             f"completed Mila recording {record.get('id')} has an empty transcript"
         )
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
     recording_id = str(record["id"])
     source_id = f"mila:{recording_id}"
     start, end = _recording_interval(record)
+    title = str(record.get("title") or Path(transcript_path).stem)
+    transcript_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    # Calendar matching and the eventual entry date/title depend on more than
+    # transcript text. Version every piece of recording provenance that can
+    # affect that decision so corrected Mila metadata is not hidden by an old
+    # successful ledger row.
+    capture = {
+        "transcript_hash": transcript_hash,
+        "title": title,
+        "recording_start": start.isoformat(),
+        "recording_end": end.isoformat(),
+        "duration": float(record.get("duration") or 0),
+        "source": str(record.get("source") or ""),
+        "transcript_name": Path(transcript_path).name,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            capture, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
     return {
         "id": f"{source_id}@{digest}",
-        "title": str(record.get("title") or Path(transcript_path).stem),
+        "title": title,
         "raw": {
             "source_id": source_id,
             "recording": record,
             "transcript": body,
             "transcript_path": transcript_path,
             "content_hash": digest,
+            "transcript_hash": transcript_hash,
             "recording_start": start.isoformat().replace("+00:00", "Z"),
             "recording_end": end.isoformat().replace("+00:00", "Z"),
         },
@@ -372,7 +394,10 @@ def fetch(_routine, source, candidate):
         "source_kind": "mila",
         "title": candidate["title"],
         "date": local_date,
-        "body": raw["transcript"],
+        # Transcripts can contain dictated credentials or pasted tokens. Keep
+        # Mila's source files untouched, but redact before either the Calendar
+        # matcher or the summarizer receives the text.
+        "body": redact_secrets(raw["transcript"]),
         "_mila_calendar_candidates": events,
         "frontmatter": {
             "mila_recording_id": str(record["id"]),

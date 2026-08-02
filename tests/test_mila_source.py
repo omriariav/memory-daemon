@@ -62,6 +62,26 @@ class MilaSourceTest(unittest.TestCase):
     def write_json(self, path, records):
         path.write_text(json.dumps(records))
 
+    def test_transcript_secrets_are_redacted_before_calendar_or_summary(self):
+        candidate = {
+            "id": "mila:ID@hash",
+            "title": "Meeting",
+            "raw": {
+                "source_id": "mila:ID",
+                "recording": record("ID", created="2026-07-27T19:35:32Z"),
+                "recording_start": "2026-07-27T19:35:32Z",
+                "recording_end": "2026-07-27T20:08:19Z",
+                "content_hash": "hash",
+                "transcript": "Use token ghp_abcdefghijklmnopqrstuvwxyz1234567890 now",
+            },
+        }
+        with mock.patch.object(mila_source, "_calendar_candidates", return_value=[]):
+            item = mila_source.fetch(
+                {}, {"calendar_timezone": "UTC"}, candidate
+            )
+        self.assertNotIn("ghp_", item["body"])
+        self.assertIn("REDACTED", item["body"])
+
     def test_manual_recording_and_new_indexed_record_are_versioned(self):
         legacy_record = record("LEGACY")
         current_record = record(
@@ -133,6 +153,33 @@ class MilaSourceTest(unittest.TestCase):
             manual["raw"]["source_id"],
             changed["raw"]["source_id"],
         )
+
+    def test_recording_metadata_change_versions_an_unchanged_transcript(self):
+        metadata = self.current / "recordings.json"
+        original = record(
+            "META",
+            source="voiceMemo",
+            audio="Voice memo.m4a",
+            created="2026-07-30T08:00:00Z",
+            duration=600,
+            title="Original title",
+            segments=[{"start": 0, "text": "The same transcript."}],
+        )
+        self.write_json(metadata, [original])
+        source = {
+            "kind": "mila",
+            "recordings_file": str(metadata),
+            "max_results": 0,
+        }
+        first = mila_source.candidates(source)[0]
+
+        corrected = dict(original, title="Corrected title", duration=660)
+        self.write_json(metadata, [corrected])
+        second = mila_source.candidates(source)[0]
+
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(first["raw"]["transcript"], second["raw"]["transcript"])
+        self.assertEqual(first["raw"]["source_id"], second["raw"]["source_id"])
 
     def test_meeting_filename_is_start_but_voice_memo_created_at_is_start(self):
         meeting_start, meeting_end = mila_source._recording_interval(

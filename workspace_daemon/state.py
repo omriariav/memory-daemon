@@ -24,6 +24,21 @@ class AlreadyRunning(Exception):
     pass
 
 
+def ensure_private_dir(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def ensure_private_file(path):
+    """Migrate an existing sensitive runtime file to owner-only access."""
+    path = Path(path)
+    if path.exists():
+        os.chmod(path, 0o600)
+    return path
+
+
 def state_file(base_dir):
     return Path(base_dir) / "state" / "processed.json"
 
@@ -164,7 +179,7 @@ def _serialize(entries):
 
 
 def save(base_dir, entries):
-    write_atomic(state_file(base_dir), _serialize(entries))
+    write_atomic(state_file(base_dir), _serialize(entries), mode=0o600)
 
 
 def last_run(base_dir, routine_id):
@@ -183,6 +198,9 @@ class Store:
     def __init__(self, base_dir, dry_run=False):
         self.path = state_file(base_dir)
         self.dry_run = dry_run
+        if not dry_run:
+            ensure_private_dir(self.path.parent)
+            ensure_private_file(self.path)
         self.entries = load(base_dir)
 
     def __contains__(self, item_id):
@@ -208,11 +226,11 @@ class Store:
             return
         merged = dict(self.entries)
         merged[item_id] = entry
-        write_atomic(self.path, _serialize(merged))
+        write_atomic(self.path, _serialize(merged), mode=0o600)
         self.entries = merged
 
     def record_resolving(self, item_id, entry, source_id):
-        """Record success and atomically clear rejected versions of one source.
+        """Record success and atomically clear failed versions of one source.
 
         Versioned sources may produce a new candidate id after their content is
         corrected while retaining one stable source id. Keeping an older
@@ -226,12 +244,20 @@ class Store:
             for key, value in self.entries.items()
             if not (
                 key != item_id
-                and value.get("calendar_match_rejected")
-                and value.get("source_id") == source_id
+                and source_id is not None
+                and (
+                    value.get("calendar_match_rejected")
+                    or value.get("memory_error")
+                    or value.get("expand_fallback")
+                )
+                and (
+                    value.get("memory_source_id") == source_id
+                    or value.get("source_id") == source_id
+                )
             )
         }
         merged[item_id] = entry
-        write_atomic(self.path, _serialize(merged))
+        write_atomic(self.path, _serialize(merged), mode=0o600)
         self.entries = merged
 
 
@@ -246,6 +272,9 @@ class ScheduleStore:
     def __init__(self, base_dir, dry_run=False):
         self.path = schedule_file(base_dir)
         self.dry_run = dry_run
+        if not dry_run:
+            ensure_private_dir(self.path.parent)
+            ensure_private_file(self.path)
         self.entries = self._load()
 
     def _load(self):
@@ -288,7 +317,7 @@ class ScheduleStore:
                 "last_attempted_at": stamp,
                 "last_attempted_epoch": now,
             }
-        write_atomic(self.path, _serialize(merged))
+        write_atomic(self.path, _serialize(merged), mode=0o600)
         self.entries = merged
 
 
@@ -304,6 +333,9 @@ class CursorStore:
     def __init__(self, base_dir, dry_run=False):
         self.path = cursor_file(base_dir)
         self.dry_run = dry_run
+        if not dry_run:
+            ensure_private_dir(self.path.parent)
+            ensure_private_file(self.path)
         self.entries = self._load()
 
     @staticmethod
@@ -362,7 +394,7 @@ class CursorStore:
                 "kind": kind,
                 "last_successful_scan_at": checkpoint,
             }
-        write_atomic(self.path, _serialize(merged))
+        write_atomic(self.path, _serialize(merged), mode=0o600)
         self.entries = merged
 
 
@@ -381,12 +413,13 @@ class RunLock:
         self._fh = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
         for _ in range(5):
             # O_RDWR|O_CREAT, never "w": open(path, "w") truncates before the
             # lock is even attempted, so a losing contender would erase the
             # holder's pid — the one diagnostic this file carries.
-            fh = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
+            fh = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600), "r+")
+            os.chmod(self.path, 0o600)
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
