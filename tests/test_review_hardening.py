@@ -208,6 +208,43 @@ class CursorIsolationTest(unittest.TestCase):
                 "gmail",
             ))
 
+    def test_failed_owner_listing_holds_the_fallback_claimant_cursor(self):
+        candidate = {
+            "id": "m1", "title": "durable",
+            "raw": {"thread_id": "t1"},
+        }
+
+        def source(query):
+            return {
+                "kind": "gmail", "query": query, "catch_up": True,
+                "catch_up_after": "2026-08-01T00:00:00Z", "max_results": 0,
+            }
+
+        owner = self.routine("owner", source("from:owner@example.com"))
+        owner["routing"] = {"priority": 1}
+        fallback = self.routine("fallback", source("in:anywhere"))
+        fallback["routing"] = {"fallback": True}
+
+        def candidates(value):
+            if value["query"] == "from:owner@example.com":
+                raise RuntimeError("owner listing unavailable")
+            return [candidate]
+
+        with mock.patch.dict(
+            runner.SOURCES,
+            {"gmail": (candidates, mock.Mock())},
+        ), mock.patch.object(config, "validate", return_value=[]):
+            totals = runner.run(self.base, [owner, fallback])
+
+        cursors = state.CursorStore(self.base)
+        self.assertEqual(totals["errors"], 1)
+        for routine in (owner, fallback):
+            self.assertIsNone(cursors.checkpoint(
+                routine["id"],
+                runner._catch_up_cursor_id(routine["source"]),
+                "gmail",
+            ))
+
 
 class MemorySinkProofTest(unittest.TestCase):
     def test_structured_extraction_rejects_missing_and_unknown_fields(self):

@@ -14,14 +14,18 @@ MAINTENANCE_LAUNCHD_LABEL = "com.memory-daemon-maintenance"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
+_TICK_PREFIX = (
+    r"^tick(?:\[(?P<id>[^\]]+)\])?"
+    r"(?:\((?P<group>capture|maintenance|all)\))?"
+)
 _TICK_DUE = re.compile(
-    r"^tick(?:\[(?P<id>[^\]]+)\])?: due=(?P<ids>.*?)"
+    _TICK_PREFIX + r": due=(?P<ids>.*?)"
     r"(?P<dry> \(dry-run\))?$"
 )
-_TICK_DONE = re.compile(r"^tick(?:\[(?P<id>[^\]]+)\])? done:")
-_TICK_SKIPPED = re.compile(r"^tick(?:\[(?P<id>[^\]]+)\])? skipped\b")
+_TICK_DONE = re.compile(_TICK_PREFIX + r" done:")
+_TICK_SKIPPED = re.compile(_TICK_PREFIX + r" skipped\b")
 _TICK_NOOP = re.compile(
-    r"^tick(?:\[(?P<id>[^\]]+)\])?: no routines due"
+    _TICK_PREFIX + r": no routines due"
     r"(?P<dry> \(dry-run\))?$"
 )
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
@@ -108,7 +112,7 @@ def read_tick_history(path):
     """Summarize coordinator ticks and the last result for every routine."""
     path = Path(path)
     if not path.exists():
-        return {"latest": None, "routines": {}}
+        return {"latest": None, "latest_by_group": {}, "routines": {}}
     try:
         # Status is interactive and must stay bounded even after years of
         # unattended operation. Rotation normally keeps this small; tailing is
@@ -121,11 +125,23 @@ def read_tick_history(path):
                 handle.readline()  # discard a partial first line
             lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
-        return {"latest": None, "routines": {}}
+        return {"latest": None, "latest_by_group": {}, "routines": {}}
 
     routine_results = {}
     active = {}
     latest = None
+    latest_by_group = {}
+
+    def tick_group(match):
+        return match.group("group") or "all"
+
+    def tick_key(match):
+        return (tick_group(match), match.group("id") or _LEGACY_TICK_KEY)
+
+    def record_latest(group, result):
+        nonlocal latest
+        latest = result
+        latest_by_group[group] = result
 
     def close_incomplete(block):
         if not block:
@@ -136,6 +152,7 @@ def read_tick_history(path):
             routine_results[routine_id] = {
                 "state": "incomplete",
                 "at": block["at"],
+                "group": block["group"],
             }
 
     for line in lines:
@@ -147,7 +164,8 @@ def read_tick_history(path):
 
         due = _TICK_DUE.match(message)
         if due:
-            key = due.group("id") or _LEGACY_TICK_KEY
+            group = tick_group(due)
+            key = tick_key(due)
             close_incomplete(active.pop(key, None))
             dry_run = bool(due.group("dry"))
             due_ids = {
@@ -159,19 +177,22 @@ def read_tick_history(path):
                 "at": at,
                 "due_ids": due_ids,
                 "dry_run": dry_run,
+                "group": group,
                 "routine_errors": {},
             }
             if not dry_run:
-                latest = {
+                record_latest(group, {
                     "state": "incomplete",
                     "at": at,
                     "message": message,
-                }
+                    "group": group,
+                })
             continue
 
         done = _TICK_DONE.match(message)
         if done:
-            key = done.group("id") or _LEGACY_TICK_KEY
+            group = tick_group(done)
+            key = tick_key(done)
             block = active.pop(key, None)
             dry_run = message.endswith(" (dry-run)") or bool(
                 block and block["dry_run"]
@@ -198,16 +219,18 @@ def read_tick_history(path):
                         routine_results[routine_id] = {
                             "state": "error" if failed else "ok",
                             "at": at,
+                            "group": block["group"],
                         }
                         if failed and attribution_complete:
                             routine_results[routine_id]["errors"] = (
                                 routine_error_count
                             )
-                latest = {
+                record_latest(group, {
                     "state": "error" if error_count else "done",
                     "at": at,
                     "message": message,
-                }
+                    "group": group,
+                })
             continue
 
         routine_error = _ROUTINE_ERROR.match(message)
@@ -221,7 +244,8 @@ def read_tick_history(path):
 
         skipped = _TICK_SKIPPED.match(message)
         if skipped:
-            key = skipped.group("id") or _LEGACY_TICK_KEY
+            group = tick_group(skipped)
+            key = tick_key(skipped)
             block = active.pop(key, None)
             dry_run = message.endswith(" (dry-run)") or bool(
                 block and block["dry_run"]
@@ -232,28 +256,39 @@ def read_tick_history(path):
                         routine_results[routine_id] = {
                             "state": "skipped",
                             "at": at,
+                            "group": block["group"],
                         }
-                latest = {
+                record_latest(group, {
                     "state": "skipped",
                     "at": at,
                     "message": message,
-                }
+                    "group": group,
+                })
             continue
 
         noop = _TICK_NOOP.match(message)
         if noop:
-            key = noop.group("id") or _LEGACY_TICK_KEY
+            group = tick_group(noop)
+            key = tick_key(noop)
             close_incomplete(active.pop(key, None))
             if not noop.group("dry"):
-                latest = {"state": "idle", "at": at, "message": message}
+                record_latest(group, {
+                    "state": "idle", "at": at, "message": message,
+                    "group": group,
+                })
 
     for block in active.values():
         close_incomplete(block)
-    return {"latest": latest, "routines": routine_results}
+    return {
+        "latest": latest,
+        "latest_by_group": latest_by_group,
+        "routines": routine_results,
+    }
 
 
 def routine_rows(
-    base_dir, routines, tick_history, now=None, scheduler_running=False
+    base_dir, routines, tick_history, now=None, scheduler_running=False,
+    scheduler_running_groups=None,
 ):
     """Build privacy-safe status rows from durable state and operational logs."""
     now = time.time() if now is None else float(now)
@@ -261,6 +296,11 @@ def routine_rows(
     ledger = state.load(base_dir)
     tick_results = tick_history.get("routines", {})
     latest_tick = tick_history.get("latest") or {}
+    latest_by_group = tick_history.get("latest_by_group", {})
+    if scheduler_running_groups is None:
+        scheduler_running_groups = {"all"} if scheduler_running else set()
+    else:
+        scheduler_running_groups = set(scheduler_running_groups)
     rows = []
 
     for routine in routines:
@@ -300,11 +340,22 @@ def routine_rows(
 
         tick_result = tick_results.get(routine_id) or {}
         tick_state = tick_result.get("state")
+        tick_group = tick_result.get("group", "all")
+        latest_for_group = latest_by_group.get(tick_group) or (
+            latest_tick if tick_group == "all" else {}
+        )
+        matching_scheduler_running = (
+            tick_group in scheduler_running_groups
+            or (
+                tick_group == "all"
+                and bool(scheduler_running_groups)
+            )
+        )
         current_tick = (
-            scheduler_running
+            matching_scheduler_running
             and tick_state == "incomplete"
-            and latest_tick.get("state") == "incomplete"
-            and tick_result.get("at") == latest_tick.get("at")
+            and latest_for_group.get("state") == "incomplete"
+            and tick_result.get("at") == latest_for_group.get("at")
         )
         if tick_state == "error":
             error_count = tick_result.get("errors")
@@ -370,16 +421,17 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     if label == DEFAULT_LAUNCHD_LABEL:
         legacy = probe_launchd(LEGACY_LAUNCHD_LABEL)
     history = read_tick_history(Path(base_dir) / "logs" / "run.log")
-    scheduler_running = (
-        launchd.get("state") == "running"
-        or bool(maintenance and maintenance.get("state") == "running")
-    )
+    scheduler_running_groups = set()
+    if launchd.get("state") == "running":
+        scheduler_running_groups.add("capture")
+    if maintenance and maintenance.get("state") == "running":
+        scheduler_running_groups.add("maintenance")
     rows = routine_rows(
         base_dir,
         routines,
         history,
         now=now,
-        scheduler_running=scheduler_running,
+        scheduler_running_groups=scheduler_running_groups,
     )
 
     if launchd["loaded"]:
@@ -415,14 +467,26 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
                 f"legacy {LEGACY_LAUNCHD_LABEL} is still loaded; migrate it"
             )
 
-    latest = history.get("latest")
-    tick_issue = _tick_issue(launchd, latest, now)
-    if latest:
-        tick_text = f"{_iso_age(latest['at'], now)} — {latest['message']}"
-    else:
-        tick_text = "never recorded"
-    if tick_issue:
-        tick_text += f" · ATTENTION: {tick_issue}"
+    latest_by_group = history.get("latest_by_group", {})
+    grouped_history = any(
+        group in latest_by_group for group in ("capture", "maintenance")
+    )
+    legacy_latest = latest_by_group.get("all") or (
+        history.get("latest") if not grouped_history else None
+    )
+    capture_latest = latest_by_group.get("capture") or (
+        legacy_latest if not grouped_history else None
+    )
+    maintenance_latest = (
+        latest_by_group.get("maintenance")
+        or (legacy_latest if not grouped_history else None)
+        if maintenance is not None else None
+    )
+    capture_tick_issue = _tick_issue(launchd, capture_latest, now)
+    maintenance_tick_issue = (
+        _tick_issue(maintenance, maintenance_latest, now)
+        if maintenance is not None else None
+    )
 
     lines = [
         "Memory Daemon",
@@ -435,7 +499,16 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             f"Maintenance scheduler: {' · '.join(maintenance_bits)}",
             f"Next maintenance run: {_next_coordinator_run(maintenance)}",
         ])
-    lines.extend([f"Last tick: {tick_text}", ""])
+    lines.append(
+        "Last capture tick: "
+        f"{_tick_text(capture_latest, capture_tick_issue, now)}"
+    )
+    if maintenance is not None:
+        lines.append(
+            "Last maintenance tick: "
+            f"{_tick_text(maintenance_latest, maintenance_tick_issue, now)}"
+        )
+    lines.append("")
     headers = (
         "ROUTINE", "ROLE", "SOURCES", "ARMED", "STATUS", "EVERY",
         "LAST ATTEMPT", "NEXT", "LAST CAPTURE", "ISSUES",
@@ -464,19 +537,39 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
                 and maintenance.get("last_exit") in (None, 0)
             )
         )
-        and tick_issue is None
+        and capture_tick_issue is None
+        and maintenance_tick_issue is None
         and not (legacy and legacy["loaded"])
     )
     routines_healthy = all(row["issues"] == "-" for row in rows)
-    latest_healthy = (
-        not latest
-        or latest["state"] not in {"error", "incomplete"}
-        or (
-            latest["state"] == "incomplete"
-            and scheduler_running
+    latest_healthy = all(
+        _latest_tick_healthy(
+            result,
+            group in scheduler_running_groups,
         )
+        for group, result in (
+            ("capture", capture_latest),
+            ("maintenance", maintenance_latest),
+        )
+        if result is not None
     )
     return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
+
+
+def _tick_text(latest, issue, now):
+    if latest:
+        text = f"{_iso_age(latest['at'], now)} — {latest['message']}"
+    else:
+        text = "never recorded"
+    if issue:
+        text += f" · ATTENTION: {issue}"
+    return text
+
+
+def _latest_tick_healthy(latest, scheduler_running):
+    if not latest or latest["state"] not in {"error", "incomplete"}:
+        return True
+    return latest["state"] == "incomplete" and scheduler_running
 
 
 def _scheduler_bits(job):

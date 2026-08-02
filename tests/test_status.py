@@ -149,6 +149,26 @@ class TickHistoryTest(unittest.TestCase):
         self.assertEqual(history["routines"]["alpha"]["state"], "error")
         self.assertNotIn("beta", history["routines"])
 
+    def test_interleaved_scheduler_groups_keep_independent_latest_ticks(self):
+        self.write(
+            "2026-07-29T09:00:00Z tick[cap123](capture): due=alpha\n"
+            "2026-07-29T09:00:01Z tick[maint456](maintenance): "
+            "no routines due\n"
+        )
+
+        history = status.read_tick_history(self.log)
+
+        self.assertEqual(history["latest"]["group"], "maintenance")
+        self.assertEqual(
+            history["latest_by_group"]["capture"]["state"],
+            "incomplete",
+        )
+        self.assertEqual(
+            history["latest_by_group"]["maintenance"]["state"],
+            "idle",
+        )
+        self.assertEqual(history["routines"]["alpha"]["group"], "capture")
+
 
 class RoutineStatusTest(unittest.TestCase):
     def setUp(self):
@@ -436,6 +456,47 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(alpha["status"], "attention")
         self.assertEqual(alpha["issues"], "incomplete")
 
+    def test_other_scheduler_cannot_make_an_incomplete_tick_current(self):
+        history = {
+            "latest": {
+                "state": "idle", "at": "later", "group": "maintenance",
+            },
+            "latest_by_group": {
+                "capture": {
+                    "state": "incomplete", "at": "now", "group": "capture",
+                },
+                "maintenance": {
+                    "state": "idle", "at": "later", "group": "maintenance",
+                },
+            },
+            "routines": {
+                "alpha": {
+                    "state": "incomplete", "at": "now", "group": "capture",
+                },
+            },
+        }
+
+        rows = status.routine_rows(
+            self.base,
+            self.routines,
+            history,
+            now=5000,
+            scheduler_running_groups={"maintenance"},
+        )
+        alpha = next(row for row in rows if row["routine"] == "alpha")
+        self.assertEqual(alpha["status"], "attention")
+        self.assertEqual(alpha["issues"], "incomplete")
+
+        rows = status.routine_rows(
+            self.base,
+            self.routines,
+            history,
+            now=5000,
+            scheduler_running_groups={"capture"},
+        )
+        alpha = next(row for row in rows if row["routine"] == "alpha")
+        self.assertEqual(alpha["status"], "in-tick")
+
 
 class RenderStatusTest(unittest.TestCase):
     @staticmethod
@@ -549,6 +610,48 @@ class RenderStatusTest(unittest.TestCase):
 
         self.assertFalse(healthy)
         self.assertIn("last tick is stale", text)
+
+    def test_recent_maintenance_tick_does_not_hide_stale_capture_tick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            log = base / "logs" / "run.log"
+            log.parent.mkdir()
+            log.write_text(
+                "1970-01-01T00:16:40Z tick[cap](capture): no routines due\n"
+                "1970-01-01T00:48:20Z tick[maint](maintenance): "
+                "no routines due\n"
+            )
+            launchd = {
+                "loaded": True,
+                "label": "com.memory-daemon",
+                "state": "not running",
+                "pid": None,
+                "runs": 4,
+                "last_exit": 0,
+                "interval_seconds": 900,
+            }
+            maintenance = {
+                **launchd,
+                "label": status.MAINTENANCE_LAUNCHD_LABEL,
+            }
+            with mock.patch.object(
+                status,
+                "probe_launchd",
+                side_effect=self.probe(launchd, maintenance=maintenance),
+            ):
+                text, healthy = status.render(base, [], now=3000)
+
+        self.assertFalse(healthy)
+        capture_line = next(
+            line for line in text.splitlines()
+            if line.startswith("Last capture tick:")
+        )
+        maintenance_line = next(
+            line for line in text.splitlines()
+            if line.startswith("Last maintenance tick:")
+        )
+        self.assertIn("ATTENTION: last tick is stale", capture_line)
+        self.assertNotIn("ATTENTION", maintenance_line)
 
     def test_legacy_loaded_job_gets_a_migration_hint(self):
         current = {

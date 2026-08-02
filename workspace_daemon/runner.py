@@ -402,12 +402,15 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 f"{source_coverage[coverage_key]}"
             )
     routing_errors_before = totals["errors"]
+    routing_holds = set()
     owned = _route_claims(
-        claims, totals, failures=[*routing_failures, *listing_failures]
+        claims, totals, failures=[*routing_failures, *listing_failures],
+        held_source_keys=routing_holds,
     )
     failed_source_keys = {
         key for key, problem in source_coverage.items() if problem
     }
+    failed_source_keys.update(routing_holds)
     if totals["errors"] > routing_errors_before:
         # Ownership ambiguity cannot safely be assigned to just one claimant.
         failed_source_keys.update(
@@ -1800,7 +1803,7 @@ def _failure_blocks_claim(failure, claim, best_rank, managed):
     return failure["rank"] <= best_rank
 
 
-def _route_claims(claims, totals, failures=()):
+def _route_claims(claims, totals, failures=(), held_source_keys=None):
     """Choose exactly one routine for every source candidate.
 
     A specific routine always beats a fallback. Explicit lower priority wins
@@ -1808,6 +1811,9 @@ def _route_claims(claims, totals, failures=()):
     rather than letting routine file order choose the extraction prompt.
     """
     owned = {}
+    held_source_keys = (
+        held_source_keys if held_source_keys is not None else set()
+    )
     for (kind, item_id), candidates in claims.items():
         managed_followups = [
             claim for claim in candidates if _is_managed_followup_claim(claim)
@@ -1859,6 +1865,10 @@ def _route_claims(claims, totals, failures=()):
             )
         }
         if blockers:
+            # The fallback correctly refuses to steal this item, but its
+            # successful listing must not advance past it. Hold every claimant
+            # cursor until the failed higher-priority owner recovers.
+            held_source_keys.update(claimant_source_keys)
             ids = ", ".join(sorted(blockers))
             log(
                 f"ownership blocked source={kind} id={item_id}: "

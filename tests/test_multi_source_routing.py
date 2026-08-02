@@ -2410,6 +2410,89 @@ class RunCommandTest(unittest.TestCase):
             ):
                 daemon_cli.cmd_run(args)
 
+    def test_manual_all_uses_the_scheduler_lock_for_slack_census(self):
+        self.routine["enabled"] = True
+        census = {
+            "id": "census",
+            "enabled": True,
+            "role": "maintenance",
+            "schedule": {"every": "1d"},
+            "maintenance": {
+                "kind": "slack_conversation_census",
+                "checkpoint": "state/census.json",
+            },
+        }
+        args = SimpleNamespace(
+            routine=None,
+            include_disabled=False,
+            dry_run=False,
+            refresh_labels=False,
+        )
+        totals = {
+            "processed": 0, "skipped": 0, "errors": 0,
+            "matched": 0, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(daemon_cli.config, "secure_routine_files"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine, census]
+             ), \
+             mock.patch.object(daemon_cli.config, "validate", return_value=[]), \
+             mock.patch.object(
+                 daemon_cli.runner, "run", return_value=totals
+             ) as run:
+            self.assertEqual(daemon_cli.cmd_run(args), 0)
+
+        self.assertEqual(run.call_count, 2)
+        calls = {
+            frozenset(call.kwargs["active_ids"]): call.kwargs["lock_name"]
+            for call in run.call_args_list
+        }
+        self.assertEqual(calls[frozenset({"domain"})], "run")
+        self.assertEqual(calls[frozenset({"census"})], "slack-census")
+
+    def test_manual_named_slack_census_uses_its_scheduler_lock(self):
+        census = {
+            "id": "census",
+            "enabled": True,
+            "role": "maintenance",
+            "schedule": {"every": "1d"},
+            "maintenance": {
+                "kind": "slack_conversation_census",
+                "checkpoint": "state/census.json",
+            },
+        }
+        args = SimpleNamespace(
+            routine="census",
+            include_disabled=False,
+            dry_run=False,
+            refresh_labels=False,
+        )
+        totals = {
+            "processed": 0, "skipped": 0, "errors": 0,
+            "matched": 0, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(daemon_cli.config, "secure_routine_files"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[census]
+             ), \
+             mock.patch.object(daemon_cli.config, "validate", return_value=[]), \
+             mock.patch.object(
+                 daemon_cli.runner, "run", return_value=totals
+             ) as run:
+            self.assertEqual(daemon_cli.cmd_run(args), 0)
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["active_ids"], {"census"})
+        self.assertEqual(run.call_args.kwargs["lock_name"], "slack-census")
+
 
 class TickCommandTest(unittest.TestCase):
     def setUp(self):
@@ -2444,6 +2527,44 @@ class TickCommandTest(unittest.TestCase):
                 mock.call("tick[abc123456789]: due=domain"),
                 mock.call(
                     "tick[abc123456789] done: 0 processed, "
+                    "0 already-seen, 0 error(s)"
+                ),
+            ],
+        )
+
+    def test_grouped_tick_identifies_its_scheduler_stream(self):
+        args = SimpleNamespace(
+            dry_run=False,
+            refresh_labels=False,
+            group="capture",
+        )
+        totals = {
+            "processed": 0, "skipped": 0, "errors": 0,
+            "matched": 0, "fallbacks": 0, "pending_actions": 0,
+            "ambiguous": 0,
+        }
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(
+                 daemon_cli.uuid, "uuid4",
+                 return_value=SimpleNamespace(hex="capture12345ffff"),
+             ), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine]
+             ), \
+             mock.patch.object(
+                 daemon_cli.runner, "run", return_value=totals
+             ), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_tick(args), 0)
+
+        self.assertEqual(
+            log.call_args_list,
+            [
+                mock.call("tick[capture12345](capture): due=domain"),
+                mock.call(
+                    "tick[capture12345](capture) done: 0 processed, "
                     "0 already-seen, 0 error(s)"
                 ),
             ],

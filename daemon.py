@@ -113,6 +113,54 @@ def cmd_validate(args):
 
 # --- run --------------------------------------------------------------------
 
+def _execution_groups(routines, active_ids):
+    """Partition work by the lock that protects its mutable state."""
+    selected = [
+        routine for routine in routines
+        if routine.get("enabled", True) and routine["id"] in active_ids
+    ]
+    return [
+        (
+            {
+                routine["id"] for routine in selected
+                if not config.is_maintenance(routine)
+            },
+            "run",
+        ),
+        (
+            {
+                routine["id"] for routine in selected
+                if config.is_maintenance(routine)
+                and (routine.get("maintenance") or {}).get("kind")
+                != "slack_conversation_census"
+            },
+            "run",
+        ),
+        (
+            {
+                routine["id"] for routine in selected
+                if config.is_maintenance(routine)
+                and (routine.get("maintenance") or {}).get("kind")
+                == "slack_conversation_census"
+            },
+            "slack-census",
+        ),
+    ]
+
+
+def _empty_totals():
+    return {
+        "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
+        "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
+    }
+
+
+def _merge_totals(totals, additions):
+    for key, value in additions.items():
+        if isinstance(value, (int, float)):
+            totals[key] = totals.get(key, 0) + value
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
     if not args.dry_run:
@@ -142,18 +190,31 @@ def cmd_run(args):
         "operational log only)"
         if args.dry_run else ""
     )
-    log(f"run start: {len(routines)} routine(s){mode}")
-    try:
-        active_ids = {args.routine} if args.routine else None
-        totals = runner.run(
-            BASE_DIR, routines, dry_run=args.dry_run,
-            refresh_labels=args.refresh_labels, active_ids=active_ids,
-        )
-    except state.AlreadyRunning as exc:
-        # Not an error: launchd firing while a long run is still going is
-        # expected, and the next interval will pick the work up.
-        log(f"run skipped — {exc}")
-        return 0
+    active_ids = (
+        {args.routine}
+        if args.routine else {
+            routine["id"] for routine in routines
+            if routine.get("enabled", True)
+        }
+    )
+    log(f"run start: {len(active_ids)} routine(s){mode}")
+    totals = _empty_totals()
+    for group_ids, lock_name in _execution_groups(routines, active_ids):
+        if not group_ids:
+            continue
+        try:
+            group_totals = runner.run(
+                BASE_DIR, routines, dry_run=args.dry_run,
+                refresh_labels=args.refresh_labels, active_ids=group_ids,
+                lock_name=lock_name,
+            )
+        except state.AlreadyRunning as exc:
+            # Manual and scheduled census runs share slack-census.lock; other
+            # work shares run.lock. A busy group is deferred without blocking
+            # an independent group in the same manual invocation.
+            log(f"run group={lock_name} skipped — {exc}")
+            continue
+        _merge_totals(totals, group_totals)
 
     verb = "would process" if args.dry_run else "processed"
     summary = (
@@ -191,6 +252,9 @@ def cmd_tick(args):
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
     group = getattr(args, "group", "all")
+    tick_name = f"tick[{tick_id}]"
+    if group != "all":
+        tick_name += f"({group})"
     selected = [
         r for r in routines
         if (
@@ -208,43 +272,17 @@ def cmd_tick(args):
     ]
     if not due:
         mode = " (dry-run)" if args.dry_run else ""
-        log(f"tick[{tick_id}]: no routines due{mode}")
+        log(f"{tick_name}: no routines due{mode}")
         return 0
 
     due_ids = {r["id"] for r in due}
     mode = " (dry-run)" if args.dry_run else ""
-    log(f"tick[{tick_id}]: due={', '.join(sorted(due_ids))}{mode}")
-    totals = {
-        "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
-        "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
-    }
+    log(f"{tick_name}: due={', '.join(sorted(due_ids))}{mode}")
+    totals = _empty_totals()
     # Run latency-sensitive capture before long maintenance (the Slack census
     # can take tens of minutes). Persist each group's attempt immediately, so
     # the next tick cannot repeat capture merely because maintenance was slow.
-    groups = [
-        (
-            {r["id"] for r in due if not config.is_maintenance(r)},
-            "run",
-        ),
-        (
-            {
-                r["id"] for r in due
-                if config.is_maintenance(r)
-                and (r.get("maintenance") or {}).get("kind")
-                != "slack_conversation_census"
-            },
-            "run",
-        ),
-        (
-            {
-                r["id"] for r in due
-                if config.is_maintenance(r)
-                and (r.get("maintenance") or {}).get("kind")
-                == "slack_conversation_census"
-            },
-            "slack-census",
-        ),
-    ]
+    groups = _execution_groups(routines, due_ids)
     for group_ids, lock_name in groups:
         if not group_ids:
             continue
@@ -258,14 +296,12 @@ def cmd_tick(args):
                 lock_name=lock_name,
             )
         except state.AlreadyRunning as exc:
-            log(f"tick[{tick_id}] skipped — {exc}{mode}")
+            log(f"{tick_name} skipped — {exc}{mode}")
             continue
         schedule.mark_attempted(group_ids, now=group_started_epoch)
-        for key, value in group_totals.items():
-            if isinstance(value, (int, float)):
-                totals[key] = totals.get(key, 0) + value
+        _merge_totals(totals, group_totals)
     log(
-        f"tick[{tick_id}] done: {totals['processed']} processed, "
+        f"{tick_name} done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
         f"{mode}"
     )
