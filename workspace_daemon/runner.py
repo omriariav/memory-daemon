@@ -1547,6 +1547,17 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             # Keep the normal Gmail sweep and the explicit Inbox queue as two
             # independent reads. A failure in either one must not erase the
             # successful candidates from the other.
+            followup_listing = dict(
+                listing_source,
+                query=GMAIL_CHAT_FOLLOWUP_QUERY,
+                max_results=0,
+                _gmail_chat_followup_listing=True,
+            )
+            # This is an exact lifecycle queue, not another catch-up source.
+            # Inheriting the broad Gmail queue or its cursor causes every
+            # unread/starred thread to masquerade as an explicit Chat forward.
+            for inherited in ("queue_query", "exclude_query", "_since"):
+                followup_listing.pop(inherited, None)
             listing_specs = [
                 {
                     "label": "gmail",
@@ -1563,12 +1574,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 },
                 {
                     "label": "gmail follow-up queue",
-                    "listing_source": dict(
-                        listing_source,
-                        query=GMAIL_CHAT_FOLLOWUP_QUERY,
-                        max_results=0,
-                        _gmail_chat_followup_listing=True,
-                    ),
+                    "listing_source": followup_listing,
                     "claim_source": source,
                     "ownership_class": "gmail_followup",
                     "expand_ownership": False,
