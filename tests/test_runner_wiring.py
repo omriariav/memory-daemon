@@ -319,6 +319,68 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertIn("Original specialized context.", prompts[0])
         self.assertIn("Newest durable reply.", prompts[0])
 
+    def test_two_gmail_sources_route_to_the_newest_thread_message(self):
+        prompts = []
+        action_ids = []
+
+        def search(query, max_results=20):
+            message_id = "older-match" if query == "first" else "newest-reply"
+            return [{
+                "message_id": message_id,
+                "thread_id": "shared-thread",
+                "subject": "Shared topic",
+            }]
+
+        gmail.search = search
+        gmail.read_message = lambda _mid: self.fail(
+            "same-routine Gmail collisions must fetch the complete thread"
+        )
+        gmail.read_thread = lambda _tid: {
+            "messages": [
+                {
+                    "id": "older-match",
+                    "headers": {
+                        "subject": "Shared topic",
+                        "from": "First <first@example.com>",
+                        "date": "Sat, 1 Aug 2026 08:00:00 +0000",
+                    },
+                    "labels": ["INBOX"],
+                    "body": "Earlier context.",
+                },
+                {
+                    "id": "newest-reply",
+                    "headers": {
+                        "subject": "Re: Shared topic",
+                        "from": "Second <second@example.com>",
+                        "date": "Sat, 1 Aug 2026 09:00:00 +0000",
+                    },
+                    "labels": ["INBOX", "UNREAD"],
+                    "body": "Latest update.",
+                },
+            ]
+        }
+        llm.analyze = lambda _routine, prompt: (
+            prompts.append(prompt) or "a summary"
+        )
+        actions._HANDLERS["archive"] = action_ids.append
+
+        domain = routine(self.vault)
+        domain.pop("source")
+        domain.pop("actions")
+        domain["sources"] = [
+            {"kind": "gmail", "query": "first", "actions": ["archive"]},
+            {"kind": "gmail", "query": "second", "actions": ["archive"]},
+        ]
+
+        totals = runner.run(self.base, [domain])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(action_ids, ["newest-reply"])
+        self.assertEqual(set(self.ledger()), {"newest-reply"})
+        self.assertIn("Earlier context.", prompts[0])
+        self.assertIn("Latest update.", prompts[0])
+
     def test_gmail_marks_active_self_forwarded_chat_as_followup(self):
         gmail.read_message = lambda mid: {
             "headers": {

@@ -1621,13 +1621,13 @@ def _route_claims(claims, totals, failures=()):
                 f"owner {claim['routine']['id']} reached its processing cap"
             )
             continue
-        if kind == "gmail" and len({
-            candidate["routine"]["id"] for candidate in candidates
-        }) > 1:
+        if kind == "gmail" and len(candidates) > 1:
             # Different Gmail queries can match different messages from the
             # same thread. Keep the winning routine and prompt, but make fetch
             # resolve the actual newest message and render the bounded thread.
             # This also makes message-scoped actions target the current reply.
+            # Multiple source blocks inside one routine need the same treatment
+            # as claims from separate routines.
             claim = dict(claim)
             candidate = dict(claim["candidate"])
             raw = dict(candidate.get("raw") or {})
