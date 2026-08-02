@@ -76,6 +76,23 @@ Date: {date}
 {body}
 """
 
+OPERATOR_CONFIRMED_PROMPT = """The memory owner explicitly confirmed that this exact source is durable
+and must be retained. Do not decide whether it is memory-worthy and do not
+output NOT MEMORY-WORTHY. Write a compact, self-contained work-memory note in
+English that preserves the source's concrete product facts, questions, current
+behavior, constraints, decisions, and actions. Do not invent missing context.
+Never reproduce credentials, secrets, or unrelated sensitive personal data.
+
+--- SOURCE ---
+{source_header}
+
+{body}
+"""
+
+OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
+    r"^(?:gmail|gchat|slack|gdrive|mila):[^\s]+$"
+)
+
 
 def memory_cfg(routine):
     cfg = routine.get("memory")
@@ -136,6 +153,20 @@ def validate(routine):
     tags = cfg.get("tags")
     if tags is not None and not isinstance(tags, list):
         problems.append(f"{rid}: memory.tags must be a list")
+    confirmed = cfg.get("operator_confirmed_source_ids")
+    if confirmed is not None and (
+        not isinstance(confirmed, list)
+        or any(
+            not isinstance(value, str)
+            or value != value.strip()
+            or not OPERATOR_CONFIRMED_SOURCE_ID_RE.fullmatch(value)
+            for value in confirmed
+        )
+    ):
+        problems.append(
+            f"{rid}: memory.operator_confirmed_source_ids must be a list "
+            "of canonical source ids (gmail:, gchat:, slack:, gdrive:, or mila:)"
+        )
     return problems
 
 
@@ -380,6 +411,43 @@ def _has_no_owner_action_marker(summary):
     return any(line.strip().casefold() == marker for line in summary.splitlines())
 
 
+def _operator_confirmed(cfg, source_id):
+    return bool(
+        source_id
+        and source_id in (cfg.get("operator_confirmed_source_ids") or [])
+    )
+
+
+def is_operator_confirmed(routine, item):
+    """Whether the owner explicitly approved this exact source for memory."""
+    return is_operator_confirmed_source_id(routine, source_id_for(item))
+
+
+def is_operator_confirmed_source_id(routine, source_id):
+    """Whether an exact canonical source id has an explicit owner override."""
+    return _operator_confirmed(memory_cfg(routine), source_id)
+
+
+def _operator_confirmed_summary(routine, item):
+    """Re-summarize one exact source after an explicit owner override."""
+    from . import llm  # late import to avoid cycles
+
+    source_header = llm.source_header_lines(item) + [
+        f"Title: {item.get('title', '')}",
+        f"Date: {item.get('date', '')}",
+    ]
+    prompt = OPERATOR_CONFIRMED_PROMPT.format(
+        source_header="\n".join(source_header),
+        body=item.get("body", ""),
+    )
+    summary = llm.analyze(routine, prompt).strip()
+    if not summary or summary == "NOT MEMORY-WORTHY":
+        raise RuntimeError(
+            "operator-confirmed source did not produce a usable summary"
+        )
+    return summary
+
+
 def capture(routine, item, summary, dry_run=False):
     """Distill `summary` into one memory entry and store it via the CLI.
 
@@ -393,6 +461,7 @@ def capture(routine, item, summary, dry_run=False):
     store = cfg["store"]
     rid = routine.get("id")
     source_id = source_id_for(item)
+    operator_confirmed = is_operator_confirmed(routine, item)
     meta = item.get("frontmatter") or {}
     active_chat_followup = (
         meta.get("gmail_chat_followup_managed") is True
@@ -419,6 +488,16 @@ def capture(routine, item, summary, dry_run=False):
             "The memory owner manually forwarded this Chat message to their "
             "Gmail Inbox for follow-up. Review the source-linked conversation."
         )
+    if (
+        summary.strip() == "NOT MEMORY-WORTHY"
+        and operator_confirmed
+        and not active_chat_followup
+    ):
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "operator-confirmed, forcing durable summarization"
+        )
+        summary = _operator_confirmed_summary(routine, item)
     if summary.strip() == "NOT MEMORY-WORTHY" and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
@@ -458,6 +537,16 @@ def capture(routine, item, summary, dry_run=False):
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
 
+    if (
+        not entry.get("worthy", True)
+        and operator_confirmed
+        and not active_chat_followup
+    ):
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "operator confirmation overrode extraction veto"
+        )
+        entry["worthy"] = True
     if not entry.get("worthy", True) and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
@@ -504,6 +593,8 @@ def capture(routine, item, summary, dry_run=False):
     tags += list(cfg.get("tags") or [])
     if active_chat_followup:
         tags.append("gmail-followup")
+    if operator_confirmed:
+        tags.append("operator-confirmed")
     tags.append(AUTO_TAG)
     if (
         dropped or unresolved_source or unresolved_owners

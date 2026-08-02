@@ -664,6 +664,271 @@ class RunnerWiringTest(unittest.TestCase):
             record["memory_entry_id"], "2026-08-01-follow-up"
         )
 
+    def test_operator_confirmed_memory_failure_retries_before_gmail_actions(self):
+        r = routine(
+            self.vault,
+            memory={
+                "store": "/store",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:m1"],
+            },
+            actions=["archive"],
+        )
+        outcomes = [
+            RuntimeError("store unavailable"),
+            {
+                "memory": "created",
+                "memory_entry_id": "2026-08-01-durable-product-context",
+            },
+        ]
+
+        with mock.patch.object(
+            memory_sink, "capture", side_effect=outcomes
+        ) as capture:
+            first = runner.run(self.base, [r])
+            first_record = self.ledger()["m1"]
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertTrue(first_record["memory_operator_confirmed"])
+        self.assertIn("memory_error", first_record)
+        self.assertNotIn("actions_pending", first_record)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 2)
+        record = self.ledger()["m1"]
+        self.assertTrue(record["memory_operator_confirmed"])
+        self.assertNotIn("memory_error", record)
+        self.assertEqual(
+            record["memory_entry_id"],
+            "2026-08-01-durable-product-context",
+        )
+
+    def test_new_operator_confirmation_replays_archived_not_worthy_thread(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        gmail.read_thread = lambda thread_id: {
+            "messages": [{
+                "id": "m1",
+                "headers": {
+                    "subject": "Durable product context",
+                    "from": "owner@example.com",
+                    "to": "memory@example.com",
+                    "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+                },
+                "body": "The product behavior changed.",
+            }],
+        }
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            side_effect=[
+                {"memory": "skipped_not_worthy"},
+                {
+                    "memory": "created",
+                    "memory_entry_id": "2026-08-01-durable-product-context",
+                },
+            ],
+        ) as capture:
+            first = runner.run(self.base, [r])
+            gmail.search = lambda query, max_results=20: []
+            r["memory"]["operator_confirmed_source_ids"] = ["gmail:m1"]
+            second = runner.run(self.base, [r])
+            third = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(third["processed"], 0)
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(self.applied, ["archive"])
+        record = self.ledger()["m1"]
+        self.assertTrue(record["memory_operator_confirmed"])
+        self.assertEqual(record["memory_source_id"], "gmail:m1")
+        self.assertEqual(record["memory"], "created")
+        self.assertEqual(
+            record["memory_entry_id"],
+            "2026-08-01-durable-product-context",
+        )
+
+    def test_operator_replay_prefers_newest_skipped_reply_over_older_success(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "wiring",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:m1",
+            "memory": "created",
+            "processed_at": "2026-08-01T17:00:00Z",
+        })
+        processed.record("m2", {
+            "rule_id": "wiring",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:m1",
+            "memory": "skipped_not_worthy",
+            "processed_at": "2026-08-02T08:00:00Z",
+        })
+        gmail.search = lambda query, max_results=20: []
+        gmail.read_thread = lambda thread_id: {
+            "messages": [
+                {
+                    "id": "m1",
+                    "headers": {
+                        "subject": "Original product thread",
+                        "from": "first@example.com",
+                        "to": "memory@example.com",
+                        "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+                    },
+                    "body": "The original context.",
+                },
+                {
+                    "id": "m2",
+                    "headers": {
+                        "subject": "Re: Durable product update",
+                        "from": "latest@example.com",
+                        "to": "memory@example.com",
+                        "date": "Sun, 2 Aug 2026 08:00:00 +0000",
+                    },
+                    "body": "The durable new product behavior.",
+                },
+            ],
+        }
+        r = routine(
+            self.vault,
+            memory={
+                "store": "/store",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:m1"],
+            },
+            actions=["archive"],
+        )
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={
+                "memory": "created",
+                "memory_entry_id": "2026-08-02-durable-product-update",
+            },
+        ) as capture:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(self.applied, [])
+        item = capture.call_args.args[1]
+        self.assertEqual(item["id"], "m2")
+        self.assertEqual(item["title"], "Re: Durable product update")
+        self.assertEqual(item["date"], "2026-08-02")
+        self.assertEqual(
+            item["frontmatter"]["email_from"], "latest@example.com"
+        )
+        self.assertEqual(item["frontmatter"]["gmail_thread_message_count"], 2)
+        record = self.ledger()["m2"]
+        self.assertTrue(record["memory_operator_confirmed"])
+        self.assertEqual(record["memory_source_id"], "gmail:m1")
+        self.assertEqual(record["memory"], "created")
+
+    def test_operator_replay_retries_newer_error_after_confirmed_success(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "wiring",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:m1",
+            "memory_operator_confirmed": True,
+            "memory": "created",
+            "processed_at": "2026-08-01T17:00:00Z",
+        })
+        processed.record("m2", {
+            "rule_id": "wiring",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:m1",
+            "memory_operator_confirmed": True,
+            "memory_error": "store unavailable",
+            "processed_at": "2026-08-02T08:00:00Z",
+        })
+        gmail.search = lambda query, max_results=20: []
+        gmail.read_thread = lambda thread_id: {
+            "messages": [
+                {
+                    "id": "m1",
+                    "headers": {
+                        "subject": "Original product thread",
+                        "date": "Sat, 1 Aug 2026 17:00:00 +0000",
+                    },
+                    "body": "Original context.",
+                },
+                {
+                    "id": "m2",
+                    "headers": {
+                        "subject": "Re: New durable reply",
+                        "date": "Sun, 2 Aug 2026 08:00:00 +0000",
+                    },
+                    "body": "New durable context.",
+                },
+            ],
+        }
+        r = routine(
+            self.vault,
+            memory={
+                "store": "/store",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:m1"],
+            },
+            actions=["archive"],
+        )
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={
+                "memory": "updated",
+                "memory_entry_id": "2026-08-01-product-thread",
+            },
+        ) as capture:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args.args[1]["id"], "m2")
+        self.assertEqual(self.applied, [])
+        record = self.ledger()["m2"]
+        self.assertNotIn("memory_error", record)
+        self.assertEqual(record["memory"], "updated")
+
+    def test_operator_override_does_not_replay_latest_ordinary_success(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "wiring",
+            "source_kind": "gmail",
+            "memory_source_id": "gmail:m1",
+            "memory": "created",
+            "processed_at": "2026-08-02T08:00:00Z",
+        })
+        gmail.search = lambda query, max_results=20: []
+        r = routine(
+            self.vault,
+            memory={
+                "store": "/store",
+                "type": "note",
+                "operator_confirmed_source_ids": ["gmail:m1"],
+            },
+            actions=["archive"],
+        )
+
+        with mock.patch.object(gmail, "read_thread") as read_thread, \
+             mock.patch.object(memory_sink, "capture") as capture:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 0)
+        read_thread.assert_not_called()
+        capture.assert_not_called()
+        self.assertEqual(self.applied, [])
+
     def test_managed_followup_upgrades_an_ordinary_ledger_record(self):
         processed = state.Store(self.base)
         processed.record("m1", {

@@ -138,6 +138,40 @@ class ValidateTest(unittest.TestCase):
             [],
         )
 
+    def test_operator_confirmed_source_ids_must_be_non_empty_strings(self):
+        for invalid in (
+            "gmail:t1",
+            [""],
+            [None],
+            [" gmail:t1 "],
+            ["gmail:"],
+            ["bogus"],
+            ["unknown:t1"],
+        ):
+            with self.subTest(value=invalid):
+                probs = memory_sink.validate({
+                    "id": "r",
+                    "memory": {
+                        "store": "/s",
+                        "operator_confirmed_source_ids": invalid,
+                    },
+                })
+                self.assertTrue(
+                    any("operator_confirmed_source_ids" in p for p in probs),
+                    probs,
+                )
+
+        self.assertEqual(
+            memory_sink.validate({
+                "id": "r",
+                "memory": {
+                    "store": "/s",
+                    "operator_confirmed_source_ids": ["gmail:thread-1"],
+                },
+            }),
+            [],
+        )
+
     def test_no_memory_block_is_fine(self):
         self.assertEqual(memory_sink.validate({"id": "r"}), [])
 
@@ -845,6 +879,74 @@ class CaptureValidationTest(unittest.TestCase):
         cli.assert_not_called()
         resolve.assert_not_called()
 
+    def test_operator_confirmation_overrides_both_worthiness_vetoes(self):
+        self.routine["memory"]["operator_confirmed_source_ids"] = [
+            "slack:C1:1.0"
+        ]
+        with mock.patch.object(
+            memory_sink,
+            "_operator_confirmed_summary",
+            return_value="Durable product capability context.",
+        ) as summarize:
+            out, calls = self._run_capture(
+                {
+                    "worthy": False,
+                    "owner_attention": False,
+                    "type": "note",
+                    "title": "Capability context",
+                    "people": [],
+                    "tags": ["product"],
+                    "body": "The capability changed in a durable way.",
+                },
+                summary="NOT MEMORY-WORTHY",
+            )
+
+        summarize.assert_called_once_with(self.routine, self.item)
+        self.assertEqual(out["memory"], "created")
+        self.assertEqual(
+            calls["stdin"], "The capability changed in a durable way."
+        )
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn("operator-confirmed", tags.split(","))
+
+    def test_operator_confirmation_is_exact_source_id_only(self):
+        self.routine["memory"]["operator_confirmed_source_ids"] = [
+            "slack:C1:different"
+        ]
+        with mock.patch.object(memory_sink, "_operator_confirmed_summary") as summarize:
+            out, calls = self._run_capture(summary="NOT MEMORY-WORTHY")
+
+        self.assertEqual(out, {"memory": "skipped_not_worthy"})
+        self.assertEqual(calls, {})
+        summarize.assert_not_called()
+
+    def test_operator_confirmed_summary_keeps_normal_source_metadata(self):
+        self.item.update({
+            "source_kind": "gmail",
+            "body": "The product behavior changed.",
+        })
+        self.item["frontmatter"].update({
+            "email_from": "Product Owner <owner@example.com>",
+            "email_to": "Memory Owner <memory@example.com>",
+            "gmail_thread_message_count": 9,
+            "gmail_thread_messages_included": 5,
+            "gmail_thread_truncated": True,
+        })
+        with mock.patch(
+            "workspace_daemon.llm.analyze",
+            return_value="Durable product context.",
+        ) as analyze:
+            summary = memory_sink._operator_confirmed_summary(
+                self.routine, self.item
+            )
+
+        self.assertEqual(summary, "Durable product context.")
+        prompt = analyze.call_args.args[1]
+        self.assertIn("From: Product Owner <owner@example.com>", prompt)
+        self.assertIn("To: Memory Owner <memory@example.com>", prompt)
+        self.assertIn("Messages in supplied thread: 5 of 9", prompt)
+        self.assertIn("Coverage warning:", prompt)
+
     def test_dry_run_makes_no_calls(self):
         with mock.patch.object(memory_sink, "_cli") as m, \
              mock.patch.object(memory_sink, "_extract") as e, \
@@ -853,6 +955,32 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(out, {"memory": "dry_run"})
         m.assert_not_called()
         e.assert_not_called()
+
+    def test_operator_confirmation_dry_run_makes_no_calls(self):
+        self.routine["memory"]["operator_confirmed_source_ids"] = [
+            "slack:C1:1.0"
+        ]
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary"
+        ) as summarize, mock.patch.object(
+            memory_sink, "_extract"
+        ) as extract, mock.patch.object(
+            memory_sink, "_cli"
+        ) as cli, mock.patch(
+            "workspace_daemon.llm.analyze"
+        ) as analyze, mock.patch.object(memory_sink, "log"):
+            out = memory_sink.capture(
+                self.routine,
+                self.item,
+                "NOT MEMORY-WORTHY",
+                dry_run=True,
+            )
+
+        self.assertEqual(out, {"memory": "dry_run"})
+        summarize.assert_not_called()
+        extract.assert_not_called()
+        cli.assert_not_called()
+        analyze.assert_not_called()
 
     def test_active_followup_dry_run_reports_forced_todo(self):
         self.item["frontmatter"].update({
