@@ -439,7 +439,7 @@ def validate(routine):
                 else {
                     "kind", "checkpoint", "store", "tasklists",
                     "outbound_tasklist", "outbound_since", "exclude_tags",
-                    "max_tasks",
+                    "identity_exclude_people", "max_tasks",
                 }
             )
             unknown = set(maintenance) - allowed
@@ -525,6 +525,19 @@ def validate(routine):
                 ):
                     problems.append(
                         f"{rid}: maintenance.exclude_tags must be kebab-case tags"
+                    )
+                excluded_people = maintenance.get("identity_exclude_people", [])
+                if (
+                    not isinstance(excluded_people, list)
+                    or any(
+                        not isinstance(value, str)
+                        or not _ROUTINE_ID.fullmatch(value)
+                        for value in excluded_people
+                    )
+                ):
+                    problems.append(
+                        f"{rid}: maintenance.identity_exclude_people must be "
+                        "kebab-case person slugs"
                     )
                 max_tasks = maintenance.get("max_tasks", 10000)
                 if (

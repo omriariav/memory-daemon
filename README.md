@@ -522,6 +522,17 @@ therefore uses the task's authoritative `updated` date for the memory entry and
 records the full initial `updated` timestamp in the generated metadata. Both
 values remain stable on later edits instead of being replaced by the run date.
 A new association fails closed if Google does not return a valid timestamp.
+Titles that contain no ASCII slug characters receive a deterministic id based
+on the canonical Google Task source id, avoiding empty or colliding filenames.
+The sync also performs conservative, model-free identity enrichment: it links
+only person slugs that already exist in the private graph, using exact full
+names or an unambiguous capitalized first name. Unknown and ambiguous names are
+left unlinked. Person links are excluded from the bidirectional content hash,
+so enrichment can never cause an outbound Google Tasks edit. Use the optional
+`identity_exclude_people` list to suppress specific existing slugs. Identity
+enrichment is also restricted to private-only entries; an entry materialized
+in any shared graph is reported and skipped so private identity resolution is
+never propagated into a shared copy.
 
 If both sides changed since the previous checkpoint, neither is overwritten.
 The run reports a conflict and fails closed. A retry after an interrupted write

@@ -49,6 +49,7 @@ def tasks_routine():
             "outbound_tasklist": "incoming-list-id",
             "outbound_since": "2026-08-02",
             "exclude_tags": ["no-google-tasks"],
+            "identity_exclude_people": [],
             "max_tasks": 10000,
         },
     }
@@ -107,6 +108,17 @@ class MaintenanceValidationTest(unittest.TestCase):
         self.assertTrue(any("absolute path" in problem for problem in problems))
         self.assertTrue(any("YYYY-MM-DD" in problem for problem in problems))
         self.assertTrue(any("must be included" in problem for problem in problems))
+
+    def test_google_tasks_sync_rejects_invalid_identity_exclusions(self):
+        routine = tasks_routine()
+        routine["maintenance"]["identity_exclude_people"] = ["Not a slug"]
+
+        problems = config.validate(routine)
+
+        self.assertTrue(
+            any("kebab-case person slugs" in problem for problem in problems),
+            problems,
+        )
 
 
 class MaintenanceRunTest(unittest.TestCase):
