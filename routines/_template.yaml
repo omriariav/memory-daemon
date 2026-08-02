@@ -153,7 +153,11 @@ actions: [apply_label, mark_read, unstar, archive]
 # a handler can replace only the instruction while keeping provider/model and
 # can replace only memory type/tags while keeping memory.store. Put specialized
 # source blocks before the unhandled general block; first match wins inside one
-# routine. Keep actions on the source block so mutations follow the same match.
+# routine. Handler source blocks require max_results: 0 so capped overflow can
+# never leak into the general prompt. Managed self-forwarded Chat follow-ups are
+# the exception to first-match order and must stay on the unhandled default
+# source because their lifecycle is reconciled after they leave Gmail. Keep
+# actions on the source block so mutations follow the same match.
 # handlers:
 #   meeting-notes:
 #     analyze:

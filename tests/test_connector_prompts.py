@@ -190,6 +190,20 @@ class RoutineValidationTest(StoreFixture):
     def test_inline_routine_still_valid(self):
         self.assertEqual(config.validate(self._routine(instruction="Summarize it.")), [])
 
+    def test_instruction_values_must_be_non_empty_strings(self):
+        for invalid in ("", "   ", [], 123):
+            probs = config.validate(self._routine(instruction=invalid))
+            self.assertTrue(
+                any("instruction must be a non-empty string" in p for p in probs),
+                (invalid, probs),
+            )
+
+        probs = config.validate(self._routine(instruction_from_connector=""))
+        self.assertTrue(
+            any("must be a bare connector name" in p for p in probs),
+            probs,
+        )
+
     def test_missing_instruction_reported_once(self):
         probs = config.validate(self._routine())
         self.assertEqual(sum("instruction" in p for p in probs), 1)

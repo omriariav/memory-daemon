@@ -142,7 +142,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
 
     if not dry_run:
         state.sweep_temp_files(state.state_file(base_dir).parent)
-        for vault in {r.get("output", {}).get("vault_dir") for r in active}:
+        vaults = {
+            effective.get("output", {}).get("vault_dir")
+            for routine in active
+            for effective in config.execution_routines(routine)
+            if isinstance(effective.get("output"), dict)
+        }
+        for vault in vaults:
             if vault:
                 state.sweep_temp_files(vault)
 
@@ -1689,17 +1695,14 @@ def _route_claims(claims, totals, failures=()):
             # owns the Gmail item even if another source also matched it.
             candidates = managed_followups
         # Multiple source blocks in one routine may match the same item. That is
-        # one owner; prefer a processable claim, then declaration order.
+        # one owner, and declaration order is deterministic handler precedence.
+        # Never replace an earlier ownership-only claim with a later broad
+        # processable one: doing so would let a capped specialized query leak
+        # overflow into the general prompt. The item waits for its first owner.
         by_routine = {}
         for claim in candidates:
             rid = claim["routine"]["id"]
-            if (
-                rid not in by_routine
-                or (
-                    not by_routine[rid].get("processable", True)
-                    and claim.get("processable", True)
-                )
-            ):
+            if rid not in by_routine:
                 by_routine[rid] = claim
         unique = list(by_routine.values())
         best_rank = min(config.routing_rank(c["routine"]) for c in unique)

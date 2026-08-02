@@ -203,13 +203,42 @@ def _routine_summary(repo, path, routine, rid):
     if not isinstance(source_list, list):
         source_list = [routine.get("source")] if isinstance(routine.get("source"), dict) else []
     routine_actions = routine.get("actions")
-    sinks = []
+    sinks = set()
     if isinstance(routine.get("output"), dict):
-        sinks.append("vault")
+        sinks.add("vault")
     if isinstance(routine.get("memory"), dict):
-        sinks.append("memory")
+        sinks.add("memory")
+    base_sinks = frozenset(sinks)
     routing = routine.get("routing") if isinstance(routine.get("routing"), dict) else {}
     analyze = routine.get("analyze") if isinstance(routine.get("analyze"), dict) else {}
+    handler_rows = []
+    handlers = routine.get("handlers")
+    if isinstance(handlers, dict):
+        for handler_id, profile in sorted(handlers.items()):
+            if not isinstance(handler_id, str) or not isinstance(profile, dict):
+                continue
+            handler_sinks = set(base_sinks)
+            if isinstance(profile.get("output"), dict) and profile["output"]:
+                handler_sinks.add("vault")
+            if isinstance(profile.get("memory"), dict) and profile["memory"]:
+                handler_sinks.add("memory")
+            handler_analyze = (
+                profile.get("analyze")
+                if isinstance(profile.get("analyze"), dict)
+                else {}
+            )
+            prompt_source = (
+                "inline" if handler_analyze.get("instruction")
+                else f"connector:{handler_analyze.get('instruction_from_connector')}"
+                if handler_analyze.get("instruction_from_connector")
+                else "inherited"
+            )
+            handler_rows.append({
+                "id": handler_id,
+                "sinks": sorted(handler_sinks),
+                "prompt_source": prompt_source,
+            })
+            sinks.update(handler_sinks)
     return {
         "id": rid,
         "file": str(path.relative_to(repo)),
@@ -227,13 +256,14 @@ def _routine_summary(repo, path, routine, rid):
             if isinstance(source, dict)
         ],
         "routine_actions": routine_actions if isinstance(routine_actions, list) else [],
-        "sinks": sinks,
+        "sinks": sorted(sinks),
         "prompt_source": (
             "inline" if analyze.get("instruction")
             else f"connector:{analyze.get('instruction_from_connector')}"
             if analyze.get("instruction_from_connector")
             else "missing"
         ),
+        "handlers": handler_rows,
     }
 
 

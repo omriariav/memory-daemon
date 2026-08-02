@@ -37,6 +37,16 @@ def analyze_cfg(routine):
     return cfg if isinstance(cfg, dict) else {}
 
 
+def has_sink(routine):
+    """Whether an execution path has a non-empty configured sink block."""
+    output = routine.get("output")
+    memory = routine.get("memory")
+    return bool(
+        (isinstance(output, dict) and output)
+        or (isinstance(memory, dict) and memory)
+    )
+
+
 def configured_labels(routine):
     """Every statically-configured Gmail label in a routine.
 
@@ -91,13 +101,13 @@ def routine_for_source(routine, source):
             continue
         merged = dict(base) if isinstance(base, dict) else {}
         if key == "analyze":
-            if override.get("instruction"):
+            if "instruction" in override:
                 merged.pop("instruction_from_connector", None)
                 merged.pop("instruction_extra", None)
                 # Connector health belongs to the medium routine, not to the
                 # specialized extraction profile selected for one item.
                 merged.pop("connector_sweep", None)
-            elif override.get("instruction_from_connector"):
+            elif "instruction_from_connector" in override:
                 merged.pop("instruction", None)
         merged.update(override)
         effective[key] = merged
@@ -365,6 +375,11 @@ def validate(routine):
     """Return a list of human-readable problems; empty means valid."""
     problems = []
     rid = routine.get("id", "<missing id>")
+    if "_handler_id" in routine:
+        problems.append(
+            f"{rid}: `_handler_id` is reserved runtime metadata and cannot "
+            "be configured"
+        )
     maintenance_routine = is_maintenance(routine)
 
     required = ["id"] if maintenance_routine else REQUIRED_TOP_LEVEL
@@ -576,15 +591,13 @@ def validate(routine):
     if not isinstance(output, dict):
         problems.append(f"{rid}: `output` must be a mapping")
         output = {}
-    has_memory = isinstance(routine.get("memory"), dict)
     effective_routines = execution_routines(routine)
     missing_sinks = [
         (index, source.get("handler"))
         for index, (source, effective) in enumerate(
             zip(source_dicts, effective_routines)
         )
-        if not effective.get("output")
-        and not isinstance(effective.get("memory"), dict)
+        if not has_sink(effective)
     ]
     if missing_sinks:
         multiple = len(source_dicts) > 1
@@ -596,7 +609,7 @@ def validate(routine):
                 f"{rid}: {owner} needs an `output:` block, a `memory:` "
                 "block, or both"
             )
-    elif not source_dicts and not output and not has_memory:
+    elif not source_dicts and not has_sink(routine):
         problems.append(f"{rid}: needs an `output:` block, a `memory:` block, or both")
     if output:
         if not output.get("vault_dir"):
@@ -763,6 +776,16 @@ def _validate_handlers(routine, source_dicts):
                 problems.append(
                     f"{rid}: handlers[{handler_id}].{key} must be a mapping"
                 )
+        memory = profile.get("memory")
+        if (
+            isinstance(memory, dict)
+            and "operator_confirmed_source_ids" in memory
+        ):
+            problems.append(
+                f"{rid}: handlers[{handler_id}].memory cannot set "
+                "operator_confirmed_source_ids; put exact replay overrides "
+                "in the routine-level memory block"
+            )
         valid_profiles[handler_id] = profile
 
     used = set()
@@ -781,6 +804,18 @@ def _validate_handlers(routine, source_dicts):
         used.add(handler_id)
         if handler_id not in valid_profiles:
             continue
+        if source.get("max_results") != 0:
+            problems.append(
+                f"{rid}: {prefix}.handler requires max_results: 0 so a "
+                "capped deterministic query cannot leak overflow items into "
+                "the general source"
+            )
+        if source.get("self_forwarded_chat_followups") is True:
+            problems.append(
+                f"{rid}: {prefix}.self_forwarded_chat_followups must use the "
+                "routine-level default handler because its lifecycle is "
+                "reconciled after the source leaves Gmail"
+            )
 
         # Reuse the complete routine validator on the materialized profile.
         # Removing `handlers` and the selector prevents recursion, while a

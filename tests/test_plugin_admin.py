@@ -338,6 +338,56 @@ memory:
         self.assertEqual(row["sources"][0]["handler"], "recurring-report")
         self.assertEqual(row["sources"][1]["channel_count"], 1)
 
+    def test_routine_list_reports_handler_sinks_and_prompt_source(self):
+        (self.repo / "routines" / "handled.yaml").write_text(
+            """\
+id: handled
+sources:
+  - kind: gmail
+    query: 'from:reports@example.test'
+    max_results: 0
+    handler: report
+    actions: []
+  - kind: gmail
+    query: 'from:memos@example.test'
+    max_results: 0
+    handler: memo
+    actions: []
+handlers:
+  memo:
+    memory:
+      store: /tmp/example-memory
+      type: note
+  report:
+    analyze:
+      instruction: Extract durable report facts.
+    output:
+      vault_dir: /tmp/example-vault
+      slug_prefix: report
+analyze:
+  provider: gemini
+  model: example-model
+  instruction: General triage.
+"""
+        )
+
+        result = self.run_admin("routine", "list", "--repo", self.repo)
+
+        row = json.loads(result.stdout)["routines"][0]
+        self.assertEqual(row["sinks"], ["memory", "vault"])
+        self.assertEqual(row["handlers"], [
+            {
+                "id": "memo",
+                "prompt_source": "inherited",
+                "sinks": ["memory"],
+            },
+            {
+                "id": "report",
+                "prompt_source": "inline",
+                "sinks": ["vault"],
+            },
+        ])
+
     def test_prompt_override_lifecycle_preserves_template_and_other_memory(self):
         template = self.store / "connectors" / "slack.md"
         template.write_text(

@@ -102,9 +102,9 @@ def resolve_instruction(routine):
     ref = analyze.get("instruction_from_connector")
     extra = (analyze.get("instruction_extra") or "").strip()
 
-    if inline:
+    if isinstance(inline, str) and inline.strip():
         base = inline.strip()
-    elif ref:
+    elif isinstance(ref, str) and ref.strip():
         store = (routine.get("memory") or {}).get("store")
         if not store:
             raise PromptError(
@@ -127,22 +127,35 @@ def validate(routine):
     analyze = routine.get("analyze")
     if not isinstance(analyze, dict):
         return []  # the core validator already reports a missing analyze block
+    inline_present = "instruction" in analyze
+    ref_present = "instruction_from_connector" in analyze
     inline = analyze.get("instruction")
     ref = analyze.get("instruction_from_connector")
     problems = []
 
-    if inline and ref:
+    if inline_present and ref_present:
         problems.append(
             f"{rid}: set analyze.instruction OR analyze.instruction_from_connector, "
             f"not both — an inline instruction would shadow the connector prompt"
         )
-    if not inline and not ref:
+    if not inline_present and not ref_present:
         problems.append(
             f"{rid}: analyze needs an `instruction` or an "
             f"`instruction_from_connector` (the connector body is the prompt)"
         )
-    if ref:
-        if not isinstance(ref, str) or "/" in ref or ref.startswith("."):
+    if inline_present and (
+        not isinstance(inline, str) or not inline.strip()
+    ):
+        problems.append(
+            f"{rid}: analyze.instruction must be a non-empty string"
+        )
+    if ref_present:
+        if (
+            not isinstance(ref, str)
+            or not ref.strip()
+            or "/" in ref
+            or ref.startswith(".")
+        ):
             problems.append(
                 f"{rid}: analyze.instruction_from_connector must be a bare "
                 f"connector name (got {ref!r})"

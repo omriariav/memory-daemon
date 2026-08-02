@@ -97,9 +97,15 @@ an inherited connector prompt and its general-only extra guidance. Gmail
 actions remain on the matching source block.
 
 Within one routine, the first matching source block wins. Put deterministic
-handlers first and the unhandled general connector source last. The ledger and
-scheduler retain the medium routine id; successful handler executions also
-record `handler_id` for auditability. Use
+handlers first and the unhandled general connector source last. Every handler
+source requires `max_results: 0`; otherwise overflow could be claimed by the
+general source without proving that it missed the deterministic query. Managed
+self-forwarded Chat follow-ups deliberately beat ordinary source order and must
+use the unhandled routine-level profile so delayed resolution uses the same
+memory store. Keep `operator_confirmed_source_ids` routine-level for the same
+reason: an archived item must be replayable after its handler query stops
+returning it. The ledger and scheduler retain the medium routine id; successful
+handler executions also record `handler_id` for auditability. Use
 `routines/_example-medium-handlers.yaml` as the canonical shape.
 
 ## Safe editing

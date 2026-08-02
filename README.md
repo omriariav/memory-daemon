@@ -119,11 +119,20 @@ memory:
 
 Source blocks are evaluated in declaration order. If several blocks in the
 same routine match one thread, the first block owns it; put narrow deterministic
-queries first and the general source last. This choice happens before any LLM
-call. The selected handler may override `analyze`, `output`, `memory`, `label`,
-and `streams`; provider/model, store paths, and other omitted mapping fields are
+queries first and the general source last. Handler source blocks require
+`max_results: 0`, because a capped exact query cannot prove that overflow items
+belong to the fallback. The deliberate exception is Gmail's managed
+self-forwarded Chat queue: an active queue claim beats ordinary source order so
+its todo lifecycle cannot be lost. That lifecycle must use the routine-level
+default profile, not a handler. These choices happen before any LLM call.
+
+The selected handler may override `analyze`, `output`, `memory`, `label`, and
+`streams`; provider/model, store paths, and other omitted mapping fields are
 inherited from the medium routine. An inline handler instruction replaces the
-general connector prompt rather than appending to it.
+general connector prompt rather than appending to it. Exact
+`operator_confirmed_source_ids` remain routine-level because an archived source
+must be replayable through the default source even after its original handler
+query no longer returns it.
 
 Gmail actions remain on the source block, so mailbox mutation is tied to the
 same deterministic match. Logs, vault frontmatter, and ledger records include

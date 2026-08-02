@@ -261,6 +261,41 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertNotIn("SPECIAL REPORT INSTRUCTION", prompts[0])
         self.assertNotIn("handler_id", self.ledger()["general-message"])
 
+    def test_handler_only_vault_participates_in_temp_file_cleanup(self):
+        gmail.search = lambda _query, _max_results=20: []
+        handler_vault = self.base / "handler-vault"
+        r = {
+            "id": "gmail-general",
+            "enabled": True,
+            "source": {
+                "kind": "gmail",
+                "query": "known source",
+                "max_results": 0,
+                "handler": "known",
+                "actions": [],
+            },
+            "handlers": {
+                "known": {
+                    "analyze": {"instruction": "Known-source extraction."},
+                    "output": {
+                        "vault_dir": str(handler_vault),
+                        "slug_prefix": "known",
+                    },
+                }
+            },
+            "analyze": {
+                "provider": "gemini",
+                "model": "m",
+                "instruction": "General extraction.",
+            },
+        }
+
+        with mock.patch.object(state, "sweep_temp_files") as sweep:
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        sweep.assert_any_call(str(handler_vault))
+
     def test_stream_subject_date_beats_later_reply_date(self):
         gmail.read_message = lambda mid: {
             "headers": {
