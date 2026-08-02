@@ -716,15 +716,27 @@ def _gmail_fetch(routine, source, candidate):
     message_id = candidate["id"]
     thread_id = candidate["raw"].get("thread_id", message_id)
     thread_messages = None
-    if source.get("read_thread"):
+    routed_thread = candidate["raw"].get("_gmail_routed_thread") is True
+    if source.get("read_thread") or routed_thread:
         thread = gmail.read_thread(thread_id)
         thread_messages = thread.get("messages") or []
         if not thread_messages:
             raise RuntimeError(f"no content: Gmail thread {thread_id} has no messages")
-        msg = next(
-            (entry for entry in thread_messages if entry.get("id") == message_id),
-            thread_messages[-1],
-        )
+        if routed_thread:
+            # Routing is thread-scoped, but the ledger and Gmail actions are
+            # message-scoped. Always process the thread's actual newest message
+            # so an older specialized match cannot hide or mutate the wrong
+            # reply. The complete bounded thread remains the analysis body.
+            msg = thread_messages[-1]
+            message_id = msg.get("id") or message_id
+        else:
+            msg = next(
+                (
+                    entry for entry in thread_messages
+                    if entry.get("id") == message_id
+                ),
+                thread_messages[-1],
+            )
     else:
         msg = gmail.read_message(message_id)
     headers = msg.get("headers", {})
@@ -1609,6 +1621,19 @@ def _route_claims(claims, totals, failures=()):
                 f"owner {claim['routine']['id']} reached its processing cap"
             )
             continue
+        if kind == "gmail" and len({
+            candidate["routine"]["id"] for candidate in candidates
+        }) > 1:
+            # Different Gmail queries can match different messages from the
+            # same thread. Keep the winning routine and prompt, but make fetch
+            # resolve the actual newest message and render the bounded thread.
+            # This also makes message-scoped actions target the current reply.
+            claim = dict(claim)
+            candidate = dict(claim["candidate"])
+            raw = dict(candidate.get("raw") or {})
+            raw["_gmail_routed_thread"] = True
+            candidate["raw"] = raw
+            claim["candidate"] = candidate
         owned.setdefault(claim["routine"]["id"], []).append(claim)
     return owned
 
@@ -1620,6 +1645,25 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     new = 0
     for claim in claims:
         candidate = claim["candidate"]
+        prefetched_item = None
+        if (
+            claim["source"].get("kind") == "gmail"
+            and (candidate.get("raw") or {}).get("_gmail_routed_thread") is True
+        ):
+            try:
+                prefetched_item = claim["fetch"](
+                    routine, claim["source"], candidate
+                )
+            except Exception as exc:
+                totals["errors"] += 1
+                log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
+                continue
+            candidate = dict(
+                candidate,
+                id=prefetched_item["id"],
+                title=prefetched_item.get("title", candidate.get("title", "")),
+            )
+            claim = dict(claim, candidate=candidate)
         existing = processed.get(candidate["id"])
         upgrade_followup = (
             existing is not None
@@ -1672,6 +1716,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             _process(
                 routine, claim["source"], candidate, claim["fetch"], processed,
                 label_catalog, dry_run, totals, catalog, base_dir,
+                prefetched_item,
             )
             totals["processed"] += 1
         except state.AlreadyRunning:
@@ -1716,12 +1761,17 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
 
 
 def _process(routine, source, candidate, fetch, processed, label_catalog,
-             dry_run, totals, catalog=None, base_dir=None):
+             dry_run, totals, catalog=None, base_dir=None,
+             prefetched_item=None):
     rid = routine["id"]
     action_list = config.source_actions(routine, source)
     log(f"routine={rid} new match id={candidate['id']} title={candidate['title']!r}")
 
-    item = fetch(routine, source, candidate)
+    item = (
+        prefetched_item
+        if prefetched_item is not None
+        else fetch(routine, source, candidate)
+    )
     item.setdefault("source_kind", source["kind"])
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 

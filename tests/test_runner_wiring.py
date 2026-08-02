@@ -223,9 +223,12 @@ class RunnerWiringTest(unittest.TestCase):
             },
             "body": (
                 "The benefit account is ready.\n"
-                "מספר כרטיס: 2609920051590860\n"
+                "מספר כרטיס: 2609 9200 5159 0860\n"
+                "Card number: 4111-1111-1111-1111\n"
                 "שם משתמש: employee@example.com\n"
-                "סיסמה: secret-value\n"
+                "סיסמה זמנית: correct horse battery staple\n"
+                "Password: several words must all disappear\n"
+                "PIN code: 1234\n"
                 "Keep the onboarding fact."
             ),
         }
@@ -237,11 +240,84 @@ class RunnerWiringTest(unittest.TestCase):
             {"id": "m2", "raw": {"thread_id": "thread-1"}},
         )
 
-        self.assertNotIn("2609920051590860", item["body"])
+        self.assertNotIn("2609", item["body"])
+        self.assertNotIn("9200", item["body"])
+        self.assertNotIn("5159", item["body"])
+        self.assertNotIn("0860", item["body"])
+        self.assertNotIn("4111", item["body"])
         self.assertNotIn("employee@example.com", item["body"])
-        self.assertNotIn("secret-value", item["body"])
-        self.assertEqual(item["body"].count("[REDACTED]"), 3)
+        self.assertNotIn("correct horse battery staple", item["body"])
+        self.assertNotIn("several words must all disappear", item["body"])
+        self.assertNotIn("1234", item["body"])
+        self.assertEqual(item["body"].count("[REDACTED]"), 6)
         self.assertIn("Keep the onboarding fact.", item["body"])
+
+    def test_thread_routing_analyzes_and_actions_the_newest_message(self):
+        prompts = []
+        action_ids = []
+
+        def search(query, max_results=20):
+            if query == "specialized":
+                return [{
+                    "message_id": "older-match",
+                    "thread_id": "shared-thread",
+                    "subject": "Specialized topic",
+                }]
+            return [{
+                "message_id": "newest-reply",
+                "thread_id": "shared-thread",
+                "subject": "Re: Specialized topic",
+            }]
+
+        gmail.search = search
+        gmail.read_message = lambda _mid: self.fail(
+            "thread-routed ownership must fetch the complete thread"
+        )
+        gmail.read_thread = lambda _tid: {
+            "messages": [
+                {
+                    "id": "older-match",
+                    "headers": {
+                        "subject": "Specialized topic",
+                        "from": "Specialist <specialist@example.com>",
+                        "date": "Sat, 1 Aug 2026 08:00:00 +0000",
+                    },
+                    "labels": ["INBOX"],
+                    "body": "Original specialized context.",
+                },
+                {
+                    "id": "newest-reply",
+                    "headers": {
+                        "subject": "Re: Specialized topic",
+                        "from": "Owner <owner@example.com>",
+                        "date": "Sat, 1 Aug 2026 09:00:00 +0000",
+                    },
+                    "labels": ["INBOX", "UNREAD"],
+                    "body": "Newest durable reply.",
+                },
+            ]
+        }
+        llm.analyze = lambda _routine, prompt: (
+            prompts.append(prompt) or "a summary"
+        )
+        actions._HANDLERS["archive"] = action_ids.append
+
+        specialized = routine(self.vault, actions=["archive"])
+        specialized["id"] = "specialized"
+        specialized["source"]["query"] = "specialized"
+        fallback = routine(self.vault, actions=[])
+        fallback["id"] = "fallback"
+        fallback["source"]["query"] = "general"
+        fallback["routing"] = {"fallback": True}
+
+        totals = runner.run(self.base, [specialized, fallback])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(action_ids, ["newest-reply"])
+        self.assertEqual(set(self.ledger()), {"newest-reply"})
+        self.assertIn("Original specialized context.", prompts[0])
+        self.assertIn("Newest durable reply.", prompts[0])
 
     def test_gmail_marks_active_self_forwarded_chat_as_followup(self):
         gmail.read_message = lambda mid: {

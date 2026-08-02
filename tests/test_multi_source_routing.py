@@ -214,6 +214,11 @@ class OwnershipRoutingTest(unittest.TestCase):
 
         self.assertEqual(list(claims), [("gmail", "shared-thread")])
         self.assertEqual(list(owned), ["privacy"])
+        routed = owned["privacy"][0]
+        self.assertEqual(routed["candidate"]["id"], "privacy-message")
+        self.assertTrue(
+            routed["candidate"]["raw"]["_gmail_routed_thread"]
+        )
         self.assertEqual(totals, {"errors": 0, "ambiguous": 0})
 
     def test_lower_priority_wins(self):
