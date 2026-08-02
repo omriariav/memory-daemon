@@ -225,7 +225,11 @@ def cmd_run(args):
             # Manual and scheduled census runs share slack-census.lock; other
             # work shares run.lock. A busy group is deferred without blocking
             # an independent group in the same manual invocation.
-            log(f"run group={lock_name} skipped — {exc}")
+            skipped_ids = ", ".join(sorted(group_ids))
+            log(
+                f"run group={lock_name} skipped routines={skipped_ids} — "
+                f"{exc}"
+            )
             continue
         _merge_totals(totals, group_totals)
 

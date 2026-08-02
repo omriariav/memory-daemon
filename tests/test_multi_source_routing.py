@@ -2497,6 +2497,36 @@ class RunCommandTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["active_ids"], {"census"})
         self.assertEqual(run.call_args.kwargs["lock_name"], "slack-census")
 
+    def test_manual_overlap_log_names_every_skipped_routine(self):
+        self.routine["enabled"] = True
+        args = SimpleNamespace(
+            routine=None,
+            include_disabled=False,
+            dry_run=False,
+            refresh_labels=False,
+        )
+        with mock.patch.object(daemon_cli, "BASE_DIR", self.base), \
+             mock.patch.object(daemon_cli, "LOG_FILE", self.base / "run.log"), \
+             mock.patch.object(daemon_cli, "set_log_file"), \
+             mock.patch.object(daemon_cli.config, "secure_routine_files"), \
+             mock.patch.object(
+                 daemon_cli.config, "discover", return_value=[self.routine]
+             ), \
+             mock.patch.object(daemon_cli.config, "validate", return_value=[]), \
+             mock.patch.object(
+                 daemon_cli.runner, "run",
+                 side_effect=state.AlreadyRunning("run.lock held"),
+             ), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_run(args), 0)
+
+        self.assertIn(
+            mock.call(
+                "run group=run skipped routines=domain — run.lock held"
+            ),
+            log.call_args_list,
+        )
+
 
 class TickCommandTest(unittest.TestCase):
     def setUp(self):
