@@ -100,6 +100,7 @@ class PluginAdminTest(unittest.TestCase):
             "--candidate", candidate, "--token", self.token(plan.stdout),
         )
         self.assertTrue(target.exists())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(applied.stdout)["validation"], "ok")
 
         edited = self.candidate(
@@ -113,12 +114,21 @@ class PluginAdminTest(unittest.TestCase):
             "--operation", "edit", "--id", "example-routine",
             "--candidate", edited,
         )
+        os.chmod(target, 0o644)
+        # The stale-token contract includes the old mode, so re-plan after
+        # simulating a legacy world-readable routine.
+        edit_plan = self.run_admin(
+            "routine", "plan", "--repo", self.repo,
+            "--operation", "edit", "--id", "example-routine",
+            "--candidate", edited,
+        )
         self.run_admin(
             "routine", "apply", "--repo", self.repo,
             "--operation", "edit", "--id", "example-routine",
             "--candidate", edited, "--token", self.token(edit_plan.stdout),
         )
         self.assertTrue(target.read_text().startswith("# user comment stays"))
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
         ledger = self.repo / "state" / "processed.json"
         ledger.write_text('{"keep-me": {"rule_id": "example-routine"}}\n')

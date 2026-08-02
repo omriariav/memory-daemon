@@ -15,8 +15,10 @@ import os
 import re
 import signal
 import sys
+import traceback
 import uuid
 from pathlib import Path
+from time import time as current_epoch
 
 import yaml
 
@@ -111,8 +113,69 @@ def cmd_validate(args):
 
 # --- run --------------------------------------------------------------------
 
+def _execution_groups(routines, active_ids):
+    """Partition work by the lock that protects its mutable state."""
+    selected = [
+        routine for routine in routines
+        if routine.get("enabled", True) and routine["id"] in active_ids
+    ]
+    return [
+        (
+            {
+                routine["id"] for routine in selected
+                if not config.is_maintenance(routine)
+            },
+            "run",
+        ),
+        (
+            {
+                routine["id"] for routine in selected
+                if config.is_maintenance(routine)
+                and (routine.get("maintenance") or {}).get("kind")
+                != "slack_conversation_census"
+            },
+            "run",
+        ),
+        (
+            {
+                routine["id"] for routine in selected
+                if config.is_maintenance(routine)
+                and (routine.get("maintenance") or {}).get("kind")
+                == "slack_conversation_census"
+            },
+            "slack-census",
+        ),
+    ]
+
+
+def _manual_execution_groups(routines, active_ids):
+    """Refresh census first, then preserve the runner's maintenance ordering."""
+    capture, maintenance, census = _execution_groups(routines, active_ids)
+    capture_ids, _ = capture
+    maintenance_ids, _ = maintenance
+    return [
+        census,
+        (capture_ids | maintenance_ids, "run"),
+    ]
+
+
+def _empty_totals():
+    return {
+        "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
+        "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
+    }
+
+
+def _merge_totals(totals, additions):
+    for key, value in additions.items():
+        if isinstance(value, (int, float)):
+            totals[key] = totals.get(key, 0) + value
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
+    if not args.dry_run:
+        config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
     if args.routine and args.routine not in {r["id"] for r in routines}:
         raise config.RoutineError(f"no routine with id '{args.routine}'")
@@ -130,7 +193,7 @@ def cmd_run(args):
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
-            print(f"invalid routine: {p}", file=sys.stderr)
+            log(f"invalid routine: {p}")
         return 1
 
     mode = (
@@ -138,18 +201,37 @@ def cmd_run(args):
         "operational log only)"
         if args.dry_run else ""
     )
-    log(f"run start: {len(routines)} routine(s){mode}")
-    try:
-        active_ids = {args.routine} if args.routine else None
-        totals = runner.run(
-            BASE_DIR, routines, dry_run=args.dry_run,
-            refresh_labels=args.refresh_labels, active_ids=active_ids,
-        )
-    except state.AlreadyRunning as exc:
-        # Not an error: launchd firing while a long run is still going is
-        # expected, and the next interval will pick the work up.
-        log(f"run skipped — {exc}")
-        return 0
+    active_ids = (
+        {args.routine}
+        if args.routine else {
+            routine["id"] for routine in routines
+            if routine.get("enabled", True)
+        }
+    )
+    log(f"run start: {len(active_ids)} routine(s){mode}")
+    totals = _empty_totals()
+    for group_ids, lock_name in _manual_execution_groups(
+        routines, active_ids
+    ):
+        if not group_ids:
+            continue
+        try:
+            group_totals = runner.run(
+                BASE_DIR, routines, dry_run=args.dry_run,
+                refresh_labels=args.refresh_labels, active_ids=group_ids,
+                lock_name=lock_name,
+            )
+        except state.AlreadyRunning as exc:
+            # Manual and scheduled census runs share slack-census.lock; other
+            # work shares run.lock. A busy group is deferred without blocking
+            # an independent group in the same manual invocation.
+            skipped_ids = ", ".join(sorted(group_ids))
+            log(
+                f"run group={lock_name} skipped routines={skipped_ids} — "
+                f"{exc}"
+            )
+            continue
+        _merge_totals(totals, group_totals)
 
     verb = "would process" if args.dry_run else "processed"
     summary = (
@@ -175,38 +257,72 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
+    if not args.dry_run:
+        config.secure_routine_files(BASE_DIR)
     tick_id = uuid.uuid4().hex[:12]
     routines = config.discover(BASE_DIR)
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
         for p in problems:
-            print(f"invalid routine: {p}", file=sys.stderr)
+            log(f"invalid routine: {p}")
         return 1
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
-    due = [
+    group = getattr(args, "group", "all")
+    tick_name = f"tick[{tick_id}]"
+    if group != "all":
+        tick_name += f"({group})"
+    selected = [
         r for r in routines
-        if r.get("enabled", True) and schedule.due(r)
+        if (
+            r.get("enabled", True)
+            and (
+                group == "all"
+                or (group == "capture" and not config.is_maintenance(r))
+                or (group == "maintenance" and config.is_maintenance(r))
+            )
+        )
+    ]
+    due = [
+        r for r in selected
+        if schedule.due(r)
     ]
     if not due:
         mode = " (dry-run)" if args.dry_run else ""
-        log(f"tick[{tick_id}]: no routines due{mode}")
+        log(f"{tick_name}: no routines due{mode}")
         return 0
 
     due_ids = {r["id"] for r in due}
     mode = " (dry-run)" if args.dry_run else ""
-    log(f"tick[{tick_id}]: due={', '.join(sorted(due_ids))}{mode}")
-    try:
-        totals = runner.run(
-            BASE_DIR, routines, dry_run=args.dry_run,
-            refresh_labels=args.refresh_labels, active_ids=due_ids,
-        )
-    except state.AlreadyRunning as exc:
-        log(f"tick[{tick_id}] skipped — {exc}{mode}")
-        return 0
-    schedule.mark_attempted(due_ids)
+    log(f"{tick_name}: due={', '.join(sorted(due_ids))}{mode}")
+    totals = _empty_totals()
+    # Run latency-sensitive capture before long maintenance (the Slack census
+    # can take tens of minutes). Persist each group's attempt immediately, so
+    # the next tick cannot repeat capture merely because maintenance was slow.
+    groups = _execution_groups(routines, due_ids)
+    for group_ids, lock_name in groups:
+        if not group_ids:
+            continue
+        # Cadence is measured from the attempt's start. A 40-minute census on
+        # a one-day schedule must not silently become a 24h40m schedule.
+        group_started_epoch = current_epoch()
+        try:
+            group_totals = runner.run(
+                BASE_DIR, routines, dry_run=args.dry_run,
+                refresh_labels=args.refresh_labels, active_ids=group_ids,
+                lock_name=lock_name,
+            )
+        except state.AlreadyRunning as exc:
+            skipped_ids = ", ".join(sorted(group_ids))
+            log(
+                f"{tick_name} skipped routines={skipped_ids} — "
+                f"{exc}{mode}"
+            )
+            continue
+        schedule.mark_attempted(group_ids, now=group_started_epoch)
+        _merge_totals(totals, group_totals)
     log(
-        f"tick[{tick_id}] done: {totals['processed']} processed, "
+        f"{tick_name} done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
         f"{mode}"
     )
@@ -280,7 +396,13 @@ def cmd_new(args):
             print(f"    {p}", file=sys.stderr)
         return 1
 
-    path.write_text(yaml.safe_dump(routine, sort_keys=False, allow_unicode=True, width=100))
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    state.write_atomic(
+        path,
+        yaml.safe_dump(routine, sort_keys=False, allow_unicode=True, width=100),
+        mode=0o600,
+    )
     print(f"\nwrote {path}")
     print(f"preview it with: ./daemon.py run --routine {routine_id} --dry-run")
     return 0
@@ -332,6 +454,10 @@ def main(argv=None):
         "tick", help="run only enabled routines whose schedule is due"
     )
     p_tick.add_argument(
+        "--group", choices=("all", "capture", "maintenance"), default="all",
+        help="run all due routines, capture only, or maintenance only",
+    )
+    p_tick.add_argument(
         "-n", "--dry-run", action="store_true",
         help="preview due routines without LLM/source mutation or data/state "
              "writes; operational log only",
@@ -352,14 +478,19 @@ def main(argv=None):
     try:
         return args.func(args)
     except (config.RoutineError, MissingBinary, state.StateError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        log(f"error: {exc}")
         return 1
     except KeyboardInterrupt:
-        print("\naborted", file=sys.stderr)
+        log("aborted")
         return 130
     except SystemExit as exc:
         log(f"terminated by signal (exit {exc.code})")
         raise
+    except Exception as exc:
+        # launchd stdout/stderr intentionally go to /dev/null; unexpected
+        # failures must still leave a private, actionable traceback.
+        log(f"unhandled ERROR: {exc}\n{traceback.format_exc().rstrip()}")
+        return 1
 
 
 if __name__ == "__main__":

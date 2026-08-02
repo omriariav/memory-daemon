@@ -60,7 +60,7 @@ oldest successful scope checkpoint. A non-due owner therefore holds the safe
 watermark instead of creating a silent gap. Partial and inline specialized
 routines do not advance connector health on their own. Connector coverage
 sources use `max_results: 0`; a bounded source or a reported upstream service
-cap holds the watermark until complete coverage succeeds. Slack and Google Chat
+cap holds the watermark until complete coverage succeeds. Gmail, Slack, and Google Chat
 sweep publishers also require `catch_up: true`; Google Chat requires
 `max_per_space: 0`.
 
@@ -171,6 +171,8 @@ launchd, which does not inherit a login shell's `PATH`):
 ```sh
 export WORKSPACE_DAEMON_GWS_BIN=/path/to/gws
 export WORKSPACE_DAEMON_YOETZ_BIN=/path/to/yoetz
+export WORKSPACE_DAEMON_ADA_BIN=/path/to/ada
+export WORKSPACE_DAEMON_NPX_BIN=/stable/node/bin/npx
 ```
 
 ```sh
@@ -335,11 +337,12 @@ catch_up: true
 catch_up_overlap: 1h
 ```
 
-After an error-free run, `state/cursors.json` records when that source scan
+After each source completes successfully, `state/cursors.json` records when that source scan
 started. The next scan begins one overlap before that checkpoint. The processed
 ledger skips unchanged daily versions, while messages that arrived during the
 previous run remain eligible. A source, analysis, or memory error holds the
-cursor; catch-up items ledgered with a memory error are retried. Before the
+affected source's cursor without holding successful unrelated sources; catch-up
+items ledgered with a memory error are retried. Before the
 first successful run, `batch_messages_after` is the bootstrap boundary (or the
 configured `hours` window is used when no boundary exists).
 
@@ -354,6 +357,26 @@ batch_messages_after: "2026-07-28T06:46:03Z"
 The boundary is exclusive. Pre-boundary messages stay under their legacy source
 ids, while later messages use the new `gchat:<space>:daily:<date>` namespace.
 Remove neither the boundary nor legacy ledger rows after cutover.
+
+Set `session_gap_minutes` (for example, `120`) on daily GChat or direct Slack
+digests to split long-separated conversation bursts into distinct durable
+memories. The first session keeps the historical daily source id; later
+sessions get stable `:session:<first-message-time>` suffixes.
+
+Gmail supports the same durable cursor. Keep the catch-up `query` free of
+`newer_than:`, `older_than:`, `after:`, and `before:`; the daemon appends its
+own `after:` boundary. Use a timeless `queue_query` for Inbox items that must
+remain eligible regardless of age:
+
+```yaml
+kind: gmail
+query: '{in:inbox in:sent}'
+queue_query: 'in:inbox {is:unread is:starred}'
+max_results: 0
+catch_up: true
+catch_up_overlap: 1h
+catch_up_after: "2026-08-01T00:00:00Z"
+```
 
 Slack supports the same durable queue for explicitly configured channels and
 workspace-wide mentions. Use `direct_channels` for public or private channels
@@ -404,8 +427,9 @@ python3 -m workspace_daemon.slack_cli census \
   --checkpoint state/slack-census.json
 ```
 
-It enumerates conversations joined by the authenticated user, probes each for
-one top-level message in the window, and prints only active conversation
+It enumerates conversations joined by the authenticated user, scans a bounded
+thread-root horizon (30 days by default), and detects both new roots and new
+replies to older roots. It prints only active conversation and thread-root
 metadata—never message text. The checkpoint is resumable across laptop sleep
 and contains IDs, names, types, timestamps, and API errors only. The default
 40-request/minute throttle bounds this process's history probes; other clients
@@ -830,13 +854,16 @@ tags: [kind/email-scoop-summary, status/inbox]
 ---
 ```
 
-## Scheduling (macOS LaunchAgent)
+## Scheduling (macOS LaunchAgents)
 
-The LaunchAgent is a lightweight coordinator. It wakes every 15 minutes and
-calls `daemon.py tick`; routines that are not due make no source or LLM calls.
-The template deliberately uses `RunAtLoad: false`, so installation itself
-never triggers the first real run. Render the template and add your key, but
-leave activation to the explicit `run.sh` step below:
+Two lightweight coordinators wake every 15 minutes. The capture job runs Gmail,
+Google Chat, Slack, and local capture routines; the maintenance job runs
+metadata work such as the long Slack conversation census. Separating them means
+a census cannot delay a due 15-minute capture. Routines that are not due make
+no source or LLM calls. Both templates deliberately use `RunAtLoad: false`, so
+installation itself never triggers a real run. Render both templates, add the
+provider key only to the capture plist, and leave activation to the explicit
+`run.sh` step below:
 
 ```sh
 # The template uses this stable link so Node upgrades do not break launchd.
@@ -847,9 +874,15 @@ ln -sfn "$(dirname "$(dirname "$(command -v node)")")" ~/.local/node-current
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon.plist.template \
   > ~/Library/LaunchAgents/com.memory-daemon.plist
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+  launchd/com.memory-daemon-maintenance.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
 
-# replace REPLACE_ME with your provider API key
+# Replace REPLACE_ME with your provider API key, then keep both rendered
+# definitions private. The maintenance job does not receive the provider key.
 $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
+chmod 600 ~/Library/LaunchAgents/com.memory-daemon.plist \
+  ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
 
 # One-time cleanup when upgrading from the former workspace-daemon label.
 launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
@@ -865,21 +898,25 @@ want to turn the daemon on and choose its first tick, run:
 ./run.sh
 ```
 
-The helper validates every routine, loads the configured LaunchAgent when
-necessary, and clears any launchd disable override before starting one
-coordinator tick immediately. That tick runs every **enabled**
-routine that is due; the helper never changes a routine's `enabled` setting.
-It is safe to call again when the scheduler is already loaded.
+The helper validates every routine, reloads both LaunchAgents from their current
+plists, clears launchd disable overrides, and starts one capture and one
+maintenance coordinator tick immediately. Each tick runs every **enabled**
+routine in its group that is due; the helper never changes a routine's
+`enabled` setting. It is safe to call again when the schedulers are loaded.
 
 Check on it:
 
 ```sh
 ./memory-daemon-status.sh
 tail -f logs/run.log
-tail -f logs/launchd.err.log
 ```
 
-`memory-daemon-status.sh` is read-only. It shows each routine's declared role
+Operational logs rotate at 20 MiB with five backups. Runtime state, logs, and
+non-example routine files are written owner-only (`0600`) under owner-only
+directories (`0700`).
+
+`memory-daemon-status.sh` is read-only. It reports both coordinators and shows
+each routine's declared role
 (`general`, `domain`, `specialized`, `partial`, or `maintenance`) and source
 connectors,
 distinguishes a last scheduled attempt from a last captured item, shows when
@@ -904,7 +941,12 @@ the LaunchAgent or a routine needs attention, so it can also be used by a
 separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
 installed job uses a different label.
 
-Unload with `launchctl unload ~/Library/LaunchAgents/com.memory-daemon.plist`.
+Rollback both jobs with:
+
+```sh
+launchctl bootout gui/$(id -u)/com.memory-daemon
+launchctl bootout gui/$(id -u)/com.memory-daemon-maintenance
+```
 
 The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
 gitignored — only the template is tracked.
@@ -930,7 +972,7 @@ workspace_daemon/
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
-launchd/                   LaunchAgent template
+launchd/                   capture + maintenance LaunchAgent templates
 state/  logs/              runtime, gitignored
 ```
 
@@ -955,23 +997,29 @@ once `archive` lands, an `in:inbox` query can no longer see the item. Every
 action is idempotent, so replaying a partial sequence is safe, and the retry
 never re-summarizes. `daemon.py run` reports the count.
 
+Configured memory sinks and source expansion are mutation barriers: Gmail
+actions are withheld and the item is retried until the memory entry and any
+required expanded document are successfully persisted.
+
 **A partial write cannot corrupt anything.** Notes and the ledger both go through
 a temp file plus `os.replace`, with the containing directory fsynced so the
 rename itself survives power loss. An unreadable or wrong-shaped ledger raises a
 clear error rather than a traceback — and does not tempt you to delete it, since
 an empty ledger means re-summarizing and re-triaging everything still matched.
 
-**Two runs cannot overlap.** A real run takes an exclusive lock on
-`state/run.lock`. launchd will not overlap a `StartInterval` job with itself, but
-a manual `daemon.py run` alongside the scheduled one would otherwise have both
-processes summarizing the same item. A second run exits cleanly, logging that it
-skipped. Dry runs never take the lock.
+**Work that mutates the same state cannot overlap.** Capture and most
+maintenance work take `state/run.lock`. The long Slack conversation census uses
+its own `state/slack-census.lock`, so it cannot block frequent capture and can
+overlap it safely; its checkpoint is replaced atomically. Manual and scheduled
+runs use the same lock mapping. A second run in an occupied lock group exits
+cleanly and logs exactly which routines it skipped, while independent groups
+continue. Dry runs never take either lock.
 
-`flock` binds to an inode, not a path, so deleting `state/run.lock` mid-run
-leaves the holder guarding an orphan and lets another run lock a freshly created
-file. There is no rendezvous left to defend at that point, so the holder checks
-before each item and stops rather than racing on. Don't delete that file while a
-run is going.
+`flock` binds to an inode, not a path, so deleting an active file under
+`state/*.lock` leaves the holder guarding an orphan and lets another run lock a
+freshly created file. There is no rendezvous left to defend at that point, so
+the holder checks before each item and stops rather than racing on. Don't delete
+lock files while their work is running.
 
 ## Tests
 

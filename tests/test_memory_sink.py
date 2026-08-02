@@ -1,5 +1,7 @@
 """memory_sink: slug-catalog parsing, model-output validation, source-id derivation."""
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import memory_sink
@@ -60,8 +62,8 @@ class SlugCatalogTest(unittest.TestCase):
             "resource_name": "people/new-person",
         }]
         response = (
-            '{"worthy":true,"type":"note","title":"T",'
-            '"people":["new-person"],"tags":[],"body":"b"}'
+            '{"worthy":true,"owner_attention":false,"type":"note","title":"T",'
+            '"people":["new-person"],"tags":["context"],"body":"b"}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -80,8 +82,9 @@ class SlugCatalogTest(unittest.TestCase):
 
     def test_extraction_policy_keeps_concrete_pending_requests(self):
         response = (
-            '{"worthy":true,"type":"todo","title":"Review roadmap",'
-            '"people":[],"tags":[],"body":"Review the roadmap."}'
+            '{"worthy":true,"owner_attention":true,"type":"todo",'
+            '"title":"Review roadmap","people":[],"tags":["roadmap"],'
+            '"body":"Review the roadmap."}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -120,6 +123,38 @@ class SourceIdTest(unittest.TestCase):
 
     def test_no_provenance_returns_none(self):
         self.assertIsNone(memory_sink.source_id_for({"id": "x", "frontmatter": {}}))
+
+    def test_ambiguous_write_verification_requires_the_exact_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_dir = Path(directory) / "memory" / "entries" / "2026" / "08"
+            entry_dir.mkdir(parents=True)
+            path = entry_dir / "durable.md"
+            path.write_text(
+                "---\n"
+                "id: durable\n"
+                "date: 2026-08-02\n"
+                "type: note\n"
+                "title: Durable update\n"
+                "people: [jane-doe]\n"
+                "tags: [auto-captured, product]\n"
+                "source_ids: [gmail:thread-1]\n"
+                "---\n"
+                "The exact durable body.\n"
+            )
+            self.assertEqual(
+                memory_sink._verify_written_entry(
+                    directory, "gmail:thread-1", "note", "Durable update",
+                    ["jane-doe"], ["auto-captured"],
+                    "The exact durable body.",
+                ),
+                "durable",
+            )
+            self.assertIsNone(
+                memory_sink._verify_written_entry(
+                    directory, "gmail:thread-1", "note", "Durable update",
+                    ["jane-doe"], ["auto-captured"], "stale body",
+                )
+            )
 
 
 class ValidateTest(unittest.TestCase):
@@ -532,6 +567,25 @@ class CaptureValidationTest(unittest.TestCase):
                 memory_sink.capture(self.routine, self.item, "summary text")
 
         commit.assert_called_once_with("/store", "memory: r auto-capture")
+
+    def test_nonzero_add_is_accepted_only_after_exact_disk_verification(self):
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult("late failure", returncode=2)
+        ), mock.patch.object(memory_sink, "_commit_store") as commit, \
+             mock.patch.object(
+                 memory_sink, "_verify_written_entry",
+                 return_value="2026-08-02-verified-entry",
+             ) as verify:
+            outcome = memory_sink.capture(
+                self.routine, self.item, "summary text"
+            )
+
+        self.assertEqual(outcome["memory"], "verified")
+        self.assertEqual(
+            outcome["memory_entry_id"], "2026-08-02-verified-entry"
+        )
+        commit.assert_called_once_with("/store", "memory: r auto-capture")
+        verify.assert_called_once()
 
     def test_verified_drive_owner_can_mint_new_person_slug(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
@@ -1014,7 +1068,9 @@ class FollowupResolutionTest(unittest.TestCase):
             "memory": {"store": "/store", "type": "note"},
         }
         with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
-             mock.patch.object(memory_sink.subprocess, "run"):
+             mock.patch.object(
+                 memory_sink.subprocess, "run", return_value=FakeResult()
+             ):
             outcome = memory_sink.resolve_followup(
                 routine,
                 memory_entry_id="2026-07-31-open-follow-up",

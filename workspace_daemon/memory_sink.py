@@ -26,9 +26,12 @@ import datetime
 import json
 import re
 import subprocess
+from pathlib import Path
+
+import yaml
 
 from . import contacts, drive
-from .shell import log
+from .shell import log, npx_bin
 
 MEMORY_TYPES = {
     "event", "decision", "todo", "pending-decision", "1on1", "hiring",
@@ -55,7 +58,7 @@ other text, with exactly these keys:
             If the note contains the standalone line
             "{no_owner_action_marker}", set this false.
   "type": one of: event, decision, todo, pending-decision, 1on1, hiring,
-          incident, achievement, feedback, meeting, note
+          incident, achievement, feedback, meeting, note, summary
           (use "meeting" only for an actual meeting record; an email report or
           channel discussion is a "note", "decision", or "event"; use "todo"
           or "pending-decision" only when owner_attention is true)
@@ -147,6 +150,13 @@ def validate(routine):
         return []
     rid = routine.get("id", "<missing id>")
     problems = []
+    unknown = set(cfg) - {
+        "store", "type", "tags", "extract", "operator_confirmed_source_ids",
+    }
+    if unknown:
+        problems.append(
+            f"{rid}: memory has unknown key(s) {', '.join(sorted(unknown))}"
+        )
     store = cfg.get("store")
     if not store or not str(store).startswith("/"):
         problems.append(f"{rid}: memory.store must be an absolute path to the store instance")
@@ -178,10 +188,83 @@ def validate(routine):
 
 def _cli(store, args, stdin_text=None, timeout=120):
     return subprocess.run(
-        ["npx", "tsx", "src/cli.ts", *args],
+        [npx_bin(), "tsx", "src/cli.ts", *args],
         cwd=store, capture_output=True, text=True, timeout=timeout,
         input=stdin_text,
     )
+
+
+def _verify_written_entry(store, source_id, etype, title, people, tags, body):
+    """Return the exact persisted entry id after an ambiguous CLI result.
+
+    personal-memory can exit non-zero after its durable write (for example if
+    a later indexing or rule step fails). Trusting only the exit status causes
+    an endless retry, while trusting any file carrying the source id could hide
+    a failed update. Verify the complete payload in every materialization of
+    the one matching id before treating the write as successful.
+    """
+    if not source_id:
+        return None
+    root = Path(store)
+    entry_roots = [root / "memory" / "entries"]
+    graphs = root / "memory-graphs"
+    if graphs.is_dir():
+        entry_roots.extend(
+            path / "entries"
+            for path in graphs.iterdir()
+            if path.is_dir()
+        )
+
+    expected_people = set(people)
+    expected_tags = set(tags)
+    matches = {}
+    try:
+        paths = [
+            path
+            for entry_root in entry_roots
+            if entry_root.is_dir()
+            for path in entry_root.rglob("*.md")
+            if path.is_file()
+        ]
+        for path in paths:
+            raw = path.read_text(encoding="utf-8")
+            if not raw.startswith("---"):
+                continue
+            parts = raw.split("---", 2)
+            if len(parts) != 3:
+                continue
+            frontmatter = yaml.safe_load(parts[1]) or {}
+            if not isinstance(frontmatter, dict):
+                continue
+            source_ids = frontmatter.get("source_ids") or []
+            if not isinstance(source_ids, list) or any(
+                not isinstance(value, str) for value in source_ids
+            ):
+                continue
+            if source_id not in source_ids:
+                continue
+            stored_people = frontmatter.get("people") or []
+            stored_tags = frontmatter.get("tags") or []
+            if not isinstance(stored_people, list) or not isinstance(
+                stored_tags, list
+            ):
+                continue
+            entry_id = frontmatter.get("id")
+            valid = bool(
+                isinstance(entry_id, str)
+                and frontmatter.get("type") == etype
+                and frontmatter.get("title") == title
+                and expected_people.issubset(set(stored_people))
+                and expected_tags.issubset(set(stored_tags))
+                and parts[2].strip() == body.strip()
+            )
+            matches.setdefault(entry_id, []).append(valid)
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        return None
+    if len(matches) != 1:
+        return None
+    entry_id, materializations = next(iter(matches.items()))
+    return entry_id if entry_id and all(materializations) else None
 
 
 _slug_cache = {}
@@ -408,6 +491,38 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
     data = json.loads(raw)  # let a malformed answer raise; caller falls back
     if not isinstance(data, dict):
         raise ValueError("extraction did not return a JSON object")
+    expected = {
+        "worthy", "owner_attention", "type", "title", "people", "tags", "body",
+    }
+    if set(data) != expected:
+        missing = sorted(expected - set(data))
+        unknown = sorted(set(data) - expected)
+        details = []
+        if missing:
+            details.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown keys: {', '.join(unknown)}")
+        raise ValueError("invalid extraction schema (" + "; ".join(details) + ")")
+    if type(data["worthy"]) is not bool or type(data["owner_attention"]) is not bool:
+        raise ValueError("worthy and owner_attention must be booleans")
+    if data["type"] not in MEMORY_TYPES:
+        raise ValueError(f"unknown memory type {data['type']!r}")
+    if not isinstance(data["title"], str) or not data["title"].strip():
+        raise ValueError("title must be a non-empty string")
+    if len(data["title"]) > 120:
+        raise ValueError("title must be at most 120 characters")
+    if not isinstance(data["body"], str) or not data["body"].strip():
+        raise ValueError("body must be a non-empty string")
+    for key, limit in (("people", None), ("tags", 4)):
+        values = data[key]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value)
+            for value in values
+        ):
+            raise ValueError(f"{key} must be a list of kebab-case strings")
+        if limit is not None and not 1 <= len(values) <= limit:
+            raise ValueError(f"{key} must contain 1-{limit} values")
     return data
 
 
@@ -458,8 +573,9 @@ def capture(routine, item, summary, dry_run=False):
     """Distill `summary` into one memory entry and store it via the CLI.
 
     Returns a small outcome dict for the ledger, or None when skipped.
-    Never raises on model/validation trouble — degrades to a plain note,
-    because a failed capture must not fail the routine's Gmail triage.
+    Model extraction trouble degrades to a validated plain note. Persistence
+    uncertainty raises so callers can retry and must not perform source-side
+    actions (such as Gmail archive) after an unverified memory write.
     """
     cfg = memory_cfg(routine)
     if not cfg:
@@ -652,19 +768,30 @@ def capture(routine, item, summary, dry_run=False):
 
     r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        # Some store failures happen after the entry file was written. Preserve
-        # any such write before surfacing the error for an idempotent retry.
-        _commit_store(store, f"memory: {rid} auto-capture")
-        raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
-    m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
-    verdict, entry_id = (m.group(1), m.group(2)) if m else ("unknown", None)
+    # Some store failures happen after the entry file was written. Preserve
+    # any such write before deciding whether the result is an error.
     _commit_store(store, f"memory: {rid} auto-capture")
-    if active_chat_followup and not entry_id:
-        raise RuntimeError(
-            "memory add returned no entry id for active Gmail follow-up: "
-            f"{out.strip()[:300]}"
+    m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
+    if r.returncode == 0 and m:
+        verdict, entry_id = m.group(1), m.group(2)
+    else:
+        entry_id = _verify_written_entry(
+            store, source_id, etype, title, people,
+            list(dict.fromkeys(tags)), body,
         )
+        if entry_id:
+            verdict = "verified"
+            log(
+                f"routine={rid} memory WARN ambiguous CLI result was "
+                f"verified on disk for source_id={source_id}"
+            )
+        elif r.returncode != 0:
+            raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
+        else:
+            raise RuntimeError(
+                "memory add returned no entry id or recognized verdict: "
+                f"{out.strip()[:300]}"
+            )
     log(
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"
@@ -721,10 +848,29 @@ def resolve_followup(routine, memory_entry_id, thread_id, title,
 
 
 def _commit_store(store, message):
-    """Best-effort nested-git commit for unattended store writes."""
+    """Commit unattended store writes and fail if versioning is unhealthy."""
     # The store's auto-commit hook only fires inside agent sessions; commit here
     # so daemon writes are versioned too.
-    subprocess.run(["git", "-C", f"{store}/memory", "add", "-A", "."],
-                   capture_output=True, timeout=30)
-    subprocess.run(["git", "-C", f"{store}/memory", "commit", "-q", "-m",
-                    message], capture_output=True, timeout=30)
+    repo = f"{store}/memory"
+    added = subprocess.run(
+        ["git", "-C", repo, "add", "-A", "."],
+        capture_output=True, text=True, timeout=30,
+    )
+    if added.returncode != 0:
+        raise RuntimeError(
+            f"memory git add failed: {(added.stderr or added.stdout).strip()[:300]}"
+        )
+    committed = subprocess.run(
+        ["git", "-C", repo, "commit", "-q", "-m", message],
+        capture_output=True, text=True, timeout=30,
+    )
+    if committed.returncode == 0:
+        return
+    status = subprocess.run(
+        ["git", "-C", repo, "status", "--porcelain"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if status.returncode == 0 and not status.stdout.strip():
+        return
+    detail = (committed.stderr or committed.stdout).strip()[:300]
+    raise RuntimeError(f"memory git commit failed: {detail or 'working tree still dirty'}")

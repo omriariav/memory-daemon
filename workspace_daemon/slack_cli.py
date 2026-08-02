@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .shell import ada_bin
+
 
 API = "https://slack.com/api"
 PERMALINK_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})")
@@ -414,6 +416,7 @@ def cmd_joined(args: List[str]) -> None:
 def run_census(
     hours: float = 48,
     requests_per_minute: int = 40,
+    thread_root_days: float = 30,
     checkpoint: Optional[Path] = None,
     progress=None,
 ) -> Dict:
@@ -445,6 +448,7 @@ def run_census(
         restart = (
             existing_hours is None
             or abs(existing_hours - hours) >= (1 / 3600)
+            or float(existing.get("thread_root_days", 0)) != float(thread_root_days)
         )
     if existing and not restart:
         conversations = existing["inventory"]
@@ -467,6 +471,7 @@ def run_census(
         cutoff_epoch,
         until_epoch=until_epoch,
         requests_per_minute=requests_per_minute,
+        thread_root_days=thread_root_days,
         checkpoint=checkpoint,
         progress=progress,
         resume=not restart,
@@ -493,6 +498,7 @@ def run_census(
 def cmd_census(args: List[str]) -> None:
     """Find joined conversations with top-level activity in a recent window."""
     hours = float(opt(args, "--hours", 48))
+    thread_root_days = float(opt(args, "--thread-root-days", 30))
     rpm = int(opt(args, "--requests-per-minute", 40))
     if hours <= 0:
         die("census hours must be greater than zero")
@@ -506,6 +512,7 @@ def cmd_census(args: List[str]) -> None:
     )
     payload = run_census(
         hours=hours,
+        thread_root_days=thread_root_days,
         requests_per_minute=rpm,
         checkpoint=checkpoint,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
@@ -605,7 +612,7 @@ def cmd_mentions(args: List[str]) -> None:
     days = opt(args, "--days", "1")
     result = subprocess.run(
         [
-            "ada", "slack", "mentions",
+            ada_bin(), "slack", "mentions",
             "--user", mention_user(),
             "--days", str(days),
             "--max-results", str(MENTION_MAX_RESULTS),

@@ -896,6 +896,118 @@ class RunnerWiringTest(unittest.TestCase):
             "2026-08-01-durable-product-context",
         )
 
+    def test_ordinary_memory_failure_also_withholds_and_retries_gmail_actions(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        outcomes = [
+            RuntimeError("store unavailable"),
+            {"memory": "created", "memory_entry_id": "entry-1"},
+        ]
+        with mock.patch.object(memory_sink, "capture", side_effect=outcomes):
+            first = runner.run(self.base, [r])
+            self.assertEqual(self.applied, [])
+            self.assertIn("memory_error", self.ledger()["m1"])
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertNotIn("memory_error", self.ledger()["m1"])
+
+    def test_incomplete_drive_expansion_withholds_gmail_actions_and_retries(self):
+        r = routine(self.vault, actions=["archive"])
+        original_fetch = runner.SOURCES["gmail"]
+        attempts = 0
+
+        def fetch(_routine, _source, candidate):
+            nonlocal attempts
+            attempts += 1
+            item = original_fetch[1](_routine, _source, candidate)
+            if attempts == 1:
+                item["expand_fallback"] = "meeting document unavailable"
+            return item
+
+        runner.SOURCES["gmail"] = (original_fetch[0], fetch)
+        first = runner.run(self.base, [r])
+        self.assertEqual(self.applied, [])
+        self.assertIn("expand_fallback", self.ledger()["m1"])
+        second = runner.run(self.base, [r])
+
+        self.assertEqual(first["fallbacks"], 1)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(self.applied, ["archive"])
+        self.assertNotIn("expand_fallback", self.ledger()["m1"])
+
+    def test_archived_historical_memory_error_replays_without_gmail_actions(self):
+        processed = state.Store(self.base)
+        processed.record("m1", {
+            "rule_id": "wiring",
+            "handler_id": "meeting-notes",
+            "source_kind": "gmail",
+            "source_id": "gmail:thread-1",
+            "memory_source_id": "gmail:thread-1",
+            "memory_error": "legacy store outage",
+            "processed_at": "2026-08-01T08:00:00Z",
+        })
+        gmail.search = lambda query, max_results=20: []
+        gmail.read_thread = lambda thread_id: {
+            "messages": [{
+                "id": "m1",
+                "headers": {
+                    "subject": "Durable meeting record",
+                    "from": "notes@example.com",
+                    "date": "Sat, 1 Aug 2026 08:00:00 +0000",
+                },
+                "body": "A durable decision and named owner.",
+            }],
+        }
+        prompts = []
+        llm.analyze = lambda _routine, prompt: (
+            prompts.append(prompt) or "Recovered meeting summary"
+        )
+        r = routine(
+            self.vault,
+            sources=[
+                {
+                    "kind": "gmail", "query": "from:notes@example.com",
+                    "max_results": 0, "handler": "meeting-notes",
+                    "actions": ["archive"],
+                },
+                {
+                    "kind": "gmail", "query": "in:anywhere",
+                    "max_results": 0, "actions": [],
+                },
+            ],
+            handlers={
+                "meeting-notes": {
+                    "analyze": {"instruction": "SPECIAL RECOVERY PROMPT"},
+                },
+            },
+            memory={"store": "/store", "type": "note"},
+        )
+        r.pop("source")
+        r.pop("actions")
+
+        with mock.patch.object(
+            memory_sink,
+            "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry-1"},
+        ):
+            totals = runner.run(self.base, [r])
+
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(self.applied, [])
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("SPECIAL RECOVERY PROMPT", prompts[0])
+        record = self.ledger()["m1"]
+        self.assertEqual(record["handler_id"], "meeting-notes")
+        self.assertEqual(record["memory"], "created")
+        self.assertNotIn("memory_error", record)
+
     def test_new_operator_confirmation_replays_archived_not_worthy_thread(self):
         r = routine(
             self.vault,

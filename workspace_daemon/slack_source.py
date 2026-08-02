@@ -291,6 +291,11 @@ def _with_active_conversations(source):
     ]))
     effective = dict(source)
     effective["direct_channels"] = merged
+    effective["_active_thread_roots"] = {
+        row["id"]: list(row.get("active_thread_roots") or [])
+        for row in data.get("active") or []
+        if row.get("id") in active and row.get("active_thread_roots")
+    }
     effective.pop("private_channels", None)
 
     # A conversation can first enter the census after the global catch-up
@@ -431,6 +436,22 @@ def _daily_version(messages):
     ).hexdigest()[:16]
 
 
+def _message_sessions(messages, gap_minutes):
+    if not gap_minutes:
+        return [messages]
+    batches = []
+    for message in messages:
+        if (
+            batches
+            and float(message["ts"]) - float(batches[-1][-1]["ts"])
+            < gap_minutes * 60
+        ):
+            batches[-1].append(message)
+        else:
+            batches.append([message])
+    return batches
+
+
 def _normalize_direct_message(message, channel, day):
     """Retain unsupported non-text activity instead of silently dropping it."""
     if (
@@ -483,6 +504,31 @@ def _catch_up_direct_candidates(source):
             )
         active_days = set()
         expanded = {}
+
+        known_roots = {root.get("ts") for root in roots if root.get("ts")}
+        for root_ts in (
+            (source.get("_active_thread_roots") or {}).get(channel) or []
+        ):
+            if root_ts in known_roots:
+                continue
+            thread = _cli(["replies", channel, root_ts]).get("messages", [])
+            if not thread:
+                raise RuntimeError(
+                    f"Slack census reported active thread {channel}:{root_ts} "
+                    "but conversations.replies returned no messages"
+                )
+            root = dict(thread[0])
+            root.setdefault("ts", root_ts)
+            roots.append(root)
+            known_roots.add(root_ts)
+            expanded[root_ts] = thread
+            active_days.update(
+                _message_day(message["ts"])
+                for message in thread
+                if message.get("ts")
+                and float(message["ts"]) > since_epoch
+                and not _is_membership_event(message)
+            )
 
         for root in roots:
             root_ts = root.get("ts")
@@ -560,34 +606,42 @@ def _catch_up_direct_candidates(source):
             by_day.setdefault(_message_day(message["ts"]), []).append(message)
         for day, day_messages in by_day.items():
             day_messages.sort(key=lambda message: float(message["ts"]))
-            sid = f"slack:{channel}:daily:{day}"
-            latest = day_messages[-1]["ts"]
-            first_text = next(
-                (
-                    redact_secrets(
-                        (message.get("text") or "").replace("\n", " ")
-                    )
-                    for message in day_messages
-                    if (message.get("text") or "").strip()
-                ),
-                "",
+            sessions = _message_sessions(
+                day_messages, source.get("session_gap_minutes")
             )
-            out.append({
-                # Latest activity keeps the version legible; the content hash
-                # also changes when a wider root floor reveals older context
-                # without changing the day's latest timestamp.
-                "id": f"{sid}@{latest}:{_daily_version(day_messages)}",
-                "title": first_text[:90] or f"Slack catch-up for {day}",
-                "raw": {
-                    "channel": channel,
-                    "source_id": sid,
-                    "mode": "catch_up_digest",
-                    "capture_mode": "direct-catch-up-daily-digest",
-                    "digest_day": day,
-                    "messages": day_messages,
-                    "messages_expanded": True,
-                },
-            })
+            for session_index, session in enumerate(sessions):
+                suffix = (
+                    f":session:{session[0]['ts']}"
+                    if session_index > 0 else ""
+                )
+                sid = f"slack:{channel}:daily:{day}{suffix}"
+                latest = session[-1]["ts"]
+                first_text = next(
+                    (
+                        redact_secrets(
+                            (message.get("text") or "").replace("\n", " ")
+                        )
+                        for message in session
+                        if (message.get("text") or "").strip()
+                    ),
+                    "",
+                )
+                out.append({
+                    # Latest activity keeps the version legible; the content
+                    # hash also changes when a wider root floor reveals older
+                    # context without changing the latest timestamp.
+                    "id": f"{sid}@{latest}:{_daily_version(session)}",
+                    "title": first_text[:90] or f"Slack catch-up for {day}",
+                    "raw": {
+                        "channel": channel,
+                        "source_id": sid,
+                        "mode": "catch_up_digest",
+                        "capture_mode": "direct-catch-up-daily-digest",
+                        "digest_day": day,
+                        "messages": session,
+                        "messages_expanded": True,
+                    },
+                })
     return out
 
 
@@ -622,34 +676,42 @@ def _direct_digest_candidates(source):
                 for message in day_messages
             ]
             day_messages.sort(key=lambda message: message.get("ts") or "")
-            sid = f"slack:{channel}:digest:{day}"
-            latest = max(
-                (_activity_ts(message) for message in day_messages),
-                default="",
-                key=float,
+            sessions = _message_sessions(
+                day_messages, source.get("session_gap_minutes")
             )
-            first_text = next(
-                (
-                    redact_secrets(
-                        (message.get("text") or "").replace("\n", " ")
-                    )
-                    for message in day_messages
-                    if (message.get("text") or "").strip()
-                ),
-                "",
-            )
-            out.append({
-                "id": f"{sid}@{latest}",
-                "title": first_text[:90] or f"Slack digest for {day}",
-                "raw": {
-                    "channel": channel,
-                    "source_id": sid,
-                    "mode": "direct_digest",
-                    "capture_mode": capture_mode,
-                    "digest_day": day,
-                    "messages": day_messages,
-                },
-            })
+            for session_index, session in enumerate(sessions):
+                suffix = (
+                    f":session:{session[0]['ts']}"
+                    if session_index > 0 else ""
+                )
+                sid = f"slack:{channel}:digest:{day}{suffix}"
+                latest = max(
+                    (_activity_ts(message) for message in session),
+                    default="",
+                    key=float,
+                )
+                first_text = next(
+                    (
+                        redact_secrets(
+                            (message.get("text") or "").replace("\n", " ")
+                        )
+                        for message in session
+                        if (message.get("text") or "").strip()
+                    ),
+                    "",
+                )
+                out.append({
+                    "id": f"{sid}@{latest}:{_daily_version(session)}",
+                    "title": first_text[:90] or f"Slack digest for {day}",
+                    "raw": {
+                        "channel": channel,
+                        "source_id": sid,
+                        "mode": "direct_digest",
+                        "capture_mode": capture_mode,
+                        "digest_day": day,
+                        "messages": session,
+                    },
+                })
     return out
 
 

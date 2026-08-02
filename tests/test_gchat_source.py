@@ -48,14 +48,64 @@ class CandidatesTest(unittest.TestCase):
         by_sid = {c["raw"]["source_id"]: c for c in out}
         self.assertEqual(set(by_sid), {"gchat:AAA:t1", "gchat:AAA:t2"})
         # candidate id carries the LATEST message time -> new reply = new candidate
-        self.assertEqual(by_sid["gchat:AAA:t1"]["id"],
-                         "gchat:AAA:t1@2026-07-27T09:00:00Z")
+        self.assertTrue(by_sid["gchat:AAA:t1"]["id"].startswith(
+            "gchat:AAA:t1@2026-07-27T09:00:00Z:"
+        ))
         self.assertEqual(by_sid["gchat:AAA:t1"]["title"], "first")
 
     def test_empty_window(self):
         with mock.patch.object(gchat_source, "_gws",
                                return_value={"count": 0, "messages": None}):
             self.assertEqual(gchat_source.candidates({"spaces": ["spaces/AAA"]}), [])
+
+    def test_attachment_only_message_is_captured_without_url_or_body(self):
+        message = msg("file", "2026-07-27T08:00:00Z", "")
+        message["attachments"] = [{
+            "content_name": "roadmap.pdf",
+            "content_type": "application/pdf",
+            "download_uri": "https://secret.example/file",
+        }]
+        with mock.patch.object(
+            gchat_source, "_gws", return_value={"messages": [message]}
+        ):
+            candidate = gchat_source.candidates({"spaces": ["spaces/AAA"]})[0]
+        self.assertIn("roadmap.pdf", candidate["title"])
+        with mock.patch.object(gchat_source, "_member_context", return_value={
+            "names": {}, "members": [], "people": {},
+        }), mock.patch.object(gchat_source, "_space_context", return_value={}):
+            item = gchat_source.fetch({}, candidate)
+        self.assertIn("[Attachment: roadmap.pdf (application/pdf)]", item["body"])
+        self.assertNotIn("secret.example", item["body"])
+
+    def test_edit_changes_candidate_version_even_when_create_time_is_stable(self):
+        original = {"messages": [msg("t1", "2026-07-27T08:00:00Z", "draft")]}
+        edited = {"messages": [{
+            **msg("t1", "2026-07-27T08:00:00Z", "final decision"),
+            "last_update_time": "2026-07-27T09:00:00Z",
+        }]}
+        with mock.patch.object(gchat_source, "_gws", side_effect=[original, edited]):
+            before = gchat_source.candidates({"spaces": ["spaces/AAA"]})[0]
+            after = gchat_source.candidates({"spaces": ["spaces/AAA"]})[0]
+        self.assertNotEqual(before["id"], after["id"])
+        self.assertIn("@2026-07-27T09:00:00Z:", after["id"])
+
+    def test_daily_batches_split_long_gaps_into_stable_sessions(self):
+        messages = {"messages": [
+            msg("one", "2026-07-27T08:00:00Z", "morning topic"),
+            msg("two", "2026-07-27T08:30:00Z", "morning follow-up"),
+            msg("three", "2026-07-27T14:00:00Z", "unrelated afternoon topic"),
+        ]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            candidates = gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "batch_messages": "daily",
+                "session_gap_minutes": 120,
+            })
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            sum(":session:" in row["raw"]["source_id"] for row in candidates),
+            1,
+        )
 
     def test_zero_max_explicit_space_uses_exhaustive_positive_limit(self):
         with mock.patch.object(
@@ -92,7 +142,7 @@ class CandidatesTest(unittest.TestCase):
         )
         digest = by_sid["gchat:AAA:day:2026-07-27"]
         self.assertEqual(len(digest["raw"]["messages"]), 2)
-        self.assertTrue(digest["id"].endswith("@2026-07-27T10:01:00Z"))
+        self.assertIn("@2026-07-27T10:01:00Z:", digest["id"])
 
     def test_daily_message_batch_has_one_stable_space_day_identity(self):
         first_messages = {"messages": [
@@ -125,7 +175,7 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(first["raw"]["source_id"], updated["raw"]["source_id"])
         self.assertNotEqual(first["id"], updated["id"])
         self.assertEqual(len(updated["raw"]["messages"]), 4)
-        self.assertTrue(updated["id"].endswith("@2026-07-27T10:01:00Z"))
+        self.assertIn("@2026-07-27T10:01:00Z:", updated["id"])
         # The second discovery saw only the newest slice, but the final
         # candidate was rebuilt from an exhaustive UTC-day history call.
         self.assertEqual(
@@ -197,7 +247,7 @@ class CandidatesTest(unittest.TestCase):
                 "batch_messages": "daily",
             })[0]
 
-        self.assertTrue(candidate["id"].endswith("@2026-07-27T08:00:00Z"))
+        self.assertIn("@2026-07-27T08:00:00Z:", candidate["id"])
         self.assertEqual(len(candidate["raw"]["messages"]), 1)
 
     def test_daily_message_batch_drops_empty_system_messages(self):

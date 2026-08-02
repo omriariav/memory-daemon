@@ -17,7 +17,7 @@ import yaml
 
 from . import state
 from .memory_sink import _commit_store
-from .shell import gws_bin
+from .shell import gws_bin, npx_bin
 from .time_utils import is_rfc3339_instant
 
 
@@ -106,7 +106,7 @@ def _gws(args, timeout=120):
 
 def _memory_cli(store, args, timeout=180):
     return subprocess.run(
-        ["npx", "tsx", "src/cli.ts", *args],
+        [npx_bin(), "tsx", "src/cli.ts", *args],
         cwd=str(store),
         capture_output=True,
         text=True,

@@ -18,14 +18,49 @@ MAX_GMAIL_SOURCE_PEOPLE = 20
 MAX_GMAIL_THREAD_MESSAGES = 50
 MAX_GMAIL_THREAD_CHARS = 120_000
 GMAIL_CHAT_FOLLOWUP_QUERY = 'in:inbox from:me to:me subject:"Fwd: Chat"'
+_SHARED_DEPENDENCY_ERRORS = (
+    "name or service not known", "temporary failure in name resolution",
+    "could not resolve host", "nodename nor servname provided",
+    "network is unreachable", "connection refused", "connection reset",
+    "connection timed out", "timed out", "too many requests", "rate limit",
+    "quota exceeded", "unauthenticated", "invalid api key",
+)
+
+
+def _is_shared_dependency_failure(value):
+    text = str(value).casefold()
+    return any(marker in text for marker in _SHARED_DEPENDENCY_ERRORS)
 
 
 def _catch_up_cursor_id(source):
     """Stable cursor namespace for each supported catch-up source shape."""
     kind = source["kind"]
     if kind == "gchat":
-        # Preserve the cursor id shipped by the original GChat implementation.
-        return "gchat:all-spaces"
+        # Preserve the original namespace for legacy unbatched configurations.
+        # Once batching is configured, fingerprint the construction contract:
+        # a later cutover/session change must not inherit a cursor newer than
+        # the messages that need to be rebuilt under the new semantics.
+        batching_scope = {
+            "batch_messages": source.get("batch_messages"),
+            "batch_messages_after": source.get("batch_messages_after"),
+            "session_gap_minutes": source.get("session_gap_minutes"),
+            "catch_up_after": source.get("catch_up_after"),
+            "candidate_schema": gchat_source.CATCH_UP_SCHEMA,
+        }
+        if not any(
+            batching_scope[key] is not None
+            for key in (
+                "batch_messages", "batch_messages_after",
+                "session_gap_minutes",
+            )
+        ):
+            return "gchat:all-spaces"
+        digest = hashlib.sha256(
+            json.dumps(
+                batching_scope, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()[:16]
+        return f"gchat:all-spaces:{digest}"
     if kind == "slack":
         # A cursor is valid only for the exact configured coverage. If a
         # channel or mentions are added later, the new scope bootstraps from
@@ -58,6 +93,23 @@ def _catch_up_cursor_id(source):
             json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:16]
         return f"slack:configured-scope:{digest}"
+    if kind == "gmail":
+        # The cursor belongs to the stable semantic query, not its runtime
+        # `after:` boundary. Changing mailbox scope intentionally bootstraps a
+        # new cursor from catch_up_after.
+        scope = {
+            "query": source.get("query"),
+            "queue_query": source.get("queue_query"),
+            "exclude_query": source.get("exclude_query"),
+            "read_thread": source.get("read_thread") is True,
+            "self_forwarded_chat_followups": (
+                source.get("self_forwarded_chat_followups") is True
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        return f"gmail:configured-query:{digest}"
     raise config.RoutineError(f"catch-up is not supported for source kind {kind!r}")
 
 
@@ -99,7 +151,8 @@ def _needs_label_catalog(routines):
     )
 
 
-def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None):
+def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
+        lock_name="run"):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -115,7 +168,10 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
-        lock = stack.enter_context(state.RunLock(base_dir)) if not dry_run else None
+        lock = (
+            stack.enter_context(state.RunLock(base_dir, name=lock_name))
+            if not dry_run else None
+        )
         return _run_locked(
             base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
         )
@@ -189,9 +245,10 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             log(f"routine={routine.get('id', '?')} FATAL: {exc}")
             routing_failures.extend(_routine_failures(routine))
 
-    # Maintenance shares the global run lock and executes before capture
-    # sources. If a daily census and its consumer are due in the same tick,
-    # the consumer sees the newly completed fixed-window snapshot.
+    # Within one lock group, maintenance executes before capture sources. The
+    # coordinator refreshes Slack census separately under slack-census.lock:
+    # manual all-routine runs do that first, while scheduled capture consumes
+    # the last completed snapshot without waiting for a long census.
     for routine in valid:
         if (
             routine["id"] not in active_ids
@@ -297,7 +354,9 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                     f"since={since}"
                 )
             if routine_active:
-                catch_up_sources.append((routine["id"], cursor_id, kind))
+                catch_up_sources.append(
+                    (routine["id"], source_index, cursor_id, kind)
+                )
 
     # Source adapters may need to distinguish a real run from a read-only
     # preview. Keep this runtime-only flag out of routine files and cursor
@@ -343,10 +402,25 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 f"routine={routine_id} source={kind} FATAL: "
                 f"{source_coverage[coverage_key]}"
             )
+    routing_errors_before = totals["errors"]
+    routing_holds = set()
     owned = _route_claims(
-        claims, totals, failures=[*routing_failures, *listing_failures]
+        claims, totals, failures=[*routing_failures, *listing_failures],
+        held_source_keys=routing_holds,
     )
+    failed_source_keys = {
+        key for key, problem in source_coverage.items() if problem
+    }
+    failed_source_keys.update(routing_holds)
+    if totals["errors"] > routing_errors_before:
+        # Ownership ambiguity cannot safely be assigned to just one claimant.
+        failed_source_keys.update(
+            (routine["id"], source_index)
+            for routine in active
+            for source_index, _source in enumerate(config.sources(routine))
+        )
     valid_ids = {routine["id"] for routine in valid}
+    shared_circuit = {}
 
     for routine in active:
         if (
@@ -356,28 +430,31 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])
-        _run_owned(
+        failed_source_keys.update(_run_owned(
             routine, routine_claims, processed, label_catalog, dry_run,
-            totals, lock, catalog, base_dir,
-        )
+            totals, lock, catalog, base_dir, shared_circuit,
+        ))
 
-    coverage_points = []
-    if totals["errors"] == 0:
-        coverage_points = _mark_connector_sweeps(
-            routines,
-            valid_ids,
-            active_ids,
-            scan_started_at,
-            dry_run,
-            totals,
-            cursors,
-            source_coverage,
-            active_source_stamps,
-        )
+    for key in failed_source_keys:
+        if key in source_coverage and not source_coverage[key]:
+            source_coverage[key] = "item processing failed"
+
+    coverage_points = _mark_connector_sweeps(
+        routines,
+        valid_ids,
+        active_ids,
+        scan_started_at,
+        dry_run,
+        totals,
+        cursors,
+        source_coverage,
+        active_source_stamps,
+    )
 
     successful_points = [
-        (*source, scan_started_at)
-        for source in catch_up_sources
+        (routine_id, cursor_id, kind, scan_started_at)
+        for routine_id, source_index, cursor_id, kind in catch_up_sources
+        if not source_coverage.get((routine_id, source_index))
     ]
     successful_points.extend(coverage_points)
     for (
@@ -388,11 +465,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         runtime,
     ) in active_conversation_sources:
         until_at = runtime.get("until_at")
-        if until_at:
+        if until_at and not source_coverage.get((routine_id, _source_index)):
             successful_points.append(
                 (routine_id, cursor_id, kind, until_at)
             )
-        elif totals["errors"] == 0:
+        elif not source_coverage.get((routine_id, _source_index)):
             totals["errors"] += 1
             log(
                 f"routine={routine_id} source={kind} FATAL: "
@@ -400,25 +477,23 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             )
 
     if successful_points:
-        if totals["errors"] == 0:
-            cursors.mark_successful_at(successful_points)
-            if catch_up_sources:
-                mode = "[dry-run] would advance" if dry_run else "advanced"
-                log(
-                    f"catch-up cursor {mode} to {scan_started_at} for "
-                    f"{len(catch_up_sources)} source(s)"
-                )
-        else:
-            if catch_up_sources:
-                log(
-                    f"catch-up cursor held at prior checkpoint due to "
-                    f"{totals['errors']} error(s)"
-                )
-            if coverage_points:
-                log(
-                    f"connector coverage checkpoint held at prior state due to "
-                    f"{totals['errors']} error(s)"
-                )
+        cursors.mark_successful_at(successful_points)
+        advanced_catch_up = sum(
+            1 for rid, index, _cursor, _kind in catch_up_sources
+            if not source_coverage.get((rid, index))
+        )
+        if advanced_catch_up:
+            mode = "[dry-run] would advance" if dry_run else "advanced"
+            log(
+                f"catch-up cursor {mode} to {scan_started_at} for "
+                f"{advanced_catch_up} source(s)"
+            )
+    held = len(catch_up_sources) - sum(
+        1 for rid, index, _cursor, _kind in catch_up_sources
+        if not source_coverage.get((rid, index))
+    )
+    if held:
+        log(f"catch-up cursor held for {held} failed source(s)")
 
     return totals
 
@@ -593,10 +668,27 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
             )
         except Exception as exc:
             totals["errors"] += 1
+            for routine in routines:
+                if routine.get("id") not in active_ids:
+                    continue
+                for source_index, source in enumerate(config.sources(routine)):
+                    if source.get("kind") == connector:
+                        source_coverage[(routine["id"], source_index)] = (
+                            f"connector mark-pulled failed: {exc}"
+                        )
             log(
                 f"routine={sweep['id']} connector state FATAL: {exc}"
             )
-    return coverage_points
+    return [
+        point for point in coverage_points
+        if not any(
+            routine.get("id") == point[0]
+            and _coverage_cursor_id(source_index, source) == point[1]
+            and source_coverage.get((point[0], source_index))
+            for routine in routines
+            for source_index, source in enumerate(config.sources(routine))
+        )
+    ]
 
 
 # --- sources ----------------------------------------------------------------
@@ -604,7 +696,22 @@ def _mark_connector_sweeps(routines, valid_ids, active_ids, scan_started_at,
 # full content on demand. Listing stays cheap so dedupe can skip most work.
 
 def _gmail_candidates(source):
-    threads = gmail.search(source["query"], source.get("max_results", 20))
+    query = source["query"]
+    exclude_query = source.get("exclude_query")
+    if exclude_query:
+        query = f"({query}) ({exclude_query})"
+    since = source.get("_since")
+    if since:
+        second, _ = time_utils.rfc3339_key(since)
+        windowed = f"({query}) after:{int(second.timestamp())}"
+        queue_query = source.get("queue_query")
+        if queue_query and exclude_query:
+            queue_query = f"({queue_query}) ({exclude_query})"
+        query = (
+            f"({queue_query}) OR ({windowed})"
+            if queue_query else windowed
+        )
+    threads = gmail.search(query, source.get("max_results", 20))
     candidates = []
     seen = set()
     for thread in threads:
@@ -1386,27 +1493,15 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         for space in source.get("spaces", [])
         if isinstance(space, str)
     }
-    operator_replay_gmail_source = {
-        routine["id"]: next(
-            (
-                index
-                for index, source in enumerate(config.sources(routine))
-                if (
-                    source.get("kind") == "gmail"
-                    and not source.get("handler")
-                )
-            ),
-            next(
-                (
-                    index
-                    for index, source in enumerate(config.sources(routine))
-                    if source.get("kind") == "gmail"
-                ),
-                None,
-            ),
-        )
+    gmail_sources = {
+        routine["id"]: [
+            (index, source)
+            for index, source in enumerate(config.sources(routine))
+            if source.get("kind") == "gmail"
+        ]
         for routine in routines
     }
+    gmail_listed_ids = {routine["id"]: set() for routine in routines}
 
     for routine, source_index, source in entries:
         rid = routine["id"]
@@ -1512,6 +1607,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
             listed_routing_ids.update(normal_ids)
+            if kind == "gmail":
+                gmail_listed_ids[rid].update(normal_ids)
 
             discovery = []
             discovery_limit = _ownership_limit(source, all_sources)
@@ -1562,74 +1659,104 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     "processable": processable,
                 })
 
-        if (
-            kind == "gmail"
-            and source_index == operator_replay_gmail_source[rid]
-        ):
-            # An explicit owner override may be added after a prior run
-            # archived/read the Gmail item out of its original query. Replay
-            # the exact thread directly, with actions disabled, so the memory
-            # decision can be repaired without repeating mailbox mutations.
-            confirmed = (
-                memory_sink.memory_cfg(routine)
-                .get("operator_confirmed_source_ids")
-                or []
-            )
-            replayed = 0
-            for source_id in confirmed:
-                if not source_id.startswith("gmail:"):
-                    continue
-                latest = _latest_memory_record(processed, source_id)
-                already_complete = bool(
-                    latest
-                    and latest.get("memory") not in (
-                        None,
-                        "skipped_not_worthy",
-                    )
-                    and "memory_error" not in latest
-                )
-                if already_complete:
-                    continue
-                thread_id = source_id.split(":", 1)[1]
-                if thread_id in listed_routing_ids:
-                    # The ordinary claim below can perform the ledger upgrade;
-                    # a second synthetic claim would needlessly force a full
-                    # thread prefetch during routing.
-                    continue
-                candidate = {
-                    "id": thread_id,
-                    "title": "operator-confirmed Gmail thread",
-                    "raw": {
-                        "thread_id": thread_id,
-                        "_operator_confirmed_replay": True,
-                        "_gmail_routed_thread": True,
-                    },
-                }
-                replay_source = dict(
-                    source,
-                    read_thread=True,
-                    actions=[],
-                )
-                key = (kind, thread_id)
-                claims.setdefault(key, []).append({
-                    "routine": routine,
-                    "source": replay_source,
-                    "source_index": source_index,
-                    "candidate": candidate,
-                    "fetch": fetch,
-                    "processable": True,
-                })
-                replayed += 1
-            if replayed:
-                log(
-                    f"routine={rid} source=gmail added {replayed} "
-                    "operator-confirmed replay candidate(s)"
-                )
-
         source_coverage[(rid, source_index)] = (
             "; ".join(dict.fromkeys(coverage_problems))
             if coverage_problems else None
         )
+
+    # Query results are not a recovery mechanism: older daemon versions could
+    # archive a Gmail thread even when its memory sink failed.  Re-open those
+    # exact threads from the ledger and retry the sink without repeating Gmail
+    # actions.  The same mechanism supports explicit operator overrides after
+    # an item has fallen out of its original query.
+    for routine in routines:
+        rid = routine["id"]
+        available = gmail_sources.get(rid) or []
+        if not available:
+            continue
+
+        def replay_source_for(handler_id):
+            if handler_id:
+                for index, candidate_source in available:
+                    if candidate_source.get("handler") == handler_id:
+                        return index, candidate_source
+            for index, candidate_source in available:
+                if not candidate_source.get("handler"):
+                    return index, candidate_source
+            return available[0]
+
+        requested = {}
+        for source_id in (
+            memory_sink.memory_cfg(routine)
+            .get("operator_confirmed_source_ids")
+            or []
+        ):
+            if not source_id.startswith("gmail:"):
+                continue
+            latest = _latest_memory_record(processed, source_id)
+            already_complete = bool(
+                latest
+                and latest.get("memory") not in (None, "skipped_not_worthy")
+                and "memory_error" not in latest
+            )
+            if already_complete:
+                continue
+            requested[source_id] = {
+                "operator_confirmed": True,
+                "handler_id": (latest or {}).get("handler_id"),
+            }
+
+        latest_by_source = {}
+        for item_id, entry in processed.items() if processed is not None else []:
+            if (
+                entry.get("rule_id") != rid
+                or entry.get("source_kind") != "gmail"
+            ):
+                continue
+            source_id = entry.get("memory_source_id") or entry.get("source_id")
+            if not isinstance(source_id, str) or not source_id.startswith("gmail:"):
+                continue
+            marker = (entry.get("processed_at") or "", item_id)
+            if marker > latest_by_source.get(source_id, (("", ""), None))[0]:
+                latest_by_source[source_id] = (marker, entry)
+        for source_id, (_, entry) in latest_by_source.items():
+            if "memory_error" not in entry:
+                continue
+            replay = requested.setdefault(source_id, {})
+            replay["memory_error"] = True
+            replay.setdefault("handler_id", entry.get("handler_id"))
+
+        replayed = 0
+        for source_id, replay in requested.items():
+            thread_id = source_id.split(":", 1)[1]
+            if not thread_id or thread_id in gmail_listed_ids[rid]:
+                continue
+            source_index, source = replay_source_for(replay.get("handler_id"))
+            raw = {
+                "thread_id": thread_id,
+                "_gmail_routed_thread": True,
+            }
+            title = "failed Gmail memory capture"
+            if replay.get("operator_confirmed"):
+                raw["_operator_confirmed_replay"] = True
+                title = "operator-confirmed Gmail thread"
+            if replay.get("memory_error"):
+                raw["_memory_error_replay"] = True
+            candidate = {"id": thread_id, "title": title, "raw": raw}
+            claims.setdefault(("gmail", thread_id), []).append({
+                "routine": routine,
+                "source": dict(source, read_thread=True, actions=[]),
+                "source_index": source_index,
+                "candidate": candidate,
+                "fetch": SOURCES["gmail"][1],
+                "processable": True,
+            })
+            replayed += 1
+        if replayed:
+            log(
+                f"routine={rid} source=gmail added {replayed} durable replay "
+                "candidate(s)"
+            )
     return claims, failures
 
 
@@ -1677,7 +1804,7 @@ def _failure_blocks_claim(failure, claim, best_rank, managed):
     return failure["rank"] <= best_rank
 
 
-def _route_claims(claims, totals, failures=()):
+def _route_claims(claims, totals, failures=(), held_source_keys=None):
     """Choose exactly one routine for every source candidate.
 
     A specific routine always beats a fallback. Explicit lower priority wins
@@ -1685,6 +1812,9 @@ def _route_claims(claims, totals, failures=()):
     rather than letting routine file order choose the extraction prompt.
     """
     owned = {}
+    held_source_keys = (
+        held_source_keys if held_source_keys is not None else set()
+    )
     for (kind, item_id), candidates in claims.items():
         managed_followups = [
             claim for claim in candidates if _is_managed_followup_claim(claim)
@@ -1719,6 +1849,10 @@ def _route_claims(claims, totals, failures=()):
             )
             continue
         claim = winners[0]
+        claimant_source_keys = {
+            (candidate["routine"]["id"], candidate["source_index"])
+            for candidate in candidates
+        }
         blockers = {
             failure["routine_id"]
             for failure in failures
@@ -1732,6 +1866,10 @@ def _route_claims(claims, totals, failures=()):
             )
         }
         if blockers:
+            # The fallback correctly refuses to steal this item, but its
+            # successful listing must not advance past it. Hold every claimant
+            # cursor until the failed higher-priority owner recovers.
+            held_source_keys.update(claimant_source_keys)
             ids = ", ".join(sorted(blockers))
             log(
                 f"ownership blocked source={kind} id={item_id}: "
@@ -1757,13 +1895,28 @@ def _route_claims(claims, totals, failures=()):
             raw["_gmail_routed_thread"] = True
             candidate["raw"] = raw
             claim["candidate"] = candidate
+        # Cursor safety follows the item, not only its selected owner. Every
+        # source that listed this ownership key stays behind it until the
+        # winning prompt and sinks complete successfully.
+        claim["_claimant_source_keys"] = claimant_source_keys
         owned.setdefault(claim["routine"]["id"], []).append(claim)
     return owned
 
 
 def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
-               lock=None, catalog=None, base_dir=None):
+               lock=None, catalog=None, base_dir=None, shared_circuit=None):
     rid = routine["id"]
+    shared_circuit = {} if shared_circuit is None else shared_circuit
+    failed_source_keys = set()
+    circuit_reported = False
+
+    def hold_claim(claim):
+        keys = claim.get("_claimant_source_keys")
+        if keys:
+            failed_source_keys.update(keys)
+        else:
+            failed_source_keys.add((rid, claim["source_index"]))
+
     log(f"routine={rid} {len(claims)} owned item(s)")
     new = 0
     for claim in claims:
@@ -1786,6 +1939,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 )
             except Exception as exc:
                 totals["errors"] += 1
+                hold_claim(claim)
                 log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
                 continue
             candidate = dict(
@@ -1812,15 +1966,17 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 ),
             )
         )
+        # A sink failure is never a completed item.  This applies equally to
+        # bounded Gmail queries and catch-up connectors: otherwise Gmail can
+        # be mutated while its durable memory is missing, and the ledger then
+        # prevents the sink from ever being retried.
         retry_memory = (
             existing is not None
-            and (
-                claim["source"].get("catch_up") is True
-                or claim["source"].get("kind") == "mila"
-                or existing.get("gmail_followup_open") is True
-                or existing.get("memory_operator_confirmed") is True
-            )
             and "memory_error" in existing
+        )
+        retry_expansion = (
+            existing is not None
+            and "expand_fallback" in existing
         )
         retry_calendar = (
             existing is not None
@@ -1830,11 +1986,22 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         if (
             existing is not None
             and not retry_memory
+            and not retry_expansion
             and not retry_calendar
             and not upgrade_followup
             and not upgrade_operator_confirmation
         ):
             totals["skipped"] += 1
+            continue
+        if shared_circuit and not dry_run:
+            hold_claim(claim)
+            totals["skipped"] += 1
+            if not circuit_reported:
+                log(
+                    f"routine={rid} dependency circuit open after: "
+                    f"{shared_circuit['error']}; deferring remaining candidates"
+                )
+                circuit_reported = True
             continue
         if upgrade_followup:
             log(
@@ -1850,6 +2017,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             log(
                 f"routine={rid} retrying id={candidate['id']} after memory error"
             )
+        elif retry_expansion:
+            log(
+                f"routine={rid} retrying id={candidate['id']} after "
+                "incomplete source expansion"
+            )
         elif retry_calendar:
             log(
                 f"routine={rid} retrying id={candidate['id']} after "
@@ -1862,17 +2034,29 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             # be the only run, and continuing risks double-processing.
             lock.check()
         try:
-            _process(
+            errors_before = totals["errors"]
+            outcome_record = _process(
                 effective, claim["source"], candidate, claim["fetch"], processed,
                 label_catalog, dry_run, totals, catalog, base_dir,
                 prefetched_item,
             )
+            if totals["errors"] > errors_before:
+                hold_claim(claim)
+            if (
+                isinstance(outcome_record, dict)
+                and outcome_record.get("memory_error")
+                and _is_shared_dependency_failure(outcome_record["memory_error"])
+            ):
+                shared_circuit["error"] = outcome_record["memory_error"]
             totals["processed"] += 1
         except state.AlreadyRunning:
             raise
         except Exception as exc:  # per-item failures are isolated
             totals["errors"] += 1
+            hold_claim(claim)
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
+            if _is_shared_dependency_failure(exc):
+                shared_circuit["error"] = str(exc)[:300]
             if (
                 claim["source"].get("kind") == "mila"
                 and not dry_run
@@ -1907,6 +2091,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                     )
     if new == 0:
         log(f"routine={rid} no new matches")
+    return failed_source_keys
 
 
 def _process(routine, source, candidate, fetch, processed, label_catalog,
@@ -1949,7 +2134,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         if memory_sink.memory_cfg(routine):
             memory_sink.capture(routine, item, "<summary>", dry_run=True)
         log(f"routine={rid} [dry-run] would apply: {desc}")
-        return
+        return None
 
     calendar_match = None
     if source["kind"] == "mila":
@@ -2034,7 +2219,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     # Memory sink runs after the vault note: the note is the expensive half and
     # the memory add is idempotent by source id, so a crash between the two is
     # healed by the next run re-capturing into the same entry.
-    operator_memory_failed = False
+    memory_failed = False
     if memory_sink.memory_cfg(routine):
         try:
             outcome = memory_sink.capture(routine, item, summary)
@@ -2050,17 +2235,14 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     "as not memory-worthy"
                 )
         except Exception as exc:
-            # Ordinary memory failures remain non-blocking for Gmail triage.
-            # An operator-confirmed source is different: retain its source
-            # state and retry until the explicitly requested memory exists.
             record["memory_error"] = str(exc)[:300]
-            operator_memory_failed = operator_confirmed
+            memory_failed = True
             totals["errors"] += 1
             log(f"routine={rid} memory ERROR: {exc}")
-            if operator_memory_failed and action_list:
+            if action_list:
                 log(
                     f"routine={rid} id={item['id']} withholding Gmail actions "
-                    "until operator-confirmed memory capture succeeds"
+                    "until memory capture succeeds"
                 )
     if item.get("expand_fallback"):
         # Queryable: `grep expand_fallback state/processed.json` lists every
@@ -2068,12 +2250,17 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         # the underlying document shows up.
         record["expand_fallback"] = item["expand_fallback"]
         totals["fallbacks"] += 1
+        if action_list:
+            log(
+                f"routine={rid} id={item['id']} withholding Gmail actions "
+                "until source expansion succeeds"
+            )
 
     # Two-phase. The note on disk is the expensive, irreversible half, so it is
     # ledgered immediately — with the whole action list marked pending, so that
     # dying here leaves the triage recoverable rather than lost. Recording only
     # after triage would instead risk a duplicate note on the next run.
-    actions_to_apply = [] if operator_memory_failed else action_list
+    actions_to_apply = [] if (memory_failed or item.get("expand_fallback")) else action_list
     if actions_to_apply:
         record["actions_pending"] = list(actions_to_apply)
     if source["kind"] == "mila" and base_dir is not None:
@@ -2092,6 +2279,10 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
+    elif not record.get("memory_error") and not record.get("expand_fallback"):
+        processed.record_resolving(
+            item["id"], record, record.get("memory_source_id") or item.get("source_id")
+        )
     else:
         processed.record(item["id"], record)
 
@@ -2100,6 +2291,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record(item["id"], _with_action_outcome(record, applied, pending))
         if pending:
             totals["pending_actions"] += 1
+    return record
 
 
 def _stream_for(routine, item):

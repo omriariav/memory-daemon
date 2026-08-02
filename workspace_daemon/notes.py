@@ -154,5 +154,5 @@ def write(routine, item, summary, label):
     so a vault watcher never indexes a half-written note.
     """
     path = target_path(routine, item)
-    state.write_atomic(path, render(routine, item, summary, label))
+    state.write_atomic(path, render(routine, item, summary, label), mode=0o600)
     return path

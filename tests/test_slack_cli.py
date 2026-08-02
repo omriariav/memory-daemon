@@ -588,6 +588,8 @@ class MentionLimitTest(unittest.TestCase):
         with mock.patch.object(
             slack_cli, "mention_user", return_value="person@example.com"
         ), mock.patch.object(
+            slack_cli, "ada_bin", return_value="/test/bin/ada"
+        ), mock.patch.object(
             slack_cli.subprocess, "run", return_value=completed
         ), redirect_stdout(stream):
             slack_cli.cmd_mentions(["--days", "1"])

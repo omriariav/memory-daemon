@@ -10,8 +10,10 @@ else
 fi
 
 LABEL="${MEMORY_DAEMON_LAUNCHD_LABEL:-com.memory-daemon}"
+MAINTENANCE_LABEL="${MEMORY_DAEMON_MAINTENANCE_LAUNCHD_LABEL:-com.memory-daemon-maintenance}"
 DOMAIN="${MEMORY_DAEMON_LAUNCHD_DOMAIN:-gui/$(id -u)}"
 PLIST="${MEMORY_DAEMON_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+MAINTENANCE_PLIST="${MEMORY_DAEMON_MAINTENANCE_PLIST:-$HOME/Library/LaunchAgents/$MAINTENANCE_LABEL.plist}"
 LAUNCHCTL="${MEMORY_DAEMON_LAUNCHCTL:-launchctl}"
 PYTHON="${MEMORY_DAEMON_PYTHON:-python3}"
 
@@ -24,23 +26,40 @@ fi
 echo "Validating memory-daemon configuration..."
 "$PYTHON" "$REPO_DIR/daemon.py" validate
 
-TARGET="$DOMAIN/$LABEL"
-if "$LAUNCHCTL" print "$TARGET" >/dev/null 2>&1; then
-  echo "Scheduler already loaded: $LABEL"
-  "$LAUNCHCTL" enable "$TARGET"
-else
-  if [[ ! -f "$PLIST" ]]; then
-    echo "LaunchAgent plist not found at $PLIST" >&2
-    echo "Render and configure it before running this helper." >&2
-    exit 1
+load_scheduler() {
+  local label="$1"
+  local plist="$2"
+  local target="$DOMAIN/$label"
+  if [[ ! -f "$plist" ]]; then
+    echo "LaunchAgent plist not found at $plist" >&2
+    return 1
   fi
-  echo "Loading scheduler: $LABEL"
-  "$LAUNCHCTL" enable "$TARGET"
-  "$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST"
-fi
+  if "$LAUNCHCTL" print "$target" >/dev/null 2>&1; then
+    # An already-loaded LaunchAgent keeps its old ProgramArguments and
+    # environment even when the plist on disk changes. run.sh is the explicit
+    # activation command, so atomically replace the loaded definition before
+    # starting its next tick.
+    echo "Reloading scheduler from plist: $label"
+    "$LAUNCHCTL" bootout "$target"
+    "$LAUNCHCTL" enable "$target"
+    "$LAUNCHCTL" bootstrap "$DOMAIN" "$plist"
+  else
+    echo "Loading scheduler: $label"
+    "$LAUNCHCTL" enable "$target"
+    "$LAUNCHCTL" bootstrap "$DOMAIN" "$plist"
+  fi
+}
 
-echo "Starting one coordinator tick for all enabled routines that are due..."
+load_scheduler "$LABEL" "$PLIST"
+load_scheduler "$MAINTENANCE_LABEL" "$MAINTENANCE_PLIST"
+
+TARGET="$DOMAIN/$LABEL"
+MAINTENANCE_TARGET="$DOMAIN/$MAINTENANCE_LABEL"
+
+echo "Starting one capture coordinator tick for due routines..."
 "$LAUNCHCTL" kickstart "$TARGET"
+echo "Starting one maintenance coordinator tick for due routines..."
+"$LAUNCHCTL" kickstart "$MAINTENANCE_TARGET"
 
 echo
 echo "Scheduler started. Current status:"

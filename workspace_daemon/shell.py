@@ -1,9 +1,11 @@
 """Subprocess helpers, binary resolution, and logging shared by adapters."""
 import datetime
+import fcntl
 import json
 import os
 import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -53,13 +55,65 @@ def ada_bin():
     )
 
 
+def npx_bin():
+    return _resolve(
+        "npx", "WORKSPACE_DAEMON_NPX_BIN",
+        "Install Node.js 20 or newer and ensure its bin directory is on PATH.",
+    )
+
+
 _log_file = None
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+LOG_BACKUPS = 5
+
+
+@contextmanager
+def _log_guard(path):
+    """Serialize rotation and appends across the two LaunchAgents."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _rotate_log(path):
+    try:
+        if not path.exists() or path.stat().st_size < LOG_ROTATE_BYTES:
+            return
+        oldest = path.with_name(f"{path.name}.{LOG_BACKUPS}")
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(LOG_BACKUPS - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            if source.exists():
+                destination = path.with_name(f"{path.name}.{index + 1}")
+                source.replace(destination)
+                destination.chmod(0o600)
+        destination = path.with_name(f"{path.name}.1")
+        path.replace(destination)
+        destination.chmod(0o600)
+    except OSError:
+        # Logging must remain best-effort; the console still carries the run.
+        return
 
 
 def set_log_file(path):
     global _log_file
     _log_file = Path(path)
-    _log_file.parent.mkdir(parents=True, exist_ok=True)
+    _log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(_log_file.parent, 0o700)
+    with _log_guard(_log_file):
+        if _log_file.exists():
+            os.chmod(_log_file, 0o600)
+        for index in range(1, LOG_BACKUPS + 1):
+            backup = _log_file.with_name(f"{_log_file.name}.{index}")
+            if backup.exists():
+                os.chmod(backup, 0o600)
+        _rotate_log(_log_file)
+        if _log_file.exists():
+            os.chmod(_log_file, 0o600)
 
 
 def utc_now_iso():
@@ -70,8 +124,12 @@ def log(msg):
     line = f"{utc_now_iso()} {msg}"
     print(line, flush=True)
     if _log_file:
-        with open(_log_file, "a") as f:
-            f.write(line + "\n")
+        with _log_guard(_log_file):
+            fd = os.open(
+                _log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+            )
+            with os.fdopen(fd, "a") as f:
+                f.write(line + "\n")
 
 
 def run(cmd, timeout=120, check=True):

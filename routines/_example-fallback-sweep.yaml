@@ -12,8 +12,12 @@ routing:
 
 sources:
   - kind: gmail
-    query: '{is:unread is:starred}'
-    max_results: 50
+    query: '{in:inbox in:sent}'
+    queue_query: 'in:inbox {is:unread is:starred}'
+    max_results: 0
+    catch_up: true
+    catch_up_overlap: 1h
+    catch_up_after: "2026-08-01T00:00:00Z"
     actions: []
 
   - kind: slack
@@ -27,6 +31,7 @@ sources:
     max_results: 0        # all messages across active spaces
     max_per_space: 0      # all messages inside each active space
     batch_messages: daily # stable space/day digest, updated as replies arrive
+    session_gap_minutes: 120 # separate unrelated conversation bursts
     catch_up: true         # durable last-successful cursor; no fixed loss window
     catch_up_overlap: 1h   # source reads repeat safely; ledger skips seen versions
 
