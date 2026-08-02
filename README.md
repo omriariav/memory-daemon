@@ -480,6 +480,57 @@ reply whose root predates the census window in a conversation that had no
 recent top-level message; pin such critical channels explicitly with
 `direct_channels`.
 
+### Bidirectional Google Tasks sync
+
+A maintenance routine can synchronize Google Tasks with open `todo` entries in
+a personal-memory store without an LLM. Google task ids become canonical
+`google-tasks:<list-id>:<task-id>` source ids, and a private checkpoint records
+the last content hash seen on each side:
+
+```yaml
+id: google-tasks-sync
+enabled: false
+role: maintenance
+schedule:
+  every: 1d
+  work_hours:
+    every: 1h
+    days: [sun, mon, tue, wed, thu]
+    start: "08:00"
+    end: "20:00"
+    timezone: Asia/Jerusalem
+maintenance:
+  kind: google_tasks_sync
+  checkpoint: state/google-tasks-sync.json
+  store: /absolute/path/to/personal-memory
+  tasklists: all
+  outbound_tasklist: replace-with-task-list-id
+  outbound_since: "2026-01-01"
+  exclude_tags: [no-google-tasks]
+  max_tasks: 10000
+```
+
+Open Google tasks are imported from the selected lists; new open memory todos
+on or after the required `outbound_since` boundary are created in the outbound
+list. Title, notes, due date, and completion state synchronize in both
+directions. Google completion creates a following memory note, while memory
+resolution completes the Google task. Historical completed Google tasks are
+not imported during bootstrap. A configured `exclude_tags` match is an ongoing
+opt-out: even an already-linked entry is skipped without changing either side.
+
+If both sides changed since the previous checkpoint, neither is overwritten.
+The run reports a conflict and fails closed. A retry after an interrupted write
+can recover automatically when the two sides already agree. The configured
+`gws` CLI cannot clear an existing Google due date, so that specific change is
+also surfaced as a conflict. Dry runs perform real reads and log every planned
+import, export, update, completion, link, or conflict without writing either
+system or the checkpoint. Immediately before a write, the sync re-reads both
+sides and aborts if either changed since discovery. Neither the current `gws`
+CLI nor the personal-memory CLI exposes a conditional-write/expected-hash
+flag, so a very small race remains between each last read and its subsequent
+write. A divergence that remains visible is caught as a conflict on the
+following run.
+
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
 `schedule.work_hours` override, runs due owners sequentially under the existing
@@ -491,7 +542,8 @@ on every coordinator wake-up. A dry-run tick never updates schedule state.
 Routines without `schedule.every` retain the legacy hourly cadence; the template
 sets `4h` explicitly for new routines.
 
-See `_example-domain-routine.yaml` and `_example-fallback-sweep.yaml`.
+See `_example-domain-routine.yaml`, `_example-fallback-sweep.yaml`, and
+`_example-google-tasks-sync.yaml`.
 
 ## Adding a routine
 
@@ -801,7 +853,8 @@ tail -f logs/launchd.err.log
 ```
 
 `memory-daemon-status.sh` is read-only. It shows each routine's declared role
-(`general`, `domain`, `specialized`, or `partial`) and source connectors,
+(`general`, `domain`, `specialized`, `partial`, or `maintenance`) and source
+connectors,
 distinguishes a last scheduled attempt from a last captured item, shows when
 each routine is next due, and flags an unfinished last run, memory-sink
 failures, or pending Gmail triage. `partial` means a connector sweep still has
@@ -837,6 +890,7 @@ workspace_daemon/
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
   mila_source.py           read-only Mila + Calendar matching
+  google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync
   llm.py                   yoetz adapter, prompt building, label extraction
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions

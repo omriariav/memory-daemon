@@ -1,7 +1,8 @@
-"""Scheduled source-maintenance routines that do not create memories."""
+"""Scheduled deterministic maintenance and cross-system sync routines."""
+import json
 from pathlib import Path
 
-from . import slack_census, slack_cli
+from . import google_tasks_sync, slack_census, slack_cli
 from .shell import log
 
 
@@ -15,6 +16,43 @@ def run(base_dir, routine, dry_run=False):
     routine_id = routine["id"]
     cfg = routine["maintenance"]
     kind = cfg["kind"]
+    if kind == "google_tasks_sync":
+        # A preview needs the real baseline to distinguish which side changed;
+        # google_tasks_sync.run guarantees it never saves that checkpoint in
+        # dry-run mode.
+        checkpoint = _path(base_dir, cfg["checkpoint"])
+        mode = "previewing" if dry_run else "syncing"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = google_tasks_sync.run(
+            cfg,
+            checkpoint_path=checkpoint,
+            dry_run=dry_run,
+        )
+        log(
+            f"routine={routine_id} maintenance={kind} "
+            f"tasklists={report['tasklist_count']} "
+            f"google_open={report['open_google_tasks']} "
+            f"memory_open={report['open_memory_todos']} "
+            f"planned={len(report['planned'])} "
+            f"conflicts={report['conflicts']} errors={len(report['errors'])}"
+        )
+        for row in report["planned"]:
+            log(
+                f"routine={routine_id} maintenance={kind} plan="
+                + json.dumps(row, ensure_ascii=False, sort_keys=True)
+            )
+        for row in report["errors"]:
+            log(
+                f"routine={routine_id} maintenance={kind} error="
+                + json.dumps(row, ensure_ascii=False, sort_keys=True)
+            )
+        if not report["ok"]:
+            raise RuntimeError(
+                "Google Tasks sync requires attention: "
+                f"{report['conflicts']} conflict(s), "
+                f"{len(report['errors'])} error(s)"
+            )
+        return report
     if kind != "slack_conversation_census":
         raise RuntimeError(f"unsupported maintenance kind {kind!r}")
 

@@ -25,6 +25,35 @@ def census_routine():
     }
 
 
+def tasks_routine():
+    return {
+        "id": "google-tasks-sync",
+        "enabled": True,
+        "description": "Sync operational tasks.",
+        "role": "maintenance",
+        "schedule": {
+            "every": "1d",
+            "work_hours": {
+                "every": "1h",
+                "days": ["sun", "mon", "tue", "wed", "thu"],
+                "start": "08:00",
+                "end": "20:00",
+                "timezone": "Asia/Jerusalem",
+            },
+        },
+        "maintenance": {
+            "kind": "google_tasks_sync",
+            "checkpoint": "state/google-tasks-sync.json",
+            "store": "/tmp/personal-memory",
+            "tasklists": "all",
+            "outbound_tasklist": "incoming-list-id",
+            "outbound_since": "2026-08-02",
+            "exclude_tags": ["no-google-tasks"],
+            "max_tasks": 10000,
+        },
+    }
+
+
 class MaintenanceValidationTest(unittest.TestCase):
     def test_valid_census_routine_needs_no_prompt_or_sink(self):
         self.assertEqual(config.validate(census_routine()), [])
@@ -65,6 +94,20 @@ class MaintenanceValidationTest(unittest.TestCase):
             )
         )
 
+    def test_valid_google_tasks_sync_schedule_and_config(self):
+        self.assertEqual(config.validate(tasks_routine()), [])
+
+    def test_google_tasks_sync_rejects_relative_store_and_bad_cutover(self):
+        routine = tasks_routine()
+        routine["maintenance"]["store"] = "relative/store"
+        routine["maintenance"]["outbound_since"] = "today"
+        routine["maintenance"]["tasklists"] = ["another-list"]
+        problems = config.validate(routine)
+
+        self.assertTrue(any("absolute path" in problem for problem in problems))
+        self.assertTrue(any("YYYY-MM-DD" in problem for problem in problems))
+        self.assertTrue(any("must be included" in problem for problem in problems))
+
 
 class MaintenanceRunTest(unittest.TestCase):
     REPORT = {
@@ -97,6 +140,30 @@ class MaintenanceRunTest(unittest.TestCase):
             daemon_cli._routine_last_run(census_routine(), schedule),
             "2026-07-31T08:00:00Z",
         )
+
+    def test_google_tasks_sync_dry_run_reads_the_real_checkpoint(self):
+        report = {
+            "ok": True,
+            "tasklist_count": 2,
+            "open_google_tasks": 3,
+            "open_memory_todos": 4,
+            "planned": [],
+            "conflicts": 0,
+            "errors": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            maintenance.google_tasks_sync, "run", return_value=report
+        ) as sync:
+            result = maintenance.run(
+                Path(tmp), tasks_routine(), dry_run=True
+            )
+
+        self.assertEqual(result, report)
+        self.assertEqual(
+            sync.call_args.kwargs["checkpoint_path"],
+            Path(tmp) / "state" / "google-tasks-sync.json",
+        )
+        self.assertTrue(sync.call_args.kwargs["dry_run"])
 
     def test_maintenance_runs_before_capture_sources_in_same_tick(self):
         with tempfile.TemporaryDirectory() as tmp:
