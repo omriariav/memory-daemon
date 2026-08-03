@@ -408,6 +408,11 @@ def routine_rows(
             next_run = "-"
 
         every = config.schedule_label(routine)
+        last_capture = (
+            "N/A"
+            if config.is_maintenance(routine)
+            else _iso_age(max(captures) if captures else None, now)
+        )
         rows.append({
             "routine": routine_id,
             "role": _routine_role(routine),
@@ -417,7 +422,7 @@ def routine_rows(
             "every": every,
             "last_attempt": _age(last_epoch, now),
             "next": next_run,
-            "last_capture": _iso_age(max(captures) if captures else None, now),
+            "last_capture": last_capture,
             "issues": ", ".join(issues) or "-",
         })
     return rows
