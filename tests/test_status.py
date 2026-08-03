@@ -362,6 +362,39 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["partial"]["role"], "partial")
         self.assertEqual(by_id["partial"]["sources"], "slack")
 
+    def test_maintenance_last_capture_is_not_applicable(self):
+        state.save(self.base, {
+            "stale-maintenance-ledger-row": {
+                "rule_id": "slack-census",
+                "processed_at": "1970-01-01T00:16:40Z",
+            },
+        })
+        routines = [
+            {
+                "id": "google-tasks",
+                "role": "maintenance",
+                "enabled": True,
+                "schedule": {"every": "1h"},
+                "maintenance": {"kind": "google_tasks_sync"},
+            },
+            {
+                "id": "slack-census",
+                "role": "maintenance",
+                "enabled": True,
+                "schedule": {"every": "1d"},
+                "maintenance": {"kind": "slack_conversation_census"},
+            },
+        ]
+
+        rows = status.routine_rows(
+            self.base, routines, {"routines": {}}, now=5000
+        )
+
+        self.assertEqual(
+            {row["routine"]: row["last_capture"] for row in rows},
+            {"google-tasks": "N/A", "slack-census": "N/A"},
+        )
+
     def test_reports_work_hours_cadence_and_next_transition(self):
         routine = {
             "id": "gchat",
