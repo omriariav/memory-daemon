@@ -363,6 +363,12 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["partial"]["sources"], "slack")
 
     def test_maintenance_last_capture_is_not_applicable(self):
+        state.save(self.base, {
+            "stale-maintenance-ledger-row": {
+                "rule_id": "slack-census",
+                "processed_at": "1970-01-01T00:16:40Z",
+            },
+        })
         routines = [
             {
                 "id": "google-tasks",
