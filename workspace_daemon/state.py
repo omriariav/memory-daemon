@@ -171,19 +171,17 @@ def _create_directory_beneath_pinned_parents(directory):
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:
-                created = False
                 try:
                     os.mkdir(component, mode=0o777, dir_fd=directory_fd)
-                    created = True
                 except FileExistsError:
                     # A concurrent creator is acceptable only if the component
                     # can now be opened as a real directory without following a
                     # symlink.
                     pass
-                if created:
-                    # Make the new directory entry durable before a later
-                    # ledger commit can claim that its note exists.
-                    os.fsync(directory_fd)
+                # Whether this mkdir succeeded or lost a concurrent-creator
+                # race, make the newly observed directory entry durable before
+                # a later ledger commit can claim that its note exists.
+                os.fsync(directory_fd)
                 child_fd = os.open(
                     component,
                     directory_flags | no_follow,

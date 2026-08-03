@@ -111,6 +111,19 @@ class TestNoteCollision(unittest.TestCase):
         self.assertIn("updated", legacy.read_text())
         self.assertEqual(list(self.vault.glob("*.md")), [legacy])
 
+    def test_unbounded_legacy_id_falls_through_to_digest_filename(self):
+        item_id = "a" * 300
+        base = self.vault / "note-2026-07-26.md"
+        base.write_text("---\nitem_id: another-item\n---\n")
+
+        selected = notes.write(
+            routine(self.vault), item(item_id), "summary", None
+        )
+
+        digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:12]
+        self.assertEqual(selected, self.vault / f"note-2026-07-26-{digest}.md")
+        self.assertIn("summary", selected.read_text())
+
     def test_owner_of_a_non_note_file_is_none(self):
         path = self.vault / "note-2026-07-26.md"
         path.write_text("no frontmatter here")
@@ -246,6 +259,31 @@ class TestNoteCollision(unittest.TestCase):
 
         self.assertTrue(missing.is_dir())
         self.assertEqual(list(missing.iterdir()), [])
+
+    def test_concurrent_vault_creator_still_triggers_parent_fsync(self):
+        missing = self.vault / "missing-vault"
+        real_open = state.os.open
+        real_fsync = state.os.fsync
+        raced = False
+
+        def create_then_report_missing(path, *args, **kwargs):
+            nonlocal raced
+            if path == missing.name and not raced:
+                missing.mkdir()
+                raced = True
+                raise FileNotFoundError("simulated lookup race")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(
+            state.os, "open", side_effect=create_then_report_missing
+        ), mock.patch.object(
+            state.os, "fsync", side_effect=real_fsync
+        ) as fsync:
+            identity = state.ensure_directory_identity(missing)
+
+        self.assertTrue(raced)
+        self.assertEqual(identity, state._directory_identity(missing))
+        fsync.assert_called_once()
 
     def test_missing_vault_ancestor_swap_cannot_redirect_creation(self):
         container = self.vault / "container"
