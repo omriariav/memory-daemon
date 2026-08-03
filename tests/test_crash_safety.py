@@ -7,6 +7,7 @@ recovery behaviour, not to exercise the kernel.
 Run: python3 -m unittest discover -s tests -v
 """
 import json
+import hashlib
 import os
 import sys
 import tempfile
@@ -87,6 +88,12 @@ class TestNoteCollision(unittest.TestCase):
                 routine(self.vault, filename_template="{slug_prefix:/<10}"), item()
             )
 
+    def test_runtime_rejects_automatic_template_field(self):
+        with self.assertRaisesRegex(ValueError, "invalid output.filename_template"):
+            notes.target_path(
+                routine(self.vault, filename_template="{slug_prefix}-{}"), item()
+            )
+
     def test_runtime_rejects_final_file_symlink_escape(self):
         with tempfile.TemporaryDirectory() as outside_dir:
             outside = Path(outside_dir) / "outside.md"
@@ -127,6 +134,42 @@ class TestNoteCollision(unittest.TestCase):
             routine(self.vault, filename_template="report.v1-{date}"), item()
         )
         self.assertEqual(path.parent, self.vault)
+
+    def test_collision_suffixes_never_use_raw_source_id_path_syntax(self):
+        malicious_id = "x/../victim"
+        digest = hashlib.sha256(malicious_id.encode("utf-8")).hexdigest()
+        base = self.vault / "note-2026-07-26.md"
+        short = self.vault / f"note-2026-07-26-{digest[:12]}.md"
+        for path in (base, short):
+            path.write_text("---\nitem_id: another-item\n---\n")
+        victim = self.vault / "victim.md"
+        victim.write_text("must stay untouched")
+
+        selected = notes.write(
+            routine(self.vault), item(malicious_id), "safe summary", None
+        )
+
+        self.assertEqual(selected.parent, self.vault)
+        self.assertEqual(selected.name, f"note-2026-07-26-{digest}.md")
+        self.assertIn("safe summary", selected.read_text())
+        self.assertEqual(victim.read_text(), "must stay untouched")
+
+    def test_full_digest_collision_fails_closed(self):
+        item_id = "source-item"
+        digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+        paths = (
+            self.vault / "note-2026-07-26.md",
+            self.vault / f"note-2026-07-26-{digest[:12]}.md",
+            self.vault / f"note-2026-07-26-{digest}.md",
+        )
+        for path in paths:
+            path.write_text("---\nitem_id: another-item\n---\nkeep me")
+
+        with self.assertRaisesRegex(FileExistsError, "owned by other items"):
+            notes.write(routine(self.vault), item(item_id), "do not write", None)
+
+        for path in paths:
+            self.assertIn("keep me", path.read_text())
 
 
 class TestLedger(unittest.TestCase):
@@ -210,6 +253,138 @@ class TestLedger(unittest.TestCase):
         state.sweep_temp_files(d)
         self.assertTrue(fresh.exists(), "an in-flight write must not be swept")
         self.assertFalse(stale.exists())
+
+
+class TestPinnedAtomicWrite(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tmp.name)
+        self.path = self.directory / "private.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assert_no_temps(self):
+        self.assertEqual(list(self.directory.glob(".*.tmp")), [])
+
+    def test_temp_open_failure_leaves_no_artifact(self):
+        real_open = state.os.open
+
+        def fail_temp(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith(".private.md."):
+                raise OSError("open failed")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(state.os, "open", side_effect=fail_temp):
+            with self.assertRaisesRegex(OSError, "open failed"):
+                state.write_atomic_at(
+                    self.directory.resolve(), "private.md", "secret", mode=0o600
+                )
+        self.assertFalse(self.path.exists())
+        self.assert_no_temps()
+
+    def test_write_failure_closes_and_removes_temp(self):
+        real_close = os.close
+
+        class FailingWriter:
+            def __init__(self, fd):
+                self.fd = fd
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                real_close(self.fd)
+
+            def write(self, _text):
+                raise OSError("write failed")
+
+        with mock.patch.object(
+            state.os, "fdopen", side_effect=lambda fd, _mode: FailingWriter(fd)
+        ):
+            with self.assertRaisesRegex(OSError, "write failed"):
+                state.write_atomic_at(
+                    self.directory.resolve(), "private.md", "secret", mode=0o600
+                )
+        self.assertFalse(self.path.exists())
+        self.assert_no_temps()
+
+    def test_replace_failure_removes_fsynced_temp(self):
+        with mock.patch.object(
+            state.os, "replace", side_effect=OSError("replace failed")
+        ):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                state.write_atomic_at(
+                    self.directory.resolve(), "private.md", "secret", mode=0o600
+                )
+        self.assertFalse(self.path.exists())
+        self.assert_no_temps()
+
+    def test_private_mode_is_applied_before_replace(self):
+        real_replace = os.replace
+        observed = []
+
+        def inspect_then_replace(source, destination, **kwargs):
+            metadata = os.stat(
+                source,
+                dir_fd=kwargs["src_dir_fd"],
+                follow_symlinks=False,
+            )
+            observed.append(metadata.st_mode & 0o777)
+            real_replace(source, destination, **kwargs)
+
+        with mock.patch.object(
+            state.os, "replace", side_effect=inspect_then_replace
+        ):
+            state.write_atomic_at(
+                self.directory.resolve(), "private.md", "secret", mode=0o600
+            )
+
+        self.assertEqual(observed, [0o600])
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_file_fsync_failure_removes_temp(self):
+        with mock.patch.object(
+            state.os, "fsync", side_effect=OSError("file fsync failed")
+        ):
+            with self.assertRaisesRegex(OSError, "file fsync failed"):
+                state.write_atomic_at(
+                    self.directory.resolve(), "private.md", "secret", mode=0o600
+                )
+        self.assertFalse(self.path.exists())
+        self.assert_no_temps()
+
+    def test_directory_fsync_failure_does_not_undo_committed_write(self):
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_second(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("directory fsync failed")
+            return real_fsync(fd)
+
+        with mock.patch.object(state.os, "fsync", side_effect=fail_second):
+            state.write_atomic_at(
+                self.directory.resolve(), "private.md", "secret", mode=0o600
+            )
+
+        self.assertEqual(self.path.read_text(), "secret")
+        self.assert_no_temps()
+
+    def test_execute_only_ancestor_remains_supported(self):
+        ancestor = self.directory / "search-only"
+        vault = ancestor / "vault"
+        vault.mkdir(parents=True)
+        os.chmod(ancestor, 0o100)
+        try:
+            state.write_atomic_at(
+                vault.resolve(), "private.md", "secret", mode=0o600
+            )
+            self.assertEqual((vault / "private.md").read_text(), "secret")
+        finally:
+            os.chmod(ancestor, 0o700)
 
 
 class TestRunLock(unittest.TestCase):
@@ -448,6 +623,34 @@ class TestTempSweepScope(unittest.TestCase):
         self.assertFalse(ours.exists())
         for f in theirs:
             self.assertTrue(f.exists(), f"{f.name} is not ours and must survive")
+
+    def test_symlink_retarget_cannot_redirect_cleanup(self):
+        intended = self.dir / "intended"
+        redirected = self.dir / "redirected"
+        intended.mkdir()
+        redirected.mkdir()
+        configured = self.dir / "configured"
+        configured.symlink_to(intended, target_is_directory=True)
+        intended_temp = intended / ".note.md.123.tmp"
+        redirected_temp = redirected / ".private.md.456.tmp"
+        for path in (intended_temp, redirected_temp):
+            path.write_text("x")
+            os.utime(path, (0, 0))
+        real_open_directory = state._open_directory_fd
+
+        def open_then_retarget(directory, *args, **kwargs):
+            directory_fd = real_open_directory(directory, *args, **kwargs)
+            configured.unlink()
+            configured.symlink_to(redirected, target_is_directory=True)
+            return directory_fd
+
+        with mock.patch.object(
+            state, "_open_directory_fd", side_effect=open_then_retarget
+        ):
+            self.assertEqual(state.sweep_temp_files(configured), 1)
+
+        self.assertFalse(intended_temp.exists())
+        self.assertTrue(redirected_temp.exists())
 
 
 if __name__ == "__main__":

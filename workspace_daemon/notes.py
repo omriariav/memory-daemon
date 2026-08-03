@@ -9,6 +9,7 @@ not depend on where its content came from:
 ...) and is spliced in after the common header fields.
 """
 import datetime
+import hashlib
 import re
 from pathlib import Path
 
@@ -91,6 +92,22 @@ def _contained_note_path(directory, candidate):
     return resolved_candidate
 
 
+def _direct_note_candidate(directory, filename):
+    """Build and resolve one filename without allowing path semantics."""
+    if (
+        not filename
+        or ".." in filename
+        or "/" in filename
+        or "\\" in filename
+        or Path(filename).name != filename
+    ):
+        raise ValueError(
+            f"refusing generated note filename containing path syntax: {filename!r}"
+        )
+    candidate = directory / filename
+    return candidate, _contained_note_path(directory, candidate)
+
+
 def _target_paths(routine, item):
     """Return the configured and resolved deterministic note paths.
 
@@ -106,30 +123,37 @@ def _target_paths(routine, item):
     output = routine["output"]
     template = output.get("filename_template", DEFAULT_FILENAME_TEMPLATE)
     item_id = str(item["id"])
-    short_id = item_id[:8]
+    item_digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    short_id = item_digest[:12]
     slug = title_slug(item.get("title"))
-    stem = template.format(
-        slug_prefix=output["slug_prefix"],
-        date=item["date"],
-        title=slug,
-        subject=slug,
-        id=short_id,
-        message_id=short_id,
-    )
-    stem = re.sub(r"-{2,}", "-", stem).strip("-")
-    if not stem or ".." in stem or "/" in stem or "\\" in stem:
-        raise ValueError(
-            "refusing generated note filename containing path syntax: "
-            f"{stem!r}"
+    try:
+        stem = template.format(
+            slug_prefix=output["slug_prefix"],
+            date=item["date"],
+            title=slug,
+            subject=slug,
+            id=short_id,
+            message_id=short_id,
         )
+    except (IndexError, KeyError, ValueError) as exc:
+        raise ValueError(f"invalid output.filename_template: {template!r}") from exc
+    stem = re.sub(r"-{2,}", "-", stem).strip("-")
     directory = Path(output["vault_dir"])
-    for candidate in (directory / f"{stem}.md", directory / f"{stem}-{short_id}.md"):
-        resolved = _contained_note_path(directory, candidate)
+    for filename in (f"{stem}.md", f"{stem}-{short_id}.md"):
+        candidate, resolved = _direct_note_candidate(directory, filename)
         if not resolved.exists() or note_owner(resolved) == item_id:
             return candidate, resolved
-    # Both taken by other items: two ids sharing a stem and an 8-char prefix.
-    candidate = directory / f"{stem}-{item_id}.md"
-    return candidate, _contained_note_path(directory, candidate)
+    # Both taken by other items: use the full digest to make a third collision
+    # deterministic without ever putting a raw source id into the path. Even
+    # this fallback must not overwrite a file owned by somebody else.
+    candidate, resolved = _direct_note_candidate(
+        directory, f"{stem}-{item_digest}.md"
+    )
+    if not resolved.exists() or note_owner(resolved) == item_id:
+        return candidate, resolved
+    raise FileExistsError(
+        f"all deterministic note paths are owned by other items: {candidate}"
+    )
 
 
 def target_path(routine, item):

@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -136,43 +137,43 @@ def write_atomic(path, text, mode=None):
 
 
 def _open_directory_fd(directory, create=False):
-    """Open an absolute directory path without following any path symlink.
+    """Open and verify a canonical directory, returning a pinned descriptor.
 
-    Callers pass an already-resolved path. Walking it one component at a time
-    relative to pinned directory descriptors closes the check/write race that
-    comes from resolving a path and then opening that same path by name.
+    Direct open preserves ordinary pathname semantics for execute-only parent
+    directories. Verifying the opened descriptor's kernel path catches an
+    intermediate symlink swapped in between resolve and open; O_NOFOLLOW covers
+    the final component. Once verified, descriptor-relative operations cannot
+    be redirected by later renames or symlink changes.
     """
     directory = Path(directory)
     if not directory.is_absolute():
         raise ValueError(f"directory must be absolute: {directory}")
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    expected = directory.resolve(strict=True)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    current_fd = os.open("/", directory_flags)
+    directory_fd = os.open(
+        expected,
+        directory_flags | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-        for part in directory.parts[1:]:
-            try:
-                child_fd = os.open(
-                    part,
-                    directory_flags | no_follow,
-                    dir_fd=current_fd,
-                )
-            except FileNotFoundError:
-                if not create:
-                    raise
-                try:
-                    os.mkdir(part, mode=0o777, dir_fd=current_fd)
-                except FileExistsError:
-                    pass
-                child_fd = os.open(
-                    part,
-                    directory_flags | no_follow,
-                    dir_fd=current_fd,
-                )
-            os.close(current_fd)
-            current_fd = child_fd
-        return current_fd
+        if sys.platform == "darwin":
+            # macOS F_GETPATH is not exposed as a Python constant.
+            raw_path = fcntl.fcntl(directory_fd, 50, bytes(1024))
+            opened = Path(raw_path.split(b"\0", 1)[0].decode()).resolve(
+                strict=False
+            )
+        else:
+            opened = Path(
+                os.readlink(f"/proc/self/fd/{directory_fd}")
+            ).resolve(strict=False)
+        if opened != expected:
+            raise OSError(
+                f"directory changed while opening: expected {expected}, got {opened}"
+            )
+        return directory_fd
     except BaseException:
-        os.close(current_fd)
+        os.close(directory_fd)
         raise
 
 
@@ -248,26 +249,34 @@ def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
     write that is genuinely in flight.
     """
     directory = Path(directory)
-    if not directory.is_dir():
+    try:
+        resolved_directory = directory.resolve(strict=True)
+        directory_fd = _open_directory_fd(resolved_directory)
+    except (FileNotFoundError, NotADirectoryError):
         return 0
     now = time.time()
     removed = 0
-    for tmp in directory.glob(".*.tmp"):
-        # Only our own shape: `.<real name>.<pid>.tmp`. A bare `.*.tmp` glob also
-        # matches editor swap files and sync-conflict artifacts in a vault this
-        # daemon does not own, and deleting someone else's data is far worse
-        # than leaving a stray temp behind.
-        if not TEMP_NAME.match(tmp.name):
-            continue
-        try:
-            if now - tmp.stat().st_mtime < max_age:
+    try:
+        for name in os.listdir(directory_fd):
+            # Only our own shape: `.<real name>.<pid>.tmp`. A broad suffix match
+            # also catches editor swap files and sync-conflict artifacts, and
+            # deleting somebody else's data is worse than leaving a stale temp.
+            if not TEMP_NAME.match(name):
                 continue
-            tmp.unlink()
-            removed += 1
-        except OSError:
-            continue
+            try:
+                metadata = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if now - metadata.st_mtime < max_age:
+                    continue
+                os.unlink(name, dir_fd=directory_fd)
+                removed += 1
+            except OSError:
+                continue
+    finally:
+        os.close(directory_fd)
     if removed:
-        log(f"swept {removed} orphaned temp file(s) from {directory}")
+        log(f"swept {removed} orphaned temp file(s) from {resolved_directory}")
     return removed
 
 

@@ -816,7 +816,16 @@ def validate(routine):
                     f"{rid}: output.filename_template is malformed — {exc}"
                 )
             else:
-                fields = {field for _, field, _, _ in parsed if field}
+                replacement_fields = [
+                    field for _, field, _, _ in parsed if field is not None
+                ]
+                if any(field == "" or field.isdecimal()
+                       for field in replacement_fields):
+                    problems.append(
+                        f"{rid}: output.filename_template does not support "
+                        "automatic or positional placeholders"
+                    )
+                fields = {field for field in replacement_fields if field}
                 if any(
                     _unsafe_filename_fragment(literal)
                     for literal, _, _, _ in parsed
@@ -828,7 +837,7 @@ def validate(routine):
                 if any(
                     format_spec or conversion
                     for _, field, format_spec, conversion in parsed
-                    if field
+                    if field is not None
                 ):
                     problems.append(
                         f"{rid}: output.filename_template does not support "

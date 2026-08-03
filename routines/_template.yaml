@@ -133,6 +133,8 @@ output:
   slug_prefix: my-routine-summary
 
   # OPTIONAL filename template. Placeholders: {slug_prefix} {date} {title} {id}.
+  # {id} and the legacy {message_id} alias are 12-character SHA-256-derived
+  # tokens, not raw source ids.
   # If a routine can match several items with the same date — several meetings
   # in one day, say — put {title} in here or they all collide onto one stem.
   # filename_template: "{slug_prefix}-{date}-{title}"

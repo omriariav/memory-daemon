@@ -126,6 +126,15 @@ class ConfigSchemaTest(unittest.TestCase):
                 self.assertTrue(any("format specifications or conversions" in p
                                     for p in problems), problems)
 
+    def test_filename_template_rejects_automatic_and_positional_fields(self):
+        for template in ("{slug_prefix}-{}", "{0}-{date}"):
+            with self.subTest(template=template):
+                problems = config.validate(
+                    self._vault_routine(filename_template=template)
+                )
+                self.assertTrue(any("automatic or positional placeholders" in p
+                                    for p in problems), problems)
+
     def test_dots_in_filename_components_remain_valid(self):
         problems = config.validate(self._vault_routine(
             filename_template="report.{date}.v1",
