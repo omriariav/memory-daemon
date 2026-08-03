@@ -113,12 +113,12 @@ class TestNoteCollision(unittest.TestCase):
             original_target_paths = notes._target_paths
 
             def retarget_after_validation(*args):
-                display_path, resolved_path = original_target_paths(*args)
+                display_path, resolved_path, identity = original_target_paths(*args)
                 configured_vault.unlink()
                 configured_vault.symlink_to(
                     redirected_dir, target_is_directory=True
                 )
-                return display_path, resolved_path
+                return display_path, resolved_path, identity
 
             with mock.patch.object(
                 notes, "_target_paths", side_effect=retarget_after_validation
@@ -139,10 +139,10 @@ class TestNoteCollision(unittest.TestCase):
         original_target_paths = notes._target_paths
 
         def swap_canonical_path_after_validation(*args):
-            display_path, resolved_path = original_target_paths(*args)
+            display_path, resolved_path, identity = original_target_paths(*args)
             intended.rename(moved)
             intended.symlink_to(redirected, target_is_directory=True)
-            return display_path, resolved_path
+            return display_path, resolved_path, identity
 
         with mock.patch.object(
             notes,
@@ -154,6 +154,41 @@ class TestNoteCollision(unittest.TestCase):
 
         self.assertEqual(list(redirected.iterdir()), [])
         self.assertEqual(list(moved.iterdir()), [])
+
+    def test_intermediate_ancestor_swap_cannot_redirect_write(self):
+        container = self.vault / "container"
+        intended = container / "vault"
+        moved_container = self.vault / "moved-container"
+        redirected_container = self.vault / "redirected-container"
+        redirected = redirected_container / "vault"
+        intended.mkdir(parents=True)
+        redirected.mkdir(parents=True)
+        r = routine(intended)
+        original_target_paths = notes._target_paths
+
+        def swap_ancestor_after_validation(*args):
+            display_path, resolved_path, identity = original_target_paths(*args)
+            container.rename(moved_container)
+            container.symlink_to(
+                redirected_container, target_is_directory=True
+            )
+            return display_path, resolved_path, identity
+
+        with mock.patch.object(
+            notes, "_target_paths", side_effect=swap_ancestor_after_validation
+        ):
+            with self.assertRaises(OSError):
+                notes.write(r, item(), "private summary", None)
+
+        self.assertEqual(list(redirected.iterdir()), [])
+        self.assertEqual(list((moved_container / "vault").iterdir()), [])
+
+    def test_real_write_creates_and_pins_missing_vault(self):
+        missing = self.vault / "missing-vault"
+        written = notes.write(routine(missing), item(), "summary", None)
+        self.assertTrue(missing.is_dir())
+        self.assertEqual(written.parent, missing)
+        self.assertIn("summary", written.read_text())
 
     def test_runtime_accepts_regular_note_path(self):
         path = notes.target_path(
@@ -727,6 +762,39 @@ class TestTempSweepScope(unittest.TestCase):
             self.assertEqual(state.sweep_temp_files(intended), 0)
 
         self.assertTrue((moved / intended_temp.name).exists())
+        self.assertTrue(redirected_temp.exists())
+
+    def test_intermediate_ancestor_swap_cannot_redirect_cleanup(self):
+        container = self.dir / "container"
+        intended = container / "vault"
+        moved_container = self.dir / "moved-container"
+        redirected_container = self.dir / "redirected-container"
+        redirected = redirected_container / "vault"
+        intended.mkdir(parents=True)
+        redirected.mkdir(parents=True)
+        intended_temp = intended / ".note.md.123.tmp"
+        redirected_temp = redirected / ".private.md.456.tmp"
+        for path in (intended_temp, redirected_temp):
+            path.write_text("x")
+            os.utime(path, (0, 0))
+        real_open_directory = state._open_directory_fd
+
+        def swap_ancestor_before_open(directory, *args, **kwargs):
+            container.rename(moved_container)
+            container.symlink_to(
+                redirected_container, target_is_directory=True
+            )
+            return real_open_directory(directory, *args, **kwargs)
+
+        with mock.patch.object(
+            state,
+            "_open_directory_fd",
+            side_effect=swap_ancestor_before_open,
+        ):
+            with self.assertRaises(OSError):
+                state.sweep_temp_files(intended)
+
+        self.assertTrue((moved_container / "vault" / intended_temp.name).exists())
         self.assertTrue(redirected_temp.exists())
 
 

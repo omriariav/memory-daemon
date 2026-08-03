@@ -136,7 +136,15 @@ def write_atomic(path, text, mode=None):
         log(f"WARN wrote {path} but could not fsync its directory: {exc}")
 
 
-def _open_directory_fd(directory, create=False):
+def _directory_identity(directory, follow_symlinks=True):
+    """Return the stable device/inode identity of a directory."""
+    metadata = os.stat(directory, follow_symlinks=follow_symlinks)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"not a directory: {directory}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _open_directory_fd(directory, create=False, expected_identity=None):
     """Open and verify a canonical directory, returning a pinned descriptor.
 
     The caller supplies an immutable, already-resolved path. Do not resolve it
@@ -153,9 +161,10 @@ def _open_directory_fd(directory, create=False):
         raise ValueError(f"directory must be absolute: {directory}")
     if create:
         directory.mkdir(parents=True, exist_ok=True)
-    expected = os.stat(directory, follow_symlinks=False)
-    if not stat.S_ISDIR(expected.st_mode):
-        raise NotADirectoryError(f"not a directory: {directory}")
+    if expected_identity is None:
+        expected_identity = _directory_identity(
+            directory, follow_symlinks=False
+        )
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_fd = os.open(
         directory,
@@ -163,7 +172,7 @@ def _open_directory_fd(directory, create=False):
     )
     try:
         opened = os.fstat(directory_fd)
-        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+        if (opened.st_dev, opened.st_ino) != expected_identity:
             raise OSError(
                 f"directory changed while opening: {directory}"
             )
@@ -173,7 +182,7 @@ def _open_directory_fd(directory, create=False):
         raise
 
 
-def write_atomic_at(directory, filename, text, mode):
+def write_atomic_at(directory, filename, text, mode, expected_identity=None):
     """Atomically write one direct child of an already-resolved directory.
 
     The directory is held open throughout creation and replacement, so a
@@ -184,7 +193,11 @@ def write_atomic_at(directory, filename, text, mode):
         raise ValueError(f"filename must be one direct path component: {filename!r}")
 
     directory = Path(directory)
-    directory_fd = _open_directory_fd(directory, create=True)
+    directory_fd = _open_directory_fd(
+        directory,
+        create=True,
+        expected_identity=expected_identity,
+    )
     tmp_name = f".{filename}.{os.getpid()}.tmp"
     replaced = False
     try:
@@ -246,8 +259,12 @@ def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
     """
     directory = Path(directory)
     try:
+        expected_identity = _directory_identity(directory)
         resolved_directory = directory.resolve(strict=True)
-        directory_fd = _open_directory_fd(resolved_directory)
+        directory_fd = _open_directory_fd(
+            resolved_directory,
+            expected_identity=expected_identity,
+        )
     except (FileNotFoundError, NotADirectoryError):
         return 0
     now = time.time()

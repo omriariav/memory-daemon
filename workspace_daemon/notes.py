@@ -109,7 +109,7 @@ def _direct_note_candidate(directory, filename):
 
 
 def _target_paths(routine, item):
-    """Return the configured and resolved deterministic note paths.
+    """Return display/resolved note paths and the observed vault identity.
 
     output.filename_template accepts {slug_prefix}, {date}, {title} and {id}.
     Routines whose matches share a date (several meetings in one day) want
@@ -121,6 +121,11 @@ def _target_paths(routine, item):
     different item colliding on the same stem and write a second copy.
     """
     output = routine["output"]
+    directory = Path(output["vault_dir"])
+    try:
+        directory_identity = state._directory_identity(directory)
+    except FileNotFoundError:
+        directory_identity = None
     template = output.get("filename_template", DEFAULT_FILENAME_TEMPLATE)
     item_id = str(item["id"])
     item_digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
@@ -138,11 +143,10 @@ def _target_paths(routine, item):
     except (IndexError, KeyError, ValueError) as exc:
         raise ValueError(f"invalid output.filename_template: {template!r}") from exc
     stem = re.sub(r"-{2,}", "-", stem).strip("-")
-    directory = Path(output["vault_dir"])
     for filename in (f"{stem}.md", f"{stem}-{short_id}.md"):
         candidate, resolved = _direct_note_candidate(directory, filename)
         if not resolved.exists() or note_owner(resolved) == item_id:
-            return candidate, resolved
+            return candidate, resolved, directory_identity
     # Both taken by other items: use the full digest to make a third collision
     # deterministic without ever putting a raw source id into the path. Even
     # this fallback must not overwrite a file owned by somebody else.
@@ -150,7 +154,7 @@ def _target_paths(routine, item):
         directory, f"{stem}-{item_digest}.md"
     )
     if not resolved.exists() or note_owner(resolved) == item_id:
-        return candidate, resolved
+        return candidate, resolved, directory_identity
     raise FileExistsError(
         f"all deterministic note paths are owned by other items: {candidate}"
     )
@@ -202,11 +206,23 @@ def write(routine, item, summary, label):
     flushed, and the item is then skipped forever. The temp file is dot-prefixed
     so a vault watcher never indexes a half-written note.
     """
-    path, resolved_path = _target_paths(routine, item)
+    directory = Path(routine["output"]["vault_dir"])
+    try:
+        initial_identity = state._directory_identity(directory)
+    except FileNotFoundError:
+        directory.mkdir(parents=True, exist_ok=True)
+        initial_identity = state._directory_identity(directory)
+
+    path, resolved_path, directory_identity = _target_paths(routine, item)
+    if directory_identity != initial_identity:
+        raise OSError(
+            f"output.vault_dir changed while selecting note path: {directory}"
+        )
     state.write_atomic_at(
         resolved_path.parent,
         resolved_path.name,
         render(routine, item, summary, label),
         mode=0o600,
+        expected_identity=initial_identity,
     )
     return path

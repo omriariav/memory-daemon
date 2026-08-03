@@ -687,7 +687,9 @@ rendered name must remain one direct file inside `vault_dir`. Before writing,
 the daemon resolves that location and pins the validated directory through the
 atomic replacement, so a symlink cannot redirect the write. `{id}` and
 `{message_id}`, as well as collision suffixes, use a bounded SHA-256-derived
-token rather than putting a raw source id into a filename.
+token rather than putting a raw source id into a filename. The configured
+`vault_dir` is created before it is pinned when missing; dry runs only preview
+the path and never create it.
 
 **Actions** run in order after the note is written:
 `apply_label`, `mark_read`, `mark_unread`, `star`, `unstar`, `archive`.
