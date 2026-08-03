@@ -9,8 +9,8 @@ not depend on where its content came from:
 ...) and is spliced in after the common header fields.
 """
 import datetime
+import errno
 import hashlib
-import os
 import re
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from .shell import utc_now_iso
 
 DEFAULT_FILENAME_TEMPLATE = "{slug_prefix}-{date}"
 MAX_TITLE_SLUG = 70
-MAX_LEGACY_FILENAME_BYTES = 255
+MAX_LEGACY_FILENAME_CHARS = 255
 
 # {subject} and {message_id} are the original Gmail-era spellings, kept as
 # aliases so existing routines keep working.
@@ -140,12 +140,16 @@ def _legacy_owned_path(directory, template, output, item, item_id, slug):
         # A legacy file could only exist if its single path component fit the
         # filesystem limit. Never send an unbounded raw source id into pathname
         # resolution merely to discover that it could not have been created.
-        if len(os.fsencode(filename)) > MAX_LEGACY_FILENAME_BYTES:
+        if len(filename) > MAX_LEGACY_FILENAME_CHARS:
             continue
         try:
             candidate, resolved = _direct_note_candidate(directory, filename)
         except ValueError:
             continue
+        except OSError as exc:
+            if exc.errno == errno.ENAMETOOLONG:
+                continue
+            raise
         if resolved.exists() and note_owner(resolved) == item_id:
             return candidate, resolved
     return None

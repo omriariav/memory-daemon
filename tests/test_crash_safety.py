@@ -6,8 +6,9 @@ recovery behaviour, not to exercise the kernel.
 
 Run: python3 -m unittest discover -s tests -v
 """
-import json
+import errno
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -123,6 +124,61 @@ class TestNoteCollision(unittest.TestCase):
         digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:12]
         self.assertEqual(selected, self.vault / f"note-2026-07-26-{digest}.md")
         self.assertIn("summary", selected.read_text())
+
+    def test_unicode_legacy_name_is_not_rejected_by_byte_length(self):
+        item_id = "é" * 180
+        r = routine(self.vault)
+        seen = []
+
+        def candidate(_directory, filename):
+            seen.append(filename)
+            resolved = mock.Mock()
+            resolved.exists.return_value = filename.endswith(
+                f"-{item_id}.md"
+            )
+            return self.vault / filename, resolved
+
+        with mock.patch.object(
+            notes, "_direct_note_candidate", side_effect=candidate
+        ), mock.patch.object(notes, "note_owner", return_value=item_id):
+            selected = notes._legacy_owned_path(
+                self.vault,
+                notes.DEFAULT_FILENAME_TEMPLATE,
+                r["output"],
+                item(item_id),
+                item_id,
+                notes.title_slug("Weekly sync"),
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertTrue(seen[-1].endswith(f"-{item_id}.md"))
+        self.assertLessEqual(len(seen[-1]), 255)
+        self.assertGreater(len(seen[-1].encode("utf-8")), 255)
+
+    def test_legacy_probe_skips_only_filesystem_name_too_long(self):
+        r = routine(self.vault)
+        args = (
+            self.vault,
+            notes.DEFAULT_FILENAME_TEMPLATE,
+            r["output"],
+            item(),
+            item()["id"],
+            notes.title_slug("Weekly sync"),
+        )
+        with mock.patch.object(
+            notes,
+            "_direct_note_candidate",
+            side_effect=OSError(errno.ENAMETOOLONG, "name too long"),
+        ):
+            self.assertIsNone(notes._legacy_owned_path(*args))
+
+        with mock.patch.object(
+            notes,
+            "_direct_note_candidate",
+            side_effect=OSError(errno.EACCES, "permission denied"),
+        ):
+            with self.assertRaisesRegex(OSError, "permission denied"):
+                notes._legacy_owned_path(*args)
 
     def test_owner_of_a_non_note_file_is_none(self):
         path = self.vault / "note-2026-07-26.md"
