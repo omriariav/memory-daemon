@@ -135,6 +135,103 @@ def write_atomic(path, text, mode=None):
         log(f"WARN wrote {path} but could not fsync its directory: {exc}")
 
 
+def _open_directory_fd(directory, create=False):
+    """Open an absolute directory path without following any path symlink.
+
+    Callers pass an already-resolved path. Walking it one component at a time
+    relative to pinned directory descriptors closes the check/write race that
+    comes from resolving a path and then opening that same path by name.
+    """
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    current_fd = os.open("/", directory_flags)
+    try:
+        for part in directory.parts[1:]:
+            try:
+                child_fd = os.open(
+                    part,
+                    directory_flags | no_follow,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, mode=0o777, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(
+                    part,
+                    directory_flags | no_follow,
+                    dir_fd=current_fd,
+                )
+            os.close(current_fd)
+            current_fd = child_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def write_atomic_at(directory, filename, text, mode):
+    """Atomically write one direct child of an already-resolved directory.
+
+    The directory is held open throughout creation and replacement, so a
+    symlink cannot redirect the destination between containment validation and
+    the durable write.
+    """
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        raise ValueError(f"filename must be one direct path component: {filename!r}")
+
+    directory = Path(directory)
+    directory_fd = _open_directory_fd(directory, create=True)
+    tmp_name = f".{filename}.{os.getpid()}.tmp"
+    replaced = False
+    try:
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w") as file:
+                fd = None
+                file.write(text)
+                file.flush()
+                os.fsync(file.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(
+            tmp_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        replaced = True
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if replaced:
+            try:
+                os.fsync(directory_fd)
+            except OSError as exc:
+                log(
+                    f"WARN wrote {directory / filename} but could not fsync "
+                    f"its directory: {exc}"
+                )
+        os.close(directory_fd)
+
+
 TEMP_MAX_AGE_SECONDS = 3600
 
 # The exact shape write_atomic produces: `.<real name>.<pid>.tmp`.

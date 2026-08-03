@@ -117,9 +117,18 @@ class ConfigSchemaTest(unittest.TestCase):
                 self.assertTrue(any("filename_template literal" in p
                                     for p in problems), problems)
 
+    def test_filename_template_rejects_format_specs_and_conversions(self):
+        for template in ("{slug_prefix:/<10}-{date}", "{title!r}-{date}"):
+            with self.subTest(template=template):
+                problems = config.validate(
+                    self._vault_routine(filename_template=template)
+                )
+                self.assertTrue(any("format specifications or conversions" in p
+                                    for p in problems), problems)
+
     def test_dots_in_filename_components_remain_valid(self):
         problems = config.validate(self._vault_routine(
-            filename_template="report.v1-{date}",
+            filename_template="report.{date}.v1",
         ))
         self.assertFalse(any("slug_prefix" in p or "filename_template" in p
                              for p in problems), problems)

@@ -72,22 +72,55 @@ class TestNoteCollision(unittest.TestCase):
         self.assertIsNone(notes.note_owner(path))
 
     def test_runtime_rejects_parent_directory_escape(self):
-        with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
+        with self.assertRaisesRegex(ValueError, "generated note filename"):
             notes.target_path(
                 routine(self.vault, filename_template="../{title}"), item()
             )
 
     def test_runtime_rejects_absolute_slug_prefix_escape(self):
-        with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
+        with self.assertRaisesRegex(ValueError, "generated note filename"):
             notes.target_path(routine(self.vault, slug_prefix="/tmp/escape"), item())
 
-    def test_runtime_rejects_symlink_escape(self):
-        with tempfile.TemporaryDirectory() as outside:
-            (self.vault / "linked").symlink_to(outside, target_is_directory=True)
+    def test_runtime_rejects_format_spec_separator_escape(self):
+        with self.assertRaisesRegex(ValueError, "generated note filename"):
+            notes.target_path(
+                routine(self.vault, filename_template="{slug_prefix:/<10}"), item()
+            )
+
+    def test_runtime_rejects_final_file_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as outside_dir:
+            outside = Path(outside_dir) / "outside.md"
+            outside.write_text("outside")
+            (self.vault / "report.v1-2026-07-26.md").symlink_to(outside)
             with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
                 notes.target_path(
-                    routine(self.vault, filename_template="linked/{title}"), item()
+                    routine(self.vault, filename_template="report.v1-{date}"), item()
                 )
+
+    def test_symlink_retarget_cannot_redirect_the_atomic_write(self):
+        with tempfile.TemporaryDirectory() as intended_dir, \
+             tempfile.TemporaryDirectory() as redirected_dir:
+            configured_vault = self.vault / "configured-vault"
+            configured_vault.symlink_to(intended_dir, target_is_directory=True)
+            r = routine(configured_vault)
+            original_target_paths = notes._target_paths
+
+            def retarget_after_validation(*args):
+                display_path, resolved_path = original_target_paths(*args)
+                configured_vault.unlink()
+                configured_vault.symlink_to(
+                    redirected_dir, target_is_directory=True
+                )
+                return display_path, resolved_path
+
+            with mock.patch.object(
+                notes, "_target_paths", side_effect=retarget_after_validation
+            ):
+                written = notes.write(r, item(), "private summary", None)
+
+            self.assertEqual(written.parent, configured_vault)
+            self.assertTrue((Path(intended_dir) / written.name).exists())
+            self.assertEqual(list(Path(redirected_dir).iterdir()), [])
 
     def test_runtime_accepts_regular_note_path(self):
         path = notes.target_path(

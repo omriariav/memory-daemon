@@ -817,11 +817,22 @@ def validate(routine):
                 )
             else:
                 fields = {field for _, field, _, _ in parsed if field}
-                literal_text = "".join(literal for literal, _, _, _ in parsed)
-                if _unsafe_filename_fragment(literal_text):
+                if any(
+                    _unsafe_filename_fragment(literal)
+                    for literal, _, _, _ in parsed
+                ):
                     problems.append(
                         f"{rid}: output.filename_template literal text must not "
                         "contain path separators or '..'"
+                    )
+                if any(
+                    format_spec or conversion
+                    for _, field, format_spec, conversion in parsed
+                    if field
+                ):
+                    problems.append(
+                        f"{rid}: output.filename_template does not support "
+                        "format specifications or conversions"
                     )
                 unknown = fields - allowed
                 if unknown:

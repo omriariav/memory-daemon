@@ -79,7 +79,7 @@ def note_owner(path):
 
 
 def _contained_note_path(directory, candidate):
-    """Return candidate only when its resolved location stays in directory."""
+    """Return the resolved candidate only when it stays in directory."""
     resolved_directory = directory.resolve(strict=False)
     resolved_candidate = candidate.resolve(strict=False)
     try:
@@ -88,11 +88,11 @@ def _contained_note_path(directory, candidate):
         raise ValueError(
             f"refusing note path outside output.vault_dir: {candidate}"
         ) from exc
-    return candidate
+    return resolved_candidate
 
 
-def target_path(routine, item):
-    """Deterministic note path; suffixed with a short item id on collision.
+def _target_paths(routine, item):
+    """Return the configured and resolved deterministic note paths.
 
     output.filename_template accepts {slug_prefix}, {date}, {title} and {id}.
     Routines whose matches share a date (several meetings in one day) want
@@ -117,13 +117,24 @@ def target_path(routine, item):
         message_id=short_id,
     )
     stem = re.sub(r"-{2,}", "-", stem).strip("-")
+    if not stem or ".." in stem or "/" in stem or "\\" in stem:
+        raise ValueError(
+            "refusing generated note filename containing path syntax: "
+            f"{stem!r}"
+        )
     directory = Path(output["vault_dir"])
     for candidate in (directory / f"{stem}.md", directory / f"{stem}-{short_id}.md"):
-        candidate = _contained_note_path(directory, candidate)
-        if not candidate.exists() or note_owner(candidate) == item_id:
-            return candidate
+        resolved = _contained_note_path(directory, candidate)
+        if not resolved.exists() or note_owner(resolved) == item_id:
+            return candidate, resolved
     # Both taken by other items: two ids sharing a stem and an 8-char prefix.
-    return _contained_note_path(directory, directory / f"{stem}-{item_id}.md")
+    candidate = directory / f"{stem}-{item_id}.md"
+    return candidate, _contained_note_path(directory, candidate)
+
+
+def target_path(routine, item):
+    """Deterministic display path; suffixed with a short id on collision."""
+    return _target_paths(routine, item)[0]
 
 
 def render(routine, item, summary, label):
@@ -167,6 +178,11 @@ def write(routine, item, summary, label):
     flushed, and the item is then skipped forever. The temp file is dot-prefixed
     so a vault watcher never indexes a half-written note.
     """
-    path = target_path(routine, item)
-    state.write_atomic(path, render(routine, item, summary, label), mode=0o600)
+    path, resolved_path = _target_paths(routine, item)
+    state.write_atomic_at(
+        resolved_path.parent,
+        resolved_path.name,
+        render(routine, item, summary, label),
+        mode=0o600,
+    )
     return path
