@@ -9,7 +9,7 @@ import fcntl
 import json
 import os
 import re
-import sys
+import stat
 import time
 from pathlib import Path
 
@@ -139,37 +139,33 @@ def write_atomic(path, text, mode=None):
 def _open_directory_fd(directory, create=False):
     """Open and verify a canonical directory, returning a pinned descriptor.
 
-    Direct open preserves ordinary pathname semantics for execute-only parent
-    directories. Verifying the opened descriptor's kernel path catches an
-    intermediate symlink swapped in between resolve and open; O_NOFOLLOW covers
-    the final component. Once verified, descriptor-relative operations cannot
-    be redirected by later renames or symlink changes.
+    The caller supplies an immutable, already-resolved path. Do not resolve it
+    again here: a rename-plus-symlink swap between those two resolutions would
+    bless the attacker's new target. Direct open preserves ordinary pathname
+    semantics for execute-only parent directories. Comparing the directory's
+    device/inode identity before and after open catches changed intermediate
+    components without depending on pathname casing or platform-specific fd
+    paths; O_NOFOLLOW covers the final component. Once verified,
+    descriptor-relative operations cannot be redirected by later changes.
     """
     directory = Path(directory)
     if not directory.is_absolute():
         raise ValueError(f"directory must be absolute: {directory}")
     if create:
         directory.mkdir(parents=True, exist_ok=True)
-    expected = directory.resolve(strict=True)
+    expected = os.stat(directory, follow_symlinks=False)
+    if not stat.S_ISDIR(expected.st_mode):
+        raise NotADirectoryError(f"not a directory: {directory}")
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_fd = os.open(
-        expected,
+        directory,
         directory_flags | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        if sys.platform == "darwin":
-            # macOS F_GETPATH is not exposed as a Python constant.
-            raw_path = fcntl.fcntl(directory_fd, 50, bytes(1024))
-            opened = Path(raw_path.split(b"\0", 1)[0].decode()).resolve(
-                strict=False
-            )
-        else:
-            opened = Path(
-                os.readlink(f"/proc/self/fd/{directory_fd}")
-            ).resolve(strict=False)
-        if opened != expected:
+        opened = os.fstat(directory_fd)
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
             raise OSError(
-                f"directory changed while opening: expected {expected}, got {opened}"
+                f"directory changed while opening: {directory}"
             )
         return directory_fd
     except BaseException:

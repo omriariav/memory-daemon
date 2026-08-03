@@ -136,11 +136,16 @@ class ConfigSchemaTest(unittest.TestCase):
                                     for p in problems), problems)
 
     def test_dots_in_filename_components_remain_valid(self):
-        problems = config.validate(self._vault_routine(
-            filename_template="report.{date}.v1",
-        ))
-        self.assertFalse(any("slug_prefix" in p or "filename_template" in p
-                             for p in problems), problems)
+        for output in (
+            {"filename_template": "report.{date}.v1"},
+            {"slug_prefix": "report.", "filename_template": "{slug_prefix}"},
+        ):
+            with self.subTest(output=output):
+                problems = config.validate(self._vault_routine(**output))
+                self.assertFalse(any(
+                    "slug_prefix" in p or "filename_template" in p
+                    for p in problems
+                ), problems)
 
     def test_handler_output_gets_the_same_path_validation(self):
         routine = {

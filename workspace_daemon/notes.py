@@ -96,10 +96,10 @@ def _direct_note_candidate(directory, filename):
     """Build and resolve one filename without allowing path semantics."""
     if (
         not filename
-        or ".." in filename
         or "/" in filename
         or "\\" in filename
         or Path(filename).name != filename
+        or filename in {".", ".."}
     ):
         raise ValueError(
             f"refusing generated note filename containing path syntax: {filename!r}"

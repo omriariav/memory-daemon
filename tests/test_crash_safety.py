@@ -129,11 +129,48 @@ class TestNoteCollision(unittest.TestCase):
             self.assertTrue((Path(intended_dir) / written.name).exists())
             self.assertEqual(list(Path(redirected_dir).iterdir()), [])
 
+    def test_canonical_directory_swap_fails_instead_of_redirecting_write(self):
+        intended = self.vault / "intended"
+        moved = self.vault / "moved"
+        redirected = self.vault / "redirected"
+        intended.mkdir()
+        redirected.mkdir()
+        r = routine(intended)
+        original_target_paths = notes._target_paths
+
+        def swap_canonical_path_after_validation(*args):
+            display_path, resolved_path = original_target_paths(*args)
+            intended.rename(moved)
+            intended.symlink_to(redirected, target_is_directory=True)
+            return display_path, resolved_path
+
+        with mock.patch.object(
+            notes,
+            "_target_paths",
+            side_effect=swap_canonical_path_after_validation,
+        ):
+            with self.assertRaises(OSError):
+                notes.write(r, item(), "private summary", None)
+
+        self.assertEqual(list(redirected.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [])
+
     def test_runtime_accepts_regular_note_path(self):
         path = notes.target_path(
             routine(self.vault, filename_template="report.v1-{date}"), item()
         )
         self.assertEqual(path.parent, self.vault)
+
+    def test_runtime_accepts_safe_adjacent_dots_in_direct_filename(self):
+        path = notes.target_path(
+            routine(
+                self.vault,
+                slug_prefix="report.",
+                filename_template="{slug_prefix}",
+            ),
+            item(),
+        )
+        self.assertEqual(path, self.vault / "report..md")
 
     def test_collision_suffixes_never_use_raw_source_id_path_syntax(self):
         malicious_id = "x/../victim"
@@ -385,6 +422,20 @@ class TestPinnedAtomicWrite(unittest.TestCase):
             self.assertEqual((vault / "private.md").read_text(), "secret")
         finally:
             os.chmod(ancestor, 0o700)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/PRIVATE").exists(),
+        "requires a case-insensitive macOS filesystem",
+    )
+    def test_directory_identity_does_not_depend_on_path_casing(self):
+        canonical = self.directory.resolve()
+        alternate_case = Path(
+            str(canonical).replace("/private/", "/PRIVATE/", 1)
+        )
+        state.write_atomic_at(
+            alternate_case, "private.md", "secret", mode=0o600
+        )
+        self.assertEqual(self.path.read_text(), "secret")
 
 
 class TestRunLock(unittest.TestCase):
@@ -650,6 +701,32 @@ class TestTempSweepScope(unittest.TestCase):
             self.assertEqual(state.sweep_temp_files(configured), 1)
 
         self.assertFalse(intended_temp.exists())
+        self.assertTrue(redirected_temp.exists())
+
+    def test_canonical_directory_swap_cannot_redirect_cleanup(self):
+        intended = self.dir / "intended"
+        moved = self.dir / "moved"
+        redirected = self.dir / "redirected"
+        intended.mkdir()
+        redirected.mkdir()
+        intended_temp = intended / ".note.md.123.tmp"
+        redirected_temp = redirected / ".private.md.456.tmp"
+        for path in (intended_temp, redirected_temp):
+            path.write_text("x")
+            os.utime(path, (0, 0))
+        real_open_directory = state._open_directory_fd
+
+        def swap_before_open(directory, *args, **kwargs):
+            intended.rename(moved)
+            intended.symlink_to(redirected, target_is_directory=True)
+            return real_open_directory(directory, *args, **kwargs)
+
+        with mock.patch.object(
+            state, "_open_directory_fd", side_effect=swap_before_open
+        ):
+            self.assertEqual(state.sweep_temp_files(intended), 0)
+
+        self.assertTrue((moved / intended_temp.name).exists())
         self.assertTrue(redirected_temp.exists())
 
 
