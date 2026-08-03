@@ -2,10 +2,10 @@
 
 *(formerly `workspace-daemon`)*
 
-A small scheduled automation that sweeps your work sources — Gmail, Google
-Drive docs, Google Chat, Slack, local meeting transcripts, and Google Tasks —
-against declarative routines,
-distills each match with an LLM, and sinks the result into one or both of:
+A small scheduled automation that runs declarative capture and maintenance
+routines over Gmail, Google Drive docs, Google Chat, Slack, local meeting
+transcripts, and Google Tasks. Capture routines can distill each match with an
+LLM and sink the result into one or both of:
 
 - a **markdown note** in an Obsidian vault (documents), and/or
 - a **[personal-memory](https://github.com/vladimanaev/personal-memory) entry**
@@ -16,6 +16,9 @@ distills each match with an LLM, and sinks the result into one or both of:
   and every entry is tagged `auto-captured` for later review.
 
 Gmail matches can additionally be triaged (label / mark read / unstar / archive).
+Maintenance routines perform deterministic work such as Slack conversation
+discovery and bidirectional Google Tasks synchronization without an extraction
+LLM.
 
 **Adding a new routine is a drop-in YAML file, never a code change.** A routine
 may own one source, combine several transports under one domain prompt, or keep

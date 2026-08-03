@@ -1,9 +1,9 @@
 # Memory Daemon Retrospective and Agent Handoff
 
-**As of:** 2026-08-03  
-**Audience:** maintainers and future coding agents  
-**Scope:** durable architectural and operational context, not a live health
-snapshot
+- **As of:** 2026-08-03
+- **Audience:** maintainers and future coding agents
+- **Scope:** durable architectural and operational context, not a live health
+  snapshot
 
 This document explains why memory-daemon looks the way it does. The README is
 the reference manual; this is the project memory: the path taken, the failures
@@ -187,9 +187,11 @@ otherwise nothing is sent to memory and the recording remains retryable.
 
 ### Google Tasks
 
-Tasks synchronization is deterministic and bidirectional. Google task IDs are
-canonical source IDs. The checkpoint holds hashes for both sides, so one-sided
-changes propagate and simultaneous divergence fails closed as a conflict.
+Tasks synchronization is deterministic and bidirectional. Its canonical source
+identity is the composite `google-tasks:<list-id>:<task-id>`, because task IDs
+are scoped by their list. The checkpoint holds hashes for both sides, so
+one-sided changes propagate and simultaneous divergence fails closed as a
+conflict.
 
 Google Tasks does not expose a creation timestamp. Initial imports preserve its
 authoritative `updated` time rather than pretending the daemon run time is the
@@ -218,13 +220,15 @@ These rules are more important than any individual implementation:
    attention must not disappear merely because the laptop slept or the item is
    older than one interval.
 5. **Required sinks precede source mutation.** If memory or required document
-   expansion fails, Gmail actions remain pending. Archive must never make failed
-   work undiscoverable.
+   expansion fails, Gmail actions are withheld and the item remains retryable.
+   Archive must never make failed work undiscoverable.
 6. **Dry run is observational.** It performs real source reads, but no LLM call,
    source mutation, vault write, memory write, checkpoint update, or cursor
    advancement.
-7. **Maintenance cannot block capture.** Separate LaunchAgents and lock groups
-   isolate long metadata work from communication sweeps.
+7. **Long census work cannot block capture.** The Slack census has a separate
+   LaunchAgent and lock group. Google Tasks is shorter maintenance and shares
+   `state/run.lock` with capture, so overlap can defer a capture tick until the
+   next coordinator wake-up.
 8. **Failures are attributable.** Status names the affected routine and counts
    its last-run errors. A healthy later tick clears the operational error.
 9. **Identity is verified, never invented.** Source addresses are resolved
@@ -247,13 +251,14 @@ eligible; it does not mean a process is continuously running.
 
 Both plists intentionally use `RunAtLoad: false`. Installation must not cause an
 unreviewed wet run. `./run.sh` is the explicit activation boundary: it validates,
-loads both agents, and starts one due-routine tick.
+loads both agents, and starts one tick for each coordinator.
 
 launchd does not inherit a login shell. The rendered capture plist must expose
 stable paths for Python, `gws`, `yoetz`, optional mentions tooling, and Node/npm
 used by the memory CLI. Use a stable Node symlink rather than a version-pinned
 NVM directory. A missing Node runtime can otherwise let source reads and Gmail
-triage succeed while every memory write fails.
+analysis succeed while every memory write fails; required Gmail triage remains
+withheld for retry.
 
 ## What review and wet runs taught us
 
@@ -345,8 +350,9 @@ history are recovery assets.
 - Connector prompts are live configuration. They can improve without a daemon
   deployment, but a poor browser edit can change unattended judgment just as
   quickly. Review frontmatter and body together.
-- The processed ledger is intentionally append-only and currently has no prune
-  policy.
+- Successful processed-ledger rows accumulate and currently have no general
+  prune policy. Individual rows can still be updated or removed during normal
+  retry/resolution flows.
 - Google Tasks lacks conditional writes and a creation timestamp; conservative
   conflict detection reduces but cannot eliminate the last-read/write race.
 - Status reports when maintenance last ran, not whether it changed anything.
