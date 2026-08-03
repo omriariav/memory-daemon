@@ -63,6 +63,11 @@ SOURCE_KEYS = {
 }
 
 
+def _unsafe_filename_fragment(value):
+    """Whether config-controlled filename text can change path location."""
+    return ".." in value or "/" in value or "\\" in value
+
+
 def analyze_cfg(routine):
     cfg = routine.get("analyze")
     return cfg if isinstance(cfg, dict) else {}
@@ -779,8 +784,16 @@ def validate(routine):
             problems.append(f"{rid}: output.vault_dir is required")
         elif not str(output["vault_dir"]).startswith("/"):
             problems.append(f"{rid}: output.vault_dir must be an absolute path")
-        if not output.get("slug_prefix"):
+        slug_prefix = output.get("slug_prefix")
+        if not slug_prefix:
             problems.append(f"{rid}: output.slug_prefix is required")
+        elif not isinstance(slug_prefix, str):
+            problems.append(f"{rid}: output.slug_prefix must be a string")
+        elif _unsafe_filename_fragment(slug_prefix):
+            problems.append(
+                f"{rid}: output.slug_prefix must be a filename component "
+                "(no path separators or '..')"
+            )
         if "tags" in output and (
             not isinstance(output["tags"], list)
             or any(not isinstance(tag, str) or not tag for tag in output["tags"])
@@ -793,23 +806,55 @@ def validate(routine):
     template = output.get("filename_template")
     if template is not None:
         allowed = FILENAME_FIELDS
-        try:
-            fields = {f for _, f, _, _ in Formatter().parse(template) if f}
-        except ValueError as exc:
-            problems.append(f"{rid}: output.filename_template is malformed — {exc}")
+        if not isinstance(template, str):
+            problems.append(f"{rid}: output.filename_template must be a string")
         else:
-            unknown = fields - allowed
-            if unknown:
+            try:
+                parsed = list(Formatter().parse(template))
+            except ValueError as exc:
                 problems.append(
-                    f"{rid}: output.filename_template has unknown placeholder(s) "
-                    f"{', '.join('{%s}' % u for u in sorted(unknown))} "
-                    f"(valid: {', '.join('{%s}' % a for a in sorted(allowed))})"
+                    f"{rid}: output.filename_template is malformed — {exc}"
                 )
-            if not fields:
-                problems.append(
-                    f"{rid}: output.filename_template has no placeholders — "
-                    f"every note would overwrite the same filename"
-                )
+            else:
+                replacement_fields = [
+                    field for _, field, _, _ in parsed if field is not None
+                ]
+                if any(field == "" or field.isdecimal()
+                       for field in replacement_fields):
+                    problems.append(
+                        f"{rid}: output.filename_template does not support "
+                        "automatic or positional placeholders"
+                    )
+                fields = {field for field in replacement_fields if field}
+                if any(
+                    _unsafe_filename_fragment(literal)
+                    for literal, _, _, _ in parsed
+                ):
+                    problems.append(
+                        f"{rid}: output.filename_template literal text must not "
+                        "contain path separators or '..'"
+                    )
+                if any(
+                    format_spec or conversion
+                    for _, field, format_spec, conversion in parsed
+                    if field is not None
+                ):
+                    problems.append(
+                        f"{rid}: output.filename_template does not support "
+                        "format specifications or conversions"
+                    )
+                unknown = fields - allowed
+                if unknown:
+                    problems.append(
+                        f"{rid}: output.filename_template has unknown placeholder(s) "
+                        f"{', '.join('{%s}' % u for u in sorted(unknown))} "
+                        f"(valid: {', '.join('{%s}' % a for a in sorted(allowed))})"
+                    )
+                if not fields:
+                    problems.append(
+                        f"{rid}: output.filename_template has no placeholders — "
+                        f"every note would overwrite the same filename"
+                    )
 
     streams = routine.get("streams")
     configured_label = bool(configured_labels(routine))

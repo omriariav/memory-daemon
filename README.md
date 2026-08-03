@@ -680,6 +680,18 @@ output:
 actions: [apply_label, mark_read, unstar, archive]
 ```
 
+`slug_prefix` and the literal text in `filename_template` are filename-only:
+path separators and `..` are rejected, and format specifications/conversions
+and automatic/positional placeholders are intentionally unsupported. The
+rendered name must remain one direct file inside `vault_dir`. Before writing,
+the daemon resolves that location and pins the validated directory through the
+atomic replacement, so a symlink cannot redirect the write. `{id}` and
+`{message_id}`, as well as collision suffixes, use a bounded SHA-256-derived
+token rather than putting a raw source id into a filename. The configured
+`vault_dir` is created component-by-component beneath pinned parent descriptors
+when missing, without following newly introduced symlinks; dry runs only
+preview the path and never create it.
+
 **Actions** run in order after the note is written:
 `apply_label`, `mark_read`, `mark_unread`, `star`, `unstar`, `archive`.
 Use `[]` to leave the mailbox untouched.

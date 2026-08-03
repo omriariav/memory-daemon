@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import time
 from pathlib import Path
 
@@ -135,6 +136,189 @@ def write_atomic(path, text, mode=None):
         log(f"WARN wrote {path} but could not fsync its directory: {exc}")
 
 
+def _directory_identity(directory, follow_symlinks=True):
+    """Return the stable device/inode identity of a directory."""
+    metadata = os.stat(directory, follow_symlinks=follow_symlinks)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"not a directory: {directory}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _create_directory_beneath_pinned_parents(directory):
+    """Create a canonical absolute directory without following new symlinks.
+
+    ``directory`` has already been resolved against the symlinks that were part
+    of the configured path at the start of the operation. Walk that canonical
+    path from a pinned root descriptor and open every component with
+    ``O_NOFOLLOW``. If an ancestor is renamed while we walk, later work remains
+    attached to its original inode; if a symlink is inserted, opening it fails.
+    The caller subsequently compares the resulting identity with the configured
+    path again, so creation beneath a renamed ancestor cannot authorize a write.
+    """
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(directory.anchor, directory_flags | no_follow)
+    try:
+        for component in directory.parts[1:]:
+            try:
+                child_fd = os.open(
+                    component,
+                    directory_flags | no_follow,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o777, dir_fd=directory_fd)
+                except FileExistsError:
+                    # A concurrent creator is acceptable only if the component
+                    # can now be opened as a real directory without following a
+                    # symlink.
+                    pass
+                # Whether this mkdir succeeded or lost a concurrent-creator
+                # race, make the newly observed directory entry durable before
+                # a later ledger commit can claim that its note exists.
+                os.fsync(directory_fd)
+                child_fd = os.open(
+                    component,
+                    directory_flags | no_follow,
+                    dir_fd=directory_fd,
+                )
+            os.close(directory_fd)
+            directory_fd = child_fd
+
+        opened = os.fstat(directory_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise NotADirectoryError(f"not a directory: {directory}")
+        return opened.st_dev, opened.st_ino
+    finally:
+        os.close(directory_fd)
+
+
+def ensure_directory_identity(directory):
+    """Return a vault's identity, securely creating it when it is absent."""
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+
+    # Capture the configured path's canonical meaning before testing existence.
+    # If a missing path is redirected after that observation, the descriptor
+    # walk below follows the captured path and rejects newly introduced links.
+    canonical = directory.resolve(strict=False)
+    try:
+        configured_identity = _directory_identity(directory)
+    except FileNotFoundError:
+        return _create_directory_beneath_pinned_parents(canonical)
+
+    # Existing configured symlinks remain supported, but a retarget between
+    # resolution and identity capture must not silently redefine the vault.
+    canonical_identity = _directory_identity(canonical, follow_symlinks=False)
+    if configured_identity != canonical_identity:
+        raise OSError(f"directory changed while resolving: {directory}")
+    return configured_identity
+
+
+def _open_directory_fd(directory, create=False, expected_identity=None):
+    """Open and verify a canonical directory, returning a pinned descriptor.
+
+    The caller supplies an immutable, already-resolved path. Do not resolve it
+    again here: a rename-plus-symlink swap between those two resolutions would
+    bless the attacker's new target. Direct open preserves ordinary pathname
+    semantics for execute-only parent directories. Comparing the directory's
+    device/inode identity before and after open catches changed intermediate
+    components without depending on pathname casing or platform-specific fd
+    paths; O_NOFOLLOW covers the final component. Once verified,
+    descriptor-relative operations cannot be redirected by later changes.
+    """
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    if expected_identity is None:
+        expected_identity = _directory_identity(
+            directory, follow_symlinks=False
+        )
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(
+        directory,
+        directory_flags | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(directory_fd)
+        if (opened.st_dev, opened.st_ino) != expected_identity:
+            raise OSError(
+                f"directory changed while opening: {directory}"
+            )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def write_atomic_at(directory, filename, text, mode, expected_identity=None):
+    """Atomically write one direct child of an already-resolved directory.
+
+    The directory is held open throughout creation and replacement, so a
+    symlink cannot redirect the destination between containment validation and
+    the durable write.
+    """
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        raise ValueError(f"filename must be one direct path component: {filename!r}")
+
+    directory = Path(directory)
+    directory_fd = _open_directory_fd(
+        directory,
+        create=expected_identity is None,
+        expected_identity=expected_identity,
+    )
+    tmp_name = f".{filename}.{os.getpid()}.tmp"
+    replaced = False
+    try:
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w") as file:
+                fd = None
+                file.write(text)
+                file.flush()
+                os.fsync(file.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(
+            tmp_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        replaced = True
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if replaced:
+            try:
+                os.fsync(directory_fd)
+            except OSError as exc:
+                log(
+                    f"WARN wrote {directory / filename} but could not fsync "
+                    f"its directory: {exc}"
+                )
+        os.close(directory_fd)
+
+
 TEMP_MAX_AGE_SECONDS = 3600
 
 # The exact shape write_atomic produces: `.<real name>.<pid>.tmp`.
@@ -151,26 +335,38 @@ def sweep_temp_files(directory, max_age=TEMP_MAX_AGE_SECONDS):
     write that is genuinely in flight.
     """
     directory = Path(directory)
-    if not directory.is_dir():
+    try:
+        expected_identity = _directory_identity(directory)
+        resolved_directory = directory.resolve(strict=True)
+        directory_fd = _open_directory_fd(
+            resolved_directory,
+            expected_identity=expected_identity,
+        )
+    except (FileNotFoundError, NotADirectoryError):
         return 0
     now = time.time()
     removed = 0
-    for tmp in directory.glob(".*.tmp"):
-        # Only our own shape: `.<real name>.<pid>.tmp`. A bare `.*.tmp` glob also
-        # matches editor swap files and sync-conflict artifacts in a vault this
-        # daemon does not own, and deleting someone else's data is far worse
-        # than leaving a stray temp behind.
-        if not TEMP_NAME.match(tmp.name):
-            continue
-        try:
-            if now - tmp.stat().st_mtime < max_age:
+    try:
+        for name in os.listdir(directory_fd):
+            # Only our own shape: `.<real name>.<pid>.tmp`. A broad suffix match
+            # also catches editor swap files and sync-conflict artifacts, and
+            # deleting somebody else's data is worse than leaving a stale temp.
+            if not TEMP_NAME.match(name):
                 continue
-            tmp.unlink()
-            removed += 1
-        except OSError:
-            continue
+            try:
+                metadata = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if now - metadata.st_mtime < max_age:
+                    continue
+                os.unlink(name, dir_fd=directory_fd)
+                removed += 1
+            except OSError:
+                continue
+    finally:
+        os.close(directory_fd)
     if removed:
-        log(f"swept {removed} orphaned temp file(s) from {directory}")
+        log(f"swept {removed} orphaned temp file(s) from {resolved_directory}")
     return removed
 
 
