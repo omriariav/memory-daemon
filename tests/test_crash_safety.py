@@ -67,6 +67,50 @@ class TestNoteCollision(unittest.TestCase):
         self.assertEqual(notes.note_owner(path), "abc123def456")
         self.assertEqual(notes.write(routine(self.vault), item(), "new", None), path)
 
+    def test_retry_reuses_owned_legacy_short_id_collision_path(self):
+        item_id = "abcdefgh-rest-of-id"
+        base = self.vault / "note-2026-07-26.md"
+        legacy = self.vault / "note-2026-07-26-abcdefgh.md"
+        base.write_text("---\nitem_id: another-item\n---\n")
+        legacy.write_text(f"---\nitem_id: {item_id}\n---\n\nold\n")
+
+        selected = notes.write(
+            routine(self.vault), item(item_id), "updated", None
+        )
+
+        self.assertEqual(selected, legacy)
+        self.assertIn("updated", legacy.read_text())
+        self.assertEqual(len(list(self.vault.glob("*.md"))), 2)
+
+    def test_retry_reuses_owned_legacy_full_id_collision_path(self):
+        item_id = "abcdefgh-rest-of-id"
+        base = self.vault / "note-2026-07-26.md"
+        short = self.vault / "note-2026-07-26-abcdefgh.md"
+        legacy = self.vault / f"note-2026-07-26-{item_id}.md"
+        for path in (base, short):
+            path.write_text("---\nitem_id: another-item\n---\n")
+        legacy.write_text(f"---\nitem_id: {item_id}\n---\n\nold\n")
+
+        selected = notes.write(
+            routine(self.vault), item(item_id), "updated", None
+        )
+
+        self.assertEqual(selected, legacy)
+        self.assertIn("updated", legacy.read_text())
+        self.assertEqual(len(list(self.vault.glob("*.md"))), 3)
+
+    def test_retry_reuses_owned_legacy_id_template_path(self):
+        item_id = "abcdefgh-rest-of-id"
+        legacy = self.vault / "capture-abcdefgh.md"
+        legacy.write_text(f"---\nitem_id: {item_id}\n---\n\nold\n")
+        r = routine(self.vault, filename_template="capture-{id}")
+
+        selected = notes.write(r, item(item_id), "updated", None)
+
+        self.assertEqual(selected, legacy)
+        self.assertIn("updated", legacy.read_text())
+        self.assertEqual(list(self.vault.glob("*.md")), [legacy])
+
     def test_owner_of_a_non_note_file_is_none(self):
         path = self.vault / "note-2026-07-26.md"
         path.write_text("no frontmatter here")
@@ -125,7 +169,7 @@ class TestNoteCollision(unittest.TestCase):
             ):
                 written = notes.write(r, item(), "private summary", None)
 
-            self.assertEqual(written.parent, configured_vault)
+            self.assertEqual(written.parent, Path(intended_dir).resolve())
             self.assertTrue((Path(intended_dir) / written.name).exists())
             self.assertEqual(list(Path(redirected_dir).iterdir()), [])
 
@@ -189,6 +233,19 @@ class TestNoteCollision(unittest.TestCase):
         self.assertTrue(missing.is_dir())
         self.assertEqual(written.parent, missing)
         self.assertIn("summary", written.read_text())
+
+    def test_missing_vault_parent_fsync_failure_stops_before_note_write(self):
+        missing = self.vault / "missing-vault"
+        with mock.patch.object(
+            state.os,
+            "fsync",
+            side_effect=OSError("parent fsync failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "parent fsync failed"):
+                notes.write(routine(missing), item(), "summary", None)
+
+        self.assertTrue(missing.is_dir())
+        self.assertEqual(list(missing.iterdir()), [])
 
     def test_missing_vault_ancestor_swap_cannot_redirect_creation(self):
         container = self.vault / "container"

@@ -108,6 +108,42 @@ def _direct_note_candidate(directory, filename):
     return candidate, _contained_note_path(directory, candidate)
 
 
+def _legacy_owned_path(directory, template, output, item, item_id, slug):
+    """Find a pre-digest filename owned by this item, without creating one.
+
+    Older releases put the first eight raw id characters into ``{id}`` and
+    collision suffixes, then used the complete raw id as a final fallback.
+    Retrying one of those notes must update it rather than create a duplicate,
+    but raw ids are considered only as direct, existing, owned filenames.
+    """
+    legacy_short_id = item_id[:8]
+    try:
+        legacy_stem = template.format(
+            slug_prefix=output["slug_prefix"],
+            date=item["date"],
+            title=slug,
+            subject=slug,
+            id=legacy_short_id,
+            message_id=legacy_short_id,
+        )
+    except (IndexError, KeyError, ValueError):
+        return None
+    legacy_stem = re.sub(r"-{2,}", "-", legacy_stem).strip("-")
+    filenames = (
+        f"{legacy_stem}.md",
+        f"{legacy_stem}-{legacy_short_id}.md",
+        f"{legacy_stem}-{item_id}.md",
+    )
+    for filename in filenames:
+        try:
+            candidate, resolved = _direct_note_candidate(directory, filename)
+        except ValueError:
+            continue
+        if resolved.exists() and note_owner(resolved) == item_id:
+            return candidate, resolved
+    return None
+
+
 def _target_paths(routine, item):
     """Return display/resolved note paths and the observed vault identity.
 
@@ -131,6 +167,12 @@ def _target_paths(routine, item):
     item_digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
     short_id = item_digest[:12]
     slug = title_slug(item.get("title"))
+    legacy = _legacy_owned_path(
+        directory, template, output, item, item_id, slug
+    )
+    if legacy is not None:
+        candidate, resolved = legacy
+        return candidate, resolved, directory_identity
     try:
         stem = template.format(
             slug_prefix=output["slug_prefix"],
@@ -221,4 +263,9 @@ def write(routine, item, summary, label):
         mode=0o600,
         expected_identity=initial_identity,
     )
-    return path
+    try:
+        if state._directory_identity(directory) == initial_identity:
+            return path
+    except OSError:
+        pass
+    return resolved_path
