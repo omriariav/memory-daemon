@@ -190,6 +190,68 @@ class TestNoteCollision(unittest.TestCase):
         self.assertEqual(written.parent, missing)
         self.assertIn("summary", written.read_text())
 
+    def test_missing_vault_ancestor_swap_cannot_redirect_creation(self):
+        container = self.vault / "container"
+        missing = container / "vault"
+        moved_container = self.vault / "moved-container"
+        redirected_container = self.vault / "redirected-container"
+        container.mkdir()
+        redirected_container.mkdir()
+        real_identity = state._directory_identity
+        swapped = False
+
+        def swap_after_missing_lookup(directory, *args, **kwargs):
+            nonlocal swapped
+            try:
+                return real_identity(directory, *args, **kwargs)
+            except FileNotFoundError:
+                if Path(directory) == missing and not swapped:
+                    container.rename(moved_container)
+                    container.symlink_to(
+                        redirected_container, target_is_directory=True
+                    )
+                    swapped = True
+                raise
+
+        with mock.patch.object(
+            state, "_directory_identity", side_effect=swap_after_missing_lookup
+        ):
+            with self.assertRaises(OSError):
+                notes.write(
+                    routine(missing), item(), "private summary", None
+                )
+
+        self.assertTrue(swapped)
+        self.assertFalse((redirected_container / "vault").exists())
+        self.assertEqual(list(moved_container.iterdir()), [])
+
+    def test_validated_write_does_not_create_redirected_missing_vault(self):
+        container = self.vault / "container"
+        intended = container / "vault"
+        moved_container = self.vault / "moved-container"
+        redirected_container = self.vault / "redirected-container"
+        intended.mkdir(parents=True)
+        redirected_container.mkdir()
+        r = routine(intended)
+        original_target_paths = notes._target_paths
+
+        def swap_ancestor_after_validation(*args):
+            selected = original_target_paths(*args)
+            container.rename(moved_container)
+            container.symlink_to(
+                redirected_container, target_is_directory=True
+            )
+            return selected
+
+        with mock.patch.object(
+            notes, "_target_paths", side_effect=swap_ancestor_after_validation
+        ):
+            with self.assertRaises(OSError):
+                notes.write(r, item(), "private summary", None)
+
+        self.assertFalse((redirected_container / "vault").exists())
+        self.assertEqual(list((moved_container / "vault").iterdir()), [])
+
     def test_runtime_accepts_regular_note_path(self):
         path = notes.target_path(
             routine(self.vault, filename_template="report.v1-{date}"), item()

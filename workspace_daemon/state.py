@@ -144,6 +144,79 @@ def _directory_identity(directory, follow_symlinks=True):
     return metadata.st_dev, metadata.st_ino
 
 
+def _create_directory_beneath_pinned_parents(directory):
+    """Create a canonical absolute directory without following new symlinks.
+
+    ``directory`` has already been resolved against the symlinks that were part
+    of the configured path at the start of the operation. Walk that canonical
+    path from a pinned root descriptor and open every component with
+    ``O_NOFOLLOW``. If an ancestor is renamed while we walk, later work remains
+    attached to its original inode; if a symlink is inserted, opening it fails.
+    The caller subsequently compares the resulting identity with the configured
+    path again, so creation beneath a renamed ancestor cannot authorize a write.
+    """
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(directory.anchor, directory_flags | no_follow)
+    try:
+        for component in directory.parts[1:]:
+            try:
+                child_fd = os.open(
+                    component,
+                    directory_flags | no_follow,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o777, dir_fd=directory_fd)
+                except FileExistsError:
+                    # A concurrent creator is acceptable only if the component
+                    # can now be opened as a real directory without following a
+                    # symlink.
+                    pass
+                child_fd = os.open(
+                    component,
+                    directory_flags | no_follow,
+                    dir_fd=directory_fd,
+                )
+            os.close(directory_fd)
+            directory_fd = child_fd
+
+        opened = os.fstat(directory_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise NotADirectoryError(f"not a directory: {directory}")
+        return opened.st_dev, opened.st_ino
+    finally:
+        os.close(directory_fd)
+
+
+def ensure_directory_identity(directory):
+    """Return a vault's identity, securely creating it when it is absent."""
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise ValueError(f"directory must be absolute: {directory}")
+
+    # Capture the configured path's canonical meaning before testing existence.
+    # If a missing path is redirected after that observation, the descriptor
+    # walk below follows the captured path and rejects newly introduced links.
+    canonical = directory.resolve(strict=False)
+    try:
+        configured_identity = _directory_identity(directory)
+    except FileNotFoundError:
+        return _create_directory_beneath_pinned_parents(canonical)
+
+    # Existing configured symlinks remain supported, but a retarget between
+    # resolution and identity capture must not silently redefine the vault.
+    canonical_identity = _directory_identity(canonical, follow_symlinks=False)
+    if configured_identity != canonical_identity:
+        raise OSError(f"directory changed while resolving: {directory}")
+    return configured_identity
+
+
 def _open_directory_fd(directory, create=False, expected_identity=None):
     """Open and verify a canonical directory, returning a pinned descriptor.
 
@@ -195,7 +268,7 @@ def write_atomic_at(directory, filename, text, mode, expected_identity=None):
     directory = Path(directory)
     directory_fd = _open_directory_fd(
         directory,
-        create=True,
+        create=expected_identity is None,
         expected_identity=expected_identity,
     )
     tmp_name = f".{filename}.{os.getpid()}.tmp"

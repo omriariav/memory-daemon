@@ -207,11 +207,7 @@ def write(routine, item, summary, label):
     so a vault watcher never indexes a half-written note.
     """
     directory = Path(routine["output"]["vault_dir"])
-    try:
-        initial_identity = state._directory_identity(directory)
-    except FileNotFoundError:
-        directory.mkdir(parents=True, exist_ok=True)
-        initial_identity = state._directory_identity(directory)
+    initial_identity = state.ensure_directory_identity(directory)
 
     path, resolved_path, directory_identity = _target_paths(routine, item)
     if directory_identity != initial_identity:
