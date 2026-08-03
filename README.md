@@ -2,9 +2,10 @@
 
 *(formerly `workspace-daemon`)*
 
-A small scheduled automation that sweeps your work sources — Gmail, Google
-Drive docs, Slack channels and @mentions — against declarative routines,
-distills each match with an LLM, and sinks the result into one or both of:
+A small scheduled automation that runs declarative capture and maintenance
+routines over Gmail, Google Drive docs, Google Chat, Slack, local meeting
+transcripts, and Google Tasks. Capture routines can distill each match with an
+LLM and sink the result into one or both of:
 
 - a **markdown note** in an Obsidian vault (documents), and/or
 - a **[personal-memory](https://github.com/vladimanaev/personal-memory) entry**
@@ -15,6 +16,9 @@ distills each match with an LLM, and sinks the result into one or both of:
   and every entry is tagged `auto-captured` for later review.
 
 Gmail matches can additionally be triaged (label / mark read / unstar / archive).
+Maintenance routines perform deterministic work such as Slack conversation
+discovery and bidirectional Google Tasks synchronization without an extraction
+LLM.
 
 **Adding a new routine is a drop-in YAML file, never a code change.** A routine
 may own one source, combine several transports under one domain prompt, or keep
@@ -22,11 +26,34 @@ one scheduler per medium while deterministic source queries select specialized
 handlers inside it.
 
 ```
-source (gws / built-in Slack client) ──▶ LLM (yoetz) ──▶ vault note and/or memory
-                                                    ──▶ ledger and triage
+source (gws / Slack / local files) ──▶ LLM (yoetz) ──▶ vault note and/or memory
+                                                   ──▶ ledger and triage
 ```
 
 See `routines/_example-slack-to-memory.yaml` for the Slack→memory shape.
+
+## Operating model
+
+The daemon now favors **one general owner per communication medium**, with
+deterministic routing for known source shapes, instead of a growing collection
+of overlapping domain routines:
+
+| Plane | Responsibility |
+|---|---|
+| General capture | Gmail, Google Chat, and Slack sweeps cover incoming and outgoing work and apply each connector's general memory-worthiness prompt. |
+| Deterministic capture | Exact sender/subject rules claim known Gmail traffic such as recurring reports and meeting notes before the general prompt. |
+| Specialized capture | Guarded local-transcription ingestion handles material that cannot be discovered reliably through a communication connector. |
+| Maintenance | Slack conversation discovery and Google Tasks synchronization run without an extraction LLM. |
+
+The exact production routine files, source identifiers, addresses, labels,
+filesystem paths, and connector prompt overrides are intentionally private and
+gitignored. The examples in this repository document the schema; the local
+`routines/*.yaml` files are the authority for an installed daemon. Never copy
+private scope into an issue, pull request, README example, test fixture, or log
+excerpt intended for publication.
+
+For the architectural history, incidents that shaped the invariants, and the
+handoff checklist for future agents, read [`REFLECTION.md`](REFLECTION.md).
 
 ### Where the extraction prompt lives
 
@@ -146,7 +173,7 @@ complete meeting-note plus recurring-report example.
 | | |
 |---|---|
 | **Python 3.9+** | stdlib only, plus `pyyaml` |
-| **[`gws`](https://github.com/omriariav/workspace-cli)** — workspace-cli, an unofficial Google Workspace CLI | provides Gmail read/search/label/archive. Must be authenticated: `gws auth login` (developed against v1.41.0) |
+| **[`gws`](https://github.com/omriariav/workspace-cli)** — workspace-cli, an unofficial Google Workspace CLI | provides Gmail, Chat, Drive/Docs, directory, Calendar, and Tasks access. Authenticate with the scopes required by the enabled routines: `gws auth login` (developed against v1.41.0) |
 | **[`yoetz`](https://github.com/avivsinai/yoetz)** — CLI LLM gateway | `brew install avivsinai/tap/yoetz`, then configure a provider key |
 
 The Slack client is included in this repository. Put its user token in
@@ -164,6 +191,20 @@ different path. `mention_user` is optional; when omitted, the client resolves
 the authenticated user's email and therefore needs `users:read` and
 `users:read.email`. The optional mentions integration shells out to `ada`;
 ordinary channel, DM, and group-DM reads do not.
+
+For complete joined-conversation discovery and content reads, the recommended
+Slack user-token scopes are:
+
+| Purpose | Scopes |
+|---|---|
+| Conversation metadata | `channels:read`, `groups:read`, `im:read`, `mpim:read` |
+| Message and thread content | `channels:history`, `groups:history`, `im:history`, `mpim:history` |
+| Identity resolution | `users:read`, `users:read.email` |
+
+The daemon does not use Slack search for its general sweep, so `search:read` is
+not required. It also does not write Slack messages, so `chat:write` and
+`mpim:write` are not required by memory-daemon. An optional external mentions
+helper may have its own authorization requirements.
 
 `gws` and `yoetz` are found on `PATH`. To pin them explicitly (useful under
 launchd, which does not inherit a login shell's `PATH`):
@@ -928,7 +969,10 @@ current `STATUS`: `in-tick`, `due`, `waiting`, `attention`, or `disabled`.
 `in-tick` means the routine was selected for the current batch; it does not
 claim that every selected routine is executing simultaneously. An armed
 scheduler is loaded and will keep checking its schedule; `tick running` means
-its coordinator process is executing now.
+its coordinator process is executing now. `LAST CAPTURE` is derived from the
+capture ledger; maintenance-only routines display `N/A` because the field does
+not apply to them. Use `LAST ATTEMPT`, `STATUS`, and `ISSUES` to judge their
+health.
 Copy it to a directory on `PATH` to call it from anywhere:
 
 ```sh
@@ -956,6 +1000,7 @@ gitignored — only the template is tracked.
 ```
 daemon.py                  CLI entrypoint
 memory-daemon-status.sh    scheduler and per-routine health
+REFLECTION.md              architectural retrospective and agent handoff
 workspace_daemon/
   config.py                routine discovery, loading, validation
   shell.py                 binary resolution, subprocess, logging
