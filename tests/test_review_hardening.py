@@ -84,6 +84,70 @@ class ConfigSchemaTest(unittest.TestCase):
         for typo in ("enabeld", "max_reuslts", "max_output_toknes", "tyep"):
             self.assertIn(typo, rendered)
 
+    @staticmethod
+    def _vault_routine(**output):
+        output = {
+            "vault_dir": "/tmp/vault",
+            "slug_prefix": "report.v1",
+            **output,
+        }
+        return {
+            "id": "vault-output",
+            "source": {"kind": "gmail", "query": "in:inbox"},
+            "analyze": {"provider": "gemini", "model": "m", "instruction": "x"},
+            "output": output,
+        }
+
+    def test_output_slug_prefix_cannot_change_directories(self):
+        for prefix in ("../escape", "/tmp/escape", "nested/path", r"nested\path"):
+            with self.subTest(prefix=prefix):
+                problems = config.validate(self._vault_routine(slug_prefix=prefix))
+                self.assertTrue(any("slug_prefix" in p and "separators" in p
+                                    for p in problems), problems)
+
+    def test_filename_template_literal_cannot_change_directories(self):
+        for template in (
+            "../escape-{title}", "/tmp/escape-{title}",
+            "nested/path-{title}", r"nested\path-{title}",
+        ):
+            with self.subTest(template=template):
+                problems = config.validate(
+                    self._vault_routine(filename_template=template)
+                )
+                self.assertTrue(any("filename_template literal" in p
+                                    for p in problems), problems)
+
+    def test_dots_in_filename_components_remain_valid(self):
+        problems = config.validate(self._vault_routine(
+            filename_template="report.v1-{date}",
+        ))
+        self.assertFalse(any("slug_prefix" in p or "filename_template" in p
+                             for p in problems), problems)
+
+    def test_handler_output_gets_the_same_path_validation(self):
+        routine = {
+            "id": "handler-output",
+            "source": {
+                "kind": "gmail", "query": "in:inbox", "max_results": 0,
+                "handler": "special",
+            },
+            "handlers": {
+                "special": {
+                    "output": {
+                        "vault_dir": "/tmp/vault",
+                        "slug_prefix": "../escape",
+                    },
+                },
+            },
+            "analyze": {
+                "provider": "gemini", "model": "m", "instruction": "x",
+            },
+            "memory": {"store": "/tmp/store"},
+        }
+        problems = config.validate(routine)
+        self.assertTrue(any("handler 'special'" in p and "slug_prefix" in p
+                            for p in problems), problems)
+
 
 class CursorIsolationTest(unittest.TestCase):
     def setUp(self):

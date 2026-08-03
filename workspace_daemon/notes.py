@@ -78,6 +78,19 @@ def note_owner(path):
     return None
 
 
+def _contained_note_path(directory, candidate):
+    """Return candidate only when its resolved location stays in directory."""
+    resolved_directory = directory.resolve(strict=False)
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        resolved_candidate.relative_to(resolved_directory)
+    except ValueError as exc:
+        raise ValueError(
+            f"refusing note path outside output.vault_dir: {candidate}"
+        ) from exc
+    return candidate
+
+
 def target_path(routine, item):
     """Deterministic note path; suffixed with a short item id on collision.
 
@@ -106,10 +119,11 @@ def target_path(routine, item):
     stem = re.sub(r"-{2,}", "-", stem).strip("-")
     directory = Path(output["vault_dir"])
     for candidate in (directory / f"{stem}.md", directory / f"{stem}-{short_id}.md"):
+        candidate = _contained_note_path(directory, candidate)
         if not candidate.exists() or note_owner(candidate) == item_id:
             return candidate
     # Both taken by other items: two ids sharing a stem and an 8-char prefix.
-    return directory / f"{stem}-{item_id}.md"
+    return _contained_note_path(directory, directory / f"{stem}-{item_id}.md")
 
 
 def render(routine, item, summary, label):

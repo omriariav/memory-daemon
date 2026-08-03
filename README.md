@@ -680,6 +680,11 @@ output:
 actions: [apply_label, mark_read, unstar, archive]
 ```
 
+`slug_prefix` and the literal text in `filename_template` are filename-only:
+path separators and `..` are rejected. Before writing, the daemon also resolves
+the final path and refuses any location outside `vault_dir`, including an escape
+through a symlink.
+
 **Actions** run in order after the note is written:
 `apply_label`, `mark_read`, `mark_unread`, `star`, `unstar`, `archive`.
 Use `[]` to leave the mailbox untouched.

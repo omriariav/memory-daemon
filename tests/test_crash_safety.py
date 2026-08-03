@@ -71,6 +71,30 @@ class TestNoteCollision(unittest.TestCase):
         path.write_text("no frontmatter here")
         self.assertIsNone(notes.note_owner(path))
 
+    def test_runtime_rejects_parent_directory_escape(self):
+        with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
+            notes.target_path(
+                routine(self.vault, filename_template="../{title}"), item()
+            )
+
+    def test_runtime_rejects_absolute_slug_prefix_escape(self):
+        with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
+            notes.target_path(routine(self.vault, slug_prefix="/tmp/escape"), item())
+
+    def test_runtime_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as outside:
+            (self.vault / "linked").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "outside output.vault_dir"):
+                notes.target_path(
+                    routine(self.vault, filename_template="linked/{title}"), item()
+                )
+
+    def test_runtime_accepts_regular_note_path(self):
+        path = notes.target_path(
+            routine(self.vault, filename_template="report.v1-{date}"), item()
+        )
+        self.assertEqual(path.parent, self.vault)
+
 
 class TestLedger(unittest.TestCase):
     def setUp(self):
