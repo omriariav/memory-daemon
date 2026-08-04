@@ -404,6 +404,109 @@ class CaptureValidationTest(unittest.TestCase):
 
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "note")
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn(memory_sink.NO_OWNER_ACTION_TAG, tags)
+
+    def test_slack_todo_without_ownership_evidence_is_downgraded(self):
+        # Regression: a channel discussion between two other people about a
+        # relevant domain must not become the owner's task even when the
+        # extraction model affirms owner attention on topical relevance.
+        self.item["frontmatter"]["slack_owner_evidence"] = []
+        outcome, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": True,
+            "type": "todo",
+            "title": "Decide OKR share for another team's experiment",
+            "people": ["jane-doe"],
+            "tags": ["okr"],
+            "body": "Two colleagues discussed what to share in the OKR review.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+        people = calls["args"][calls["args"].index("--people") + 1]
+        self.assertEqual(people, "jane-doe")
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertIn(memory_sink.NO_OWNER_ACTION_TAG, tags)
+
+    def test_slack_pending_decision_without_evidence_is_downgraded(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = []
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": True,
+            "type": "pending-decision",
+            "title": "Open choice owned elsewhere",
+            "people": [],
+            "tags": [],
+            "body": "Someone else must decide.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_slack_evidence_must_be_real_strings(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = [3, "", None]
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": True,
+            "type": "todo",
+            "title": "Junk evidence",
+            "people": [],
+            "tags": [],
+            "body": "b",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_slack_todo_with_ownership_evidence_stays_todo(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = ["mentioned"]
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": True,
+            "type": "todo",
+            "title": "Owner was asked directly",
+            "people": [],
+            "tags": [],
+            "body": "The memory owner was mentioned and asked to decide.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertNotIn(memory_sink.NO_OWNER_ACTION_TAG, tags)
+
+    def test_slack_evidence_does_not_override_owner_attention_denial(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = ["mentioned"]
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": False,
+            "type": "todo",
+            "title": "Mentioned but not assigned",
+            "people": [],
+            "tags": [],
+            "body": "The owner was mentioned as FYI only.",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_slack_note_without_evidence_is_not_tagged(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = []
+        _, calls = self._run_capture({
+            "worthy": True,
+            "owner_attention": False,
+            "type": "note",
+            "title": "Plain context",
+            "people": [],
+            "tags": ["context"],
+            "body": "b",
+        })
+
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+        tags = calls["args"][calls["args"].index("--tags") + 1]
+        self.assertNotIn(memory_sink.NO_OWNER_ACTION_TAG, tags)
 
     def test_actionable_type_requires_explicit_boolean_owner_attention(self):
         invalid_values = [

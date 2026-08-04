@@ -5,6 +5,16 @@ from unittest import mock
 from workspace_daemon import config, gchat_source, memory_sink, slack_source
 
 
+def setUpModule():
+    # slack_source.fetch resolves the authenticated Slack user once per process
+    # for ownership evidence; seed the cache so tests never shell out.
+    slack_source._self_user_cache["id"] = "USELF"
+
+
+def tearDownModule():
+    slack_source._self_user_cache.clear()
+
+
 def msg(thread, ts, text, sender="users/1"):
     return {"thread": f"spaces/AAA/threads/{thread}", "create_time": ts,
             "text": text, "sender": sender, "name": f"spaces/AAA/messages/{thread}.x"}

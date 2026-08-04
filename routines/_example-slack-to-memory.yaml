@@ -31,6 +31,14 @@ source:
     - C0123ABCD          # #my-team-channel
     - C0456EFGH          # #my-project-channel (private channels work too)
   include_mentions: true # workspace-wide @mentions of you
+  # Channels whose action items are yours by standing agreement. Elsewhere a
+  # Slack capture can become a todo/pending-decision only with deterministic
+  # ownership evidence: an @mention of you, a message you wrote, or a direct
+  # message conversation. Without evidence the sink stores a note tagged
+  # `no-owner-action` instead, so other people's discussions never reach your
+  # task list, Google Tasks, or briefs.
+  # owner_action_channels:
+  #   - C0123ABCD
   hours: 26              # bootstrap fallback before the first cursor
   max_results: 0         # uncapped direct reads are required for catch-up
   catch_up: true

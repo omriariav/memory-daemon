@@ -8,6 +8,16 @@ from unittest import mock
 from workspace_daemon import config, slack_source
 
 
+def setUpModule():
+    # fetch() resolves the authenticated Slack user once per process to compute
+    # ownership evidence; seed the cache so tests never shell out to auth-test.
+    slack_source._self_user_cache["id"] = "USELF"
+
+
+def tearDownModule():
+    slack_source._self_user_cache.clear()
+
+
 class AdaDigestTest(unittest.TestCase):
     SUMMARY = {
         "success": True,
@@ -890,6 +900,150 @@ class MentionOwnershipTest(unittest.TestCase):
         )
 
 
+class OwnerEvidenceTest(unittest.TestCase):
+    """Deterministic ownership evidence rides along with every fetched item."""
+
+    def _thread_item(self, messages, channel="C1", source=None):
+        candidate = {
+            "id": f"slack:{channel}:1.0@2.0",
+            "title": "t",
+            "raw": {
+                "channel": channel,
+                "anchor": "1.0",
+                "source_id": f"slack:{channel}:1.0",
+                "mode": "thread",
+            },
+        }
+        thread = {"ok": True, "messages": messages}
+        whois = {"ok": True, "users": {}}
+        with mock.patch.object(
+            slack_source, "_cli", side_effect=[thread, whois]
+        ):
+            return slack_source.fetch({}, candidate, source)
+
+    def test_channel_thread_between_other_people_carries_no_evidence(self):
+        # Regression for the OKR-share incident: an on-domain discussion where
+        # one colleague reports findings and another asks what to share must
+        # not present any owner-action evidence.
+        item = self._thread_item([
+            {"ts": "1.0", "user": "U1",
+             "text": "market_price lift confirmed on AdX, y_hb bug reported"},
+            {"ts": "2.0", "user": "U2",
+             "text": "what of this can we share in the OKR review?"},
+        ])
+        self.assertEqual(item["frontmatter"]["slack_owner_evidence"], [])
+
+    def test_mention_of_the_owner_is_evidence(self):
+        item = self._thread_item([
+            {"ts": "1.0", "user": "U1",
+             "text": "<@USELF> can you decide what we share?"},
+        ])
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["mentioned"]
+        )
+
+    def test_labeled_mention_markup_is_evidence(self):
+        item = self._thread_item([
+            {"ts": "1.0", "user": "U1", "text": "over to <@USELF|omri>"},
+        ])
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["mentioned"]
+        )
+
+    def test_mention_of_someone_else_is_not_evidence(self):
+        item = self._thread_item([
+            {"ts": "1.0", "user": "U1", "text": "<@UOTHER> please decide"},
+        ])
+        self.assertEqual(item["frontmatter"]["slack_owner_evidence"], [])
+
+    def test_owner_message_is_evidence(self):
+        item = self._thread_item([
+            {"ts": "1.0", "user": "USELF", "text": "I will take this"},
+        ])
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["authored"]
+        )
+
+    def test_direct_message_conversation_is_evidence(self):
+        item = self._thread_item(
+            [{"ts": "1.0", "user": "U1", "text": "can you review?"}],
+            channel="D0DM",
+        )
+        self.assertIn(
+            "direct-message", item["frontmatter"]["slack_owner_evidence"]
+        )
+
+    def test_owner_action_channel_rule_is_evidence(self):
+        item = self._thread_item(
+            [{"ts": "1.0", "user": "U1", "text": "action: ship the fix"}],
+            source={"owner_action_channels": ["C1"]},
+        )
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["channel-rule"]
+        )
+
+    def test_unresolved_self_id_degrades_to_structural_signals(self):
+        slack_source._self_user_cache["id"] = ""
+        try:
+            item = self._thread_item(
+                [{"ts": "1.0", "user": "USELF", "text": "<@USELF> ping"}],
+                source={"owner_action_channels": ["C1"]},
+            )
+        finally:
+            slack_source._self_user_cache["id"] = "USELF"
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["channel-rule"]
+        )
+
+    def test_direct_digest_carries_evidence(self):
+        candidate = {
+            "id": "slack:D0DM:digest:2026-07-27@1784700404.0",
+            "title": "t",
+            "raw": {
+                "channel": "D0DM",
+                "source_id": "slack:D0DM:digest:2026-07-27",
+                "digest_day": "2026-07-27",
+                "capture_mode": "private-daily-digest",
+                "mode": "direct_digest",
+                "messages_expanded": True,
+                "messages": [
+                    {"ts": "1784700404.0", "user": "U1", "text": "hello"},
+                ],
+            },
+        }
+        whois = {"ok": True, "users": {}}
+        with mock.patch.object(slack_source, "_cli", return_value=whois):
+            item = slack_source.fetch({}, candidate)
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["direct-message"]
+        )
+
+    def test_ada_digest_scans_curated_texts_for_mentions(self):
+        summary = dict(AdaDigestTest.SUMMARY)
+        summary["key_threads"] = [{
+            "permalink": "https://example.test/thread",
+            "reply_count": 0,
+            "text_preview": "<@USELF> please own the follow-up",
+            "timestamp": "1783922952.468549",
+            "user": "Ada User",
+        }]
+        candidate = {
+            "id": "slack:CPUBLIC:digest:2026-07-27@v1",
+            "title": "t",
+            "raw": {
+                "channel": "CPUBLIC",
+                "source_id": "slack:CPUBLIC:digest:2026-07-27",
+                "capture_day": "2026-07-27",
+                "summary": summary,
+                "mode": "ada_digest",
+            },
+        }
+        item = slack_source.fetch({}, candidate)
+        self.assertEqual(
+            item["frontmatter"]["slack_owner_evidence"], ["mentioned"]
+        )
+
+
 class HybridValidationTest(unittest.TestCase):
     def routine(self, source):
         return {
@@ -919,6 +1073,24 @@ class HybridValidationTest(unittest.TestCase):
             "private_channels": ["CSAME"],
         }))
         self.assertTrue(any("appears in both" in problem for problem in problems))
+
+    def test_owner_action_channels_must_be_channel_id_strings(self):
+        for bad in ([], "C1", ["C1", 7]):
+            problems = config.validate(self.routine({
+                "kind": "slack",
+                "direct_channels": ["CDIRECT"],
+                "owner_action_channels": bad,
+            }))
+            self.assertTrue(
+                any("owner_action_channels" in problem for problem in problems),
+                bad,
+            )
+        problems = config.validate(self.routine({
+            "kind": "slack",
+            "direct_channels": ["CDIRECT"],
+            "owner_action_channels": ["CDIRECT"],
+        }))
+        self.assertEqual(problems, [])
 
     def test_ada_days_range_is_validated(self):
         problems = config.validate(self.routine({
