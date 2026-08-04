@@ -1094,6 +1094,9 @@ and 3.12.
 
 ## Operational notes
 
+- [`RELEASE.md`](RELEASE.md) is the release procedure: local gate, PR, deploy,
+  verification, and rollback. Merging to `main` and pulling in the live
+  checkout is the deploy — each tick is a fresh process from this directory.
 - A failure on one message is caught, logged, and does not abort the run; the
   same is true for a failing routine.
 - `state/processed.json` is the dedupe ledger. Delete an entry to force a
