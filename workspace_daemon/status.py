@@ -335,6 +335,12 @@ def routine_rows(
             if entry.get("processed_at")
         ]
         memory_errors = sum(bool(entry.get("memory_error")) for entry in entries)
+        # Seen-but-judged-non-durable is a distinct outcome from "never
+        # fetched"; expose it here so the distinction does not require
+        # reading raw daemon logs.
+        skipped_not_worthy = sum(
+            entry.get("memory") == "skipped_not_worthy" for entry in entries
+        )
         expansion_fallbacks = sum(
             bool(entry.get("expand_fallback")) for entry in entries
         )
@@ -423,6 +429,11 @@ def routine_rows(
             "last_attempt": _age(last_epoch, now),
             "next": next_run,
             "last_capture": last_capture,
+            "skipped_not_worthy": (
+                "N/A"
+                if config.is_maintenance(routine)
+                else str(skipped_not_worthy)
+            ),
             "issues": ", ".join(issues) or "-",
         })
     return rows
@@ -530,13 +541,14 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     lines.append("")
     headers = (
         "ROUTINE", "ROLE", "SOURCES", "ARMED", "STATUS", "EVERY",
-        "LAST ATTEMPT", "NEXT", "LAST CAPTURE", "ISSUES",
+        "LAST ATTEMPT", "NEXT", "LAST CAPTURE", "NOT WORTHY", "ISSUES",
     )
     values = [
         (
             row["routine"], row["role"], row["sources"], row["armed"],
             row["status"], row["every"], row["last_attempt"],
-            row["next"], row["last_capture"], row["issues"],
+            row["next"], row["last_capture"], row["skipped_not_worthy"],
+            row["issues"],
         )
         for row in rows
     ]

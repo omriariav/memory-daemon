@@ -2178,6 +2178,39 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     return failed_source_keys
 
 
+def _attach_related_memories(routine, source, item):
+    """Give Chat items their conversation's recent durable memories as context.
+
+    Without this, a terse acknowledgement ("done") is judged in isolation and
+    discarded, losing the state transition of an already-captured request.
+    Enrichment only: any lookup failure leaves the item unchanged.
+    """
+    if source.get("kind") != "gchat":
+        return
+    cfg = memory_sink.memory_cfg(routine)
+    space = (item.get("frontmatter") or {}).get("gchat_space")
+    if not cfg or not space:
+        return
+    prefix = f"gchat:{space.split('/')[-1]}:"
+    try:
+        related = memory_sink.recent_entries_for_prefix(
+            cfg["store"], prefix, exclude_source_id=item.get("source_id"),
+        )
+    except Exception as exc:
+        log(
+            f"routine={routine['id']} WARN related-memory lookup failed "
+            f"for {space}: {exc}"
+        )
+        return
+    if related:
+        item.setdefault("frontmatter", {})["related_memory_entries"] = related
+        log(
+            f"routine={routine['id']} id={item['id']} attached "
+            f"{len(related)} related memory entr"
+            f"{'y' if len(related) == 1 else 'ies'} for {space}"
+        )
+
+
 def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
              prefetched_item=None, followup_predecessor_entry_id=None,
@@ -2276,6 +2309,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             f"event={calendar_match['event_id']}"
         )
 
+    _attach_related_memories(routine, source, item)
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
     summary, label = llm.split_label(content, label_catalog)

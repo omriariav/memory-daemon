@@ -39,6 +39,8 @@ MEMORY_TYPES = {
 }
 AUTO_TAG = "auto-captured"
 MAX_SOURCE_PEOPLE = 20
+RELATED_CONTEXT_DAYS = 14
+RELATED_CONTEXT_LIMIT = 8
 NO_OWNER_ACTION_MARKER = "FYI: no action assigned to the memory owner."
 EXTRACT_PROMPT = """You are filing a distilled work note into a structured personal memory store.
 
@@ -50,7 +52,10 @@ other text, with exactly these keys:
             request with a named or clearly identified owner and a specific
             deliverable is worthy as a todo while it remains unresolved; it
             need not already have been accepted or started. Preserve any stated
-            deadline, but do not require one.
+            deadline, but do not require one. A short acknowledgement
+            (e.g. "done", "approved", a positive reaction) that resolves or
+            confirms one of the related memory entries listed below is worthy
+            even though the text alone is terse.
   "owner_attention": boolean — true only when the memory owner explicitly owns
             or accepted an action, must make a decision, or is expected to
             follow up. A third party's deadline, commitment, or unresolved work
@@ -67,11 +72,17 @@ other text, with exactly these keys:
             below (leave out anyone not listed, and include only people
             materially involved in the memory)
   "tags": array of 1-4 short kebab-case topic tags
+  "follows": array of entry ids copied EXACTLY from the related memory entries
+          below that this note directly resolves, confirms, or updates —
+          usually empty; never invent an id. When the note records the
+          resolution or completion of a related entry, list it here and
+          prefer type "achievement" or "decision" over a standalone note.
   "body": the memory entry body in ENGLISH — concrete facts, names, numbers,
           dates, decisions, follow-ups. Compact but complete.
 
 Known memory person slugs: {slugs}
 Verified source identities: {verified_people}
+Related memory entries already captured from this conversation: {related_entries}
 
 --- NOTE ---
 Title: {title}
@@ -265,6 +276,66 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
         return None
     entry_id, materializations = next(iter(matches.items()))
     return entry_id if entry_id and all(materializations) else None
+
+
+def recent_entries_for_prefix(store, prefix, exclude_source_id=None,
+                              days=RELATED_CONTEXT_DAYS,
+                              limit=RELATED_CONTEXT_LIMIT):
+    """Recent default-graph entries whose source ids share a source prefix.
+
+    This is the conversation's durable history: with it in the prompt, a terse
+    acknowledgement ("done", a reaction) can be recognized and linked as the
+    resolution of an already-captured request instead of discarded as noise.
+    Only the default graph is scanned — every capture lands there, and shared
+    graphs must not leak extra context into prompts. Empty on any failure.
+    """
+    entries_root = Path(store) / "memory" / "entries"
+    cutoff = (
+        datetime.date.today() - datetime.timedelta(days=days)
+    ).isoformat()
+    found = {}
+    try:
+        paths = (
+            [path for path in entries_root.rglob("*.md") if path.is_file()]
+            if entries_root.is_dir() else []
+        )
+        for path in paths:
+            raw = path.read_text(encoding="utf-8")
+            if not raw.startswith("---"):
+                continue
+            parts = raw.split("---", 2)
+            if len(parts) != 3:
+                continue
+            frontmatter = yaml.safe_load(parts[1]) or {}
+            if not isinstance(frontmatter, dict):
+                continue
+            source_ids = frontmatter.get("source_ids") or []
+            if not isinstance(source_ids, list):
+                continue
+            if exclude_source_id and exclude_source_id in source_ids:
+                continue
+            if not any(
+                isinstance(value, str) and value.startswith(prefix)
+                for value in source_ids
+            ):
+                continue
+            entry_id = frontmatter.get("id")
+            date = str(frontmatter.get("date") or "")
+            if not isinstance(entry_id, str) or not entry_id or date < cutoff:
+                continue
+            found[entry_id] = {
+                "id": entry_id,
+                "type": str(frontmatter.get("type") or ""),
+                "date": date,
+                "title": str(frontmatter.get("title") or ""),
+            }
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        return []
+    ordered = sorted(
+        found.values(), key=lambda entry: (entry["date"], entry["id"]),
+        reverse=True,
+    )
+    return ordered[:limit]
 
 
 _slug_cache = {}
@@ -492,10 +563,21 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         f"{person['name']} -> {person['slug']}"
         for person in verified_people
     )
+    related = [
+        entry for entry in
+        (item.get("frontmatter") or {}).get("related_memory_entries") or []
+        if isinstance(entry, dict) and entry.get("id")
+    ]
+    related_catalog = "; ".join(
+        f"{entry['id']} ({entry.get('type', '')}, {entry.get('date', '')}: "
+        f"{entry.get('title', '')})"
+        for entry in related
+    )
     prompt = EXTRACT_PROMPT.format(
         slugs=", ".join(slugs) or "(none known yet)",
         verified_people=verified_catalog or "(none)",
         no_owner_action_marker=NO_OWNER_ACTION_MARKER,
+        related_entries=related_catalog or "(none)",
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
     )
     raw = llm.analyze(routine, prompt).strip()
@@ -504,7 +586,8 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
     if not isinstance(data, dict):
         raise ValueError("extraction did not return a JSON object")
     expected = {
-        "worthy", "owner_attention", "type", "title", "people", "tags", "body",
+        "worthy", "owner_attention", "type", "title", "people", "tags",
+        "follows", "body",
     }
     if set(data) != expected:
         missing = sorted(expected - set(data))
@@ -535,6 +618,11 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
             raise ValueError(f"{key} must be a list of kebab-case strings")
         if limit is not None and not 1 <= len(values) <= limit:
             raise ValueError(f"{key} must contain 1-{limit} values")
+    follows = data["follows"]
+    if not isinstance(follows, list) or any(
+        not isinstance(value, str) or not value.strip() for value in follows
+    ):
+        raise ValueError("follows must be a list of entry-id strings")
     return data
 
 
@@ -785,6 +873,31 @@ def capture(routine, item, summary, dry_run=False):
         # No canonical id -> the store's near-dup guard may interject; force-new
         # would risk duplicates, so let the guard win and report it.
         log(f"routine={rid} memory WARN: no source id derived; relying on near-dup guard")
+    if not active_chat_followup:
+        # Only ids that were offered as related context are linkable — a
+        # model-invented id must never reach the store. The store merges
+        # repeated links, so re-runs stay idempotent.
+        related_ids = {
+            related_entry.get("id")
+            for related_entry in meta.get("related_memory_entries") or []
+            if isinstance(related_entry, dict)
+        }
+        model_follows = list(dict.fromkeys(entry.get("follows") or []))
+        follows = [value for value in model_follows if value in related_ids]
+        dropped_follows = [
+            value for value in model_follows if value not in related_ids
+        ]
+        if dropped_follows:
+            log(
+                f"routine={rid} memory: dropped unoffered follows targets "
+                f"{dropped_follows}"
+            )
+        if follows:
+            args += ["--follows", ",".join(follows)]
+            log(
+                f"routine={rid} memory: linking resolution to "
+                f"{', '.join(follows)}"
+            )
     if active_chat_followup:
         # The underlying Chat fact may already exist in memory, but the user's
         # explicit follow-up intent is a separate actionable record. Its

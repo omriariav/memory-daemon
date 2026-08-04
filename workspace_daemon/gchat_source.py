@@ -22,7 +22,12 @@ inject an exact ``_since`` checkpoint for ``catch_up: true`` sources; this
 replaces the fixed discovery window without changing daily candidate identity.
 
 One `gws chat messages --after` call per space returns full message texts, so
-candidates are grouped client-side by thread. Fetch resolves the space name,
+candidates are grouped client-side by thread. Message lists are requested in
+raw API shape (``--raw``): the ergonomic transform drops emoji reaction
+summaries and quoted-message context, and both matter — a terse "done" reply
+is only legible next to the request it quotes, and a reaction is the only
+Chat-native acknowledgement signal. Raw messages are normalized back into the
+flattened snake_case shape this module consumes. Fetch resolves the space name,
 conversation type, and members once per space per process. `gws chat members`
 uses gws's persistent user cache for display names; this module adds a small
 in-process cache so several threads from one space do not repeat API calls.
@@ -49,10 +54,7 @@ from .time_utils import rfc3339_key
 # from the declared batching cutover rather than the ordinary live overlap.
 CATCH_UP_SCHEMA = 1
 MAX_CONTEXT_MEMBERS = 20
-# The ergonomic `gws chat messages` command treats zero as "return nothing".
-# A very large positive max makes it paginate exhaustively while preserving its
-# flattened, snake_case output shape.
-FULL_DAY_MAX_RESULTS = 9223372036854775807
+MAX_QUOTED_SNIPPET = 200
 _member_cache = {}
 _space_cache = {}
 
@@ -76,6 +78,70 @@ def _space_id(space):
 
 def _thread_id(message):
     return (message.get("thread") or message.get("name", "")).split("/")[-1]
+
+
+def _normalize_raw_message(message):
+    """Flatten a raw Chat API message into the shape this module consumes.
+
+    Already-flattened messages (``gws chat recent``, ledgered fixtures) pass
+    through unchanged. Beyond the ergonomic fields, raw mode contributes
+    ``reactions`` (emoji + count summaries) and ``quoted_message`` (the quoted
+    snippet a reply was anchored to).
+    """
+    if "createTime" not in message:
+        return message
+    sender = message.get("sender")
+    thread = message.get("thread")
+    space = message.get("space")
+    flat = {
+        "name": message.get("name"),
+        "create_time": message.get("createTime"),
+        "last_update_time": message.get("lastUpdateTime"),
+        "text": message.get("text"),
+        "sender": sender.get("name") if isinstance(sender, dict) else sender,
+        "sender_type": sender.get("type") if isinstance(sender, dict) else None,
+        "thread": thread.get("name") if isinstance(thread, dict) else thread,
+        "space": space.get("name") if isinstance(space, dict) else space,
+        "cards_v2": message.get("cardsV2"),
+    }
+    attachments = message.get("attachment") or message.get("attachments") or []
+    if isinstance(attachments, dict):
+        attachments = [attachments]
+    normalized_attachments = [
+        {
+            "content_name": attachment.get("contentName")
+            or attachment.get("content_name"),
+            "content_type": attachment.get("contentType")
+            or attachment.get("content_type"),
+        }
+        for attachment in attachments
+        if isinstance(attachment, dict)
+    ]
+    if normalized_attachments:
+        flat["attachments"] = normalized_attachments
+    reactions = []
+    for summary in message.get("emojiReactionSummaries") or []:
+        if not isinstance(summary, dict):
+            continue
+        emoji = summary.get("emoji") or {}
+        label = (
+            emoji.get("unicode")
+            or (emoji.get("customEmoji") or {}).get("name")
+            or "custom emoji"
+        )
+        reactions.append({
+            "emoji": label,
+            "count": summary.get("reactionCount", 1),
+        })
+    if reactions:
+        flat["reactions"] = reactions
+    quoted = (
+        (message.get("quotedMessageMetadata") or {})
+        .get("quotedMessageSnapshot") or {}
+    ).get("text")
+    if quoted:
+        flat["quoted_message"] = {"text": quoted}
+    return {key: value for key, value in flat.items() if value is not None}
 
 
 def _message_content(message):
@@ -107,6 +173,36 @@ def _message_content(message):
     return redact_secrets("\n".join(parts))
 
 
+def _rendered_reactions(message):
+    """Human-readable reaction summary, or empty string."""
+    parts = []
+    for reaction in message.get("reactions") or []:
+        emoji = reaction.get("emoji") or "?"
+        count = reaction.get("count") or 1
+        parts.append(f"{emoji} x{count}" if count > 1 else str(emoji))
+    return ", ".join(parts)
+
+
+def _rendered_text(message):
+    """Message content plus quoted-reply context and reaction annotations.
+
+    A reaction does not advance the message's update time, so it must also be
+    part of the version payload below — otherwise a heart on yesterday's
+    "done" would never reprocess the digest.
+    """
+    text = _message_content(message)
+    quoted = (message.get("quoted_message") or {}).get("text") or ""
+    if quoted:
+        snippet = redact_secrets(quoted).replace("\n", " ")[:MAX_QUOTED_SNIPPET]
+        prefix = f'[in reply to: "{snippet}"]'
+        text = f"{prefix}\n{text}" if text else prefix
+    reactions = _rendered_reactions(message)
+    if reactions:
+        suffix = f"[reactions: {reactions}]"
+        text = f"{text}\n{suffix}" if text else suffix
+    return text
+
+
 def _message_version(message):
     return message.get("last_update_time") or message.get("create_time") or ""
 
@@ -120,6 +216,8 @@ def _batch_version(messages):
             "updated": message.get("last_update_time"),
             "sender": message.get("sender"),
             "content": _message_content(message),
+            "reactions": message.get("reactions") or [],
+            "quoted": (message.get("quoted_message") or {}).get("text") or "",
         }
         for message in messages
     ]
@@ -176,14 +274,11 @@ def _full_daily_batches(discovered, cutoff=None):
         )
         after = start.isoformat(timespec="microseconds").replace("+00:00", "Z")
         data = _gws(
-            [
-                "chat", "messages", space,
-                "--after", after,
-                "--max", str(FULL_DAY_MAX_RESULTS),
-            ],
+            ["chat", "messages", space, "--after", after, "--raw", "--all"],
             timeout=300,
         )
         for message in data.get("messages") or []:
+            message = _normalize_raw_message(message)
             timestamp = message.get("create_time") or ""
             day = timestamp[:10]
             key = (space, day)
@@ -242,18 +337,20 @@ def _windowed_messages(source):
         return
 
     configured_max = int(source.get("max_results", 50))
-    per_space = (
-        FULL_DAY_MAX_RESULTS if configured_max == 0 else configured_max
+    # In raw mode zero means "no cap": --all paginates exhaustively, while a
+    # positive max is a single bounded page, matching the old cap semantics.
+    limit_args = (
+        ["--all"] if configured_max == 0 else ["--max", str(configured_max)]
     )
     after = source.get("_since") or _after_iso(source.get("hours", 26))
     for space in source.get("spaces", []):
         if space in excluded_spaces:
             continue
         data = _gws(
-            ["chat", "messages", space, "--after", after, "--max", str(per_space)]
+            ["chat", "messages", space, "--after", after, "--raw", *limit_args]
         )
         for message in data.get("messages") or []:
-            yield space, message
+            yield space, _normalize_raw_message(message)
 
 
 def candidates(source):
@@ -435,7 +532,7 @@ def fetch(routine, candidate):
         timestamped_line(
             m.get("create_time"),
             names.get(m.get("sender"), m.get("sender", "?")),
-            _message_content(m),
+            _rendered_text(m),
         )
         for m in msgs
         if _message_content(m)
@@ -460,6 +557,11 @@ def fetch(routine, candidate):
             "gchat_participants": sorted({names.get(m.get("sender"), m.get("sender", "?"))
                                           for m in msgs}),
             "source_people": source_people,
+            "reaction_count": sum(
+                reaction.get("count") or 1
+                for m in msgs
+                for reaction in m.get("reactions") or []
+            ),
             "message_count": len(msgs),
             "first_message_at": msgs[0].get("create_time", ""),
             "latest_message_at": msgs[-1].get("create_time", ""),

@@ -44,6 +44,12 @@ def source_header_lines(item):
             lines.append(f"Participants in supplied messages: {', '.join(participants)}")
         if meta.get("message_count") is not None:
             lines.append(f"Messages in supplied window: {meta['message_count']}")
+        if meta.get("reaction_count"):
+            lines.append(
+                f"Emoji reactions on supplied messages: {meta['reaction_count']} "
+                "(annotated inline; a reaction is Chat's acknowledgement/"
+                "feedback signal on the message it decorates)"
+            )
         if meta.get("first_message_at"):
             lines.append(f"First supplied message: {meta['first_message_at']}")
         if meta.get("latest_message_at"):
@@ -107,6 +113,27 @@ def source_header_lines(item):
                 "Coverage warning: older thread messages were omitted by the "
                 "configured safety limit."
             )
+    related = meta.get("related_memory_entries") or []
+    if related:
+        lines.append(
+            "Durable memories already captured from this conversation:"
+        )
+        for entry in related:
+            lines.append(
+                f"- {entry.get('id')} ({entry.get('type')}, "
+                f"{entry.get('date')}): {entry.get('title')}"
+            )
+        lines.append(
+            'A terse acknowledgement in this source (e.g. "done", '
+            '"approved", "looks good", or an emoji reaction) that resolves '
+            "or confirms one of these captured items IS durable: summarize "
+            "it as the resolution or state change of that item, naming the "
+            "item, instead of dismissing the message as non-durable. "
+            "Reactions are aggregate counts without reactor identity — "
+            "treat a reaction alone as a weaker signal than an explicit "
+            "reply, and never attribute a reaction to a specific person."
+        )
+
     if item.get("source_kind") == "mila" or meta.get("mila_recording_id"):
         lines.append("Source: Mila transcription")
         if meta.get("mila_recording_start"):
