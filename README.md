@@ -168,6 +168,25 @@ to the single medium routine. See
 [`_example-medium-handlers.yaml`](routines/_example-medium-handlers.yaml) for a
 complete meeting-note plus recurring-report example.
 
+### Slack ownership gate for actionable captures
+
+A model judging a Slack conversation can mistake topical relevance for
+ownership and file another team's discussion as the memory owner's task. Every
+fetched Slack item therefore carries deterministic `slack_owner_evidence` in
+its frontmatter: `mentioned` (an `<@…>` mention of the authenticated user),
+`authored` (a message the user wrote), `direct-message` (an IM conversation),
+and/or `channel-rule` (the channel is listed in the source's
+`owner_action_channels`). The memory sink refuses to store a Slack-derived
+`todo` or `pending-decision` when that list is empty — regardless of what the
+extraction model claimed — and stores a `note` tagged `no-owner-action`
+instead, preserving any named owners. Because Google Tasks sync only exports
+open `todo` entries, unassigned Slack activity never reaches the task list,
+and briefing flows must treat `no-owner-action` entries as FYI rather than
+"waiting on me". The authenticated Slack identity comes from `auth-test` once
+per run; if it cannot be resolved, mention/authored evidence is unavailable
+and only the structural signals (direct message, channel rule) can qualify an
+item.
+
 ## Requirements
 
 | | |

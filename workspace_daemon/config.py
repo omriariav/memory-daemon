@@ -53,6 +53,7 @@ SOURCE_KEYS = {
     "self_forwarded_chat_followups", "catch_up", "catch_up_overlap",
     "catch_up_after", "channels", "ada_channels", "direct_channels",
     "private_channels", "include_mentions", "ada_days", "active_conversations",
+    "owner_action_channels",
     "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
     "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
     "session_gap_minutes",
@@ -1201,6 +1202,19 @@ def _validate_source(routine, source, prefix):
                 problems.append(f"{prefix}.{key} entries must be channel ID strings")
                 continue
             configured.extend((key, value) for value in values)
+        owner_channels = source.get("owner_action_channels")
+        if owner_channels is not None:
+            if not isinstance(owner_channels, list) or not owner_channels:
+                problems.append(
+                    f"{prefix}.owner_action_channels must be a non-empty list"
+                )
+            elif not all(
+                isinstance(value, str) and value for value in owner_channels
+            ):
+                problems.append(
+                    f"{prefix}.owner_action_channels entries must be "
+                    "channel ID strings"
+                )
         active_conversations = source.get("active_conversations")
         if active_conversations is not None:
             if not isinstance(active_conversations, dict):

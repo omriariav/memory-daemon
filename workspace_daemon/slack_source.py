@@ -13,6 +13,8 @@ Routine config:
       channels:                 # legacy per-thread mode
         - C0789LEGACY
       include_mentions: true
+      owner_action_channels:    # channels whose action items belong to the user
+        - C0123ABCD
       hours: 26
       ada_days: 2               # Ada accepts whole days, 1..90
       max_results: 1000         # direct-message cap per channel
@@ -21,6 +23,14 @@ Ada returns a curated public-channel payload. Direct and legacy private channels
 are read with the user token and grouped into one candidate per UTC day, so a
 conversation made of unthreaded sentences reaches Yoetz as one coherent input.
 Mentions outside configured channels remain canonical thread candidates.
+
+Every fetched item carries `slack_owner_evidence` in its frontmatter: the
+deterministic reasons this conversation can assign an action to the memory
+owner (an @mention of the owner, a message the owner wrote, a direct message
+conversation, or an `owner_action_channels` rule). The memory sink refuses to
+store a Slack-derived `todo`/`pending-decision` when the list is empty, so a
+discussion between other people can never become the owner's task on topical
+relevance alone.
 """
 import datetime
 import hashlib
@@ -835,6 +845,58 @@ def candidates(source):
     return out
 
 
+# auth-test resolves once per run; a failure is remembered so a broken token
+# does not retry per item. Without a self id, owner evidence degrades to
+# direct-message and channel-rule signals only.
+_self_user_cache = {}
+
+
+def _self_user_id():
+    """The authenticated Slack user id, or '' when it cannot be resolved."""
+    if "id" not in _self_user_cache:
+        try:
+            _self_user_cache["id"] = _cli(["auth-test"]).get("user_id") or ""
+        except Exception as exc:
+            log(
+                f"slack auth-test failed ({exc}); owner evidence limited to "
+                "direct-message and channel-rule signals"
+            )
+            _self_user_cache["id"] = ""
+    return _self_user_cache["id"]
+
+
+def _mentions_self(text, self_id):
+    return f"<@{self_id}>" in text or f"<@{self_id}|" in text
+
+
+def _owner_evidence(source, channel, messages=(), texts=()):
+    """Deterministic reasons this item may assign an action to the owner.
+
+    Topical relevance is deliberately not a reason: without one of these
+    positive signals the memory sink downgrades a model-classified todo or
+    pending-decision to a note, so other people's discussions never become
+    the owner's tasks (or reach Google Tasks and daily briefs). Usergroup
+    mentions (<!subteam^...>) are also deliberately not evidence — membership
+    in a pinged group is not a personal assignment. Group DMs carry no
+    direct-message signal either (their G prefix is shared with legacy
+    private channels); an action there qualifies via mention or authorship.
+    """
+    reasons = []
+    if channel in ((source or {}).get("owner_action_channels") or []):
+        reasons.append("channel-rule")
+    if channel.startswith("D"):
+        reasons.append("direct-message")
+    self_id = _self_user_id()
+    if self_id:
+        if any(message.get("user") == self_id for message in messages):
+            reasons.append("authored")
+        scan = [message.get("text") or "" for message in messages]
+        scan.extend(texts)
+        if any(_mentions_self(text, self_id) for text in scan):
+            reasons.append("mentioned")
+    return reasons
+
+
 def _resolve_people(messages):
     user_ids = sorted({
         message["user"]
@@ -867,7 +929,7 @@ def _resolve_people(messages):
     return names, user_ids, source_people
 
 
-def _fetch_ada_digest(candidate):
+def _fetch_ada_digest(candidate, source=None):
     raw = candidate["raw"]
     summary = raw["summary"]
     rows = []
@@ -937,11 +999,17 @@ def _fetch_ada_digest(candidate):
             ),
             "first_message_at": slack_timestamp_iso(first),
             "latest_message_at": slack_timestamp_iso(latest),
+            # Ada rows carry display names, not author ids, so authored
+            # evidence is not detectable in this mode — only mention markup
+            # inside the curated texts and explicit channel rules are.
+            "slack_owner_evidence": _owner_evidence(
+                source, raw["channel"], texts=[row[2] for row in rows],
+            ),
         },
     }
 
 
-def _fetch_direct_digest(candidate):
+def _fetch_direct_digest(candidate, source=None):
     raw = candidate["raw"]
     channel = raw["channel"]
     messages = list(raw["messages"]) if raw.get("messages_expanded") else []
@@ -988,17 +1056,18 @@ def _fetch_direct_digest(candidate):
             "latest_message_at": slack_timestamp_iso(messages[-1].get("ts")),
             "digest_day": raw["digest_day"],
             "via_mention": False,
+            "slack_owner_evidence": _owner_evidence(source, channel, messages),
         },
     }
 
 
-def fetch(routine, candidate):
+def fetch(routine, candidate, source=None):
     """Render an Ada digest, a private daily digest, or a legacy thread."""
     mode = candidate.get("raw", {}).get("mode")
     if mode == "ada_digest":
-        return _fetch_ada_digest(candidate)
+        return _fetch_ada_digest(candidate, source)
     if mode in {"direct_digest", "catch_up_digest"}:
-        return _fetch_direct_digest(candidate)
+        return _fetch_direct_digest(candidate, source)
 
     channel = candidate["raw"]["channel"]
     anchor = candidate["raw"]["anchor"]
@@ -1044,5 +1113,6 @@ def fetch(routine, candidate):
             "via_mention": bool(candidate["raw"].get("via_mention")),
             "first_message_at": slack_timestamp_iso(first_ts),
             "latest_message_at": slack_timestamp_iso(latest_ts),
+            "slack_owner_evidence": _owner_evidence(source, channel, messages),
         },
     }

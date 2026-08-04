@@ -1175,7 +1175,8 @@ SOURCES = {
     "gmail": (_gmail_candidates, _gmail_fetch),
     "drive_docs": (_drive_candidates, _drive_fetch),
     "slack": (slack_source.candidates,
-              lambda routine, source, candidate: slack_source.fetch(routine, candidate)),
+              lambda routine, source, candidate: slack_source.fetch(
+                  routine, candidate, source)),
     "gchat": (gchat_source.candidates,
               lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
     "mila": (mila_source.candidates, mila_source.fetch),

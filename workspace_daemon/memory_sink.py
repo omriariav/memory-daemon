@@ -38,6 +38,10 @@ MEMORY_TYPES = {
     "incident", "achievement", "feedback", "meeting", "note", "summary",
 }
 AUTO_TAG = "auto-captured"
+# Marks a capture that a model classified as the owner's action but that was
+# downgraded to a note for lack of ownership evidence. Briefing and triage
+# flows must treat entries carrying it as FYI, never as "waiting on me".
+NO_OWNER_ACTION_TAG = "no-owner-action"
 MAX_SOURCE_PEOPLE = 20
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -793,6 +797,7 @@ def capture(routine, item, summary, dry_run=False):
     owner_attention_denied = has_no_owner_marker or (
         extraction_succeeded and entry.get("owner_attention") is not True
     )
+    downgraded_no_owner = False
     if etype in {"todo", "pending-decision"} and owner_attention_denied:
         reason = (
             "the source contains the standalone no-owner-action marker"
@@ -803,6 +808,26 @@ def capture(routine, item, summary, dry_run=False):
             f"routine={rid} memory: downgraded {etype} to note because {reason}"
         )
         etype = "note"
+        downgraded_no_owner = True
+    # Slack items carry deterministic ownership evidence computed from the
+    # source itself (self mention, own message, direct conversation, or an
+    # owner-action channel rule). A model's owner_attention judgment alone
+    # cannot mint the owner a task from other people's discussion — topical
+    # relevance is not ownership.
+    if etype in {"todo", "pending-decision"} and "slack_owner_evidence" in meta:
+        evidence = [
+            value for value in (meta.get("slack_owner_evidence") or [])
+            if isinstance(value, str) and value
+        ]
+        if not evidence:
+            log(
+                f"routine={rid} memory: downgraded {etype} to note because "
+                "the Slack source carries no ownership evidence (no mention "
+                "of the owner, no owner message, not a direct conversation, "
+                "no owner-action channel rule)"
+            )
+            etype = "note"
+            downgraded_no_owner = True
     if active_chat_followup and etype != "todo":
         log(
             f"routine={rid} memory: classified active self-forwarded Chat "
@@ -828,6 +853,8 @@ def capture(routine, item, summary, dry_run=False):
         tags.append("gmail-followup")
     if operator_confirmed:
         tags.append("operator-confirmed")
+    if downgraded_no_owner:
+        tags.append(NO_OWNER_ACTION_TAG)
     tags.append(AUTO_TAG)
     if (
         dropped or unresolved_source or unresolved_owners
