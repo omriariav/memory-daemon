@@ -63,7 +63,7 @@ class SlugCatalogTest(unittest.TestCase):
         }]
         response = (
             '{"worthy":true,"owner_attention":false,"type":"note","title":"T",'
-            '"people":["new-person"],"tags":["context"],"body":"b"}'
+            '"people":["new-person"],"tags":["context"],"follows":[],"body":"b"}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -84,7 +84,7 @@ class SlugCatalogTest(unittest.TestCase):
         response = (
             '{"worthy":true,"owner_attention":true,"type":"todo",'
             '"title":"Review roadmap","people":[],"tags":["roadmap"],'
-            '"body":"Review the roadmap."}'
+            '"follows":[],"body":"Review the roadmap."}'
         )
         routine = {
             "analyze": {"provider": "gemini", "model": "m"},
@@ -360,6 +360,28 @@ class CaptureValidationTest(unittest.TestCase):
         tags = calls["args"][calls["args"].index("--tags") + 1]
         self.assertIn("people-unmapped", tags)
         self.assertIn(memory_sink.AUTO_TAG, tags)
+        self.assertEqual(out["memory"], "created")
+
+    def test_follows_restricted_to_offered_related_entries(self):
+        self.item["frontmatter"]["related_memory_entries"] = [
+            {"id": "2026-08-03-provide-bullets", "type": "todo",
+             "date": "2026-08-03", "title": "Provide bullets"},
+        ]
+        out, calls = self._run_capture(
+            {"worthy": True, "type": "achievement", "title": "T",
+             "people": [], "tags": ["x"],
+             "follows": ["2026-08-03-provide-bullets", "invented-entry"],
+             "body": "b"})
+        idx = calls["args"].index("--follows")
+        self.assertEqual(calls["args"][idx + 1], "2026-08-03-provide-bullets")
+        self.assertEqual(out["memory"], "created")
+
+    def test_follows_dropped_entirely_without_related_context(self):
+        out, calls = self._run_capture(
+            {"worthy": True, "type": "note", "title": "T",
+             "people": [], "tags": ["x"],
+             "follows": ["invented-entry"], "body": "b"})
+        self.assertNotIn("--follows", calls["args"])
         self.assertEqual(out["memory"], "created")
 
     def test_invalid_type_falls_back_to_config(self):

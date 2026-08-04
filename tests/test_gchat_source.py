@@ -107,7 +107,7 @@ class CandidatesTest(unittest.TestCase):
             1,
         )
 
-    def test_zero_max_explicit_space_uses_exhaustive_positive_limit(self):
+    def test_zero_max_explicit_space_paginates_exhaustively(self):
         with mock.patch.object(
             gchat_source, "_gws", return_value={"messages": []}
         ) as gws:
@@ -120,7 +120,23 @@ class CandidatesTest(unittest.TestCase):
         gws.assert_called_once_with([
             "chat", "messages", "spaces/AAA",
             "--after", mock.ANY,
-            "--max", str(gchat_source.FULL_DAY_MAX_RESULTS),
+            "--raw", "--all",
+        ])
+
+    def test_positive_max_explicit_space_caps_a_single_raw_page(self):
+        with mock.patch.object(
+            gchat_source, "_gws", return_value={"messages": []}
+        ) as gws:
+            gchat_source.candidates({
+                "spaces": ["spaces/AAA"],
+                "hours": 26,
+                "max_results": 50,
+            })
+
+        gws.assert_called_once_with([
+            "chat", "messages", "spaces/AAA",
+            "--after", mock.ANY,
+            "--raw", "--max", "50",
         ])
 
     def test_daily_batches_unthreaded_messages_but_keeps_real_threads(self):
@@ -183,7 +199,7 @@ class CandidatesTest(unittest.TestCase):
             mock.call([
                 "chat", "messages", "spaces/AAA",
                 "--after", "2026-07-26T23:59:59.999999Z",
-                "--max", str(gchat_source.FULL_DAY_MAX_RESULTS),
+                "--raw", "--all",
             ], timeout=300),
         )
 
@@ -371,6 +387,125 @@ class CandidatesTest(unittest.TestCase):
             "considered_space_ids=['spaces/BBB']",
             coverage,
         )
+
+
+def raw_msg(thread, ts, text, sender="users/1", **extra):
+    return {
+        "name": f"spaces/AAA/messages/{thread}.x",
+        "createTime": ts,
+        "text": text,
+        "sender": {"name": sender, "type": "HUMAN"},
+        "thread": {"name": f"spaces/AAA/threads/{thread}"},
+        "space": {"name": "spaces/AAA"},
+        **extra,
+    }
+
+
+class RawNormalizationTest(unittest.TestCase):
+    def setUp(self):
+        gchat_source._member_cache.clear()
+        gchat_source._space_cache.clear()
+
+    def test_raw_message_flattens_to_module_shape(self):
+        flat = gchat_source._normalize_raw_message(raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "done",
+            lastUpdateTime="2026-08-04T07:31:00Z",
+        ))
+        self.assertEqual(flat["create_time"], "2026-08-04T07:30:00Z")
+        self.assertEqual(flat["last_update_time"], "2026-08-04T07:31:00Z")
+        self.assertEqual(flat["sender"], "users/1")
+        self.assertEqual(flat["thread"], "spaces/AAA/threads/t1")
+        self.assertEqual(flat["space"], "spaces/AAA")
+
+    def test_flattened_message_passes_through(self):
+        message = msg("t1", "2026-08-04T07:30:00Z", "hello")
+        self.assertIs(gchat_source._normalize_raw_message(message), message)
+
+    def test_reactions_and_quoted_context_are_normalized(self):
+        flat = gchat_source._normalize_raw_message(raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "done",
+            emojiReactionSummaries=[
+                {"emoji": {"unicode": "♥️"}, "reactionCount": 1},
+            ],
+            quotedMessageMetadata={
+                "quotedMessageSnapshot": {
+                    "text": "can you add some bullets to this slide?",
+                },
+            },
+        ))
+        self.assertEqual(flat["reactions"], [{"emoji": "♥️", "count": 1}])
+        self.assertEqual(
+            flat["quoted_message"],
+            {"text": "can you add some bullets to this slide?"},
+        )
+
+    def test_raw_attachment_metadata_survives_normalization(self):
+        flat = gchat_source._normalize_raw_message(raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "",
+            attachment=[{
+                "contentName": "roadmap.pdf",
+                "contentType": "application/pdf",
+                "downloadUri": "https://secret.example/file",
+            }],
+        ))
+        content = gchat_source._message_content(flat)
+        self.assertIn("roadmap.pdf (application/pdf)", content)
+        self.assertNotIn("secret.example", content)
+
+    def test_single_dict_attachment_is_normalized_like_a_list(self):
+        flat = gchat_source._normalize_raw_message(raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "",
+            attachment={
+                "contentName": "notes.txt",
+                "contentType": "text/plain",
+            },
+        ))
+        self.assertIn(
+            "notes.txt (text/plain)", gchat_source._message_content(flat)
+        )
+
+    def test_new_reaction_changes_candidate_version(self):
+        plain = {"messages": [raw_msg("t1", "2026-08-04T07:30:00Z", "done")]}
+        hearted = {"messages": [raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "done",
+            emojiReactionSummaries=[
+                {"emoji": {"unicode": "♥️"}, "reactionCount": 1},
+            ],
+        )]}
+        source = {"spaces": ["spaces/AAA"], "batch_messages": "daily"}
+        with mock.patch.object(gchat_source, "_gws",
+                               side_effect=[plain, plain, hearted, hearted]):
+            before = gchat_source.candidates(source)[0]
+            after = gchat_source.candidates(source)[0]
+        self.assertEqual(
+            before["raw"]["source_id"], after["raw"]["source_id"]
+        )
+        self.assertNotEqual(before["id"], after["id"])
+
+    def test_fetch_renders_reactions_and_quoted_context(self):
+        messages = {"messages": [raw_msg(
+            "t1", "2026-08-04T07:30:00Z", "done",
+            emojiReactionSummaries=[
+                {"emoji": {"unicode": "♥️"}, "reactionCount": 2},
+            ],
+            quotedMessageMetadata={
+                "quotedMessageSnapshot": {
+                    "text": "can you add some bullets to this slide?",
+                },
+            },
+        )]}
+        with mock.patch.object(gchat_source, "_gws", return_value=messages):
+            candidate = gchat_source.candidates({"spaces": ["spaces/AAA"]})[0]
+        with mock.patch.object(gchat_source, "_member_context", return_value={
+            "names": {}, "members": [], "people": {},
+        }), mock.patch.object(gchat_source, "_space_context", return_value={}):
+            item = gchat_source.fetch({}, candidate)
+        self.assertIn(
+            '[in reply to: "can you add some bullets to this slide?"]',
+            item["body"],
+        )
+        self.assertIn("[reactions: ♥️ x2]", item["body"])
+        self.assertEqual(item["frontmatter"]["reaction_count"], 2)
 
 
 class ConfigTest(unittest.TestCase):
