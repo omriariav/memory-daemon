@@ -1,11 +1,12 @@
-# Example: Gemini meeting notes, using the inbox as a work queue.
+# Example: Gemini meeting notes with cursor-safe Gmail discovery.
 #
 # Two ideas worth stealing for your own routines:
 #
-# 1. THE INBOX IS THE QUEUE. Scoping on `in:inbox` means only meetings you have
-#    not dealt with get processed, and the `archive` action is what marks one
-#    done. A Drive-wide search instead reaches back through all history — the
-#    first draft of this routine matched 49 docs going back 16 months.
+# 1. THE CURSOR IS THE BOUNDARY. Searching matching incoming mail in All Mail
+#    means manually archiving a notification before the next tick cannot hide
+#    it. `catch_up_after` prevents the first run from reaching through all
+#    history — the first draft of this routine matched 49 docs going back 16
+#    months — and the processed ledger prevents duplicate summaries.
 #
 # 2. THE EMAIL IS A STUB. The notification carries only Gemini's "Quick notes"
 #    tab (~2k chars) and its link to the real document exists solely in the HTML
@@ -15,12 +16,16 @@
 # Copy without the leading underscore to activate.
 id: meeting-notes
 enabled: true
-description: Scoop Gemini meeting notes (all doc tabs) for anything sitting in the inbox.
+description: Scoop new Gemini meeting notes from Gmail and expand all document tabs.
 
 source:
   kind: gmail
-  query: 'from:gemini-notes@google.com in:inbox'
-  max_results: 20
+  query: 'from:gemini-notes@google.com -in:sent -in:drafts'
+  max_results: 0
+  catch_up: true
+  catch_up_overlap: 1h
+  # Replace with the earliest timestamp this routine should cover.
+  catch_up_after: "2026-08-01T00:00:00Z"
   expand:
     kind: drive_doc
     title_from_subject: "Notes: '(?P<title>.+)'"

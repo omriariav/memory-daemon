@@ -13,12 +13,18 @@ description: Regional, channel and BU business reports — product signals only.
 source:
   kind: gmail
   query: >-
-    in:inbox (
+    -in:sent -in:drafts (
       subject:"Weekly Report DACH TEAM"
       OR subject:"Channel Business weekly report"
       OR subject:"Exec Bi Weekly Report"
     )
-  max_results: 20
+  # Catch-up scans matching messages in All Mail, so manually archiving a new
+  # report before the next tick cannot hide it from this specialized handler.
+  max_results: 0
+  catch_up: true
+  catch_up_overlap: 1h
+  # Replace with the earliest timestamp this routine should cover.
+  catch_up_after: "2026-08-01T00:00:00Z"
 
 streams:
   "Weekly Report DACH TEAM":
