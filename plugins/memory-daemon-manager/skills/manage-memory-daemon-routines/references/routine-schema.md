@@ -39,6 +39,18 @@ daemon's `state/transcriptions/`, never inside Mila's directory. Inconclusive
 matches retry on the routine cadence and a later success resolves older failed
 versions by stable recording source id.
 
+For `source.kind: whisper`, point `transcriptions_dir` at the
+speech-to-text-tools output directory (read-only). Enumeration is
+pattern-scoped to the pipeline's frozen base names
+(`{queue-stamp}-{name}[-{hash}]-{he|en}[-diarized].txt`), so unrelated files
+in a shared directory are ignored. Sibling language/diarized variants collapse
+into one candidate (Hebrew diarized preferred). Google Meet recordings embed
+the meeting's own local start time in the name; that instant — never the
+transcription time — anchors Calendar matching. `min_quiet_seconds` delays
+ingestion until a variant group stops changing; `exclude_base_names`
+baselines specific outputs. The Calendar gate, receipts, and retry semantics
+are identical to `mila`.
+
 An `all_spaces: true` Google Chat fallback automatically excludes explicit
 spaces configured by domain routines, including disabled routines. For frequent
 fallback sweeps, `batch_messages: daily` gives all messages and replies in one

@@ -1,0 +1,58 @@
+# Read-only ingestion of local Whisper pipeline transcripts (Google Meet
+# recordings fetched from Drive plus manual Downloads drops). Enumeration is
+# pattern-scoped to the pipeline's frozen base names, so a directory shared
+# with other applications' files stays safe; the daemon never moves or edits
+# pipeline outputs.
+id: whisper-transcriptions
+enabled: false
+description: Match finished Whisper transcripts to Calendar and retain durable meeting memory.
+role: specialized
+
+schedule:
+  every: 1h
+
+source:
+  kind: whisper
+  # The speech-to-text pipeline's OUTPUT_DIR. Only files shaped like
+  # {queue-stamp}-{name}[-{hash}]-{he|en}[-diarized].txt are enumerated.
+  # Sibling language/diarized variants collapse into one candidate (Hebrew
+  # diarized preferred); a later better variant reprocesses as a correction
+  # of the same memory. Google Meet recordings embed the meeting's own local
+  # start time in the name — that instant, never the transcription time,
+  # anchors Calendar matching.
+  transcriptions_dir: /absolute/path/to/whisper-output
+  max_results: 0
+
+  # A variant group is ingested only after this many seconds without writes,
+  # so an hourly scan never races the transcription worker.
+  min_quiet_seconds: 300
+
+  # Baseline specific already-handled outputs when enabling the routine
+  # against an established archive.
+  exclude_base_names:
+    - 2026-01-01-10-00-00-already-handled-meeting-abc123
+
+  calendar_timezone: Europe/London
+  calendar_window_days: 3
+  calendar_match_hours: 6
+  max_calendar_candidates: 8
+  calendar_max_results: 250
+  match_max_output_tokens: 2048
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  instruction: >-
+    The source is a meeting transcript and may not be in English. Write the
+    memory in English. Preserve only durable decisions, commitments, action
+    items, deadlines, blockers, material findings, and people/project facts.
+    Attribute an owner or deadline only when stated. Use Calendar metadata only
+    to identify the meeting and its participants; never infer discussion
+    content from the invitation. Ignore small talk and transcription noise.
+    Return exactly NOT MEMORY-WORTHY when nothing durable was discussed.
+
+memory:
+  store: /absolute/path/to/private-memory
+  type: note
+  tags: [meeting, transcription, whisper]

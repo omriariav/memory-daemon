@@ -19,20 +19,23 @@ import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import state
+from . import transcripts
 from .chat_text import redact_secrets
-from .shell import gws_bin, log, run_json, utc_now_iso, yoetz_bin
+from .shell import gws_bin, run_json, yoetz_bin
 
 
 _CAPTURE_STAMP = re.compile(
     r"(?P<stamp>20\d{2}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)"
 )
-_SAFE_RECEIPT = re.compile(r"[^A-Za-z0-9._-]+")
 _SRT_TIMING = re.compile(
     r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+"
     r"\d{2}:\d{2}:\d{2}[,.]\d{3}"
 )
-_MATCH_CONFIDENCE = {"high", "medium", "low"}
+
+_parse_instant = transcripts.parse_instant
+_event_instant = transcripts.event_instant
+_title_tokens = transcripts.title_tokens
+_extract_json = transcripts.extract_json
 
 
 def _read_json(path):
@@ -60,19 +63,6 @@ def _record_by_id(path, recording_id):
             f"{recording_id}"
         )
     return matches[0]
-
-
-def _parse_instant(value):
-    raw = str(value or "")
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        parsed = datetime.datetime.fromisoformat(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"invalid Mila timestamp {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
 
 
 def _recording_interval(record):
@@ -289,12 +279,6 @@ def candidates(source):
     return ordered[:limit] if limit else ordered
 
 
-def _event_instant(value):
-    if not value or len(str(value)) == 10:
-        return None
-    return _parse_instant(value)
-
-
 def _raw_calendar_events(source, recording_start):
     timezone = source.get("calendar_timezone", "UTC")
     zone = ZoneInfo(timezone)
@@ -310,14 +294,6 @@ def _raw_calendar_events(source, recording_start):
         "--format", "json",
     ], timeout=120)
     return result.get("events") or []
-
-
-def _title_tokens(value):
-    return {
-        token
-        for token in re.findall(r"[A-Za-z0-9\u0590-\u05ff]+", str(value).casefold())
-        if len(token) > 1
-    }
 
 
 def _calendar_candidates(source, record, recording_start, recording_end):
@@ -411,18 +387,6 @@ def fetch(_routine, source, candidate):
     }
 
 
-def _extract_json(raw):
-    text = str(raw or "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"calendar matcher returned invalid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError("calendar matcher must return one JSON object")
-    return value
-
-
 def _match_prompt(item, events):
     metadata = {
         "recording_title": item.get("title"),
@@ -430,21 +394,7 @@ def _match_prompt(item, events):
         "recording_end": item["frontmatter"]["mila_recording_end"],
         "duration_seconds": item["frontmatter"]["mila_duration_seconds"],
     }
-    return (
-        "Match this recording to exactly one supplied Google Calendar event. "
-        "Use time overlap, duration, title, attendees, and the transcript excerpt. "
-        "Do not invent an event and do not choose merely because an event is nearby. "
-        "If the evidence is ambiguous, return matched=false. Confidence may be "
-        "high, medium, or low; high means the identity is unambiguous enough for "
-        "unattended memory capture.\n\n"
-        "Return only JSON with this exact shape:\n"
-        '{"matched":true|false,"event_id":"id or null",'
-        '"confidence":"high|medium|low","reason":"short explanation"}\n\n'
-        f"Recording metadata:\n{json.dumps(metadata, ensure_ascii=False)}\n\n"
-        f"Calendar candidates:\n{json.dumps(events, ensure_ascii=False)}\n\n"
-        "Transcript excerpt:\n"
-        f"{item['body'][:5000]}"
-    )
+    return transcripts.match_prompt(metadata, events, item["body"][:5000])
 
 
 def match_calendar(routine, source, item):
@@ -474,73 +424,18 @@ def match_calendar(routine, source, item):
         "--format", "json",
     ], timeout=300)
     match = _extract_json(result.get("content"))
-    confidence = str(match.get("confidence") or "").casefold()
-    if confidence not in _MATCH_CONFIDENCE:
-        raise RuntimeError(
-            f"calendar matcher returned invalid confidence {confidence!r}"
-        )
-    event_ids = {event["id"] for event in events}
-    event_id = match.get("event_id")
-    if match.get("matched") is True and (
-        not isinstance(event_id, str) or not event_id.strip()
-    ):
-        raise RuntimeError(
-            "calendar matcher returned matched=true without a non-empty event_id"
-        )
-    if event_id is not None and event_id not in event_ids:
-        raise RuntimeError(
-            f"calendar matcher selected an event outside the supplied candidates: "
-            f"{event_id}"
-        )
-    accepted = (
-        match.get("matched") is True
-        and confidence == "high"
-        and isinstance(event_id, str)
-        and bool(event_id.strip())
-        and event_id in event_ids
+    accepted, match = transcripts.validate_match(
+        match, {event["id"] for event in events}
     )
-    match = {
-        "matched": bool(match.get("matched")),
-        "event_id": event_id,
-        "confidence": confidence,
-        "reason": str(match.get("reason") or "")[:500],
-    }
     if not accepted:
         return False, match
 
-    event = next(event for event in events if event.get("id") == event_id)
-    source_people = []
-    seen = set()
-    organizer = event.get("organizer")
-    if isinstance(organizer, str):
-        organizer = {"email": organizer}
-    for role, person in [
-        ("calendar-organizer", organizer),
-        *[("calendar-attendee", attendee) for attendee in event.get("attendees") or []],
-    ]:
-        if not isinstance(person, dict):
-            continue
-        email = str(person.get("email") or "").strip().casefold()
-        if not email or email in seen:
-            continue
-        seen.add(email)
-        source_people.append({
-            "email": email,
-            "name": str(person.get("display_name") or ""),
-            "role": role,
-        })
-
-    item["title"] = event.get("summary") or item["title"]
-    item["date"] = str(event.get("start") or item["date"])[:10]
-    item["frontmatter"].update({
-        "calendar_event_id": event_id,
-        "calendar_event_title": event.get("summary") or "",
-        "calendar_event_start": event.get("start"),
-        "calendar_event_end": event.get("end"),
-        "calendar_match_confidence": confidence,
-        "calendar_match_reason": match["reason"],
-        "source_people": source_people,
-    })
+    event = next(
+        event for event in events if event.get("id") == match["event_id"]
+    )
+    transcripts.accept_event(
+        item, event, match["confidence"], match["reason"]
+    )
     return True, match
 
 
@@ -552,48 +447,34 @@ def dry_run_description(item):
     )
 
 
-def _receipt_path(base_dir, status_name, item):
+def write_receipt(base_dir, status_name, item, details):
     # One receipt per stable source, not per transcript hash. A corrected
     # transcript therefore resolves the old failed receipt instead of leaving
     # permanent stale attention behind.
     identity = item.get("source_id") or item["id"]
-    safe = _SAFE_RECEIPT.sub("-", identity).strip("-")
-    return (
-        Path(base_dir)
-        / "state"
-        / "transcriptions"
-        / status_name
-        / f"{safe}.json"
-    )
-
-
-def write_receipt(base_dir, status_name, item, details):
-    if status_name not in {"processed", "failed"}:
-        raise ValueError(f"unknown transcription receipt status {status_name!r}")
     payload = {
-        "status": status_name,
         "recording_id": item.get("frontmatter", {}).get("mila_recording_id"),
         "candidate_id": item.get("id"),
         "source_id": item.get("source_id"),
         "content_hash": item.get("frontmatter", {}).get("mila_content_hash"),
         "recording_start": item.get("frontmatter", {}).get("mila_recording_start"),
-        "updated_at": utc_now_iso(),
         **details,
     }
-    target = _receipt_path(base_dir, status_name, item)
-    state.write_atomic(
-        target,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        mode=0o600,
+    return transcripts.write_receipt_payload(
+        base_dir, status_name, identity, payload,
+        f"recording={payload['recording_id']}",
     )
-    opposite = _receipt_path(
-        base_dir,
-        "failed" if status_name == "processed" else "processed",
-        item,
-    )
-    try:
-        opposite.unlink()
-    except FileNotFoundError:
-        pass
-    log(f"routine receipt={status_name} recording={payload['recording_id']}")
-    return target
+
+
+def error_receipt_item(candidate):
+    """Receipt-shaped stand-in for a candidate that failed before fetch."""
+    raw = candidate.get("raw") or {}
+    return {
+        "id": candidate["id"],
+        "source_id": raw.get("source_id"),
+        "frontmatter": {
+            "mila_recording_id": (raw.get("recording") or {}).get("id"),
+            "mila_content_hash": raw.get("content_hash"),
+            "mila_recording_start": raw.get("recording_start"),
+        },
+    }
