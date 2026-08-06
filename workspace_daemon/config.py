@@ -12,7 +12,7 @@ from .notes import FILENAME_FIELDS
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila"}
+VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila", "whisper"}
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
 }
@@ -61,6 +61,7 @@ SOURCE_KEYS = {
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
     "calendar_match_hours",
+    "transcriptions_dir", "min_quiet_seconds", "exclude_base_names",
 }
 
 
@@ -1539,6 +1540,36 @@ def _validate_source(routine, source, prefix):
                         problems.append(
                             f"{entry_prefix}.transcript_file is required"
                         )
+
+    if kind == "whisper":
+        transcriptions_dir = source.get("transcriptions_dir")
+        if (
+            not isinstance(transcriptions_dir, str)
+            or not transcriptions_dir.startswith("/")
+        ):
+            problems.append(
+                f"{prefix}.transcriptions_dir must be an absolute path"
+            )
+        quiet = source.get("min_quiet_seconds")
+        if quiet is not None and (
+            not isinstance(quiet, (int, float))
+            or isinstance(quiet, bool)
+            or quiet < 0
+            or quiet > 3600
+        ):
+            problems.append(
+                f"{prefix}.min_quiet_seconds must be a number from 0 to 3600"
+            )
+        excluded = source.get("exclude_base_names")
+        if excluded is not None and (
+            not isinstance(excluded, list)
+            or any(not isinstance(value, str) or not value for value in excluded)
+        ):
+            problems.append(
+                f"{prefix}.exclude_base_names must be a list of output base names"
+            )
+
+    if kind in {"mila", "whisper"}:
         timezone = source.get("calendar_timezone", "UTC")
         try:
             ZoneInfo(timezone)
@@ -1573,7 +1604,7 @@ def _validate_source(routine, source, prefix):
             )
 
     max_results = source.get("max_results", 20)
-    unlimited_source = kind in {"gmail", "gchat", "slack", "mila"}
+    unlimited_source = kind in {"gmail", "gchat", "slack", "mila", "whisper"}
     if (
         not isinstance(max_results, int)
         or isinstance(max_results, bool)

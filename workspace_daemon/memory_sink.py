@@ -108,7 +108,7 @@ Never reproduce credentials, secrets, or unrelated sensitive personal data.
 """
 
 OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
-    r"^(?:gmail|gchat|slack|gdrive|mila):[^\s]+$"
+    r"^(?:gmail|gchat|slack|gdrive|mila|whisper):[^\s]+$"
 )
 
 
@@ -196,7 +196,8 @@ def validate(routine):
     ):
         problems.append(
             f"{rid}: memory.operator_confirmed_source_ids must be a list "
-            "of canonical source ids (gmail:, gchat:, slack:, gdrive:, or mila:)"
+            "of canonical source ids (gmail:, gchat:, slack:, gdrive:, "
+            "mila:, or whisper:)"
         )
     return problems
 

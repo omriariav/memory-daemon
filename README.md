@@ -675,7 +675,7 @@ enabled: true
 description: Summarize the weekly report email.
 
 source:
-  kind: gmail                  # gmail, drive_docs, slack, gchat, or mila
+  kind: gmail                  # gmail, drive_docs, slack, gchat, mila, or whisper
   query: 'from:reports@example.com subject:"Weekly Report" is:unread'
   max_results: 20              # optional, default 20
 
@@ -837,6 +837,35 @@ For a copied or renamed legacy transcript, `manual_recordings` points at the
 explicit `.srt`/`.txt` pair and the Mila index that still owns its metadata.
 That provides a trustworthy UUID and time without hand-editing the active app
 database. See `_example-mila-to-memory.yaml`.
+
+### Whisper pipeline transcriptions
+
+`source.kind: whisper` ingests finished transcripts from the local
+speech-to-text-tools pipeline (Google Meet recordings fetched from Drive, plus
+manual Downloads drops). It shares the Mila protocol — the mandatory
+high-confidence Calendar gate, `state/transcriptions/` receipts, retry of
+inconclusive matches, and versioned candidates whose corrections update the
+same memory — but its identity comes from filenames, not an index file.
+
+Point `transcriptions_dir` at the pipeline's `OUTPUT_DIR`. Only files matching
+the pipeline's frozen base-name pattern
+(`{queue-stamp}-{name}[-{hash}]-{he|en}[-diarized].txt`) are enumerated, so a
+directory shared with other applications stays safe. Sibling variants of one
+recording collapse into a single candidate, preferring `-he-diarized`, then
+`-he`, `-en-diarized`, `-en`; a later-arriving better variant is reprocessed
+as a correction. A group is only ingested after `min_quiet_seconds` (default
+300) without writes, so the worker never races the hourly scan.
+
+Meet-derived names embed the meeting's own local start time
+(`{title}---{YYYY_MM_DD}-{HH_MM}-{TZ}--Recording`); that instant anchors
+Calendar matching even when the recording is transcribed days later, and the
+memory source ID is built from it (`whisper:meet:<start>:<title>`), so
+re-running the same recording through the pipeline updates the same memory.
+Local drops fall back to the queue timestamp
+(`whisper:file:<name>`) and tell the matcher their start time is approximate.
+When the paired `.m4a` still exists, its ffprobe duration upgrades matching to
+full interval overlap; without it, matching uses start proximity and title
+tokens.
 
 ### One routine, several report streams
 
@@ -1041,6 +1070,8 @@ workspace_daemon/
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
   mila_source.py           read-only Mila + Calendar matching
+  whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
+  transcripts.py           shared transcript-source Calendar gate + receipts
   google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync
   llm.py                   yoetz adapter, prompt building, label extraction
   notes.py                 frontmatter + note writing

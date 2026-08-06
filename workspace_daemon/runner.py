@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils
+from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -1180,6 +1180,16 @@ SOURCES = {
     "gchat": (gchat_source.candidates,
               lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
     "mila": (mila_source.candidates, mila_source.fetch),
+    "whisper": (whisper_source.candidates, whisper_source.fetch),
+}
+
+# Transcript connectors share one protocol beyond enumeration: a Calendar
+# match gate before analysis, and current-state receipts under
+# state/transcriptions/.  Every ``kind == "mila"`` special case below must
+# apply to the whole family, so membership lives in one map.
+TRANSCRIPT_SOURCES = {
+    "mila": mila_source,
+    "whisper": whisper_source,
 }
 
 
@@ -1192,6 +1202,8 @@ def _scope(source):
         return "recently active Slack conversations"
     if source.get("kind") == "mila":
         return source.get("recordings_file") or "Mila recordings"
+    if source.get("kind") == "whisper":
+        return source.get("transcriptions_dir") or "Whisper transcripts"
     slack_channels = [
         channel
         for key in (
@@ -1229,6 +1241,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "slack": 30,
     "gchat": 50,
     "mila": 0,
+    "whisper": 0,
 }
 
 
@@ -2063,7 +2076,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         )
         retry_calendar = (
             existing is not None
-            and claim["source"].get("kind") == "mila"
+            and claim["source"].get("kind") in TRANSCRIPT_SOURCES
             and existing.get("calendar_match_rejected") is True
         )
         if (
@@ -2142,26 +2155,18 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):
                 shared_circuit["error"] = str(exc)[:300]
+            transcript_module = TRANSCRIPT_SOURCES.get(
+                claim["source"].get("kind")
+            )
             if (
-                claim["source"].get("kind") == "mila"
+                transcript_module is not None
                 and not dry_run
                 and base_dir is not None
             ):
-                raw = candidate.get("raw") or {}
-                placeholder = {
-                    "id": candidate["id"],
-                    "source_id": raw.get("source_id"),
-                    "frontmatter": {
-                        "mila_recording_id": (
-                            raw.get("recording") or {}
-                        ).get("id"),
-                        "mila_content_hash": raw.get("content_hash"),
-                        "mila_recording_start": raw.get("recording_start"),
-                    },
-                }
                 try:
-                    mila_source.write_receipt(
-                        base_dir, "failed", placeholder,
+                    transcript_module.write_receipt(
+                        base_dir, "failed",
+                        transcript_module.error_receipt_item(candidate),
                         {
                             "failure_kind": "transient-error",
                             "error": str(exc)[:500],
@@ -2252,11 +2257,12 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     item.setdefault("source_kind", source["kind"])
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
+    transcript_module = TRANSCRIPT_SOURCES.get(source["kind"])
     if dry_run:
-        if source["kind"] == "mila":
+        if transcript_module is not None:
             log(
                 f"routine={rid} [dry-run] "
-                f"{mila_source.dry_run_description(item)}"
+                f"{transcript_module.dry_run_description(item)}"
             )
         dry_label = (
             static
@@ -2275,8 +2281,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         return None
 
     calendar_match = None
-    if source["kind"] == "mila":
-        accepted, calendar_match = mila_source.match_calendar(
+    if transcript_module is not None:
+        accepted, calendar_match = transcript_module.match_calendar(
             routine, source, item
         )
         if not accepted:
@@ -2291,7 +2297,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             if handler_id:
                 record["handler_id"] = handler_id
             if base_dir is not None:
-                mila_source.write_receipt(
+                transcript_module.write_receipt(
                     base_dir, "failed", item,
                     {
                         "failure_kind": "calendar-match",
@@ -2419,7 +2425,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     actions_to_apply = [] if (memory_failed or item.get("expand_fallback")) else action_list
     if actions_to_apply:
         record["actions_pending"] = list(actions_to_apply)
-    if source["kind"] == "mila" and base_dir is not None:
+    if transcript_module is not None and base_dir is not None:
         receipt_status = "failed" if record.get("memory_error") else "processed"
         details = {
             "calendar_match": calendar_match,
@@ -2431,7 +2437,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                 "failure_kind": "memory-error",
                 "error": record["memory_error"],
             })
-        mila_source.write_receipt(base_dir, receipt_status, item, details)
+        transcript_module.write_receipt(base_dir, receipt_status, item, details)
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
