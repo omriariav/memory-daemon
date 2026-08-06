@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import config, runner, whisper_source
+from workspace_daemon import config, llm, memory_sink, runner, state, whisper_source
 
 
 MEET_BASE = (
@@ -103,6 +103,40 @@ class WhisperSourceTest(unittest.TestCase):
         self.assertEqual(raw["recording_start"], "2026-07-28T09:01:00Z")
         # The later transcription wins as the current version.
         self.assertTrue(raw["base_name"].startswith("2026-07-28-15-54-12"))
+
+    def test_current_meet_naming_parenthesized_gmt_offset(self):
+        # The current pipeline emits "{title}-({date}-{HH_MM}-GMT+3)-{hash}":
+        # no "Recording" suffix, explicit UTC offset instead of abbreviation.
+        self.write(
+            "2026-08-06-06-12-27-Omri-_-Limor-(2026-08-05-14_03-GMT+3)"
+            "-c6a71d-he.txt"
+        )
+        found = whisper_source.candidates(source(self.dir))
+        self.assertEqual(len(found), 1)
+        raw = found[0]["raw"]
+        self.assertEqual(raw["origin"], "meet")
+        # 14:03 at explicit GMT+3, regardless of the configured zone's DST.
+        self.assertEqual(raw["recording_start"], "2026-08-05T11:03:00Z")
+        self.assertEqual(
+            raw["source_id"], "whisper:meet:2026-08-05T14-03:omri-limor"
+        )
+        self.assertEqual(found[0]["title"], "Omri Limor")
+
+    def test_file_origin_name_collision_is_logged_not_silent(self):
+        # Two genuinely different local drops sharing a sanitized name have
+        # no embedded meeting time to disambiguate them; the collapse must at
+        # least be visible in the log.
+        self.write("2026-07-01-10-00-00-Standup-aaaaaa-he.txt", "פגישה ראשונה")
+        self.write("2026-07-08-10-00-00-Standup-bbbbbb-he.txt", "פגישה שנייה")
+        with mock.patch.object(whisper_source, "log") as logged:
+            found = whisper_source.candidates(source(self.dir))
+        self.assertEqual(len(found), 1)
+        self.assertTrue(
+            found[0]["raw"]["base_name"].startswith("2026-07-08")
+        )
+        self.assertTrue(any(
+            "collapses" in str(call) for call in logged.call_args_list
+        ))
 
     def test_rerun_of_same_recording_keeps_one_candidate_same_memory(self):
         self.write(f"{MEET_BASE}-he.txt")
@@ -344,6 +378,132 @@ class WhisperValidationTest(unittest.TestCase):
                 "calendar_timezone": "Neverland/Nowhere",
             })
         ))
+
+
+class WhisperRunnerTest(unittest.TestCase):
+    """Drive whisper items through the generic TRANSCRIPT_SOURCES dispatch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.source = {
+            "kind": "whisper",
+            "transcriptions_dir": "/tmp/whisper-out",
+            "max_results": 0,
+        }
+        self.routine = routine(self.base / "memory", self.source)
+        self.candidate = {
+            "id": "whisper:meet:2026-07-27T13-30:brief@hash",
+            "title": "Brief",
+            "raw": {"source_id": "whisper:meet:2026-07-27T13-30:brief"},
+        }
+        self.item = {
+            "id": self.candidate["id"],
+            "source_id": "whisper:meet:2026-07-27T13-30:brief",
+            "source_kind": "whisper",
+            "title": "Brief",
+            "date": "2026-07-27",
+            "body": "Transcript",
+            "_whisper_calendar_candidates": [{"id": "event-1"}],
+            "frontmatter": {
+                "whisper_base_name": "2026-07-27-15-00-00-brief-abc123",
+                "whisper_origin": "meet",
+                "whisper_content_hash": "hash",
+                "whisper_recording_start": "2026-07-27T10:30:00Z",
+                "whisper_recording_end": "2026-07-27T11:00:00Z",
+                "whisper_duration_seconds": 1800,
+            },
+        }
+
+    def patched_source(self, fetch=None):
+        return mock.patch.dict(
+            runner.SOURCES,
+            {"whisper": (
+                lambda _source: [self.candidate],
+                fetch or (lambda _routine, _source, _candidate: dict(
+                    self.item,
+                    frontmatter=dict(self.item["frontmatter"]),
+                )),
+            )},
+        )
+
+    def test_dry_run_never_calls_calendar_match_or_writes_state(self):
+        with self.patched_source(), \
+             mock.patch.object(whisper_source, "match_calendar") as match:
+            totals = runner.run(self.base, [self.routine], dry_run=True)
+        self.assertEqual(totals["processed"], 1)
+        match.assert_not_called()
+        self.assertFalse((self.base / "state").exists())
+
+    def test_low_match_is_ledgered_and_receipted_without_memory(self):
+        with self.patched_source(), \
+             mock.patch.object(
+                 whisper_source,
+                 "match_calendar",
+                 return_value=(False, {
+                     "matched": False,
+                     "event_id": None,
+                     "confidence": "medium",
+                     "reason": "Ambiguous.",
+                 }),
+             ), \
+             mock.patch.object(memory_sink, "capture") as capture:
+            totals = runner.run(self.base, [self.routine])
+        self.assertEqual(totals["processed"], 1)
+        capture.assert_not_called()
+        ledger = state.load(self.base)
+        self.assertTrue(ledger[self.candidate["id"]]["calendar_match_rejected"])
+        receipts = list(
+            (self.base / "state" / "transcriptions" / "failed").glob("*.json")
+        )
+        self.assertEqual(len(receipts), 1)
+        self.assertIn("whisper-meet", receipts[0].name)
+
+    def test_high_match_runs_analysis_and_writes_processed_receipt(self):
+        with self.patched_source(), \
+             mock.patch.object(
+                 whisper_source,
+                 "match_calendar",
+                 return_value=(True, {
+                     "matched": True,
+                     "event_id": "event-1",
+                     "confidence": "high",
+                     "reason": "Exact.",
+                 }),
+             ), \
+             mock.patch.object(llm, "analyze", return_value="Summary"), \
+             mock.patch.object(
+                 memory_sink, "capture",
+                 return_value={"memory": "created", "memory_entry_id": "entry"},
+             ):
+            totals = runner.run(self.base, [self.routine])
+        self.assertEqual(totals["errors"], 0)
+        receipt = next(
+            (self.base / "state" / "transcriptions" / "processed").glob("*.json")
+        )
+        payload = json.loads(receipt.read_text())
+        self.assertEqual(payload["memory"], "created")
+        self.assertEqual(
+            payload["base_name"], "2026-07-27-15-00-00-brief-abc123"
+        )
+
+    def test_fetch_error_writes_transient_failure_receipt(self):
+        def broken_fetch(_routine, _source, _candidate):
+            raise RuntimeError("transcript vanished")
+
+        with self.patched_source(fetch=broken_fetch):
+            totals = runner.run(self.base, [self.routine])
+        self.assertEqual(totals["errors"], 1)
+        receipt = next(
+            (self.base / "state" / "transcriptions" / "failed").glob("*.json")
+        )
+        payload = json.loads(receipt.read_text())
+        self.assertEqual(payload["failure_kind"], "transient-error")
+        self.assertIn("transcript vanished", payload["error"])
+        self.assertEqual(
+            payload["source_id"], "whisper:meet:2026-07-27T13-30:brief"
+        )
 
 
 class WhisperRunnerWiringTest(unittest.TestCase):

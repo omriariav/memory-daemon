@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 from . import transcripts
 from .chat_text import redact_secrets
-from .shell import gws_bin, run, run_json, yoetz_bin
+from .shell import gws_bin, log, run, run_json, yoetz_bin
 
 
 _VARIANT = re.compile(
@@ -45,18 +45,26 @@ _PROC_STAMP = re.compile(
     r"^(?P<stamp>20\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d{2})?)-(?P<name>.+)$"
 )
 _PATH_HASH = re.compile(r"^(?P<name>.+)-(?P<hash>[0-9a-f]{6})$")
-# Sanitized Google Meet recording names keep the meeting's local start time:
-# "Value-reflection---2026_02_18-13_03-IST---Recording".  Observed archive
-# variants: dashes or underscores inside the date and time, two or three
-# dashes before "Recording", a surviving en/em dash from the original
-# " – Recording" suffix, and a numeric copy suffix from a duplicate Drive
-# download ("Recording (2)") — the same meeting, so the same identity.
+# Sanitized Google Meet recording names keep the meeting's local start time.
+# Observed variants: dashes or underscores inside the date and time, two or
+# three dashes before "Recording", a surviving en/em dash from the original
+# " – Recording" suffix, a numeric copy suffix from a duplicate Drive
+# download ("Recording (2)") — the same meeting, so the same identity — and
+# the current Meet naming, a parenthesized "(2026-08-05-14_03-GMT+3)" with a
+# UTC-offset token instead of a timezone abbreviation and no "Recording".
+_MEET_SEGMENT = (
+    r"(?P<year>20\d{2})[-_](?P<month>\d{2})[-_](?P<day>\d{2})[-_]"
+    r"(?P<hour>\d{2})[-_](?P<minute>\d{2})[-_]"
+    r"(?P<tz>GMT[+-]\d{1,2}|[A-Z]{2,5})"
+)
 _MEET_NAME = re.compile(
-    r"^(?P<title>.+?)---"
-    r"(?P<year>20\d{2})[-_](?P<month>\d{2})[-_](?P<day>\d{2})-"
-    r"(?P<hour>\d{2})[-_](?P<minute>\d{2})-(?P<tz>[A-Z]{2,5})"
+    rf"^(?P<title>.+?)---{_MEET_SEGMENT}"
     r"[-–—]{1,4}Recording(?:-\d{1,2})?$"
 )
+_MEET_PARENS = re.compile(
+    rf"^(?P<title>.+?)[-_]*\({_MEET_SEGMENT}\)$"
+)
+_GMT_OFFSET = re.compile(r"^GMT(?P<hours>[+-]\d{1,2})$")
 _SLUG = re.compile(r"[^a-z0-9\u0590-\u05ff]+")
 
 # Preferred transcript variant, best first: diarized keeps speaker turns, and
@@ -120,13 +128,20 @@ def _parse_base(base, zone):
     hashed = _PATH_HASH.match(name)
     if hashed:
         name = hashed.group("name")
-    meet = _MEET_NAME.match(name)
+    meet = _MEET_NAME.match(name) or _MEET_PARENS.match(name)
     if meet:
+        # A "GMT+3"-style token is an explicit offset; abbreviations like
+        # IDT/IST are ambiguous, so those defer to the configured timezone.
+        offset = _GMT_OFFSET.match(meet.group("tz"))
+        meeting_zone = (
+            datetime.timezone(datetime.timedelta(hours=int(offset["hours"])))
+            if offset else zone
+        )
         start = datetime.datetime(
             int(meet.group("year")), int(meet.group("month")),
             int(meet.group("day")),
             int(meet.group("hour")), int(meet.group("minute")),
-            tzinfo=zone,
+            tzinfo=meeting_zone,
         )
         title = _humanize(meet.group("title"))
         identity = (
@@ -262,30 +277,53 @@ def candidates(source):
                 source_id = parsed["identity"]
                 title = parsed["title"]
                 start = _utc_label(parsed["recording_start"])
+                origin = parsed["origin"]
+                queued_at = _utc_label(
+                    parsed["queued_at"].astimezone(datetime.timezone.utc)
+                )
             except Exception:
                 source_id = f"whisper:file:{_slug(base)}"
                 title = base
                 start = None
+                origin = "file"
+                queued_at = None
             candidate = {
                 "id": f"{source_id}@error-{digest}",
                 "title": title,
                 "raw": {
                     "source_id": source_id,
                     "base_name": base,
+                    "origin": origin,
                     "transcript_error": str(exc),
                     "content_hash": digest,
                     "recording_start": start,
                     "recording_end": None,
+                    "queued_at": queued_at,
                 },
             }
         source_id = candidate["raw"]["source_id"]
         previous = found.get(source_id)
-        # The same recording re-run through the pipeline gets a fresh queue
-        # stamp and path hash; keep only the newest output base per identity.
-        if previous is None or (
-            previous["raw"].get("base_name") or ""
-        ) < (candidate["raw"].get("base_name") or ""):
+        if previous is None:
             found[source_id] = candidate
+            continue
+        # The same recording re-run through the pipeline gets a fresh queue
+        # stamp and path hash; keep only the newest output per identity. For
+        # file-origin drops the identity is only the sanitized name, so two
+        # genuinely different recordings sharing a name would collapse
+        # silently — make that visible instead.
+        if candidate["raw"].get("origin") == "file":
+            log(
+                f"whisper identity {source_id} collapses "
+                f"{previous['raw'].get('base_name')} and "
+                f"{candidate['raw'].get('base_name')}; keeping newest"
+            )
+        found[source_id] = max(
+            previous, candidate,
+            key=lambda entry: (
+                entry["raw"].get("queued_at") or "",
+                entry["raw"].get("base_name") or "",
+            ),
+        )
 
     ordered = sorted(
         found.values(),
