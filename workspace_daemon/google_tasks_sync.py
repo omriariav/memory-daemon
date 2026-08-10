@@ -1198,6 +1198,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                         memory_id=entry["id"],
                         source_id=source_id,
                         terminal=True,
+                        pending_link=False,
                     )
                     _save_checkpoint(checkpoint_path, checkpoint)
                 continue
