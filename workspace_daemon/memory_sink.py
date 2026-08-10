@@ -961,7 +961,11 @@ def capture(routine, item, summary, dry_run=False):
                 f"verified on disk for source_id={source_id}"
             )
         elif r.returncode != 0:
-            raise RuntimeError(f"memory add failed: {out.strip()[:300]}")
+            raise RuntimeError(
+                f"memory add failed (exit {r.returncode}): "
+                f"{out.strip()[:300]}"
+                + (f" … {out.strip()[-300:]}" if len(out.strip()) > 300 else "")
+            )
         else:
             raise RuntimeError(
                 "memory add returned no entry id or recognized verdict: "
