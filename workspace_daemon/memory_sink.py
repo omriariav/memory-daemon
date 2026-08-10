@@ -210,6 +210,21 @@ def _cli(store, args, stdin_text=None, timeout=120):
     )
 
 
+def _head_and_tail(output, limit=300):
+    """Failure-report excerpt of CLI output: first and last `limit` chars.
+
+    Real errors print last, after any warnings, so the head alone can hide
+    them (a native crash once surfaced as nothing but the embedder's fp32
+    warning). No-output deaths are called out explicitly.
+    """
+    text = (output or "").strip()
+    if not text:
+        return "(no output)"
+    if len(text) <= 2 * limit:
+        return text
+    return f"{text[:limit]} … {text[-limit:]}"
+
+
 def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     """Return the exact persisted entry id after an ambiguous CLI result.
 
@@ -963,13 +978,12 @@ def capture(routine, item, summary, dry_run=False):
         elif r.returncode != 0:
             raise RuntimeError(
                 f"memory add failed (exit {r.returncode}): "
-                f"{out.strip()[:300]}"
-                + (f" … {out.strip()[-300:]}" if len(out.strip()) > 300 else "")
+                f"{_head_and_tail(out)}"
             )
         else:
             raise RuntimeError(
                 "memory add returned no entry id or recognized verdict: "
-                f"{out.strip()[:300]}"
+                f"{_head_and_tail(out)}"
             )
     log(
         f"routine={rid} memory {verdict} {entry_id or ''} "

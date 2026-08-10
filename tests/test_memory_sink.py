@@ -717,6 +717,32 @@ class CaptureValidationTest(unittest.TestCase):
 
         commit.assert_called_once_with("/store", "memory: r auto-capture")
 
+    def test_failed_add_reports_exit_code_and_output_tail(self):
+        warning = "w" * 300
+        output = warning + " middle " + "real error at the end"
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult(output, returncode=1)
+        ), mock.patch.object(memory_sink, "_commit_store"), \
+             mock.patch.object(
+                 memory_sink, "_verify_written_entry", return_value=None,
+             ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"exit 1.*real error at the end"
+            ):
+                memory_sink.capture(self.routine, self.item, "summary text")
+
+    def test_failed_add_with_no_output_says_so(self):
+        with mock.patch.object(
+            memory_sink, "_cli", return_value=FakeResult("", returncode=-6)
+        ), mock.patch.object(memory_sink, "_commit_store"), \
+             mock.patch.object(
+                 memory_sink, "_verify_written_entry", return_value=None,
+             ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"exit -6.*\(no output\)"
+            ):
+                memory_sink.capture(self.routine, self.item, "summary text")
+
     def test_nonzero_add_is_accepted_only_after_exact_disk_verification(self):
         with mock.patch.object(
             memory_sink, "_cli", return_value=FakeResult("late failure", returncode=2)
