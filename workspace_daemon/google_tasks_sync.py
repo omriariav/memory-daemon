@@ -751,6 +751,10 @@ def run(cfg, checkpoint_path=None, dry_run=False):
     tasklists = _tasklists(cfg)
     max_tasks = int(cfg.get("max_tasks", 10000))
     google_tasks = _open_tasks(tasklists, max_tasks)
+    # Tasks present in the live open listing, before rehydration adds back
+    # completed/deleted tasks fetched by id. Only these can demand pairing
+    # work; a task absent from the listing no longer asks for attention.
+    open_listing_keys = set(google_tasks)
     memory_entries = _load_memory_entries(store)
     known_people = _known_people(memory_entries)
     report = {
@@ -900,9 +904,9 @@ def run(cfg, checkpoint_path=None, dry_run=False):
             continue
         if key in google_tasks:
             continue
-        if (
-            mappings.get(key, {}).get("terminal")
-            and memory_by_source[source_id]["resolved"]
+        source_entry = memory_by_source[source_id]
+        if mappings.get(key, {}).get("terminal") and (
+            source_entry["resolved"] or source_entry["type"] != "todo"
         ):
             continue
         try:
@@ -920,7 +924,9 @@ def run(cfg, checkpoint_path=None, dry_run=False):
         if key in google_tasks or key in invalid_mapping_keys:
             continue
         mapped_entry = memory_entries.get(mapping.get("memory_id"))
-        if mapping.get("terminal") and mapped_entry and mapped_entry["resolved"]:
+        if mapping.get("terminal") and mapped_entry and (
+            mapped_entry["resolved"] or mapped_entry["type"] != "todo"
+        ):
             continue
         list_id, task_id = key.split(":", 1)
         if list_id not in tasklists:
@@ -1173,6 +1179,29 @@ def run(cfg, checkpoint_path=None, dry_run=False):
             )
             continue
         if entry["type"] != "todo":
+            if key not in open_listing_keys:
+                # The task is gone from the live listing (completed or
+                # deleted — `gws get` returns tombstones for both, with no
+                # deleted marker) and the entry is not a todo, so no pairing
+                # can ever be re-established. Retire the mapping instead of
+                # rehydrating the tombstone into a permanent conflict.
+                _plan(
+                    report,
+                    "retire_stale_pair",
+                    task=key,
+                    memory_id=entry["id"],
+                    title=entry["title"],
+                )
+                if not dry_run:
+                    mappings[key] = dict(
+                        mappings.get(key) or {},
+                        memory_id=entry["id"],
+                        source_id=source_id,
+                        terminal=True,
+                        pending_link=False,
+                    )
+                    _save_checkpoint(checkpoint_path, checkpoint)
+                continue
             report["conflicts"] += 1
             report["planned"].append({
                 "action": "conflict",
