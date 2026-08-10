@@ -341,6 +341,65 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertNotIn("update_memory", report)
         self.assertFalse(report["ok"])
 
+    def test_rehydrated_tombstone_of_non_todo_pair_is_retired_not_conflict(self):
+        # The linked task was completed or deleted in Google (absent from the
+        # open listing; `gws get` returns a tombstone either way) and the
+        # memory side is a note. No pairing can ever be re-established, so
+        # the pair retires instead of conflicting on every run forever.
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        self.write_entry(entry_text(
+            title="Google task",
+            body="Concrete task notes.",
+            entry_type="note",
+            source_ids=[source_id],
+        ))
+
+        with mock.patch.object(
+            google_tasks_sync, "_tasklists", return_value=self.tasklists
+        ), mock.patch.object(
+            google_tasks_sync, "_open_tasks", return_value={}
+        ), mock.patch.object(
+            google_tasks_sync, "_memory_cli"
+        ), mock.patch.object(
+            google_tasks_sync, "_gws", return_value=task()
+        ) as gws:
+            report = google_tasks_sync.run(
+                self.cfg, checkpoint_path=self.checkpoint, dry_run=False,
+            )
+
+        gws.assert_called_once_with(["get", LIST_ID, TASK_ID])
+        self.assertEqual(report["conflicts"], 0)
+        self.assertEqual(report.get("retire_stale_pair"), 1)
+        self.assertTrue(report["ok"])
+        mapping = json.loads(self.checkpoint.read_text())["mappings"][
+            f"{LIST_ID}:{TASK_ID}"
+        ]
+        self.assertTrue(mapping["terminal"])
+
+    def test_retired_non_todo_pair_is_not_refetched_on_later_runs(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        self.write_entry(entry_text(
+            title="Google task",
+            body="Concrete task notes.",
+            entry_type="note",
+            source_ids=[source_id],
+        ))
+        self.checkpoint.write_text(json.dumps({
+            "version": 1,
+            "mappings": {
+                f"{LIST_ID}:{TASK_ID}": {
+                    "memory_id": "2026-08-02-local-task",
+                    "source_id": source_id,
+                    "terminal": True,
+                },
+            },
+        }))
+
+        report = self.run_dry({})
+
+        self.assertEqual(report["planned"], [])
+        self.assertTrue(report["ok"])
+
     def test_outbound_since_prevents_historical_flood(self):
         self.write_entry(entry_text(date="2026-08-01"))
         report = self.run_dry({})
