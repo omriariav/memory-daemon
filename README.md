@@ -592,6 +592,7 @@ maintenance:
   outbound_tasklist: replace-with-task-list-id
   outbound_since: "2026-01-01"
   exclude_tags: [no-google-tasks]
+  reclassify_non_todo: false
   max_tasks: 10000
 ```
 
@@ -602,6 +603,10 @@ directions. Google completion creates a following memory note, while memory
 resolution completes the Google task. Historical completed Google tasks are
 not imported during bootstrap. A configured `exclude_tags` match is an ongoing
 opt-out: even an already-linked entry is skipped without changing either side.
+A still-open Google task whose linked memory entry is no longer a `todo` (for
+example, a later capture rewrote it as a note) is reported as a conflict by
+default; with `reclassify_non_todo: true` the entry is promoted back to a todo
+in place instead, keeping its id, title, body, and people.
 Google Tasks does not expose a creation timestamp. On first import, the sync
 therefore uses the task's authoritative `updated` date for the memory entry and
 records the full initial `updated` timestamp in the generated metadata. Both

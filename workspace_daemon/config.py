@@ -497,6 +497,7 @@ def validate(routine):
                     "kind", "checkpoint", "store", "tasklists",
                     "outbound_tasklist", "outbound_since", "exclude_tags",
                     "identity_exclude_people", "max_tasks",
+                    "reclassify_non_todo",
                 }
             )
             unknown = set(maintenance) - allowed
@@ -604,6 +605,11 @@ def validate(routine):
                     problems.append(
                         f"{rid}: maintenance.identity_exclude_people must be "
                         "kebab-case person slugs"
+                    )
+                reclassify = maintenance.get("reclassify_non_todo", False)
+                if not isinstance(reclassify, bool):
+                    problems.append(
+                        f"{rid}: maintenance.reclassify_non_todo must be a boolean"
                     )
                 max_tasks = maintenance.get("max_tasks", 10000)
                 if (

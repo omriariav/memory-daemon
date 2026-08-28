@@ -109,6 +109,18 @@ class MaintenanceValidationTest(unittest.TestCase):
         self.assertTrue(any("YYYY-MM-DD" in problem for problem in problems))
         self.assertTrue(any("must be included" in problem for problem in problems))
 
+    def test_google_tasks_sync_accepts_boolean_reclassify_flag_only(self):
+        routine = tasks_routine()
+        routine["maintenance"]["reclassify_non_todo"] = True
+        self.assertEqual(config.validate(routine), [])
+
+        routine["maintenance"]["reclassify_non_todo"] = "yes"
+        problems = config.validate(routine)
+        self.assertTrue(
+            any("reclassify_non_todo must be a boolean" in p for p in problems),
+            problems,
+        )
+
     def test_google_tasks_sync_rejects_invalid_identity_exclusions(self):
         routine = tasks_routine()
         routine["maintenance"]["identity_exclude_people"] = ["Not a slug"]

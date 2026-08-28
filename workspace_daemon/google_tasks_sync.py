@@ -621,6 +621,27 @@ def _memory_upsert(
     })
 
 
+def _memory_reclassify_todo(store, entry, source_id):
+    """Promote a Google-linked non-todo entry back to a todo, in place."""
+    args = [
+        "add", "--title", entry["title"],
+        "--type", "todo", "--date", entry["date"],
+        "--source-ids", source_id,
+        "--body", entry["body"],
+        "--update", entry["id"],
+    ]
+    if entry.get("people"):
+        args.extend(["--people", ",".join(entry["people"])])
+    result = _memory_cli(store, args)
+    return _memory_result_id(result, store, source_id, {
+        "id": entry["id"],
+        "title": entry["title"],
+        "type": "todo",
+        "body": entry["body"],
+        "source_ids": [source_id],
+    })
+
+
 def _memory_enrich_people(store, entry, source_id, people):
     """Add verified existing person slugs without changing synced task fields."""
     missing = sorted(set(people) - set(entry.get("people", [])))
@@ -942,6 +963,7 @@ def run(cfg, checkpoint_path=None, dry_run=False):
     linked_memory_ids = set(mapped_memory_ids)
     google_titles = {}
     excluded = set(cfg.get("exclude_tags") or [])
+    reclassify_non_todo = bool(cfg.get("reclassify_non_todo", False))
     identity_deferred_keys = set()
 
     for key, task in sorted(google_tasks.items()):
@@ -1202,18 +1224,35 @@ def run(cfg, checkpoint_path=None, dry_run=False):
                     )
                     _save_checkpoint(checkpoint_path, checkpoint)
                 continue
-            report["conflicts"] += 1
-            report["planned"].append({
-                "action": "conflict",
-                "task": key,
-                "memory_id": entry["id"],
-                "title": entry["title"],
-                "reason": (
-                    "linked memory entry is not a todo; automatic "
-                    "reclassification is not allowed"
-                ),
-            })
-            continue
+            if not reclassify_non_todo:
+                report["conflicts"] += 1
+                report["planned"].append({
+                    "action": "conflict",
+                    "task": key,
+                    "memory_id": entry["id"],
+                    "title": entry["title"],
+                    "reason": (
+                        "linked memory entry is not a todo; automatic "
+                        "reclassification is not allowed"
+                    ),
+                })
+                continue
+            # The Google task is still open, so the pairing is live. With
+            # `reclassify_non_todo` the memory side is promoted back to a
+            # todo in place (same id, title, body, people) instead of
+            # conflicting on every run.
+            _plan(
+                report,
+                "reclassify_memory",
+                task=key,
+                memory_id=entry["id"],
+                title=entry["title"],
+                previous_type=entry["type"],
+            )
+            if not dry_run:
+                _memory_reclassify_todo(store, entry, source_id)
+                memory_write_this_item = True
+            entry = dict(entry, type="todo")
         if (
             mapping
             and not mapping.get("pending_link")
