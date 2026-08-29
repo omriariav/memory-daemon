@@ -13,6 +13,8 @@ DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
 MAINTENANCE_LAUNCHD_LABEL = "com.memory-daemon-maintenance"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
+# Memory-sink failures older than this no longer count as an open issue.
+MEMORY_ERROR_WINDOW_SECONDS = 24 * 3600
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
 _TICK_PREFIX = (
     r"^tick(?:\[(?P<id>[^\]]+)\])?"
@@ -151,6 +153,13 @@ def read_tick_history(path):
         if block["dry_run"]:
             return
         for routine_id in block["due_ids"]:
+            # A tick that died without a "done" line (crash, kill, token
+            # expiry) stays in `active` forever. Its routines may have run
+            # fine in every later tick; never let the abandoned block clobber
+            # a newer result.
+            existing = routine_results.get(routine_id)
+            if existing and str(existing.get("at") or "") > block["at"]:
+                continue
             routine_results[routine_id] = {
                 "state": "incomplete",
                 "at": block["at"],
@@ -334,7 +343,15 @@ def routine_rows(
             for entry in entries
             if entry.get("processed_at")
         ]
-        memory_errors = sum(bool(entry.get("memory_error")) for entry in entries)
+        # A sink failure is retried while its source still lists the item,
+        # which refreshes processed_at; an item the source dropped keeps its
+        # old row forever. Count only recent failures so one transient
+        # rejection does not flag the routine indefinitely.
+        memory_errors = sum(
+            bool(entry.get("memory_error"))
+            and _within(entry.get("processed_at"), now, MEMORY_ERROR_WINDOW_SECONDS)
+            for entry in entries
+        )
         # Seen-but-judged-non-durable is a distinct outcome from "never
         # fetched"; expose it here so the distinction does not require
         # reading raw daemon logs.
@@ -714,6 +731,11 @@ def _tick_issue(launchd, latest, now):
             f"last tick is stale (expected within {_duration(stale_after)})"
         )
     return None
+
+
+def _within(value, now, window):
+    epoch = _iso_epoch(value)
+    return epoch is not None and now - epoch <= window
 
 
 def _iso_epoch(value):

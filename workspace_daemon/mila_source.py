@@ -27,6 +27,14 @@ from .shell import gws_bin, run_json, yoetz_bin
 _CAPTURE_STAMP = re.compile(
     r"(?P<stamp>20\d{2}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)"
 )
+# Google Meet exports name recordings after their scheduled start in the
+# organizer's local zone, e.g. "Tomer__Omri - PM resources - 2026_08_13 15_32
+# IDT – Recording 2026-08-14T16-39-11Z-XYZ.m4a". The trailing capture stamp is
+# then the import instant, sometimes a day later.
+_MEET_STAMP = re.compile(
+    r"(?P<date>20\d{2}_\d{2}_\d{2}) (?P<time>\d{2}_\d{2})"
+    r"(?: (?P<abbr>[A-Z]{2,5}))?"
+)
 _SRT_TIMING = re.compile(
     r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+"
     r"\d{2}:\d{2}:\d{2}[,.]\d{3}"
@@ -65,19 +73,25 @@ def _record_by_id(path, recording_id):
     return matches[0]
 
 
-def _recording_interval(record):
+def _recording_interval(record, zone=None):
     """Return the actual capture interval, not the file-import time.
 
     Native Mila meeting filenames contain their start instant.  Mila's
     ``createdAt`` for those records is the completion time, so using it
     directly shifts Calendar matching by the full meeting duration.  Imported
-    Voice Memos use their original creation time as the start.
+    Voice Memos use their original creation time as the start.  Imported
+    Google Meet recordings carry the scheduled start as a local-time stamp in
+    the title portion, which wins over the (later) capture stamp; ``zone`` is
+    the routine's calendar timezone used to interpret it.
     """
     duration = max(0.0, float(record.get("duration") or 0))
     source = str(record.get("source") or "")
     audio_name = str(record.get("audioFileName") or "")
+    meet = _MEET_STAMP.search(audio_name)
     stamp = _CAPTURE_STAMP.search(audio_name)
-    if stamp and source != "voiceMemo":
+    if meet and source != "voiceMemo":
+        start = _meet_start(meet, zone)
+    elif stamp and source != "voiceMemo":
         start = datetime.datetime.strptime(
             stamp.group("stamp"), "%Y-%m-%dT%H-%M-%SZ"
         ).replace(tzinfo=datetime.timezone.utc)
@@ -87,6 +101,31 @@ def _recording_interval(record):
             seconds=duration
         )
     return start, start + datetime.timedelta(seconds=duration)
+
+
+_FIXED_ABBREVIATIONS = {
+    "Z": 0, "UTC": 0, "GMT": 0,
+    "IST": 2 * 3600, "IDT": 3 * 3600,
+}
+
+
+def _meet_start(match, zone):
+    naive = datetime.datetime.strptime(
+        f"{match.group('date')} {match.group('time')}", "%Y_%m_%d %H_%M"
+    )
+    zone = zone or datetime.timezone.utc
+    local = naive.replace(tzinfo=zone)
+    abbr = match.group("abbr")
+    # The configured calendar zone is authoritative when the filename agrees
+    # with it (or names no zone). Otherwise fall back to a small fixed table
+    # so a recording exported under another zone is not silently misplaced.
+    if not abbr or local.tzname() == abbr:
+        return local.astimezone(datetime.timezone.utc)
+    offset = _FIXED_ABBREVIATIONS.get(abbr)
+    if offset is None:
+        return local.astimezone(datetime.timezone.utc)
+    fixed = datetime.timezone(datetime.timedelta(seconds=offset))
+    return naive.replace(tzinfo=fixed).astimezone(datetime.timezone.utc)
 
 
 def _timestamp_label(seconds):
@@ -161,7 +200,7 @@ def _transcript(record, directory, manual=None):
     )
 
 
-def _candidate(record, directory, manual=None):
+def _candidate(record, directory, manual=None, zone=None):
     body, transcript_path = _transcript(record, directory, manual)
     if not body.strip():
         raise RuntimeError(
@@ -169,7 +208,7 @@ def _candidate(record, directory, manual=None):
         )
     recording_id = str(record["id"])
     source_id = f"mila:{recording_id}"
-    start, end = _recording_interval(record)
+    start, end = _recording_interval(record, zone)
     title = str(record.get("title") or Path(transcript_path).stem)
     transcript_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
     # Calendar matching and the eventual entry date/title depend on more than
@@ -214,6 +253,7 @@ def _completed(record):
 def candidates(source):
     """List manual recordings first, then completed indexed Mila recordings."""
     found = {}
+    zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
     for manual in source.get("manual_recordings") or []:
         metadata_file = manual.get("recordings_file") or source["recordings_file"]
         record = _record_by_id(metadata_file, manual["recording_id"])
@@ -221,7 +261,9 @@ def candidates(source):
             raise RuntimeError(
                 f"manual Mila recording {manual['recording_id']} is not completed"
             )
-        candidate = _candidate(record, Path(metadata_file).parent, manual)
+        candidate = _candidate(
+            record, Path(metadata_file).parent, manual, zone=zone
+        )
         found[candidate["raw"]["source_id"]] = candidate
 
     excluded = {str(value) for value in source.get("exclude_recording_ids") or []}
@@ -239,13 +281,13 @@ def candidates(source):
             continue
         try:
             found[source_id] = _candidate(
-                record, metadata_file.parent
+                record, metadata_file.parent, zone=zone
             )
         except Exception as exc:
             # Keep one item-level failure visible without making a single
             # malformed sidecar prevent every other recording from running.
             try:
-                start, end = _recording_interval(record)
+                start, end = _recording_interval(record, zone)
             except Exception:
                 start = end = None
             digest = hashlib.sha256(

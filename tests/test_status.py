@@ -96,6 +96,18 @@ class TickHistoryTest(unittest.TestCase):
         self.assertEqual(history["latest"]["state"], "incomplete")
         self.assertEqual(history["routines"]["alpha"]["state"], "incomplete")
 
+    def test_abandoned_tick_does_not_clobber_newer_routine_results(self):
+        self.write(
+            "2026-07-29T10:00:00Z tick[aaa](capture): due=alpha, beta\n"
+            "2026-07-29T10:00:01Z unhandled ERROR: token expired\n"
+            "2026-07-29T11:00:00Z tick[bbb](capture): due=alpha\n"
+            "2026-07-29T11:00:05Z tick[bbb](capture) done: 1 processed, 0 already-seen, 0 error(s)\n"
+        )
+        history = status.read_tick_history(self.log)
+        self.assertEqual(history["routines"]["alpha"]["state"], "ok")
+        self.assertEqual(history["routines"]["alpha"]["at"], "2026-07-29T11:00:05Z")
+        self.assertEqual(history["routines"]["beta"]["state"], "incomplete")
+
     def test_unattributed_error_fails_all_routines_in_that_tick(self):
         self.write(
             "2026-07-29T10:00:00Z tick: due=alpha, beta\n"
@@ -262,6 +274,33 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["off"]["armed"], "no")
         self.assertEqual(by_id["alpha"]["role"], "specialized")
         self.assertEqual(by_id["alpha"]["sources"], "-")
+
+    def test_old_memory_sink_failures_are_not_open_issues(self):
+        def _iso(epoch):
+            return datetime.datetime.fromtimestamp(
+                epoch, datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        recent = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS + 60
+        stale = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS - 60
+        state.save(self.base, {
+            "old": {
+                "rule_id": "alpha",
+                "processed_at": _iso(stale),
+                "memory_error": "sink failed",
+            },
+            "new": {
+                "rule_id": "beta",
+                "processed_at": _iso(recent),
+                "memory_error": "sink failed",
+            },
+        })
+        rows = status.routine_rows(
+            self.base, self.routines, {"routines": {}}, now=5000,
+        )
+        by_id = {row["routine"]: row for row in rows}
+        self.assertNotIn("memory sink", by_id["alpha"]["issues"])
+        self.assertEqual(by_id["beta"]["issues"], "1 memory sink")
 
     def test_reports_transcriptions_that_need_manual_calendar_matching(self):
         state.save(self.base, {

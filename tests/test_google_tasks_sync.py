@@ -341,6 +341,57 @@ class GoogleTasksSyncTest(unittest.TestCase):
         self.assertNotIn("update_memory", report)
         self.assertFalse(report["ok"])
 
+    def test_source_linked_non_todo_is_reclassified_when_opted_in(self):
+        self.cfg["reclassify_non_todo"] = True
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        self.write_entry(entry_text(
+            title="Google task",
+            body="Concrete task notes.",
+            entry_type="note",
+            source_ids=[source_id],
+        ))
+
+        report = self.run_dry({f"{LIST_ID}:{TASK_ID}": task()})
+
+        self.assertEqual(report["reclassify_memory"], 1)
+        plan = next(
+            row for row in report["planned"]
+            if row["action"] == "reclassify_memory"
+        )
+        self.assertEqual(plan["previous_type"], "note")
+        self.assertEqual(report["conflicts"], 0)
+        self.assertTrue(report["ok"])
+
+    def test_reclassify_updates_entry_in_place_as_todo(self):
+        source_id = google_tasks_sync._source_id(LIST_ID, TASK_ID)
+        entry = {
+            "id": "2026-08-02-google-task",
+            "title": "Google task",
+            "date": "2026-08-02",
+            "type": "note",
+            "body": "Concrete task notes.",
+            "people": ["tomer-tunitsky"],
+            "source_ids": [source_id],
+        }
+        with mock.patch.object(
+            google_tasks_sync,
+            "_memory_cli",
+            return_value=SimpleNamespace(
+                returncode=0, stdout="updated 2026-08-02-google-task", stderr="",
+            ),
+        ) as memory_cli, mock.patch.object(
+            google_tasks_sync, "_memory_result_id", return_value=entry["id"],
+        ):
+            google_tasks_sync._memory_reclassify_todo(self.store, entry, source_id)
+
+        args = memory_cli.call_args.args[1]
+        self.assertEqual(args[args.index("--update") + 1], entry["id"])
+        self.assertEqual(args[args.index("--type") + 1], "todo")
+        self.assertEqual(args[args.index("--title") + 1], "Google task")
+        self.assertEqual(args[args.index("--body") + 1], "Concrete task notes.")
+        self.assertEqual(args[args.index("--people") + 1], "tomer-tunitsky")
+        self.assertNotIn("--force-new", args)
+
     def test_rehydrated_tombstone_of_non_todo_pair_is_retired_not_conflict(self):
         # The linked task was completed or deleted in Google (absent from the
         # open listing; `gws get` returns a tombstone either way) and the

@@ -181,6 +181,45 @@ class MilaSourceTest(unittest.TestCase):
         self.assertEqual(first["raw"]["transcript"], second["raw"]["transcript"])
         self.assertEqual(first["raw"]["source_id"], second["raw"]["source_id"])
 
+    def test_meet_export_uses_local_scheduled_start_not_import_stamp(self):
+        from zoneinfo import ZoneInfo
+        start, end = mila_source._recording_interval(
+            record(
+                "MEET",
+                audio=(
+                    "Tomer__Omri - PM resources - 2026_08_13 15_32 IDT – "
+                    "Recording 2026-08-14T16-39-11Z-FEE10D.m4a"
+                ),
+                created="2026-08-14T16:39:11Z",
+                duration=724.5,
+            ),
+            zone=ZoneInfo("Asia/Jerusalem"),
+        )
+        self.assertEqual(
+            start,
+            datetime.datetime(2026, 8, 13, 12, 32, tzinfo=datetime.timezone.utc),
+        )
+        self.assertEqual(
+            end,
+            start + datetime.timedelta(seconds=724.5),
+        )
+
+    def test_meet_export_abbreviation_wins_over_disagreeing_zone(self):
+        from zoneinfo import ZoneInfo
+        start, _end = mila_source._recording_interval(
+            record(
+                "MEET",
+                audio="Sync - 2026_01_20 10_00 UTC – Recording 2026-01-21T08-00-00Z-AB.m4a",
+                created="2026-01-21T08:00:00Z",
+                duration=600,
+            ),
+            zone=ZoneInfo("Asia/Jerusalem"),
+        )
+        self.assertEqual(
+            start,
+            datetime.datetime(2026, 1, 20, 10, 0, tzinfo=datetime.timezone.utc),
+        )
+
     def test_meeting_filename_is_start_but_voice_memo_created_at_is_start(self):
         meeting_start, meeting_end = mila_source._recording_interval(
             record("MEETING")

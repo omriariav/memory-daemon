@@ -31,6 +31,10 @@ maintenance:
   outbound_since: "2026-01-01"
   # Any memory todo carrying one of these tags remains local-only.
   exclude_tags: [no-google-tasks]
+  # When a still-open Google task is linked to a memory entry that is no longer
+  # a todo (re-captured as a note, for example), promote the entry back to a
+  # todo in place instead of reporting a conflict on every run.
+  reclassify_non_todo: false
   # Optional existing person slugs that identity enrichment must never link.
   identity_exclude_people: []
   # Fail closed instead of silently truncating an unusually large list.
