@@ -343,9 +343,10 @@ def routine_rows(
             for entry in entries
             if entry.get("processed_at")
         ]
-        # Ledger rows are never retried, so a lifetime count would flag a
-        # routine forever over one transient sink failure. Only recent
-        # failures are actionable.
+        # A sink failure is retried while its source still lists the item,
+        # which refreshes processed_at; an item the source dropped keeps its
+        # old row forever. Count only recent failures so one transient
+        # rejection does not flag the routine indefinitely.
         memory_errors = sum(
             bool(entry.get("memory_error"))
             and _within(entry.get("processed_at"), now, MEMORY_ERROR_WINDOW_SECONDS)
@@ -730,12 +731,6 @@ def _tick_issue(launchd, latest, now):
             f"last tick is stale (expected within {_duration(stale_after)})"
         )
     return None
-
-
-def _iso_from_epoch(epoch):
-    return datetime.datetime.fromtimestamp(
-        float(epoch), datetime.timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _within(value, now, window):

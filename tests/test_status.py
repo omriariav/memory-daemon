@@ -276,17 +276,22 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["alpha"]["sources"], "-")
 
     def test_old_memory_sink_failures_are_not_open_issues(self):
+        def _iso(epoch):
+            return datetime.datetime.fromtimestamp(
+                epoch, datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         recent = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS + 60
         stale = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS - 60
         state.save(self.base, {
             "old": {
                 "rule_id": "alpha",
-                "processed_at": status._iso_from_epoch(stale),
+                "processed_at": _iso(stale),
                 "memory_error": "sink failed",
             },
             "new": {
                 "rule_id": "beta",
-                "processed_at": status._iso_from_epoch(recent),
+                "processed_at": _iso(recent),
                 "memory_error": "sink failed",
             },
         })
