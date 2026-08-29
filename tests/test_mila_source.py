@@ -361,6 +361,40 @@ class MilaSourceTest(unittest.TestCase):
         )
         self.assertEqual(item["date"], "2026-07-27")
 
+    def test_declined_event_is_still_a_candidate_but_loses_ties(self):
+        indexed = record(
+            "RID",
+            segments=[{"start": 0, "end": 1, "text": "Transcript"}],
+        )
+        self.write_json(self.current / "recordings.json", [indexed])
+        source = {
+            "kind": "mila",
+            "recordings_file": str(self.current / "recordings.json"),
+            "calendar_timezone": "Asia/Jerusalem",
+            "calendar_window_days": 3,
+            "max_results": 0,
+        }
+        overlap = {
+            "start": "2026-07-27T22:00:00+03:00",
+            "end": "2026-07-27T22:35:00+03:00",
+            "event_type": "default",
+        }
+        events = [
+            {"id": "declined", "summary": "Weekly", "response_status": "declined", **overlap},
+            {"id": "accepted", "summary": "Weekly", "response_status": "accepted", **overlap},
+        ]
+        candidate = mila_source.candidates(source)[0]
+
+        with mock.patch.object(
+            mila_source, "_raw_calendar_events", return_value=events
+        ):
+            item = mila_source.fetch({}, source, candidate)
+
+        self.assertEqual(
+            [event["id"] for event in item["_mila_calendar_candidates"]],
+            ["accepted", "declined"],
+        )
+
     def test_calendar_candidates_without_ids_are_discarded(self):
         indexed = record(
             "NEW",

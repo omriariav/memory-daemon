@@ -362,7 +362,6 @@ def _calendar_candidates(source, title, recording_start, recording_end):
             or not event_id.strip()
             or event.get("status") == "cancelled"
             or event.get("all_day")
-            or event.get("response_status") == "declined"
             or event.get("event_type", "default") != "default"
         ):
             continue
@@ -399,6 +398,9 @@ def _calendar_candidates(source, title, recording_start, recording_end):
             start_gap,
             duration_gap,
             -title_overlap,
+            # A recording proves the meeting happened whatever the RSVP says;
+            # a declined invite only loses ties against an accepted one.
+            1 if event.get("response_status") == "declined" else 0,
         )
         ranked.append((rank, {
             "id": event_id,
