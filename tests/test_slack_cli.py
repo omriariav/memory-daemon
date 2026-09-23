@@ -170,6 +170,63 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
         self.assertIn("Could not resolve host", raised.exception.error)
 
+    def test_hung_request_is_retried_then_succeeds(self):
+        """A curl that never returns is transport noise, not a coverage error."""
+        attempts = []
+
+        def hangs_once(command, **_kwargs):
+            attempts.append(command)
+            if len(attempts) == 1:
+                raise slack_cli.subprocess.TimeoutExpired(cmd="curl", timeout=30)
+            return mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=hangs_once,
+             ):
+            data = slack_cli.slack_request("conversations.history")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(attempts), 2)
+
+    def test_persistent_hang_raises_slack_api_error_not_timeout(self):
+        """Exhausted hangs must surface as SlackAPIError, not TimeoutExpired."""
+        def always_hangs(_command, **_kwargs):
+            raise slack_cli.subprocess.TimeoutExpired(cmd="curl", timeout=30)
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=always_hangs,
+             ) as run, self.assertRaises(slack_cli.SlackAPIError) as raised:
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
+        self.assertIn("timed out", raised.exception.error)
+
+    def test_curl_is_given_its_own_timeouts(self):
+        """curl must cap itself below the subprocess timeout so exit 28 can fire."""
+        completed = mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as run:
+            slack_cli.slack_request("conversations.history")
+
+        command = run.call_args.args[0]
+        self.assertIn("--connect-timeout", command)
+        self.assertIn("--max-time", command)
+        self.assertLess(
+            slack_cli.MAX_TIME_SECONDS, slack_cli.SUBPROCESS_TIMEOUT_SECONDS
+        )
+
     def test_single_attempt_configuration_raises_cleanly(self):
         """TRANSPORT_ATTEMPTS = 1 must raise, not fall through the loop unbound."""
         completed = mock.Mock(
