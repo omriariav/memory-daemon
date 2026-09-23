@@ -183,7 +183,9 @@ class CensusTest(unittest.TestCase):
         self.assertIn("completed_at", result)
         self.assertEqual(result["errors"], [])
         self.assertEqual(len(result["active"]), 0)
-        self.assertEqual(seen[:2], ["C1", "D2"])
+        # The full sequence proves the retry resumes from the streak start
+        # rather than from wherever the loop happened to be.
+        self.assertEqual(seen, ["C1", "D2", "C1", "D2", "G3"])
 
     def test_rejects_checkpoint_with_out_of_range_progress(self):
         with tempfile.TemporaryDirectory() as tmp:

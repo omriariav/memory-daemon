@@ -16,8 +16,10 @@ CENSUS_VERSION = 1
 CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 20
 # At 40 rpm a streak of 20 is only a minute or two of wall time, so a brief
 # resolver blip could trip the breaker and park Slack capture until the next
-# scheduled census. Give the network one chance to come back before concluding
-# it is down; a second streak in the same run is treated as real.
+# scheduled census. Wait once before concluding the network is down, and only
+# abort on a streak that survives the wait. The grace is re-earned by progress:
+# a conversation has to succeed before another cooldown is allowed, so a
+# flapping network cannot spend cooldowns without also making headway.
 TRANSPORT_COOLDOWN_SECONDS = 60
 IGNORABLE_CONVERSATION_ERRORS = {
     # Slack can retain stale DM/channel rows in users.conversations after the
@@ -376,6 +378,7 @@ def run(
                 transport_streak = 0
         else:
             transport_streak = 0
+            cooldown_used = False
             activity = [
                 message for message in messages
                 if any(
