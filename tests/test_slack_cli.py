@@ -126,6 +126,9 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(raised.exception.error, "ratelimited")
         self.assertEqual(raised.exception.http_status, 429)
         self.assertEqual(raised.exception.retry_after, 17)
+        # A Slack-level answer is not transport noise and must never count
+        # toward the census breaker's streak.
+        self.assertFalse(raised.exception.transport)
 
     def test_transient_resolve_failure_is_retried_then_succeeds(self):
         attempts = []
@@ -169,6 +172,9 @@ class TransportTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
         self.assertIn("Could not resolve host", raised.exception.error)
+        # The census breaker keys off this flag; without it a refactor would
+        # silently stop counting transport failures and never trip.
+        self.assertTrue(raised.exception.transport)
 
     def test_hung_request_is_retried_then_succeeds(self):
         """A curl that never returns is transport noise, not a coverage error."""
@@ -208,6 +214,7 @@ class TransportTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
         self.assertIn("timed out", raised.exception.error)
+        self.assertTrue(raised.exception.transport)
 
     def test_curl_is_given_its_own_timeouts(self):
         """curl must cap itself below the subprocess timeout so exit 28 can fire."""

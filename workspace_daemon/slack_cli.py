@@ -35,12 +35,17 @@ class SlackAPIError(RuntimeError):
         error: str,
         http_status: Optional[int] = None,
         retry_after: Optional[int] = None,
+        transport: bool = False,
     ):
         super().__init__(f"{method}: {error}")
         self.method = method
         self.error = error
         self.http_status = http_status
         self.retry_after = retry_after
+        # True when the request never reached Slack. Says nothing about the
+        # conversation, so a run of these means the network is down, not that
+        # the conversations are unreadable.
+        self.transport = transport
 
 
 def config_path() -> Path:
@@ -160,6 +165,7 @@ def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
                 raise SlackAPIError(
                     method,
                     f"curl timed out after {attempts} attempt(s)",
+                    transport=True,
                 )
             time.sleep(TRANSPORT_BACKOFF_SECONDS * (2 ** attempt))
             continue
@@ -173,7 +179,9 @@ def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
             detail = result.stderr.strip()[:200]
             if attempt:
                 detail = f"{detail} (after {attempt + 1} attempts)"
-            raise SlackAPIError(method, f"curl failed: {detail}")
+            raise SlackAPIError(
+                method, f"curl failed: {detail}", transport=True
+            )
         time.sleep(TRANSPORT_BACKOFF_SECONDS * (2 ** attempt))
     body = result.stdout
     http_status, retry_after = _response_limits(raw_headers)
