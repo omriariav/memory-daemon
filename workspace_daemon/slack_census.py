@@ -14,6 +14,11 @@ CENSUS_VERSION = 1
 # unreachable -- and walking the remaining inventory just to rediscover that
 # costs hours. Abort instead; the checkpoint resumes the untried remainder.
 CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 20
+# At 40 rpm a streak of 20 is only a minute or two of wall time, so a brief
+# resolver blip could trip the breaker and park Slack capture until the next
+# scheduled census. Give the network one chance to come back before concluding
+# it is down; a second streak in the same run is treated as real.
+TRANSPORT_COOLDOWN_SECONDS = 60
 IGNORABLE_CONVERSATION_ERRORS = {
     # Slack can retain stale DM/channel rows in users.conversations after the
     # conversation is no longer readable. They are not evidence that the
@@ -209,6 +214,7 @@ def run(
     sleep=time.sleep,
     resume=True,
     transport_failure_limit=CONSECUTIVE_TRANSPORT_FAILURE_LIMIT,
+    transport_cooldown_seconds=TRANSPORT_COOLDOWN_SECONDS,
 ):
     """Discover recent roots and recent replies to older thread roots.
 
@@ -281,6 +287,7 @@ def run(
     transport_failure_limit = max(1, int(transport_failure_limit))
     transport_streak = 0
     streak_start_index = None
+    cooldown_used = False
     while index < total:
         conversation = inventory[index]
         channel = conversation["id"]
@@ -336,20 +343,34 @@ def run(
                 transport_streak += 1
                 if transport_streak >= transport_failure_limit:
                     # These rows describe the network, not the conversations.
-                    # Drop the streak and rewind so a later run re-attempts
-                    # them with a clean slate instead of inheriting a census
-                    # that looks permanently broken.
-                    del data["errors"][-transport_streak:]
-                    data["next_index"] = streak_start_index
+                    # Drop the streak and rewind so the retry -- here or in a
+                    # later run -- re-attempts them with a clean slate instead
+                    # of inheriting a census that looks permanently broken.
+                    streak = transport_streak
+                    del data["errors"][-streak:]
+                    index = streak_start_index
+                    data["next_index"] = index
                     _save_checkpoint(checkpoint, data)
+                    transport_streak = 0
+                    streak_start_index = None
+                    if not cooldown_used:
+                        cooldown_used = True
+                        progress(
+                            f"Slack census paused at {index}/{total}: "
+                            f"{streak} consecutive transport failures; "
+                            f"waiting {transport_cooldown_seconds}s before "
+                            "deciding Slack is unreachable"
+                        )
+                        sleep(transport_cooldown_seconds)
+                        continue
                     progress(
                         f"Slack census aborted at {index}/{total}: "
-                        f"{transport_streak} consecutive transport failures; "
-                        "Slack looks unreachable"
+                        f"{streak} consecutive transport failures after a "
+                        "cooldown; Slack looks unreachable"
                     )
                     raise CensusUnreachable(
-                        f"aborted after {transport_streak} consecutive "
-                        f"transport failures at {index}/{total}: {error}"
+                        f"aborted after {streak} consecutive transport "
+                        f"failures at {index}/{total}: {error}"
                     )
             else:
                 transport_streak = 0

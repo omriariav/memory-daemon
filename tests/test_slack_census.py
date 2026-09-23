@@ -53,10 +53,13 @@ class CensusTest(unittest.TestCase):
                 until_epoch=20,
                 sleep=lambda _seconds: None,
                 transport_failure_limit=2,
+                transport_cooldown_seconds=0,
             )
 
-        # Stopped on the second failure rather than attempting all three.
-        self.assertEqual(attempted, ["C1", "D2"])
+        # One streak, a cooldown, then the same two conversations again before
+        # concluding Slack is unreachable. It never walks the rest.
+        self.assertEqual(attempted, ["C1", "D2", "C1", "D2"])
+        self.assertNotIn("G3", attempted)
 
     def test_abort_rewinds_checkpoint_and_drops_the_streak(self):
         """The dropped rows described the network, not the conversations."""
@@ -75,6 +78,7 @@ class CensusTest(unittest.TestCase):
                     checkpoint=checkpoint,
                     sleep=lambda _seconds: None,
                     transport_failure_limit=2,
+                    transport_cooldown_seconds=0,
                 )
 
             saved = json.loads(checkpoint.read_text())
@@ -121,6 +125,65 @@ class CensusTest(unittest.TestCase):
             ["curl failed: could not resolve host"] * 2,
         )
         self.assertIn("completed_at", result)
+
+    def test_midrun_streak_preserves_earlier_work_and_rewinds_to_it(self):
+        """The slice and rewind must not disturb anything before the streak."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+
+            def first_ok_then_unreachable(_method, params):
+                if params["channel"] == "C1":
+                    return {"ok": True, "messages": [{"ts": "15.0"}]}
+                raise APIError("curl failed: could not resolve host", transport=True)
+
+            with self.assertRaises(slack_census.CensusUnreachable):
+                slack_census.run(
+                    self.CONVERSATIONS,
+                    first_ok_then_unreachable,
+                    cutoff_epoch=10,
+                    until_epoch=20,
+                    checkpoint=checkpoint,
+                    sleep=lambda _seconds: None,
+                    transport_failure_limit=2,
+                    transport_cooldown_seconds=0,
+                )
+
+            saved = json.loads(checkpoint.read_text())
+            # C1's completed work survives, and the rewind stops exactly at the
+            # streak start rather than behind it.
+            self.assertEqual([row["id"] for row in saved["active"]], ["C1"])
+            self.assertEqual(saved["errors"], [])
+            self.assertEqual(saved["next_index"], 1)
+
+    def test_cooldown_lets_a_brief_outage_recover(self):
+        """A blip must not park capture until the next scheduled census."""
+        seen = []
+        waits = []
+
+        def recovers_after_cooldown(_method, params):
+            seen.append(params["channel"])
+            if len(seen) <= 2:
+                raise APIError(
+                    "curl failed: could not resolve host", transport=True
+                )
+            return {"ok": True, "messages": []}
+
+        result = slack_census.run(
+            self.CONVERSATIONS,
+            recovers_after_cooldown,
+            cutoff_epoch=10,
+            until_epoch=20,
+            sleep=lambda seconds: waits.append(seconds),
+            transport_failure_limit=2,
+            transport_cooldown_seconds=60,
+        )
+
+        # Tripped, waited, rewound, and completed the whole inventory.
+        self.assertIn(60, waits)
+        self.assertIn("completed_at", result)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["active"]), 0)
+        self.assertEqual(seen[:2], ["C1", "D2"])
 
     def test_rejects_checkpoint_with_out_of_range_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
