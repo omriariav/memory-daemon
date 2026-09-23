@@ -8,10 +8,11 @@ from workspace_daemon import slack_census
 
 
 class APIError(RuntimeError):
-    def __init__(self, error, retry_after=None):
+    def __init__(self, error, retry_after=None, transport=False):
         super().__init__(error)
         self.error = error
         self.retry_after = retry_after
+        self.transport = transport
 
 
 class CensusTest(unittest.TestCase):
@@ -35,6 +36,91 @@ class CensusTest(unittest.TestCase):
             ]),
             [{"id": "C4", "error": "missing_scope"}],
         )
+
+    def test_transport_failure_streak_aborts_the_census(self):
+        """An unreachable Slack stops the run instead of walking the rest."""
+        attempted = []
+
+        def unreachable(_method, params):
+            attempted.append(params["channel"])
+            raise APIError("curl failed: could not resolve host", transport=True)
+
+        with self.assertRaises(slack_census.CensusUnreachable):
+            slack_census.run(
+                self.CONVERSATIONS,
+                unreachable,
+                cutoff_epoch=10,
+                until_epoch=20,
+                sleep=lambda _seconds: None,
+                transport_failure_limit=2,
+            )
+
+        # Stopped on the second failure rather than attempting all three.
+        self.assertEqual(attempted, ["C1", "D2"])
+
+    def test_abort_rewinds_checkpoint_and_drops_the_streak(self):
+        """The dropped rows described the network, not the conversations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "census.json"
+
+            def unreachable(_method, _params):
+                raise APIError("curl failed: could not resolve host", transport=True)
+
+            with self.assertRaises(slack_census.CensusUnreachable):
+                slack_census.run(
+                    self.CONVERSATIONS,
+                    unreachable,
+                    cutoff_epoch=10,
+                    until_epoch=20,
+                    checkpoint=checkpoint,
+                    sleep=lambda _seconds: None,
+                    transport_failure_limit=2,
+                )
+
+            saved = json.loads(checkpoint.read_text())
+            self.assertEqual(saved["errors"], [])
+            self.assertEqual(saved["next_index"], 0)
+            self.assertNotIn("completed_at", saved)
+
+    def test_slack_level_errors_do_not_trip_the_breaker(self):
+        """A conversation Slack refuses is a real fact, not network noise."""
+        def refused(_method, _params):
+            raise APIError("channel_not_found")
+
+        result = slack_census.run(
+            self.CONVERSATIONS,
+            refused,
+            cutoff_epoch=10,
+            until_epoch=20,
+            sleep=lambda _seconds: None,
+            transport_failure_limit=2,
+        )
+
+        self.assertEqual(len(result["errors"]), 3)
+        self.assertEqual(result["completed_at"][-1], "Z")
+
+    def test_a_success_resets_the_transport_streak(self):
+        """Scattered transport failures on a healthy run must not abort it."""
+        def flaky(_method, params):
+            if params["channel"] == "D2":
+                return {"ok": True, "messages": []}
+            raise APIError("curl failed: could not resolve host", transport=True)
+
+        result = slack_census.run(
+            self.CONVERSATIONS,
+            flaky,
+            cutoff_epoch=10,
+            until_epoch=20,
+            sleep=lambda _seconds: None,
+            transport_failure_limit=2,
+        )
+
+        # C1 fails, D2 succeeds and resets, G3 fails: never two in a row.
+        self.assertEqual(
+            [row["error"] for row in result["errors"]],
+            ["curl failed: could not resolve host"] * 2,
+        )
+        self.assertIn("completed_at", result)
 
     def test_rejects_checkpoint_with_out_of_range_progress(self):
         with tempfile.TemporaryDirectory() as tmp:

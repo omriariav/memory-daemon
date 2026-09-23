@@ -9,6 +9,11 @@ from . import state
 
 
 CENSUS_VERSION = 1
+# A census issues one request per conversation. Transport failures say nothing
+# about the conversation, so a long unbroken run of them means Slack is
+# unreachable -- and walking the remaining inventory just to rediscover that
+# costs hours. Abort instead; the checkpoint resumes the untried remainder.
+CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 20
 IGNORABLE_CONVERSATION_ERRORS = {
     # Slack can retain stale DM/channel rows in users.conversations after the
     # conversation is no longer readable. They are not evidence that the
@@ -17,6 +22,15 @@ IGNORABLE_CONVERSATION_ERRORS = {
     "is_archived",
     "not_in_channel",
 }
+
+
+class CensusUnreachable(RuntimeError):
+    """Slack looked unreachable, so the census stopped instead of grinding.
+
+    The checkpoint is rewound to the start of the failing streak, so a later
+    run retries those conversations rather than inheriting errors that were
+    never evidence about them.
+    """
 
 
 def fatal_errors(errors):
@@ -194,6 +208,7 @@ def run(
     progress=None,
     sleep=time.sleep,
     resume=True,
+    transport_failure_limit=CONSECUTIVE_TRANSPORT_FAILURE_LIMIT,
 ):
     """Discover recent roots and recent replies to older thread roots.
 
@@ -261,6 +276,11 @@ def run(
     delay = 60.0 / requests_per_minute
     total = len(inventory)
     index = int(data.get("next_index") or 0)
+    # Clamp for the same reason the request retry does: a nonsensical limit
+    # should degrade to a safe behaviour, never to an unreachable branch.
+    transport_failure_limit = max(1, int(transport_failure_limit))
+    transport_streak = 0
+    streak_start_index = None
     while index < total:
         conversation = inventory[index]
         channel = conversation["id"]
@@ -310,7 +330,31 @@ def run(
                 sleep(wait_seconds)
                 continue
             data["errors"].append({"id": channel, "error": error})
+            if getattr(exc, "transport", False):
+                if transport_streak == 0:
+                    streak_start_index = index
+                transport_streak += 1
+                if transport_streak >= transport_failure_limit:
+                    # These rows describe the network, not the conversations.
+                    # Drop the streak and rewind so a later run re-attempts
+                    # them with a clean slate instead of inheriting a census
+                    # that looks permanently broken.
+                    del data["errors"][-transport_streak:]
+                    data["next_index"] = streak_start_index
+                    _save_checkpoint(checkpoint, data)
+                    progress(
+                        f"Slack census aborted at {index}/{total}: "
+                        f"{transport_streak} consecutive transport failures; "
+                        "Slack looks unreachable"
+                    )
+                    raise CensusUnreachable(
+                        f"aborted after {transport_streak} consecutive "
+                        f"transport failures at {index}/{total}: {error}"
+                    )
+            else:
+                transport_streak = 0
         else:
+            transport_streak = 0
             activity = [
                 message for message in messages
                 if any(
