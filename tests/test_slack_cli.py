@@ -127,6 +127,142 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(raised.exception.http_status, 429)
         self.assertEqual(raised.exception.retry_after, 17)
 
+    def test_transient_resolve_failure_is_retried_then_succeeds(self):
+        attempts = []
+
+        def flaky(command, **_kwargs):
+            attempts.append(command)
+            if len(attempts) < 3:
+                return mock.Mock(
+                    returncode=6,
+                    stdout="",
+                    stderr="curl: (6) Could not resolve host: slack.com",
+                )
+            return mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=flaky,
+             ):
+            data = slack_cli.slack_request("conversations.history")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(attempts), 3)
+
+    def test_transient_failure_raises_after_retries_are_exhausted(self):
+        completed = mock.Mock(
+            returncode=6,
+            stdout="",
+            stderr="curl: (6) Could not resolve host: slack.com",
+        )
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as run, self.assertRaises(slack_cli.SlackAPIError) as raised:
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
+        self.assertIn("Could not resolve host", raised.exception.error)
+
+    def test_hung_request_is_retried_then_succeeds(self):
+        """A curl that never returns is transport noise, not a coverage error."""
+        attempts = []
+
+        def hangs_once(command, **_kwargs):
+            attempts.append(command)
+            if len(attempts) == 1:
+                raise slack_cli.subprocess.TimeoutExpired(cmd="curl", timeout=30)
+            return mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=hangs_once,
+             ):
+            data = slack_cli.slack_request("conversations.history")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(attempts), 2)
+
+    def test_persistent_hang_raises_slack_api_error_not_timeout(self):
+        """Exhausted hangs must surface as SlackAPIError, not TimeoutExpired."""
+        def always_hangs(_command, **_kwargs):
+            raise slack_cli.subprocess.TimeoutExpired(cmd="curl", timeout=30)
+
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 side_effect=always_hangs,
+             ) as run, self.assertRaises(slack_cli.SlackAPIError) as raised:
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(run.call_count, slack_cli.TRANSPORT_ATTEMPTS)
+        self.assertIn("timed out", raised.exception.error)
+
+    def test_curl_is_given_its_own_timeouts(self):
+        """curl must cap itself below the subprocess timeout so exit 28 can fire."""
+        completed = mock.Mock(returncode=0, stdout='{"ok": true}', stderr="")
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as run:
+            slack_cli.slack_request("conversations.history")
+
+        command = run.call_args.args[0]
+        self.assertIn("--connect-timeout", command)
+        self.assertIn("--max-time", command)
+        self.assertLess(
+            slack_cli.MAX_TIME_SECONDS, slack_cli.SUBPROCESS_TIMEOUT_SECONDS
+        )
+
+    def test_single_attempt_configuration_raises_cleanly(self):
+        """TRANSPORT_ATTEMPTS = 1 must raise, not fall through the loop unbound."""
+        completed = mock.Mock(
+            returncode=6,
+            stdout="",
+            stderr="curl: (6) Could not resolve host: slack.com",
+        )
+        with mock.patch.object(slack_cli, "TRANSPORT_ATTEMPTS", 1), \
+             mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as run, self.assertRaises(slack_cli.SlackAPIError):
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(run.call_count, 1)
+
+    def test_non_transient_curl_failure_is_not_retried(self):
+        completed = mock.Mock(
+            returncode=60,
+            stdout="",
+            stderr="curl: (60) SSL certificate problem",
+        )
+        with mock.patch.object(slack_cli, "token", return_value="token"), \
+             mock.patch.object(slack_cli.time, "sleep"), \
+             mock.patch.object(
+                 slack_cli.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as run, self.assertRaises(slack_cli.SlackAPIError):
+            slack_cli.slack_request("conversations.history")
+
+        self.assertEqual(run.call_count, 1)
+
 
 class TimestampTest(unittest.TestCase):
     def test_python39_compatible_utc_suffix(self):

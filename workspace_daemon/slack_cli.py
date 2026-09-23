@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,6 +82,32 @@ def token() -> str:
     return value
 
 
+# curl exit codes that mean "the request never reached Slack", not "Slack said
+# no". A burst census fires one curl per conversation, and the system resolver
+# drops some of them under that load; without a retry each drop became a
+# permanent coverage error cached for the life of the census.
+TRANSIENT_CURL_EXIT_CODES = {
+    6,   # couldn't resolve host
+    7,   # failed to connect
+    18,  # partial file: transfer ended early
+    28,  # operation timed out
+    35,  # SSL connect error
+    52,  # empty reply from server
+    55,  # failure sending network data
+    56,  # failure receiving network data
+}
+# Total attempts, not retries-after-the-first: 1 means try once and never
+# retry. Every method reached through slack_request is a read, so replaying a
+# request that never landed cannot double-apply a write.
+TRANSPORT_ATTEMPTS = 3
+TRANSPORT_BACKOFF_SECONDS = 0.5
+# curl's own ceilings, kept below the subprocess timeout so a stalled request
+# surfaces as exit 28 (retriable) rather than as TimeoutExpired.
+CONNECT_TIMEOUT_SECONDS = 10
+MAX_TIME_SECONDS = 25
+SUBPROCESS_TIMEOUT_SECONDS = 30
+
+
 def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
     """Call one Slack Web API method via curl.
 
@@ -92,33 +119,62 @@ def slack_request(method: str, params: Optional[Dict] = None) -> Dict:
         url += "?" + urllib.parse.urlencode(
             {key: value for key, value in params.items() if value is not None}
         )
-    with tempfile.NamedTemporaryFile(
-        prefix="memory-daemon-slack-headers-",
-        delete=False,
-    ) as header_file:
-        header_path = Path(header_file.name)
-    try:
-        result = subprocess.run(
-            [
-                "curl", "-sS", "-X", "POST", url,
-                "--dump-header", str(header_path),
-                "-H", "@-",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            input=f"Authorization: Bearer {token()}\n",
-        )
+    attempts = max(1, TRANSPORT_ATTEMPTS)
+    for attempt in range(attempts):
+        last_attempt = attempt == attempts - 1
+        with tempfile.NamedTemporaryFile(
+            prefix="memory-daemon-slack-headers-",
+            delete=False,
+        ) as header_file:
+            header_path = Path(header_file.name)
+        timed_out = False
         try:
-            raw_headers = header_path.read_text(errors="replace")
-        except OSError:
-            raw_headers = ""
-    finally:
-        header_path.unlink(missing_ok=True)
-    if result.returncode != 0:
-        raise SlackAPIError(
-            method, f"curl failed: {result.stderr.strip()[:200]}"
+            try:
+                result = subprocess.run(
+                    [
+                        "curl", "-sS", "-X", "POST", url,
+                        "--connect-timeout", str(CONNECT_TIMEOUT_SECONDS),
+                        "--max-time", str(MAX_TIME_SECONDS),
+                        "--dump-header", str(header_path),
+                        "-H", "@-",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                    input=f"Authorization: Bearer {token()}\n",
+                )
+            except subprocess.TimeoutExpired:
+                # curl never returned inside the hard ceiling. The request did
+                # not land, so this is transport noise exactly like a dropped
+                # resolve -- not evidence about the conversation.
+                timed_out = True
+            if not timed_out:
+                try:
+                    raw_headers = header_path.read_text(errors="replace")
+                except OSError:
+                    raw_headers = ""
+        finally:
+            header_path.unlink(missing_ok=True)
+        if timed_out:
+            if last_attempt:
+                raise SlackAPIError(
+                    method,
+                    f"curl timed out after {attempts} attempt(s)",
+                )
+            time.sleep(TRANSPORT_BACKOFF_SECONDS * (2 ** attempt))
+            continue
+        if result.returncode == 0:
+            break
+        retriable = (
+            result.returncode in TRANSIENT_CURL_EXIT_CODES
+            and not last_attempt
         )
+        if not retriable:
+            detail = result.stderr.strip()[:200]
+            if attempt:
+                detail = f"{detail} (after {attempt + 1} attempts)"
+            raise SlackAPIError(method, f"curl failed: {detail}")
+        time.sleep(TRANSPORT_BACKOFF_SECONDS * (2 ** attempt))
     body = result.stdout
     http_status, retry_after = _response_limits(raw_headers)
     try:
