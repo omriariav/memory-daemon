@@ -673,6 +673,15 @@ def validate(routine):
     for key in ("provider", "model"):
         if not analyze.get(key):
             problems.append(f"{rid}: analyze.{key} is required")
+    # Transcript calendar matching still calls yoetz with analyze.provider.
+    transcript_kinds = sorted({
+        s.get("kind") for s in sources(routine) if s.get("kind") in ("mila", "whisper")
+    })
+    if analyze.get("provider") == "claude" and transcript_kinds:
+        problems.append(
+            f"{rid}: analyze.provider claude is not supported for "
+            f"{', '.join(transcript_kinds)} sources yet (calendar matching uses yoetz)"
+        )
     # The instruction may be inline or sourced from a store connector body.
     from . import connector_prompts
     problems.extend(connector_prompts.validate(routine))
