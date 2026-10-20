@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import memory_sink
+from workspace_daemon import contacts, drive, memory_sink
 
 # Verbatim `slugs list --kind person` output from personal-memory (2026-07).
 # The count column broke the original parser: it returned an empty set, and the
@@ -296,7 +296,7 @@ class CaptureValidationTest(unittest.TestCase):
 
     def setUp(self):
         memory_sink._slug_cache.clear()
-        memory_sink.contacts.clear_cache()
+        contacts.clear_cache()
         memory_sink._slug_cache["/store"] = {"jane-doe"}
         self.routine = {"id": "r", "memory": {"store": "/store", "type": "note",
                                               "extract": False}}
@@ -770,7 +770,7 @@ class CaptureValidationTest(unittest.TestCase):
             "slug": "owner-example",
             "resource_name": "people/owner-example",
         }
-        with mock.patch.object(memory_sink.contacts, "resolve_email",
+        with mock.patch.object(contacts, "resolve_email",
                                return_value=verified):
             out, calls = self._run_capture()
 
@@ -791,7 +791,7 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/directory-person",
         }
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=verified
+            contacts, "resolve_email", return_value=verified
         ):
             out, calls = self._run_capture({
                 "worthy": True,
@@ -818,7 +818,7 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/observer",
         }
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=verified
+            contacts, "resolve_email", return_value=verified
         ):
             out, calls = self._run_capture({
                 "worthy": True,
@@ -844,9 +844,9 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/other",
         }
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=verified
+            contacts, "resolve_email", return_value=verified
         ) as resolve, mock.patch.object(
-            memory_sink.drive, "current_user_email", return_value="me@example.com"
+            drive, "current_user_email", return_value="me@example.com"
         ):
             people, unresolved = memory_sink._verified_source_people(
                 self.item,
@@ -895,7 +895,7 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/memory-owner",
         }
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=same_person
+            contacts, "resolve_email", return_value=same_person
         ) as resolve:
             out, calls = self._run_capture({
                 "worthy": True,
@@ -924,7 +924,7 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/different-person",
         }
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=different_person
+            contacts, "resolve_email", return_value=different_person
         ):
             out, calls = self._run_capture({
                 "worthy": True,
@@ -945,7 +945,7 @@ class CaptureValidationTest(unittest.TestCase):
             "email": "observer@example.com",
             "name": "Observer",
         }]
-        with mock.patch.object(memory_sink.contacts, "resolve_email") as resolve:
+        with mock.patch.object(contacts, "resolve_email") as resolve:
             out, calls = self._run_capture()
 
         resolve.assert_not_called()
@@ -968,7 +968,7 @@ class CaptureValidationTest(unittest.TestCase):
             }
 
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", side_effect=resolve
+            contacts, "resolve_email", side_effect=resolve
         ) as directory:
             out, calls = self._run_capture({
                 "worthy": True,
@@ -990,7 +990,7 @@ class CaptureValidationTest(unittest.TestCase):
             "name": "Unknown",
         }]
         with mock.patch.object(
-            memory_sink.contacts, "resolve_email", return_value=None
+            contacts, "resolve_email", return_value=None
         ):
             out, calls = self._run_capture({
                 "worthy": True,
@@ -1017,7 +1017,7 @@ class CaptureValidationTest(unittest.TestCase):
             "resource_name": "people/owner-example",
         }
         with mock.patch.object(
-            memory_sink.contacts,
+            contacts,
             "resolve_email",
             return_value=verified,
         ) as resolve:
@@ -1032,7 +1032,7 @@ class CaptureValidationTest(unittest.TestCase):
 
     def test_identity_failure_skips_owner_enrichment_and_marks_for_repair(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
-        with mock.patch.object(memory_sink.contacts, "resolve_email") as resolve:
+        with mock.patch.object(contacts, "resolve_email") as resolve:
             out, calls = self._run_capture(
                 current_user_email=RuntimeError("Drive unavailable"),
             )
@@ -1045,7 +1045,7 @@ class CaptureValidationTest(unittest.TestCase):
 
     def test_unresolved_drive_owner_is_tagged_without_failing_capture(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
-        with mock.patch.object(memory_sink.contacts, "resolve_email",
+        with mock.patch.object(contacts, "resolve_email",
                                return_value=None):
             out, calls = self._run_capture()
 
@@ -1057,7 +1057,7 @@ class CaptureValidationTest(unittest.TestCase):
     def test_directory_failure_is_tagged_without_failing_capture(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
         with mock.patch.object(
-            memory_sink.contacts,
+            contacts,
             "resolve_email",
             side_effect=RuntimeError("directory unavailable"),
         ):
@@ -1070,11 +1070,11 @@ class CaptureValidationTest(unittest.TestCase):
     def test_directory_failure_shells_out_once_across_captures(self):
         self.item["frontmatter"]["drive_owner_emails"] = ["owner@example.com"]
         with mock.patch.object(
-            memory_sink.contacts,
+            contacts,
             "run_json",
             side_effect=RuntimeError("directory unavailable"),
         ) as directory, mock.patch.object(
-            memory_sink.contacts,
+            contacts,
             "gws_bin",
             return_value="/bin/gws",
         ):
@@ -1095,7 +1095,7 @@ class CaptureValidationTest(unittest.TestCase):
     def test_source_not_worthy_sentinel_skips_extraction_and_store(self):
         with mock.patch.object(memory_sink, "_extract") as extract, \
              mock.patch.object(memory_sink, "_cli") as cli, \
-             mock.patch.object(memory_sink.contacts, "resolve_email") as resolve, \
+             mock.patch.object(contacts, "resolve_email") as resolve, \
              mock.patch.object(memory_sink, "log"):
             out = memory_sink.capture(
                 self.routine,

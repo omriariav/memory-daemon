@@ -30,7 +30,7 @@ from pathlib import Path
 
 import yaml
 
-from . import contacts, drive
+from . import identity as identity_providers
 from .shell import log, npx_bin
 
 MEMORY_TYPES = {
@@ -167,6 +167,7 @@ def validate(routine):
     problems = []
     unknown = set(cfg) - {
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
+        "identity",
     }
     if unknown:
         problems.append(
@@ -184,6 +185,7 @@ def validate(routine):
     tags = cfg.get("tags")
     if tags is not None and not isinstance(tags, list):
         problems.append(f"{rid}: memory.tags must be a list")
+    problems.extend(identity_providers.validate(cfg, rid))
     confirmed = cfg.get("operator_confirmed_source_ids")
     if confirmed is not None and (
         not isinstance(confirmed, list)
@@ -404,10 +406,11 @@ def followup_source_id_for(item):
     return f"gmail:{thread_id}:followup-open" if thread_id else None
 
 
-def _authenticated_identity(rid):
+def _authenticated_identity(rid, provider=None):
     """Verified authenticated person used to enforce self-exclusion."""
+    provider = provider or identity_providers.provider_for({})
     try:
-        email = drive.current_user_email()
+        email = provider.current_user_email()
     except Exception as exc:
         log(
             f"routine={rid} memory WARN authenticated Workspace identity "
@@ -415,7 +418,7 @@ def _authenticated_identity(rid):
         )
         return {"email": None, "person": None, "safe": False}
     try:
-        person = contacts.resolve_email(email)
+        person = provider.resolve_email(email)
     except Exception as exc:
         log(
             f"routine={rid} memory WARN authenticated person lookup failed "
@@ -429,6 +432,26 @@ def _authenticated_identity(rid):
         )
         return {"email": email, "person": None, "safe": False}
     return {"email": email, "person": person, "safe": True}
+
+
+def _prefetch_identities(item, rid, provider, extract):
+    """Let a batching provider resolve all of an item's emails in one call."""
+    meta = item.get("frontmatter") or {}
+    emails = list(meta.get("drive_owner_emails") or [])
+    if extract:
+        people = [
+            c for c in (meta.get("source_people") or [])
+            if isinstance(c, dict) and c.get("email")
+        ][:MAX_SOURCE_PEOPLE]
+        emails += [c["email"] for c in people]
+    emails = [str(e).strip().casefold() for e in emails if e]
+    if not emails:
+        return
+    try:
+        provider.prefetch(list(dict.fromkeys(emails)))
+    except Exception as exc:
+        # Resolution below re-raises the latched outage per email and fails closed.
+        log(f"routine={rid} memory WARN identity prefetch failed: {exc}")
 
 
 def _is_authenticated_person(email, person, identity):
@@ -463,8 +486,9 @@ def _known_slugs_for_identity(store, identity):
     return slugs
 
 
-def _verified_owner_people(item, rid, identity):
+def _verified_owner_people(item, rid, identity, provider=None):
     """Resolve exact Drive owner emails; return (slugs, unresolved emails)."""
+    provider = provider or identity_providers.provider_for({})
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
     if not owner_emails:
         return [], []
@@ -483,7 +507,7 @@ def _verified_owner_people(item, rid, identity):
             log(f"routine={rid} memory: skipped authenticated user as Drive owner")
             continue
         try:
-            person = contacts.resolve_email(normalized)
+            person = provider.resolve_email(normalized)
         except Exception as exc:
             log(f"routine={rid} memory WARN directory lookup failed for {normalized}: {exc}")
             unresolved.append(normalized)
@@ -509,8 +533,9 @@ def _verified_owner_people(item, rid, identity):
     return list(dict.fromkeys(slugs)), unresolved
 
 
-def _verified_source_people(item, rid, identity):
+def _verified_source_people(item, rid, identity, provider=None):
     """Resolve exact Gmail/Chat participant emails for safe model attribution."""
+    provider = provider or identity_providers.provider_for({})
     candidates = item.get("frontmatter", {}).get("source_people") or []
     candidates = [
         candidate for candidate in candidates
@@ -541,7 +566,7 @@ def _verified_source_people(item, rid, identity):
             log(f"routine={rid} memory: skipped authenticated user as source participant")
             continue
         try:
-            person = contacts.resolve_email(email)
+            person = provider.resolve_email(email)
         except Exception as exc:
             log(f"routine={rid} memory WARN directory lookup failed for {email}: {exc}")
             unresolved.append(email)
@@ -764,19 +789,22 @@ def capture(routine, item, summary, dry_run=False):
     extraction_succeeded = False
     extract = cfg.get("extract", True)
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
+    provider = identity_providers.provider_for(routine)
     identity = (
-        _authenticated_identity(rid)
+        _authenticated_identity(rid, provider)
         if extract or owner_emails
         else {"email": None, "person": None, "safe": False}
     )
+    if identity.get("safe"):
+        _prefetch_identities(item, rid, provider, extract)
     if extract:
         verified_source, unresolved_source = _verified_source_people(
-            item, rid, identity
+            item, rid, identity, provider
         )
     else:
         verified_source, unresolved_source = [], []
     verified_owners, unresolved_owners = _verified_owner_people(
-        item, rid, identity
+        item, rid, identity, provider
     )
     if extract:
         try:

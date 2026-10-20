@@ -857,6 +857,54 @@ capture; they skip unsafe enrichment and add `people-unmapped` for later repair.
 This requires Workspace directory-read access and the source-specific metadata
 scopes in the `gws` authorization.
 
+### Identity providers
+
+`memory.identity.provider` chooses how participants are resolved: `gws`
+(default, the directory flow above, unchanged) or `slack_mcp`.
+
+`slack_mcp` resolves people through a claude.ai Slack connector driven by the
+headless Claude bridge. The connector masks emails (DLP), so searching by email
+cannot work. The daemon searches the email's local part instead and verifies
+the hit; it never tries to unmask anything.
+
+```yaml
+memory:
+  store: /path/to/store
+  identity:
+    provider: slack_mcp
+    owner_email: me@example.com     # the authenticated user, no lookup
+    owner_slug: me-example          # owner's person slug in the store
+    owner_name: Me Example          # optional
+    search_tool: mcp__claude_ai_Example_Slack__slack_search_users
+    profile_tool: mcp__claude_ai_Example_Slack__slack_read_user_profile
+    model: haiku                    # optional
+    cache: state/identity-cache.json  # optional, relative to the base dir
+    hit_ttl_days: 30                # optional
+    miss_ttl_days: 1                # optional
+    batch_size: 15                  # optional, emails per bridge call
+```
+
+Acceptance rule: for each email the daemon reads the profile of every user the
+search returned and accepts the person only if exactly one candidate is not a
+bot, has a `Username` equal to the local part (case-insensitive), and has a
+masked email whose segment lengths match the real address (local part and
+domain split on `.`; `[EMAIL:*****.*****@*******.***]` fits
+`alice.smith@example.com`). Anything else is unresolved and handled like a
+directory miss: the person is dropped and the memory is tagged
+`people-unmapped`. The slug is the kebab-case ASCII-folded real name, as for
+`gws`; nothing is written to the store.
+
+One bridge session serves up to `batch_size` uncached emails; the sink
+prefetches all of an item's participant and Drive-owner emails together. The
+owner's own email resolves locally. Results are cached in a JSON file (mode
+`0600`, atomic writes): hits for `hit_ttl_days`, misses for `miss_ttl_days`. A
+corrupt cache is treated as empty. A bridge failure is an outage, latched for
+the rest of the run, and the sink fails closed as it does for a `gws` outage.
+Dry runs never reach identity resolution.
+
+Privacy: logs carry counts only, never emails or names, and the bridge allows
+only the two configured read-only connector tools.
+
 Picking the **wrong** document is the worst thing this can do — a confident
 summary of somebody else's meeting, filed in your vault. Three guards:
 
@@ -1186,6 +1234,7 @@ workspace_daemon/
   gmail.py                 gws Gmail adapter
   drive.py                 gws Drive/Docs adapter, tab reading, doc lookup
   contacts.py              exact Workspace-directory identity resolution
+  identity.py              pluggable identity providers (gws, slack_mcp)
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
   mila_source.py           read-only Mila + Calendar matching
