@@ -4,8 +4,12 @@
 # Claude bridge (a claude.ai Google Calendar connector, read-only tools only)
 # and writes a compact text file plus a JSON twin. A Claude Code
 # UserPromptSubmit hook can `cat` the text file into every prompt. Claude only
-# transports the connector results; Python parses and renders them. Event text
-# from outside internal_domains never reaches the file as agenda or links.
+# transports the connector results; Python parses and renders them. Agendas
+# and links are kept only for internal events; outside text is length-capped.
+#
+# Scheduling: calendar_cache runs in its own tick group. Install the optional
+# launchd job `tick --group calendar` (see README); `tick --group maintenance`
+# does not run it.
 #
 # The tool names are exact MCP tool names as your connector exposes them; run
 # `claude mcp list` / check your connector to find them.
@@ -25,16 +29,19 @@ schedule:
 
 maintenance:
   kind: calendar_cache
-  # Pinned: the bridge only permits calls with exactly this calendar_id.
+  # Pinned: the bridge only permits calls with exactly this calendar_id (and
+  # the window and max_events computed by the routine).
   calendar_id: primary
   window_hours: 48
   # Rendering timezone (IANA).
   timezone: UTC
   # Whose RSVP is "my RSVP"; also makes events you organize show "organizer".
   owner_email: me@example.com
-  # Agendas and links are kept only for events organized from these domains.
+  # Events are internal only when the organizer's domain is exactly one of
+  # these. Agendas and links are kept only for internal events.
   internal_domains: [example.com]
-  # The JSON twin is written next to it with a .json extension.
+  # Absolute or ~ path. The JSON twin is written next to it with a .json
+  # extension.
   output: ~/.cache/claude-calendar/next48h.txt
   # All-day working-location style markers to drop.
   skip_titles: [Office, Home]
@@ -44,3 +51,10 @@ maintenance:
   list_tool: mcp__claude_ai_Example_Calendar__list_events
   get_tool: mcp__claude_ai_Example_Calendar__get_event
   max_events: 50
+  # get_event lookups per run (soonest events first).
+  max_details: 20
+  # A failed refresh marks the text file STALE once the last good one is older.
+  stale_after: 2h
+  # Conference links from outside events are kept only for these hosts (and
+  # their subdomains).
+  conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]

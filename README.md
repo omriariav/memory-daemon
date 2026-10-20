@@ -645,12 +645,25 @@ Calendar on disk. Each run fetches the next `window_hours` through the
 (a claude.ai Google Calendar connector; Claude only transports the tool
 results) and Python parses and renders them into `output` (text) and the same
 path with a `.json` extension (normalized events plus `refreshed_at`, for other
-routines). Both files are written atomically (mode 0600); if the bridge call or
-parsing fails the run errors and the previous files stay untouched. A result
-that cannot be parsed is a failure, never "0 events".
+routines). Both files are written atomically (mode 0600, parent directory 0700
+when created); `output` must be an absolute or `~` path. The list call's
+`calendar_id`, `time_min`, `time_max` and `max_results` are all computed in
+Python and pinned in the bridge allowlist, and events outside the window are
+dropped. If the bridge call or parsing fails the run errors and the previous
+files stay untouched. A result that cannot be parsed is a failure, never "0
+events": only a whole-text "No events found" / "Found 0 event(s)" counts as
+empty. Once the last good refresh is older than `stale_after` (default `2h`), a
+failed run rewrites the text file with a `# Calendar STALE: last refreshed ...`
+header and drops events that already ended (the JSON twin is left as is).
 
-The routine has its own lock (`calendar-cache.lock`), so a long capture or
-Slack census never delays the refresh, and the refresh never delays them. See
+Calendar refreshes run in their own tick group, never in `maintenance`: install
+the optional `com.memory-daemon-calendar` job (`tick --group calendar`) so a
+long Slack census in the maintenance job cannot delay it. A calendar_cache
+routine also runs under `tick` / `tick --group all`, but not under
+`--group maintenance`, so without the calendar job (or an `all` tick) it never
+refreshes. The routine keeps its own lock (`calendar-cache.lock`). The bridge
+call times out after 180s (2 attempts), and at most `max_details` (default 20,
+soonest first) event lookups are made per run. See
 `routines/_example-calendar-cache.yaml`; `checkpoint` is not used.
 
 ```yaml
@@ -668,6 +681,9 @@ maintenance:
   list_tool: mcp__claude_ai_Example_Calendar__list_events
   get_tool: mcp__claude_ai_Example_Calendar__get_event
   max_events: 50
+  max_details: 20                      # get_event lookups per run, soonest first
+  stale_after: 2h                      # mark the text file STALE after this
+  conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]
 ```
 
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
@@ -703,14 +719,22 @@ context):
 
 Security notes:
 
-- Only the two read-only tools you configure are allowlisted, and `calendar_id`
-  is pinned, so the bridge refuses any other calendar or tool. Claude never
-  writes the files.
+- Only the two read-only tools you configure are allowlisted, and the list
+  call's arguments (calendar, window, size) are pinned, so the bridge refuses
+  any other calendar, window or tool. Claude never writes the files.
 - Everything in the file is injected into every prompt, so event text is
-  treated as untrusted: control characters are stripped, each field is one
-  line, and agendas (description, collapsed, 300 characters) and links are kept
-  only when the organizer's domain is in `internal_domains`. Invitations from
-  outside never contribute free text beyond the title, location and names.
+  treated as untrusted: control characters are stripped and each field is one
+  line. An event is internal only when its organizer's email domain is exactly
+  in `internal_domains` (no suffix matching), or a shared calendar organizes it
+  and its creator is internal and the event type is `default`. The creator
+  alone never makes an event internal.
+- Agendas (description, collapsed, 300 characters) and extra links are kept only
+  for internal events, and conference links never carry query strings, so
+  passcodes are not written. For events from outside, what can still reach the
+  prompt is: the title (100 characters), the location (80 characters, links
+  removed), organizer and attendee names derived from email addresses (at most
+  3 words / 30 characters each), RSVP statuses, room names, and a conference
+  link only if its host is in `conference_hosts` (or a subdomain of it).
   Internal descriptions are still prompt input; list only domains you trust.
 - The cache contains meeting titles and attendee names, so it is written 0600.
 
@@ -1079,15 +1103,22 @@ Security model, least privilege by construction:
   persisted, permission mode is `dontAsk`, and risky built-ins (shell, edit,
   web, agents, scheduling) are disallowed.
 - A PreToolUse hook denies everything except `ToolSearch select:<allowlisted
-  names>` and allowlisted tools whose arguments equal their pinned values. Any
-  hook error denies.
-- The stream is re-checked in Python: a non-success result, any permission
-  denial, an off-allowlist tool call, an unexpected built-in, or a tool error
-  fails the run closed. If the model made no real call for a required tool
-  (it sometimes answers from imagination), the run is retried, up to 3 attempts.
-- Errors name only kinds, exit codes and tool names; prompts and tool
+  names>` and allowlisted tools whose arguments exactly equal their pinned
+  values (JSON types included, so `true` is not `1`). Any hook error denies.
+- The stream is re-checked in Python, including the same pin check on every
+  tool call, so a hook that fails open cannot widen access: a non-success
+  result, an off-allowlist call, a call that ran despite failing its pins, an
+  unexpected built-in, a missing `init` event, or a tool error fails the run
+  closed. Hook-denied calls (e.g. the model trying `Read`) never yield results
+  and only bump a denial count in the usage log. If the model made no real call
+  for a required tool (it sometimes answers from imagination), the run is
+  retried, up to 3 attempts. The timeout covers the connector wait and the
+  stdin write. `call_tools(..., accept_partial=True)` returns results gathered
+  before a max-turns/max-budget stop (flagged `.partial`) if every required
+  tool already answered.
+- Errors name only kinds, exit codes and known tool names (anything else is `<invalid>`); prompts and tool
   inputs/results are never logged. `state/claude-usage.jsonl` (0600) records
-  per-attempt model, tool names, duration, cost and token counts only.
+  per-attempt model, tool names, denial count, duration, cost and token counts only.
 
 ### Label caching
 
@@ -1160,12 +1191,17 @@ sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HO
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon-maintenance.plist.template \
   > ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
+# Optional: only needed for a calendar_cache routine (see "Calendar cache").
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+  launchd/com.memory-daemon-calendar.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon-calendar.plist
 
 # Replace REPLACE_ME with your provider API key, then keep both rendered
 # definitions private. The maintenance job does not receive the provider key.
 $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
 chmod 600 ~/Library/LaunchAgents/com.memory-daemon.plist \
   ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
+chmod 600 ~/Library/LaunchAgents/com.memory-daemon-calendar.plist 2>/dev/null || true
 
 # One-time cleanup when upgrading from the former workspace-daemon label.
 launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
@@ -1227,11 +1263,13 @@ the LaunchAgent or a routine needs attention, so it can also be used by a
 separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
 installed job uses a different label.
 
-Rollback both jobs with:
+`run.sh` loads and kicks the calendar job only when its rendered plist exists.
+Rollback the jobs with:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.memory-daemon
 launchctl bootout gui/$(id -u)/com.memory-daemon-maintenance
+launchctl bootout gui/$(id -u)/com.memory-daemon-calendar 2>/dev/null || true
 ```
 
 The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
@@ -1264,7 +1302,7 @@ workspace_daemon/
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
-launchd/                   capture + maintenance LaunchAgent templates
+launchd/                   capture, maintenance + calendar LaunchAgent templates
 state/  logs/              runtime, gitignored
 ```
 

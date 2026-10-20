@@ -11,6 +11,7 @@ from . import config, state
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
 MAINTENANCE_LAUNCHD_LABEL = "com.memory-daemon-maintenance"
+CALENDAR_LAUNCHD_LABEL = "com.memory-daemon-calendar"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
 # Memory-sink failures older than this no longer count as an open issue.
@@ -18,7 +19,7 @@ MEMORY_ERROR_WINDOW_SECONDS = 24 * 3600
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
 _TICK_PREFIX = (
     r"^tick(?:\[(?P<id>[^\]]+)\])?"
-    r"(?:\((?P<group>capture|maintenance|all)\))?"
+    r"(?:\((?P<group>capture|maintenance|calendar|all)\))?"
 )
 _TICK_DUE = re.compile(
     _TICK_PREFIX + r": due=(?P<ids>.*?)"
@@ -467,12 +468,21 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     legacy = None
     if label == DEFAULT_LAUNCHD_LABEL:
         legacy = probe_launchd(LEGACY_LAUNCHD_LABEL)
+    # The calendar job is optional: it only shows up once it is loaded.
+    calendar = (
+        probe_launchd(CALENDAR_LAUNCHD_LABEL)
+        if label == DEFAULT_LAUNCHD_LABEL else None
+    )
+    if calendar is not None and not calendar.get("loaded"):
+        calendar = None
     history = read_tick_history(Path(base_dir) / "logs" / "run.log")
     scheduler_running_groups = set()
     if launchd.get("state") == "running":
         scheduler_running_groups.add("capture")
     if maintenance and maintenance.get("state") == "running":
         scheduler_running_groups.add("maintenance")
+    if calendar and calendar.get("state") == "running":
+        scheduler_running_groups.add("calendar")
     rows = routine_rows(
         base_dir,
         routines,
@@ -546,6 +556,9 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             f"Maintenance scheduler: {' · '.join(maintenance_bits)}",
             f"Next maintenance run: {_next_coordinator_run(maintenance)}",
         ])
+    if calendar is not None:
+        calendar_bits = _scheduler_bits(calendar)
+        lines.append(f"Calendar scheduler: {' · '.join(calendar_bits)}")
     lines.append(
         "Last capture tick: "
         f"{_tick_text(capture_latest, capture_tick_issue, now)}"
@@ -585,6 +598,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
                 and maintenance.get("last_exit") in (None, 0)
             )
         )
+        and (calendar is None or calendar.get("last_exit") in (None, 0))
         and capture_tick_issue is None
         and maintenance_tick_issue is None
         and not (legacy and legacy["loaded"])

@@ -5,6 +5,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -25,13 +26,15 @@ STUB = textwrap.dedent(
     n = len([f for f in os.listdir(d) if f.startswith("argv-")]) + 1
     with open(os.path.join(d, "argv-%%d.json" %% n), "w") as f:
         json.dump(sys.argv[1:], f)
-    with open(os.path.join(d, "stdin-%%d.txt" %% n), "w") as f:
-        f.write(sys.stdin.read())
     with open(os.path.join(d, "cwd-%%d.txt" %% n), "w") as f:
         f.write(os.getcwd())
     settings = sys.argv[sys.argv.index("--settings") + 1]
     with open(os.path.join(d, "settings-%%d.json" %% n), "w") as f:
         f.write(open(settings).read())
+    if os.path.exists(os.path.join(d, "noread")):
+        time.sleep(30)
+    with open(os.path.join(d, "stdin-%%d.txt" %% n), "w") as f:
+        f.write(sys.stdin.read())
     if os.path.exists(os.path.join(d, "sleep")):
         time.sleep(30)
     stream = os.path.join(d, "stream-%%d.jsonl" %% n)
@@ -221,23 +224,143 @@ class CallToolsTest(BridgeBase):
             self.call({TOOL_A: {}, TOOL_B: {}}, attempts=2)
         self.assertEqual(self.invocations(), 2)
 
-    def test_permission_denials_fail_closed_without_retry(self):
-        denial = [{"tool_name": "Bash", "tool_input": {"command": SECRET_OUTPUT}}]
+    def test_reported_denials_do_not_fail_required_success(self):
+        denial = [{"tool_name": "Read", "tool_input": {"file_path": SECRET_OUTPUT}}]
         self.stream(good_stream().replace(
             '"permission_denials": []', f'"permission_denials": {json.dumps(denial)}'))
+        self.assertEqual(self.call()[0]["text"], "item one")
+        self.assertEqual(self.invocations(), 1)
+        entry = self.usage_lines()[0]
+        self.assertEqual(entry["denials"], 1)
+        self.assertNotIn(SECRET_OUTPUT, json.dumps(entry))
+
+    def test_denied_read_alongside_required_tool_succeeds(self):
+        self.stream(good_stream(extra=(
+            tool_use("t8", "Read", {"file_path": SECRET_OUTPUT})
+            + tool_result("t8", "denied by hook " + SECRET_OUTPUT, is_error=True)
+            + tool_use("t9", "Grep", {"pattern": "x"}))))
+        out = self.call()
+        self.assertEqual([r["name"] for r in out], [TOOL_A])
+        entry = self.usage_lines()[0]
+        self.assertEqual((entry["outcome"], entry["denials"]), ("ok", 2))
+        self.assertNotIn(SECRET_OUTPUT, json.dumps(entry))
+
+    def test_denied_optional_tool_does_not_fail_run(self):
+        pinned = {TOOL_A: {}, TOOL_B: {"id": "1"}}
+        self.stream(good_stream(extra=(
+            tool_use("t8", TOOL_B, {"id": "2"})
+            + tool_result("t8", "denied", is_error=True))))
+        out = self.call(pinned, required=[TOOL_A], attempts=1)
+        self.assertEqual([r["name"] for r in out], [TOOL_A])
+        self.assertEqual(self.usage_lines()[0]["denials"], 1)
+
+    def test_denied_required_tool_yields_no_result_and_retries(self):
+        pinned = {TOOL_A: {"q": "pinned"}}
+        self.stream(good_stream(extra=""
+                                ).replace('"q": "x"', '"q": "other"')
+                    .replace('"item one"', '"item one", "is_error": true'))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(pinned, attempts=2)
+        self.assertEqual(self.invocations(), 2)
+
+    def test_pin_mismatch_that_ran_anyway_fails(self):
+        # The hook "allowed" it (real non-error result) but the pins differ.
+        self.stream(good_stream())
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call({TOOL_A: {"q": "pinned"}})
+        self.assertIn("ran despite allowlist", str(ctx.exception))
+        self.assertIn(TOOL_A, str(ctx.exception))
+        self.assertEqual(self.invocations(), 1)
+
+    def test_builtin_that_ran_anyway_fails(self):
+        self.stream(good_stream(extra=(
+            tool_use("t8", "Read", {"file_path": "x"})
+            + tool_result("t8", SECRET_OUTPUT))))
         with self.assertRaises(claude_bridge.BridgeError) as ctx:
             self.call()
-        self.assertEqual(self.invocations(), 1)
         self.assertNotIn(SECRET_OUTPUT, str(ctx.exception))
+
+    def test_tool_search_query_rechecked(self):
+        self.stream(
+            init()
+            + tool_use("t1", "ToolSearch", {"query": "select:mcp__other__x"})
+            + tool_result("t1", [{"type": "tool_reference"}])
+            + result())
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call()
+
+    def test_complete_still_fails_on_denials(self):
+        denial = [{"tool_name": "Bash", "tool_input": {}}]
+        self.stream(init() + result().replace(
+            '"permission_denials": []', f'"permission_denials": {json.dumps(denial)}'))
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.complete("p", model="sonnet", base_dir=self.base)
+
+    def test_no_init_event_fails(self):
+        self.stream(good_stream().replace(init(), "", 1))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call()
+        self.assertIn("init", str(ctx.exception))
 
     def test_off_allowlist_tool_use_fails(self):
         self.stream(good_stream(extra=tool_use(
             "t9", "mcp__claude_ai_Example__delete_item", {"id": SECRET_OUTPUT})))
         with self.assertRaises(claude_bridge.BridgeError) as ctx:
             self.call()
-        self.assertIn("mcp__claude_ai_Example__delete_item", str(ctx.exception))
+        self.assertIn("outside allowlist", str(ctx.exception))
         self.assertNotIn(SECRET_OUTPUT, str(ctx.exception))
+        self.assertNotIn("delete_item", str(ctx.exception))
+        self.assertIn("<invalid>", str(ctx.exception))
         self.assertEqual(self.invocations(), 1)
+        self.assertNotIn("delete_item", json.dumps(self.usage_lines()))
+
+    def test_known_builtin_name_is_reported(self):
+        self.stream(good_stream(extra=tool_use("t9", "Bash", {"command": "x"})))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call()
+        self.assertIn("Bash", str(ctx.exception))
+
+    def test_malformed_tool_names_never_echoed(self):
+        for bad in ("evil\nname " + SECRET_OUTPUT, "a" * 129, 7, None):
+            self.stream(good_stream(extra=tool_use("t9", bad)))
+            with self.assertRaises(claude_bridge.BridgeError) as ctx:
+                self.call()
+            self.assertIn("<invalid>", str(ctx.exception))
+            self.assertNotIn(SECRET_OUTPUT, str(ctx.exception))
+        self.assertNotIn(SECRET_OUTPUT, json.dumps(self.usage_lines()))
+
+    def test_partial_default_still_raises(self):
+        self.stream(good_stream().replace(
+            result(), result(subtype="error_max_turns", is_error=True)))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call()
+
+    def test_accept_partial_returns_collected_results(self):
+        for subtype in ("error_max_turns", "error_max_budget_usd"):
+            self.stream(good_stream().replace(
+                result(), result(subtype=subtype, is_error=True)))
+            out = self.call(accept_partial=True)
+            self.assertTrue(out.partial)
+            self.assertEqual(out[0]["text"], "item one")
+            self.assertEqual(self.usage_lines()[-1]["outcome"], "partial")
+
+    def test_accept_partial_needs_every_required_tool(self):
+        self.stream(good_stream().replace(
+            result(), result(subtype="error_max_turns", is_error=True)))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call({TOOL_A: {}, TOOL_B: {}}, accept_partial=True)
+        self.assertEqual(self.invocations(), 1)
+
+    def test_accept_partial_ignores_other_failures(self):
+        self.stream(good_stream().replace(
+            result(), result(subtype="error_during_execution", is_error=True)))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(accept_partial=True)
+
+    def test_normal_success_is_not_partial(self):
+        self.stream(good_stream())
+        self.assertFalse(self.call(accept_partial=True).partial)
+        self.assertFalse(self.call().partial)
 
     def test_unexpected_builtin_in_init_fails(self):
         self.stream(good_stream().replace(
@@ -293,6 +416,25 @@ class CallToolsTest(BridgeBase):
             self.call(timeout=1)
         self.assertIn("timed out", str(ctx.exception))
         self.assertEqual(self.invocations(), 1)
+
+    def test_stdin_write_is_covered_by_timeout(self):
+        (self.stub_dir / "noread").write_text("")
+        self.stream(good_stream())
+        big = "x" * 5_000_000
+        started = time.monotonic()
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.call_tools(big, {TOOL_A: {}}, base_dir=self.base,
+                                     connect_delay=0, timeout=1)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_connect_delay_counts_against_timeout(self):
+        self.stream(good_stream())
+        started = time.monotonic()
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(connect_delay=30, timeout=1)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("timed out", str(ctx.exception))
 
     def test_malformed_stream_line_fails(self):
         self.stream(init() + SECRET_OUTPUT + "\n" + result())
@@ -415,6 +557,19 @@ class HookTest(unittest.TestCase):
                      "Grep", "Bash"):
             self.assertFalse(self.decide(name, {"file_path": "x"}), name)
 
+    def test_pins_need_exact_json_type(self):
+        tools = {TOOL_A: {"flag": True, "n": 1, "tags": ["a"]}}
+
+        def ok(**given):
+            return claude_bridge_hook.decide(
+                {"tool_name": TOOL_A, "tool_input": given}, tools)[0]
+
+        self.assertTrue(ok(flag=True, n=1, tags=["a"]))
+        self.assertFalse(ok(flag=1, n=1, tags=["a"]))
+        self.assertFalse(ok(flag=True, n=True, tags=["a"]))
+        self.assertFalse(ok(flag=True, n=1.0, tags=["a"]))
+        self.assertFalse(ok(flag=True, n=1, tags=[True]))
+
     def test_tool_search_select(self):
         self.assertTrue(self.decide(
             "ToolSearch", {"query": f"select:{TOOL_A},{TOOL_B}"}))
@@ -450,6 +605,39 @@ class HookTest(unittest.TestCase):
                                                    "tool_input": {}}), "{bad")):
             code, out = self.run_main(stdin_text, allowlist)
             self.assertEqual((code, out["permissionDecision"]), (2, "deny"))
+
+    def test_emit_failure_denies_with_exit_2(self):
+        real = claude_bridge_hook._emit
+        calls = []
+
+        def flaky(allowed, reason):
+            calls.append(allowed)
+            if len(calls) == 1:
+                raise OSError("stdout closed")
+            real(allowed, reason)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow.json"
+            path.write_text(json.dumps({"tools": self.TOOLS}))
+            out = io.StringIO()
+            with mock.patch.object(claude_bridge_hook, "_emit", flaky), \
+                    redirect_stdout(out):
+                code = claude_bridge_hook.main(["hook", str(path)], io.StringIO(
+                    json.dumps({"tool_name": TOOL_B, "tool_input": {}})))
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(json.loads(out.getvalue())[
+            "hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_emit_always_failing_still_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow.json"
+            path.write_text(json.dumps({"tools": self.TOOLS}))
+            with mock.patch.object(claude_bridge_hook, "_emit",
+                                   side_effect=OSError("x")):
+                code = claude_bridge_hook.main(["hook", str(path)], io.StringIO(
+                    json.dumps({"tool_name": TOOL_B, "tool_input": {}})))
+        self.assertEqual(code, 2)
 
     def test_runs_as_isolated_script(self):
         import subprocess
