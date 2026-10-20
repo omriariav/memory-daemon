@@ -33,12 +33,19 @@ DEFAULT_DISALLOWED_TOOLS = (
     "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,CronCreate,"
     "CronDelete,CronList,RemoteTrigger,DesignSync,PushNotification,Monitor,"
     "EnterWorktree,ExitWorktree,SendMessage,ListAgents,Workflow,PublishPlugin,"
-    "ShareOnboardingGuide,ScheduleWakeup,ReportFindings,TaskStop"
+    "ShareOnboardingGuide,ScheduleWakeup,ReportFindings,TaskStop,"
+    # Generic MCP resource readers appear once connectors attach; they could
+    # read any connector's resources, so they are removed too.
+    "ListMcpResourcesTool,ReadMcpResourceDirTool,ReadMcpResourceTool"
 )
 # A built-in outside this set showing up in init means a new CLI version added
 # one; refuse rather than run with an unreviewed capability.
 ALLOWED_BUILTINS = {"ToolSearch", "Read", "Glob", "Grep"}
 SEARCH_TOOL = "ToolSearch"
+# claude.ai connectors attach a few seconds after the CLI starts. A prompt sent
+# before that often finds no deferred tools and the model gives up, so the
+# prompt is held back this long (stream-json input keeps stdin open meanwhile).
+CONNECT_DELAY_SECONDS = 6.0
 
 
 class BridgeError(RuntimeError):
@@ -72,6 +79,7 @@ def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
     return [
         claude_bin(), "-p",
         "--model", model,
+        "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
         "--setting-sources", "",
@@ -86,14 +94,27 @@ def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
     ]
 
 
-def _spawn(cmd, prompt, cwd, timeout):
-    """Run claude with the prompt on stdin; kill its whole process group on timeout."""
+def _spawn(cmd, prompt, cwd, timeout, connect_delay):
+    """Run claude with the prompt on stdin; kill its whole process group on timeout.
+
+    The prompt is one stream-json user message, written after `connect_delay`
+    seconds so connector tools are discoverable when the model starts.
+    """
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, cwd=cwd, start_new_session=True,
     )
+    message = json.dumps(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
     try:
-        stdout, _ = proc.communicate(prompt, timeout=timeout)
+        if connect_delay:
+            time.sleep(connect_delay)
+        try:
+            proc.stdin.write(message + "\n")
+        except BrokenPipeError:
+            pass  # exited early; the exit code and stream report why
+        stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -164,7 +185,7 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result):
 
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
-             timeout, attempt, disallowed):
+             timeout, attempt, disallowed, connect_delay):
     """One claude run. Returns (results, final result event); raises BridgeError."""
     started = time.monotonic()
     result_event = None
@@ -185,7 +206,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         cmd = _build_command(
             model, settings, allowed, max_turns, max_budget_usd, disallowed
         )
-        returncode, stdout = _spawn(cmd, prompt, run_dir, timeout)
+        returncode, stdout = _spawn(cmd, prompt, run_dir, timeout, connect_delay)
         events, parsed_ok = _parse_stream(stdout)
         result_event = next(
             (e for e in reversed(events) if e.get("type") == "result"), None
@@ -260,7 +281,8 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
 
 def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
-               disallowed_tools=DEFAULT_DISALLOWED_TOOLS):
+               disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
+               connect_delay=CONNECT_DELAY_SECONDS):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -285,6 +307,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             full_prompt, dict(tools), model=model, base_dir=base_dir,
             max_turns=max_turns, max_budget_usd=max_budget_usd,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
+            connect_delay=connect_delay,
         )
         if all(any(r["name"] == name for r in results) for name in tools):
             return results
@@ -300,7 +323,7 @@ def complete(prompt, *, model, base_dir, max_turns=1, max_budget_usd=0.25,
     _, result_event = _attempt(
         prompt, {}, model=model, base_dir=base_dir, max_turns=max_turns,
         max_budget_usd=max_budget_usd, timeout=timeout, attempt=1,
-        disallowed=disallowed_tools,
+        disallowed=disallowed_tools, connect_delay=0,
     )
     text = result_event.get("result")
     if not isinstance(text, str) or not text.strip():

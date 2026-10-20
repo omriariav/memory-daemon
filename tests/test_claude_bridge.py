@@ -122,6 +122,7 @@ class BridgeBase(unittest.TestCase):
 class CallToolsTest(BridgeBase):
     def call(self, tools=None, **kw):
         kw.setdefault("base_dir", self.base)
+        kw.setdefault("connect_delay", 0)
         return claude_bridge.call_tools(
             SECRET_PROMPT, tools if tools is not None else {TOOL_A: {}}, **kw
         )
@@ -144,12 +145,24 @@ class CallToolsTest(BridgeBase):
     def test_prompt_on_stdin_only_with_search_instruction(self):
         self.stream(good_stream())
         self.call()
-        stdin = (self.stub_dir / "stdin-1.txt").read_text()
+        raw = (self.stub_dir / "stdin-1.txt").read_text()
+        self.assertTrue(raw.endswith("\n"))
+        message = json.loads(raw)
+        self.assertEqual(message["type"], "user")
+        stdin = message["message"]["content"]
         self.assertIn(SECRET_PROMPT, stdin)
         self.assertTrue(stdin.startswith(
             f'First call ToolSearch with query "select:{TOOL_A}".'
         ))
         self.assertNotIn(SECRET_PROMPT, " ".join(self.argv()))
+
+    def test_prompt_waits_for_connectors_by_default(self):
+        self.stream(good_stream())
+        with mock.patch.object(claude_bridge.time, "sleep") as sleep:
+            self.call(connect_delay=claude_bridge.CONNECT_DELAY_SECONDS)
+        sleep.assert_called_once_with(claude_bridge.CONNECT_DELAY_SECONDS)
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
 
     def test_required_flags_and_settings(self):
         self.stream(good_stream())
