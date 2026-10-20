@@ -42,6 +42,7 @@ memory:
     owner_email: me@example.com
     owner_slug: me-example
     owner_name: Me Example
+    internal_domains: [example.com]   # only these domains are looked up
     search_tool: mcp__claude_ai_Example_Slack__slack_search_users
     profile_tool: mcp__claude_ai_Example_Slack__slack_read_user_profile
     model: haiku

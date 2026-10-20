@@ -414,21 +414,21 @@ def _authenticated_identity(rid, provider=None):
     except Exception as exc:
         log(
             f"routine={rid} memory WARN authenticated Workspace identity "
-            f"unavailable: {exc}"
+            f"unavailable: {type(exc).__name__}"
         )
         return {"email": None, "person": None, "safe": False}
     try:
         person = provider.resolve_email(email)
     except Exception as exc:
         log(
-            f"routine={rid} memory WARN authenticated person lookup failed "
-            f"for {email}: {exc}"
+            f"routine={rid} memory WARN authenticated person lookup failed: "
+            f"{type(exc).__name__}"
         )
         return {"email": email, "person": None, "safe": False}
     if not person:
         log(
             f"routine={rid} memory WARN authenticated person not found in "
-            f"Workspace directory: {email}"
+            "Workspace directory"
         )
         return {"email": email, "person": None, "safe": False}
     return {"email": email, "person": person, "safe": True}
@@ -451,7 +451,7 @@ def _prefetch_identities(item, rid, provider, extract):
         provider.prefetch(list(dict.fromkeys(emails)))
     except Exception as exc:
         # Resolution below re-raises the latched outage per email and fails closed.
-        log(f"routine={rid} memory WARN identity prefetch failed: {exc}")
+        log(f"routine={rid} memory WARN identity prefetch failed: {type(exc).__name__}")
 
 
 def _is_authenticated_person(email, person, identity):
@@ -509,7 +509,10 @@ def _verified_owner_people(item, rid, identity, provider=None):
         try:
             person = provider.resolve_email(normalized)
         except Exception as exc:
-            log(f"routine={rid} memory WARN directory lookup failed for {normalized}: {exc}")
+            log(
+                f"routine={rid} memory WARN directory lookup failed: "
+                f"{type(exc).__name__}"
+            )
             unresolved.append(normalized)
             continue
         if not person:
@@ -520,16 +523,13 @@ def _verified_owner_people(item, rid, identity, provider=None):
             continue
         if _collides_with_authenticated_slug(person, identity):
             log(
-                f"routine={rid} memory WARN Drive owner {normalized} has a "
+                f"routine={rid} memory WARN Drive owner has a "
                 "person-slug collision with the authenticated user"
             )
             unresolved.append(normalized)
             continue
         slugs.append(person["slug"])
-        log(
-            f"routine={rid} memory: verified Drive owner "
-            f"{person['name']} <{person['email']}> as {person['slug']}"
-        )
+        log(f"routine={rid} memory: verified Drive owner")
     return list(dict.fromkeys(slugs)), unresolved
 
 
@@ -568,7 +568,10 @@ def _verified_source_people(item, rid, identity, provider=None):
         try:
             person = provider.resolve_email(email)
         except Exception as exc:
-            log(f"routine={rid} memory WARN directory lookup failed for {email}: {exc}")
+            log(
+                f"routine={rid} memory WARN directory lookup failed: "
+                f"{type(exc).__name__}"
+            )
             unresolved.append(email)
             continue
         if not person:
@@ -582,16 +585,13 @@ def _verified_source_people(item, rid, identity, provider=None):
             continue
         if _collides_with_authenticated_slug(person, identity):
             log(
-                f"routine={rid} memory WARN source participant {email} has a "
+                f"routine={rid} memory WARN source participant has a "
                 "person-slug collision with the authenticated user"
             )
             unresolved.append(email)
             continue
         verified.append(person)
-        log(
-            f"routine={rid} memory: verified source participant "
-            f"{person['name']} <{person['email']}> as {person['slug']}"
-        )
+        log(f"routine={rid} memory: verified source participant")
     return verified, unresolved
 
 
@@ -906,16 +906,16 @@ def capture(routine, item, summary, dry_run=False):
     ):
         tags.append("people-unmapped")
         if dropped:
-            log(f"routine={rid} memory: dropped unknown slugs {dropped}")
+            log(f"routine={rid} memory: dropped {len(dropped)} unknown slug(s)")
         if unresolved_source:
             log(
-                f"routine={rid} memory: unresolved source identities "
-                f"{unresolved_source}"
+                f"routine={rid} memory: {len(unresolved_source)} unresolved "
+                "source identit(ies)"
             )
         if unresolved_owners:
             log(
-                f"routine={rid} memory: unresolved Drive owners "
-                f"{unresolved_owners}"
+                f"routine={rid} memory: {len(unresolved_owners)} unresolved "
+                "Drive owner(s)"
             )
         if source_people_truncated:
             log(

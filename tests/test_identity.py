@@ -45,6 +45,11 @@ def profile_result(user_id, text):
             "is_error": False}
 
 
+def zero_results(*queries):
+    empty = json.dumps({"results": "## Users (0 results)\n"})
+    return [search_result(query, empty) for query in queries]
+
+
 def alice_results(query="alice.smith", uid="U0EXAMPLE01"):
     return [
         search_result(query, search_text((uid, "Alice Smith"))),
@@ -117,13 +122,18 @@ class AcceptTest(unittest.TestCase):
             "resource_name": "slack:U0EXAMPLE00",
         })
 
-    def test_falls_back_to_display_name(self):
+    def test_name_falls_back_to_display_then_derived(self):
         person = self.accept(self.fields(**{"Real Name": ""}))
         self.assertEqual(person["name"], "Alice")
+        person = self.accept(self.fields(**{"Real Name": "", "Display Name": ""}))
+        self.assertEqual(person["name"], "Alice Smith")
 
-    def test_folds_accents_in_slug(self):
+    def test_slug_comes_from_email_not_editable_name(self):
         person = self.accept(self.fields(**{"Real Name": "Zoë Müller"}))
-        self.assertEqual(person["slug"], "zoe-muller")
+        self.assertEqual(person["slug"], "alice-smith")
+        self.assertEqual(person["name"], "Zoë Müller")
+        person = self.accept(self.fields(**{"Real Name": "CEO Bob"}))
+        self.assertEqual(person["slug"], "alice-smith")
 
     def test_rejects_bot_username_mismatch_mask_mismatch(self):
         self.assertIsNone(self.accept(self.fields(Bot="Yes")))
@@ -132,6 +142,19 @@ class AcceptTest(unittest.TestCase):
             self.accept(self.fields(Email="[EMAIL:****.*****@*******.***]"))
         )
         self.assertIsNone(self.accept({}))
+
+    def test_bot_is_an_allowlist(self):
+        for bad in ("Yes", "", "maybe", "true"):
+            self.assertIsNone(self.accept(self.fields(Bot=bad)), bad)
+        fields = self.fields()
+        del fields["Bot"]
+        self.assertIsNone(self.accept(fields))
+        self.assertIsNotNone(self.accept(self.fields(Bot=" NO ")))
+
+    def test_rejects_deleted_or_deactivated_profiles(self):
+        self.assertIsNone(self.accept(self.fields(Deleted="Yes")))
+        self.assertIsNone(self.accept(self.fields(Deactivated="true")))
+        self.assertIsNotNone(self.accept(self.fields(Deleted="No")))
 
     def test_username_compare_is_casefolded(self):
         self.assertIsNotNone(self.accept(self.fields(Username="Alice.Smith")))
@@ -152,7 +175,7 @@ class ProviderBase(unittest.TestCase):
         self.cfg = {
             "provider": "slack_mcp", "owner_email": "Me@Example.com",
             "owner_slug": "me-example", "search_tool": SEARCH,
-            "profile_tool": PROFILE,
+            "profile_tool": PROFILE, "internal_domains": ["example.com"],
         }
         self.logs = []
         patcher = mock.patch.object(
@@ -210,7 +233,9 @@ class SlackProviderTest(ProviderBase):
             search_result("alice.smith", "not even json"),
         ]
         with mock.patch.object(claude_bridge, "call_tools", return_value=results):
-            self.assertIsNone(self.provider().resolve_email("alice.smith@example.com"))
+            with self.assertRaises(RuntimeError):  # undecidable, not a miss
+                self.provider().resolve_email("alice.smith@example.com")
+        self.assertFalse(self.cache_file.exists())
 
     def test_keywords_as_string_accepted(self):
         results = [
@@ -222,9 +247,7 @@ class SlackProviderTest(ProviderBase):
             self.assertIsNotNone(self.provider().resolve_email("alice.smith@example.com"))
 
     def test_zero_hits_is_unresolved_not_error(self):
-        results = [search_result(
-            "alice.smith", json.dumps({"results": "## Users (0 results)\n"})
-        )]
+        results = zero_results("alice.smith")
         with mock.patch.object(claude_bridge, "call_tools", return_value=results):
             self.assertIsNone(self.provider().resolve_email("alice.smith@example.com"))
 
@@ -234,7 +257,10 @@ class SlackProviderTest(ProviderBase):
 
         def fake(prompt, tools, **kwargs):
             calls.append(kwargs["max_turns"])
-            return []
+            return zero_results(*(
+                e.split("@")[0] for e in emails
+                if f"- {e.split('@')[0]}" in prompt.splitlines()
+            ))
 
         provider = self.provider(batch_size=2)
         with mock.patch.object(claude_bridge, "call_tools", side_effect=fake):
@@ -244,17 +270,35 @@ class SlackProviderTest(ProviderBase):
                 self.assertIsNone(provider.resolve_email(email))
         self.assertEqual(len(calls), 3)
 
-    def test_same_local_part_two_domains_share_one_search(self):
-        results = alice_results()
+    def test_external_domain_rejected_before_any_lookup(self):
+        provider = self.provider(internal_domains=["example.com"])
+        with mock.patch.object(claude_bridge, "call_tools") as call:
+            # example.org has the same mask shape as example.com
+            self.assertIsNone(provider.resolve_email("alice.smith@example.org"))
+            self.assertIsNone(provider.resolve_email("alice.smith@sub.example.com"))
+            self.assertIsNone(provider.resolve_email("alice.smith@example.com.org"))
+            provider.prefetch(["alice.smith@example.org"])
+        call.assert_not_called()
+        self.assertFalse(self.cache_file.exists())
+
+    def test_external_twin_does_not_resolve_to_internal_user(self):
         provider = self.provider()
         with mock.patch.object(
-            claude_bridge, "call_tools", return_value=results
+            claude_bridge, "call_tools", return_value=alice_results()
         ) as call:
             provider.prefetch(["alice.smith@example.com", "alice.smith@example.org"])
+            self.assertIsNotNone(provider.resolve_email("alice.smith@example.com"))
+            self.assertIsNone(provider.resolve_email("alice.smith@example.org"))
         self.assertEqual(call.call_count, 1)
-        self.assertIsNotNone(provider.resolve_email("alice.smith@example.com"))
-        # example.org mask shape differs only by TLD length: ".***" vs ".***"
-        self.assertIsNotNone(provider.resolve_email("alice.smith@example.org"))
+        self.assertNotIn("alice.smith@example.org", json.loads(
+            self.cache_file.read_text())["entries"])
+
+    def test_internal_domain_match_is_case_insensitive_and_multi(self):
+        provider = self.provider(internal_domains=["example.com", "example.net"])
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=alice_results()
+        ):
+            self.assertIsNotNone(provider.resolve_email("Alice.Smith@EXAMPLE.com"))
 
     def test_logs_counts_only(self):
         with mock.patch.object(claude_bridge, "call_tools", return_value=alice_results()):
@@ -279,14 +323,17 @@ class CacheTest(ProviderBase):
         self.assertEqual(stat.S_IMODE(self.cache_file.stat().st_mode), 0o600)
         data = json.loads(self.cache_file.read_text())
         self.assertEqual(data["version"], 1)
-        entry = data["entries"]["alice.smith@example.com"]
+        entry = data["entries"][self.key("alice.smith@example.com")]
         self.assertEqual(entry["person"]["slug"], "alice-smith")
         self.assertIn("checked_at", entry)
+
+    def key(self, email, **over):
+        return f"{self.provider(**over).namespace}:{email}"
 
     def _age(self, email, days):
         data = json.loads(self.cache_file.read_text())
         stamp = (identity._now() - datetime.timedelta(days=days)).isoformat()
-        data["entries"][email]["checked_at"] = stamp
+        data["entries"][self.key(email)]["checked_at"] = stamp
         self.cache_file.write_text(json.dumps(data))
 
     def test_hit_ttl_expiry(self):
@@ -304,7 +351,9 @@ class CacheTest(ProviderBase):
 
     def test_miss_ttl_expiry_is_shorter(self):
         email = "nobody@example.com"
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]) as call:
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("nobody")
+        ) as call:
             self.provider().resolve_email(email)
             self._age(email, 0.5)
             self.assertIsNone(self.provider().resolve_email(email))
@@ -315,12 +364,14 @@ class CacheTest(ProviderBase):
 
     def test_custom_ttls_and_relative_cache_path(self):
         email = "nobody@example.com"
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]) as call:
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("nobody")
+        ) as call:
             provider = self.provider(cache="other/ids.json", miss_ttl_days=10)
             provider.resolve_email(email)
             self.assertTrue((self.base / "other" / "ids.json").exists())
             data = json.loads((self.base / "other" / "ids.json").read_text())
-            data["entries"][email]["checked_at"] = (
+            data["entries"][self.key(email, cache="other/ids.json")]["checked_at"] = (
                 identity._now() - datetime.timedelta(days=5)
             ).isoformat()
             (self.base / "other" / "ids.json").write_text(json.dumps(data))
@@ -331,7 +382,9 @@ class CacheTest(ProviderBase):
         self.cache_file.parent.mkdir(parents=True)
         self.cache_file.write_text("{ corrupt")
         provider = self.provider()
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]) as call:
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("a.b", "c.d")
+        ) as call:
             provider.resolve_email("a.b@example.com")
             provider.resolve_email("c.d@example.com")
         self.assertEqual(call.call_count, 2)
@@ -345,15 +398,54 @@ class CacheTest(ProviderBase):
     def test_wrong_shape_and_bad_entries_ignored(self):
         self.cache_file.parent.mkdir(parents=True)
         self.cache_file.write_text(json.dumps({"version": 9, "entries": {}}))
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]) as call:
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("a.b")
+        ) as call:
             self.provider().resolve_email("a.b@example.com")
         self.assertEqual(call.call_count, 1)
         self.cache_file.write_text(json.dumps({"version": 1, "entries": {
-            "a.b@example.com": {"person": "oops", "checked_at": "never"},
+            self.key("a.b@example.com"): {"person": "oops", "checked_at": "never"},
         }}))
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]) as call:
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("a.b")
+        ) as call:
             self.provider().resolve_email("a.b@example.com")
         self.assertEqual(call.call_count, 1)
+
+    def test_entries_are_namespaced_by_config(self):
+        base = self.provider()
+        self.assertNotEqual(base.namespace, self.provider(
+            internal_domains=["example.com", "example.net"]).namespace)
+        self.assertNotEqual(base.namespace, self.provider(
+            search_tool="mcp__other__search").namespace)
+        self.assertNotEqual(base.namespace, self.provider(
+            profile_tool="mcp__other__profile").namespace)
+        self.assertEqual(base.namespace, self.provider(model="sonnet").namespace)
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=alice_results()
+        ) as call:
+            base.resolve_email("alice.smith@example.com")
+            other = self.provider(internal_domains=["example.com", "example.net"])
+            other.resolve_email("alice.smith@example.com")
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(len(json.loads(self.cache_file.read_text())["entries"]), 2)
+
+    def test_save_merges_entries_written_by_another_routine(self):
+        first, second = self.provider(), self.provider(
+            internal_domains=["example.com", "example.net"])
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=alice_results()
+        ):
+            first.resolve_email("alice.smith@example.com")
+            second.resolve_email("alice.smith@example.com")
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("nobody")
+        ):
+            first.resolve_email("nobody@example.com")  # stale _disk snapshot
+        entries = json.loads(self.cache_file.read_text())["entries"]
+        self.assertEqual(len(entries), 3)
+        self.assertIn(f"{second.namespace}:alice.smith@example.com", entries)
+        self.assertEqual(stat.S_IMODE(self.cache_file.stat().st_mode), 0o600)
 
     def test_clear_cache_drops_run_state_but_keeps_disk(self):
         provider = self.provider()
@@ -364,6 +456,82 @@ class CacheTest(ProviderBase):
             provider.clear_cache()
             provider.resolve_email("alice.smith@example.com")
         self.assertEqual(call.call_count, 1)
+
+
+class IncompleteLookupTest(ProviderBase):
+    EMAIL = "alice.smith@example.com"
+
+    def check_undecided(self, results):
+        provider = self.provider()
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=results
+        ) as call:
+            with self.assertRaises(RuntimeError):
+                provider.resolve_email(self.EMAIL)
+            with self.assertRaises(RuntimeError):  # no refetch within the run
+                provider.resolve_email(self.EMAIL)
+            provider.prefetch([self.EMAIL])
+        self.assertEqual(call.call_count, 1)
+        self.assertFalse(self.cache_file.exists())
+        # A fresh run retries rather than serving a cached miss.
+        provider.clear_cache()
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=alice_results()
+        ):
+            self.assertIsNotNone(provider.resolve_email(self.EMAIL))
+
+    def test_skipped_query_is_not_a_miss(self):
+        self.check_undecided([])
+
+    def test_search_error_result_is_not_a_miss(self):
+        errored = dict(alice_results()[0], is_error=True)
+        self.check_undecided([errored])
+
+    def test_search_error_json_without_results_is_not_a_miss(self):
+        self.check_undecided([search_result(
+            "alice.smith", json.dumps({"error": "rate_limited"})
+        )])
+
+    def test_missing_profile_read_is_not_a_miss(self):
+        self.check_undecided(alice_results()[:1])
+
+    def test_errored_profile_read_is_not_a_miss(self):
+        search, profile = alice_results()
+        self.check_undecided([search, dict(profile, is_error=True)])
+
+    def test_unprofiled_extra_candidate_blocks_a_decision(self):
+        # Alice verifies, but a second unprofiled candidate could be a twin.
+        self.check_undecided([
+            search_result("alice.smith", search_text(
+                ("U0EXAMPLE01", "Alice Smith"), ("U0EXAMPLE02", "Alice Twin"))),
+            profile_result("U0EXAMPLE01", profile_text("U0EXAMPLE01", "alice.smith")),
+        ])
+
+    def test_complete_miss_is_cached(self):
+        provider = self.provider()
+        results = [
+            search_result("alice.smith", search_text(("U0EXAMPLE01", "A"))),
+            profile_result("U0EXAMPLE01", profile_text(
+                "U0EXAMPLE01", "someone.else")),
+        ]
+        with mock.patch.object(claude_bridge, "call_tools", return_value=results):
+            self.assertIsNone(provider.resolve_email(self.EMAIL))
+        entries = json.loads(self.cache_file.read_text())["entries"]
+        self.assertIsNone(entries[f"{provider.namespace}:{self.EMAIL}"]["person"])
+
+    def test_one_undecided_email_does_not_block_the_rest(self):
+        provider = self.provider()
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=alice_results()
+        ):
+            provider.prefetch([self.EMAIL, "bob.jones@example.com"])
+        self.assertIsNotNone(provider.resolve_email(self.EMAIL))
+        with self.assertRaises(RuntimeError):
+            provider.resolve_email("bob.jones@example.com")
+        self.assertEqual(
+            list(json.loads(self.cache_file.read_text())["entries"]),
+            [f"{provider.namespace}:{self.EMAIL}"],
+        )
 
 
 class OutageTest(ProviderBase):
@@ -391,7 +559,9 @@ class OutageTest(ProviderBase):
             with self.assertRaises(RuntimeError):
                 provider.resolve_email("a.b@example.com")
         provider.clear_cache()
-        with mock.patch.object(claude_bridge, "call_tools", return_value=[]):
+        with mock.patch.object(
+            claude_bridge, "call_tools", return_value=zero_results("a.b")
+        ):
             self.assertIsNone(provider.resolve_email("a.b@example.com"))
 
     def test_dry_run_is_an_outage_without_logging(self):
@@ -451,7 +621,7 @@ class GwsDefaultTest(unittest.TestCase):
         routine = {"memory": {"identity": {
             "provider": "slack_mcp", "owner_email": "me@example.com",
             "owner_slug": "me-example", "search_tool": SEARCH,
-            "profile_tool": PROFILE,
+            "profile_tool": PROFILE, "internal_domains": ["example.com"],
         }}}
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(identity, "_base_dir", None):
@@ -524,8 +694,9 @@ class SinkIntegrationTest(unittest.TestCase):
              mock.patch.object(
                  memory_sink.identity_providers, "provider_for",
                  return_value=provider), \
-             mock.patch.object(memory_sink, "log"):
+             mock.patch.object(memory_sink, "log") as sink_log:
             out = memory_sink.capture(self.routine, self.item, "summary")
+        self.sink_logs = " ".join(c.args[0] for c in sink_log.call_args_list)
         return out, calls
 
     def test_verified_participant_allowed_and_unresolved_dropped(self):
@@ -543,6 +714,13 @@ class SinkIntegrationTest(unittest.TestCase):
             ["alice.smith@example.com", "unknown.person@example.com",
              "me@example.com"],
         )
+
+    def test_sink_logs_carry_no_emails_or_names(self):
+        self.capture(FakeProvider(), ["alice-smith", "unknown-person"])
+        logs = self.sink_logs.casefold()
+        self.assertIn("verified source participant", logs)
+        for leaked in ("alice", "smith", "example.com", "unknown-person", "unknown.person", "@"):
+            self.assertNotIn(leaked, logs)
 
     def test_provider_outage_fails_closed(self):
         class Down(FakeProvider):
@@ -566,7 +744,7 @@ class SinkIntegrationTest(unittest.TestCase):
             provider = identity.SlackMcpProvider({
                 "provider": "slack_mcp", "owner_email": "me@example.com",
                 "owner_slug": "me-example", "search_tool": SEARCH,
-                "profile_tool": PROFILE,
+                "profile_tool": PROFILE, "internal_domains": ["example.com"],
             }, Path(tmp))
             with mock.patch.object(
                 claude_bridge, "call_tools", return_value=alice_results()
@@ -583,7 +761,8 @@ class ValidateTest(unittest.TestCase):
         cfg = {"store": "/store", "identity": {
             "provider": "slack_mcp", "owner_email": "me@example.com",
             "owner_slug": "me-example", "search_tool": SEARCH,
-            "profile_tool": PROFILE, **over,
+            "profile_tool": PROFILE, "internal_domains": ["example.com"],
+            **over,
         }}
         return cfg
 
@@ -608,7 +787,8 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(self.problems(bogus=1))
 
     def test_required_keys(self):
-        for key in ("owner_email", "owner_slug", "search_tool", "profile_tool"):
+        for key in ("owner_email", "owner_slug", "search_tool", "profile_tool",
+                    "internal_domains"):
             cfg = self.good()
             del cfg["identity"][key]
             self.assertTrue(identity.validate(cfg, "r"), key)
@@ -628,6 +808,13 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(self.problems(cache="/abs/cache.json"))
         self.assertTrue(self.problems(cache="../up.json"))
         self.assertTrue(self.problems(model=""))
+
+    def test_internal_domains_shape(self):
+        self.assertEqual(
+            self.problems(internal_domains=["a.example.com", "example.org"]), [])
+        for bad in ([], "example.com", ["Example.com"], ["example"], ["@example.com"],
+                    ["example.com", 5], [""], ["a b.com"], None):
+            self.assertTrue(self.problems(internal_domains=bad), bad)
 
     def test_memory_sink_validate_accepts_identity_block(self):
         routine = {"id": "r", "memory": self.good()}

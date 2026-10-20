@@ -12,6 +12,7 @@ Providers share one interface: ``current_user_email()``, ``resolve_email()``
 ``prefetch()`` and ``clear_cache()``.
 """
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -31,8 +32,9 @@ CACHE_VERSION = 1
 _IDENTITY_KEYS = {
     "provider", "owner_email", "owner_slug", "owner_name", "search_tool",
     "profile_tool", "model", "cache", "hit_ttl_days", "miss_ttl_days",
-    "batch_size",
+    "batch_size", "internal_domains",
 }
+_DOMAIN_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
 
 _base_dir = None
 _providers = {}
@@ -98,6 +100,15 @@ def validate(cfg, rid):
         value = raw.get(key)
         if isinstance(value, str) and value.strip() and not value.startswith("mcp__"):
             problems.append(f"{rid}: memory.identity.{key} must start with 'mcp__'")
+    domains = raw.get("internal_domains")
+    if (
+        not isinstance(domains, list) or not domains
+        or not all(isinstance(d, str) and _DOMAIN_RE.fullmatch(d) for d in domains)
+    ):
+        problems.append(
+            f"{rid}: memory.identity.internal_domains is required for slack_mcp "
+            "and must be a non-empty list of lowercase domains"
+        )
     for key in ("owner_name", "model", "cache"):
         if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
             problems.append(f"{rid}: memory.identity.{key} must be a non-empty string")
@@ -208,11 +219,22 @@ def _mask_matches(mask_field, email):
 
 
 def _accept(email, profiles):
-    """Person for ``email`` iff exactly one profile passes every check."""
+    """Person for ``email`` iff exactly one profile passes every check.
+
+    ``profiles`` must hold every candidate the search returned. The slug comes
+    from the email local part (the match already requires Username == local
+    part), never from the user-editable profile name, which is display only.
+    """
     local = email.split("@")[0]
+    slug = contacts.slugify(local)
     passing = []
     for user_id, fields in profiles.items():
-        if fields.get("Bot", "").strip().casefold() == "yes":
+        if fields.get("Bot", "").strip().casefold() != "no":
+            continue  # allowlist: only an explicit "Bot: No" passes
+        if any(
+            fields.get(key, "").strip().casefold() in ("yes", "true")
+            for key in ("Deleted", "Deactivated")
+        ):
             continue
         if fields.get("Username", "").strip().casefold() != local:
             continue
@@ -220,9 +242,8 @@ def _accept(email, profiles):
             continue
         name = " ".join(
             (fields.get("Real Name") or fields.get("Display Name") or "").split()
-        )
-        slug = contacts.slugify(name)
-        if not name or not slug:
+        ) or SlackMcpProvider._derived_name(email)
+        if not slug:
             continue
         passing.append({
             "email": email,
@@ -231,6 +252,11 @@ def _accept(email, profiles):
             "resource_name": f"slack:{user_id}",
         })
     return passing[0] if len(passing) == 1 else None
+
+
+def _search_parsed(text):
+    """True when a search result has a Users section (zero hits included)."""
+    return "## Users" in _unwrap(text)
 
 
 def _keywords(tool_input):
@@ -261,6 +287,16 @@ class SlackMcpProvider:
             days=cfg.get("miss_ttl_days", DEFAULT_MISS_TTL_DAYS)
         )
         self.batch_size = cfg.get("batch_size", DEFAULT_BATCH_SIZE)
+        self.internal_domains = frozenset(
+            str(d).strip().casefold() for d in cfg["internal_domains"]
+        )
+        # Cache entries are namespaced by what shapes results, so routines
+        # sharing one cache file never serve each other's lookups.
+        self.namespace = hashlib.sha256(json.dumps({
+            "search_tool": self.search_tool,
+            "profile_tool": self.profile_tool,
+            "internal_domains": sorted(self.internal_domains),
+        }, sort_keys=True).encode()).hexdigest()[:12]
         self.base_dir = base_dir
         self.cache_path = (
             Path(base_dir) / cfg.get("cache", DEFAULT_CACHE)
@@ -268,6 +304,7 @@ class SlackMcpProvider:
         )
         self._failure = None
         self._run = {}  # email -> person | None, resolved this run
+        self._incomplete = set()  # emails whose lookup could not be decided
         self._disk = None  # lazily loaded cache entries
         self._warned_corrupt = False
 
@@ -279,6 +316,7 @@ class SlackMcpProvider:
     def clear_cache(self):
         self._failure = None
         self._run = {}
+        self._incomplete = set()
         self._disk = None
         self._warned_corrupt = False
 
@@ -286,7 +324,10 @@ class SlackMcpProvider:
         wanted = []
         for value in emails:
             email = _email(value)
-            if not self._valid(email) or email == self.owner_email:
+            if (
+                not self._valid(email) or email == self.owner_email
+                or not self._is_internal(email) or email in self._incomplete
+            ):
                 continue
             if email not in wanted and self._lookup(email) is _UNKNOWN:
                 wanted.append(email)
@@ -308,12 +349,17 @@ class SlackMcpProvider:
                 "slug": self.owner_slug,
                 "resource_name": "owner",
             }
+        if not self._is_internal(email):
+            return None  # external: never looked up, never cached
         found = self._lookup(email)
         if found is not _UNKNOWN:
             return found
         if self._failure is not None:
             raise RuntimeError(self._failure)
-        self._fetch([email])
+        if email not in self._incomplete:
+            self._fetch([email])
+        if email in self._incomplete:
+            raise RuntimeError("slack identity lookup incomplete")
         return self._run[email]
 
     # -- internals
@@ -321,6 +367,9 @@ class SlackMcpProvider:
     @staticmethod
     def _valid(email):
         return bool(email) and email.count("@") == 1 and all(email.split("@"))
+
+    def _is_internal(self, email):
+        return email.split("@")[1] in self.internal_domains
 
     @staticmethod
     def _derived_name(email):
@@ -330,7 +379,7 @@ class SlackMcpProvider:
     def _lookup(self, email):
         if email in self._run:
             return self._run[email]
-        entry = self._load_disk().get(email)
+        entry = self._load_disk().get(f"{self.namespace}:{email}")
         if isinstance(entry, dict):
             try:
                 checked = datetime.datetime.fromisoformat(entry["checked_at"])
@@ -346,35 +395,43 @@ class SlackMcpProvider:
                     return person
         return _UNKNOWN
 
-    def _load_disk(self):
-        if self._disk is not None:
-            return self._disk
-        entries = {}
-        if self.cache_path is not None and self.cache_path.exists():
-            try:
-                data = json.loads(self.cache_path.read_text())
-                if (
-                    not isinstance(data, dict)
-                    or data.get("version") != CACHE_VERSION
-                    or not isinstance(data.get("entries"), dict)
-                ):
-                    raise ValueError("unexpected cache shape")
-                entries = data["entries"]
-            except (OSError, ValueError):
-                if not self._warned_corrupt:
-                    self._warned_corrupt = True
-                    log("identity WARN cache unreadable; treating as empty")
-        self._disk = entries
-        return entries
+    def _read_entries(self):
+        """Entries currently on disk ({} if missing or unreadable)."""
+        if self.cache_path is None or not self.cache_path.exists():
+            return {}
+        try:
+            data = json.loads(self.cache_path.read_text())
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != CACHE_VERSION
+                or not isinstance(data.get("entries"), dict)
+            ):
+                raise ValueError("unexpected cache shape")
+            return data["entries"]
+        except (OSError, ValueError):
+            if not self._warned_corrupt:
+                self._warned_corrupt = True
+                log("identity WARN cache unreadable; treating as empty")
+            return {}
 
-    def _save_disk(self):
+    def _load_disk(self):
+        if self._disk is None:
+            self._disk = self._read_entries()
+        return self._disk
+
+    def _save_disk(self, new_entries):
+        """Merge ``new_entries`` into the file as it is now, then write."""
         if self.cache_path is None:
             return
         from . import state  # late import: avoid cycles
+        # Re-read under the write so another routine's entries are kept.
+        entries = self._read_entries()
+        entries.update(new_entries)
+        self._disk = entries
         try:
             state.write_atomic(
                 self.cache_path,
-                json.dumps({"version": CACHE_VERSION, "entries": self._disk},
+                json.dumps({"version": CACHE_VERSION, "entries": entries},
                            indent=2, sort_keys=True) + "\n",
                 mode=0o600,
             )
@@ -414,33 +471,50 @@ class SlackMcpProvider:
             self._fail(f"slack identity lookup failed: {exc}")
 
         ids_by_query = {}
+        searched = set()  # queries whose search returned a parsed result
         profiles = {}
         for result in results:
             name, tool_input = result.get("name"), result.get("input")
+            ok = not result.get("is_error")
             if name == self.search_tool:
+                if not ok or not _search_parsed(result.get("text")):
+                    continue
                 ids = parse_search_users(result.get("text"))
                 for query in _keywords(tool_input):
                     if query in locals_:
+                        searched.add(query)
                         known = ids_by_query.setdefault(query, [])
                         known.extend(i for i in ids if i not in known)
             elif name == self.profile_tool:
                 user_id = (tool_input or {}).get("user_id")
-                if isinstance(user_id, str):
-                    profiles[user_id] = parse_profile(result.get("text"))
+                fields = parse_profile(result.get("text")) if ok else {}
+                if isinstance(user_id, str) and fields:
+                    profiles[user_id] = fields
 
         stamp = _now().isoformat()
-        disk = self._load_disk()
-        hits = 0
+        new_entries = {}
+        hits = incomplete = 0
         for email in batch:
-            ids = ids_by_query.get(email.split("@")[0], [])
-            person = _accept(
-                email, {i: profiles[i] for i in ids if i in profiles}
-            )
+            query = email.split("@")[0]
+            ids = ids_by_query.get(query, [])
+            if query not in searched or any(i not in profiles for i in ids):
+                # Skipped query, errored/missing profile, or error JSON:
+                # cannot decide, so cache nothing and treat as an outage.
+                self._incomplete.add(email)
+                incomplete += 1
+                continue
+            person = _accept(email, {i: profiles[i] for i in ids})
             hits += person is not None
             self._run[email] = person
-            disk[email] = {"person": person, "checked_at": stamp}
-        self._save_disk()
-        log(f"identity slack_mcp lookup: {len(batch)} email(s), {hits} resolved")
+            new_entries[f"{self.namespace}:{email}"] = {
+                "person": person, "checked_at": stamp,
+            }
+        if new_entries:
+            self._save_disk(new_entries)
+        log(
+            f"identity slack_mcp lookup: {len(batch)} email(s), {hits} resolved"
+            + (f", {incomplete} incomplete" if incomplete else "")
+        )
 
 
 _UNKNOWN = object()
