@@ -1,0 +1,46 @@
+# Rolling Google Calendar cache for prompt injection, model-free in Python.
+#
+# Every run fetches the next window_hours of the calendar through the headless
+# Claude bridge (a claude.ai Google Calendar connector, read-only tools only)
+# and writes a compact text file plus a JSON twin. A Claude Code
+# UserPromptSubmit hook can `cat` the text file into every prompt. Claude only
+# transports the connector results; Python parses and renders them. Event text
+# from outside internal_domains never reaches the file as agenda or links.
+#
+# The tool names are exact MCP tool names as your connector exposes them; run
+# `claude mcp list` / check your connector to find them.
+id: calendar-cache
+enabled: false
+description: Cache the next 48h of calendar events for prompt injection.
+role: maintenance
+
+schedule:
+  every: 1h
+  work_hours:
+    every: 15m
+    days: [sun, mon, tue, wed, thu, fri, sat]
+    start: "07:00"
+    end: "23:00"
+    timezone: UTC
+
+maintenance:
+  kind: calendar_cache
+  # Pinned: the bridge only permits calls with exactly this calendar_id.
+  calendar_id: primary
+  window_hours: 48
+  # Rendering timezone (IANA).
+  timezone: UTC
+  # Whose RSVP is "my RSVP"; also makes events you organize show "organizer".
+  owner_email: me@example.com
+  # Agendas and links are kept only for events organized from these domains.
+  internal_domains: [example.com]
+  # The JSON twin is written next to it with a .json extension.
+  output: ~/.cache/claude-calendar/next48h.txt
+  # All-day working-location style markers to drop.
+  skip_titles: [Office, Home]
+  # 0 lists every attendee name; N > 0 shows per-status counts above N.
+  max_attendee_names: 0
+  model: haiku
+  list_tool: mcp__claude_ai_Example_Calendar__list_events
+  get_tool: mcp__claude_ai_Example_Calendar__get_event
+  max_events: 50

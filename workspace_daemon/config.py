@@ -17,8 +17,26 @@ VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
 }
 VALID_MAINTENANCE_KINDS = {
-    "google_tasks_sync", "slack_conversation_census",
+    "google_tasks_sync", "slack_conversation_census", "calendar_cache",
 }
+MAINTENANCE_ALLOWED_KEYS = {
+    "slack_conversation_census": {
+        "kind", "checkpoint", "hours", "requests_per_minute",
+        "thread_root_days",
+    },
+    "google_tasks_sync": {
+        "kind", "checkpoint", "store", "tasklists",
+        "outbound_tasklist", "outbound_since", "exclude_tags",
+        "identity_exclude_people", "max_tasks", "reclassify_non_todo",
+    },
+    "calendar_cache": {
+        "kind", "calendar_id", "window_hours", "timezone", "owner_email",
+        "internal_domains", "output", "skip_titles", "max_attendee_names",
+        "model", "list_tool", "get_tool", "max_events",
+    },
+}
+# Kinds that keep no checkpoint file; every other kind requires one.
+MAINTENANCE_NO_CHECKPOINT = {"calendar_cache"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -487,18 +505,10 @@ def validate(routine):
             problems.append(f"{rid}: `maintenance` must be a mapping")
         else:
             kind = maintenance.get("kind")
-            allowed = (
-                {
-                    "kind", "checkpoint", "hours", "requests_per_minute",
-                    "thread_root_days",
-                }
-                if kind == "slack_conversation_census"
-                else {
-                    "kind", "checkpoint", "store", "tasklists",
-                    "outbound_tasklist", "outbound_since", "exclude_tags",
-                    "identity_exclude_people", "max_tasks",
-                    "reclassify_non_todo",
-                }
+            # An unknown kind is reported below; fall back to the original
+            # Google Tasks key set so that report stays unchanged.
+            allowed = MAINTENANCE_ALLOWED_KEYS.get(
+                kind, MAINTENANCE_ALLOWED_KEYS["google_tasks_sync"]
             )
             unknown = set(maintenance) - allowed
             if unknown:
@@ -512,9 +522,13 @@ def validate(routine):
                     f"{', '.join(sorted(VALID_MAINTENANCE_KINDS))}"
                 )
             checkpoint = maintenance.get("checkpoint")
-            if not isinstance(checkpoint, str) or not checkpoint:
+            if kind not in MAINTENANCE_NO_CHECKPOINT and (
+                not isinstance(checkpoint, str) or not checkpoint
+            ):
                 problems.append(f"{rid}: maintenance.checkpoint is required")
-            if kind == "slack_conversation_census":
+            if kind == "calendar_cache":
+                problems.extend(_validate_calendar_cache(rid, maintenance))
+            elif kind == "slack_conversation_census":
                 hours = maintenance.get("hours", 48)
                 if (
                     not isinstance(hours, (int, float))
@@ -1064,6 +1078,90 @@ def _validate_handlers(routine, source_dicts):
     if unused:
         problems.append(
             f"{rid}: unused handler(s): {', '.join(unused)}"
+        )
+    return problems
+
+
+def _non_empty_str(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _str_list(value):
+    return isinstance(value, list) and all(_non_empty_str(v) for v in value)
+
+
+def _validate_calendar_cache(rid, cfg):
+    problems = []
+    for key in ("owner_email", "list_tool", "get_tool", "output"):
+        if not _non_empty_str(cfg.get(key)):
+            problems.append(f"{rid}: maintenance.{key} is required")
+    output = cfg.get("output")
+    if _non_empty_str(output) and output.lower().endswith(".json"):
+        problems.append(
+            f"{rid}: maintenance.output must not end in .json "
+            "(the JSON twin uses that name)"
+        )
+    owner = cfg.get("owner_email")
+    if _non_empty_str(owner) and not re.fullmatch(r"[^@\s]+@[^@\s]+", owner):
+        problems.append(f"{rid}: maintenance.owner_email must be an email address")
+    for key in ("list_tool", "get_tool"):
+        value = cfg.get(key)
+        if _non_empty_str(value) and not re.fullmatch(r"mcp__[A-Za-z0-9_-]+", value):
+            problems.append(
+                f"{rid}: maintenance.{key} must be an exact MCP tool name "
+                "(mcp__<server>__<tool>)"
+            )
+    if (
+        _non_empty_str(cfg.get("list_tool"))
+        and cfg.get("list_tool") == cfg.get("get_tool")
+    ):
+        problems.append(
+            f"{rid}: maintenance.list_tool and get_tool must differ"
+        )
+    if "calendar_id" in cfg and not _non_empty_str(cfg["calendar_id"]):
+        problems.append(f"{rid}: maintenance.calendar_id must be a non-empty string")
+    window = cfg.get("window_hours", 48)
+    if (
+        not isinstance(window, (int, float)) or isinstance(window, bool)
+        or not 0 < window <= 24 * 31
+    ):
+        problems.append(
+            f"{rid}: maintenance.window_hours must be a positive number "
+            "of at most 744"
+        )
+    if "timezone" in cfg:
+        try:
+            ZoneInfo(cfg["timezone"])
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            problems.append(
+                f"{rid}: maintenance.timezone must be a valid IANA timezone"
+            )
+    domains = cfg.get("internal_domains", [])
+    if not _str_list(domains) or any(
+        "@" in d or d != d.strip() or d != d.lower() for d in domains
+    ):
+        problems.append(
+            f"{rid}: maintenance.internal_domains must be a list of "
+            "lowercase domain names"
+        )
+    if not _str_list(cfg.get("skip_titles", [])):
+        problems.append(
+            f"{rid}: maintenance.skip_titles must be a list of strings"
+        )
+    names = cfg.get("max_attendee_names", 0)
+    if not isinstance(names, int) or isinstance(names, bool) or names < 0:
+        problems.append(
+            f"{rid}: maintenance.max_attendee_names must be an integer >= 0"
+        )
+    if "model" in cfg and not _non_empty_str(cfg["model"]):
+        problems.append(f"{rid}: maintenance.model must be a non-empty string")
+    max_events = cfg.get("max_events", 50)
+    if (
+        not isinstance(max_events, int) or isinstance(max_events, bool)
+        or not 1 <= max_events <= 250
+    ):
+        problems.append(
+            f"{rid}: maintenance.max_events must be an integer from 1 to 250"
         )
     return problems
 
