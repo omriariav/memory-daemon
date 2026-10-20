@@ -126,9 +126,9 @@ def _maintenance_kind(routine):
 def _execution_groups(routines, active_ids):
     """Partition work by the lock that protects its mutable state.
 
-    The Slack census and the calendar cache each own a lock so a long capture
-    or census never delays the (cheap, frequent) calendar refresh, and the
-    calendar refresh never blocks anything else.
+    Each group runs under its own lock. The calendar cache is only scheduled
+    by the `calendar` tick job (or `all`), so a long Slack census in the
+    `maintenance` job never delays it; a manual `run` orders census first.
     """
     selected = [
         routine for routine in routines
@@ -145,10 +145,22 @@ def _execution_groups(routines, active_ids):
                 and kind not in (CENSUS_KIND, CALENDAR_KIND)),
             "run",
         ),
-        # Cheap calendar refresh ahead of the long census within one tick.
+        # Within one `all` tick the cheap calendar refresh runs before the census.
         (ids(lambda kind: kind == CALENDAR_KIND), "calendar-cache"),
         (ids(lambda kind: kind == CENSUS_KIND), "slack-census"),
     ]
+
+
+def _in_tick_group(routine, group):
+    """Whether `tick --group <group>` considers this routine."""
+    kind = _maintenance_kind(routine)
+    if group == "capture":
+        return kind is None
+    if group == "calendar":
+        return kind == CALENDAR_KIND
+    if group == "maintenance":
+        return kind is not None and kind != CALENDAR_KIND
+    return True
 
 
 def _manual_execution_groups(routines, active_ids):
@@ -282,11 +294,7 @@ def cmd_tick(args):
         r for r in routines
         if (
             r.get("enabled", True)
-            and (
-                group == "all"
-                or (group == "capture" and not config.is_maintenance(r))
-                or (group == "maintenance" and config.is_maintenance(r))
-            )
+            and _in_tick_group(r, group)
         )
     ]
     due = [
@@ -460,8 +468,9 @@ def main(argv=None):
         "tick", help="run only enabled routines whose schedule is due"
     )
     p_tick.add_argument(
-        "--group", choices=("all", "capture", "maintenance"), default="all",
-        help="run all due routines, capture only, or maintenance only",
+        "--group", choices=("all", "capture", "maintenance", "calendar"), default="all",
+        help="run all due routines, capture only, maintenance only (without "
+             "the calendar cache), or the calendar cache only",
     )
     p_tick.add_argument(
         "-n", "--dry-run", action="store_true",

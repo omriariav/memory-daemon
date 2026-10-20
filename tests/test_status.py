@@ -747,6 +747,28 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("ATTENTION: last tick is stale", capture_line)
         self.assertNotIn("ATTENTION", maintenance_line)
 
+    def test_loaded_calendar_job_is_reported_and_checked(self):
+        loaded = {
+            "loaded": True, "label": "com.memory-daemon", "state": "not running",
+            "runs": 0, "last_exit": 0, "interval_seconds": 300,
+        }
+        calendar = {**loaded, "label": status.CALENDAR_LAUNCHD_LABEL}
+        for last_exit, healthy_expected in ((0, True), (1, False)):
+            calendar["last_exit"] = last_exit
+            base_probe = self.probe(loaded)
+
+            def resolve(label, calendar=dict(calendar), base_probe=base_probe):
+                if label == status.CALENDAR_LAUNCHD_LABEL:
+                    return calendar
+                return base_probe(label)
+
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                status, "probe_launchd", side_effect=resolve
+            ):
+                text, healthy = status.render(Path(tmp), [], now=1100)
+            self.assertIn("Calendar scheduler: armed", text)
+            self.assertEqual(healthy, healthy_expected, text)
+
     def test_legacy_loaded_job_gets_a_migration_hint(self):
         current = {
             "loaded": False,
@@ -768,6 +790,7 @@ class RenderStatusTest(unittest.TestCase):
                     current,
                     {**current, "label": status.MAINTENANCE_LAUNCHD_LABEL},
                     legacy,
+                    {**current, "label": status.CALENDAR_LAUNCHD_LABEL},
                 ],
             ):
                 text, healthy = status.render(Path(tmp), [], now=1100)
@@ -885,7 +908,7 @@ class RenderStatusTest(unittest.TestCase):
                 with mock.patch.object(
                     status,
                     "probe_launchd",
-                    side_effect=[unavailable, unavailable, unavailable],
+                    side_effect=[unavailable] * 4,
                 ):
                     text, _ = status.render(Path(tmp), [], now=1100)
 

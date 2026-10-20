@@ -32,7 +32,8 @@ MAINTENANCE_ALLOWED_KEYS = {
     "calendar_cache": {
         "kind", "calendar_id", "window_hours", "timezone", "owner_email",
         "internal_domains", "output", "skip_titles", "max_attendee_names",
-        "model", "list_tool", "get_tool", "max_events",
+        "model", "list_tool", "get_tool", "max_events", "max_details",
+        "stale_after", "conference_hosts",
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
@@ -1101,6 +1102,13 @@ def _validate_calendar_cache(rid, cfg):
             f"{rid}: maintenance.output must not end in .json "
             "(the JSON twin uses that name)"
         )
+    if _non_empty_str(output) and not (
+        output.startswith("~") or output.startswith("/")
+    ):
+        problems.append(
+            f"{rid}: maintenance.output must be an absolute or ~ path "
+            "(a relative path would land inside the repository)"
+        )
     owner = cfg.get("owner_email")
     if _non_empty_str(owner) and not re.fullmatch(r"[^@\s]+@[^@\s]+", owner):
         problems.append(f"{rid}: maintenance.owner_email must be an email address")
@@ -1162,6 +1170,31 @@ def _validate_calendar_cache(rid, cfg):
     ):
         problems.append(
             f"{rid}: maintenance.max_events must be an integer from 1 to 250"
+        )
+    details = cfg.get("max_details", 20)
+    if (
+        not isinstance(details, int) or isinstance(details, bool)
+        or not 0 <= details <= 100
+    ):
+        problems.append(
+            f"{rid}: maintenance.max_details must be an integer from 0 to 100"
+        )
+    if "stale_after" in cfg:
+        try:
+            duration_seconds(cfg["stale_after"])
+        except RoutineError:
+            problems.append(
+                f"{rid}: maintenance.stale_after must look like '30m', '2h', "
+                "or '1d'"
+            )
+    hosts = cfg.get("conference_hosts", [])
+    if not _str_list(hosts) or any(
+        not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", h) or "." not in h
+        for h in hosts
+    ):
+        problems.append(
+            f"{rid}: maintenance.conference_hosts must be a list of "
+            "lowercase host names such as zoom.us"
         )
     return problems
 

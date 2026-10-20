@@ -31,6 +31,7 @@ class RunScriptTest(unittest.TestCase):
         self.plist.write_text("plist", encoding="utf-8")
         self.maintenance_plist = self.root / "com.memory-daemon-maintenance.plist"
         self.maintenance_plist.write_text("plist", encoding="utf-8")
+        self.calendar_plist = self.root / "com.memory-daemon-calendar.plist"
         self.log = self.root / "launchctl.log"
         self.launchctl = self.root / "launchctl"
 
@@ -61,6 +62,7 @@ class RunScriptTest(unittest.TestCase):
             "MEMORY_DAEMON_LAUNCHD_DOMAIN": "gui/123",
             "MEMORY_DAEMON_PLIST": str(self.plist),
             "MEMORY_DAEMON_MAINTENANCE_PLIST": str(self.maintenance_plist),
+            "MEMORY_DAEMON_CALENDAR_PLIST": str(self.calendar_plist),
             "MEMORY_DAEMON_LAUNCHCTL": str(self.launchctl),
             "LAUNCHCTL_TEST_LOG": str(self.log),
             **extra_env,
@@ -119,6 +121,31 @@ class RunScriptTest(unittest.TestCase):
                 "kickstart gui/123/com.memory-daemon-maintenance",
             ],
         )
+
+    def test_optional_calendar_job_is_loaded_and_started_when_rendered(self):
+        self.write_launchctl(loaded=False)
+        self.calendar_plist.write_text("plist", encoding="utf-8")
+
+        result = self.run_helper()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.launchctl_calls()
+        self.assertEqual(calls[6:9], [
+            "print gui/123/com.memory-daemon-calendar",
+            "enable gui/123/com.memory-daemon-calendar",
+            f"bootstrap gui/123 {self.calendar_plist}",
+        ])
+        self.assertEqual(
+            calls[-1], "kickstart gui/123/com.memory-daemon-calendar"
+        )
+
+    def test_calendar_job_is_skipped_without_its_plist(self):
+        self.write_launchctl(loaded=False)
+
+        result = self.run_helper()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("calendar" in c for c in self.launchctl_calls()))
 
     def test_missing_plist_blocks_bootstrap(self):
         self.write_launchctl(loaded=False)
