@@ -1040,15 +1040,22 @@ Security model, least privilege by construction:
   persisted, permission mode is `dontAsk`, and risky built-ins (shell, edit,
   web, agents, scheduling) are disallowed.
 - A PreToolUse hook denies everything except `ToolSearch select:<allowlisted
-  names>` and allowlisted tools whose arguments equal their pinned values. Any
-  hook error denies.
-- The stream is re-checked in Python: a non-success result, any permission
-  denial, an off-allowlist tool call, an unexpected built-in, or a tool error
-  fails the run closed. If the model made no real call for a required tool
-  (it sometimes answers from imagination), the run is retried, up to 3 attempts.
-- Errors name only kinds, exit codes and tool names; prompts and tool
+  names>` and allowlisted tools whose arguments exactly equal their pinned
+  values (JSON types included, so `true` is not `1`). Any hook error denies.
+- The stream is re-checked in Python, including the same pin check on every
+  tool call, so a hook that fails open cannot widen access: a non-success
+  result, an off-allowlist call, a call that ran despite failing its pins, an
+  unexpected built-in, a missing `init` event, or a tool error fails the run
+  closed. Hook-denied calls (e.g. the model trying `Read`) never yield results
+  and only bump a denial count in the usage log. If the model made no real call
+  for a required tool (it sometimes answers from imagination), the run is
+  retried, up to 3 attempts. The timeout covers the connector wait and the
+  stdin write. `call_tools(..., accept_partial=True)` returns results gathered
+  before a max-turns/max-budget stop (flagged `.partial`) if every required
+  tool already answered.
+- Errors name only kinds, exit codes and known tool names (anything else is `<invalid>`); prompts and tool
   inputs/results are never logged. `state/claude-usage.jsonl` (0600) records
-  per-attempt model, tool names, duration, cost and token counts only.
+  per-attempt model, tool names, denial count, duration, cost and token counts only.
 
 ### Label caching
 

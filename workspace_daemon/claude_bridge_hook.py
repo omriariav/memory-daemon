@@ -11,6 +11,15 @@ import sys
 SELECT_PREFIX = "select:"
 
 
+def _same(left, right):
+    """Exact JSON equality: True != 1 and 1 != 1.0 (Python == would pass both)."""
+    try:
+        return (json.dumps(left, sort_keys=True)
+                == json.dumps(right, sort_keys=True))
+    except (TypeError, ValueError):
+        return False
+
+
 def decide(payload, tools):
     """Return (allowed, reason) for one tool call against {name: pins}.
 
@@ -38,7 +47,7 @@ def decide(payload, tools):
     if not isinstance(pins, dict):
         raise ValueError("malformed allowlist")
     for key, value in pins.items():
-        if key not in tool_input or tool_input[key] != value:
+        if key not in tool_input or not _same(tool_input[key], value):
             return False, f"tool {name} argument {key} does not match its pin"
     return True, "allowlisted tool call"
 
@@ -56,11 +65,14 @@ def main(argv, stdin):
         with open(argv[1], encoding="utf-8") as handle:
             tools = json.load(handle)["tools"]
         allowed, reason = decide(json.load(stdin), tools)
+        _emit(allowed, reason)
+        return 0
     except Exception:  # fail closed on anything, including a bad allowlist
-        _emit(False, "bridge hook error")
+        try:
+            _emit(False, "bridge hook error")
+        except Exception:
+            pass  # exit 2 still blocks the call
         return 2
-    _emit(allowed, reason)
-    return 0
 
 
 if __name__ == "__main__":
