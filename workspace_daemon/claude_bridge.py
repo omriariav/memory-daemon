@@ -6,14 +6,18 @@ the model's own restatement (models hallucinate tool output as plain text).
 `complete` is a no-tools completion used as an LLM provider.
 
 Enforcement is layered: a PreToolUse hook (claude_bridge_hook.py) allows only the
-allowlisted calls, risky built-ins are disallowed, and the stream is re-checked
-here so any off-allowlist call, permission denial, or unknown built-in fails the
-run closed. BridgeError messages carry only kinds, subtypes, exit codes, tool
+allowlisted calls, risky built-ins are disallowed, and every tool_use in the
+stream is re-checked here with the same decide(): an off-allowlist call, a call
+that ran despite failing its pins, or an unknown built-in fails the run closed.
+Hook-denied calls (e.g. a model poking at Read) never contribute results and
+only bump a denial count; the run is judged on its required tool results.
+BridgeError messages carry only kinds, subtypes, exit codes, tool
 names and counts; prompts, tool inputs, results and CLI output never appear in
 errors or logs.
 """
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -23,6 +27,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import claude_bridge_hook
 from .shell import claude_bin, utc_now_iso
 
 HOOK_PATH = Path(__file__).with_name("claude_bridge_hook.py")
@@ -42,10 +47,19 @@ DEFAULT_DISALLOWED_TOOLS = (
 # one; refuse rather than run with an unreviewed capability.
 ALLOWED_BUILTINS = {"ToolSearch", "Read", "Glob", "Grep"}
 SEARCH_TOOL = "ToolSearch"
+# Result subtypes where the CLI stopped on a limit rather than failing; with
+# accept_partial the results collected so far may still be used.
+PARTIAL_SUBTYPES = {"error_max_turns", "error_max_budget_usd"}
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # claude.ai connectors attach a few seconds after the CLI starts. A prompt sent
 # before that often finds no deferred tools and the model gives up, so the
 # prompt is held back this long (stream-json input keeps stdin open meanwhile).
 CONNECT_DELAY_SECONDS = 6.0
+
+
+class ToolResults(list):
+    """call_tools return value: a plain list of results plus a `partial` flag."""
+    partial = False
 
 
 class BridgeError(RuntimeError):
@@ -98,7 +112,8 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
     """Run claude with the prompt on stdin; kill its whole process group on timeout.
 
     The prompt is one stream-json user message, written after `connect_delay`
-    seconds so connector tools are discoverable when the model starts.
+    seconds so connector tools are discoverable when the model starts. The
+    delay and the write share the one `timeout` budget.
     """
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -107,14 +122,17 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
     message = json.dumps(
         {"type": "user", "message": {"role": "user", "content": prompt}}
     )
+    deadline = time.monotonic() + timeout
     try:
         if connect_delay:
-            time.sleep(connect_delay)
-        try:
-            proc.stdin.write(message + "\n")
-        except BrokenPipeError:
-            pass  # exited early; the exit code and stream report why
-        stdout, _ = proc.communicate(timeout=timeout)
+            time.sleep(min(connect_delay, timeout))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        # The write is inside communicate so a child that never reads stdin
+        # still hits the timeout instead of blocking on a full pipe. A child
+        # that exited early is a broken pipe communicate already swallows.
+        stdout, _ = proc.communicate(input=message + "\n", timeout=remaining)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -159,7 +177,25 @@ def _content_blocks(event):
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
-def _log_usage(base_dir, model, names, attempt, outcome, started, result):
+def _safe_name(name, known):
+    """A model-chosen tool name is loggable only if well formed and known."""
+    if isinstance(name, str) and _SAFE_NAME.match(name) and name in known:
+        return name
+    return "<invalid>"
+
+
+def _call_allowed(name, tool_input, tools):
+    """Re-run the hook's decision for one tool_use; malformed input is a no."""
+    try:
+        return claude_bridge_hook.decide(
+            {"tool_name": name, "tool_input": tool_input}, tools
+        )[0]
+    except ValueError:
+        return False
+
+
+def _log_usage(base_dir, model, names, attempt, outcome, started, result,
+               denials):
     """Best-effort metadata line; never the prompt or any tool output."""
     usage = (result or {}).get("usage")
     usage = usage if isinstance(usage, dict) else {}
@@ -169,6 +205,7 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result):
         "tools": sorted(names),
         "attempt": attempt,
         "outcome": outcome,
+        "denials": denials,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "total_cost_usd": (result or {}).get("total_cost_usd"),
         "input_tokens": usage.get("input_tokens"),
@@ -185,11 +222,17 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result):
 
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
-             timeout, attempt, disallowed, connect_delay, required=None):
-    """One claude run. Returns (results, final result event); raises BridgeError."""
+             timeout, attempt, disallowed, connect_delay, required=None,
+             accept_partial=False):
+    """One claude run. Returns (results, final result event, partial).
+
+    Raises BridgeError. partial is True only when accept_partial let a
+    max-turns/max-budget stop through with every required tool answered.
+    """
     started = time.monotonic()
     result_event = None
     outcome = "error"
+    denials = 0
     runs = _runs_dir(base_dir)
     runs.mkdir(parents=True, exist_ok=True, mode=0o700)
     needed = list(tools) if required is None else list(required)
@@ -219,17 +262,23 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         if result_event is None:
             raise BridgeError("claude stream had no final result event")
         subtype = result_event.get("subtype")
-        if subtype != "success" or result_event.get("is_error"):
+        stopped = accept_partial and subtype in PARTIAL_SUBTYPES
+        if not stopped and (subtype != "success" or result_event.get("is_error")):
             raise BridgeError(f"claude run failed: result subtype {subtype}")
-        if result_event.get("permission_denials"):
-            denied = len(result_event["permission_denials"])
-            raise BridgeError(f"claude run had {denied} permission denial(s)")
+        reported = result_event.get("permission_denials")
+        denials = len(reported) if isinstance(reported, list) else 0
+        if denials and not tools:
+            raise BridgeError(f"claude run had {denials} permission denial(s)")
 
-        issued = {}  # tool_use id -> (name, input), only for calls actually made
+        known = set(tools) | ALLOWED_BUILTINS | set(disallowed.split(","))
+        issued = {}  # tool_use id -> (name, input, allowed), calls actually made
         results = []
+        saw_init = False
+        streamed_denials = 0
         for event in events:
             kind = event.get("type")
             if kind == "system" and event.get("subtype") == "init":
+                saw_init = True
                 extra = sorted(
                     t for t in event.get("tools") or []
                     if isinstance(t, str) and not t.startswith("mcp__")
@@ -244,24 +293,39 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     if block.get("type") != "tool_use":
                         continue
                     name = block.get("name")
-                    if name == SEARCH_TOOL and tools:
-                        pass
-                    elif name not in tools:
-                        raise BridgeError(f"tool call outside allowlist: {name}")
+                    if not tools or not (
+                        isinstance(name, str)
+                        and (name in tools or name in ALLOWED_BUILTINS)
+                    ):
+                        raise BridgeError(
+                            f"tool call outside allowlist: {_safe_name(name, known)}"
+                        )
                     tool_input = block.get("input")
-                    issued[block.get("id")] = (
-                        name, tool_input if isinstance(tool_input, dict) else {}
-                    )
+                    tool_input = tool_input if isinstance(tool_input, dict) else {}
+                    ok = _call_allowed(name, tool_input, tools)
+                    streamed_denials += not ok
+                    issued[block.get("id")] = (name, tool_input, ok)
             elif kind == "user":
                 for block in _content_blocks(event):
                     if block.get("type") != "tool_result":
                         continue
-                    name, tool_input = issued.get(
-                        block.get("tool_use_id"), (None, None)
+                    name, tool_input, ok = issued.get(
+                        block.get("tool_use_id"), (None, None, True)
                     )
-                    if name is None or name == SEARCH_TOOL:
+                    if name is None:
                         continue
                     is_error = bool(block.get("is_error"))
+                    if not ok:
+                        # The hook should have denied this. A real result
+                        # means it ran anyway (hook failed open): fail closed.
+                        if not is_error:
+                            raise BridgeError(
+                                f"tool call ran despite allowlist check: "
+                                f"{_safe_name(name, known)}"
+                            )
+                        continue
+                    if name == SEARCH_TOOL:
+                        continue
                     # A failed required call fails the run; a failed optional
                     # one (e.g. one detail lookup) is returned marked is_error.
                     if is_error and name in needed:
@@ -272,23 +336,33 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                         "text": _result_text(block.get("content")),
                         "is_error": is_error,
                     })
-        outcome = "ok" if all(
+        if not saw_init:
+            raise BridgeError("claude stream had no init event")
+        denials = max(denials, streamed_denials)
+        complete_run = all(
             any(r["name"] == n and not r["is_error"] for r in results)
             for n in needed
-        ) else "missing_results"
-        return results, result_event
+        )
+        partial = stopped and subtype != "success"
+        if partial and not complete_run:
+            raise BridgeError(f"claude run failed: result subtype {subtype}")
+        outcome = ("partial" if partial else "ok") if complete_run \
+            else "missing_results"
+        return results, result_event, partial
     except BridgeError as exc:
         outcome = "error: " + str(exc)
         raise
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
-        _log_usage(base_dir, model, tools, attempt, outcome, started, result_event)
+        _log_usage(base_dir, model, tools, attempt, outcome, started, result_event,
+                   denials)
 
 
 def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
-               connect_delay=CONNECT_DELAY_SECONDS, required=None):
+               connect_delay=CONNECT_DELAY_SECONDS, required=None,
+               accept_partial=False):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -299,6 +373,15 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     required: names that must each yield a real result, else the run is retried
     and finally fails. Default (None): every allowlisted tool. Pass a subset to
     allow optional tools the model may or may not call.
+
+    accept_partial: when True and the run stops on max-turns or max-budget with
+    every required tool already answered by a real non-error result, return
+    what was collected instead of raising. The return is always a list
+    subclass (ToolResults) whose `.partial` is True in that case, else False.
+    A partial run is not retried. Default False: such a stop raises.
+
+    Hook-denied calls (e.g. Read) never produce results and do not fail the
+    run; only a count is recorded in the usage log.
 
     dry_run: the runner already skips LLM/connector work under --dry-run, so
     this refuses loudly with BridgeDryRun (a BridgeError) instead of returning
@@ -317,15 +400,18 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     )
     full_prompt = f"{instruction}\n\n{prompt}"
     for attempt in range(1, attempts + 1):
-        results, _ = _attempt(
+        results, _, partial = _attempt(
             full_prompt, dict(tools), model=model, base_dir=base_dir,
             max_turns=max_turns, max_budget_usd=max_budget_usd,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
             connect_delay=connect_delay, required=needed,
+            accept_partial=accept_partial,
         )
         if all(any(r["name"] == name and not r["is_error"] for r in results)
                for name in needed):
-            return results
+            out = ToolResults(results)
+            out.partial = partial
+            return out
     raise BridgeError(
         f"required tool results missing after {attempts} attempt(s): "
         f"{', '.join(needed)}"
@@ -335,7 +421,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
 def complete(prompt, *, model, base_dir, max_turns=1, max_budget_usd=0.25,
              timeout=300, disallowed_tools=DEFAULT_DISALLOWED_TOOLS):
     """No-tools completion: returns the model's final text, fails on any tool use."""
-    _, result_event = _attempt(
+    _, result_event, _ = _attempt(
         prompt, {}, model=model, base_dir=base_dir, max_turns=max_turns,
         max_budget_usd=max_budget_usd, timeout=timeout, attempt=1,
         disallowed=disallowed_tools, connect_delay=0,
