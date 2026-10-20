@@ -494,9 +494,12 @@ def _is_internal(raw, detail, internal):
     """Internal only by the organiser's own domain; the creator never decides alone.
 
     A shared (group/resource) calendar organiser defers to the creator, and only
-    for a plain `default` event: invitations imported from mail or other
-    sources carry another type and stay external.
+    for a plain event: invitations imported from mail or other sources carry
+    another type and stay external. Connectors that omit the type line (the
+    common case) count as plain; only an explicit other type demotes.
     """
+    if detail.get("event_type") not in (None, "", "default"):
+        return False  # e.g. created from mail: the text came from outside
     organizers = [e for e in (raw["organizer"], detail.get("organizer")) if e]
     if any(e.split("@", 1)[0] == "unknownorganizer" for e in organizers):
         return False  # Google's stand-in organiser for imported invitations
@@ -507,7 +510,7 @@ def _is_internal(raw, detail, internal):
     return bool(
         organizers and creator and not _is_calendar_email(creator)
         and _domain(creator) in internal
-        and detail.get("event_type") == "default"
+        and detail.get("event_type") in (None, "", "default")
     )
 
 
@@ -856,7 +859,12 @@ def fetch(cfg, base_dir, now, tz):
         timeout=BRIDGE_TIMEOUT,
         attempts=BRIDGE_ATTEMPTS,
         required=[list_tool],
+        # A busy calendar can run out of turns or budget on detail lookups;
+        # the pinned listing alone is still a valid refresh.
+        accept_partial=True,
     )
+    if getattr(results, "partial", False):
+        log("calendar_cache: bridge stopped early; rendering what was fetched")
     listing = next(
         (r for r in results if r["name"] == list_tool and not r.get("is_error")
          and r.get("input") == args),

@@ -995,11 +995,21 @@ class InternalStatusTest(unittest.TestCase):
             "room-1@resource.calendar.google.com", "alice.smith@example.com"))
 
     def test_other_event_types_are_external(self):
-        for event_type in ("fromGmail", "birthday", "focusTime", None):
+        for event_type in ("fromGmail", "birthday", "focusTime"):
             self.assertFalse(
                 self.internal(self.CAL_ORG, "alice.smith@example.com", event_type),
                 event_type,
             )
+
+    def test_mail_created_event_is_external_even_with_internal_organizer(self):
+        self.assertFalse(self.internal("alice.smith@example.com",
+                                       event_type="fromGmail"))
+        # A detail without an event-type line does not demote a person organizer.
+        self.assertTrue(self.internal("alice.smith@example.com", event_type=None))
+
+    def test_shared_calendar_without_an_event_type_line_counts_as_plain(self):
+        self.assertTrue(
+            self.internal(self.CAL_ORG, "alice.smith@example.com", None))
 
     def test_shared_calendar_needs_an_internal_creator(self):
         self.assertFalse(self.internal(self.CAL_ORG, None))
@@ -1102,6 +1112,14 @@ class RunTest(unittest.TestCase):
             ["next48h.json", "next48h.txt"],
         )
         self.assertEqual(self.out.stat().st_mode & 0o777, 0o600)
+
+    def test_partial_run_with_the_listing_still_refreshes(self):
+        results = calendar_cache.claude_bridge.ToolResults(self.results[:1])
+        results.partial = True
+        report, call = self.run_cache(results)
+        self.assertTrue(call.call_args.kwargs["accept_partial"])
+        self.assertEqual(report["events"], 2)
+        self.assertIn("Weekly sync", self.out.read_text())
 
     def test_bridge_call_shape(self):
         _, call = self.run_cache()
