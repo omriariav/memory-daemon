@@ -268,6 +268,15 @@ class CallToolsTest(BridgeBase):
         self.assertNotIn(SECRET_OUTPUT, str(ctx.exception))
         self.assertEqual(self.invocations(), 1)
 
+    def test_optional_tool_error_is_returned_not_fatal(self):
+        self.stream(
+            init() + tool_use("t1", TOOL_A) + tool_result("t1", "listing")
+            + tool_use("t2", TOOL_B) + tool_result("t2", SECRET_OUTPUT, is_error=True)
+            + result())
+        out = self.call({TOOL_A: {}, TOOL_B: {}}, required=[TOOL_A], attempts=1)
+        self.assertEqual([(r["name"], r["is_error"]) for r in out],
+                         [(TOOL_A, False), (TOOL_B, True)])
+
     def test_nonzero_exit_fails(self):
         self.stream(good_stream() + SECRET_OUTPUT)
         (self.stub_dir / "exit").write_text("3")
@@ -336,6 +345,24 @@ class CallToolsTest(BridgeBase):
         with self.assertRaises(claude_bridge.BridgeError):
             self.call()
         self.assertEqual(list((self.base / "state" / "claude-runs").iterdir()), [])
+
+    def test_required_subset_allows_missing_optional_tool(self):
+        self.stream(good_stream())
+        out = self.call({TOOL_A: {}, TOOL_B: {}}, required=[TOOL_A], attempts=1)
+        self.assertEqual([r["name"] for r in out], [TOOL_A])
+        self.assertEqual(self.invocations(), 1)
+        self.assertEqual(self.usage_lines()[0]["outcome"], "ok")
+
+    def test_required_tool_missing_still_retries_and_fails(self):
+        self.stream(good_stream())
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call({TOOL_A: {}, TOOL_B: {}}, required=[TOOL_B], attempts=2)
+        self.assertEqual(self.invocations(), 2)
+
+    def test_required_must_be_allowlisted(self):
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call({TOOL_A: {}}, required=[TOOL_B])
+        self.assertEqual(self.invocations(), 0)
 
     def test_dry_run_spawns_nothing(self):
         with self.assertRaises(claude_bridge.BridgeDryRun):

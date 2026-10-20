@@ -185,13 +185,14 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result):
 
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
-             timeout, attempt, disallowed, connect_delay):
+             timeout, attempt, disallowed, connect_delay, required=None):
     """One claude run. Returns (results, final result event); raises BridgeError."""
     started = time.monotonic()
     result_event = None
     outcome = "error"
     runs = _runs_dir(base_dir)
     runs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    needed = list(tools) if required is None else list(required)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=runs))
     try:
         os.chmod(run_dir, 0o700)
@@ -260,16 +261,21 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     )
                     if name is None or name == SEARCH_TOOL:
                         continue
-                    if block.get("is_error"):
+                    is_error = bool(block.get("is_error"))
+                    # A failed required call fails the run; a failed optional
+                    # one (e.g. one detail lookup) is returned marked is_error.
+                    if is_error and name in needed:
                         raise BridgeError(f"tool returned an error: {name}")
                     results.append({
                         "name": name,
                         "input": tool_input,
                         "text": _result_text(block.get("content")),
-                        "is_error": False,
+                        "is_error": is_error,
                     })
-        outcome = "ok" if all(any(r["name"] == n for r in results) for n in tools) \
-            else "missing_results"
+        outcome = "ok" if all(
+            any(r["name"] == n and not r["is_error"] for r in results)
+            for n in needed
+        ) else "missing_results"
         return results, result_event
     except BridgeError as exc:
         outcome = "error: " + str(exc)
@@ -282,13 +288,17 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
 def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
-               connect_delay=CONNECT_DELAY_SECONDS):
+               connect_delay=CONNECT_DELAY_SECONDS, required=None):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
     equality; {} pins nothing). Returns [{"name", "input", "text", "is_error"}]
     for every real tool_result of an allowlisted tool, in order. Results are
     usually human-readable text, not JSON; callers parse.
+
+    required: names that must each yield a real result, else the run is retried
+    and finally fails. Default (None): every allowlisted tool. Pass a subset to
+    allow optional tools the model may or may not call.
 
     dry_run: the runner already skips LLM/connector work under --dry-run, so
     this refuses loudly with BridgeDryRun (a BridgeError) instead of returning
@@ -298,6 +308,10 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
         raise BridgeError("call_tools needs at least one tool")
     if dry_run:
         raise BridgeDryRun("dry-run: claude bridge not invoked")
+    needed = list(tools) if required is None else list(required)
+    unknown = [name for name in needed if name not in tools]
+    if unknown:
+        raise BridgeError(f"required tool not in allowlist: {', '.join(unknown)}")
     instruction = (
         f'First call ToolSearch with query "select:{",".join(tools)}".'
     )
@@ -307,13 +321,14 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             full_prompt, dict(tools), model=model, base_dir=base_dir,
             max_turns=max_turns, max_budget_usd=max_budget_usd,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
-            connect_delay=connect_delay,
+            connect_delay=connect_delay, required=needed,
         )
-        if all(any(r["name"] == name for r in results) for name in tools):
+        if all(any(r["name"] == name and not r["is_error"] for r in results)
+               for name in needed):
             return results
     raise BridgeError(
         f"required tool results missing after {attempts} attempt(s): "
-        f"{', '.join(tools)}"
+        f"{', '.join(needed)}"
     )
 
 
