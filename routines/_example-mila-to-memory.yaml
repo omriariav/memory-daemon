@@ -89,3 +89,4 @@ memory:
     max_per_item: 5
     tag: from-meeting
     owner_slug: me-example
+    owner_name: Me Example   # required; fail closed without it

@@ -10,10 +10,13 @@ so the task-inbox export can see it:
         enabled: true
         max_per_item: 5
         tag: from-meeting
-        owner_slug: me-example   # optional; default: the verified owner slug
+        owner_slug: me-example
+        owner_name: Me Example         # fail closed without a known name
+        owner_names: [Me E.]           # optional aliases / other scripts
 
-Pure helpers live here (config, prompt text, strict validation, stable keys);
-writing goes through memory_sink so the store CLI stays the only writer.
+Pure helpers live here (config, prompt text, strict validation, deterministic
+grounding, stable keys); writing goes through memory_sink so the store CLI
+stays the only writer.
 """
 import hashlib
 import re
@@ -37,13 +40,14 @@ _KEYS = {"text", "due", "evidence_ts"}
 
 PROMPT_SECTION = """  "owner_actions": array (at most {max_per_item}) of {owner}'s OWN action items
             from this meeting, each {{"text": imperative sentence <= {text_limit}
-            chars, "due": "YYYY-MM-DD" (optional), "evidence_ts": transcript
-            timestamp (optional)}}. Only what the owner explicitly committed to,
-            or was explicitly asked to do and accepted, grounded in the
-            transcript. Never other people's actions, vague intentions, or app
-            hints the transcript does not support (hints are candidates only).
-            Use [] when none.
+            chars, "due": "YYYY-MM-DD" (optional){ts_schema}}}. Only what the
+            owner explicitly committed to, or was explicitly asked to do and
+            accepted, grounded in the transcript. Never other people's actions,
+            vague intentions, or app hints the transcript does not support
+            (hints are candidates only). Use [] when none.{existing}
 """
+TS_SCHEMA = (', "evidence_ts": the timestamp in brackets of the transcript '
+             'line where it was committed to, copied exactly (required)')
 
 BACKFILL_PROMPT = """You are reading a stored meeting memory entry. Answer with a SINGLE JSON
 object, no markdown fence, no other text, with exactly one key:
@@ -84,6 +88,10 @@ def is_meeting_item(item):
     )
 
 
+def _name_ok(value):
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= 80
+
+
 def validate(memory_cfg, rid):
     """Config problems for `memory.owner_todos`; empty list means valid."""
     if "owner_todos" not in memory_cfg:
@@ -92,7 +100,10 @@ def validate(memory_cfg, rid):
     if not isinstance(block, dict):
         return [f"{rid}: memory.owner_todos must be a mapping"]
     problems = []
-    unknown = set(block) - {"enabled", "max_per_item", "tag", "owner_slug"}
+    unknown = set(block) - {
+        "enabled", "max_per_item", "tag", "owner_slug", "owner_name",
+        "owner_names",
+    }
     if unknown:
         problems.append(
             f"{rid}: memory.owner_todos has unknown key(s) "
@@ -115,13 +126,44 @@ def validate(memory_cfg, rid):
             problems.append(
                 f"{rid}: memory.owner_todos.{key} must be a kebab-case slug"
             )
+    if "owner_name" in block and not _name_ok(block["owner_name"]):
+        problems.append(
+            f"{rid}: memory.owner_todos.owner_name must be a non-empty string"
+        )
+    names = block.get("owner_names")
+    if "owner_names" in block and not (
+        isinstance(names, list) and all(_name_ok(n) for n in names)
+    ):
+        problems.append(
+            f"{rid}: memory.owner_todos.owner_names must be a list of "
+            "non-empty strings"
+        )
     return problems
 
 
-def prompt_section(routine, owner_name=None):
+def owner_names(routine, verified_name=None):
+    """Display names that identify the owner; empty means fail closed."""
+    block = cfg(routine)
+    names = [block.get("owner_name"), *(block.get("owner_names") or []),
+             verified_name]
+    return list(dict.fromkeys(
+        " ".join(n.split()) for n in names if _name_ok(n)
+    ))
+
+
+def prompt_section(routine, names, existing_titles=(), require_ts=True):
+    owner = "the memory owner (" + " / ".join(f'"{n}"' for n in names) + ")"
+    existing = ""
+    if existing_titles:
+        existing = (
+            "\n            Already filed for this meeting; when an action is the "
+            "same one, reuse that title verbatim as its text: "
+            + "; ".join(f'"{t}"' for t in list(existing_titles)[:10])
+        )
     return PROMPT_SECTION.format(
         max_per_item=max_per_item(routine), text_limit=TEXT_LIMIT,
-        owner=owner_name or "the memory owner (identified by the speaker mapping)",
+        owner=owner, ts_schema=TS_SCHEMA if require_ts else "",
+        existing=existing,
     )
 
 
@@ -139,45 +181,118 @@ def action_source_id(meeting_source_id, text):
     return f"{meeting_source_id}{ACTION_ID_PREFIX}{action_key(text)}"
 
 
-def validate_actions(raw):
+def validate_actions(raw, require_ts=False):
     """Strictly validate the model's `owner_actions`.
 
-    Returns a list of clean dicts (possibly empty), or None when the value is
-    present but invalid in any way: one bad element voids the whole list.
+    Returns (clean list, dropped count), or (None, 0) when the value itself is
+    not a list. An invalid element is dropped on its own; the rest are kept.
     """
     if raw is None:
-        return []
+        return [], 0
     if not isinstance(raw, list):
-        return None
-    clean = []
+        return None, 0
+    clean, dropped = [], 0
     for row in raw:
-        if not isinstance(row, dict) or set(row) - _KEYS:
-            return None
-        text = row.get("text")
-        if not isinstance(text, str) or not " ".join(text.split()):
-            return None
-        text = " ".join(text.split())
-        if len(text) > TEXT_LIMIT:
-            return None
-        out = {"text": text}
-        due = row.get("due")
-        if due is not None:
-            if not isinstance(due, str) or not _DATE_RE.fullmatch(due):
-                return None
-            out["due"] = due
-        ts = row.get("evidence_ts")
-        if ts is not None:
-            if not isinstance(ts, str) or not _TS_RE.fullmatch(ts.strip()):
-                return None
-            out["evidence_ts"] = ts.strip()
-        clean.append(out)
+        out = _clean_row(row, require_ts)
+        if out is None:
+            dropped += 1
+        else:
+            clean.append(out)
     seen, unique = set(), []
     for row in clean:
         key = action_key(row["text"])
         if key not in seen:
             seen.add(key)
             unique.append(row)
-    return unique
+    return unique, dropped
+
+
+def _clean_row(row, require_ts):
+    if not isinstance(row, dict) or set(row) - _KEYS:
+        return None
+    text = row.get("text")
+    if not isinstance(text, str) or not " ".join(text.split()):
+        return None
+    text = " ".join(text.split())
+    if len(text) > TEXT_LIMIT:
+        return None
+    out = {"text": text}
+    due = row.get("due")
+    if due is not None:
+        if not isinstance(due, str) or not _DATE_RE.fullmatch(due):
+            return None
+        out["due"] = due
+    ts = row.get("evidence_ts")
+    if ts is not None:
+        if not isinstance(ts, str) or not _TS_RE.fullmatch(ts.strip()):
+            return None
+        out["evidence_ts"] = ts.strip()
+    if require_ts and "evidence_ts" not in out:
+        return None
+    return out
+
+
+# --- deterministic grounding -------------------------------------------------
+
+_LINE_RE = re.compile(r"^\[(?P<ts>[^\]\n]{1,40})\]\s*(?P<rest>.*)$")
+_SPEAKER_RE = re.compile(r"^(?P<who>[^:\n]{1,60}):\s")
+_GENERIC_SPEAKER_RE = re.compile(
+    r"^(speaker|spk|unknown|guest|participant|voice)[\s_-]*\w{0,3}$", re.I
+)
+
+
+def _norm_ts(ts):
+    """Comparable HH:MM:SS form; folds SRT commas, ranges and short forms."""
+    ts = ts.strip().strip("[]").split("-->", 1)[0].strip()
+    ts = ts.replace(",", ".").split(".", 1)[0]
+    parts = [p.strip() for p in ts.split(":")]
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    parts = ["0"] * (3 - len(parts)) + parts
+    return ":".join(f"{int(p):02d}" for p in parts)
+
+
+def _name_match(label, names):
+    label = label.casefold().strip()
+    return any(
+        label == n.casefold() or n.casefold() in label for n in names
+    )
+
+
+def grounded_in_transcript(body, evidence_ts, names):
+    """True when `evidence_ts` heads a transcript line (rendered as
+    `[ts] Speaker: text`) and that line's speaker, if it is a real name, is
+    the owner. Missing or generic speaker labels cannot be checked and pass."""
+    want = _norm_ts(evidence_ts or "")
+    if want is None:
+        return False
+    for line in str(body or "").splitlines():
+        m = _LINE_RE.match(line.strip())
+        if not m or _norm_ts(m.group("ts")) != want:
+            continue
+        who = _SPEAKER_RE.match(m.group("rest"))
+        if not who or _GENERIC_SPEAKER_RE.match(who.group("who").strip()):
+            return True
+        if _name_match(who.group("who"), names):
+            return True
+    return False
+
+
+def grounded_in_body(body, text, names):
+    """Backfill check: an owner name shares a sentence or bullet with the
+    action (most of its significant words appear there). Weaker than the
+    transcript check: the stored body is a model summary, not the source."""
+    # Compare 4-letter stems so "send" matches "sends".
+    words = {w[:4] for w in normalize(text).split() if len(w) >= 4}
+    if not words:
+        return False
+    for seg in re.split(r"[\n.;!?]+", str(body or "")):
+        seg_norm = normalize(seg)
+        if not any(normalize(n) and normalize(n) in seg_norm for n in names):
+            continue
+        if len(words & {w[:4] for w in seg_norm.split()}) >= 0.6 * len(words):
+            return True
+    return False
 
 
 def todo_title(text):
