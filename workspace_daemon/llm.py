@@ -1,8 +1,18 @@
 """LLM analysis over the `yoetz` CLI, plus label extraction/validation."""
 from .connector_prompts import resolve_instruction
+from . import claude_bridge
 from .shell import run_json, yoetz_bin
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+# Routine base dir for providers that keep run state (claude); set once per run
+# by the runner so analyze() keeps its (routine, prompt) signature.
+_base_dir = None
+
+
+def configure(base_dir):
+    global _base_dir
+    _base_dir = base_dir
 
 
 def source_header_lines(item):
@@ -190,8 +200,14 @@ def build_prompt(routine, item, label_catalog):
 
 
 def analyze(routine, prompt):
-    """Call yoetz and return the raw generated content."""
+    """Call the configured provider (yoetz, or headless Claude) and return the text."""
     cfg = routine["analyze"]
+    if cfg["provider"] == "claude":
+        if _base_dir is None:
+            raise RuntimeError("analyze.provider claude needs llm.configure(base_dir)")
+        return claude_bridge.complete(
+            prompt, model=cfg["model"], base_dir=_base_dir
+        )
     cmd = [
         yoetz_bin(), "ask",
         "-p", prompt,

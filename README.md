@@ -912,6 +912,50 @@ each message its own memory source ID. The default remains thread-oriented:
 quoted context is preserved, an explicit subject date wins, and memory updates
 the existing thread entry.
 
+### Headless Claude bridge and `analyze.provider: claude`
+
+Instead of yoetz, the LLM step can run through the Claude Code CLI:
+
+```yaml
+analyze:
+  provider: claude
+  model: sonnet        # any `claude --model` alias or id
+```
+
+The same bridge (`workspace_daemon/claude_bridge.py`) can also let a headless
+`claude -p` call specific claude.ai connector (MCP) tools and hand back the
+**real tool results parsed from the event stream** — never the model's
+restatement, which can be hallucinated. Later features consume it through
+`claude_bridge.call_tools(prompt, {tool_name: pinned_args}, base_dir=...)`.
+
+Prerequisites: the Claude Code CLI, logged in with a claude.ai account whose
+connectors are authorized. It is found on `PATH`, then at `~/.local/bin/claude`
+(launchd has no login `PATH`); pin it with `WORKSPACE_DAEMON_CLAUDE_BIN`.
+
+Security model, least privilege by construction:
+
+- The prompt goes to the CLI on stdin, never argv.
+- User plugins and hooks are not loaded (`--setting-sources ""`), nothing is
+  persisted, permission mode is `dontAsk`, and risky built-ins (shell, edit,
+  web, agents, scheduling) are disallowed.
+- A PreToolUse hook denies everything except `ToolSearch select:<allowlisted
+  names>` and allowlisted tools whose arguments exactly equal their pinned
+  values (JSON types included, so `true` is not `1`). Any hook error denies.
+- The stream is re-checked in Python, including the same pin check on every
+  tool call, so a hook that fails open cannot widen access: a non-success
+  result, an off-allowlist call, a call that ran despite failing its pins, an
+  unexpected built-in, a missing `init` event, or a tool error fails the run
+  closed. Hook-denied calls (e.g. the model trying `Read`) never yield results
+  and only bump a denial count in the usage log. If the model made no real call
+  for a required tool (it sometimes answers from imagination), the run is
+  retried, up to 3 attempts. The timeout covers the connector wait and the
+  stdin write. `call_tools(..., accept_partial=True)` returns results gathered
+  before a max-turns/max-budget stop (flagged `.partial`) if every required
+  tool already answered.
+- Errors name only kinds, exit codes and known tool names (anything else is `<invalid>`); prompts and tool
+  inputs/results are never logged. `state/claude-usage.jsonl` (0600) records
+  per-attempt model, tool names, denial count, duration, cost and token counts only.
+
 ### Label caching
 
 The user-label catalog is ~940 names and changes maybe monthly, so it is cached
@@ -1078,7 +1122,8 @@ workspace_daemon/
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
   transcripts.py           shared transcript-source Calendar gate + receipts
   google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync
-  llm.py                   yoetz adapter, prompt building, label extraction
+  llm.py                   yoetz/Claude adapter, prompt building, label extraction
+  claude_bridge.py         least-privilege headless `claude -p` runner (+ PreToolUse hook)
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions
   state.py                 processed.json

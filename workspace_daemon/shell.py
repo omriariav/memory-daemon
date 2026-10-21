@@ -48,6 +48,22 @@ def yoetz_bin():
     )
 
 
+def claude_bin():
+    """Claude Code CLI; the native installer's ~/.local/bin is not on launchd's PATH."""
+    try:
+        return _resolve(
+            "claude", "WORKSPACE_DAEMON_CLAUDE_BIN",
+            "Install Claude Code and log in with `claude`.",
+        )
+    except MissingBinary:
+        if os.environ.get("WORKSPACE_DAEMON_CLAUDE_BIN"):
+            raise
+        fallback = Path.home() / ".local" / "bin" / "claude"
+        if fallback.exists():
+            return str(fallback)
+        raise
+
+
 def ada_bin():
     return _resolve(
         "ada", "WORKSPACE_DAEMON_ADA_BIN",

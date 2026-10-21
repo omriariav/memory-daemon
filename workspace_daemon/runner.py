@@ -187,6 +187,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         r for r in routines
         if r.get("enabled", True) and r["id"] in active_ids
     ]
+    llm.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
     catalog = None
