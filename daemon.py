@@ -6,7 +6,7 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py list                       show routines, enabled state, last run
   daemon.py status                     show scheduler and routine health
   daemon.py validate                   check all routine YAML
-  daemon.py run [--routine ID] [-n]    process new matches now
+  daemon.py run [--routine ID] [-n]    process new matches now (--ignore-pause overrides state/PAUSED)
   daemon.py tick [-n]                  process only routines whose cadence is due
   daemon.py new                        interactive scaffold for a new routine
 """
@@ -190,16 +190,26 @@ def _merge_totals(totals, additions):
             totals[key] = totals.get(key, 0) + value
 
 
-def _count_only(routines, active_ids):
+def _count_only(routines, active_ids, ignore_pause=False):
     """List-only pass over capture routines: no lock, ledger, cursor or store write."""
     capture = {
         r["id"] for r in routines
         if r["id"] in active_ids and not config.is_maintenance(r)
     }
     totals = runner.run(
-        BASE_DIR, routines, dry_run=True, active_ids=capture, count_only=True
+        BASE_DIR, routines, dry_run=True, active_ids=capture, count_only=True,
+        ignore_pause=ignore_pause,
     )
     return 1 if totals["errors"] else 0
+
+
+def _pause_reason(args, prefix=""):
+    """Log and return the kill-switch reason when this invocation must not run."""
+    reason = state.paused(BASE_DIR)
+    if reason and not getattr(args, "ignore_pause", False):
+        log(f"{prefix}paused: {reason}")
+        return reason
+    return None
 
 
 def cmd_run(args):
@@ -210,6 +220,8 @@ def cmd_run(args):
             "--count-only and --dry-run cannot be combined: a dry run makes "
             "no connector call, so it has nothing to count"
         )
+    if _pause_reason(args):
+        return 0
     if not args.dry_run and not count_only:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
@@ -245,7 +257,9 @@ def cmd_run(args):
         }
     )
     if count_only:
-        return _count_only(routines, active_ids)
+        return _count_only(
+            routines, active_ids, getattr(args, "ignore_pause", False)
+        )
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
     for group_ids, lock_name in _manual_execution_groups(
@@ -258,6 +272,7 @@ def cmd_run(args):
                 BASE_DIR, routines, dry_run=args.dry_run,
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
                 lock_name=lock_name,
+                ignore_pause=getattr(args, "ignore_pause", False),
             )
         except state.AlreadyRunning as exc:
             # Manual and scheduled census runs share slack-census.lock; other
@@ -269,6 +284,9 @@ def cmd_run(args):
                 f"{exc}"
             )
             continue
+        except state.Paused as exc:
+            log(f"run stopped: {exc}")
+            return 0
         _merge_totals(totals, group_totals)
 
     verb = "would process" if args.dry_run else "processed"
@@ -295,9 +313,16 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
+    tick_id = uuid.uuid4().hex[:12]
+    group = getattr(args, "group", "all")
+    tick_name = f"tick[{tick_id}]"
+    if group != "all":
+        tick_name += f"({group})"
+    # Tick-prefixed so `status` reads a paused tick as a healthy no-op.
+    if _pause_reason(args, f"{tick_name}: "):
+        return 0
     if not args.dry_run:
         config.secure_routine_files(BASE_DIR)
-    tick_id = uuid.uuid4().hex[:12]
     routines = config.discover(BASE_DIR)
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
@@ -306,10 +331,6 @@ def cmd_tick(args):
         return 1
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
-    group = getattr(args, "group", "all")
-    tick_name = f"tick[{tick_id}]"
-    if group != "all":
-        tick_name += f"({group})"
     selected = [
         r for r in routines
         if (
@@ -334,6 +355,7 @@ def cmd_tick(args):
     # can take tens of minutes). Persist each group's attempt immediately, so
     # the next tick cannot repeat capture merely because maintenance was slow.
     groups = _execution_groups(routines, due_ids)
+    paused_mid_tick = False
     for group_ids, lock_name in groups:
         if not group_ids:
             continue
@@ -345,6 +367,7 @@ def cmd_tick(args):
                 BASE_DIR, routines, dry_run=args.dry_run,
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
                 lock_name=lock_name,
+                ignore_pause=getattr(args, "ignore_pause", False),
             )
         except state.AlreadyRunning as exc:
             skipped_ids = ", ".join(sorted(group_ids))
@@ -353,12 +376,20 @@ def cmd_tick(args):
                 f"{exc}{mode}"
             )
             continue
-        schedule.mark_attempted(group_ids, now=group_started_epoch)
+        except state.Paused as exc:
+            # Stop here, but close the tick normally so status sees a finished
+            # (paused) tick rather than an incomplete one.
+            log(f"{tick_name} stopped early — {exc}{mode}")
+            paused_mid_tick = True
+            break
+        # A routine held by a cap or the pause switch did not really attempt.
+        held = set(group_totals.get("held_ids", ()))
+        schedule.mark_attempted(group_ids - held, now=group_started_epoch)
         _merge_totals(totals, group_totals)
     log(
         f"{tick_name} done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
-        f"{mode}"
+        f"{' (paused)' if paused_mid_tick else ''}{mode}"
     )
     return 1 if totals["errors"] else 0
 
@@ -485,6 +516,8 @@ def main(argv=None):
     p_run.add_argument("--count-only", action="store_true",
                        help="list only: report new/changed items and a cost "
                             "estimate; no ledger, cursor or store write")
+    p_run.add_argument("--ignore-pause", action="store_true",
+                       help="run even though state/PAUSED exists (manual override)")
     p_run.set_defaults(func=cmd_run)
 
     p_tick = sub.add_parser(

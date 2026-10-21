@@ -61,7 +61,7 @@ HANDLER_OVERRIDE_KEYS = {"analyze", "output", "memory", "label", "streams"}
 TOP_LEVEL_KEYS = {
     "id", "enabled", "description", "role", "schedule", "source", "sources",
     "handlers", "analyze", "output", "memory", "actions", "routing", "label",
-    "streams", "maintenance", "_source_file",
+    "streams", "maintenance", "budget", "_source_file",
 }
 ANALYZE_KEYS = {
     "provider", "model", "instruction", "instruction_from_connector",
@@ -476,6 +476,62 @@ def _expanded(source, missing_ok=False):
     return merged
 
 
+def budget_cap(routine):
+    """The routine's budget.daily_usd, or None when unset or malformed."""
+    budget = routine.get("budget")
+    cap = budget.get("daily_usd") if isinstance(budget, dict) else None
+    ok = isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0
+    return cap if ok else None
+
+
+def uses_claude_bridge(routine):
+    """Whether any of the routine's work can spend through the Claude bridge.
+
+    Global caps (and a broken budget file) only matter to such routines; a
+    routine that never calls Claude has nothing to hold.
+    """
+    profiles = [routine]
+    handlers = routine.get("handlers")
+    if isinstance(handlers, dict):
+        profiles.extend(h for h in handlers.values() if isinstance(h, dict))
+    for profile in profiles:
+        analyze = profile.get("analyze")
+        if isinstance(analyze, dict) and analyze.get("provider") == "claude":
+            return True
+        memory = profile.get("memory")
+        identity = memory.get("identity") if isinstance(memory, dict) else None
+        if isinstance(identity, dict) and identity.get("provider") == "slack_mcp":
+            return True
+    maintenance = routine.get("maintenance")
+    if isinstance(maintenance, dict) and maintenance.get("kind") == "calendar_cache":
+        return True
+    return any(
+        isinstance(source, dict) and source.get("kind") == "slack_mcp"
+        for source in sources(routine)
+    )
+
+
+def _budget_problems(rid, routine):
+    if "budget" not in routine:
+        return []
+    budget = routine["budget"]
+    if not isinstance(budget, dict):
+        return [f"{rid}: budget must be a mapping"]
+    problems = []
+    unknown = set(budget) - {"daily_usd"}
+    if unknown:
+        problems.append(
+            f"{rid}: budget has unknown key(s) {', '.join(sorted(map(str, unknown)))}"
+        )
+    cap = budget.get("daily_usd")
+    if (
+        isinstance(cap, bool) or not isinstance(cap, (int, float))
+        or not 0 < cap < float("inf")
+    ):
+        problems.append(f"{rid}: budget.daily_usd must be a positive number")
+    return problems
+
+
 def validate(routine):
     """Return a list of human-readable problems; empty means valid."""
     problems = []
@@ -491,6 +547,7 @@ def validate(routine):
             "be configured"
         )
     maintenance_routine = is_maintenance(routine)
+    problems.extend(_budget_problems(rid, routine))
 
     required = ["id"] if maintenance_routine else REQUIRED_TOP_LEVEL
     for key in required:

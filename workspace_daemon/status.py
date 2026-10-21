@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config, state
+from . import claude_bridge, config, state
 
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
@@ -30,8 +30,7 @@ _TICK_SKIPPED = re.compile(
     _TICK_PREFIX + r" skipped(?: routines=(?P<ids>.*?))?(?: —|$)"
 )
 _TICK_NOOP = re.compile(
-    _TICK_PREFIX + r": no routines due"
-    r"(?P<dry> \(dry-run\))?$"
+    _TICK_PREFIX + r": (?:no routines due(?P<dry> \(dry-run\))?|paused: .*)$"
 )
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
 _ROUTINE_ERROR = re.compile(
@@ -220,6 +219,7 @@ def read_tick_history(path):
                         and error_count > 0
                         and attributed_count >= error_count
                     )
+                    paused = " (paused)" in message
                     for routine_id in block["due_ids"]:
                         routine_error_count = routine_errors.get(
                             routine_id, 0
@@ -229,7 +229,10 @@ def read_tick_history(path):
                             or routine_error_count > 0
                         )
                         routine_results[routine_id] = {
-                            "state": "error" if failed else "ok",
+                            "state": (
+                                "error" if failed
+                                else "paused" if paused else "ok"
+                            ),
                             "at": at,
                             "group": block["group"],
                         }
@@ -490,6 +493,24 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         now=now,
         scheduler_running_groups=scheduler_running_groups,
     )
+    pause = state.paused(base_dir)
+    by_id = {routine.get("id"): routine for routine in routines}
+    for row in rows:
+        if row["status"] in ("disabled", "in-tick"):
+            continue
+        routine = by_id.get(row["routine"]) or {}
+        if pause:
+            label = "paused"
+        elif claude_bridge.budget_exhausted(
+            base_dir, row["routine"], config.budget_cap(routine), now=now,
+            include_global=config.uses_claude_bridge(routine),
+        ):
+            label = "budget held"
+        else:
+            continue
+        row["status"] = (
+            f"{label} (attention)" if row["issues"] != "-" else label
+        )
 
     if launchd["loaded"]:
         state_name = launchd.get("state") or "loaded"
@@ -539,17 +560,24 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         or (legacy_latest if not grouped_history else None)
         if maintenance is not None else None
     )
-    capture_tick_issue = _tick_issue(launchd, capture_latest, now)
+    # A paused daemon is expected to be quiet; staleness would be a false alarm.
+    capture_tick_issue = (
+        None if pause else _tick_issue(launchd, capture_latest, now)
+    )
     maintenance_tick_issue = (
         _tick_issue(maintenance, maintenance_latest, now)
-        if maintenance is not None else None
+        if maintenance is not None and not pause else None
     )
 
     lines = [
         "Memory Daemon",
+    ]
+    if pause:
+        lines.append(f"*** PAUSED: {pause} (remove state/PAUSED to resume) ***")
+    lines.extend([
         f"Scheduler: {' · '.join(scheduler_bits)}",
         f"Next coordinator run: {_next_coordinator_run(launchd, legacy)}",
-    ]
+    ])
     if maintenance is not None:
         maintenance_bits = _scheduler_bits(maintenance)
         lines.extend([
@@ -583,6 +611,8 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         for row in rows
     ]
     lines.extend(_table(headers, values))
+    bridge_text, bridge_problems = bridge_lines(base_dir, now)
+    lines.extend(bridge_text)
     lines.extend([
         "",
         "Logs: logs/run.log (rotated, owner-only)",
@@ -615,7 +645,87 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         )
         if result is not None
     )
-    return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
+    return "\n".join(lines), (
+        scheduler_healthy and routines_healthy and latest_healthy
+        and not bridge_problems
+    )
+
+
+def bridge_lines(base_dir, now):
+    """Claude bridge block, plus problems that make the daemon unhealthy.
+
+    Spend and per-connector last ok / last error come from the metadata-only
+    usage log (last 7 days). Empty when the bridge has never run, so installs
+    without it see no change. Returns (lines, problems).
+    """
+    problems = []
+    try:
+        entries = claude_bridge.recent_usage(base_dir, now=now)
+    except claude_bridge.BridgeError as exc:
+        entries = []
+        problems.append(str(exc))
+    try:
+        cap, tz = claude_bridge.load_budget(base_dir)
+    except claude_bridge.BridgeError as exc:
+        cap, tz = None, None
+        problems.append(str(exc))
+    write_failed = claude_bridge.usage_write_failed(base_dir)
+    if write_failed:
+        problems.append(
+            f"usage log write failed at {write_failed}; spend is undercounted"
+        )
+    if not entries and cap is None and not problems:
+        return [], []
+    day_start = claude_bridge.day_start_epoch(now, tz)
+    spent = {}
+    last_ok, last_error, last_in_failed = {}, {}, {}
+    latest_error = None
+    for epoch, entry in entries:
+        if epoch >= day_start:
+            tag = entry.get("routine") or "(unattributed)"
+            spent[tag] = spent.get(tag, 0.0) + claude_bridge.entry_cost(entry)
+        outcome = str(entry.get("outcome", ""))
+        failed = outcome == "missing_results" or outcome.startswith("error")
+        servers = {
+            name.split("__")[1] for name in entry.get("tools") or []
+            if isinstance(name, str) and name.startswith("mcp__")
+            and len(name.split("__")) > 2
+        }
+        for server in servers:
+            if not failed:
+                target = last_ok
+            elif f"mcp__{server}__" in outcome:
+                target = last_error  # the failure names this connector
+            else:
+                target = last_in_failed  # it was merely part of a failed call
+            target[server] = max(target.get(server, 0), epoch)
+        if failed and (latest_error is None or epoch >= latest_error[0]):
+            latest_error = (epoch, outcome)
+    total = sum(spent.values())
+    cap_text = f" of ${cap:g} cap" if cap is not None else ""
+    lines = ["", "Claude bridge", f"Spend today: ${total:.2f}{cap_text}"]
+    for tag in sorted(spent):
+        lines.append(f"  {tag}: ${spent[tag]:.2f}")
+    servers = sorted(set(last_ok) | set(last_error) | set(last_in_failed))
+    if servers:
+        lines.extend(_table(
+            ("CONNECTOR", "LAST OK", "LAST ERROR", "IN FAILED CALL"),
+            [
+                (
+                    server,
+                    _age(last_ok.get(server), now),
+                    _age(last_error.get(server), now),
+                    _age(last_in_failed.get(server), now),
+                )
+                for server in servers
+            ],
+        ))
+    if latest_error:
+        lines.append(
+            f"Last error: {_age(latest_error[0], now)} — {latest_error[1][:120]}"
+        )
+    lines.extend(f"ATTENTION: {problem}" for problem in problems)
+    return lines, problems
 
 
 def _tick_text(latest, issue, now):

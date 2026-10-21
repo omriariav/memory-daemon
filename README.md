@@ -1131,7 +1131,59 @@ Security model, least privilege by construction:
   tool already answered.
 - Errors name only kinds, exit codes and known tool names (anything else is `<invalid>`); prompts and tool
   inputs/results are never logged. `state/claude-usage.jsonl` (0600) records
-  per-attempt model, tool names, denial count, duration, cost and token counts only.
+  per-attempt model, tool names, denial count, duration, cost, token counts and the
+  attributed routine id only.
+
+### Pausing
+
+`touch state/PAUSED` is a kill switch. While the file exists, `daemon.py tick`
+and `daemon.py run` log `paused: <reason>` (the file's first line, or just
+`paused`) and exit 0 without listing, fetching or calling any model; launchd
+keeps firing, so removing the file resumes work on the next tick with nothing
+lost. `daemon.py run --ignore-pause` lets one manual run proceed. `runner.run`
+refuses with a `Paused` error as a backstop for any other caller, and
+`daemon.py status` shows a PAUSED banner.
+
+```bash
+echo "cost review until Monday" > state/PAUSED   # pause
+rm state/PAUSED                                  # resume
+```
+
+### Budgets
+
+Every bridge call is logged to `state/claude-usage.jsonl` with its cost, and
+calls made while a routine works carry that routine's id. Two optional caps use
+that log (a day is the local day unless configured; failed attempts count):
+
+```yaml
+# routines/<id>.yaml: skip this routine once it has spent this much today
+budget:
+  daily_usd: 2.50
+```
+
+```yaml
+# state/budget.yaml (private, optional): global cap across all routines
+daily_usd: 10
+day_timezone: Europe/London   # optional IANA name; default is local time
+```
+
+A routine at its own cap, or a routine that can use the Claude bridge
+(`analyze.provider: claude`, a `slack_mcp` identity or source, a calendar
+cache) once the global cap is reached (or `state/budget.yaml` is malformed), is
+held for the run; routines that never call Claude ignore the global cap. A hold
+is logged once per day: it is still listed so
+a fallback routine cannot take its items, but nothing is analyzed, no cursor
+advances, nothing is marked processed, and `tick` does not count it as
+attempted, so it catches up after the day rolls over. A cap reached mid-run
+stops that routine's remaining items the same way (counted as skipped, not as
+errors), and the bridge refuses new calls with `daily budget exhausted`. A call
+that never reported a cost (timeout, crash) is counted at its
+`--max-budget-usd` ceiling. Only the last 7 days of the log are read; an
+unreadable log counts as exhausted. `daemon.py status` shows today's spend
+(global and per routine), `budget held` routines, and per connector the last ok
+time, last error that names it, and last time it was part of a failed call
+(from the `mcp__<server>__` prefix of logged tool names); a malformed budget
+file or a failed usage-log write makes it report unhealthy.
 
 ### Slack via a connector
 
