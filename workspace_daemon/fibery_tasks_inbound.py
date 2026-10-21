@@ -119,18 +119,20 @@ def parse_blocks(text):
 
 
 def parse_document(text):
-    """Parse the TOON text into (root ids, {id: block}, suggestions text).
+    """Parse the TOON text into (root ids, {id: block}, [suggestion]).
 
+    ``version`` is the document revision counter (any non-negative integer).
     The optional top-level ``suggestions`` section (pending tracked changes)
-    is never interpreted as blocks; its raw text is returned for callers that
-    only need to know what is pending.
+    is parsed into dicts and never interpreted as blocks; every block id it
+    references must exist. Use ``pending_ids`` to expand block-level inserts.
     """
     lines = [ln.rstrip("\r") for ln in _document_text(text).split("\n")]
     roots = None
     blocks = {}
     declared = None
     seen_version = False
-    suggestions = []
+    suggestion_lines = []
+    suggestions_count = None
     in_suggestions = False
     index = 0
     while index < len(lines):
@@ -141,7 +143,7 @@ def parse_document(text):
         indent = len(line) - len(line.lstrip(" "))
         body = line.strip()
         if indent > 0 and in_suggestions:
-            suggestions.append(body)
+            suggestion_lines.append((indent, body))
             continue
         if indent == 0:
             in_suggestions = False
@@ -150,17 +152,16 @@ def parse_document(text):
                 raise FiberyParseError("unrecognised top-level line")
             key, count, raw = match.groups()
             if key == "version" and count is None:
-                if _scalar(raw, "version") != "0":
-                    raise FiberyParseError("unsupported document version")
+                if not re.fullmatch(r"[0-9]+", _scalar(raw, "version") or ""):
+                    raise FiberyParseError("document version is not an integer")
                 seen_version = True
             elif key == "rootBlockIds" and count is not None:
                 roots = _id_list(count, raw, "rootBlockIds")
             elif key == "blocks" and count is not None and not (raw or "").strip():
                 declared = int(count)
-            elif key == "suggestions":
+            elif key == "suggestions" and suggestions_count is None:
                 in_suggestions = True
-                if (raw or "").strip() not in ("", "null"):
-                    suggestions.append(raw.strip())
+                suggestions_count = _suggestions_header(count, raw)
             else:
                 raise FiberyParseError("unrecognised top-level key")
             continue
@@ -186,7 +187,95 @@ def parse_document(text):
         raise FiberyParseError("document header is incomplete")
     if declared != len(blocks):
         raise FiberyParseError("block count does not match its header")
-    return roots, blocks, "\n".join(suggestions)
+    suggestions = _parse_suggestions(suggestion_lines, suggestions_count)
+    for suggestion in suggestions:
+        if any(b not in blocks for b in suggestion["blockIds"]):
+            raise FiberyParseError("suggestion references an unknown block")
+    return roots, blocks, suggestions
+
+
+def _suggestions_header(count, raw):
+    """Declared entry count, or None for a bare count-less ``suggestions:``."""
+    raw = (raw or "").strip()
+    if count is None:
+        if raw in ("[]", "null"):
+            return 0
+        if raw == "":
+            return None
+        raise FiberyParseError("suggestions header has trailing text")
+    if raw:
+        raise FiberyParseError("suggestions header has trailing text")
+    return int(count)
+
+
+SUGGESTION_KEY_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9._-]*)(?:\[(\d+)\])?(?:\{[^}]*\})?:(?: (.*))?$")
+
+
+def _parse_suggestions(lines, declared):
+    """Parse the ``suggestions`` entries (2-space indented TOON list).
+
+    Only id, kind, blockIds and inline matter. Any other field, nested map,
+    dash-list or tabular array (everything indented below a field) is
+    tolerated and ignored.
+    """
+    items = []
+    for indent, body in lines:
+        if body.startswith("- ") and indent == 2:
+            items.append([(4, body[2:])])
+        elif not items:
+            raise FiberyParseError("unexpected line in suggestions")
+        elif indent < 4:
+            raise FiberyParseError("unexpected suggestion indentation")
+        else:
+            items[-1].append((indent, body))
+    if declared is not None and len(items) != declared:
+        raise FiberyParseError("suggestion count does not match its header")
+    parsed = []
+    for item in items:
+        entry = {"blockIds": [], "inline": None}
+        for indent, body in item:
+            if indent > 4:
+                continue  # child of an ignored or nested field
+            match = SUGGESTION_KEY_RE.match(body)
+            if not match:
+                raise FiberyParseError("unrecognised suggestion line")
+            key, count, value = match.groups()
+            value = (value or "").strip()
+            if key == "blockIds" and count is not None:
+                entry[key] = _id_list(count, value, key)
+            elif key == "inline" and count is None:
+                if value not in ("true", "false", "null"):
+                    raise FiberyParseError("suggestion inline is not a boolean")
+                entry[key] = {"true": True, "false": False}.get(value)
+            elif key in ("id", "kind") and count is None:
+                entry[key] = _scalar(value, key)
+        if not entry.get("id") or not entry.get("kind"):
+            raise FiberyParseError("suggestion without an id or kind")
+        parsed.append(entry)
+    return parsed
+
+
+def pending_ids(blocks, suggestions):
+    """Ids of blocks that exist only as unaccepted block-level insertions.
+
+    Only ``kind: inserted`` that is not ``inline: true`` counts (a missing
+    inline flag is treated as a block insert, fail safe); the listed blocks
+    and all their descendants are pending. Any other kind (a pending
+    deletion, say) or an inline change leaves the block as accepted content.
+    """
+    pending = set()
+    stack = []
+    for suggestion in suggestions:
+        if suggestion["kind"] == "inserted" and suggestion["inline"] is not True:
+            stack.extend(suggestion["blockIds"])
+    while stack:
+        block_id = stack.pop()
+        if block_id in pending or block_id not in blocks:
+            continue
+        pending.add(block_id)
+        stack.extend(blocks[block_id]["childIds"])
+    return pending
 
 
 def _parse_block(item_lines):
@@ -236,7 +325,7 @@ def _text_of(block):
 
 def parse_tasks(text):
     """Return [{block_id, section, text, state, alert_id?}] in document order."""
-    roots, blocks = parse_blocks(text)
+    roots, blocks, suggestions = parse_document(text)
     for block in blocks.values():
         for child in block["childIds"]:
             if child not in blocks:
@@ -244,6 +333,7 @@ def parse_tasks(text):
     for root in roots:
         if root not in blocks:
             raise FiberyParseError("rootBlockIds references a missing block")
+    pending = pending_ids(blocks, suggestions)
     tasks = []
     seen = set()
 
@@ -254,6 +344,8 @@ def parse_tasks(text):
         if block["id"] in seen:
             raise FiberyParseError("block is reachable twice")
         seen.add(block["id"])
+        if block_id in pending:
+            return  # an unaccepted inserted block and its descendants
         if block["type"] == "list_item":
             state_value = block["attrs"].get("state")
             if state_value not in (None, "TODO", "DONE"):
@@ -262,7 +354,10 @@ def parse_tasks(text):
             pending_pieces = 0
             for child_id in block["childIds"]:
                 child = blocks[child_id]
-                if child["type"] == "paragraph":
+                if child["type"] == "paragraph" and child_id in pending:
+                    seen.add(child_id)
+                    pending_pieces += 1
+                elif child["type"] == "paragraph":
                     seen.add(child_id)
                     raw_piece = _text_of(child).strip()
                     piece = accepted_text(raw_piece).strip()
@@ -300,6 +395,8 @@ def parse_tasks(text):
     section = None
     for root in roots:
         block = blocks[root]
+        if root in pending:
+            continue
         if block["type"] == "heading":
             section = _text_of(block).strip() or None
         elif block["type"] in CONTAINER_TYPES:

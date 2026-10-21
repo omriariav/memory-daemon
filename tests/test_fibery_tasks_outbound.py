@@ -17,11 +17,8 @@ SECRET = "00000000-0000-0000-0000-000000000000"
 OWNER = "example-owner"
 
 
-def toon(doc, suggestions=None, wrap=True):
+def toon(doc, wrap=True):
     text = doc.text(wrap=False)
-    if suggestions is not None:
-        text += f"\nsuggestions[{len(suggestions)}]:\n" + "\n".join(
-            f"  - {s}" for s in suggestions)
     return json.dumps({"success": True, "document": text}) if wrap else text
 
 
@@ -69,14 +66,18 @@ class OutboundBase(unittest.TestCase):
     def document(self):
         doc = Doc()
         if self.pending_heading:
-            doc.heading("<ins>Inbox</ins>")
+            doc.heading("Inbox")
+            doc.suggest([doc.roots[-1]])
         elif self.heading or self.accepted_items:
             doc.heading("Inbox")
             if self.accepted_items:
                 doc.bullets([(bid(i + 1), "TODO", [q(t)])
                              for i, t in enumerate(self.accepted_items)])
-        suggestions = [q(f"insert (mem:{m})") for m in self.pending_markers]
-        return toon(doc, suggestions or None)
+        if self.pending_markers:
+            doc.bullets([(bid(500 + i), "TODO", [q(f"insert (mem:{m})")])
+                         for i, m in enumerate(self.pending_markers)])
+            doc.suggest([doc.roots[-1]])
+        return toon(doc)
 
     def _call(self, prompt, tools, **kwargs):
         self.calls.append((prompt, tools, kwargs))
@@ -223,7 +224,10 @@ class ExportTest(OutboundBase):
         self.heading = False
         self.pending_markers = ["other"]
         original = self.document
-        self.document = lambda: toon(Doc(), ["insert heading Inbox"])
+        pending_doc = Doc()
+        pending_doc.heading("Inbox")
+        pending_doc.suggest([pending_doc.roots[-1]])
+        self.document = lambda: toon(pending_doc)
         report = self.run_once()
         self.document = original
         self.assertTrue(report["held_pending_heading"])
@@ -406,6 +410,43 @@ class ExportTest(OutboundBase):
         self.assertEqual(self.writes(), [])
 
 
+class LiveFormatTest(unittest.TestCase):
+    def pending_doc(self):
+        doc = Doc()
+        doc.heading("Inbox")
+        heading = doc.roots[-1]
+        doc.bullets([(bid(7), "TODO", [q("Suggested (mem:a1)")])])
+        doc.suggest([heading, doc.roots[-1]])
+        return toon(doc)
+
+    def test_pending_inserted_heading_is_not_a_heading(self):
+        info = fto.inspect(self.pending_doc(), "Inbox")
+        self.assertIsNone(info["heading_id"])
+        self.assertTrue(info["pending_heading"])
+        self.assertIsNone(info["anchor_id"])
+
+    def test_markers_found_inside_pending_blocks(self):
+        self.assertEqual(fto.markers_in(self.pending_doc()), {"a1"})
+
+    def test_inbound_imports_nothing_from_it(self):
+        self.assertEqual(fti.parse_tasks(self.pending_doc()), [])
+
+    def test_inline_ins_heading_is_pending(self):
+        doc = Doc()
+        doc.heading("<ins>Inbox</ins>")
+        info = fto.inspect(toon(doc), "Inbox")
+        self.assertIsNone(info["heading_id"])
+        self.assertTrue(info["pending_heading"])
+
+    def test_deleted_heading_suggestion_keeps_accepted_heading(self):
+        doc = Doc()
+        doc.heading("Inbox")
+        doc.suggest([doc.roots[-1]], kind="deleted")
+        info = fto.inspect(toon(doc), "Inbox")
+        self.assertEqual(info["heading_id"], doc.roots[0])
+        self.assertFalse(info["pending_heading"])
+
+
 class EscapingTest(unittest.TestCase):
     def test_title_is_escaped_bounded_single_line_redacted(self):
         title = "# *bold* _it_ [link](x)\n`code` <ins>x</ins> mem:other-id " \
@@ -542,7 +583,7 @@ class InboundCoordinationTest(unittest.TestCase):
             (bid(2), "TODO", [q("Accepted task")]),
             (bid(3), "TODO", [q("Kept <ins>pending add</ins> text <del>gone</del>")]),
         ])
-        text = toon(doc, [q("insert (mem:a1)"), q("another")])
+        text = toon(doc)
         tasks = fti.parse_tasks(text)
         self.assertEqual([t["block_id"] for t in tasks], [bid(2), bid(3)])
         self.assertEqual(tasks[1]["text"], "Kept  text gone")
@@ -563,7 +604,8 @@ class InboundCoordinationTest(unittest.TestCase):
     def test_suggestions_section_is_not_parsed_as_blocks(self):
         doc = Doc()
         doc.heading("Inbox")
-        text = toon(doc, ["id: zzz", "type: bogus"], wrap=False)
+        doc.suggest([doc.roots[-1]], kind="deleted")
+        text = toon(doc, wrap=False)
         roots, blocks = fti.parse_blocks(text)
         self.assertEqual(len(blocks), 1)
 
