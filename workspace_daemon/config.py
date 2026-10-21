@@ -1418,7 +1418,8 @@ def _validate_slack_mcp(prefix, source):
     for key, lower, upper in (
         ("max_threads_per_run", 1, 100), ("max_thread_replies", 1, 500),
         ("max_thread_chars", 500, 100000), ("max_search_pages", 1, 20),
-        ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 100),
+        ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 60),
+        ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):

@@ -1220,8 +1220,9 @@ connector, so people are identified by Slack user id only.
 How a run works:
 
 1. Search is the lister, oldest first. One bridge session runs the first page
-   of every planned search (each session carries a fixed cost, so a run never
-   splits them): the watched channels (`in:<#id>` terms, 15 per query), one
+   of every planned search (each session carries a fixed cost, so up to
+   `calls_per_session` calls, default 15, max 20, share one; more are split
+   across paced sessions): the watched channels (`in:<#id>` terms, 15 per query), one
    `from:<@id>` query per person, and one mention query by keyword
    (`mention_keywords`, default `<@{self_user_id}>`). Each uses
    `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
@@ -1235,10 +1236,10 @@ How a run works:
    returns every direct and group message involving the owner, the owner's own
    included; no per-conversation list is needed. A DM hit is accepted only when
    its result header says `DM` or `Group DM` and its `Participants:` line
-   lists the owner, and only when every valid reading of the page agrees on it
-   (a body quoting a result block cannot add a DM). Threads found this way are
-   direct asks, so they carry the same owner-action evidence as an
-   `owner_action_channels` entry. The mixed first-page session cannot pin
+   lists the owner. A 1:1 DM thread (a `D` id) carries the usual
+   `direct-message` owner evidence; a group DM carries none beyond a mention or
+   the owner's own message, so it never turns another person's discussion into
+   the owner's task. The mixed first-page session cannot pin
    `channel_types` for the other queries, so the call match enforces it; a
    session holding only the DM query pins it. Every new root and reply comes back with its
    channel, author, timestamp and thread root, so late replies to old threads
@@ -1260,9 +1261,12 @@ How a run works:
    (the count appears when a search reported the thread's reply count). Bot
    replies follow `include_bots`.
 
-Cursors are per query: `channels` (hashed by the channel set), `from:<id>` for
-each person and `me` for mentions, so changing the watch list restarts only the
-query that changed (the first run starts `bootstrap` ago). A run commits each
+Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
+each person, `me` for mentions and `dms`, so changing the watch list restarts
+only what changed: a new channel is searched apart from the known ones and
+bootstraps alone (the first run starts `bootstrap` ago). A channel with no
+cursor of its own is seeded once from the old whole-set `channels` cursor. A
+chunk of channels lists from the oldest cursor among them. A run commits each
 cursor to a watermark instead of holding everything: the older of the run's
 start, the newest message of the oldest deferred thread, and, for a search that
 hit `max_search_pages`, the point right after the last hit read (oldest-first
@@ -1319,9 +1323,8 @@ discover_from: ~/path/slack-discovered.yaml
 the watch loads: hand-written `channels` always stay, an `ignore_channels`
 entry is never merged in, and a missing discovered file adds nothing. Give the
 routine the watch file with `maintenance.watch` so it also skips channels you
-already list. Because the `channels` cursor is keyed by the channel set, a
-channel added or dropped restarts that one cursor at `bootstrap`; threads
-already in the ledger are skipped.
+already list. Cursors are per channel, so adding or dropping a discovered
+channel never re-reads the others.
 
 A run that cannot read every page it started (an unparseable page, a missing
 result) leaves the file untouched, and only hits that every valid reading of a

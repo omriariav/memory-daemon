@@ -348,16 +348,22 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 # One cursor per query (channels, each person, mentions); the
                 # source reports a watermark per cursor instead of holding.
                 ids = slack_mcp.cursor_ids(source)
+                legacy = slack_mcp.legacy_cursor_ids(source)
+                since_map = {}
+                for key, cursor_id in ids.items():
+                    stamp = cursors.checkpoint(
+                        routine["id"], cursor_id, "slack_mcp"
+                    ) or (
+                        key in legacy and cursors.checkpoint(
+                            routine["id"], legacy[key], "slack_mcp"
+                        )
+                    )
+                    # A key with no cursor is left out: it bootstraps alone.
+                    if stamp:
+                        since_map[key] = slack_mcp.since_for(source, stamp)
                 runtime = {}
                 source_overrides[(routine["id"], source_index)] = {
-                    "_since_map": {
-                        key: slack_mcp.since_for(
-                            source, cursors.checkpoint(
-                                routine["id"], cursor_id, "slack_mcp"
-                            ),
-                        )
-                        for key, cursor_id in ids.items()
-                    },
+                    "_since_map": since_map,
                     "_slack_mcp_runtime": runtime,
                 }
                 if routine_active:
