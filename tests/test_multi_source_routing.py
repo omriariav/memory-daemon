@@ -1,7 +1,6 @@
 """Multi-source routine, ownership, and cadence regression tests."""
 import datetime
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +9,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import daemon as daemon_cli
+import preflight_off
 from workspace_daemon import (
     actions,
     config,
@@ -20,9 +20,6 @@ from workspace_daemon import (
     state,
     time_utils,
 )
-
-# Ticks here are not about lid/network state; keep the preflight inert.
-os.environ["MEMORY_DAEMON_PREFLIGHT"] = "0"
 
 
 def multi_routine(vault, routine_id="domain", **extra):
@@ -2537,6 +2534,7 @@ class RunCommandTest(unittest.TestCase):
 
 class TickCommandTest(unittest.TestCase):
     def setUp(self):
+        preflight_off.disable(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)

@@ -428,7 +428,10 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
         # but say plainly that nothing is known about the write.
         log("fibery_tasks_outbound: write outcome unknown (machine "
             "slept/offline); left attempted, not retried: "
-            + ", ".join(ids))
+            + ", ".join(ids)
+            + f" ({type(exc).__name__}: "
+            + str(exc).replace(cfg["document_secret"], "<secret>")[:200]
+            + ")")
         raise RuntimeError(
             "Fibery export: write outcome unknown (machine slept/offline); "
             f"{len(ids)} item(s) left unconfirmed and will not be retried "

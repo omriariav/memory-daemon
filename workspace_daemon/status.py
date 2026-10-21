@@ -121,7 +121,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
     path = Path(path)
     if not path.exists():
         return {"latest": None, "latest_by_group": {}, "routines": {},
-                "offline_since": {}}
+                "skipping_since": {}}
     try:
         # Status is interactive and must stay bounded even after years of
         # unattended operation. Rotation normally keeps this small; tailing is
@@ -134,11 +134,11 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
             lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return {"latest": None, "latest_by_group": {}, "routines": {},
-                "offline_since": {}}
+                "skipping_since": {}}
 
     routine_results = {}
-    # group -> time of the first of an unbroken run of "offline" skips.
-    offline_since = {}
+    # group -> time of the first of an unbroken run of preflight skips.
+    skipping_since = {}
     active = {}
     latest = None
     latest_by_group = {}
@@ -153,9 +153,11 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         nonlocal latest
         latest = result
         latest_by_group[group] = result
-        if not (result["state"] == "preflight_skipped"
-                and result.get("reason") == "offline"):
-            offline_since.pop(group, None)
+        if result["state"] == "preflight_skipped":
+            skipping_since.setdefault(group, result["at"])
+        else:
+            # Any tick that got past the preflight ends the streak.
+            skipping_since.pop(group, None)
 
     def close_incomplete(block):
         if not block:
@@ -268,8 +270,6 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 "message": message,
                 "group": group,
             })
-            if gated.group("why") == "offline":
-                offline_since.setdefault(group, at)
             continue
 
         routine_error = _ROUTINE_ERROR.match(message)
@@ -334,7 +334,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         "latest": latest,
         "latest_by_group": latest_by_group,
         "routines": routine_results,
-        "offline_since": offline_since,
+        "skipping_since": skipping_since,
     }
 
 
@@ -652,8 +652,8 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             )
     bridge_text, bridge_problems = bridge_lines(base_dir, now)
     lines.extend(bridge_text)
-    offline_problems = _offline_problems(base_dir, history, now)
-    lines.extend(f"ATTENTION: {problem}" for problem in offline_problems)
+    skip_problems = skip_streak_problems(base_dir, history, now)
+    lines.extend(f"ATTENTION: {problem}" for problem in skip_problems)
     lines.extend([
         "",
         "Logs: logs/run.log (rotated, owner-only)",
@@ -688,7 +688,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     )
     return "\n".join(lines), (
         scheduler_healthy and routines_healthy and latest_healthy
-        and not bridge_problems and not offline_problems
+        and not bridge_problems and not skip_problems
     )
 
 
@@ -769,24 +769,25 @@ def bridge_lines(base_dir, now):
     return lines, problems
 
 
-def _offline_problems(base_dir, history, now):
-    """Only skips that persist while the lid is open are a problem.
+def skip_streak_problems(base_dir, history, now):
+    """A group whose newest tick is a skip, after skips only for too long.
 
-    Lid-closed and dark-wake skips are expected on a laptop. Offline skips
-    with no other tick in between for longer than the threshold mean the
-    network (or the check's host list) needs a look.
+    One lid-closed night is normal; skipping for longer than skip_warn_hours
+    (default 12) with no tick that ran means the daemon is silently idle, for
+    any skip reason.
     """
     from . import preflight
 
-    limit = preflight.load_config(base_dir)["offline_warn_hours"] * 3600
+    limit = preflight.load_config(base_dir)["skip_warn_hours"] * 3600
     problems = []
-    for group, since in sorted((history.get("offline_since") or {}).items()):
+    for group, since in sorted((history.get("skipping_since") or {}).items()):
+        latest = (history.get("latest_by_group") or {}).get(group) or {}
         epoch = _iso_epoch(since)
-        if epoch is not None and now - epoch > limit:
+        if (latest.get("state") == "preflight_skipped" and epoch is not None
+                and now - epoch > limit):
             problems.append(
-                f"{group} ticks skipped as offline for "
-                f"{_duration(now - epoch)} (check the network or "
-                "network_check.hosts in state/daemon.yaml)"
+                f"{group} ticks only skipped ({latest.get('reason')}) for "
+                f"{_duration(now - epoch)}; nothing has run"
             )
     return problems
 

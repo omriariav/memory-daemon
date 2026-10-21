@@ -387,6 +387,8 @@ class Collector:
                 "flags": flags,
             })
 
+        problems.extend(status.skip_streak_problems(
+            self.base_dir, history, now))
         latest = history.get("latest")
         last_tick = (
             f"{status._iso_age(latest['at'], now)} ("

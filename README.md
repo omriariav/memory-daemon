@@ -2200,23 +2200,31 @@ No `caffeinate` is needed; the daemon is built to tolerate sleep.
 - **Preflight skips.** Every `tick` (not an explicit `run`, unless you pass
   `run --preflight`; never a `--dry-run`) first checks, in under 0.1 s:
   - *Lid closed / dark wake* (macOS only): skipped when the clamshell is
-    closed and no external display is attached (`ioreg -r -k
-    AppleClamshellState`, `ioreg -r -c IOMobileFramebufferShim`), or when the
-    machine is in a DarkWake without graphics (`ioreg -r -n IOPMrootDomain`,
-    "System Capabilities"). Any detection error means "run anyway".
-  - *Offline*: a 3 s TCP connect to `api.anthropic.com:443`; the tick is
-    skipped only when every configured host fails.
+    closed and closing it sleeps the Mac (`ioreg -r -k AppleClamshellState`:
+    `AppleClamshellState` Yes and `AppleClamshellCausesSleep` Yes; clamshell
+    mode with a display or power keeps running), or when the machine is in a
+    DarkWake without graphics (`ioreg -r -n IOPMrootDomain`, "System
+    Capabilities"). Any detection error means "run anyway".
+  - *Offline*: a 3 s TCP connect (DNS included, bounded) to
+    `api.anthropic.com:443`; the tick is skipped only when every probed host
+    fails. If `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or `all_proxy` is
+    set, the proxy's host:port is probed instead, unless `network_check.hosts`
+    is set explicitly.
 
   A skip logs one line (`tick[...] skipped: lid closed|dark wake|offline`),
   attempts nothing, and moves no schedule, cursor, or failure counter.
   `status` and the TUI show "skipped (offline) 12m ago"; routines are not
-  marked unhealthy, and `status` warns only after offline skips persist for
-  `offline_warn_hours` (default 6) with no other tick in between.
+  marked unhealthy. `status` and the TUI warn (ATTENTION) when the newest tick
+  of a group is a skip and skips of any reason have run unbroken for more than
+  `skip_warn_hours` (default 12); any tick that ran ends the streak.
 - **Sleep during a run.** A bridge call that fails while the wall clock ran
   ahead of the monotonic clock by more than 60 s (the machine slept mid-call)
-  is classified as an outage, not an item failure: Slack/Gmail lone-failure
-  and unreadable counters, Mila attempts, and memory-sink retries are not
-  charged. A Fibery export whose post-write check fails that way stays
+  is classified as an outage (`BridgeOutage`), not an item failure. Slack and
+  Gmail reads that lose results across a sleep raise it before their
+  lone-failure or unreadable counters move. Elsewhere the outage text matches
+  the runner's shared-dependency markers, so it is not treated as an item
+  failure by the shared-outage circuit; other per-item counters are unchanged
+  by this feature. A Fibery export whose post-write check fails that way stays
   unconfirmed (never re-written) and reports "write outcome unknown (machine
   slept/offline)".
 - **Power Nap.** With Power Nap on, macOS may run jobs in brief dark wakes
@@ -2232,11 +2240,11 @@ network_check:
   enabled: true
   hosts: ["api.anthropic.com:443"]
   timeout_seconds: 3
-offline_warn_hours: 6
+skip_warn_hours: 12
 ```
 
 A missing or malformed file means these defaults. `MEMORY_DAEMON_PREFLIGHT=0`
-disables every check (the test suite uses it).
+disables every check.
 
 ## Layout
 

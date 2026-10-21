@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import daemon as daemon_cli  # noqa: E402
+import preflight_off  # noqa: E402
 from workspace_daemon import (  # noqa: E402
     claude_bridge, config, gmail, labels, llm, runner, state,
 )
@@ -646,6 +647,7 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
 class TickHeldAndMidRunPauseTest(TempBase):
     def setUp(self):
         super().setUp()
+        preflight_off.disable(self)
         self.routine = routine(self.vault, rid="domain", schedule={"every": "1h"})
         patches = [
             mock.patch.object(daemon_cli, "BASE_DIR", self.base),

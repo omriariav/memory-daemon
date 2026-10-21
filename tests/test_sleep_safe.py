@@ -13,34 +13,34 @@ import daemon as daemon_cli
 import test_fibery_tasks_outbound as tfo
 from test_multi_source_routing import multi_routine
 from workspace_daemon import (
+    tui,
     claude_bridge, gmail_mcp, preflight, runner, sleepclock, slack_mcp,
     state, status,
 )
 
-CLAMSHELL_YES = '  |   "AppleClamshellState" = Yes\n'
-CLAMSHELL_NO = '  |   "AppleClamshellState" = No\n'
-SHIM_INTERNAL_ONLY = '+-o IOMobileFramebufferShim\n  | "ExternalAppleLook" = No\n'
-SHIM_EXTERNAL = (
-    '+-o IOMobileFramebufferShim\n  | "ExternalAppleLook" = No\n'
-    '+-o IOMobileFramebufferShim\n  | "external" = Yes\n'
+CLAMSHELL_YES = (
+    '  |   "AppleClamshellCausesSleep" = Yes\n'
+    '  |   "AppleClamshellState" = Yes\n'
+)
+CLAMSHELL_DOCKED = (  # closed, but a display/power keeps the Mac awake
+    '  |   "AppleClamshellCausesSleep" = No\n'
+    '  |   "AppleClamshellState" = Yes\n'
+)
+CLAMSHELL_NO = (
+    '  |   "AppleClamshellCausesSleep" = Yes\n'
+    '  |   "AppleClamshellState" = No\n'
 )
 ROOT_FULL = '  | "System Capabilities" = 15\n'
 ROOT_DARK = '  | "System Capabilities" = 9\n'
 
 
-def fake_ioreg(clamshell=CLAMSHELL_NO, shim=SHIM_INTERNAL_ONLY, root=ROOT_FULL,
-               returncode=0, error=None):
+def fake_ioreg(clamshell=CLAMSHELL_NO, root=ROOT_FULL, returncode=0,
+               error=None):
     def run(cmd, **kwargs):
         assert cmd[0] == "ioreg" and kwargs["timeout"] <= 2
         if error:
             raise error
-        joined = " ".join(cmd)
-        if "AppleClamshellState" in joined:
-            out = clamshell
-        elif "IOMobileFramebufferShim" in joined:
-            out = shim
-        else:
-            out = root
+        out = clamshell if "AppleClamshellState" in " ".join(cmd) else root
         return SimpleNamespace(returncode=returncode, stdout=out)
     return run
 
@@ -49,13 +49,12 @@ class LidGuardTest(unittest.TestCase):
     def reason(self, **kwargs):
         return preflight.lid_skip_reason("darwin", fake_ioreg(**kwargs))
 
-    def test_lid_closed_without_external_display_skips(self):
+    def test_lid_closed_and_closing_sleeps_the_mac_skips(self):
         self.assertEqual(
             self.reason(clamshell=CLAMSHELL_YES), preflight.REASON_LID)
 
-    def test_lid_closed_with_external_display_runs(self):
-        self.assertIsNone(
-            self.reason(clamshell=CLAMSHELL_YES, shim=SHIM_EXTERNAL))
+    def test_clamshell_mode_with_display_runs(self):
+        self.assertIsNone(self.reason(clamshell=CLAMSHELL_DOCKED))
 
     def test_lid_open_runs(self):
         self.assertIsNone(self.reason())
@@ -73,8 +72,9 @@ class LidGuardTest(unittest.TestCase):
         ):
             self.assertIsNone(self.reason(**kwargs), kwargs)
 
-    def test_unknown_display_data_fails_open(self):
-        self.assertIsNone(self.reason(clamshell=CLAMSHELL_YES, shim=""))
+    def test_missing_causes_sleep_key_fails_open(self):
+        self.assertIsNone(self.reason(
+            clamshell='  |   "AppleClamshellState" = Yes\n'))
 
     def test_other_platforms_never_skip(self):
         self.assertIsNone(preflight.lid_skip_reason(
@@ -109,14 +109,15 @@ class NetworkAndConfigTest(unittest.TestCase):
             "skip_when_lid_closed: false\n"
             "network_check:\n  enabled: true\n"
             "  hosts: ['a.example:443', 'bad host', 'b.example:80']\n"
-            "  timeout_seconds: 1.5\noffline_warn_hours: 2\n"
+            "  timeout_seconds: 1.5\nskip_warn_hours: 2\n"
         )
         cfg = preflight.load_config(self.base)
         self.assertFalse(cfg["skip_when_lid_closed"])
         self.assertEqual(
             cfg["network_check"]["hosts"], ["a.example:443", "b.example:80"])
         self.assertEqual(cfg["network_check"]["timeout_seconds"], 1.5)
-        self.assertEqual(cfg["offline_warn_hours"], 2.0)
+        self.assertEqual(cfg["skip_warn_hours"], 2.0)
+        self.assertTrue(cfg["network_check"]["hosts_explicit"])
 
     def test_offline_only_when_every_host_fails(self):
         seen = []
@@ -264,7 +265,6 @@ class CatchUpTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
-        os.environ["MEMORY_DAEMON_PREFLIGHT"] = "0"
 
     def test_long_gap_is_one_due_run_not_a_backlog(self):
         routine = {"id": "r", "enabled": True, "schedule": {"every": "15m"}}
@@ -441,36 +441,97 @@ class StatusSkipTest(unittest.TestCase):
         self.assertTrue(status._latest_tick_healthy(
             dict(latest, state="preflight_skipped"), False))
 
-    def test_lid_skips_never_warn(self):
+    def test_any_skip_streak_warns_after_threshold(self):
+        # Mixed reasons all night: one streak, not reset by the reason.
         history = self.history(
-            *[f"2026-01-10T{h:02d}:00:00Z tick[x{h}](capture) skipped: lid closed"
-              for h in range(0, 12)])
-        self.assertEqual(history["offline_since"], {})
-        self.assertEqual(
-            status._offline_problems(self.base, history, self.NOW), [])
-
-    def test_persistent_offline_skips_warn_after_threshold(self):
-        history = self.history(
-            "2026-01-10T01:00:00+00:00 tick[a](capture) skipped: offline",
-            "2026-01-10T01:15:00+00:00 tick[b](capture) skipped: offline",
+            "2026-01-10T00:00:00+00:00 tick[a](capture) skipped: lid closed",
+            "2026-01-10T01:00:00+00:00 tick[b](capture) skipped: dark wake",
+            "2026-01-10T02:00:00+00:00 tick[c](capture) skipped: offline",
         )
-        since = status._iso_epoch("2026-01-10T01:00:00+00:00")
+        since = status._iso_epoch("2026-01-10T00:00:00+00:00")
+        self.assertEqual(history["skipping_since"],
+                         {"capture": "2026-01-10T00:00:00+00:00"})
         self.assertEqual(
-            status._offline_problems(self.base, history, since + 3600), [])
-        problems = status._offline_problems(
-            self.base, history, since + 7 * 3600)
+            status.skip_streak_problems(self.base, history, since + 3600), [])
+        problems = status.skip_streak_problems(
+            self.base, history, since + 13 * 3600)
         self.assertEqual(len(problems), 1)
         self.assertIn("offline", problems[0])
 
-    def test_a_real_tick_resets_the_offline_streak(self):
+    def test_a_tick_that_ran_resets_the_streak(self):
         history = self.history(
             "2026-01-10T01:00:00+00:00 tick[a](capture) skipped: offline",
             "2026-01-10T02:00:00+00:00 tick[b](capture): no routines due",
-            "2026-01-10T03:00:00+00:00 tick[c](capture) skipped: offline",
+            "2026-01-10T03:00:00+00:00 tick[c](capture) skipped: lid closed",
         )
         self.assertEqual(
-            history["offline_since"],
+            history["skipping_since"],
             {"capture": "2026-01-10T03:00:00+00:00"})
+        later = status._iso_epoch("2026-01-10T03:00:00+00:00") + 13 * 3600
+        self.assertEqual(len(
+            status.skip_streak_problems(self.base, history, later)), 1)
+        ran = self.history(
+            "2026-01-10T01:00:00+00:00 tick[a](capture) skipped: offline",
+            "2026-01-10T02:00:00+00:00 tick[b](capture): no routines due",
+        )
+        self.assertEqual(
+            status.skip_streak_problems(self.base, ran, later), [])
+
+    def test_tui_snapshot_includes_the_streak(self):
+        history = self.history(
+            "2026-01-10T00:00:00+00:00 tick[a](capture) skipped: lid closed")
+        problems = status.skip_streak_problems(
+            self.base, history,
+            status._iso_epoch("2026-01-10T00:00:00+00:00") + 20 * 3600)
+        self.assertTrue(problems)
+        self.assertIn("skip_streak_problems", open(tui.__file__).read())
+
+
+class ProxyAndDnsTest(unittest.TestCase):
+    def test_proxy_target_is_probed_instead_of_default(self):
+        cfg = preflight.defaults()
+        env = {"https_proxy": "http://proxy.example:3128"}
+        self.assertEqual(
+            preflight.network_targets(cfg, env), ["proxy.example:3128"])
+        self.assertEqual(
+            preflight.network_targets(cfg, {"ALL_PROXY": "socks5://p.example"}),
+            ["p.example:1080"])
+        self.assertEqual(
+            preflight.network_targets(cfg, {}), ["api.anthropic.com:443"])
+
+    def test_explicit_hosts_win_over_proxy(self):
+        cfg = preflight.defaults()
+        cfg["network_check"].update(hosts=["a.example:443"],
+                                    hosts_explicit=True)
+        self.assertEqual(
+            preflight.network_targets(cfg, {"HTTPS_PROXY": "http://p:1"}),
+            ["a.example:443"])
+
+    def test_check_probes_the_proxy(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        seen = []
+
+        def connect(target, timeout):
+            seen.append(target)
+            return mock.Mock()
+
+        self.assertIsNone(preflight.check(
+            tmp.name, "linux", fake_ioreg(), connect,
+            {"HTTPS_PROXY": "proxy.example:8080"}))
+        self.assertEqual(seen, [("proxy.example", 8080)])
+
+    def test_hung_connect_is_bounded(self):
+        import threading
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hang(target, timeout):
+            release.wait(10)
+
+        started = time.monotonic()
+        self.assertTrue(preflight.offline(["h.example:443"], 0.1, hang))
+        self.assertLess(time.monotonic() - started, 3)
 
 
 if __name__ == "__main__":
