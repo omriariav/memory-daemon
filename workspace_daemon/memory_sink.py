@@ -21,6 +21,10 @@ Validation discipline (nothing model-invented reaches the store unchecked):
   slug, while the authenticated user and aliases resolving to that same person
   remain source metadata rather than self-links
 - every entry carries a canonical --source-ids, so re-runs update in place
+- personal content is flagged with `memory.personal_tag` (model `personal`
+  field, bool-validated, plus a deterministic keyword/ID backstop) and
+  government-ID-like numbers are replaced by `[ID]` before any model call and
+  before saving (`memory.redact_ids`); see personal.py
 """
 import datetime
 import json
@@ -32,6 +36,7 @@ import yaml
 
 from . import claude_bridge
 from . import identity as identity_providers
+from . import personal
 from .shell import log, npx_bin
 
 MEMORY_TYPES = {
@@ -77,7 +82,7 @@ other text, with exactly these keys:
             below (leave out anyone not listed, and include only people
             materially involved in the memory)
   "tags": array of 1-4 short kebab-case topic tags
-  "follows": array of entry ids copied EXACTLY from the related memory entries
+{personal_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
           below that this note directly resolves, confirms, or updates —
           usually empty; never invent an id. When the note records the
           resolution or completion of a related entry, list it here and
@@ -93,6 +98,17 @@ Related memory entries already captured from this conversation: {related_entries
 Title: {title}
 Date: {date}
 {body}
+"""
+
+PERSONAL_SCHEMA = """  "personal": boolean — true when the content is primarily about the memory
+            owner's or another person's private life, finances, health, or
+            employment terms (payroll, compensation, HR matters, medical,
+            family, personal banking/insurance, legal, immigration, government
+            ID numbers) rather than work artifacts. Be conservative: when
+            unsure whether it is private, answer true.
+  "personal_reason": optional, only when personal is true — one of: payroll,
+            compensation, hr, health, family, finance, legal, immigration,
+            id_number, other (the category only, never details)
 """
 
 OPERATOR_CONFIRMED_PROMPT = """The memory owner explicitly confirmed that this exact source is durable
@@ -168,7 +184,7 @@ def validate(routine):
     problems = []
     unknown = set(cfg) - {
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
-        "identity",
+        "identity", "personal_tag", "redact_ids", "personal_keywords",
     }
     if unknown:
         problems.append(
@@ -187,6 +203,7 @@ def validate(routine):
     if tags is not None and not isinstance(tags, list):
         problems.append(f"{rid}: memory.tags must be a list")
     problems.extend(identity_providers.validate(cfg, rid))
+    problems.extend(personal.validate(cfg, rid))
     confirmed = cfg.get("operator_confirmed_source_ids")
     if confirmed is not None and (
         not isinstance(confirmed, list)
@@ -633,6 +650,10 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         slugs=", ".join(slugs) or "(none known yet)",
         verified_people=verified_catalog or "(none)",
         no_owner_action_marker=NO_OWNER_ACTION_MARKER,
+        personal_schema=(
+            PERSONAL_SCHEMA
+            if personal.personal_tag(personal.memory_cfg(routine)) else ""
+        ),
         related_entries=related_catalog or "(none)",
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
     )
@@ -645,9 +666,12 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         "worthy", "owner_attention", "type", "title", "people", "tags",
         "follows", "body",
     }
-    if set(data) != expected:
+    # `personal` / `personal_reason` are validated (leniently) by capture();
+    # a missing or malformed value must never discard the whole extraction.
+    optional = {"personal", "personal_reason"}
+    if set(data) - optional != expected:
         missing = sorted(expected - set(data))
-        unknown = sorted(set(data) - expected)
+        unknown = sorted(set(data) - expected - optional)
         details = []
         if missing:
             details.append(f"missing keys: {', '.join(missing)}")
@@ -794,6 +818,25 @@ def capture(routine, item, summary, dry_run=False):
         )
         return {"memory": "skipped_not_worthy"}
 
+    # Deterministic personal backstop runs on the raw source + summary; the
+    # redaction below only changes what the models and the store ever see.
+    ptag = personal.personal_tag(cfg)
+    raw_texts = (item.get("title", ""), item.get("body", ""), summary)
+    id_hit = bool(ptag) and personal.ids_detected(*raw_texts)
+    keyword_hit = bool(ptag) and personal.keywords_detected(cfg, *raw_texts)
+    if personal.redact_enabled(cfg):
+        summary, redacted = personal.redact(summary)
+        if redacted:
+            log(f"routine={rid} memory: redacted {redacted} ID-like value(s) "
+                "from the summary")
+        item = dict(item)
+        for key in ("title", "body"):
+            if isinstance(item.get(key), str):
+                item[key], n = personal.redact(item[key])
+                if n:
+                    log(f"routine={rid} memory: redacted {n} ID-like "
+                        f"value(s) from the source {key}")
+
     entry = {"worthy": True, "type": cfg.get("type", "note"),
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}
     degraded = None
@@ -937,8 +980,30 @@ def capture(routine, item, summary, dry_run=False):
             )
     if degraded:
         tags.append("extract-degraded")
+    if ptag:
+        model_flag = entry.get("personal") if extraction_succeeded else None
+        valid_verdict = type(model_flag) is bool
+        # A valid model verdict wins over keywords; keywords only backstop a
+        # missing/invalid verdict. A personal ID number always forces the flag.
+        is_personal = (model_flag if valid_verdict else keyword_hit) or id_hit
+        if is_personal:
+            tags.append(ptag)
+            reason = entry.get("personal_reason")
+            if reason not in personal.PERSONAL_REASONS:
+                reason = "id_number" if id_hit else None
+            log(
+                f"routine={rid} memory: flagged personal"
+                + (f" reason={reason}" if reason else "")
+                + (" (deterministic)" if id_hit or not valid_verdict else "")
+            )
     title = (entry.get("title") or item.get("title") or "untitled")[:120]
     body = entry.get("body") or summary
+    if personal.redact_enabled(cfg):
+        title, _ = personal.redact(title)
+        body, n = personal.redact(body)
+        if n:
+            log(f"routine={rid} memory: redacted {n} ID-like value(s) "
+                "from the entry body")
     if active_chat_followup:
         followup_line = (
             "The memory owner manually forwarded this Chat conversation to "
