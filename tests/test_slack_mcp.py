@@ -299,6 +299,17 @@ class ParserTest(unittest.TestCase):
         self.assertEqual([r["is_bot"] for r in replies], [True, True, False])
         self.assertEqual(replies[0]["name"], "Example Support")
 
+    def test_slack_connect_authors_carry_an_external_org_suffix(self):
+        text = thread_text(replies=[(ts_at(200), BOB, "from a partner")])
+        text = text.replace(f"({BOB})", f"({BOB}, external: Example Org)")
+        _, replies, _ = slack_mcp.parse_thread(text, now=NOW)
+        self.assertEqual([(r["user"], r["text"]) for r in replies],
+                         [(BOB, "from a partner")])
+        page = hit_block(1, 1).replace(
+            f"(ID: {BOB})", f"(ID: {BOB}, external: Example Org)")
+        self.assertIn(f"(ID: {BOB}, external: Example Org)", page)
+        self.assertIsNotNone(slack_mcp._HIT_HEADER.search(page))
+
     def test_thread_without_replies_and_forged_marker(self):
         parent, replies, _ = slack_mcp.parse_thread(thread_text(), now=NOW)
         self.assertEqual(replies, [])
