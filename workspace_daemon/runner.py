@@ -14,7 +14,7 @@ from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
-from . import slack_mcp
+from . import gmail_mcp, slack_mcp
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -245,6 +245,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     ]
     llm.configure(base_dir)
     slack_mcp.configure(base_dir)
+    gmail_mcp.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
@@ -338,6 +339,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     source_overrides = {}
     catch_up_sources = []
     slack_mcp_sources = []
+    gmail_mcp_sources = []
     active_conversation_sources = []
     for routine in valid:
         routine_active = routine["id"] in active_ids
@@ -369,6 +371,29 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 }
                 if routine_active:
                     slack_mcp_sources.append(
+                        (routine["id"], source_index, ids, runtime)
+                    )
+                continue
+            if (
+                source.get("kind") == "gmail_mcp"
+                and "gmail_mcp" in active_source_kinds
+            ):
+                # One cursor for the query; the source reports a watermark.
+                ids = gmail_mcp.cursor_ids(source)
+                since_map = {}
+                for key, cursor_id in ids.items():
+                    stamp = cursors.checkpoint(
+                        routine["id"], cursor_id, "gmail_mcp"
+                    )
+                    if stamp:
+                        since_map[key] = gmail_mcp.since_for(source, stamp)
+                runtime = {}
+                source_overrides[(routine["id"], source_index)] = {
+                    "_since_map": since_map,
+                    "_gmail_mcp_runtime": runtime,
+                }
+                if routine_active:
+                    gmail_mcp_sources.append(
                         (routine["id"], source_index, ids, runtime)
                     )
                 continue
@@ -582,6 +607,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     for rid, index, ids, runtime in slack_mcp_sources:
         if not source_coverage.get((rid, index)):
             successful_points.extend(slack_mcp.commit_points(
+                rid, ids, runtime, scan_started_at, cursors
+            ))
+
+    for rid, index, ids, runtime in gmail_mcp_sources:
+        if not source_coverage.get((rid, index)):
+            successful_points.extend(gmail_mcp.commit_points(
                 rid, ids, runtime, scan_started_at, cursors
             ))
 
@@ -1240,6 +1271,69 @@ def _missing(expand, item, reason):
     log(f"WARN routine fell back to the email stub — {reason}")
 
 
+def _gmail_mcp_fetch(routine, source, candidate):
+    """Build a `gmail`-shaped item from a thread read through the connector."""
+    thread = gmail_mcp.fetch(routine, candidate, source)
+    messages = thread["messages"]
+    thread_id = thread["thread_id"]
+    newest = messages[-1]
+    message_id = newest["id"]
+    headers = newest["headers"]
+    thread_messages = [
+        {"id": m["id"], "headers": m["headers"], "body": m["body"]}
+        for m in messages
+    ]
+    reading_thread = source.get("read_thread", True) is not False
+    if reading_thread:
+        body, included, thread_truncated = _gmail_thread_body(thread_messages)
+        if thread["omitted"]:
+            body = (
+                f"[{thread['omitted']} earlier message(s) of this thread "
+                f"were not read.]\n\n{body}"
+            )
+            thread_truncated = True
+        people_headers = [m["headers"] for m in reversed(thread_messages)]
+    else:
+        body = newest["body"]
+        people_headers = [headers]
+    body = chat_text.redact_secrets(body)
+    subject = chat_text.redact_secrets(headers.get("subject", ""))
+    source_people, source_people_truncated = _email_source_people(*people_headers)
+    item = {
+        "id": candidate["id"],
+        "source_id": f"gmail:{thread_id}",
+        "source_kind": "gmail",
+        "title": subject,
+        "date": notes.email_date(headers),
+        "body": body,
+        "frontmatter": {
+            "gmail_message_id": message_id,
+            "gmail_thread_id": thread_id,
+            "gmail_link": f"https://mail.google.com/mail/u/0/#inbox/{thread_id}",
+            "email_from": headers.get("from", ""),
+            "email_to": headers.get("to", ""),
+            "email_cc": headers.get("cc", ""),
+            "email_subject": subject,
+            "email_date": headers.get("date", ""),
+            "gmail_labels": [],
+            "gmail_manual_chat_followup": False,
+            "gmail_chat_followup_managed": False,
+            "gmail_chat_followup_active": False,
+            "source_people": source_people,
+            "source_people_truncated": source_people_truncated,
+        },
+    }
+    if reading_thread:
+        item["frontmatter"].update({
+            "gmail_thread_message_count": len(messages) + thread["omitted"],
+            "gmail_thread_messages_included": included,
+            "gmail_thread_truncated": thread_truncated,
+        })
+    if not item["body"].strip():
+        raise RuntimeError("no content: empty message body")
+    return item
+
+
 def _drive_candidates(source):
     files = drive.search(
         source["query"],
@@ -1293,6 +1387,8 @@ SOURCES = {
     "slack_mcp": (slack_mcp.candidates,
                   lambda routine, source, candidate: slack_mcp.fetch(
                       routine, candidate, source)),
+    "gmail_mcp": (gmail_mcp.candidates, lambda routine, source, candidate:
+                  _gmail_mcp_fetch(routine, source, candidate)),
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
 }
@@ -1312,6 +1408,8 @@ TRANSCRIPT_SOURCES = {
 def _scope(source):
     if source.get("kind") == "slack_mcp":
         return "Slack via connector"
+    if source.get("kind") == "gmail_mcp":
+        return "Gmail via connector"
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
     if source.get("kind") == "slack" and source.get("active_conversations"):
@@ -1356,6 +1454,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "drive_docs": 50,
     "slack": 30,
     "slack_mcp": 0,
+    "gmail_mcp": 0,
     "gchat": 50,
     "mila": 0,
     "whisper": 0,
@@ -1509,7 +1608,7 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
-    if source.get("kind") == "slack_mcp":
+    if source.get("kind") in ("slack_mcp", "gmail_mcp"):
         return None  # the source reports watermarks, not a hold
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
@@ -1647,7 +1746,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         list_candidates, fetch = SOURCES[kind]
         override = source_overrides.get((rid, source_index))
         listing_source = dict(source, **override) if override else source
-        if kind == "slack_mcp":
+        if kind in ("slack_mcp", "gmail_mcp"):
             # Listing skips threads the ledger already holds, so the cap and
             # settle window apply to new work only.
             listing_source = dict(listing_source, _processed=processed)
@@ -2153,6 +2252,9 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         if (
             claim["source"].get("kind") == "slack_mcp"
             and slack_mcp.note_failure(claim["candidate"])
+        ) or (
+            claim["source"].get("kind") == "gmail_mcp"
+            and gmail_mcp.note_failure(claim["candidate"])
         ):
             # Hold only the queries that found this thread, at its timestamp.
             return

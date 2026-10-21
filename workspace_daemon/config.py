@@ -15,7 +15,8 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {
-    "gmail", "drive_docs", "slack", "slack_mcp", "gchat", "mila", "whisper",
+    "gmail", "gmail_mcp", "drive_docs", "slack", "slack_mcp", "gchat", "mila",
+    "whisper",
 }
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
@@ -1466,6 +1467,10 @@ _FORBIDDEN_TOOL_WORDS = (
     "send", "schedule", "create", "update", "add", "delete", "upload",
     "complete",
 )
+_GMAIL_FORBIDDEN_TOOL_WORDS = (
+    "send", "draft", "label", "archive", "mark", "delete", "trash", "create",
+    "update", "modify",
+)
 _MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_-]+__([A-Za-z0-9_-]+)$")
 
 
@@ -1617,6 +1622,84 @@ def _validate_slack_mcp(prefix, source):
     return problems
 
 
+def _exact_tool(value, name):
+    """Whether `value` is the connector tool `mcp__<server>__<name>`, read-only."""
+    match = _MCP_TOOL.match(value) if isinstance(value, str) else None
+    return bool(match) and match.group(1) == name and not any(
+        word in match.group(1) for word in _GMAIL_FORBIDDEN_TOOL_WORDS
+    )
+
+
+def _validate_gmail_mcp(prefix, source):
+    """Connector-backed Gmail source: read-only tools and bounded budgets."""
+    from . import gmail_mcp
+    problems = []
+    for key, name in (
+        ("search_tool", gmail_mcp.SEARCH_TOOL_NAME),
+        ("fetch_tool", gmail_mcp.FETCH_TOOL_NAME),
+    ):
+        if not _exact_tool(source.get(key), name):
+            problems.append(
+                f"{prefix}.{key} must be the exact read-only MCP tool "
+                f"mcp__<server>__{name}"
+            )
+    if source.get("search_tool") == source.get("fetch_tool"):
+        problems.append(f"{prefix}: search_tool and fetch_tool must differ")
+    query = source.get("query")
+    if isinstance(query, str) and _GMAIL_TEMPORAL_OPERATOR.search(query):
+        problems.append(
+            f"{prefix}.query must not contain newer_than/older_than/after/"
+            "before; the daemon adds its own after: cursor"
+        )
+    elif query is not None and not isinstance(query, str):
+        problems.append(f"{prefix}.query must be a string")
+    for key, lower, upper in (
+        ("max_threads_per_run", 1, 100), ("max_messages_per_thread", 1, 30),
+        ("max_message_chars", 500, 100000), ("max_search_pages", 1, 20),
+        ("settle_minutes", 0, 1440), ("calls_per_session", 1, 20),
+        ("min_seconds_between_sessions", 0, 120),
+    ):
+        if key in source and not _bounded_int(source[key], lower, upper):
+            problems.append(
+                f"{prefix}.{key} must be an integer from {lower} to {upper}"
+            )
+    for key in ("bootstrap", "overlap"):
+        if key in source:
+            try:
+                duration_seconds(source[key])
+            except RoutineError:
+                problems.append(
+                    f"{prefix}.{key} must look like '15m', '4h', or '1d'"
+                )
+    estimate = source.get("estimate_analyze_usd")
+    if estimate is not None and (
+        not isinstance(estimate, (int, float)) or isinstance(estimate, bool)
+        or not 0 <= estimate <= 10
+    ):
+        problems.append(
+            f"{prefix}.estimate_analyze_usd must be a number from 0 to 10"
+        )
+    if "exclude_self_only" in source and not isinstance(
+        source["exclude_self_only"], bool
+    ):
+        problems.append(f"{prefix}.exclude_self_only must be true or false")
+    owner = source.get("owner_email")
+    if owner is not None and not (
+        isinstance(owner, str) and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", owner)
+    ):
+        problems.append(f"{prefix}.owner_email must be an email address")
+    if source.get("exclude_self_only") is True and owner is None:
+        problems.append(f"{prefix}.exclude_self_only requires owner_email")
+    if "model" in source and not _non_empty_str(source["model"]):
+        problems.append(f"{prefix}.model must be a non-empty string")
+    for key in ("queue_query", "exclude_query", "max_results"):
+        if key in source:
+            problems.append(
+                f"{prefix}.{key} is not supported by gmail_mcp"
+            )
+    return problems
+
+
 def _validate_schedule(routine):
     """Validate the cadence shared by capture and maintenance routines."""
     problems = []
@@ -1744,9 +1827,11 @@ def _validate_mila_match(source, prefix):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    from . import slack_mcp
+    from . import gmail_mcp, slack_mcp
     allowed = SOURCE_KEYS | (
         slack_mcp.SOURCE_KEYS if source.get("kind") == "slack_mcp" else set()
+    ) | (
+        gmail_mcp.SOURCE_KEYS if source.get("kind") == "gmail_mcp" else set()
     )
     unknown_source = {
         key for key in set(source) - allowed
@@ -1762,7 +1847,7 @@ def _validate_source(routine, source, prefix):
             f"{prefix}.kind must be one of {', '.join(sorted(VALID_SOURCE_KINDS))} "
             f"(got {kind!r})"
         )
-    if kind in ("gmail", "drive_docs") and not source.get("query"):
+    if kind in ("gmail", "gmail_mcp", "drive_docs") and not source.get("query"):
         problems.append(f"{prefix}.query is required")
     if "watch" in source:
         if kind not in {"slack", "slack_mcp"}:
@@ -1787,12 +1872,17 @@ def _validate_source(routine, source, prefix):
                 f"{prefix}: unknown action '{action}' "
                 f"(valid: {', '.join(sorted(VALID_ACTIONS))})"
             )
-    if kind != "gmail" and action_list:
+    if kind == "gmail_mcp" and action_list:
+        problems.append(
+            f"{prefix}: actions are not supported for source.kind 'gmail_mcp' "
+            "(it reads only; use actions: [])"
+        )
+    elif kind != "gmail" and action_list:
         problems.append(f"{prefix}: source.kind {kind!r} does not support Gmail actions")
     read_thread = source.get("read_thread")
     if read_thread is not None and not isinstance(read_thread, bool):
         problems.append(f"{prefix}.read_thread must be true or false")
-    if kind != "gmail" and read_thread is not None:
+    if kind not in ("gmail", "gmail_mcp") and read_thread is not None:
         problems.append(f"{prefix}.read_thread is supported only for gmail")
 
     chat_followups = source.get("self_forwarded_chat_followups")
@@ -2047,6 +2137,8 @@ def _validate_source(routine, source, prefix):
                     )
     if kind == "slack_mcp":
         problems.extend(_validate_slack_mcp(prefix, source))
+    if kind == "gmail_mcp":
+        problems.extend(_validate_gmail_mcp(prefix, source))
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)

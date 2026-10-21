@@ -264,13 +264,14 @@ python3 -m workspace_daemon.slack_cli auth-test
 `--dry-run` makes **no** LLM call, **no** source mutation, and **no** vault,
 memory-store, or state write. It still performs real source reads so the preview
 reflects reality, and appends to `logs/run.log` so failed previews remain
-diagnosable. The one exception to "real source reads" is a `slack_mcp`
-source, whose listing needs an LLM bridge session: a dry run only logs its plan.
+diagnosable. The one exception to "real source reads" is a `slack_mcp` or
+`gmail_mcp` source, whose listing needs an LLM bridge session: a dry run only
+logs its plan.
 
 `--count-only` cannot be combined with `--dry-run`. It is the cheap way to see what a run would do. It lists and routes
 candidates against the read-only ledger and cursors, then prints the number of
-new or changed items per routine and, for `slack_mcp`, the planned thread-read
-sessions and a cost estimate (mean past session cost times planned sessions,
+new or changed items per routine and, for `slack_mcp` and `gmail_mcp`, the
+planned read sessions and a cost estimate (mean past session cost times planned sessions,
 plus mean past analyze cost times threads, from `state/claude-usage.jsonl`;
 with `estimate_analyze_usd`, default 0.12 per thread, standing in for analyze
 history that does not exist yet). It fetches nothing, calls no analysis model, and
@@ -829,7 +830,7 @@ enabled: true
 description: Summarize the weekly report email.
 
 source:
-  kind: gmail                  # gmail, drive_docs, slack, slack_mcp, gchat, mila, or whisper
+  kind: gmail                  # gmail, gmail_mcp, drive_docs, slack, slack_mcp, gchat, mila, or whisper
   query: 'from:reports@example.com subject:"Weekly Report" is:unread'
   max_results: 20              # optional, default 20
 
@@ -1470,6 +1471,97 @@ only the cursors of the queries that found it, at its timestamp. A read outage
 (no usable result at all in a session) fails the run without counting an
 attempt against any thread. Errors and logs carry counts only, never tool inputs or message text, and
 the runner's item titles for these threads are the channel and timestamp.
+
+### Gmail via a connector
+
+`kind: gmail_mcp` reads Gmail through a claude.ai Gmail connector driven by the
+headless bridge, so no Gmail credentials live on the machine. Claude only
+transports two read-only tool calls (`search`, `fetch_message`); Python plans,
+parses, groups, bounds and versions everything. See
+`routines/_example-gmail-mcp-to-memory.yaml`.
+
+```yaml
+source:
+  kind: gmail_mcp
+  search_tool: mcp__claude_ai_Example_Gmail__search
+  fetch_tool: mcp__claude_ai_Example_Gmail__fetch_message
+  query: 'in:inbox -category:promotions'   # no newer_than:/after:/before:
+  owner_email: me@example.com
+  read_thread: true                        # false: newest message only
+```
+
+Items have the shape of the `gmail` source (`source_kind: gmail`,
+`gmail_thread_id`, `email_*` frontmatter), so the memory id is
+`gmail:<thread id>` and routing, handlers and analysis work unchanged.
+Actions (`apply_label`, `archive`, `mark_read`) are not supported: validation
+rejects `actions` on a `gmail_mcp` source or routine. Labels are not exposed by
+the connector, so `gmail_labels` is empty.
+
+Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
+`max_messages_per_thread` (8), `max_message_chars` (6000), `max_search_pages`
+(3), `overlap` (1h), `bootstrap` (2d), `settle_minutes` (10),
+`calls_per_session` (15, max 20), `min_seconds_between_sessions` (3),
+`read_thread` (true), `exclude_self_only` (false; needs `owner_email`),
+`estimate_analyze_usd` (0.12).
+
+How a run works:
+
+1. The connector has no thread tool, so a thread is the messages that share a
+   `Thread ID`. Listing runs `(<query>) after:<unix>` (cursor minus `overlap`,
+   or `bootstrap` ago), one bridge session per page of up to 50 results,
+   following the `page_token` for up to `max_search_pages`. Results are plain
+   text: blocks of `ID`, `Thread ID`, `Subject`, `From`, `Date`, `Snippet`
+   separated by `---`. Python accepts a block only with 16-hex ids and that
+   field order; dates are parsed with their time zone offsets.
+2. Hits are grouped by thread. The candidate id is
+   `gmail:<thread id>@<newest message id>` and the memory source id drops the
+   version, so a new message updates the same memory in place. Threads already
+   in the ledger are skipped; threads whose newest message is younger than
+   `settle_minutes`, and anything beyond `max_threads_per_run` (oldest first),
+   are deferred (still claiming ownership). With `exclude_self_only`, threads
+   whose listed messages all come from `owner_email` are dropped.
+3. `fetch()` reads the thread's messages seen in the window (all of them, newest
+   `max_messages_per_thread`, or only the newest when `read_thread: false`) with
+   `fetch_message`, up to `calls_per_session` per bridge session. Python cuts
+   the raw HTML part and the opaque attachment ids, keeps the text body (an
+   HTML-only message is reduced to its visible text), unescapes entities, keeps
+   attachment names and types, and cuts each message to `max_message_chars`
+   (`[truncated]`); omitted older messages are noted in the body. A fetched
+   message must carry the thread id the search reported.
+
+The cursor is one watermark for the query: a run commits the older of its
+start, the newest message of the oldest deferred thread and, when a failed item
+holds it, that item's date. Search membership is authoritative (Gmail's `after:`
+uses the received time), so the sender's `Date` header never drops a hit; it
+only orders and settles messages, clamped to the search window. Gmail lists
+newest first, so a window with more results than `max_search_pages` would lose
+its older end; the window is bisected in time instead (`before:<mid>`, at most
+6 halvings) until the newest-first search fits, only that window is processed,
+and the cursor commits to its end so the next run continues from there (no
+extra state). If even a one-hour window exceeds the cap, its first pages are
+taken and a `WARN` is logged: that rare loss is accepted. A thread whose newest message
+fails to read three times, or cannot be parsed, is recorded in the ledger as
+unreadable (`gmail_mcp: unreadable`, no text); a session-wide outage counts
+against no thread.
+
+Do not run `gmail` and `gmail_mcp` over the same mailbox scope: both write
+`gmail:<thread id>` memories, but their ledger ids differ (message id versus
+`<thread>@<newest message>`), so each processes the thread and they overwrite
+each other's entry.
+
+`--dry-run` only logs the plan (no bridge call); `--count-only` lists and
+estimates the planned message-read sessions and cost like `slack_mcp`.
+
+Security: validation accepts only the exact read-only tools whose last segment
+is `search` / `fetch_message`, without send, draft, label, archive, mark,
+delete, trash, create, update or modify in them; each session allowlists a
+single read tool, so email text never shares a session with a write tool. Email
+text is untrusted data: prompts never contain it, Python accepts a result only
+when its tool input equals a planned call (unplanned calls are dropped, a
+missing one is re-issued once), and a snippet that imitates further result
+blocks cannot remove a real hit (every reading of the page is parsed and the
+hits unioned). Errors and logs carry counts only, never tool inputs or message
+text, and the runner's item titles are `Gmail thread <id>`.
 
 ### Slack channel discovery
 

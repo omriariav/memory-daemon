@@ -1230,17 +1230,13 @@ def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def plan_cost(count, usage_path, routine_id=None, analyze_default=0.12):
-    """(sessions, estimated USD) for `count` new threads.
+def usage_means(usage_path, routine_id=None):
+    """(mean cost of a tool session, mean cost of an analyze run or None).
 
-    Uses the mean cost of past bridge sessions (logged with tools) and of
-    no-tool analyze runs from the usage log; with no analyze history,
-    `analyze_default` per thread. When usage lines carry a routine tag, only
-    this routine's lines are averaged; untagged logs average all.
+    From the usage log of past bridge sessions (logged with tools) and no-tool
+    analyze runs. When usage lines carry a routine tag, only this routine's
+    lines are averaged; untagged logs average all.
     """
-    if not count:
-        return 0, 0.0
-    sessions = int(math.ceil(count / float(THREADS_PER_SESSION)))
     entries = []
     try:
         with open(usage_path) as handle:
@@ -1260,5 +1256,19 @@ def plan_cost(count, usage_path, routine_id=None, analyze_default=0.12):
         cost = entry.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             (tool_costs if entry.get("tools") else analyze_costs).append(cost)
-    analyze = _mean(analyze_costs) if analyze_costs else analyze_default
-    return sessions, round(_mean(tool_costs) * sessions + analyze * count, 2)
+    return _mean(tool_costs), (_mean(analyze_costs) if analyze_costs else None)
+
+
+def plan_cost(count, usage_path, routine_id=None, analyze_default=0.12):
+    """(sessions, estimated USD) for `count` new threads.
+
+    Uses the mean cost of past bridge sessions and of analyze runs
+    (`usage_means`); with no analyze history, `analyze_default` per thread.
+    """
+    if not count:
+        return 0, 0.0
+    sessions = int(math.ceil(count / float(THREADS_PER_SESSION)))
+    tool_mean, analyze = usage_means(usage_path, routine_id)
+    if analyze is None:
+        analyze = analyze_default
+    return sessions, round(tool_mean * sessions + analyze * count, 2)
