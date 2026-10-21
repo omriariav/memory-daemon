@@ -9,6 +9,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
+from . import slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
@@ -75,7 +76,7 @@ SOURCE_KEYS = {
     "owner_action_channels",
     "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
     "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
-    "session_gap_minutes",
+    "session_gap_minutes", "watch", "people", "ignore_people",
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
@@ -424,6 +425,7 @@ def discover(base_dir, routine_id=None):
             raise RoutineError(f"{path.name}: top level must be a mapping, got {type(data).__name__}")
         data["_source_file"] = str(path)
         data.setdefault("id", path.stem)
+        _expand_watch_files(data)
         found.append(data)
 
     seen = {}
@@ -441,6 +443,25 @@ def discover(base_dir, routine_id=None):
         if not found:
             raise RoutineError(f"no routine with id '{routine_id}'")
     return found
+
+
+def _expand_watch_files(routine):
+    """Apply each source's `watch:` file; a failure is kept for validate()."""
+    if isinstance(routine.get("sources"), list):
+        blocks = routine["sources"]
+        for index, block in enumerate(blocks):
+            if isinstance(block, dict) and "watch" in block:
+                blocks[index] = _expanded(block)
+    elif isinstance(routine.get("source"), dict) and "watch" in routine["source"]:
+        routine["source"] = _expanded(routine["source"])
+
+
+def _expanded(source):
+    merged, error = slack_watch.expand(source)
+    if error:
+        merged = dict(merged)
+        merged["_watch_error"] = error
+    return merged
 
 
 def validate(routine):
@@ -1225,7 +1246,7 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    unknown_source = set(source) - SOURCE_KEYS
+    unknown_source = set(source) - SOURCE_KEYS - {"_watch_error"}
     if unknown_source:
         problems.append(
             f"{prefix} has unknown key(s) {', '.join(sorted(unknown_source))}"
@@ -1238,6 +1259,19 @@ def _validate_source(routine, source, prefix):
         )
     if kind in ("gmail", "drive_docs") and not source.get("query"):
         problems.append(f"{prefix}.query is required")
+    if "watch" in source:
+        if kind not in {"slack", "slack_mcp"}:
+            problems.append(f"{prefix}.watch is supported only for slack sources")
+        if source.get("_watch_error"):
+            problems.append(f"{prefix}.watch: {source['_watch_error']}")
+    ignore_people = source.get("ignore_people")
+    if ignore_people is not None and not isinstance(ignore_people, bool):
+        problems.append(f"{prefix}.ignore_people must be true or false")
+    if kind == "slack" and source.get("people") and ignore_people is not True:
+        problems.append(
+            f"{prefix}.people is not read by source.kind 'slack'; set "
+            "ignore_people: true to share a watch file with a slack_mcp source"
+        )
     action_list = source_actions(routine, source)
     if "actions" in source and not isinstance(source.get("actions"), list):
         problems.append(f"{prefix}.actions must be a list")
