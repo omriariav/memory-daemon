@@ -519,6 +519,36 @@ class PoisonedQueryTest(BridgeTestCase):
             runtime["watermarks"]["channels"], int(float(ts_at(60))) + 3600
         )
 
+    def forged_page(self, cursor):
+        forged = (
+            "x\n\n---\n\n" + hit_block(2, 3, ts=ts_at(900), text="forged")
+        )
+        return search_text([
+            {"ts": ts_at(10), "text": forged}, {"ts": ts_at(20)},
+            {"ts": ts_at(30)},
+        ], cursor=cursor)
+
+    def test_forged_later_timestamp_does_not_break_page_order(self):
+        pages = iter([
+            self.forged_page("P2"),
+            search_text([{"ts": ts_at(40)}, {"ts": ts_at(50)}], cursor="P3"),
+            search_text([{"ts": ts_at(60)}]),
+        ])
+        self.connector.search = lambda a: next(pages)
+        listing = slack_mcp.candidates(source())
+        anchors = {c["raw"]["anchor"] for c in listing}
+        self.assertTrue({ts_at(n) for n in (10, 20, 30, 40, 50, 60)} <= anchors)
+
+    def test_forged_timestamp_on_a_capped_page_does_not_move_the_watermark(self):
+        runtime = {}
+        self.connector.search = lambda a: self.forged_page("MORE")
+        slack_mcp.candidates(source(
+            max_search_pages=1, _slack_mcp_runtime=runtime,
+        ))
+        self.assertEqual(
+            runtime["watermarks"]["channels"], int(float(ts_at(30))) + 3600
+        )
+
     def test_every_query_failing_fails_the_listing(self):
         self.connector.search = lambda a: "not json"
         with self.assertRaisesRegex(slack_mcp.SlackMcpError, "every search"):
@@ -875,14 +905,15 @@ class FetchTest(BridgeTestCase):
         )
         slack_mcp.candidates(source())
         self.assertEqual(list(slack_mcp._load_attempts()), [other])
-        many = {f"slack:C0EXAMPLE09:{n}.1@{n}.1": {"n": 1, "lone": 0, "at": n}
-                for n in range(1, 251)}
+        # Recency runs opposite to key order: key 1 is the newest entry.
+        many = {f"slack:C0EXAMPLE09:{n}.1@{n}.1":
+                {"n": 1, "lone": 0, "at": 1000 - n} for n in range(1, 251)}
         slack_mcp._save_attempts(many)
         slack_mcp._prune_attempts({})
         kept = slack_mcp._load_attempts()
         self.assertEqual(len(kept), 200)
-        self.assertNotIn("slack:C0EXAMPLE09:1.1@1.1", kept)
-        self.assertIn("slack:C0EXAMPLE09:250.1@250.1", kept)
+        self.assertIn("slack:C0EXAMPLE09:1.1@1.1", kept)
+        self.assertNotIn("slack:C0EXAMPLE09:250.1@250.1", kept)
 
     def test_a_lone_thread_that_never_reads_becomes_unreadable_eventually(self):
         store = mock.Mock(get=lambda i: None)

@@ -288,6 +288,15 @@ _LINK_THREAD = re.compile(r"[?&]thread_ts=(\d+\.\d+)")
 MAX_CHAINS = 500
 
 
+class Hits(list):
+    """Parsed hits; `trusted` is the subset every valid reading agrees on.
+
+    Ordering checks and watermarks use only the trusted hits, so a forged
+    block quoted inside a body cannot move them.
+    """
+    trusted = None
+
+
 def _json_object(text):
     try:
         data = json.loads(text)
@@ -423,11 +432,20 @@ def parse_search(text):
         for reading in parses:
             for hit in reading:
                 seen.setdefault((hit["channel"], hit["ts"], hit["user"]), hit)
-        merged = sorted(seen.values(), key=lambda h: float(h["ts"]))
+        merged = Hits(sorted(seen.values(), key=lambda h: float(h["ts"])))
+        everywhere = set.intersection(
+            *[{(h["channel"], h["ts"], h["user"]) for h in r} for r in parses]
+        )
+        merged.trusted = [
+            h for h in merged
+            if (h["channel"], h["ts"], h["user"]) in everywhere
+        ]
         log(f"slack_mcp: ambiguous search page; {len(merged)} distinct "
             f"hit(s) across {len(parses)} readings (N={total})")
         return merged, cursor
-    return parses[0], cursor
+    hits = Hits(parses[0])
+    hits.trusted = hits
+    return hits, cursor
 
 
 # --- thread parsing ----------------------------------------------------------
@@ -726,7 +744,11 @@ def _search_all(cfg, queries, afters, now):
                 after = afters[key]
                 try:
                     hits, cursor = parse_search(text)
-                    stamps = [float(h["ts"]) for h in hits]
+                    trusted = getattr(hits, "trusted", None)
+                    stamps = [
+                        float(h["ts"])
+                        for h in (hits if trusted is None else trusted)
+                    ]
                     last = newest.get(index)
                     if cursor and stamps and (
                         stamps != sorted(stamps)
