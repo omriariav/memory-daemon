@@ -2520,7 +2520,7 @@ class RunCommandTest(unittest.TestCase):
                  side_effect=state.AlreadyRunning("run.lock held"),
              ), \
              mock.patch.object(daemon_cli, "log") as log:
-            self.assertEqual(daemon_cli.cmd_run(args), 0)
+            self.assertEqual(daemon_cli.cmd_run(args), state.EXIT_LOCKED)
 
         self.assertIn(
             mock.call(

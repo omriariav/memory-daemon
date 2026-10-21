@@ -29,6 +29,11 @@ class Paused(StateError):
     pass
 
 
+# `daemon.py run` exit code when every group was skipped on a busy lock
+# (sysexits EX_TEMPFAIL), so callers can tell "skipped" from "done".
+EXIT_LOCKED = 75
+
+
 def pause_file(base_dir):
     return Path(base_dir) / "state" / "PAUSED"
 
@@ -47,6 +52,25 @@ def paused(base_dir):
         return "paused"
     lines = text.splitlines()
     return (lines[0].strip() if lines else "") or "paused"
+
+
+def pause(base_dir, reason="paused from the terminal UI"):
+    """Create the kill switch. Returns True when it was newly created."""
+    path = pause_file(base_dir)
+    already = path.exists()
+    ensure_private_dir(path.parent)
+    if not already:
+        write_atomic(path, f"{reason}\n", mode=0o600)
+    return not already
+
+
+def resume(base_dir):
+    """Remove the kill switch. Returns True when a switch was removed."""
+    try:
+        pause_file(base_dir).unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def ensure_private_dir(path):

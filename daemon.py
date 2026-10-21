@@ -9,6 +9,8 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py run [--routine ID] [-n]    process new matches now (--ignore-pause overrides state/PAUSED)
   daemon.py tick [-n]                  process only routines whose cadence is due
   daemon.py new                        interactive scaffold for a new routine
+  daemon.py tui                        live terminal UI: status, pause, run, tick
+  daemon.py ctl pause|resume|state     non-interactive kill switch and summary
 """
 import argparse
 import os
@@ -22,7 +24,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, runner, state, status
+from workspace_daemon import config, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -84,6 +86,39 @@ def cmd_status(args):
     text, healthy = status.render(BASE_DIR, routines, label=args.label)
     print(text)
     return 0 if healthy else 1
+
+
+# --- tui / ctl --------------------------------------------------------------
+
+def cmd_tui(args):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("tui needs a terminal; use `daemon.py status` or `ctl state`",
+              file=sys.stderr)
+        return 2
+    explicit = bool(args.base_dir or os.environ.get("MEMORY_DAEMON_DIR"))
+    return tui.run_curses(
+        Path(args.base_dir).expanduser() if args.base_dir else BASE_DIR,
+        interval=args.interval, label_prefix=args.label_prefix,
+        explicit=explicit)
+
+
+def cmd_ctl(args):
+    try:
+        if args.action == "pause":
+            created = state.pause(BASE_DIR, args.reason)
+            print("paused" if created else "already paused")
+            return 0
+        if args.action == "resume":
+            removed = state.resume(BASE_DIR)
+            print("resumed" if removed else "was not paused")
+            return 0
+    except OSError as exc:
+        print(f"error: cannot change state/PAUSED: {exc.strerror or exc}",
+              file=sys.stderr)
+        return 1
+    snap = tui.Collector(BASE_DIR, args.label_prefix).snapshot()
+    print(tui.summary_line(snap))
+    return 0
 
 
 # --- validate ---------------------------------------------------------------
@@ -296,11 +331,13 @@ def cmd_run(args):
         )
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
+    attempted = locked = 0
     for group_ids, lock_name in _manual_execution_groups(
         routines, active_ids
     ):
         if not group_ids:
             continue
+        attempted += 1
         try:
             group_totals = runner.run(
                 BASE_DIR, routines, dry_run=args.dry_run,
@@ -317,6 +354,7 @@ def cmd_run(args):
                 f"run group={lock_name} skipped routines={skipped_ids} — "
                 f"{exc}"
             )
+            locked += 1
             continue
         except state.Paused as exc:
             log(f"run stopped: {exc}")
@@ -341,6 +379,9 @@ def cmd_run(args):
             f"(retried automatically next run)"
         )
     log(f"run done: {summary}")
+    if attempted and locked == attempted:
+        # Nothing ran: every group was busy. Distinct from a clean run.
+        return state.EXIT_LOCKED
     return 1 if totals["errors"] else 0
 
 
@@ -534,6 +575,26 @@ def main(argv=None):
         help="launchd label (default: %(default)s)",
     )
     p_status.set_defaults(func=cmd_status)
+    default_prefix = os.environ.get(
+        "MEMORY_DAEMON_LAUNCHD_LABEL", status.DEFAULT_LAUNCHD_LABEL
+    )
+    p_tui = sub.add_parser("tui", help="live terminal UI (status + controls)")
+    p_tui.add_argument("--interval", type=float, default=2.0,
+                       help="refresh seconds (default: %(default)s)")
+    p_tui.add_argument("--label-prefix", default=default_prefix,
+                       help="show every loaded launchd job whose label starts "
+                            "with this (default: %(default)s)")
+    p_tui.add_argument("--base-dir", help="control this checkout instead of "
+                       "the one launchd runs (the UI then refuses to act "
+                       "if they differ)")
+    p_tui.set_defaults(func=cmd_tui)
+    p_ctl = sub.add_parser("ctl", help="pause, resume, or summarize state")
+    p_ctl.add_argument("action", choices=("pause", "resume", "state"))
+    p_ctl.add_argument("--reason", default="paused from the command line",
+                       help="first line written to state/PAUSED")
+    p_ctl.add_argument("--label-prefix", default=default_prefix,
+                       help="launchd label prefix for `state` (default: %(default)s)")
+    p_ctl.set_defaults(func=cmd_ctl)
     sub.add_parser("validate", help="check all routine YAML").set_defaults(func=cmd_validate)
     sub.add_parser("new", help="interactive scaffold for a new routine").set_defaults(func=cmd_new)
 
