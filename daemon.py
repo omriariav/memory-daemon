@@ -183,6 +183,7 @@ def _empty_totals():
     return {
         "matched": 0, "processed": 0, "skipped": 0, "errors": 0,
         "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
+        "trivial": 0, "extract_failed": 0,
     }
 
 

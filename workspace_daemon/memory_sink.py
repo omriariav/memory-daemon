@@ -37,6 +37,7 @@ import yaml
 from . import claude_bridge
 from . import identity as identity_providers
 from . import personal
+from . import triviality
 from .shell import log, npx_bin
 
 MEMORY_TYPES = {
@@ -185,6 +186,7 @@ def validate(routine):
     unknown = set(cfg) - {
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
         "identity", "personal_tag", "redact_ids", "personal_keywords",
+        "extract_model",
     }
     if unknown:
         problems.append(
@@ -202,6 +204,11 @@ def validate(routine):
     tags = cfg.get("tags")
     if tags is not None and not isinstance(tags, list):
         problems.append(f"{rid}: memory.tags must be a list")
+    extract_model = cfg.get("extract_model")
+    if extract_model is not None and (
+        not isinstance(extract_model, str) or not extract_model.strip()
+    ):
+        problems.append(f"{rid}: memory.extract_model must be a non-empty string")
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
     confirmed = cfg.get("operator_confirmed_source_ids")
@@ -623,6 +630,30 @@ def _verified_source_people(item, rid, identity, provider=None):
     return verified, unresolved
 
 
+DEGRADED_MIN_SUMMARY_CHARS = 200
+
+
+def _trivial_max_chars(routine):
+    value = (routine.get("analyze") or {}).get("trivial_max_chars")
+    return value if isinstance(value, int) and value > 0 else (
+        triviality.DEFAULT_MAX_CHARS
+    )
+
+
+def _summary_title(summary):
+    """First sentence of the summary, as a plain-note title (<=120 chars)."""
+    for line in str(summary or "").splitlines():
+        line = re.sub(r"[*_`]+", "", line)
+        line = re.sub(r"^[\s#>\-\d.)]+", "", line).strip()
+        if not line:
+            continue
+        sentence = re.split(r"(?<=[.!?])\s", line, maxsplit=1)[0].strip()
+        if len(sentence) > 120:
+            sentence = sentence[:117].rstrip() + "..."
+        return sentence or "untitled"
+    return "untitled"
+
+
 def _extract(routine, item, summary, store, verified_people=(), identity=None):
     """Structured second pass over the already-distilled summary."""
     from . import llm  # late import to avoid cycles
@@ -657,9 +688,27 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         related_entries=related_catalog or "(none)",
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
     )
-    raw = llm.analyze(routine, prompt).strip()
+    kwargs = {}
+    extract_model = memory_cfg(routine).get("extract_model")
+    if isinstance(extract_model, str) and extract_model.strip():
+        kwargs["model"] = extract_model.strip()
+    try:
+        return _parse_extraction(llm.analyze(routine, prompt, **kwargs))
+    except ValueError as exc:  # includes json.JSONDecodeError
+        error = str(exc)
+    # One retry that shows the model exactly what was wrong.
+    retry_prompt = (
+        f"{prompt}\n\nYour previous JSON failed: {error}. "
+        "Return corrected JSON only."
+    )
+    return _parse_extraction(llm.analyze(routine, retry_prompt, **kwargs))
+
+
+def _parse_extraction(raw):
+    """Parse and validate one extraction answer; raises ValueError."""
+    raw = raw.strip()
     raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.M).strip()
-    data = json.loads(raw)  # let a malformed answer raise; caller falls back
+    data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("extraction did not return a JSON object")
     expected = {
@@ -873,6 +922,21 @@ def capture(routine, item, summary, dry_run=False):
         except Exception as exc:
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
+            keep = operator_confirmed or active_chat_followup
+            if not keep and (
+                len(summary.strip()) <= DEGRADED_MIN_SUMMARY_CHARS
+                or triviality.is_borderline(
+                    item, _trivial_max_chars(routine)
+                )
+            ):
+                log(
+                    f"routine={rid} memory WARN source_id={source_id}: "
+                    "extraction failed twice on a short/borderline item, "
+                    "not storing"
+                )
+                return {"memory": "skipped_extract_failed", "memory_warn": 1}
+            # Never title a plain note with the raw message text.
+            entry["title"] = _summary_title(summary)
 
     if (
         not entry.get("worthy", True)

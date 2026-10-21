@@ -81,7 +81,7 @@ TOP_LEVEL_KEYS = {
 ANALYZE_KEYS = {
     "provider", "model", "instruction", "instruction_from_connector",
     "instruction_extra", "connector_sweep", "max_output_tokens",
-    "focus_domains", "pick_label",
+    "focus_domains", "pick_label", "skip_trivial", "trivial_max_chars",
 }
 OUTPUT_KEYS = {"vault_dir", "slug_prefix", "filename_template", "kind", "tags"}
 SOURCE_KEYS = {
@@ -860,6 +860,16 @@ def validate(routine):
         problems.append(
             f"{rid}: analyze.max_output_tokens={tokens} is too low — reasoning models "
             f"truncate mid-sentence below ~2048; use 4096"
+        )
+    skip_trivial = analyze.get("skip_trivial")
+    if skip_trivial is not None and not isinstance(skip_trivial, bool):
+        problems.append(f"{rid}: analyze.skip_trivial must be true or false")
+    trivial_max = analyze.get("trivial_max_chars")
+    if trivial_max is not None and (
+        type(trivial_max) is not int or trivial_max < 1
+    ):
+        problems.append(
+            f"{rid}: analyze.trivial_max_chars must be a positive integer"
         )
     domains = analyze.get("focus_domains")
     if domains is not None and not isinstance(domains, list):

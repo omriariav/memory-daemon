@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
 from . import slack_mcp
 from .shell import log, utc_now_iso
@@ -268,7 +268,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 state.sweep_temp_files(vault)
 
     totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0,
-              "fallbacks": 0, "pending_actions": 0, "ambiguous": 0}
+              "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
+              "trivial": 0, "extract_failed": 0}
 
     valid = []
     routing_failures = []
@@ -2398,6 +2399,24 @@ def _attach_related_memories(routine, source, item):
         )
 
 
+def _trivial_verdict(routine, item):
+    """Reason string when the item is chat small talk to skip, else None."""
+    cfg = config.analyze_cfg(routine)
+    if cfg.get("skip_trivial") is not True:
+        return None
+    # Only memory-only routines: a configured vault note would be lost, and an
+    # owner-confirmed source must always be replayed.
+    if routine.get("output") or not memory_sink.memory_cfg(routine):
+        return None
+    if memory_sink.is_operator_confirmed(routine, item):
+        return None
+    max_chars = cfg.get("trivial_max_chars")
+    if type(max_chars) is not int or max_chars < 1:
+        max_chars = triviality.DEFAULT_MAX_CHARS
+    trivial, reason = triviality.assess(item, max_chars)
+    return reason if trivial else None
+
+
 def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
              prefetched_item=None, followup_predecessor_entry_id=None,
@@ -2439,6 +2458,34 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
     transcript_module = TRANSCRIPT_SOURCES.get(source["kind"])
+    skip_trivial = _trivial_verdict(routine, item)
+    if dry_run and skip_trivial:
+        log(f"routine={rid} [dry-run] would skip as trivial: {skip_trivial}")
+        return None
+    if skip_trivial:
+        record = {
+            "rule_id": rid,
+            "source_kind": source["kind"],
+            "source_id": item.get("source_id"),
+            "processed_at": utc_now_iso(),
+            "output_file": None,
+            "memory": "skipped_trivial",
+            "trivial_reason": skip_trivial,
+        }
+        memory_source_id = memory_sink.source_id_for(item)
+        if memory_source_id:
+            record["memory_source_id"] = memory_source_id
+        if handler_id:
+            record["handler_id"] = handler_id
+        processed.record_resolving(
+            item["id"], record, memory_source_id or item.get("source_id")
+        )
+        totals["trivial"] = totals.get("trivial", 0) + 1
+        log(
+            f"routine={rid} id={item['id']} skipped as trivial "
+            f"({skip_trivial}); no model call"
+        )
+        return record
     if dry_run:
         if transcript_module is not None:
             log(
@@ -2632,6 +2679,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             outcome = memory_sink.capture(routine, item, summary)
             if outcome:
                 record.update(outcome)
+                if outcome.get("memory") == "skipped_extract_failed":
+                    totals["extract_failed"] = totals.get("extract_failed", 0) + 1
             if (
                 meta.get("gmail_chat_followup_managed") is True
                 and meta.get("gmail_chat_followup_active") is True

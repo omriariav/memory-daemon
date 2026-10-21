@@ -360,7 +360,14 @@ def routine_rows(
         # fetched"; expose it here so the distinction does not require
         # reading raw daemon logs.
         skipped_not_worthy = sum(
-            entry.get("memory") == "skipped_not_worthy" for entry in entries
+            entry.get("memory") in ("skipped_not_worthy", "skipped_trivial")
+            for entry in entries
+        )
+        extract_failed = sum(
+            entry.get("memory") == "skipped_extract_failed"
+            and _within(entry.get("processed_at"), now,
+                        MEMORY_ERROR_WINDOW_SECONDS)
+            for entry in entries
         )
         expansion_fallbacks = sum(
             bool(entry.get("expand_fallback")) for entry in entries
@@ -372,6 +379,8 @@ def routine_rows(
         issues = []
         if memory_errors:
             issues.append(f"{memory_errors} memory sink")
+        if extract_failed:
+            issues.append(f"{extract_failed} extract failed (WARN)")
         if expansion_fallbacks:
             issues.append(f"{expansion_fallbacks} source expansion")
         if pending_actions:
