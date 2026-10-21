@@ -763,7 +763,42 @@ Routines without `schedule.every` retain the legacy hourly cadence; the template
 sets `4h` explicitly for new routines.
 
 See `_example-domain-routine.yaml`, `_example-fallback-sweep.yaml`, and
-`_example-google-tasks-sync.yaml`, and `_example-calendar-cache.yaml`.
+`_example-google-tasks-sync.yaml`, `_example-calendar-cache.yaml`, and
+`_example-fibery-tasks-inbound.yaml`.
+
+### Fibery tasks → memory (inbound)
+
+`maintenance.kind: fibery_tasks_inbound` imports the task list of one Fibery
+document into private-memory todos. It is one-way: Fibery is the source of
+truth, and the routine never writes to Fibery, touches calendars or deletes
+memory. Each run makes one [headless Claude bridge](#headless-claude-bridge-and-analyzeprovider-claude)
+call whose allowlist is only `read_tool` (an exact MCP tool name whose last
+segment must be `read_document`; anything else fails validation) pinned to
+`{"secret": document_secret}`. Python parses the returned text, treating a
+`list_item` with state `TODO`/`DONE` as a task (text = its paragraphs, section =
+the preceding top-level heading, `alert:<id>` tokens stripped). An unknown
+shape fails the run before any write.
+
+Tasks are diffed against `checkpoint` (default `state/fibery-tasks.json`, mode
+0600, hashes only, no task text) keyed by block id:
+
+| Change | Result |
+| --- | --- |
+| new TODO | `todo` with `--source-ids fibery:tasks:<block-id>`, tags = `tags` + slugified section, `--people owner_slug` |
+| new DONE | checkpointed only (`import_done: true` also creates the todo and a done note) |
+| TODO → DONE | `note` "done: <title>" with `--follows <todo>`; the todo is never rewritten |
+| text or section edited | `add --update <todo>` with the same source id |
+| DONE → TODO | `note` "reopened: <title>" following the todo |
+| disappeared | logged, checkpoint row marked `gone`; no memory change |
+
+At most `max_new_per_run` (default 50) todos are created per run (the rest stay
+pending and are picked up by later runs, which also covers the first run).
+If a run would apply more than `max_changes_per_run` (default 30) non-new
+changes (done, reopened, edited or newly gone), it writes nothing and fails with
+a "held" error until you raise the limit. `--dry-run` makes no bridge call and
+no write. Logs carry counts and block ids only, never task text or the secret.
+`store` is the personal-memory repository. See
+`routines/_example-fibery-tasks-inbound.yaml`.
 
 ## Adding a routine
 
@@ -1169,7 +1204,7 @@ day_timezone: Europe/London   # optional IANA name; default is local time
 
 A routine at its own cap, or a routine that can use the Claude bridge
 (`analyze.provider: claude`, a `slack_mcp` identity or source, a calendar
-cache) once the global cap is reached (or `state/budget.yaml` is malformed), is
+cache, a Fibery tasks import) once the global cap is reached (or `state/budget.yaml` is malformed), is
 held for the run; routines that never call Claude ignore the global cap. A hold
 is logged once per day: it is still listed so
 a fallback routine cannot take its items, but nothing is analyzed, no cursor

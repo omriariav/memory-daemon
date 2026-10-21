@@ -21,6 +21,7 @@ VALID_ROUTINE_ROLES = {
 }
 VALID_MAINTENANCE_KINDS = {
     "google_tasks_sync", "slack_conversation_census", "calendar_cache",
+    "fibery_tasks_inbound",
 }
 MAINTENANCE_ALLOWED_KEYS = {
     "slack_conversation_census": {
@@ -38,9 +39,16 @@ MAINTENANCE_ALLOWED_KEYS = {
         "model", "list_tool", "get_tool", "max_events", "max_details",
         "stale_after", "conference_hosts",
     },
+    "fibery_tasks_inbound": {
+        "kind", "document_secret", "read_tool", "model", "owner_slug",
+        "tags", "checkpoint", "store", "import_done", "max_new_per_run",
+        "max_changes_per_run",
+    },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
 MAINTENANCE_NO_CHECKPOINT = {"calendar_cache"}
+# Kinds whose checkpoint path has a built-in default.
+MAINTENANCE_DEFAULT_CHECKPOINT = {"fibery_tasks_inbound"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -503,7 +511,9 @@ def uses_claude_bridge(routine):
         if isinstance(identity, dict) and identity.get("provider") == "slack_mcp":
             return True
     maintenance = routine.get("maintenance")
-    if isinstance(maintenance, dict) and maintenance.get("kind") == "calendar_cache":
+    if isinstance(maintenance, dict) and maintenance.get("kind") in (
+        "calendar_cache", "fibery_tasks_inbound",
+    ):
         return True
     return any(
         isinstance(source, dict) and source.get("kind") == "slack_mcp"
@@ -615,9 +625,14 @@ def validate(routine):
             checkpoint = maintenance.get("checkpoint")
             if kind not in MAINTENANCE_NO_CHECKPOINT and (
                 not isinstance(checkpoint, str) or not checkpoint
+            ) and not (
+                kind in MAINTENANCE_DEFAULT_CHECKPOINT
+                and "checkpoint" not in maintenance
             ):
                 problems.append(f"{rid}: maintenance.checkpoint is required")
-            if kind == "calendar_cache":
+            if kind == "fibery_tasks_inbound":
+                problems.extend(_validate_fibery_tasks_inbound(rid, maintenance))
+            elif kind == "calendar_cache":
                 problems.extend(_validate_calendar_cache(rid, maintenance))
             elif kind == "slack_conversation_census":
                 hours = maintenance.get("hours", 48)
@@ -1179,6 +1194,50 @@ def _non_empty_str(value):
 
 def _str_list(value):
     return isinstance(value, list) and all(_non_empty_str(v) for v in value)
+
+
+def _validate_fibery_tasks_inbound(rid, cfg):
+    problems = []
+    secret = cfg.get("document_secret")
+    if not isinstance(secret, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{8,128}", secret
+    ):
+        problems.append(
+            f"{rid}: maintenance.document_secret is required "
+            "(letters, digits, - and _ only)"
+        )
+    tool = cfg.get("read_tool")
+    if not (
+        isinstance(tool, str)
+        and re.fullmatch(r"mcp__[A-Za-z0-9_-]+__read_document", tool)
+        and tool.rsplit("__", 1)[-1] == "read_document"
+    ):
+        problems.append(
+            f"{rid}: maintenance.read_tool must be an exact MCP tool name "
+            "ending in __read_document"
+        )
+    store = cfg.get("store")
+    if not isinstance(store, str) or not store.startswith("/"):
+        problems.append(f"{rid}: maintenance.store must be an absolute path")
+    owner = cfg.get("owner_slug")
+    if owner is not None and not (
+        isinstance(owner, str) and _ROUTINE_ID.fullmatch(owner)
+    ):
+        problems.append(f"{rid}: maintenance.owner_slug must be a kebab-case slug")
+    tags = cfg.get("tags", [])
+    if not isinstance(tags, list) or any(
+        not isinstance(t, str) or not _ROUTINE_ID.fullmatch(t) for t in tags
+    ):
+        problems.append(f"{rid}: maintenance.tags must be kebab-case tags")
+    if "model" in cfg and not _non_empty_str(cfg["model"]):
+        problems.append(f"{rid}: maintenance.model must be a non-empty string")
+    if "import_done" in cfg and not isinstance(cfg["import_done"], bool):
+        problems.append(f"{rid}: maintenance.import_done must be a boolean")
+    for key in ("max_new_per_run", "max_changes_per_run"):
+        value = cfg.get(key, 1)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            problems.append(f"{rid}: maintenance.{key} must be an integer >= 1")
+    return problems
 
 
 def _validate_calendar_cache(rid, cfg):

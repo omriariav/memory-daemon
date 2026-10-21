@@ -1,0 +1,37 @@
+# One-way Fibery task document -> personal-memory todos, model-free in Python.
+#
+# Fibery is the source of truth: this routine only reads. One headless Claude
+# bridge call transports a single read_document result (a claude.ai Fibery
+# connector, that one read-only tool, pinned to your document secret); Python
+# parses it and diffs against a private checkpoint of block-id hashes. It
+# never writes to Fibery, touches calendars or deletes memory.
+#
+# The tool name is the exact MCP tool name your connector exposes; its last
+# segment must be read_document. Keep the real secret out of version control
+# (real routines are gitignored).
+id: fibery-tasks-inbound
+enabled: false
+description: Import Fibery tasks into personal-memory todos.
+role: maintenance
+
+schedule:
+  every: 1h
+
+maintenance:
+  kind: fibery_tasks_inbound
+  document_secret: 00000000-0000-0000-0000-000000000000
+  read_tool: mcp__claude_ai_Example_Fibery__read_document
+  model: haiku
+  store: /absolute/path/to/personal-memory
+  # Existing person slug recorded on created todos.
+  owner_slug: example-owner
+  # Added to every created todo/note; the Fibery section name is added too.
+  tags: [fibery]
+  checkpoint: state/fibery-tasks.json
+  # Tasks first seen already done are only checkpointed unless this is true.
+  import_done: false
+  # Bootstrap/flood guard: extra new tasks stay pending for later runs.
+  max_new_per_run: 50
+  # More non-new changes (done, reopened, edited, gone) than this in one run
+  # holds the whole run: nothing is written until you raise the limit.
+  max_changes_per_run: 30
