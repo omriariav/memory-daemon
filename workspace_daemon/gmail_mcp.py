@@ -216,7 +216,7 @@ def commit_points(routine_id, ids, runtime, scan_started_at, cursors):
 
 _FOUND = re.compile(r"\AFound (\d+) message\(s\):[ \t]*(?:\n\n|\Z)")
 _EMPTY = re.compile(
-    r"\A\s*(?:Found 0 message\(s\)[.:]?|No messages found[.]?)\s*\Z", re.I
+    r"\A\s*(?:Found 0 message\(s\)[.:]?|No messages found(?: matching your search query)?[.]?)\s*\Z", re.I
 )
 _PAGE_TAIL = re.compile(
     r'\n+\(Use page_token: "(?P<token>[A-Za-z0-9_=./+-]{1,512})"'
