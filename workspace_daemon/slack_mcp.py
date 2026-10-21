@@ -309,7 +309,7 @@ def note_failure(candidate):
             return False
     else:
         try:
-            stamp = float(candidate["id"].rsplit("@", 1)[1])
+            stamp = float(candidate["id"].rsplit("@", 1)[1].split("~")[0])
         except (IndexError, ValueError):
             return False
     floor = runtime.setdefault("failed_floor", {})
@@ -1217,10 +1217,14 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
     gap = dm["gap_minutes"] * 60
     span = dm["max_span_hours"] * 3600
     by_channel = {}
+    threaded = []
     for query, hit in found:
         if dm_kind(hit) not in dm["channel_types"]:
             continue
         if hit["root"] != hit["ts"] or hit["replies"]:
+            # A reply or a parent with replies: tagged below when it belongs
+            # to a remembered session's anchor.
+            threaded.append(hit)
             continue
         if (
             hit["is_bot"] and not cfg["include_bots"]
@@ -1228,7 +1232,7 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
         ):
             continue
         by_channel.setdefault(hit["channel"], []).append(hit)
-    if not by_channel:
+    if not by_channel and not threaded:
         return 0
     store = _load_dm_state(routine_id)
     placed = []
@@ -1238,7 +1242,7 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
         for ts in sorted({h["ts"] for h in hits}, key=float):
             owner[ts] = _place(sessions, ts, gap, span)
         placed.extend((hit, owner[hit["ts"]]) for hit in hits)
-    if persist and not _save_dm_state(
+    if placed and persist and not _save_dm_state(
         routine_id, store, _dm_keep_after(cfg, _now() if now is None else now)
     ):
         raise SlackMcpError(
@@ -1246,12 +1250,40 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
             "processed this run"
         )
     for hit, session in placed:
-        hit["root"] = session["anchor"]
-        hit["dm_session"] = True
-        hit["session_first"] = session["first"]
-        hit["session_last"] = session["last"]
-        hit["session_seen"] = list(session["seen"])
+        _tag_session(hit, session)
+    for hit in threaded:
+        # The thread of a session's anchor message belongs to the session
+        # (it owns `slack:<ch>:<anchor>`); other threads stay threads.
+        anchor = hit["root"] if hit["root"] != hit["ts"] else hit["ts"]
+        for session in store.get(hit["channel"], ()):
+            if session["anchor"] == anchor:
+                _tag_session(hit, session)
+                hit["session_thread"] = True
+                placed.append((hit, session))
+                break
     return len({(h["channel"], h["root"]) for h, _ in placed})
+
+
+def _tag_session(hit, session):
+    hit["root"] = session["anchor"]
+    hit["dm_session"] = True
+    hit["session_first"] = session["first"]
+    hit["session_last"] = session["last"]
+    hit["session_seen"] = list(session["seen"])
+
+
+def dm_state_writable():
+    """Whether the session state can be written (checked before searching)."""
+    if _base_dir is None:
+        return True
+    try:
+        state.write_atomic(
+            _dm_state_path(), json.dumps(_load_dm_file(), sort_keys=True),
+            mode=0o600,
+        )
+    except OSError:
+        return False
+    return True
 
 
 # --- listing -----------------------------------------------------------------
@@ -1282,7 +1314,7 @@ def _group(cfg, found):
                 key=float,
             )
             group["session_seen"] = hit["session_seen"]
-        if hit["replies"] or (
+        if hit["replies"] or hit.get("session_thread") or (
             not hit.get("dm_session") and hit["root"] != hit["ts"]
         ):
             # The anchor message has a thread: it is read into the session.
@@ -1439,6 +1471,13 @@ def candidates(source):
             "no bridge call made"
         )
         return Listing()
+    if (
+        cfg["dm_sessions"]["enabled"] and not source.get("_count_only")
+        and not dm_state_writable()
+    ):
+        raise SlackMcpError(
+            "DM session state cannot be written; nothing was searched"
+        )
     found, capped, failed = _search_all(cfg, queries, afters, now)
     if failed and failed >= {k for q in queries for k in q["keys"]}:
         raise SlackMcpError("every search query failed")
@@ -1489,6 +1528,10 @@ def candidates(source):
                 group["normal_ts"], group["session_last"], key=float
             )
         candidate_id = f"{anchor_id}@{group['normal_ts']}"
+        if group["dm"] and float(group["session_first"]) < float(root):
+            # A late-found earlier message moved the session's start: that
+            # is a new version, processed once (`first` only moves earlier).
+            candidate_id += f"~{group['session_first']}"
         current[anchor_id] = candidate_id
         if _already_done(processed, candidate_id):
             continue

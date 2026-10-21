@@ -1645,9 +1645,13 @@ read_channel_tool: mcp__<server>__slack_read_channel   # source key, required wh
   or lies outside the range is dropped, not trusted.
   A session read shares the bridge session budget (`THREADS_PER_SESSION` per
   session) and the same retry, lone-failure and unreadable bookkeeping.
+- **Late-found start.** When a late message moves a session's start earlier,
+  the candidate id becomes `slack:<channel>:<anchor>@<latest ts>~<first ts>`
+  (a new version, processed once; the memory source id is unchanged).
 - **Thread on the anchor.** If the anchor message later gets replies, the
   session still owns `slack:<channel>:<anchor>`: the anchor's thread is read
-  with `read_thread_tool` and its replies are merged into the session body in
+  with `read_thread_tool` and its replies (even when a run lists only a reply)
+  are merged into the session body in
   time order (bounded like the rest).
 - **Interactions.** A message reacted with a `save_reactions` emoji saves its
   whole session (ledger key `saved:slack:<channel>:<anchor>`,

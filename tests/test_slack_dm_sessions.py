@@ -493,7 +493,67 @@ class ReviewFixesTest(SessionCase):
         self.assertEqual(raw["anchor"], anchor)
         self.assertEqual(raw["session_first"], ts_at(700))
         self.assertEqual(raw["session_last"], ts_at(1060))
-        self.assertEqual(out[0]["id"], first[0]["id"])
+        self.assertEqual(out[0]["id"], first[0]["id"] + f"~{ts_at(700)}")
+
+    def test_reply_only_run_keeps_the_session_identity_and_body(self):
+        self.listing([dm_hit(100), dm_hit(160)])
+        from test_slack_mcp import thread_text
+        self.connector.thread = lambda a: thread_text(
+            root=ts_at(100), parent_text="anchor message",
+            replies=[(ts_at(300), BOB, "late thread reply")],
+        )
+        self.connector.channel = lambda a: channel_text([self.A, self.B])
+        for hits in (
+            [dm_hit(300, root=ts_at(100))],
+            [dm_hit(100, replies=1), dm_hit(300, root=ts_at(100))],
+        ):
+            out = self.listing(hits)
+            self.assertEqual(len(out), 1)
+            raw = out[0]["raw"]
+            self.assertTrue(raw["dm_session"] and raw["anchor_thread"])
+            self.assertEqual(out[0]["id"], f"slack:{DM}:{ts_at(100)}@{ts_at(300)}")
+            item = slack_mcp.fetch({"id": "r"}, out[0], dm_source())
+            for text in ("anchor message", "second message",
+                         "late thread reply"):
+                self.assertIn(text, item["body"])
+            self.assertEqual(item["frontmatter"]["slack_capture_mode"],
+                             "dm_session")
+
+    def test_thread_on_another_message_stays_a_thread(self):
+        self.listing([dm_hit(100), dm_hit(160)])
+        out = self.listing([dm_hit(300, root=ts_at(160))])
+        self.assertFalse(out[0]["raw"].get("dm_session"))
+
+    def test_moved_first_is_a_new_version_processed_once(self):
+        first = self.listing([dm_hit(1000), dm_hit(1060)])
+        ledger = _Ledger({first[0]["id"]: {"processed_at": "x"}})
+        out = self.listing([dm_hit(700)], _processed=ledger)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(
+            out[0]["id"],
+            f"slack:{DM}:{ts_at(1000)}@{ts_at(1060)}~{ts_at(700)}",
+        )
+        self.assertEqual(out[0]["raw"]["source_id"], first[0]["raw"]["source_id"])
+        ledger[out[0]["id"]] = {"processed_at": "y"}
+        again = self.listing([dm_hit(700), dm_hit(1000)], _processed=ledger)
+        self.assertEqual(list(again), [])
+        # failure holds parse the version stamp through the suffix
+        runtime = {}
+        candidate = dict(out[0], raw=dict(
+            out[0]["raw"], _batch={"runtime": runtime}
+        ))
+        self.assertTrue(slack_mcp.note_failure(candidate))
+        self.assertEqual(
+            set(runtime["failed_floor"].values()), {float(ts_at(1060))}
+        )
+
+    def test_state_is_checked_writable_before_any_search(self):
+        with mock.patch.object(
+            slack_mcp.state, "write_atomic", side_effect=OSError("disk")
+        ):
+            with self.assertRaises(slack_mcp.SlackMcpError):
+                self.listing([dm_hit(100)])
+        self.assertEqual(self.connector.calls, [])
 
     def test_late_found_message_respects_the_span_cap(self):
         self.listing([dm_hit(12 * 3600 + 200)])
