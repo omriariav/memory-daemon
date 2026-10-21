@@ -9,7 +9,7 @@ from workspace_daemon import comms_inbox, config, slack_mcp, slack_watch
 
 from test_slack_mcp import (
     BOB, CHAN, ME, NOW, ROOT, BridgeTestCase, hit_block, routine, search_text,
-    source, ts_at,
+    source, thread_text, ts_at,
 )
 
 CHAN2 = "C0EXAMPLE02"
@@ -502,6 +502,137 @@ class TrackTest(InboxTestCase):
         )
 
 
+OTHER = "C0EXAMPLE07"  # a channel no query searches
+MINE = f"from:<@{ME}>"
+
+
+class FollowTest(InboxTestCase):
+    def setUp(self):
+        super().setUp()
+        self.seen = []
+        self.table = {}
+        self.reads = []
+        self.replies = []
+
+        def search(args):
+            self.seen.append(args)
+            return search_text(list(self.table.get(args.get("filters"), ())))
+
+        def thread(args):
+            self.reads.append(args)
+            return thread_text(args["message_ts"], replies=self.replies)
+
+        self.connector.search = search
+        self.connector.thread = thread
+
+    def run_once(self, now=NOW, inbox=None, **over):
+        with mock.patch.object(slack_mcp, "_now", return_value=now):
+            return slack_mcp.candidates(inbox_source(
+                inbox or {"follow_threads": True}, **over
+            ))
+
+    def follow(self):
+        return comms_inbox.load_follow(self.tmp.name)
+
+    def test_owner_query_scans_from_its_own_mark(self):
+        self.run_once()
+        mine = [a for a in self.seen if a["filters"] == MINE][0]
+        self.assertEqual(mine["after"], int(NOW) - 14 * 86400)
+        self.seen.clear()
+        self.run_once(now=NOW + 600)
+        mine = [a for a in self.seen if a["filters"] == MINE][0]
+        self.assertEqual(mine["after"], int(NOW) - 3600)
+        self.assertEqual(list(slack_mcp.cursor_ids(inbox_source(
+            {"follow_threads": True}
+        ))), [f"channels:{CHAN}"])
+
+    def test_reply_in_an_unsearched_channel_is_followed_and_polled(self):
+        root = ts_at(10)
+        self.table[MINE] = [{
+            "ch": OTHER, "uid": ME, "name": "Me", "ts": ts_at(20),
+            "root": root, "text": "any update?",
+        }]
+        listing = self.run_once()
+        self.assertEqual(len(listing), 0)
+        self.assertIn(f"{OTHER}:{root}", self.follow()["threads"])
+        # Polled in the same run: the new follow is due at once.
+        self.assertEqual(self.reads, [{
+            "channel_id": OTHER, "message_ts": root, "limit": 50,
+        }])
+        self.replies = [
+            (ts_at(20), (ME, "Me"), "any update?"), (ts_at(30), BOB, "done"),
+        ]
+        self.table.clear()
+        self.run_once(now=NOW + 60)
+        self.assertEqual(len(self.reads), 1)  # backing off
+        self.run_once(now=NOW + 86400)
+        self.assertEqual(len(self.reads), 2)
+        rows = {r["ts"]: r for r in self.messages()}
+        self.assertEqual(rows[ts_at(30)]["user_id"], BOB)
+        self.assertEqual(rows[ts_at(30)]["thread_ts"], root)
+        self.assertEqual(
+            self.follow()["threads"][f"{OTHER}:{root}"]["last"], ts_at(30)
+        )
+
+    def test_thread_in_a_searched_channel_is_recorded_without_polls(self):
+        self.table[MINE] = [{"uid": ME, "ts": ts_at(10)}]
+        self.table[f"in:<#{CHAN}>"] = [
+            {"ts": ts_at(40), "root": ts_at(10), "text": "late answer"},
+            {"ts": ts_at(50), "text": "unrelated"},
+        ]
+        self.run_once(inbox={"follow_threads": True})
+        self.assertEqual(self.reads, [])
+        self.assertEqual(
+            [r["ts"] for r in self.messages()], [ts_at(10), ts_at(40)]
+        )
+        self.assertEqual(
+            self.follow()["threads"][f"{CHAN}:{ts_at(10)}"]["last"], ts_at(40)
+        )
+
+    def test_dm_messages_are_not_followed(self):
+        self.table[MINE] = [{
+            "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,
+            "ts": ts_at(10),
+        }]
+        self.run_once()
+        self.assertEqual(self.follow()["threads"], {})
+
+    def test_threads_expire_after_retention_since_last_activity(self):
+        old = f"{int(NOW) - 15 * 86400}.000100"
+        recent = f"{int(NOW) - 13 * 86400}.000100"
+        comms_inbox.save_follow(self.tmp.name, {"threads": {
+            f"{OTHER}:{old}": {"last": old, "checked": None},
+            f"{OTHER}:{ts_at(1)}": {"last": recent, "checked": NOW},
+        }, "scanned": None}, retention_days=30, now=NOW)
+        self.run_once()
+        self.assertEqual(
+            list(self.follow()["threads"]), [f"{OTHER}:{ts_at(1)}"]
+        )
+
+    def test_poll_failure_leaves_threads_due(self):
+        self.table[MINE] = [{"ch": OTHER, "uid": ME, "ts": ts_at(10)}]
+        real = self.connector.__call__
+
+        def call(prompt, tools, **kw):
+            if "thread read" in prompt:
+                raise slack_mcp.claude_bridge.BridgeError("down")
+            return real(prompt, tools, **kw)
+
+        with mock.patch.object(slack_mcp.claude_bridge, "call_tools", call):
+            self.run_once()
+        entry = self.follow()["threads"][f"{OTHER}:{ts_at(10)}"]
+        self.assertIsNone(entry["checked"])
+
+    def test_poll_cap(self):
+        self.table[MINE] = [
+            {"ch": OTHER, "uid": ME, "ts": ts_at(n)} for n in (10, 20, 30)
+        ]
+        self.run_once(inbox={"follow_threads": True, "thread_polls": 2})
+        self.assertEqual(
+            [r["message_ts"] for r in self.reads], [ts_at(30), ts_at(20)]
+        )
+
+
 class ConfigTest(unittest.TestCase):
     def problems(self, **over):
         with tempfile.TemporaryDirectory() as tmp:
@@ -555,6 +686,19 @@ class ConfigTest(unittest.TestCase):
             comms_inbox={"track_reactions": ["track-example"]},
         ))
         self.assertIn("2 planned searches", text)
+
+    def test_follow_threads_alone_is_enough(self):
+        self.assertEqual(self.problems(
+            comms_inbox={"follow_threads": True, "thread_polls": 5},
+        ), [])
+        text = "\n".join(self.problems(
+            max_queries_per_run=1, comms_inbox={"follow_threads": True},
+        ))
+        self.assertIn("2 planned searches", text)
+        text = "\n".join(self.problems(
+            comms_inbox={"follow_threads": "yes"},
+        ))
+        self.assertIn("follow_threads", text)
 
     def test_inbox_all_dms_needs_the_dms_query(self):
         text = "\n".join(self.problems(comms_inbox={"all_dms": True}))

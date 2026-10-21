@@ -1938,6 +1938,8 @@ comms_inbox:
   reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
   reaction_check_hours: 72   # how long an unanswered message is re-checked
   track_reactions: [track-example]   # "watch this conversation", at most 3
+  follow_threads: true   # follow every channel thread the owner posted in
+  thread_polls: 10       # followed-thread reads per run, 0 to 30
 ```
 
 and on the routine's source (not the watch file):
@@ -1992,6 +1994,24 @@ One JSON object per line, oldest message first:
   cursor. The tracked set and marks live in `state/comms-inbox-tracked.json`.
   A track emoji is independent of `save_reactions`: one message can carry
   both, and an emoji cannot be in both `reactions` and `track_reactions`.
+- Followed threads (`follow_threads: true`): one more record-only search,
+  `from:<@owner>`, lists every channel message of the owner (root or reply,
+  any channel; DMs are left to `all_dms`) from its own scan mark (first run:
+  `retention_days` back), and each makes its thread followed. A followed
+  thread's messages are recorded from any query, mention or not, and it stays
+  followed until `retention_days` after its last known activity; every new
+  message extends that. Replies in channels the source searches (`channels`,
+  including discovered ones) arrive by search. A followed thread anywhere else
+  is read with `read_thread_tool` (the newest `max_thread_replies` replies):
+  at most `thread_polls` reads per run in one bridge session, skipped when
+  none is due, most recently active first, each thread again only after a
+  quarter of its idle time has passed since its last read (at most 6h). At
+  that cap a thread idle for a day or more is read about 4 times a day, so
+  N followed threads outside the searched channels cost about 4N reads a day
+  plus the reads of fresh activity. State: `state/comms-inbox-follow.json`
+  (at most 500 threads, most recently active kept). The reaction-check
+  window (`reaction_check_hours`) runs from each conversation's newest
+  message, so new activity in a thread restarts it.
 - Lines are never edited: messages dedupe on (`channel_id`, `ts`); reactions
   and track requests on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
   are not reflected. Lines whose `ts` is older than `retention_days` are

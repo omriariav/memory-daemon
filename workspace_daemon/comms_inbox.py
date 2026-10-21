@@ -16,6 +16,8 @@ Watch file (or source) block:
       reaction_checks: 10      # reaction reads per run (needs reactions_tool)
       reaction_check_hours: 72 # how long an unanswered message is re-checked
       track_reactions: [track-example]   # "watch this conversation" (at most 3)
+      follow_threads: true     # every channel thread the owner posted in
+      thread_polls: 10         # thread reads per run for followed threads
 
 One JSON object per line, oldest message first:
 
@@ -47,6 +49,17 @@ reaction adds no search hit, so open messages are polled, with a back-off of
 a quarter of the message's age (at most 6h) between checks of the same one;
 `state/comms-inbox-checks.json` keeps the last check per message.
 
+`follow_threads` adds a record-only `from:<@owner>` search (its own scan
+mark, look-back `retention_days` on the first run): every channel message of
+the owner, root or reply, makes its thread followed, outside DMs (those are
+`all_dms`). A followed thread's messages are recorded from any query, and it
+stays followed until `retention_days` after its last known activity (each
+new message extends it). Replies in channels the source searches arrive by
+search; a followed thread elsewhere is read with `read_thread_tool` (newest
+`max_thread_replies` replies), at most `thread_polls` per run in one bridge
+session, again only after a quarter of the time since its last activity has
+passed since its last read (at most 6h). State: `state/comms-inbox-follow.json`.
+
 `thread_ts` is the thread root (equal to `ts` for a top-level message); an
 `owner_reaction` names the message it was put on. Lines are never changed:
 messages are deduped on (channel_id, ts) and reactions on (channel_id, ts,
@@ -66,11 +79,15 @@ from .shell import log, utc_now_iso
 FILE_NAME = "comms-inbox.jsonl"
 KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
-    "reaction_check_hours", "track_reactions",
+    "reaction_check_hours", "track_reactions", "follow_threads",
+    "thread_polls",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
-            "reaction_check_hours": 72, "track_reactions": []}
+            "reaction_check_hours": 72, "track_reactions": [],
+            "follow_threads": False, "thread_polls": 10}
+FOLLOW_FILE = "comms-inbox-follow.json"
+MAX_FOLLOWED = 500
 TRACKED_FILE = "comms-inbox-tracked.json"
 MAX_TRACK_REACTIONS = 3
 MAX_TRACKED_QUERIES = 2
@@ -100,8 +117,9 @@ def problem(value):
         isinstance(c, str) and CHANNEL_ID.match(c) for c in channels
     ):
         return "`channels` must be a list of Slack channel ids"
-    if not isinstance(value.get("all_dms", False), bool):
-        return "`all_dms` must be true or false"
+    for key in ("all_dms", "follow_threads"):
+        if not isinstance(value.get(key, False), bool):
+            return f"`{key}` must be true or false"
     for key, most in (
         ("reactions", MAX_REACTIONS), ("track_reactions", MAX_TRACK_REACTIONS),
     ):
@@ -120,12 +138,17 @@ def problem(value):
     if (
         not channels and value.get("all_dms") is not True
         and not value.get("track_reactions")
+        and value.get("follow_threads") is not True
     ):
-        return "needs `channels`, `all_dms: true` and/or `track_reactions`"
+        return (
+            "needs `channels`, `all_dms: true`, `track_reactions` and/or "
+            "`follow_threads: true`"
+        )
 
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),
         ("reaction_checks", 0, 30), ("reaction_check_hours", 1, 336),
+        ("thread_polls", 0, 30),
     ):
         number = value.get(key, DEFAULTS[key])
         if not (
@@ -449,3 +472,107 @@ def is_tracked(tracked, hit):
         if item["whole"] or hit["root"] == item["thread_ts"]:
             return True
     return False
+
+
+# --- followed threads --------------------------------------------------------
+
+def _follow_path(base_dir):
+    return Path(base_dir) / "state" / FOLLOW_FILE
+
+
+def load_follow(base_dir):
+    """{"threads": {"<channel>:<root>": {"last", "checked"}}, "scanned":
+    epoch or None}; `last` is the newest known message ts, `checked` the
+    epoch of the last thread read. Unreadable counts as empty."""
+    empty = {"threads": {}, "scanned": None}
+    if base_dir is None:
+        return empty
+    try:
+        data = json.loads(_follow_path(base_dir).read_text())
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError):
+        log("comms inbox: follow state is unreadable; starting empty")
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    out = {"threads": {}, "scanned": None}
+    scanned = data.get("scanned")
+    if isinstance(scanned, (int, float)) and not isinstance(scanned, bool):
+        out["scanned"] = scanned
+    for key, entry in (data.get("threads") or {}).items():
+        try:
+            channel, root = str(key).split(":", 1)
+            float(root), float(entry["last"])
+            checked = entry.get("checked")
+            if checked is not None:
+                float(checked)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        out["threads"][f"{channel}:{root}"] = {
+            "last": str(entry["last"]), "checked": checked,
+        }
+    return out
+
+
+def save_follow(base_dir, follow, retention_days, now=None):
+    """Write the follow state, dropping threads idle past retention."""
+    if base_dir is None:
+        return
+    floor = (time.time() if now is None else now) - retention_days * 86400
+    live = {
+        key: entry for key, entry in follow["threads"].items()
+        if float(entry["last"]) >= floor
+    }
+    if len(live) > MAX_FOLLOWED:
+        newest = sorted(live, key=lambda k: float(live[k]["last"]))
+        live = {key: live[key] for key in newest[-MAX_FOLLOWED:]}
+    data = {"threads": live, "scanned": follow["scanned"]}
+    try:
+        state.write_atomic(
+            _follow_path(base_dir), json.dumps(data, sort_keys=True),
+            mode=0o600,
+        )
+    except OSError:
+        log("comms inbox: follow state could not be written")
+
+
+def follow_thread(follow, channel, root, ts):
+    """Follow `channel`/`root` (or extend it) with activity at `ts`; True
+    when the thread was new."""
+    key = f"{channel}:{root}"
+    entry = follow["threads"].get(key)
+    if entry is None:
+        follow["threads"][key] = {"last": ts, "checked": None}
+        return True
+    if float(ts) > float(entry["last"]):
+        entry["last"] = ts
+    return False
+
+
+def is_followed(follow, hit):
+    return f"{hit['channel']}:{hit['root']}" in follow["threads"]
+
+
+def due_polls(follow, covered, limit, now=None):
+    """Followed threads to read now, most recently active first.
+
+    Threads in `covered` channels are listed by search and never read. Due:
+    never read, or read at least a quarter of the time since the thread's
+    last activity ago (at most MAX_CHECK_GAP).
+    """
+    if not limit:
+        return []
+    now = time.time() if now is None else now
+    due = []
+    for key, entry in follow["threads"].items():
+        channel, root = key.split(":", 1)
+        if channel in covered:
+            continue
+        idle = max(0.0, now - float(entry["last"]))
+        checked = entry.get("checked")
+        if checked is not None and now - checked < min(idle / 4, MAX_CHECK_GAP):
+            continue
+        due.append((float(entry["last"]), channel, root))
+    due.sort(reverse=True)
+    return [(channel, root) for _last, channel, root in due[:limit]]
