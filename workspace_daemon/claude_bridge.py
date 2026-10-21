@@ -15,6 +15,9 @@ BridgeError messages carry only kinds, subtypes, exit codes, tool
 names and counts; prompts, tool inputs, results and CLI output never appear in
 errors or logs.
 """
+import contextlib
+import contextvars
+import datetime
 import json
 import os
 import re
@@ -25,9 +28,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import zoneinfo
 from pathlib import Path
 
-from . import claude_bridge_hook
+import yaml
+
+from . import claude_bridge_hook, state
 from .shell import claude_bin, utc_now_iso
 
 HOOK_PATH = Path(__file__).with_name("claude_bridge_hook.py")
@@ -55,7 +61,12 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # before that often finds no deferred tools and the model gives up, so the
 # prompt is held back this long (stream-json input keeps stdin open meanwhile).
 CONNECT_DELAY_SECONDS = 6.0
-
+# Spend lookups only ever read this much of the usage log's tail.
+USAGE_WINDOW_DAYS = 7
+BUDGET_EXHAUSTED = "daily budget exhausted"
+_BUDGET_KEYS = {"daily_usd", "day_timezone"}
+_USAGE_SCOPE = contextvars.ContextVar("claude_usage_scope", default=None)
+_IGNORE_PAUSE = contextvars.ContextVar("claude_ignore_pause", default=False)
 
 class ToolResults(list):
     """call_tools return value: a plain list of results plus a `partial` flag."""
@@ -64,6 +75,18 @@ class ToolResults(list):
 
 class BridgeError(RuntimeError):
     pass
+
+
+class BudgetExhausted(BridgeError):
+    """A daily cap (or an unusable budget file) stopped a call before it started."""
+
+
+class PausedError(BridgeError):
+    """state/PAUSED appeared; no further calls are made."""
+
+
+# Callers treat these as "stop spending and hold the work", not as failures.
+GUARD_STOPS = (BudgetExhausted, PausedError)
 
 
 class BridgeDryRun(BridgeError):
@@ -76,6 +99,264 @@ def _runs_dir(base_dir):
 
 def _usage_log(base_dir):
     return Path(base_dir) / "state" / "claude-usage.jsonl"
+
+
+def _budget_file(base_dir):
+    return Path(base_dir) / "state" / "budget.yaml"
+
+
+class _Scope:
+    """Who is spending, their own cap, and the guard stop that ended their work."""
+
+    def __init__(self, tag, cap):
+        self.tag = tag
+        self.cap = cap
+        self.stop = None
+
+
+@contextlib.contextmanager
+def usage_scope(tag, daily_usd=None):
+    """Attribute bridge calls in the block to `tag`; daily_usd is its own cap.
+
+    The yielded scope remembers the first guard stop raised inside it, so a
+    caller still sees it when intermediate code re-wraps the exception.
+    """
+    scope = _Scope(tag, daily_usd)
+    token = _USAGE_SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        _USAGE_SCOPE.reset(token)
+
+
+def current_tag():
+    scope = _USAGE_SCOPE.get()
+    return scope.tag if scope else None
+
+
+def scope_stop():
+    """The guard stop recorded on the current scope, or None."""
+    scope = _USAGE_SCOPE.get()
+    return scope.stop if scope else None
+
+
+@contextlib.contextmanager
+def pause_override(ignore):
+    """Let calls proceed despite state/PAUSED (a manual `run --ignore-pause`)."""
+    token = _IGNORE_PAUSE.set(bool(ignore))
+    try:
+        yield
+    finally:
+        _IGNORE_PAUSE.reset(token)
+
+
+def _positive_number(value):
+    return (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and value > 0 and value == value and value != float("inf")
+    )
+
+
+def load_budget(base_dir):
+    """Return (daily_usd or None, tzinfo or None) from the optional state/budget.yaml.
+
+    A missing file means no global cap. A malformed one raises BridgeError so a
+    typo cannot silently lift the cap. tzinfo None means local time.
+    """
+    path = _budget_file(base_dir)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError):
+        raise BridgeError("state/budget.yaml is unreadable") from None
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise BridgeError("state/budget.yaml is not valid YAML") from None
+    if data is None:
+        return None, None
+    if not isinstance(data, dict) or set(data) - _BUDGET_KEYS:
+        raise BridgeError(
+            "state/budget.yaml must be a mapping with only "
+            + ", ".join(sorted(_BUDGET_KEYS))
+        )
+    cap = data.get("daily_usd")
+    if cap is not None and not _positive_number(cap):
+        raise BridgeError("state/budget.yaml: daily_usd must be a positive number")
+    tz = None
+    name = data.get("day_timezone")
+    if name is not None:
+        try:
+            tz = zoneinfo.ZoneInfo(name)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError, OSError):
+            raise BridgeError(
+                "state/budget.yaml: day_timezone is not a known timezone"
+            ) from None
+    return cap, tz
+
+
+def _entry_epoch(entry):
+    try:
+        return datetime.datetime.strptime(
+            entry["ts"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def recent_usage(base_dir, since_epoch=None, now=None):
+    """Usage-log entries from the last USAGE_WINDOW_DAYS, oldest first.
+
+    Reads blocks backwards from the end of the file and stops once a whole
+    line older than the window is seen, so a long-lived log stays cheap.
+    Returns [(epoch, entry)]; unparseable lines are skipped. A missing log is
+    empty; one that exists but cannot be read raises BridgeError.
+    """
+    now = time.time() if now is None else now
+    floor = now - USAGE_WINDOW_DAYS * 86400
+    since = floor if since_epoch is None else max(since_epoch, floor)
+    try:
+        handle = open(_usage_log(base_dir), "rb")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise BridgeError("claude usage log is unreadable") from None
+    blocks = []  # newest first
+    with handle:
+        try:
+            position = handle.seek(0, os.SEEK_END)
+            while position > 0:
+                step = min(65536, position)
+                position -= step
+                handle.seek(position)
+                blocks.append(handle.read(step))
+                if position > 0 and _oldest_line_before(blocks, since):
+                    break
+        except OSError:
+            raise BridgeError("claude usage log is unreadable") from None
+    lines = b"".join(reversed(blocks)).split(b"\n")
+    if position > 0:
+        lines = lines[1:]  # the first line is cut off at the block boundary
+    found = []
+    for raw in lines:
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        epoch = _entry_epoch(entry) if isinstance(entry, dict) else None
+        if epoch is not None and epoch >= since:
+            found.append((epoch, entry))
+    return found
+
+
+def _oldest_line_before(blocks, since):
+    """Whether the oldest complete line read so far predates `since`."""
+    oldest = blocks[-1]
+    start = oldest.find(b"\n")
+    if start == -1:
+        return False
+    rest = oldest[start + 1:]
+    end = rest.find(b"\n")
+    if end != -1:
+        line = rest[:end]
+    elif len(blocks) > 1:
+        newer = blocks[-2]
+        stop = newer.find(b"\n")
+        if stop == -1:
+            return False
+        line = rest + newer[:stop]
+    else:
+        return False
+    try:
+        first = _entry_epoch(json.loads(line))
+    except ValueError:
+        return False
+    return first is not None and first < since
+
+
+def entry_cost(entry):
+    """Billed cost of one log line; a run that never reported one counts its cap."""
+    for key in ("total_cost_usd", "cost_estimate_usd"):
+        cost = entry.get(key)
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            return cost
+    return 0
+
+
+def day_start_epoch(now, tz):
+    # Midnight is taken on the wall clock; a DST change exactly at midnight can
+    # shift "today" by an hour, which is accepted.
+    if tz is None:
+        local = datetime.datetime.fromtimestamp(now)
+        return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    local = datetime.datetime.fromtimestamp(now, tz)
+    return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def spent_today(base_dir, routine=None, tz=None, now=None):
+    """USD spent today (in `tz`, default local) per the usage log.
+
+    Failed attempts count: they ran and were billed. routine=None sums every
+    call; otherwise only calls attributed to that usage_scope tag.
+    """
+    now = time.time() if now is None else now
+    total = 0.0
+    for _, entry in recent_usage(base_dir, day_start_epoch(now, tz), now):
+        if routine is not None and entry.get("routine") != routine:
+            continue
+        total += entry_cost(entry)
+    return total
+
+
+def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
+                     include_global=True):
+    """Why new work should not start now, or None.
+
+    Fails closed: a malformed budget file or an unreadable usage log counts as
+    exhausted, since spend can no longer be known. include_global=False is for
+    routines that never use the bridge: only their own cap applies to them.
+    """
+    if not include_global and routine_cap is None:
+        return None
+    try:
+        try:
+            cap, tz = load_budget(base_dir)
+        except BridgeError:
+            if include_global:
+                raise
+            cap, tz = None, None
+        if include_global and cap is not None \
+                and spent_today(base_dir, None, tz, now) >= cap:
+            return f"global cap ${cap:g} reached"
+        if routine_cap is not None and routine is not None \
+                and spent_today(base_dir, routine, tz, now) >= routine_cap:
+            return f"routine cap ${routine_cap:g} reached"
+    except BridgeError as exc:
+        return str(exc)
+    return None
+
+
+def _check_guards(base_dir):
+    """Refuse a new call while paused or over a cap; remember why on the scope."""
+    scope = _USAGE_SCOPE.get()
+    stop = None
+    pause = None if _IGNORE_PAUSE.get() else state.paused(base_dir)
+    if pause:
+        stop = PausedError(f"paused: {pause}")
+    else:
+        reason = budget_exhausted(
+            base_dir, scope.tag if scope else None,
+            scope.cap if scope else None,
+        )
+        if reason:
+            stop = BudgetExhausted(
+                BUDGET_EXHAUSTED if reason.startswith("global") else reason
+            )
+    if stop:
+        if scope and scope.stop is None:
+            scope.stop = stop
+        raise stop
 
 
 def _hook_command(allowlist_path):
@@ -194,8 +475,20 @@ def _call_allowed(name, tool_input, tools):
         return False
 
 
+def _write_failed_marker(base_dir):
+    return Path(base_dir) / "state" / "claude-usage-write-failed"
+
+
+def usage_write_failed(base_dir):
+    """Timestamp text if a usage-log write has failed since the last success."""
+    try:
+        return _write_failed_marker(base_dir).read_text().strip() or "unknown"
+    except OSError:
+        return None
+
+
 def _log_usage(base_dir, model, names, attempt, outcome, started, result,
-               denials):
+               denials, max_budget_usd=None):
     """Best-effort metadata line; never the prompt or any tool output."""
     usage = (result or {}).get("usage")
     usage = usage if isinstance(usage, dict) else {}
@@ -211,6 +504,14 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
         "input_tokens": usage.get("input_tokens"),
         "output_tokens": usage.get("output_tokens"),
     }
+    if entry["total_cost_usd"] is None and max_budget_usd is not None:
+        # No result event (timeout, crash) does not mean nothing was spent;
+        # count the run's budget ceiling so the daily total errs high.
+        entry["cost_estimate_usd"] = max_budget_usd
+    scope = _USAGE_SCOPE.get()
+    if scope:
+        entry["routine"] = scope.tag
+    marker = _write_failed_marker(base_dir)
     try:
         path = _usage_log(base_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,7 +519,17 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
         with os.fdopen(fd, "a") as handle:
             handle.write(json.dumps(entry) + "\n")
     except OSError:
+        # Spend is now unaccounted for; leave a marker status can show.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(entry["ts"] + "\n")
+        except OSError:
+            pass
         return
+    try:
+        marker.unlink()
+    except OSError:
+        pass
 
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
@@ -229,6 +540,8 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     Raises BridgeError. partial is True only when accept_partial let a
     max-turns/max-budget stop through with every required tool answered.
     """
+    # Refused before any run dir or process exists; nothing is logged.
+    _check_guards(base_dir)
     started = time.monotonic()
     result_event = None
     outcome = "error"
@@ -355,7 +668,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
         _log_usage(base_dir, model, tools, attempt, outcome, started, result_event,
-                   denials)
+                   denials, max_budget_usd)
 
 
 def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,

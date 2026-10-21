@@ -30,6 +30,7 @@ from pathlib import Path
 
 import yaml
 
+from . import claude_bridge
 from . import identity as identity_providers
 from .shell import log, npx_bin
 
@@ -411,6 +412,8 @@ def _authenticated_identity(rid, provider=None):
     provider = provider or identity_providers.provider_for({})
     try:
         email = provider.current_user_email()
+    except claude_bridge.GUARD_STOPS:
+        raise
     except Exception as exc:
         log(
             f"routine={rid} memory WARN authenticated Workspace identity "
@@ -419,6 +422,8 @@ def _authenticated_identity(rid, provider=None):
         return {"email": None, "person": None, "safe": False}
     try:
         person = provider.resolve_email(email)
+    except claude_bridge.GUARD_STOPS:
+        raise
     except Exception as exc:
         log(
             f"routine={rid} memory WARN authenticated person lookup failed: "
@@ -449,6 +454,8 @@ def _prefetch_identities(item, rid, provider, extract):
         return
     try:
         provider.prefetch(list(dict.fromkeys(emails)))
+    except claude_bridge.GUARD_STOPS:
+        raise
     except Exception as exc:
         # Resolution below re-raises the latched outage per email and fails closed.
         log(f"routine={rid} memory WARN identity prefetch failed: {type(exc).__name__}")
@@ -508,6 +515,8 @@ def _verified_owner_people(item, rid, identity, provider=None):
             continue
         try:
             person = provider.resolve_email(normalized)
+        except claude_bridge.GUARD_STOPS:
+            raise
         except Exception as exc:
             log(
                 f"routine={rid} memory WARN directory lookup failed: "
@@ -567,6 +576,8 @@ def _verified_source_people(item, rid, identity, provider=None):
             continue
         try:
             person = provider.resolve_email(email)
+        except claude_bridge.GUARD_STOPS:
+            raise
         except Exception as exc:
             log(
                 f"routine={rid} memory WARN directory lookup failed: "
@@ -814,6 +825,8 @@ def capture(routine, item, summary, dry_run=False):
                 identity=identity,
             ))
             extraction_succeeded = True
+        except claude_bridge.GUARD_STOPS:
+            raise
         except Exception as exc:
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")

@@ -9,9 +9,10 @@ import json
 import math
 import re
 from contextlib import ExitStack
+from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -152,7 +153,7 @@ def _needs_label_catalog(routines):
 
 
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
-        lock_name="run"):
+        lock_name="run", ignore_pause=False):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -162,13 +163,20 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     `routines` is the complete routing context. `active_ids` optionally limits
     which owners may process in this invocation while still letting inactive
     domain routines protect their candidates from a due fallback sweep.
+
+    Backstop for the state/PAUSED kill switch: the CLI checks it first, but a
+    direct caller is refused here unless it passes ignore_pause.
     """
+    reason = None if ignore_pause else state.paused(base_dir)
+    if reason:
+        raise state.Paused(f"paused: {reason}")
     contacts.clear_cache()
     drive.clear_identity_cache()
     identity.clear_cache()
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
+        stack.enter_context(claude_bridge.pause_override(ignore_pause))
         lock = (
             stack.enter_context(state.RunLock(base_dir, name=lock_name))
             if not dry_run else None
@@ -178,12 +186,56 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
         )
 
 
+def _budget_hold(base_dir, routine):
+    """Reason the global cap, a bad budget file, or the routine's own cap holds it."""
+    return claude_bridge.budget_exhausted(
+        base_dir, routine["id"], routine_cap=config.budget_cap(routine),
+        include_global=config.uses_claude_bridge(routine),
+    )
+
+
+def _log_hold_once(base_dir, rid, message, dry_run):
+    """Log a budget hold the first time each day, not on every tick."""
+    path = Path(base_dir) / "state" / "budget-hold-log.json"
+    today = datetime.date.today().isoformat()
+    try:
+        logged = json.loads(path.read_text())
+        logged = logged if isinstance(logged, dict) else {}
+    except (OSError, ValueError):
+        logged = {}
+    if logged.get(rid) == today:
+        return
+    log(message)
+    if dry_run:
+        return
+    logged[rid] = today
+    try:
+        state.write_atomic(path, json.dumps(logged, sort_keys=True), mode=0o600)
+    except OSError:
+        pass
+
+
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 active_ids=None):
     scan_started_at = utc_now_iso()
     active_ids = set(active_ids) if active_ids is not None else {
         r["id"] for r in routines if r.get("enabled", True)
     }
+    # A routine over its cap becomes an inactive owner for this run: its
+    # sources are still listed so fallbacks cannot take its items, but it
+    # processes nothing and its catch-up cursor does not move.
+    held_ids = set()
+    for routine in routines:
+        if routine.get("enabled", True) and routine["id"] in active_ids:
+            held = _budget_hold(base_dir, routine)
+            if held:
+                held_ids.add(routine["id"])
+                _log_hold_once(
+                    base_dir, routine["id"],
+                    f"routine={routine['id']} budget exhausted ({held}), holding",
+                    dry_run,
+                )
+    active_ids -= held_ids
     active = [
         r for r in routines
         if r.get("enabled", True) and r["id"] in active_ids
@@ -259,7 +311,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         ):
             continue
         try:
-            maintenance.run(base_dir, routine, dry_run=dry_run)
+            with claude_bridge.usage_scope(
+                routine["id"], config.budget_cap(routine)
+            ):
+                maintenance.run(base_dir, routine, dry_run=dry_run)
+        except claude_bridge.GUARD_STOPS as exc:
+            held_ids.add(routine["id"])
+            log(f"routine={routine['id']} maintenance held: {exc}")
         except Exception as exc:
             totals["errors"] += 1
             log(
@@ -409,10 +467,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])
-        failed_source_keys.update(_run_owned(
-            routine, routine_claims, processed, label_catalog, dry_run,
-            totals, lock, catalog, base_dir, shared_circuit,
-        ))
+        with claude_bridge.usage_scope(rid, config.budget_cap(routine)) as scope:
+            failed_source_keys.update(_run_owned(
+                routine, routine_claims, processed, label_catalog, dry_run,
+                totals, lock, catalog, base_dir, shared_circuit,
+            ))
+        if scope.stop is not None:
+            held_ids.add(rid)
 
     # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
     # follow-up queue. Reconcile after capture so an archived item whose prior
@@ -498,6 +559,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     if held:
         log(f"catch-up cursor held for {held} failed source(s)")
 
+    if held_ids:
+        totals["held_ids"] = sorted(held_ids)
     return totals
 
 
@@ -1610,8 +1673,11 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                 candidates = list_candidates(spec_source)
             except Exception as exc:
                 coverage_problems.append(f"{spec_label} listing failed: {exc}")
-                totals["errors"] += 1
-                log(f"routine={rid} source={spec_label} FATAL: {exc}")
+                if isinstance(exc, claude_bridge.GUARD_STOPS):
+                    log(f"routine={rid} source={spec_label} listing held: {exc}")
+                else:
+                    totals["errors"] += 1
+                    log(f"routine={rid} source={spec_label} FATAL: {exc}")
                 failures.append(
                     _failure(
                         routine, source,
@@ -1756,7 +1822,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             if marker > latest_by_source.get(source_id, (("", ""), None))[0]:
                 latest_by_source[source_id] = (marker, entry)
         for source_id, (_, entry) in latest_by_source.items():
-            if "memory_error" not in entry:
+            # A guard-held capture heals the same way as a failed one.
+            if "memory_error" not in entry and not entry.get("memory_held"):
                 continue
             replay = requested.setdefault(source_id, {})
             replay["memory_error"] = True
@@ -2071,7 +2138,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         # prevents the sink from ever being retried.
         retry_memory = (
             existing is not None
-            and "memory_error" in existing
+            and ("memory_error" in existing or existing.get("memory_held"))
         )
         retry_expansion = (
             existing is not None
@@ -2091,6 +2158,17 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             and not upgrade_operator_confirmation
         ):
             totals["skipped"] += 1
+            continue
+        stop = claude_bridge.scope_stop()
+        if stop is not None and not dry_run:
+            hold_claim(claim)
+            totals["skipped"] += 1
+            if not circuit_reported:
+                log(
+                    f"routine={rid} stopped by guard ({stop}); "
+                    "holding remaining candidates"
+                )
+                circuit_reported = True
             continue
         if shared_circuit and not dry_run:
             hold_claim(claim)
@@ -2142,6 +2220,10 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 managed_followup_claim=managed_followup_claim,
             )
             if totals["errors"] > errors_before:
+                if claude_bridge.scope_stop() is not None:
+                    # Stopped by a cap or the pause switch, not a failure.
+                    totals["errors"] = errors_before
+                    totals["skipped"] += 1
                 hold_claim(claim)
             if (
                 isinstance(outcome_record, dict)
@@ -2149,12 +2231,23 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 and _is_shared_dependency_failure(outcome_record["memory_error"])
             ):
                 shared_circuit["error"] = outcome_record["memory_error"]
-            totals["processed"] += 1
+            if isinstance(outcome_record, dict) and outcome_record.get("memory_held"):
+                hold_claim(claim)
+                totals["skipped"] += 1
+            else:
+                totals["processed"] += 1
         except state.AlreadyRunning:
             raise
         except Exception as exc:  # per-item failures are isolated
-            totals["errors"] += 1
             hold_claim(claim)
+            if (
+                isinstance(exc, claude_bridge.GUARD_STOPS)
+                or claude_bridge.scope_stop() is not None
+            ):
+                totals["skipped"] += 1
+                log(f"routine={rid} held id={candidate['id']}: {exc}")
+                continue
+            totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):
                 shared_circuit["error"] = str(exc)[:300]
@@ -2399,6 +2492,12 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     "an active self-forwarded Chat follow-up was rejected "
                     "as not memory-worthy"
                 )
+        except claude_bridge.GUARD_STOPS as exc:
+            # A cap or the pause switch interrupted the capture: not a failure.
+            # Tag it so the next run retries it; withhold Gmail actions.
+            record["memory_held"] = True
+            memory_failed = True
+            log(f"routine={rid} memory capture held: {exc}")
         except Exception as exc:
             record["memory_error"] = str(exc)[:300]
             memory_failed = True
@@ -2429,7 +2528,10 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     if actions_to_apply:
         record["actions_pending"] = list(actions_to_apply)
     if transcript_module is not None and base_dir is not None:
-        receipt_status = "failed" if record.get("memory_error") else "processed"
+        receipt_status = (
+            "failed" if record.get("memory_error") or record.get("memory_held")
+            else "processed"
+        )
         details = {
             "calendar_match": calendar_match,
             "memory": record.get("memory"),
@@ -2444,7 +2546,10 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
-    elif not record.get("memory_error") and not record.get("expand_fallback"):
+    elif (
+        not record.get("memory_error") and not record.get("memory_held")
+        and not record.get("expand_fallback")
+    ):
         processed.record_resolving(
             item["id"], record, record.get("memory_source_id") or item.get("source_id")
         )
