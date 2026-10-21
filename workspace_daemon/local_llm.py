@@ -21,7 +21,8 @@ class LocalLLMUnavailable(LocalLLMError):
     """The local model server could not be reached or timed out."""
 
 
-def chat_json(base_url, model, messages, schema, timeout=DEFAULT_TIMEOUT):
+def chat_json(base_url, model, messages, schema, timeout=DEFAULT_TIMEOUT,
+              options=None, keep_alive=None):
     """Run one deterministic chat turn constrained to ``schema``; return a dict.
 
     ``schema`` is passed in Ollama's ``format`` field (structured outputs) and
@@ -30,13 +31,16 @@ def chat_json(base_url, model, messages, schema, timeout=DEFAULT_TIMEOUT):
     malformed reply.  Error text never includes message content.
     """
     url = str(base_url or DEFAULT_BASE_URL).rstrip("/") + "/api/chat"
-    payload = json.dumps({
+    body = {
         "model": model,
         "messages": messages,
         "stream": False,
         "format": schema,
-        "options": {"temperature": 0},
-    }, ensure_ascii=False).encode("utf-8")
+        "options": {**(options or {}), "temperature": 0},
+    }
+    if keep_alive is not None:
+        body["keep_alive"] = keep_alive
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         url, data=payload, method="POST",
         headers={"Content-Type": "application/json"},

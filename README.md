@@ -1611,12 +1611,21 @@ analyze:
 ```
 
 - **Protected, never judged** (the model is not even called): items saved by
-  reaction; owner evidence `mentioned`, `channel-rule` or `saved`; request
-  forms; links; files or attachments; conversations longer than `max_chars`;
-  operator-confirmed sources.
+  reaction; owner evidence `mentioned`, `channel-rule`, `saved`, `authored` or
+  `direct-message`; Google Chat direct-message spaces; request forms; links;
+  files or attachments; conversations whose raw rendered body is longer than
+  `max_chars`; operator-confirmed sources.
+- **The model never decides a skip alone.** Enforce also requires the
+  deterministic borderline gate (cleaned text within `analyze.trivial_max_chars`,
+  default 120), and never skips `gchat` items (no owner evidence there). The
+  text goes to the model as the only user message, with instructions in the
+  system message and `<`/`>` neutralised, since chat text is untrusted.
 - **Fail open.** Server down, timeout, HTTP error, invalid JSON or an
   out-of-range answer counts as `substantive`: the paid call runs as today.
-  The conversation text is sent only to the local server and never logged.
+  After the first unreachable/timeout answer, triage is disabled for the rest
+  of the run. `base_url` must be loopback (localhost, 127.0.0.1, ::1). The
+  conversation text is sent only to the local server and never logged; the
+  ledger stores label and confidence, not the model's reason.
 - **`shadow`** never skips. Each item logs one line (label and confidence, no
   text) and the ledger row gains `local_triage`
   (`label`, `confidence`, `reason`, `mode`; `protected` or `failed` when the
@@ -1627,11 +1636,14 @@ analyze:
   `trivial_reason: local-triage:<label>`.
 
 Rollout: run in `shadow` for a week or two, then
-`python3 daemon.py triage-report [--days N]`. It prints, per local label, how
-the paid pipeline ended (`created`, `skipped_not_worthy`, ...) and a
-`small_talk agreement` line. Switch to `enforce` once `small_talk` rows are
-almost all `skipped_not_worthy`; each `small_talk` row that was `created` is a
-memory enforcement would have lost. Raise `min_confidence` to trade savings for
+`python3 daemon.py triage-report [--days N] [--min-confidence 0.85]`. It
+prints, per local label (`small_talk` split at and above/below the threshold),
+how the paid pipeline ended, then agreement computed only on rows where the
+paid call ran. `duplicate_skipped`, `verified`, no-memory,
+`skipped_extract_failed`, errors and rows enforce itself skipped are listed
+but excluded. Switch to `enforce` once `small_talk` at or above the threshold
+is almost all `skipped_not_worthy`; each such row that was kept is a memory
+enforcement would have lost. Raise `min_confidence` to trade savings for
 safety. The first call after Ollama loads the model is slow (several seconds);
 later calls are well under a second on Apple silicon.
 

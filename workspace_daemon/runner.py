@@ -271,6 +271,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     totals = {"matched": 0, "processed": 0, "skipped": 0, "errors": 0,
               "fallbacks": 0, "pending_actions": 0, "ambiguous": 0,
               "trivial": 0, "extract_failed": 0}
+    local_triage.reset_breaker()
 
     valid = []
     routing_failures = []
@@ -2549,7 +2550,12 @@ def _local_triage_verdict(routine, item):
         return None
     if memory_sink.is_operator_confirmed(routine, item):
         return None
-    verdict = local_triage.triage(item, cfg)
+    max_chars = config.analyze_cfg(routine).get("trivial_max_chars")
+    if type(max_chars) is not int or max_chars < 1:
+        max_chars = triviality.DEFAULT_MAX_CHARS
+    verdict = local_triage.triage(
+        item, cfg, borderline=triviality.is_borderline(item, max_chars)
+    )
     if verdict.get("protected"):
         log(f"routine={routine['id']} id={item['id']} local triage: protected")
     else:

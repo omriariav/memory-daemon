@@ -105,7 +105,7 @@ def guard_reason(item):
     Link, file/attachment and request-form checks shared with ``assess``;
     used to keep a local model from ever judging such items.
     """
-    body = item.get("body", "")
+    body = item.get("body") or ""
     if _URL_RE.search(body):
         return "contains a link"
     if _FILE_RE.search(body):
