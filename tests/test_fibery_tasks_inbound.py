@@ -461,6 +461,24 @@ class DuplicateSafetyTest(RunBase):
         self.run_once()
         self.assertEqual(self.entry_count(), 1)
 
+    def test_cli_timeout_text_never_carries_the_command_line(self):
+        seen = []
+        args = ["add", "--title", "PRIVATE TASK TITLE", "--body", "PRIVATE"]
+
+        def boom(store, cli_args, timeout=180):
+            raise subprocess.TimeoutExpired(cli_args, 180)
+
+        with mock.patch.object(fti, "_memory_cli", boom), \
+                mock.patch.object(fti, "_memory_result_id",
+                                  lambda result, *a: seen.append(result)):
+            fti._cli(self.cfg["store"], args, "fibery:tasks:x", {})
+        self.assertEqual(seen[0].stderr, "TimeoutExpired")
+        self.assertNotIn("PRIVATE", seen[0].stderr)
+
+    def test_fresh_store_without_entries_adopts_nothing(self):
+        self.assertIsNone(
+            fti._existing_entry(str(self.dir / "empty-store"), "fibery:tasks:x"))
+
     def test_killed_before_checkpoint_adopts_existing_todo(self):
         self.run_once(simple_doc((1, "TODO", "A", "S")))
         self.checkpoint.unlink()

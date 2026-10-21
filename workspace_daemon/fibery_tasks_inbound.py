@@ -383,6 +383,8 @@ def _people(cfg):
 
 def _existing_entry(store, source_id):
     """Id of the entry already carrying this exact source id, else None."""
+    if not (Path(store) / "memory" / "entries").is_dir():
+        return None  # a fresh store has no entries to adopt yet
     matches = [
         entry["id"] for entry in _load_memory_entries(store).values()
         if source_id in entry["source_ids"]
@@ -399,7 +401,9 @@ def _cli(store, args, source_id, expected):
     try:
         result = _memory_cli(store, args)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        result = subprocess.CompletedProcess(args, 1, "", str(exc))
+        # str(TimeoutExpired) carries the command line (task title/body);
+        # only the exception type may reach logs.
+        result = subprocess.CompletedProcess(args, 1, "", type(exc).__name__)
     return _memory_result_id(result, store, source_id, expected)
 
 
