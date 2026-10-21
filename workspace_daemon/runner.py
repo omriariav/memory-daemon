@@ -12,6 +12,8 @@ from contextlib import ExitStack
 from email.utils import getaddresses
 
 from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from .count_only import report as count_report
+from . import slack_mcp
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -35,6 +37,8 @@ def _is_shared_dependency_failure(value):
 def _catch_up_cursor_id(source):
     """Stable cursor namespace for each supported catch-up source shape."""
     kind = source["kind"]
+    if kind == "slack_mcp":
+        return slack_mcp.cursor_id(source)
     if kind == "gchat":
         # Preserve the original namespace for legacy unbatched configurations.
         # Once batching is configured, fingerprint the construction contract:
@@ -152,7 +156,7 @@ def _needs_label_catalog(routines):
 
 
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
-        lock_name="run"):
+        lock_name="run", count_only=False):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -174,12 +178,13 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
             if not dry_run else None
         )
         return _run_locked(
-            base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
+            base_dir, routines, dry_run, lock, refresh_labels,
+            active_ids=active_ids, count_only=count_only,
         )
 
 
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
-                active_ids=None):
+                active_ids=None, count_only=False):
     scan_started_at = utc_now_iso()
     active_ids = set(active_ids) if active_ids is not None else {
         r["id"] for r in routines if r.get("enabled", True)
@@ -189,6 +194,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         if r.get("enabled", True) and r["id"] in active_ids
     ]
     llm.configure(base_dir)
+    slack_mcp.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
@@ -279,7 +285,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         routine_active = routine["id"] in active_ids
         for source_index, source in enumerate(config.sources(routine)):
             if (
-                source.get("catch_up") is not True
+                (source.get("catch_up") is not True
+                 and source.get("kind") != "slack_mcp")
                 or source.get("kind") not in active_source_kinds
             ):
                 continue
@@ -291,7 +298,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if checkpoint:
                 second, _ = time_utils.rfc3339_key(checkpoint)
                 overlap = config.duration_seconds(
-                    source.get("catch_up_overlap", "1h")
+                    source.get("catch_up_overlap") or source.get("overlap", "1h")
                 )
                 since = (
                     second - datetime.timedelta(seconds=overlap)
@@ -300,6 +307,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 since = (
                     source.get("catch_up_after")
                     or source.get("batch_messages_after")
+                    or (slack_mcp.bootstrap_since(source)
+                        if kind == "slack_mcp" else None)
                 )
             if since:
                 override = {"_since": since}
@@ -348,6 +357,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 (routine["id"], source_index), {}
             )
             override["_dry_run"] = dry_run
+            override["_count_only"] = count_only
 
     source_coverage = {}
     claims, listing_failures = _collect_claims(
@@ -387,6 +397,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         claims, totals, failures=[*routing_failures, *listing_failures],
         held_source_keys=routing_holds,
     )
+    if count_only:
+        return count_report(owned, processed, base_dir, totals)
     failed_source_keys = {
         key for key, problem in source_coverage.items() if problem
     }
@@ -1182,6 +1194,9 @@ SOURCES = {
                   routine, candidate, source)),
     "gchat": (gchat_source.candidates,
               lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
+    "slack_mcp": (slack_mcp.candidates,
+                  lambda routine, source, candidate: slack_mcp.fetch(
+                      routine, candidate, source)),
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
 }
@@ -1242,6 +1257,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "gmail": 20,
     "drive_docs": 50,
     "slack": 30,
+    "slack_mcp": 0,
     "gchat": 50,
     "mila": 0,
     "whisper": 0,
@@ -1267,6 +1283,11 @@ def _source_scopes(source):
             if isinstance(space, str)
         }
         return values or {(kind, "*")}
+    if kind == "slack_mcp":
+        if source.get("include_mentions") or source.get("people"):
+            return {(kind, "*")}
+        return {(kind, c) for c in source.get("channels", [])
+                if isinstance(c, str)} or {(kind, "*")}
     if kind == "slack":
         if source.get("include_mentions"):
             # A workspace-wide mention can originate in any channel.
@@ -1299,7 +1320,7 @@ def _candidate_scopes(source, candidate):
     raw = candidate.get("raw")
     raw = raw if isinstance(raw, dict) else {}
     kind = source.get("kind")
-    if kind == "slack" and isinstance(raw.get("channel"), str):
+    if kind in ("slack", "slack_mcp") and isinstance(raw.get("channel"), str):
         return {(kind, raw["channel"])}
     if kind == "gchat" and isinstance(raw.get("space"), str):
         return {(kind, raw["space"])}
@@ -1390,6 +1411,8 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
+    if source.get("kind") == "slack_mcp":
+        return slack_mcp.coverage_problem(candidates)
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
     if (
@@ -1526,6 +1549,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         list_candidates, fetch = SOURCES[kind]
         override = source_overrides.get((rid, source_index))
         listing_source = dict(source, **override) if override else source
+        if kind == "slack_mcp":
+            # Listing skips threads the ledger already holds, so the cap and
+            # settle window apply to new work only.
+            listing_source = dict(listing_source, _processed=processed)
         if kind == "slack" and source.get("include_mentions"):
             # Mentions are workspace-wide. Exclude every explicitly owned
             # channel, including channels owned by another routine whose digest

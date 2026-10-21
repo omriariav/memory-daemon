@@ -13,7 +13,9 @@ from . import slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila", "whisper"}
+VALID_SOURCE_KINDS = {
+    "gmail", "drive_docs", "slack", "slack_mcp", "gchat", "mila", "whisper",
+}
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
 }
@@ -77,6 +79,10 @@ SOURCE_KEYS = {
     "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
     "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
     "session_gap_minutes", "watch", "people", "ignore_people",
+    "search_tool", "read_thread_tool", "self_user_id", "model",
+    "max_threads_per_run", "max_thread_replies", "max_thread_chars",
+    "max_search_pages", "bootstrap", "overlap", "settle_minutes",
+    "include_bots", "mention_filter", "search_args",
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
@@ -1220,6 +1226,128 @@ def _validate_calendar_cache(rid, cfg):
     return problems
 
 
+_FORBIDDEN_TOOL_WORDS = (
+    "send", "schedule", "create", "update", "add", "delete", "upload",
+    "complete",
+)
+_MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_-]+__([A-Za-z0-9_-]+)$")
+
+
+def _read_only_tool(value, family):
+    """Whether `value` is an exact connector tool of a read-only family."""
+    match = _MCP_TOOL.match(value) if isinstance(value, str) else None
+    if not match:
+        return False
+    name = match.group(1)
+    return name.startswith(family) and not any(
+        word in name for word in _FORBIDDEN_TOOL_WORDS
+    )
+
+
+def _bounded_int(value, lower, upper):
+    return (
+        isinstance(value, int) and not isinstance(value, bool)
+        and lower <= value <= upper
+    )
+
+
+def _validate_slack_mcp(prefix, source):
+    """Connector-backed Slack source: read-only tools and bounded budgets."""
+    problems = []
+    for key, family in (
+        ("search_tool", "slack_search_"), ("read_thread_tool", "slack_read_"),
+    ):
+        if not _read_only_tool(source.get(key), family):
+            problems.append(
+                f"{prefix}.{key} must be an exact read-only MCP tool name "
+                f"(mcp__<server>__{family}...)"
+            )
+    if source.get("search_tool") == source.get("read_thread_tool"):
+        problems.append(f"{prefix}: search_tool and read_thread_tool must differ")
+    owner = source.get("self_user_id")
+    if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
+        problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")
+    for key, pattern in (
+        ("channels", slack_watch.CHANNEL_ID),
+        ("owner_action_channels", slack_watch.CHANNEL_ID),
+        ("people", slack_watch.USER_ID),
+    ):
+        values = source.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list) or not all(
+            isinstance(v, str) and pattern.match(v) for v in values
+        ):
+            problems.append(f"{prefix}.{key} must be a list of Slack ids")
+    if not (
+        source.get("channels") or source.get("people")
+        or source.get("include_mentions") is True
+    ):
+        problems.append(
+            f"{prefix}: source.kind 'slack_mcp' needs channels, people "
+            "and/or include_mentions: true (inline or via watch)"
+        )
+    if "include_mentions" in source and not isinstance(
+        source["include_mentions"], bool
+    ):
+        problems.append(f"{prefix}.include_mentions must be true or false")
+    for key, lower, upper in (
+        ("max_threads_per_run", 1, 100), ("max_thread_replies", 1, 500),
+        ("max_thread_chars", 500, 100000), ("max_search_pages", 1, 20),
+        ("settle_minutes", 0, 1440),
+    ):
+        if key in source and not _bounded_int(source[key], lower, upper):
+            problems.append(
+                f"{prefix}.{key} must be an integer from {lower} to {upper}"
+            )
+    for key in ("bootstrap", "overlap"):
+        if key in source:
+            try:
+                duration_seconds(source[key])
+            except RoutineError:
+                problems.append(
+                    f"{prefix}.{key} must look like '15m', '4h', or '1d'"
+                )
+    if "include_bots" in source and not isinstance(source["include_bots"], bool):
+        problems.append(f"{prefix}.include_bots must be true or false")
+    if "model" in source and not _non_empty_str(source["model"]):
+        problems.append(f"{prefix}.model must be a non-empty string")
+    template = source.get("mention_filter")
+    if template is not None:
+        try:
+            ok = (
+                isinstance(template, str)
+                and {f for _, f, _, _ in Formatter().parse(template) if f}
+                <= {"self_user_id"}
+            )
+        except ValueError:
+            ok = False
+        if not ok:
+            problems.append(
+                f"{prefix}.mention_filter may only use the {{self_user_id}} "
+                "placeholder"
+            )
+    extra = source.get("search_args")
+    if extra is not None and (
+        not isinstance(extra, dict)
+        or not all(
+            isinstance(k, str) and isinstance(v, (str, int, float, bool))
+            for k, v in extra.items()
+        )
+        or {"filters", "after", "cursor", "limit"} & set(extra)
+    ):
+        problems.append(
+            f"{prefix}.search_args must map extra scalar arguments (not "
+            "filters, after, cursor or limit)"
+        )
+    if "max_results" in source:
+        problems.append(
+            f"{prefix}.max_results is not used by slack_mcp; use "
+            "max_threads_per_run"
+        )
+    return problems
+
+
 def _validate_schedule(routine):
     """Validate the cadence shared by capture and maintenance routines."""
     problems = []
@@ -1539,6 +1667,8 @@ def _validate_source(routine, source, prefix):
                         f"{prefix}.reply_roots_after must not be later than "
                         "catch_up_after"
                     )
+    if kind == "slack_mcp":
+        problems.extend(_validate_slack_mcp(prefix, source))
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)

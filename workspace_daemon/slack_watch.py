@@ -25,8 +25,8 @@ WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap",
 }
-_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
-_USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
+CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
+USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
 
 
@@ -86,11 +86,11 @@ def load(path):
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
     return {
-        "channels": _ids(data, "channels", _CHANNEL_ID, "channel"),
-        "people": _ids(data, "people", _USER_ID, "user"),
+        "channels": _ids(data, "channels", CHANNEL_ID, "channel"),
+        "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
         "owner_action_channels": _ids(
-            data, "owner_action_channels", _CHANNEL_ID, "channel"
+            data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
         "bootstrap": bootstrap,
     }

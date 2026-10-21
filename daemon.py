@@ -190,9 +190,22 @@ def _merge_totals(totals, additions):
             totals[key] = totals.get(key, 0) + value
 
 
+def _count_only(routines, active_ids):
+    """List-only pass over capture routines: no lock, ledger, cursor or store write."""
+    capture = {
+        r["id"] for r in routines
+        if r["id"] in active_ids and not config.is_maintenance(r)
+    }
+    totals = runner.run(
+        BASE_DIR, routines, dry_run=True, active_ids=capture, count_only=True
+    )
+    return 1 if totals["errors"] else 0
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
-    if not args.dry_run:
+    count_only = getattr(args, "count_only", False)
+    if not args.dry_run and not count_only:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
     if args.routine and args.routine not in {r["id"] for r in routines}:
@@ -226,6 +239,8 @@ def cmd_run(args):
             if routine.get("enabled", True)
         }
     )
+    if count_only:
+        return _count_only(routines, active_ids)
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
     for group_ids, lock_name in _manual_execution_groups(
@@ -462,6 +477,9 @@ def main(argv=None):
                             "operational log only")
     p_run.add_argument("--refresh-labels", action="store_true",
                        help="refetch the Gmail label catalog instead of using the cache")
+    p_run.add_argument("--count-only", action="store_true",
+                       help="list only: report new/changed items and a cost "
+                            "estimate; no ledger, cursor or store write")
     p_run.set_defaults(func=cmd_run)
 
     p_tick = sub.add_parser(
