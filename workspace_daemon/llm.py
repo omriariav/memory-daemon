@@ -15,6 +15,11 @@ def configure(base_dir):
     _base_dir = base_dir
 
 
+def base_dir():
+    """The routine base dir set by the runner (None outside a run)."""
+    return _base_dir
+
+
 def source_header_lines(item):
     """Render source metadata that materially changes how the model reads an item."""
     meta = item.get("frontmatter", {})

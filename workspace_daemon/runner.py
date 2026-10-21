@@ -2232,6 +2232,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             existing is not None
             and claim["source"].get("kind") in TRANSCRIPT_SOURCES
             and existing.get("calendar_match_rejected") is True
+            and not existing.get("calendar_match_final")
         )
         if (
             existing is not None
@@ -2462,18 +2463,73 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
 
     calendar_match = None
     if transcript_module is not None:
+        prime = getattr(transcript_module, "prime", None)
+        if prime is not None:
+            prime(processed.items())
         accepted, calendar_match = transcript_module.match_calendar(
             routine, source, item
         )
+        if not accepted and calendar_match.get("duplicate_of"):
+            # Another overlapping recording already supplies this meeting's
+            # memory; ledger this one as a duplicate without any analysis.
+            record = {
+                "rule_id": rid,
+                "source_kind": source["kind"],
+                "source_id": item["source_id"],
+                "processed_at": utc_now_iso(),
+                "duplicate_of": calendar_match["duplicate_of"],
+                "calendar_event_id": calendar_match["event_id"],
+            }
+            if handler_id:
+                record["handler_id"] = handler_id
+            if base_dir is not None:
+                transcript_module.write_receipt(
+                    base_dir, "processed", item,
+                    {
+                        "duplicate_of": calendar_match["duplicate_of"],
+                        "calendar_event_id": calendar_match["event_id"],
+                    },
+                )
+            processed.record_resolving(
+                item["id"], record, item["source_id"]
+            )
+            log(
+                f"routine={rid} id={item['id']} duplicate of "
+                f"{calendar_match['duplicate_of']}; not analyzed"
+            )
+            return record
+        if not accepted and calendar_match.get("held"):
+            # The primary capture of this meeting is still in flight; save
+            # nothing so this copy is decided after the primary is settled.
+            log(
+                f"routine={rid} id={item['id']} held: waiting for "
+                f"{calendar_match['waiting_for']} to be saved"
+            )
+            return {"memory_held": True, "calendar_hold": True}
         if not accepted:
+            attempts = int(
+                (processed.get(item["id"]) or {}).get(
+                    "calendar_match_attempts", 0
+                )
+            )
+            final = False
+            if not calendar_match.get("retry"):
+                attempts += 1
+                checker = getattr(transcript_module, "match_is_final", None)
+                final = bool(
+                    checker and checker(source, item, calendar_match, attempts)
+                )
             record = {
                 "rule_id": rid,
                 "source_kind": source["kind"],
                 "source_id": item["source_id"],
                 "processed_at": utc_now_iso(),
                 "calendar_match_rejected": True,
+                "calendar_match_attempts": attempts,
                 "calendar_match": calendar_match,
             }
+            if final:
+                record["calendar_match_final"] = True
             if handler_id:
                 record["handler_id"] = handler_id
             if base_dir is not None:
@@ -2482,6 +2538,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     {
                         "failure_kind": "calendar-match",
                         "calendar_match": calendar_match,
+                        "final": final,
                     },
                 )
             processed.record(item["id"], record)
@@ -2523,6 +2580,14 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     }
     if handler_id:
         record["handler_id"] = handler_id
+    if transcript_module is not None and meta.get("calendar_event_id"):
+        # Lets a later run recognise a second capture of the same meeting.
+        record.update({
+            "calendar_event_id": meta["calendar_event_id"],
+            "recording_start": meta.get("mila_recording_start"),
+            "recording_end": meta.get("mila_recording_end"),
+            "duration_seconds": meta.get("mila_duration_seconds"),
+        })
     canonical_memory_source_id = memory_sink.source_id_for(item)
     active_followup = (
         meta.get("gmail_chat_followup_managed") is True
@@ -2630,6 +2695,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
+        confirm = getattr(transcript_module, "confirm", None)
+        if confirm is not None:
+            confirm(item, record)
     elif (
         not record.get("memory_error") and not record.get("memory_held")
         and not record.get("expand_fallback")

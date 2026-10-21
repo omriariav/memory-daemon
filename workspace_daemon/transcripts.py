@@ -80,6 +80,18 @@ def match_prompt(metadata, events, excerpt):
     )
 
 
+MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matched": {"type": "boolean"},
+        "event_id": {"type": ["string", "null"]},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["matched", "event_id", "confidence", "reason"],
+}
+
+
 def validate_match(match, event_ids):
     """Return ``(accepted, normalized_match)``; raise on contract violations."""
     confidence = str(match.get("confidence") or "").casefold()
