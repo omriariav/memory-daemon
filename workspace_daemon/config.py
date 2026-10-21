@@ -1656,11 +1656,38 @@ def _validate_slack_mcp(prefix, source):
         source.get("channels") or source.get("people")
         or source.get("include_mentions") is True
         or source.get("all_dms") is True
+        or source.get("save_reactions")
         or source.get("_watch_unread")
     ):
         problems.append(
             f"{prefix}: source.kind 'slack_mcp' needs channels, people "
             "and/or include_mentions: true (inline or via watch)"
+        )
+    reactions = source.get("save_reactions")
+    reactions_ok = reactions is None
+    if reactions is not None:
+        reactions_ok = (
+            isinstance(reactions, list)
+            and len(reactions) <= slack_watch.MAX_SAVE_REACTIONS
+            and all(
+                isinstance(n, str) and slack_watch.SAVE_REACTION.match(n)
+                for n in reactions
+            )
+            and len(set(reactions)) == len(reactions)
+        )
+        if not reactions_ok:
+            problems.append(
+                f"{prefix}.save_reactions must be a list of at most "
+                f"{slack_watch.MAX_SAVE_REACTIONS} distinct emoji names "
+                "(no colons)"
+            )
+    tag = source.get("save_reaction_tag")
+    if tag is not None and not (
+        isinstance(tag, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", tag)
+    ):
+        problems.append(
+            f"{prefix}.save_reaction_tag must be a lowercase tag "
+            "(letters, digits, hyphens)"
         )
     if "include_mentions" in source and not isinstance(
         source["include_mentions"], bool
@@ -1674,6 +1701,7 @@ def _validate_slack_mcp(prefix, source):
         ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 60),
         ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
+        ("save_reaction_lookback_days", 1, 90),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(
@@ -1739,6 +1767,7 @@ def _validate_slack_mcp(prefix, source):
         + len(source.get("people") or [])
         + (1 if source.get("include_mentions") is True else 0)
         + (1 if source.get("all_dms") is True else 0)
+        + (len(reactions) if reactions_ok and reactions else 0)
     )
     cap = source.get("max_queries_per_run", 20)
     if _bounded_int(cap, 1, 100) and planned > cap:

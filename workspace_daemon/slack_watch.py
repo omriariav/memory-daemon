@@ -13,6 +13,8 @@ candidate ids.
       - U0EXAMPLEA
     include_mentions: true
     all_dms: true             # slack_mcp only: every DM and group DM of the owner
+    save_reactions:           # slack_mcp only: emoji names that mean "save this"
+      - save-for-later-example
     owner_action_channels:
       - C0EXAMPLE01
     bootstrap: 3d             # first-run look-back when no cursor exists
@@ -44,7 +46,11 @@ from .shell import log
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap", "all_dms", "discover_from", "ignore_channels",
+    "save_reactions",
 }
+# Emoji names (without colons) the owner reacts with to save a message.
+SAVE_REACTION = re.compile(r"^[a-z0-9][a-z0-9_+'-]{0,99}$")
+MAX_SAVE_REACTIONS = 3
 DISCOVERED_ID = re.compile(r"^[CG][A-Z0-9]{8,}$")
 DISCOVERED_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 DISCOVERED_REASONS = ("posted", "mentioned")
@@ -204,6 +210,22 @@ def _parse(path):
     all_dms = data.get("all_dms", False)
     if not isinstance(all_dms, bool):
         raise WatchError("`all_dms` must be true or false")
+    reactions = data.get("save_reactions")
+    if reactions is None:
+        reactions = []
+    if (
+        not isinstance(reactions, list)
+        or len(reactions) > MAX_SAVE_REACTIONS
+        or not all(
+            isinstance(name, str) and SAVE_REACTION.match(name)
+            for name in reactions
+        )
+        or len(set(reactions)) != len(reactions)
+    ):
+        raise WatchError(
+            f"`save_reactions` must be a list of at most {MAX_SAVE_REACTIONS} "
+            "distinct emoji names (letters, digits, _ + ' -; no colons)"
+        )
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
@@ -221,6 +243,7 @@ def _parse(path):
         "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
         "all_dms": all_dms,
+        "save_reactions": reactions,
         "owner_action_channels": _ids(
             data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
@@ -296,6 +319,10 @@ def expand(source):
             # Only the connector-backed source can search every DM.
             if value and source.get("kind") == "slack_mcp":
                 merged[key] = value
+        elif key == "save_reactions":
+            # Only the connector-backed source can search by reaction.
+            if value and source.get("kind") == "slack_mcp":
+                merged[key] = list(value)
         elif value not in ([], False):
             merged[key] = value
     return merged, None

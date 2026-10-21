@@ -476,6 +476,145 @@ class CaptureValidationTest(unittest.TestCase):
         tags = calls["args"][calls["args"].index("--tags") + 1]
         self.assertNotIn(memory_sink.NO_OWNER_ACTION_TAG, tags)
 
+    def saved(self, tag="saved", requested=True, evidence=("saved",)):
+        meta = self.item["frontmatter"]
+        meta["slack_owner_evidence"] = list(evidence)
+        meta["slack_save_tag"] = tag
+        if requested:
+            meta["slack_saved"] = True
+
+    @staticmethod
+    def tags(calls):
+        return calls["args"][calls["args"].index("--tags") + 1].split(",")
+
+    def test_saved_evidence_keeps_a_model_classified_todo(self):
+        for kind in ("todo", "pending-decision"):
+            with self.subTest(kind=kind):
+                self.saved()
+                _, calls = self._run_capture({
+                    "worthy": True, "owner_attention": True, "type": kind,
+                    "title": "Saved by the owner", "people": [], "tags": [],
+                    "body": "Action for the owner.",
+                })
+                idx = calls["args"].index("--type")
+                self.assertEqual(calls["args"][idx + 1], kind)
+                self.assertIn("saved", self.tags(calls))
+                self.assertNotIn(
+                    memory_sink.NO_OWNER_ACTION_TAG, self.tags(calls)
+                )
+
+    def test_saved_affirms_owner_attention_the_model_denied(self):
+        self.saved()
+        _, calls = self._run_capture({
+            "worthy": True, "owner_attention": False, "type": "todo",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
+
+    def test_saved_still_honours_the_standalone_no_owner_marker(self):
+        self.saved()
+        _, calls = self._run_capture({
+            "worthy": True, "owner_attention": True, "type": "todo",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        }, summary="Summary.\n\n" + memory_sink.NO_OWNER_ACTION_MARKER)
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_saved_thread_is_not_dropped_when_the_model_says_not_worthy(self):
+        self.saved()
+        outcome, calls = self._run_capture({
+            "worthy": False, "owner_attention": False, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertEqual(outcome["memory"], "created")
+        self.assertIn("saved", self.tags(calls))
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "note")
+
+    def test_unsaved_not_worthy_thread_is_still_skipped(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = []
+        outcome, _ = self._run_capture({
+            "worthy": False, "owner_attention": False, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
+
+    def test_saved_thread_overrides_a_not_worthy_source_analysis(self):
+        self.saved()
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            return_value="Forced summary.",
+        ):
+            outcome, calls = self._run_capture(
+                None, summary="NOT MEMORY-WORTHY",
+            )
+        self.assertEqual(outcome["memory"], "created")
+        self.assertEqual(calls["stdin"], "Forced summary.")
+        self.assertIn("saved", self.tags(calls))
+
+    def test_saved_falls_back_to_the_thread_text_when_forcing_fails(self):
+        self.saved()
+        self.item["body"] = "thread text"
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            side_effect=memory_sink.NoUsableSummary("no summary"),
+        ):
+            outcome, calls = self._run_capture(
+                None, summary="NOT MEMORY-WORTHY",
+            )
+        self.assertEqual(outcome["memory"], "created")
+        self.assertIn("thread text", calls["stdin"])
+        self.assertIn("Raw untrusted thread text", calls["stdin"])
+
+    def test_saved_fallback_keeps_the_personal_keyword_backstop(self):
+        self.saved()
+        self.routine["memory"]["personal_keywords"] = ["zebrasecret"]
+        self.item["body"] = "talking about zebrasecret here"
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            side_effect=memory_sink.NoUsableSummary("no summary"),
+        ):
+            _, calls = self._run_capture(None, summary="NOT MEMORY-WORTHY")
+        self.assertIn(memory_sink.personal.DEFAULT_PERSONAL_TAG, self.tags(calls))
+
+    def test_saved_transient_errors_propagate_for_a_retry(self):
+        from workspace_daemon import claude_bridge
+        self.saved()
+        for exc in (claude_bridge.BridgeError("down"), OSError("io")):
+            with self.subTest(exc=exc), mock.patch.object(
+                memory_sink, "_operator_confirmed_summary", side_effect=exc,
+            ):
+                with self.assertRaises(type(exc)):
+                    self._run_capture(None, summary="NOT MEMORY-WORTHY")
+
+    def test_unsaved_not_worthy_source_analysis_is_still_skipped(self):
+        outcome, _ = self._run_capture(None, summary="NOT MEMORY-WORTHY")
+        self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
+
+    def test_later_reply_keeps_the_tag_and_evidence_without_the_bypass(self):
+        self.saved(requested=False)
+        _, calls = self._run_capture({
+            "worthy": True, "owner_attention": True, "type": "todo",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        idx = calls["args"].index("--type")
+        self.assertEqual(calls["args"][idx + 1], "todo")
+        self.assertIn("saved", self.tags(calls))
+        outcome, _ = self._run_capture({
+            "worthy": False, "owner_attention": False, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
+
+    def test_a_malformed_save_tag_is_ignored(self):
+        self.saved(tag="Bad Tag!")
+        _, calls = self._run_capture({
+            "worthy": True, "owner_attention": True, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertNotIn("Bad Tag!", ",".join(self.tags(calls)))
+
     def test_slack_evidence_does_not_override_owner_attention_denial(self):
         self.item["frontmatter"]["slack_owner_evidence"] = ["mentioned"]
         _, calls = self._run_capture({

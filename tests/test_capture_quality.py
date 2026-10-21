@@ -107,6 +107,17 @@ class TrivialVerdictTest(unittest.TestCase):
         self.assertIn("skip_trivial must be true or false", problems)
         self.assertIn("trivial_max_chars must be a positive integer", problems)
 
+    def test_saved_by_reaction_is_never_skipped_as_trivial(self):
+        r = self.routine(skip_trivial=True)
+        item = chat(("A", "hi hi"))
+        self.assertTrue(runner._trivial_verdict(r, item))
+        item["frontmatter"]["slack_saved"] = True
+        self.assertIsNone(runner._trivial_verdict(r, item))
+        # a later reply on a saved thread is ordinary again
+        later = chat(("A", "hi hi"))
+        later["frontmatter"].update({"slack_save_tag": "saved"})
+        self.assertTrue(runner._trivial_verdict(r, later))
+
     def test_process_skips_without_model_call(self):
         class Ledger:
             def __init__(self):
