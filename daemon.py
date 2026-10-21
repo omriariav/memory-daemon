@@ -26,7 +26,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, identity, llm, memory_sink, runner, state, status, tui
+from workspace_daemon import config, identity, llm, memory_sink, preflight, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -332,6 +332,12 @@ def cmd_run(args):
         )
     if _pause_reason(args):
         return 0
+    if getattr(args, "preflight", False) and not args.dry_run:
+        # Explicit runs are never gated by default; --preflight opts in.
+        reason = preflight.check(BASE_DIR)
+        if reason:
+            log(f"run skipped: {reason}")
+            return 0
     if not args.dry_run and not count_only:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
@@ -442,6 +448,12 @@ def cmd_tick(args):
     if _pause_reason(args, f"{tick_name}: "):
         return 0
     if not args.dry_run:
+        # Nothing is attempted on a skip: no schedule, cursor or counter moves,
+        # so the next tick simply finds the same routines due.
+        reason = preflight.check(BASE_DIR)
+        if reason:
+            log(f"{tick_name} skipped: {reason}")
+            return 0
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
     cross = config.cross_problems(routines)
@@ -685,6 +697,9 @@ def main(argv=None):
                             "(entry ids and/or the word heading) before the run")
     p_run.add_argument("--ignore-pause", action="store_true",
                        help="run even though state/PAUSED exists (manual override)")
+    p_run.add_argument("--preflight", action="store_true",
+                       help="apply the tick's lid-closed and offline checks "
+                            "to this explicit run (off by default)")
     p_run.set_defaults(func=cmd_run)
 
     p_tick = sub.add_parser(

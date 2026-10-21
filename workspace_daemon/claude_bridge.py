@@ -33,7 +33,7 @@ from pathlib import Path
 
 import yaml
 
-from . import claude_bridge_hook, state
+from . import claude_bridge_hook, sleepclock, state
 from .shell import claude_bin, utc_now_iso
 
 HOOK_PATH = Path(__file__).with_name("claude_bridge_hook.py")
@@ -75,6 +75,11 @@ class ToolResults(list):
 
 class BridgeError(RuntimeError):
     pass
+
+
+class BridgeOutage(BridgeError):
+    """A call failed across a machine sleep: an outage, never an item failure."""
+    outage = True
 
 
 class BudgetExhausted(BridgeError):
@@ -555,6 +560,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     # Refused before any run dir or process exists; nothing is logged.
     _check_guards(base_dir)
     started = time.monotonic()
+    span = sleepclock.Span()
     result_event = None
     outcome = "error"
     denials = 0
@@ -676,6 +682,10 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         return results, result_event, partial
     except BridgeError as exc:
         outcome = "error: " + str(exc)
+        if not isinstance(exc, (BridgeOutage,) + GUARD_STOPS) and span.slept():
+            # Failed across a sleep: the laptop, not the item, is at fault.
+            outcome = "outage: " + str(exc)
+            raise BridgeOutage(f"{exc} ({sleepclock.OUTAGE_NOTE})") from None
         raise
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)

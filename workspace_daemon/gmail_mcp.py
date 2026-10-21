@@ -63,7 +63,7 @@ import re
 import time
 from pathlib import Path
 
-from . import claude_bridge, slack_mcp, slack_source, state
+from . import claude_bridge, slack_mcp, slack_source, sleepclock, state
 from .shell import log, utc_now_iso
 
 DEFAULTS = {
@@ -653,6 +653,7 @@ def _call_prompt(tool, calls, what):
 
 
 def _one_session(cfg, tool, pins, calls, what, required):
+    span = sleepclock.Span()
     results = claude_bridge.call_tools(
         _call_prompt(tool, calls, what),
         {tool: pins},
@@ -675,6 +676,12 @@ def _one_session(cfg, tool, pins, calls, what, required):
                     texts[index] = result["text"]
                 break
         # A call matching no planned argument set is dropped, never used.
+    if span.slept() and any(text is None for text in texts):
+        # Results lost across a machine sleep say nothing about the threads:
+        # an outage, so no per-thread attempt or lone-failure counter moves.
+        raise claude_bridge.BridgeOutage(
+            f"{what} incomplete ({sleepclock.OUTAGE_NOTE})"
+        )
     return texts
 
 

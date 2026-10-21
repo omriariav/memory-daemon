@@ -32,6 +32,10 @@ _TICK_SKIPPED = re.compile(
 _TICK_NOOP = re.compile(
     _TICK_PREFIX + r": (?:no routines due(?P<dry> \(dry-run\))?|paused: .*)$"
 )
+# Written by the tick preflight (lid closed / dark wake / offline): nothing ran.
+_TICK_PREFLIGHT = re.compile(
+    _TICK_PREFIX + r" skipped: (?P<why>lid closed|dark wake|offline)$"
+)
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
 _ROUTINE_ERROR = re.compile(
     r"^routine=(?P<id>\S+)\b.*\b(?:ERROR|FATAL)\b"
@@ -116,7 +120,8 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
     """Summarize coordinator ticks and the last result for every routine."""
     path = Path(path)
     if not path.exists():
-        return {"latest": None, "latest_by_group": {}, "routines": {}}
+        return {"latest": None, "latest_by_group": {}, "routines": {},
+                "offline_since": {}}
     try:
         # Status is interactive and must stay bounded even after years of
         # unattended operation. Rotation normally keeps this small; tailing is
@@ -128,9 +133,12 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 handle.readline()  # discard a partial first line
             lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
-        return {"latest": None, "latest_by_group": {}, "routines": {}}
+        return {"latest": None, "latest_by_group": {}, "routines": {},
+                "offline_since": {}}
 
     routine_results = {}
+    # group -> time of the first of an unbroken run of "offline" skips.
+    offline_since = {}
     active = {}
     latest = None
     latest_by_group = {}
@@ -145,6 +153,9 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         nonlocal latest
         latest = result
         latest_by_group[group] = result
+        if not (result["state"] == "preflight_skipped"
+                and result.get("reason") == "offline"):
+            offline_since.pop(group, None)
 
     def close_incomplete(block):
         if not block:
@@ -247,6 +258,20 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 })
             continue
 
+        gated = _TICK_PREFLIGHT.match(message)
+        if gated:
+            group = tick_group(gated)
+            record_latest(group, {
+                "state": "preflight_skipped",
+                "reason": gated.group("why"),
+                "at": at,
+                "message": message,
+                "group": group,
+            })
+            if gated.group("why") == "offline":
+                offline_since.setdefault(group, at)
+            continue
+
         routine_error = _ROUTINE_ERROR.match(message)
         if routine_error:
             routine_id = routine_error.group("id")
@@ -309,6 +334,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         "latest": latest,
         "latest_by_group": latest_by_group,
         "routines": routine_results,
+        "offline_since": offline_since,
     }
 
 
@@ -626,6 +652,8 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             )
     bridge_text, bridge_problems = bridge_lines(base_dir, now)
     lines.extend(bridge_text)
+    offline_problems = _offline_problems(base_dir, history, now)
+    lines.extend(f"ATTENTION: {problem}" for problem in offline_problems)
     lines.extend([
         "",
         "Logs: logs/run.log (rotated, owner-only)",
@@ -660,7 +688,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     )
     return "\n".join(lines), (
         scheduler_healthy and routines_healthy and latest_healthy
-        and not bridge_problems
+        and not bridge_problems and not offline_problems
     )
 
 
@@ -741,8 +769,35 @@ def bridge_lines(base_dir, now):
     return lines, problems
 
 
+def _offline_problems(base_dir, history, now):
+    """Only skips that persist while the lid is open are a problem.
+
+    Lid-closed and dark-wake skips are expected on a laptop. Offline skips
+    with no other tick in between for longer than the threshold mean the
+    network (or the check's host list) needs a look.
+    """
+    from . import preflight
+
+    limit = preflight.load_config(base_dir)["offline_warn_hours"] * 3600
+    problems = []
+    for group, since in sorted((history.get("offline_since") or {}).items()):
+        epoch = _iso_epoch(since)
+        if epoch is not None and now - epoch > limit:
+            problems.append(
+                f"{group} ticks skipped as offline for "
+                f"{_duration(now - epoch)} (check the network or "
+                "network_check.hosts in state/daemon.yaml)"
+            )
+    return problems
+
+
 def _tick_text(latest, issue, now):
-    if latest:
+    if latest and latest.get("state") == "preflight_skipped":
+        text = (
+            f"skipped ({latest['reason']}) "
+            f"{_iso_age(latest['at'], now)}"
+        )
+    elif latest:
         text = f"{_iso_age(latest['at'], now)} — {latest['message']}"
     else:
         text = "never recorded"
