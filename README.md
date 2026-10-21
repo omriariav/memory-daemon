@@ -1736,12 +1736,13 @@ include_mentions: true
 all_dms: true              # slack_mcp only: every DM and group DM of the owner
 save_reactions: [save-for-later-example]   # slack_mcp only: emoji that mean "save this"
 dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types: [im, mpim]}   # slack_mcp only
+comms_inbox: {channels: [C0EXAMPLE01], all_dms: true, reactions: [eyes]}   # slack_mcp only
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
-`include_mentions`, `all_dms`, `save_reactions`, `dm_sessions` and `owner_action_channels` keys; unknown keys and malformed
+`include_mentions`, `all_dms`, `save_reactions`, `dm_sessions`, `comms_inbox` and `owner_action_channels` keys; unknown keys and malformed
 ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
 are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
 `people` list unless it sets `ignore_people: true`, which keeps the exit path a
@@ -1921,6 +1922,50 @@ per-message entries from that window stay as duplicates.
 Limits: a reacted message older than every tracked session saves from that
 message on, because earlier history is not known to the session map; the
 authorship check marks owner messages no search listed as unverified.
+
+**Comms inbox.** `comms_inbox` (watch file, or inline on the source) keeps
+`state/comms-inbox.jsonl`, a local record a reply tracker can read instead of
+fetching Slack again. It reuses the hits this run's searches already returned:
+no extra read, no model call, and no settle delay (a message is recorded in the
+run that first lists it, even while its thread is still settling).
+
+```yaml
+comms_inbox:
+  channels: [C0EXAMPLE01, D0EXAMPLE03]   # conversations to record
+  all_dms: true          # also every DM / group DM the `dms` query lists (needs all_dms: true)
+  reactions: [eyes]      # owner reactions to record, at most 5 (default none)
+  retention_days: 14     # 1 to 90
+```
+
+One JSON object per line, oldest message first:
+
+```json
+{"type": "message", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "user_id": "U0EXAMPLEB", "is_owner": false, "is_bot": false, "text": "...", "seen_at": "2026-10-21T15:00:00Z"}
+{"type": "owner_reaction", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "emoji": "eyes", "seen_at": "2026-10-21T15:00:00Z"}
+```
+
+- `thread_ts` is the thread root, equal to `ts` for a top-level message (DM
+  sessions do not change it). `is_owner` compares `user_id` with `self_user_id`.
+- Both sides are recorded: other people's messages and the owner's own
+  replies, from every query (channels, people, mentions, `dms`, reactions).
+  A conversation appears only when some query lists it: put channels in
+  `channels` (or rely on `all_dms` for DMs).
+- Owner reactions: search results and reads carry no reactor ids, so the only
+  source is Slack's `hasmy::<emoji>:` filter. Each `reactions` emoji adds one
+  search per run (a `save_reactions` emoji reuses its existing search), looking
+  back `retention_days` and ignoring the cursors; its hits are recorded only
+  and never become captures. A `save_reactions` reaction on an inbox
+  conversation is recorded too. Reactions with other emoji are not seen.
+- Lines are never edited: messages dedupe on (`channel_id`, `ts`) and
+  reactions on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
+  are not reflected. Lines whose `ts` is older than `retention_days` are
+  dropped. The file is rewritten atomically with mode 600 and only when
+  something changed, so readers never see a partial line.
+- Hits that only some reading of an ambiguous search page holds are never
+  recorded (a forged block must not mark a conversation answered). Text is
+  passed through the secret redactor and cut at 4000 characters.
+- `--count-only` and `--dry-run` write nothing; a write failure is logged and
+  does not fail the run.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

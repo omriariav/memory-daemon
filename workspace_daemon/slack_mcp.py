@@ -63,6 +63,11 @@ as for threads). Threaded messages and all other channels are unchanged. A
 message reacted with a `save_reactions` emoji saves its whole session (saved
 key `saved:slack:<ch>:<anchor>`, `saved_covered_ts` as for threads).
 
+The watch file (or the source) may also set `comms_inbox` to record the hits
+of chosen conversations, and the owner's reactions with chosen emoji, in
+`state/comms-inbox.jsonl` for a reply tracker; see `comms_inbox.py`. Its
+reaction searches (`reacted:<emoji>`) have no cursor and never capture.
+
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
 else (planning, parsing, grouping, bounding, versioning) is deterministic
@@ -103,7 +108,9 @@ import re
 import time
 from pathlib import Path
 
-from . import claude_bridge, slack_source, slack_watch, sleepclock, state
+from . import (
+    claude_bridge, comms_inbox, slack_source, slack_watch, sleepclock, state,
+)
 from .chat_text import redact_secrets
 from .shell import log, utc_now_iso
 
@@ -130,10 +137,13 @@ DEFAULTS = {
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
     "all_dms", "save_reactions", "dm_sessions", "read_channel_tool",
+    "comms_inbox",
 }
 CURSOR_SCHEMA = 1
 # Query keys and ledger keys of the reaction-saved path.
 SAVED_PREFIX = "saved:"
+# Query keys of the comms-inbox reaction searches (record only, never capture).
+REACTED_PREFIX = "reacted:"
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
 THREADS_PER_SESSION = 8
@@ -220,6 +230,7 @@ def settings(source):
     cfg["search_args"] = dict(source.get("search_args") or {})
     cfg["read_channel_tool"] = source.get("read_channel_tool")
     cfg["dm_sessions"] = dm_session_cfg(source.get("dm_sessions"))
+    cfg["comms_inbox"] = comms_inbox.settings(source.get("comms_inbox"))
     return cfg
 
 
@@ -946,9 +957,24 @@ def search_queries(cfg, since=None):
             "key": f"{SAVED_PREFIX}{name}", "kind": "saved", "allowed": None,
             "user": None, "keywords": None, "filters": f"hasmy::{name}:",
         })
+    for name in inbox_reactions(cfg):
+        queries.append({
+            "key": f"{REACTED_PREFIX}{name}", "kind": "reacted",
+            "allowed": None, "user": None, "keywords": None,
+            "filters": f"hasmy::{name}:",
+        })
     for query in queries:
         query.setdefault("keys", [query["key"]])
     return queries
+
+
+def inbox_reactions(cfg):
+    """Inbox emoji that need a search of their own (a save emoji's search
+    already runs)."""
+    inbox = cfg.get("comms_inbox")
+    if not inbox:
+        return []
+    return [n for n in inbox["reactions"] if n not in cfg["save_reactions"]]
 
 
 def _pace(cfg):
@@ -1040,11 +1066,19 @@ def _search_all(cfg, queries, afters, now):
                 log(f"slack_mcp: {query['kind']} search failed: {exc}")
                 continue
             # A reaction query has no cursor to protect and its hits become
-            # paid captures, so it accepts only what every reading agrees on.
+            # paid captures or inbox evidence, so it accepts only what every
+            # reading agrees on.
             usable = (
-                trusted if query["kind"] == "saved" and trusted is not None
+                trusted
+                if query["kind"] in ("saved", "reacted") and trusted is not None
                 else hits
             )
+            if trusted is not None and usable is not trusted:
+                agreed = {id(h) for h in trusted}
+                for hit in usable:
+                    if id(hit) not in agreed:
+                        # Kept for listing, never recorded in the inbox.
+                        hit["untrusted"] = True
             accepted = [
                 h for h in usable if _valid_hit(query, h, after, now, cfg)
             ]
@@ -1466,10 +1500,15 @@ def candidates(source):
         )
     fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
     saved_after = int(now) - cfg["save_reaction_lookback_days"] * 86400
-    # Saved queries ignore the cursors: Slack's `after:` is the message date,
-    # and the owner reacts to old messages.
+    reacted_after = int(now) - (
+        cfg["comms_inbox"]["retention_days"] * 86400 if cfg["comms_inbox"]
+        else 0
+    )
+    # Reaction queries ignore the cursors: Slack's `after:` is the message
+    # date, and the owner reacts to old messages.
     afters = [
-        saved_after if query["kind"] == "saved" else min(
+        saved_after if query["kind"] == "saved"
+        else reacted_after if query["kind"] == "reacted" else min(
             int(slack_source._rfc3339_epoch(since_map[key]))
             if since_map.get(key) else fresh
             for key in query["keys"]
@@ -1500,6 +1539,15 @@ def candidates(source):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
+        elif key.startswith(REACTED_PREFIX):
+            log("slack_mcp: a comms-inbox reaction search hit "
+                "max_search_pages; newer reactions are not recorded (shorten "
+                "retention_days or raise max_search_pages)")
+    if cfg["comms_inbox"] and not source.get("_count_only"):
+        # Before DM sessions re-point `root`: the inbox keeps the real thread.
+        _record_inbox(cfg, found, now)
+    # Inbox-only reaction hits never become candidates.
+    found = [(query, hit) for query, hit in found if query["kind"] != "reacted"]
     n_sessions = assign_dm_sessions(
         cfg, found, source.get("_routine_id") or "default",
         persist=not source.get("_count_only") and not source.get("_dry_run"),
@@ -1603,7 +1651,7 @@ def candidates(source):
     marks = {}
     overlap = _seconds(cfg["overlap"])
     for query in queries:
-        if query["kind"] == "saved":
+        if query["kind"] in ("saved", "reacted"):
             continue
         for key in query["keys"]:
             values = [deferred_floor] if deferred_floor is not None else []
@@ -1630,6 +1678,34 @@ def candidates(source):
         f"{len(over)} over the per-run cap, {len(capped)} capped search(es)"
     )
     return out
+
+
+def _record_inbox(cfg, found, now):
+    """Append this run's hits in the inbox conversations to the comms inbox.
+
+    Messages from every query (both sides of a conversation, bots included);
+    owner reactions from the `hasmy::` searches of inbox and save emoji. Hits
+    that only some reading of an ambiguous page holds are skipped: a forged
+    block must not mark a conversation as answered.
+    """
+    inbox = cfg["comms_inbox"]
+    channels = set(inbox["channels"])
+    reactions = set(inbox["reactions"])
+    rows = []
+    for query, hit in found:
+        if hit.get("untrusted") or not (
+            hit["channel"] in channels
+            or (inbox["all_dms"] and hit["label"] in DM_LABELS)
+        ):
+            continue
+        rows.append(comms_inbox.message_row(hit, cfg["self_user_id"]))
+        if query["kind"] in ("saved", "reacted"):
+            emoji = query["key"].split(":", 1)[1]
+            if emoji in reactions or query["kind"] == "saved":
+                rows.append(comms_inbox.reaction_row(hit, emoji))
+    added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
+    if added:
+        log(f"slack_mcp: comms inbox recorded {added} new line(s)")
 
 
 def _inherited_tag(cfg, processed, anchor_id):
