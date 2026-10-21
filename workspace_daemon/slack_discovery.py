@@ -19,6 +19,7 @@ channel with no such activity for `idle_days` is dropped.
       idle_days: 30
       max_search_pages: 5
       max_channels: 45
+      min_mentions: 2        # distinct mentions that count as activity
 
 Searches are newest first, so a capped search still sees the most recent
 activity. A run that cannot read every page it started (an unparseable page,
@@ -38,6 +39,7 @@ DEFAULTS = {
     "max_search_pages": 5,
     "min_seconds_between_searches": 3,
     "max_channels": 45,
+    "min_mentions": 2,
 }
 DAY = 86400
 
@@ -95,11 +97,15 @@ def _usable(query, hit, cfg, after, now):
 
 
 def _search(cfg, now):
-    """{channel id: {"ts", "reason", "name"}} of the newest owner activity."""
+    """{channel id: {"ts", "reason", "name"}} of the newest owner activity.
+
+    A channel qualifies on any post by the owner, or on `min_mentions`
+    distinct messages mentioning the owner.
+    """
     queries = _queries(cfg)
     after = int(now - cfg["active_days"] * DAY)
     pending = {i: _args(q, after) for i, q in enumerate(queries)}
-    activity = {}
+    posted, mentioned, names = {}, {}, {}
     for _page in range(cfg["max_search_pages"]):
         order = sorted(pending)
         calls = [pending[i] for i in order]
@@ -121,22 +127,31 @@ def _search(cfg, now):
                 if not _usable(query, hit, cfg, after, now):
                     continue
                 stamp = float(hit["ts"])
-                seen = activity.get(hit["channel"])
+                channel = hit["channel"]
                 name = _channel_name(hit["label"])
-                if seen is None or stamp > seen["ts"] or (
-                    stamp == seen["ts"] and query["reason"] == "posted"
-                ):
-                    activity[hit["channel"]] = {
-                        "ts": stamp, "reason": query["reason"],
-                        "name": name or (seen or {}).get("name"),
-                    }
-                elif name and not seen.get("name"):
-                    seen["name"] = name
+                if name:
+                    names.setdefault(channel, name)
+                if query["reason"] == "posted":
+                    posted[channel] = max(posted.get(channel, 0.0), stamp)
+                else:
+                    mentioned.setdefault(channel, set()).add(stamp)
             if cursor and hits:
                 following[index] = _args(query, after, cursor)
         pending = following
         if not pending:
             break
+    activity = {}
+    for channel in set(posted) | set(mentioned):
+        options = []
+        if channel in posted:
+            options.append((posted[channel], 1, "posted"))
+        if len(mentioned.get(channel, ())) >= cfg["min_mentions"]:
+            options.append((max(mentioned[channel]), 0, "mentioned"))
+        if options:
+            stamp, _tie, reason = max(options)
+            activity[channel] = {
+                "ts": stamp, "reason": reason, "name": names.get(channel),
+            }
     return activity
 
 
@@ -206,7 +221,15 @@ def run(cfg, base_dir, dry_run=False, now=None):
     hand, ignore = (
         slack_watch.hand_written(cfg["watch"]) if cfg["watch"] else ([], [])
     )
-    existing = slack_watch.read_discovered(cfg["discovered"])
+    try:
+        existing = slack_watch.read_discovered(cfg["discovered"])
+    except slack_watch.WatchError as exc:
+        # Never fail forever on a damaged file: keep it aside and rebuild.
+        stamp = _day(now).strftime("%Y%m%d") + f"-{int(now) % 86400}"
+        aside = slack_watch.quarantine_discovered(cfg["discovered"], stamp)
+        log(f"slack_discovery: discovered file unusable ({exc}); "
+            f"moved aside as {aside} and rebuilding")
+        existing = []
     activity = _search(cfg, now)
     entries, added, removed = merge(
         existing, activity, _day(now), cfg, hand, ignore

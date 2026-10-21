@@ -22,7 +22,8 @@ candidate ids.
 `discover_from` names a separate private file kept by the `slack_discovery`
 maintenance routine; its channels are appended to the hand-written `channels`
 at load (a hand-written entry always wins, an `ignore_channels` entry is never
-merged in). A missing discovered file adds nothing.
+merged in). A missing discovered file adds nothing, and a corrupt one is
+treated as empty with a warning (the discovery routine rebuilds it).
 
 The discovered file is YAML written by the daemon, never by hand:
 
@@ -163,6 +164,14 @@ def read_discovered(path):
     return out
 
 
+def quarantine_discovered(path, stamp):
+    """Move a corrupt discovered file aside; returns the new file name."""
+    path = _private_path(path, "discovered file")
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    os.replace(path, aside)
+    return aside.name
+
+
 def write_discovered(path, entries):
     """Atomically write the discovered file (mode 600), sorted by id."""
     path = _private_path(path, "discovered file")
@@ -235,11 +244,19 @@ def load(path):
     ignore = set(parsed.pop("ignore_channels"))
     discover_from = parsed.pop("discover_from")
     if discover_from:
+        path = _private_path(discover_from, "discovered file")
+        try:
+            found = read_discovered(path)
+        except WatchError as exc:
+            if f"bad:{path}" not in _WARNED:
+                _WARNED.add(f"bad:{path}")
+                log(f"slack discovered file ignored: {exc}")
+            found = []
         known = set(parsed["channels"]) | ignore
         parsed["channels"] = parsed["channels"] + sorted(
-            entry["id"] for entry in read_discovered(discover_from)
-            if entry["id"] not in known
+            entry["id"] for entry in found if entry["id"] not in known
         )
+        parsed["discover_from"] = discover_from
     return parsed
 
 
@@ -272,6 +289,9 @@ def expand(source):
             # an inline value wins over the file's.
             if source.get("kind") == "slack_mcp" and key not in source:
                 merged[key] = value
+        elif key == "discover_from":
+            # Kept only so validation can cross-check the discovery routine.
+            merged["_watch_discover_from"] = str(Path(value).expanduser())
         elif key == "all_dms":
             # Only the connector-backed source can search every DM.
             if value and source.get("kind") == "slack_mcp":

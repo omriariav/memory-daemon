@@ -36,6 +36,7 @@ maintenance:
   model: haiku               # bridge model; it only transports tool results
   active_days: 14            # activity this recent adds a channel
   idle_days: 30              # no activity for this long drops it
+  min_mentions: 2            # distinct mentions that count (any post counts alone)
   max_search_pages: 5        # 20 hits per page, newest first
   min_seconds_between_searches: 3
   max_channels: 45           # keep the most recently active

@@ -1326,6 +1326,16 @@ routine the watch file with `maintenance.watch` so it also skips channels you
 already list. Cursors are per channel, so adding or dropping a discovered
 channel never re-reads the others.
 
+A channel qualifies on any message you posted there, or on `min_mentions`
+(default 2) distinct messages mentioning you within `active_days`, so a single
+passing ping does not add a channel. A discovered file that fails validation is
+moved aside as `<name>.corrupt-<stamp>` and rebuilt from the next search; the
+watch loader meanwhile treats it as empty with a logged warning, so
+hand-written channels keep working. `daemon.py validate` prints a warning (not
+an error) when a watch's `discover_from` is not written by any
+`slack_discovery` routine in the config set, or a discovery routine's file is
+read by no watch.
+
 A run that cannot read every page it started (an unparseable page, a missing
 result) leaves the file untouched, and only hits that every valid reading of a
 page agrees on count, so a message quoting a result block cannot add a channel.

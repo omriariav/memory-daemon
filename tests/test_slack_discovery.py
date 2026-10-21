@@ -173,8 +173,10 @@ class SearchTest(DiscoveryCase):
         self.search(
             posted=[{"ch": CH1, "uid": ME, "name": "Me Example",
                      "ts": day_ts(3), "text": SECRET}],
-            mentioned=[{"ch": CH2, "ts": day_ts(2),
-                        "text": f"hi <@{ME}> {SECRET}"}],
+            mentioned=[
+                {"ch": CH2, "ts": day_ts(2), "text": f"hi <@{ME}> {SECRET}"},
+                {"ch": CH2, "ts": day_ts(4), "text": f"<@{ME}> again"},
+            ],
         )
         report = self.run_discovery()
         self.assertEqual(report["added"], [CH1, CH2])
@@ -187,6 +189,22 @@ class SearchTest(DiscoveryCase):
         mode = stat.S_IMODE(os.stat(self.cfg()["discovered"]).st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_one_mention_is_not_enough_unless_min_mentions_says_so(self):
+        self.search(mentioned=[
+            {"ch": CH2, "ts": day_ts(2), "text": f"hi <@{ME}>"},
+            {"ch": CH3, "ts": day_ts(2), "text": f"hi <@{ME}>"},
+            {"ch": CH3, "ts": day_ts(2, 200), "text": f"<@{ME}> hello"},
+        ])
+        self.assertEqual(self.run_discovery()["added"], [CH3])
+        os.remove(self.cfg()["discovered"])
+        self.assertEqual(
+            self.run_discovery(min_mentions=1)["added"], [CH2, CH3]
+        )
+
+    def test_a_post_qualifies_alone(self):
+        self.search(posted=[{"ch": CH1, "uid": ME, "ts": day_ts(2)}])
+        self.assertEqual(self.run_discovery()["added"], [CH1])
+
     def test_unusable_hits_add_nothing(self):
         self.search(
             posted=[
@@ -198,9 +216,12 @@ class SearchTest(DiscoveryCase):
                 {"ch": CH4, "bot": True, "ts": day_ts(1)},  # bot
                 {"ch": CH1, "uid": ME, "ts": day_ts(40)},   # outside window
             ],
-            mentioned=[{"ch": CH2, "ts": day_ts(1), "text": "no mention"}],
+            mentioned=[
+                {"ch": CH2, "ts": day_ts(1), "text": "no mention"},
+                {"ch": CH2, "ts": day_ts(2), "text": "none here either"},
+            ],
         )
-        report = self.run_discovery()
+        report = self.run_discovery(min_mentions=1)
         self.assertEqual(report["added"], [])
         self.assertEqual(self.stored(), [])
 
@@ -294,14 +315,20 @@ class SearchTest(DiscoveryCase):
         self.assertEqual(self.connector.calls, [])
         self.assertFalse(os.path.exists(self.cfg()["discovered"]))
 
-    def test_a_corrupt_discovered_file_is_never_overwritten(self):
+    def test_a_corrupt_discovered_file_is_moved_aside_and_rebuilt(self):
         path = Path(self.cfg()["discovered"])
         path.write_text("channels: [not, a, mapping]\n")
-        self.search()
-        with self.assertRaises(slack_watch.WatchError):
-            self.run_discovery()
-        self.assertEqual(self.connector.calls, [])
-        self.assertEqual(path.read_text(), "channels: [not, a, mapping]\n")
+        self.search(posted=[{"ch": CH1, "uid": ME, "ts": day_ts(1)}])
+        lines = []
+        with mock.patch.object(slack_discovery, "log", lines.append):
+            report = self.run_discovery()
+        self.assertEqual(report["added"], [CH1])
+        self.assertEqual([e["id"] for e in self.stored()], [CH1])
+        aside = [p for p in Path(self.dir).iterdir()
+                 if ".corrupt-" in p.name]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_text(), "channels: [not, a, mapping]\n")
+        self.assertTrue(any("moved aside" in line for line in lines))
 
 
 class DiscoveredFileTest(unittest.TestCase):
@@ -367,7 +394,6 @@ class WatchMergeTest(unittest.TestCase):
             f"ignore_channels: [{CH3}]\n"
         ))
         self.assertEqual(loaded["channels"], [CH1, CH2])
-        self.assertNotIn("discover_from", loaded)
         self.assertNotIn("ignore_channels", loaded)
 
     def test_missing_discovered_file_adds_nothing(self):
@@ -376,12 +402,21 @@ class WatchMergeTest(unittest.TestCase):
         ))
         self.assertEqual(loaded["channels"], [CH1])
 
-    def test_bad_discovered_file_or_key_fails_the_watch(self):
+    def test_corrupt_discovered_file_counts_as_empty_with_a_warning(self):
         self.found.write_text("nope: 1\n")
-        with self.assertRaises(slack_watch.WatchError):
-            slack_watch.load(self.watch(f"discover_from: {self.found}\n"))
+        lines = []
+        with mock.patch.object(slack_watch, "log", lines.append):
+            loaded = slack_watch.load(self.watch(
+                f"channels: [{CH1}]\ndiscover_from: {self.found}\n"
+            ))
+        self.assertEqual(loaded["channels"], [CH1])
+        self.assertTrue(any("ignored" in line for line in lines))
+
+    def test_bad_discover_from_or_ignore_key_fails_the_watch(self):
         with self.assertRaises(slack_watch.WatchError):
             slack_watch.load(self.watch("discover_from: [a]\n"))
+        with self.assertRaises(slack_watch.WatchError):
+            slack_watch.load(self.watch("discover_from: relative.yaml\n"))
         with self.assertRaises(slack_watch.WatchError):
             slack_watch.load(self.watch("ignore_channels: [U0EXAMPLEA]\n"))
 
@@ -403,6 +438,65 @@ class WatchMergeTest(unittest.TestCase):
         loaded = config.discover(self.base)[0]
         self.assertEqual(config.validate(loaded), [])
         self.assertEqual(loaded["source"]["channels"], [CH1, CH2])
+
+
+class DiscoveryWarningTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        (self.base / "routines").mkdir()
+        self.found = self.base / "found.yaml"
+        watch = self.base / "watch.yaml"
+        watch.write_text(
+            f"channels: [{CH1}]\ndiscover_from: {self.found}\n"
+        )
+        watch.chmod(0o600)
+        self.watch = watch
+
+    def write(self, name, text):
+        (self.base / "routines" / name).write_text(text)
+
+    def reader(self):
+        self.write("reader.yaml", (
+            "id: reader\nanalyze: {provider: gemini, model: m, instruction: x}\n"
+            f"output: {{vault_dir: {self.base}, slug_prefix: s}}\n"
+            "source:\n  kind: slack_mcp\n"
+            f"  watch: {self.watch}\n  search_tool: {SEARCH}\n"
+            "  read_thread_tool: mcp__example_slack__slack_read_thread\n"
+            f"  self_user_id: {ME}\n"
+        ))
+
+    def writer(self, target=None):
+        self.write("writer.yaml", (
+            "id: writer\nrole: maintenance\nschedule: {every: 1d}\n"
+            "maintenance:\n  kind: slack_discovery\n"
+            f"  discovered: {target or self.found}\n"
+            f"  search_tool: {SEARCH}\n  self_user_id: {ME}\n"
+        ))
+
+    def warnings(self):
+        routines = config.discover(self.base)
+        self.assertEqual([p for r in routines for p in config.validate(r)], [])
+        return config.discovery_warnings(routines)
+
+    def test_matching_pair_is_quiet(self):
+        self.reader()
+        self.writer()
+        self.assertEqual(self.warnings(), [])
+
+    def test_reader_without_writer_warns(self):
+        self.reader()
+        out = self.warnings()
+        self.assertEqual(len(out), 1)
+        self.assertIn("not written by any slack_discovery", out[0])
+
+    def test_writer_without_reader_or_with_another_path_warns(self):
+        self.writer()
+        self.assertIn("no slack_mcp watch reads", self.warnings()[0])
+        self.reader()
+        self.writer(target=self.base / "other.yaml")
+        self.assertEqual(len(self.warnings()), 2)
 
 
 class ConfigAndWiringTest(DiscoveryCase):
@@ -437,6 +531,7 @@ class ConfigAndWiringTest(DiscoveryCase):
             ({"idle_days": 5}, "idle_days"),
             ({"max_search_pages": 99}, "max_search_pages"),
             ({"max_channels": 0}, "max_channels"),
+            ({"min_mentions": 0}, "min_mentions"),
             ({"model": ""}, "model"),
             ({"search_args": {}}, "unknown key"),
         ):

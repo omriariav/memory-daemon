@@ -36,7 +36,7 @@ MAINTENANCE_ALLOWED_KEYS = {
     "slack_discovery": {
         "kind", "discovered", "watch", "search_tool", "self_user_id", "model",
         "active_days", "idle_days", "max_search_pages",
-        "min_seconds_between_searches", "max_channels",
+        "min_seconds_between_searches", "max_channels", "min_mentions",
     },
     "calendar_cache": {
         "kind", "calendar_id", "window_hours", "timezone", "owner_email",
@@ -480,6 +480,41 @@ def _expanded(source, missing_ok=False):
     if error:
         merged["_watch_error"] = error
     return merged
+
+
+def discovery_warnings(routines):
+    """Cross-check watch `discover_from` paths against discovery routines.
+
+    Warnings, not errors: the writer and the reader may live in another
+    config set. Returns a list of messages.
+    """
+    reads, writes = {}, {}
+    for routine in routines:
+        for source in sources(routine):
+            path = source.get("_watch_discover_from")
+            if path and source.get("kind") == "slack_mcp":
+                reads.setdefault(path, routine.get("id", "?"))
+        maintenance = routine.get("maintenance")
+        if (
+            isinstance(maintenance, dict)
+            and maintenance.get("kind") == "slack_discovery"
+            and isinstance(maintenance.get("discovered"), str)
+        ):
+            writes.setdefault(
+                str(Path(maintenance["discovered"]).expanduser()),
+                routine.get("id", "?"),
+            )
+    out = [
+        f"{rid}: watch discover_from is not written by any slack_discovery "
+        "routine in this config set"
+        for path, rid in sorted(reads.items()) if path not in writes
+    ]
+    out.extend(
+        f"{rid}: slack_discovery writes a file no slack_mcp watch reads "
+        "with discover_from"
+        for path, rid in sorted(writes.items()) if path not in reads
+    )
+    return out
 
 
 def budget_cap(routine):
@@ -1218,7 +1253,7 @@ def _validate_slack_discovery(rid, cfg):
     for key, lower, upper in (
         ("active_days", 1, 90), ("idle_days", 1, 365),
         ("max_search_pages", 1, 10), ("max_channels", 1, 200),
-        ("min_seconds_between_searches", 0, 120),
+        ("min_mentions", 1, 20), ("min_seconds_between_searches", 0, 120),
     ):
         if key in cfg and not _bounded_int(cfg[key], lower, upper):
             problems.append(
