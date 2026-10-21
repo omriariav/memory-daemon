@@ -657,6 +657,58 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("example", text)
         self.assertIn("Logs: logs/run.log", text)
 
+    def render_bridge(self, base, now):
+        launchd = {"loaded": False, "detail": "not loaded"}
+        with mock.patch.object(
+            status, "probe_launchd", side_effect=self.probe(launchd)
+        ):
+            return status.render(base, [], now=now)[0]
+
+    def test_paused_banner_and_bridge_block(self):
+        now = datetime.datetime(
+            2026, 3, 10, 20, 0, tzinfo=datetime.timezone.utc).timestamp()
+        usage = [
+            {"ts": "2026-03-10T19:00:00Z", "tools": ["mcp__srv_a__list"],
+             "outcome": "ok", "total_cost_usd": 0.5, "routine": "alpha"},
+            {"ts": "2026-03-10T19:30:00Z",
+             "tools": ["mcp__srv_a__list", "mcp__srv_b__get"],
+             "outcome": "error: tool returned an error: mcp__srv_b__get",
+             "total_cost_usd": 0.25, "routine": "beta"},
+            {"ts": "2026-03-10T19:40:00Z", "tools": [], "outcome": "ok",
+             "total_cost_usd": 0.1},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "state").mkdir()
+            (base / "state" / "PAUSED").write_text("cost review\nmore\n")
+            (base / "state" / "budget.yaml").write_text(
+                "daily_usd: 10\nday_timezone: UTC\n")
+            (base / "state" / "claude-usage.jsonl").write_text(
+                "".join(json.dumps(u) + "\n" for u in usage))
+            text = self.render_bridge(base, now)
+        self.assertEqual(text.splitlines()[1],
+                         "*** PAUSED: cost review (remove state/PAUSED to resume) ***")
+        self.assertIn("Claude bridge", text)
+        self.assertIn("Spend today: $0.85 of $10 cap", text)
+        self.assertIn("  alpha: $0.50", text)
+        self.assertIn("  beta: $0.25", text)
+        self.assertIn("  (unattributed): $0.10", text)
+        rows = {
+            line.split()[0]: line for line in text.splitlines()
+            if line.startswith("srv_")
+        }
+        self.assertIn("1h ago", rows["srv_a"])
+        self.assertIn("30m ago", rows["srv_a"])
+        self.assertIn("never", rows["srv_b"])
+        self.assertIn(
+            "Last error: 30m ago — error: tool returned an error", text)
+
+    def test_no_bridge_activity_adds_no_block_or_banner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self.render_bridge(Path(tmp), 1100)
+        self.assertNotIn("Claude bridge", text)
+        self.assertNotIn("PAUSED", text)
+
     def test_launches_without_a_tick_log_are_unhealthy(self):
         with tempfile.TemporaryDirectory() as tmp:
             launchd = {

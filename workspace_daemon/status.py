@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config, state
+from . import claude_bridge, config, state
 
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
@@ -547,9 +547,14 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
 
     lines = [
         "Memory Daemon",
+    ]
+    pause = state.paused(base_dir)
+    if pause:
+        lines.append(f"*** PAUSED: {pause} (remove state/PAUSED to resume) ***")
+    lines.extend([
         f"Scheduler: {' · '.join(scheduler_bits)}",
         f"Next coordinator run: {_next_coordinator_run(launchd, legacy)}",
-    ]
+    ])
     if maintenance is not None:
         maintenance_bits = _scheduler_bits(maintenance)
         lines.extend([
@@ -583,6 +588,7 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         for row in rows
     ]
     lines.extend(_table(headers, values))
+    lines.extend(bridge_lines(base_dir, now))
     lines.extend([
         "",
         "Logs: logs/run.log (rotated, owner-only)",
@@ -616,6 +622,67 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         if result is not None
     )
     return "\n".join(lines), scheduler_healthy and routines_healthy and latest_healthy
+
+
+def bridge_lines(base_dir, now):
+    """Claude bridge block: today's spend and per-connector last ok / last error.
+
+    Everything comes from the metadata-only usage log (last 7 days). Empty
+    when the bridge has never run, so installs without it see no change.
+    """
+    entries = claude_bridge.recent_usage(base_dir, now=now)
+    try:
+        cap, tz = claude_bridge.load_budget(base_dir)
+        budget_note = ""
+    except claude_bridge.BridgeError as exc:
+        cap, tz, budget_note = None, None, f" ({exc})"
+    if not entries and cap is None and not budget_note:
+        return []
+    day_start = claude_bridge.day_start_epoch(now, tz)
+    spent = {}
+    last_ok, last_error = {}, {}
+    latest_error = None
+    for epoch, entry in entries:
+        cost = entry.get("total_cost_usd")
+        if epoch >= day_start and isinstance(cost, (int, float)) \
+                and not isinstance(cost, bool):
+            tag = entry.get("routine") or "(unattributed)"
+            spent[tag] = spent.get(tag, 0.0) + cost
+        outcome = str(entry.get("outcome", ""))
+        failed = outcome == "missing_results" or outcome.startswith("error")
+        servers = {
+            name.split("__")[1] for name in entry.get("tools") or []
+            if isinstance(name, str) and name.startswith("mcp__")
+            and len(name.split("__")) > 2
+        }
+        for server in servers:
+            target = last_error if failed else last_ok
+            target[server] = max(target.get(server, 0), epoch)
+        if failed and (latest_error is None or epoch >= latest_error[0]):
+            latest_error = (epoch, outcome)
+    total = sum(spent.values())
+    cap_text = f" of ${cap:g} cap" if cap is not None else ""
+    lines = ["", "Claude bridge", f"Spend today: ${total:.2f}{cap_text}{budget_note}"]
+    for tag in sorted(spent):
+        lines.append(f"  {tag}: ${spent[tag]:.2f}")
+    servers = sorted(set(last_ok) | set(last_error))
+    if servers:
+        lines.extend(_table(
+            ("CONNECTOR", "LAST OK", "LAST ERROR"),
+            [
+                (
+                    server,
+                    _age(last_ok.get(server), now),
+                    _age(last_error.get(server), now),
+                )
+                for server in servers
+            ],
+        ))
+    if latest_error:
+        lines.append(
+            f"Last error: {_age(latest_error[0], now)} — {latest_error[1][:120]}"
+        )
+    return lines
 
 
 def _tick_text(latest, issue, now):

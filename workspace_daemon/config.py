@@ -58,7 +58,7 @@ HANDLER_OVERRIDE_KEYS = {"analyze", "output", "memory", "label", "streams"}
 TOP_LEVEL_KEYS = {
     "id", "enabled", "description", "role", "schedule", "source", "sources",
     "handlers", "analyze", "output", "memory", "actions", "routing", "label",
-    "streams", "maintenance", "_source_file",
+    "streams", "maintenance", "budget", "_source_file",
 }
 ANALYZE_KEYS = {
     "provider", "model", "instruction", "instruction_from_connector",
@@ -443,6 +443,27 @@ def discover(base_dir, routine_id=None):
     return found
 
 
+def _budget_problems(rid, routine):
+    if "budget" not in routine:
+        return []
+    budget = routine["budget"]
+    if not isinstance(budget, dict):
+        return [f"{rid}: budget must be a mapping"]
+    problems = []
+    unknown = set(budget) - {"daily_usd"}
+    if unknown:
+        problems.append(
+            f"{rid}: budget has unknown key(s) {', '.join(sorted(map(str, unknown)))}"
+        )
+    cap = budget.get("daily_usd")
+    if (
+        isinstance(cap, bool) or not isinstance(cap, (int, float))
+        or not 0 < cap < float("inf")
+    ):
+        problems.append(f"{rid}: budget.daily_usd must be a positive number")
+    return problems
+
+
 def validate(routine):
     """Return a list of human-readable problems; empty means valid."""
     problems = []
@@ -458,6 +479,7 @@ def validate(routine):
             "be configured"
         )
     maintenance_routine = is_maintenance(routine)
+    problems.extend(_budget_problems(rid, routine))
 
     required = ["id"] if maintenance_routine else REQUIRED_TOP_LEVEL
     for key in required:

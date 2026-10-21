@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -152,7 +152,7 @@ def _needs_label_catalog(routines):
 
 
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
-        lock_name="run"):
+        lock_name="run", ignore_pause=False):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -162,7 +162,13 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     `routines` is the complete routing context. `active_ids` optionally limits
     which owners may process in this invocation while still letting inactive
     domain routines protect their candidates from a due fallback sweep.
+
+    Backstop for the state/PAUSED kill switch: the CLI checks it first, but a
+    direct caller is refused here unless it passes ignore_pause.
     """
+    reason = None if ignore_pause else state.paused(base_dir)
+    if reason:
+        raise state.Paused(f"paused: {reason}")
     contacts.clear_cache()
     drive.clear_identity_cache()
     identity.clear_cache()
@@ -176,6 +182,16 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
         return _run_locked(
             base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
         )
+
+
+def _budget_hold(base_dir, routine):
+    """Reason a routine's own daily cap (or the global one) blocks it, else None."""
+    cap = (routine.get("budget") or {}).get("daily_usd")
+    if cap is None:
+        return None
+    return claude_bridge.budget_exhausted(
+        base_dir, routine["id"], routine_cap=cap
+    )
 
 
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
@@ -232,6 +248,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if routine["id"] not in active_ids:
                 valid.append(routine)
                 continue
+            held = _budget_hold(base_dir, routine)
+            if held:
+                # Not in `valid`: no listing, no cursor advance, nothing marked
+                # processed. Other routines still route around its claims.
+                log(f"routine={routine['id']} budget exhausted ({held}), skipping")
+                continue
             if config.is_maintenance(routine):
                 valid.append(routine)
                 continue
@@ -259,7 +281,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         ):
             continue
         try:
-            maintenance.run(base_dir, routine, dry_run=dry_run)
+            with claude_bridge.usage_scope(routine["id"]):
+                maintenance.run(base_dir, routine, dry_run=dry_run)
         except Exception as exc:
             totals["errors"] += 1
             log(
@@ -409,10 +432,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])
-        failed_source_keys.update(_run_owned(
-            routine, routine_claims, processed, label_catalog, dry_run,
-            totals, lock, catalog, base_dir, shared_circuit,
-        ))
+        with claude_bridge.usage_scope(rid):
+            failed_source_keys.update(_run_owned(
+                routine, routine_claims, processed, label_catalog, dry_run,
+                totals, lock, catalog, base_dir, shared_circuit,
+            ))
 
     # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
     # follow-up queue. Reconcile after capture so an archived item whose prior
@@ -1607,7 +1631,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             ownership_class = spec["ownership_class"]
             log(f"routine={rid} querying {spec_label}: {_scope(spec_source)}")
             try:
-                candidates = list_candidates(spec_source)
+                with claude_bridge.usage_scope(rid):
+                    candidates = list_candidates(spec_source)
             except Exception as exc:
                 coverage_problems.append(f"{spec_label} listing failed: {exc}")
                 totals["errors"] += 1
@@ -1649,7 +1674,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     f"scan to {discovery_limit}"
                 )
                 try:
-                    discovery = list_candidates(expanded_source)
+                    with claude_bridge.usage_scope(rid):
+                        discovery = list_candidates(expanded_source)
                 except Exception as exc:
                     totals["errors"] += 1
                     log(

@@ -1118,7 +1118,50 @@ Security model, least privilege by construction:
   tool already answered.
 - Errors name only kinds, exit codes and known tool names (anything else is `<invalid>`); prompts and tool
   inputs/results are never logged. `state/claude-usage.jsonl` (0600) records
-  per-attempt model, tool names, denial count, duration, cost and token counts only.
+  per-attempt model, tool names, denial count, duration, cost, token counts and the
+  attributed routine id only.
+
+### Pausing
+
+`touch state/PAUSED` is a kill switch. While the file exists, `daemon.py tick`
+and `daemon.py run` log `paused: <reason>` (the file's first line, or just
+`paused`) and exit 0 without listing, fetching or calling any model; launchd
+keeps firing, so removing the file resumes work on the next tick with nothing
+lost. `daemon.py run --ignore-pause` lets one manual run proceed. `runner.run`
+refuses with a `Paused` error as a backstop for any other caller, and
+`daemon.py status` shows a PAUSED banner.
+
+```bash
+echo "cost review until Monday" > state/PAUSED   # pause
+rm state/PAUSED                                  # resume
+```
+
+### Budgets
+
+Every bridge call is logged to `state/claude-usage.jsonl` with its cost, and
+calls made while a routine works carry that routine's id. Two optional caps use
+that log (a day is the local day unless configured; failed attempts count):
+
+```yaml
+# routines/<id>.yaml: skip this routine once it has spent this much today
+budget:
+  daily_usd: 2.50
+```
+
+```yaml
+# state/budget.yaml (private, optional): global cap across all routines
+daily_usd: 10
+day_timezone: Europe/London   # optional IANA name; default is local time
+```
+
+A routine at its cap is skipped for the run (`budget exhausted` in the log):
+no listing, no cursor advance, nothing marked processed, so it catches up
+after the day rolls over. Once the global cap is reached the bridge refuses new
+calls with `daily budget exhausted`. A malformed `state/budget.yaml` also
+refuses calls rather than lifting the cap. Only the last 7 days of the log are
+read. `daemon.py status` shows today's spend (global and per routine) and the
+last ok and last error time per connector, derived from the `mcp__<server>__`
+prefix of logged tool names.
 
 ### Label caching
 

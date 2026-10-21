@@ -6,7 +6,7 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py list                       show routines, enabled state, last run
   daemon.py status                     show scheduler and routine health
   daemon.py validate                   check all routine YAML
-  daemon.py run [--routine ID] [-n]    process new matches now
+  daemon.py run [--routine ID] [-n]    process new matches now (--ignore-pause overrides state/PAUSED)
   daemon.py tick [-n]                  process only routines whose cadence is due
   daemon.py new                        interactive scaffold for a new routine
 """
@@ -190,8 +190,19 @@ def _merge_totals(totals, additions):
             totals[key] = totals.get(key, 0) + value
 
 
+def _pause_reason(args):
+    """Log and return the kill-switch reason when this invocation must not run."""
+    reason = state.paused(BASE_DIR)
+    if reason and not getattr(args, "ignore_pause", False):
+        log(f"paused: {reason}")
+        return reason
+    return None
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
+    if _pause_reason(args):
+        return 0
     if not args.dry_run:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
@@ -238,6 +249,7 @@ def cmd_run(args):
                 BASE_DIR, routines, dry_run=args.dry_run,
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
                 lock_name=lock_name,
+                ignore_pause=getattr(args, "ignore_pause", False),
             )
         except state.AlreadyRunning as exc:
             # Manual and scheduled census runs share slack-census.lock; other
@@ -275,6 +287,8 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
+    if _pause_reason(args):
+        return 0
     if not args.dry_run:
         config.secure_routine_files(BASE_DIR)
     tick_id = uuid.uuid4().hex[:12]
@@ -325,6 +339,7 @@ def cmd_tick(args):
                 BASE_DIR, routines, dry_run=args.dry_run,
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
                 lock_name=lock_name,
+                ignore_pause=getattr(args, "ignore_pause", False),
             )
         except state.AlreadyRunning as exc:
             skipped_ids = ", ".join(sorted(group_ids))
@@ -462,6 +477,8 @@ def main(argv=None):
                             "operational log only")
     p_run.add_argument("--refresh-labels", action="store_true",
                        help="refetch the Gmail label catalog instead of using the cache")
+    p_run.add_argument("--ignore-pause", action="store_true",
+                       help="run even though state/PAUSED exists (manual override)")
     p_run.set_defaults(func=cmd_run)
 
     p_tick = sub.add_parser(

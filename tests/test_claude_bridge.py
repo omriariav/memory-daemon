@@ -122,6 +122,66 @@ class BridgeBase(unittest.TestCase):
         return [json.loads(x) for x in path.read_text().splitlines()]
 
 
+class UsageScopeAndBudgetTest(BridgeBase):
+    def test_usage_scope_tags_log_lines_and_resets(self):
+        self.stream(good_stream())
+        with claude_bridge.usage_scope("alpha"):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        claude_bridge.call_tools(
+            SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base, connect_delay=0,
+        )
+        first, second = self.usage_lines()
+        self.assertEqual(first["routine"], "alpha")
+        self.assertNotIn("routine", second)
+
+    def write_spend(self, cost):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        path = self.base / "state" / "claude-usage.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"ts": ts, "total_cost_usd": cost}) + "\n")
+
+    def test_global_cap_refuses_before_spawning(self):
+        self.stream(good_stream())
+        self.write_spend(3.0)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 2\nday_timezone: UTC\n")
+        with self.assertRaisesRegex(
+                claude_bridge.BridgeError, "^daily budget exhausted$"):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.complete(
+                SECRET_PROMPT, model="haiku", base_dir=self.base)
+        self.assertEqual(self.invocations(), 0)
+        self.assertEqual(len(self.usage_lines()), 1)  # nothing new logged
+
+    def test_under_the_cap_still_runs(self):
+        self.stream(good_stream())
+        self.write_spend(1.0)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 2\nday_timezone: UTC\n")
+        out = claude_bridge.call_tools(
+            SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base, connect_delay=0,
+        )
+        self.assertEqual(out[0]["text"], "item one")
+
+    def test_unreadable_budget_file_fails_closed(self):
+        self.stream(good_stream())
+        (self.base / "state").mkdir()
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: nope\n")
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        self.assertEqual(self.invocations(), 0)
+
+
 class CallToolsTest(BridgeBase):
     def call(self, tools=None, **kw):
         kw.setdefault("base_dir", self.base)
