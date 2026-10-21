@@ -30,6 +30,7 @@ source:
 def write(directory, name, text):
     path = Path(directory) / name
     path.write_text(text)
+    path.chmod(0o600)
     return path
 
 
@@ -75,6 +76,17 @@ class LoaderTest(unittest.TestCase):
                 with self.assertRaises(slack_watch.WatchError) as caught:
                     self.load(text)
                 self.assertIn(fragment, str(caught.exception))
+
+    def test_loose_permissions_warn(self):
+        path = write(self.tmp.name, "watch.yaml", WATCH)
+        path.chmod(0o644)
+        with mock.patch.object(slack_watch, "log") as log:
+            slack_watch.load(path)
+        log.assert_called_once()
+        path.chmod(0o600)
+        with mock.patch.object(slack_watch, "log") as log:
+            slack_watch.load(path)
+        log.assert_not_called()
 
     def test_relative_and_missing_paths_fail(self):
         with self.assertRaises(slack_watch.WatchError):
@@ -125,6 +137,25 @@ class RoutineExpansionTest(unittest.TestCase):
             extra="  ignore_people: true\n  channels: [C0EXAMPLE09]\n"
         ))
         self.assertTrue(any("cannot be combined" in p for p in problems))
+
+    def test_expansion_is_idempotent_and_public(self):
+        loaded = self.routine(extra="  ignore_people: true\n")
+        again = config.expand_watch_files(dict(loaded))
+        self.assertEqual(again["source"], loaded["source"])
+        self.assertEqual(config.validate(again), [])
+
+    def test_missing_file_is_tolerated_for_examples_only(self):
+        raw = {
+            "id": "x", "analyze": {"provider": "g", "model": "m",
+                                   "instruction": "i"},
+            "output": {"vault_dir": self.tmp.name, "slug_prefix": "s"},
+            "source": {"kind": "slack", "watch": "~/absent-watch.yaml"},
+        }
+        import copy
+        strict = config.expand_watch_files(copy.deepcopy(raw))
+        self.assertTrue(config.validate(strict))
+        lenient = config.expand_watch_files(copy.deepcopy(raw), missing_ok=True)
+        self.assertEqual(config.validate(lenient), [])
 
     def test_watch_on_other_kinds_is_rejected(self):
         problems = config.validate(self.routine(kind="gchat"))

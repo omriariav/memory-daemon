@@ -33,6 +33,8 @@ def main():
             failed += 1
             continue
         data.setdefault("id", path.stem.lstrip("_"))
+        # Examples may name a private watch file that does not exist here.
+        config.expand_watch_files(data, missing_ok=True)
         problems = config.validate(data)
         print(f"{'✗' if problems else '✓'} {path.name}")
         for problem in problems:

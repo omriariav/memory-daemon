@@ -425,7 +425,7 @@ def discover(base_dir, routine_id=None):
             raise RoutineError(f"{path.name}: top level must be a mapping, got {type(data).__name__}")
         data["_source_file"] = str(path)
         data.setdefault("id", path.stem)
-        _expand_watch_files(data)
+        expand_watch_files(data)
         found.append(data)
 
     seen = {}
@@ -445,21 +445,31 @@ def discover(base_dir, routine_id=None):
     return found
 
 
-def _expand_watch_files(routine):
-    """Apply each source's `watch:` file; a failure is kept for validate()."""
+def expand_watch_files(routine, missing_ok=False):
+    """Apply each source's `watch:` file in place; idempotent.
+
+    A failure is kept on the source as `_watch_error` for validate() to report.
+    `missing_ok` (documentation examples) tolerates an absent file: the block
+    is marked `_watch_unread` and validated without its watched ids.
+    """
     if isinstance(routine.get("sources"), list):
         blocks = routine["sources"]
         for index, block in enumerate(blocks):
-            if isinstance(block, dict) and "watch" in block:
-                blocks[index] = _expanded(block)
-    elif isinstance(routine.get("source"), dict) and "watch" in routine["source"]:
-        routine["source"] = _expanded(routine["source"])
+            if isinstance(block, dict):
+                blocks[index] = _expanded(block, missing_ok)
+    elif isinstance(routine.get("source"), dict):
+        routine["source"] = _expanded(routine["source"], missing_ok)
+    return routine
 
 
-def _expanded(source):
+def _expanded(source, missing_ok=False):
+    if "watch" not in source or source.get("_watch_done"):
+        return source
+    if missing_ok and not Path(str(source["watch"])).expanduser().exists():
+        return dict(source, _watch_unread=True)
     merged, error = slack_watch.expand(source)
+    merged = dict(merged, _watch_done=True)
     if error:
-        merged = dict(merged)
         merged["_watch_error"] = error
     return merged
 
@@ -1246,7 +1256,10 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    unknown_source = set(source) - SOURCE_KEYS - {"_watch_error"}
+    unknown_source = {
+        key for key in set(source) - SOURCE_KEYS
+        if not str(key).startswith("_watch")
+    }
     if unknown_source:
         problems.append(
             f"{prefix} has unknown key(s) {', '.join(sorted(unknown_source))}"
@@ -1473,6 +1486,7 @@ def _validate_source(routine, source, prefix):
             not configured
             and not source.get("include_mentions")
             and not active_conversations
+            and not source.get("_watch_unread")
         ):
             problems.append(
                 f"{prefix}: source.kind 'slack' needs channels, ada_channels, "

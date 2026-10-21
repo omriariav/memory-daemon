@@ -16,10 +16,13 @@ candidate ids.
       - C0EXAMPLE01
     bootstrap: 3d             # first-run look-back when no cursor exists
 """
+import os
 import re
 from pathlib import Path
 
 import yaml
+
+from .shell import log
 
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
@@ -64,6 +67,9 @@ def load(path):
     if not path.is_absolute():
         raise WatchError("watch path must be absolute or start with ~")
     try:
+        if os.stat(path).st_mode & 0o077:
+            log("slack watch file is readable by group or others; "
+                "run chmod 600 on it")
         with open(path) as handle:
             data = yaml.safe_load(handle)
     except OSError as exc:
