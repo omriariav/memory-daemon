@@ -1493,14 +1493,25 @@ How a run works:
    (`[truncated]`); omitted older messages are noted in the body. A fetched
    message must carry the thread id the search reported.
 
-The cursor is one watermark for the query. A run commits the older of its start,
-the newest message of the oldest deferred thread and, when a failed item holds
-it, that item's date. Gmail lists newest first, so a search that hits
-`max_search_pages` leaves the older end of the window unread; the cursor then
-stays where it was (a warning says so; raise `max_search_pages` or narrow the
-query). A thread whose newest message fails to read three times, or cannot be
-parsed, is recorded in the ledger as unreadable (`gmail_mcp: unreadable`, no
-text); a session-wide outage counts against no thread.
+The cursor is one watermark for the query: a run commits the older of its
+start, the newest message of the oldest deferred thread and, when a failed item
+holds it, that item's date. Search membership is authoritative (Gmail's `after:`
+uses the received time), so the sender's `Date` header never drops a hit; it
+only orders and settles messages, clamped to the search window. Gmail lists
+newest first, so a search that hits `max_search_pages` leaves the older end of
+its window unread. That range is kept as backfill state
+(`state/gmail-mcp-backfill.json`) and drained over the following runs with a
+`before:<oldest epoch read>` search of its own, at most `max_search_pages`
+pages per run, while the cursor moves on and new windows keep listing. The
+state is removed once the range is drained. A thread whose newest message
+fails to read three times, or cannot be parsed, is recorded in the ledger as
+unreadable (`gmail_mcp: unreadable`, no text); a session-wide outage counts
+against no thread.
+
+Do not run `gmail` and `gmail_mcp` over the same mailbox scope: both write
+`gmail:<thread id>` memories, but their ledger ids differ (message id versus
+`<thread>@<newest message>`), so each processes the thread and they overwrite
+each other's entry.
 
 `--dry-run` only logs the plan (no bridge call); `--count-only` lists and
 estimates the planned message-read sessions and cost like `slack_mcp`.

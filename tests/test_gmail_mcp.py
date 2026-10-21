@@ -1,4 +1,13 @@
-"""Gmail via a connector: parsing, listing, watermarks, bounds, config, runs."""
+"""Gmail via a connector: parsing, listing, watermarks, bounds, config, runs.
+
+Fixtures follow the connector's real text formats: `search` returns
+`Found N message(s):` then blocks of ID / Thread ID / Subject / From / Date /
+Snippet separated by a `---` line and an optional `(Use page_token: ...)`
+trailer; `fetch_message` returns a header block, the plain text part, the raw
+HTML part, then an `Attachments:` list. Observed variants covered here: a
+`Date` header with a trailing zone comment (`+0000 (UTC)`), and HTML-only
+messages whose whole body is markup starting with an uppercase `<!DOCTYPE html>`.
+"""
 import datetime
 import email.utils
 import json
@@ -326,6 +335,56 @@ class MessageParserTest(unittest.TestCase):
         self.assertEqual(msg["thread"], hexid(1))
         self.assertEqual(msg["headers"]["from"], "Ann Example <ann@example.com>")
 
+    def test_date_with_a_trailing_zone_comment(self):
+        self.assertEqual(
+            gmail_mcp.parse_date("Tue, 20 Oct 2026 10:14:35 +0000 (UTC)"),
+            gmail_mcp.parse_date("Tue, 20 Oct 2026 10:14:35 +0000"),
+        )
+        text = search_text([block(1, 1, T1).replace(
+            f"Date: {rfc(T1)}", f"Date: {rfc(T1, 0)} (UTC)")])
+        self.assertEqual(gmail_mcp.parse_search(text)[0][0]["epoch"], T1)
+
+    def test_plain_text_line_that_looks_like_html_never_truncates(self):
+        body = (
+            "Please review the page source:\n\n  <html lang=\"en\">\n"
+            "  <head></head>\n\nThen tell me what you think.\n\nThanks"
+        )
+        msg = gmail_mcp.parse_message(message_text(body=body))
+        self.assertIn("Then tell me what you think.", msg["body"])
+        self.assertIn('<html lang="en">', msg["body"])
+        doc = "<!DOCTYPE html>\n<html>\n<body>text</body>\n</html>\n"
+        again = gmail_mcp.parse_message(message_text(
+            body="See this:\n" + doc + "\nand after it more prose."))
+        self.assertIn("more prose", again["body"])
+
+    def test_trailing_html_part_without_a_doctype_is_cut(self):
+        dup = '<div dir="ltr">Plain body text.<br><br>--<br>Ann</div>'
+        msg = gmail_mcp.parse_message(message_text(
+            body="Plain body text.\n\n--\nAnn", html=dup))
+        self.assertEqual(msg["body"], "Plain body text.\n\n--\nAnn")
+        # An unbalanced or prose-bearing tail is left alone.
+        msg = gmail_mcp.parse_message(message_text(
+            body="Intro\n<div>half open\nmore words"))
+        self.assertIn("more words", msg["body"])
+
+    def test_uppercase_doctype_html_only_body_becomes_text(self):
+        markup = (
+            "<!DOCTYPE html>\n<html><head><style>p{margin:0}</style></head>"
+            "<body><span style=\"display:none;max-height:0\">preheader "
+            "junk</span><p>Hello &amp; welcome</p><p>Open "
+            "<a href=\"https://t.example.com/track?x=1\">the portal</a> or "
+            "<a href=\"https://t.example.com/track?x=2\">"
+            "https://t.example.com/track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "</a></p></body></html>"
+        )
+        msg = gmail_mcp.parse_message(message_text(
+            body=markup, attachments=[("a.pdf", "application/pdf", 5)]))
+        self.assertIn("Hello & welcome", msg["body"])
+        self.assertIn("Open the portal", msg["body"])
+        for dropped in ("preheader", "margin", "track", "<", "ZZZZ"):
+            self.assertNotIn(dropped, msg["body"])
+        self.assertEqual(msg["attachments"][0][0], "a.pdf")
+
     def test_date_parsing_honours_offsets(self):
         self.assertEqual(
             gmail_mcp.parse_date("Wed, 21 Oct 2026 12:45:24 +0300"),
@@ -416,13 +475,27 @@ class ListingTest(BridgeTestCase):
         gmail_mcp.candidates(source(min_seconds_between_sessions=3))
         self.assertEqual(self.slept, [3])
 
-    def test_hits_outside_the_window_are_dropped(self):
+    def test_search_membership_is_authoritative_over_the_date_header(self):
+        # A message listed late carries a sender Date hours older than the
+        # window; a future-dated header is clamped. Neither is dropped.
         listing = self.list([
-            {"mid": 1, "thread": 1, "epoch": AFTER - 3600},
+            {"mid": 1, "thread": 1, "epoch": AFTER - 7200},
             {"mid": 2, "thread": 2, "epoch": int(NOW) + 7200},
             {"mid": 3, "thread": 3, "epoch": T1},
         ], settle_minutes=0)
-        self.assertEqual([c["raw"]["thread_id"] for c in listing], [hexid(3)])
+        self.assertEqual(
+            {c["raw"]["thread_id"] for c in listing},
+            {hexid(1), hexid(2), hexid(3)},
+        )
+        stamps = {c["raw"]["thread_id"]: c["raw"]["newest_ts"] for c in listing}
+        self.assertEqual(stamps[hexid(1)], AFTER)
+        self.assertEqual(stamps[hexid(2)], int(NOW))
+
+    def test_a_future_dated_message_settles_instead_of_processing(self):
+        listing = self.list([
+            {"mid": 2, "thread": 2, "epoch": int(NOW) + 7200},
+        ])
+        self.assertTrue(listing[0]["raw"]["_deferred"])
 
     def test_unchanged_thread_in_ledger_is_not_relisted_but_new_message_is(self):
         store = mock.Mock()
@@ -496,6 +569,30 @@ class ListingTest(BridgeTestCase):
         self.assertEqual(self.connector.tools_called(), [SEARCH])
 
 
+def ranged_search(messages, calls=None, page=2):
+    """A Gmail that lists newest first and honours after:, before: and tokens.
+
+    `messages` are (message number, thread number, received epoch).
+    """
+    def search(args):
+        if calls is not None:
+            calls.append(args["query"])
+        low = int(re.search(r"after:(\d+)", args["query"]).group(1))
+        found = re.search(r"before:(\d+)", args["query"])
+        high = int(found.group(1)) if found else 10 ** 12
+        rows = sorted(
+            (x for x in messages if low <= x[2] < high), key=lambda x: -x[2]
+        )
+        start = int(args.get("page_token") or 0)
+        more = start + page < len(rows)
+        return search_text(
+            [{"mid": a, "thread": b, "epoch": c}
+             for a, b, c in rows[start:start + page]],
+            token=str(start + page) if more else None,
+        )
+    return search
+
+
 class WatermarkTest(BridgeTestCase):
     def run_listing(self, hits_by_page, **over):
         self.connector.search = lambda a: hits_by_page[a.get("page_token")]
@@ -532,16 +629,81 @@ class WatermarkTest(BridgeTestCase):
                          [False, False, True])
         self.assertEqual(runtime["watermarks"], {"mail": T3})
 
-    def test_capped_newest_first_search_holds_the_cursor(self):
+    def test_capped_newest_first_search_keeps_the_rest_as_backfill(self):
         pages = {
             None: search_text([{"mid": 3, "thread": 3, "epoch": T3}], token="P2"),
             "P2": search_text([{"mid": 2, "thread": 2, "epoch": T2}], token="P3"),
         }
         _, runtime = self.run_listing(pages, max_search_pages=2,
                                       settle_minutes=0)
-        overlap = 3600
-        self.assertEqual(runtime["watermarks"], {"mail": AFTER + overlap})
+        # The cursor is free to advance; the unread older part is remembered.
+        self.assertEqual(runtime["watermarks"], {})
+        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
+        saved = gmail_mcp._load_backfill(cursor_id)
+        self.assertEqual(saved["after"], AFTER)
+        self.assertEqual(saved["before"], T2 + gmail_mcp.FUTURE_SLACK_SECONDS)
         self.assertEqual(len(self.connector.calls), 2)
+
+    def test_backfill_drains_over_runs_while_new_windows_still_list(self):
+        # 9 messages, newest first, 2 per page, 2 pages per query: a run lists
+        # at most 4 from each of the new window and the backfill range.
+        base = int(NOW) - 6 * 3600
+        messages = [(n, n, base + n * 600) for n in range(1, 10)]
+        calls = []
+        search = ranged_search(messages, calls)
+        self.connector.search = search
+        done = set()
+        store = mock.Mock()
+        store.get = lambda i: {"rule_id": "r"} if i in done else None
+        listed = []
+        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
+        for run in range(1, 6):
+            gmail_mcp._last_session[0] = 0.0
+            before = len(calls)
+            since = {} if run == 1 else {
+                "mail": gmail_mcp._rfc3339(int(NOW) - 100)}
+            if run == 4:
+                # a new message arrives while the backfill is still pending
+                messages.append((10, 10, int(NOW) - 50))
+            listing = gmail_mcp.candidates(source(
+                _processed=store, settle_minutes=0, max_search_pages=2,
+                _since_map=since,
+            ))
+            self.assertLessEqual(len(calls) - before, 4)
+            listed.extend(c["raw"]["thread_id"] for c in listing)
+            done.update(c["id"] for c in listing)
+            if run >= 4 and gmail_mcp._load_backfill(cursor_id) is None:
+                break
+        self.assertEqual(
+            sorted(listed), sorted(hexid(n) for n in range(1, 11)))
+        self.assertEqual(len(listed), len(set(listed)))
+        self.assertIsNone(gmail_mcp._load_backfill(cursor_id))
+        self.assertTrue(any("before:" in q for q in calls))
+
+    def test_dry_run_and_count_only_never_write_backfill(self):
+        pages = {
+            None: search_text([{"mid": 3, "thread": 3, "epoch": T3}], token="P2"),
+            "P2": search_text([{"mid": 2, "thread": 2, "epoch": T2}], token="P3"),
+        }
+        self.run_listing(pages, max_search_pages=2, settle_minutes=0,
+                         _count_only=True, _dry_run=True)
+        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
+        self.assertIsNone(gmail_mcp._load_backfill(cursor_id))
+
+    def test_old_deferred_backfill_threads_are_kept_as_backfill(self):
+        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
+        gmail_mcp._save_backfill(cursor_id, {"after": T1 - 10, "before": T3 + 10})
+        self.connector.search = ranged_search(
+            [(1, 1, T1), (2, 2, T2), (3, 3, T3)], page=50)
+        listing = gmail_mcp.candidates(source(
+            max_threads_per_run=1, settle_minutes=0,
+            _since_map={"mail": gmail_mcp._rfc3339(int(NOW) - 100)},
+        ))
+        self.assertEqual([bool(c["raw"].get("_deferred")) for c in listing],
+                         [False, True, True])
+        saved = gmail_mcp._load_backfill(cursor_id)
+        self.assertTrue(saved["after"] < T2 < saved["before"])
+        self.assertTrue(saved["after"] < T3 < saved["before"])
 
     def test_capped_oldest_first_search_resumes_after_the_prefix(self):
         pages = {

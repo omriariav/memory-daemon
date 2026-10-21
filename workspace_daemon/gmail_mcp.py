@@ -238,8 +238,10 @@ class Hits(list):
 
 def parse_date(raw):
     """Epoch seconds of an RFC 2822 date (offsets honoured), or None."""
+    # `Tue, 20 Oct 2026 10:14:35 +0000 (UTC)`: drop the zone comment.
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw or "")
     try:
-        when = email.utils.parsedate_to_datetime((raw or "").strip())
+        when = email.utils.parsedate_to_datetime(raw.strip())
     except (TypeError, ValueError, IndexError):
         return None
     if when is None:
@@ -338,13 +340,30 @@ _HEADER_LINE = re.compile(r"\A([A-Za-z][A-Za-z0-9 -]{0,40}): ?(.*)\Z")
 _HEADER_KEYS = {
     "subject", "from", "to", "cc", "date", "thread id",
 }
-_HTML_START = re.compile(
+_DOC_START = re.compile(
     r"^[ \t]*(?:<!doctype\s+html|<html[\s>])", re.I | re.M
+)
+_TAG_LINE = re.compile(r"^[ \t]*<[A-Za-z!][^>]*>", re.M)
+_HIDDEN_STYLE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden|mso-hide\s*:\s*all"
+    r"|max-height\s*:\s*0(?:px)?\s*(?:;|$)|font-size\s*:\s*0(?:px)?\s*(?:;|$)",
+    re.I,
 )
 _ATTACH_HEAD = re.compile(r"\n+[ \t]*Attachments:[ \t]*\n(?=- Filename: )")
 _ATTACH_ID = re.compile(r"^[ \t]*Attachment ID:.*$", re.M)
 _INVISIBLE = re.compile("[​-‏⁠­͏﻿]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+VOID_TAGS = {
+    "br", "hr", "img", "meta", "link", "input", "area", "base", "col",
+    "embed", "source", "track", "wbr", "!doctype",
+}
+# Elements whose end tag is optional: they never count towards balance.
+OPTIONAL_END = {
+    "p", "li", "tr", "td", "th", "dt", "dd", "option", "thead", "tbody",
+    "tfoot", "colgroup", "body", "head",
+}
 
 
 class _TextExtractor(html.parser.HTMLParser):
@@ -359,24 +378,113 @@ class _TextExtractor(html.parser.HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.skip = 0
+        self.hide_tag = None
+        self.hide_depth = 0
+        self.in_link = 0
 
     def handle_starttag(self, tag, attrs):
+        if self.hide_tag:
+            if tag == self.hide_tag:
+                self.hide_depth += 1
+            return
         if tag in self.SKIP:
             self.skip += 1
-        elif tag in self.BLOCK:
+            return
+        attrs = dict(attrs)
+        if tag not in VOID_TAGS and (
+            "hidden" in attrs or _HIDDEN_STYLE.search(attrs.get("style") or "")
+        ):
+            self.hide_tag, self.hide_depth = tag, 1
+            return
+        if tag == "a":
+            self.in_link += 1
+        if tag in self.BLOCK:
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
+        if self.hide_tag:
+            if tag == self.hide_tag:
+                self.hide_depth -= 1
+                if self.hide_depth <= 0:
+                    self.hide_tag = None
+            return
         if tag in self.SKIP:
             self.skip = max(0, self.skip - 1)
+        elif tag == "a":
+            self.in_link = max(0, self.in_link - 1)
         elif tag in self.BLOCK:
             self.parts.append("\n")
         elif tag in ("td", "th"):
             self.parts.append(" ")
 
     def handle_data(self, data):
-        if not self.skip:
-            self.parts.append(data)
+        if self.skip or self.hide_tag:
+            return
+        if self.in_link and re.fullmatch(r"\s*https?://\S{40,}\s*", data):
+            return  # a tracking URL shown as link text
+        self.parts.append(data)
+
+
+class _Balance(html.parser.HTMLParser):
+    """Whether a text is markup only: balanced tags, no loose text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.loose = False
+        self.broken = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in VOID_TAGS and tag not in OPTIONAL_END:
+            self.depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        pass
+
+    def handle_endtag(self, tag):
+        if tag in VOID_TAGS or tag in OPTIONAL_END:
+            return
+        self.depth -= 1
+        if self.depth < 0:
+            self.broken = True
+
+    def handle_data(self, data):
+        if not self.depth and data.strip():
+            self.loose = True
+
+
+def _is_markup_block(block):
+    """A block that is entirely markup up to its end."""
+    stripped = block.strip()
+    if not stripped.startswith("<") or not stripped.endswith(">"):
+        return False
+    checker = _Balance()
+    try:
+        checker.feed(stripped)
+        checker.close()
+    except Exception:
+        return False
+    return checker.depth == 0 and not checker.loose and not checker.broken
+
+
+def split_markup(body):
+    """(text, markup): cut a trailing block that is markup to the very end.
+
+    A raw HTML part follows the plain text. It is cut only when everything
+    from its first line to the end is markup (a document ending with </html>,
+    or a balanced tag block such as a trailing <div>...</div>), so a line that
+    merely looks like a tag inside prose never truncates the text.
+    """
+    starts = [m.start() for m in _DOC_START.finditer(body)]
+    for start in starts:
+        rest = body[start:]
+        if re.search(r"</html\s*>\s*\Z", rest, re.I) or _is_markup_block(rest):
+            return body[:start], rest
+    tags = [m.start() for m in _TAG_LINE.finditer(body)]
+    for start in tags[:60]:
+        if _is_markup_block(body[start:]):
+            return body[:start], body[start:]
+    return body, ""
 
 
 def _tidy(text):
@@ -463,11 +571,7 @@ def parse_message(text):
     if not re.fullmatch(r"[0-9a-f]{16}", thread):
         raise GmailMcpParseError("message thread id is malformed")
     body, attachments = _attachments(body)
-    found = _HTML_START.search(body)
-    markup = ""
-    if found:
-        markup = body[found.start():]
-        body = body[:found.start()]
+    body, markup = split_markup(body)
     plain = _tidy(html.unescape(body))
     if not plain and markup:
         plain = strip_html(markup)
@@ -572,41 +676,48 @@ def _session(cfg, tool, pins, calls, what, required):
     return texts
 
 
-def _query_text(cfg, after):
-    return f"({cfg['query']}) after:{int(after)}"
+def _query_text(cfg, after, before=None):
+    text = f"({cfg['query']}) after:{int(after)}"
+    if before:
+        text += f" before:{int(before)}"
+    return text
 
 
-def _search_pins(cfg, after):
-    return {"query": _query_text(cfg, after), "max_results": SEARCH_LIMIT}
+def _search_pins(cfg, after, before=None):
+    return {"query": _query_text(cfg, after, before),
+            "max_results": SEARCH_LIMIT}
 
 
-def _search_args(cfg, after, token=None):
-    args = _search_pins(cfg, after)
+def _search_args(cfg, after, token=None, before=None):
+    args = _search_pins(cfg, after, before)
     if token:
         args["page_token"] = token
     return args
 
 
-def _valid_hit(hit, after, now):
-    """Cross-check a parsed hit against the window the query asked for."""
-    return after - FUTURE_SLACK_SECONDS <= hit["epoch"] <= now + FUTURE_SLACK_SECONDS
+def _clamp(hit, low, high):
+    """Search membership is authoritative (Gmail's `after:` uses the received
+    time, not the sender's Date header); the header only orders and settles,
+    so its date is clamped to the window instead of dropping the hit."""
+    return dict(hit, epoch=min(max(hit["epoch"], low), high))
 
 
-def _search_all(cfg, after, now):
-    """Run the query to completion or its page cap.
+def _search_all(cfg, after, now, before=None):
+    """Run one query to completion or its page cap.
 
     Returns (hits in order, trusted epochs in order, capped).
     """
+    high = min(before, now) if before else now
     hits = []
     seen = set()
     stamps = []
     token = None
     capped = False
     for page in range(cfg["max_search_pages"]):
-        args = _search_args(cfg, after, token)
+        args = _search_args(cfg, after, token, before)
         text = _session(
-            cfg, cfg["search_tool"], _search_pins(cfg, after), [args],
-            "search", [cfg["search_tool"]],
+            cfg, cfg["search_tool"], _search_pins(cfg, after, before),
+            [args], "search", [cfg["search_tool"]],
         )[0]
         if text is None:
             raise claude_bridge.BridgeError(
@@ -615,14 +726,14 @@ def _search_all(cfg, after, now):
         found, token = parse_search(text)
         trusted = getattr(found, "trusted", None)
         stamps.extend(
-            h["epoch"] for h in (found if trusted is None else trusted)
-            if _valid_hit(h, after, now)
+            _clamp(h, after, high)["epoch"]
+            for h in (found if trusted is None else trusted)
         )
         for hit in found:
-            if hit["id"] in seen or not _valid_hit(hit, after, now):
+            if hit["id"] in seen:
                 continue
             seen.add(hit["id"])
-            hits.append(hit)
+            hits.append(_clamp(hit, after, high))
         if token and not found:
             log("gmail_mcp: search returned an empty page with a page "
                 "token; treating it as the end")
@@ -697,6 +808,79 @@ def _candidate(candidate_id, source_id, thread, group, plan, batch,
     }
 
 
+# --- backfill ----------------------------------------------------------------
+# Gmail lists newest first, so a search that hits its page cap leaves the
+# older end of its window unread. That range is kept as backfill state and
+# drained over the following runs with `before:`, while the cursor moves on.
+
+def _backfill_path():
+    return Path(_base_dir) / "state" / "gmail-mcp-backfill.json"
+
+
+def _load_backfill(cursor_id):
+    """{"after": epoch, "before": epoch} still to read, or None."""
+    if _base_dir is None:
+        return None
+    try:
+        data = json.loads(_backfill_path().read_text())
+        entry = data.get(cursor_id)
+        low, high = int(entry["after"]), int(entry["before"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return {"after": low, "before": high} if low < high else None
+
+
+def _save_backfill(cursor_id, entry):
+    if _base_dir is None:
+        return
+    path = _backfill_path()
+    try:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if entry:
+            data[cursor_id] = entry
+        else:
+            data.pop(cursor_id, None)
+        if data:
+            state.write_atomic(path, json.dumps(data, sort_keys=True), mode=0o600)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _is_ascending(stamps):
+    return len(stamps) > 1 and stamps == sorted(stamps) and stamps[0] != stamps[-1]
+
+
+def _hull(ranges):
+    ranges = [r for r in ranges if r[0] < r[1]]
+    if not ranges:
+        return None
+    return {"after": min(r[0] for r in ranges),
+            "before": max(r[1] for r in ranges)}
+
+
+def _unread_range(low, high, stamps):
+    """The part of [low, high) a capped search left unread, as (low, high).
+
+    Newest first: everything newer than the oldest message read was seen, so
+    the rest is below it (with a margin for received-vs-Date skew, always
+    shrinking the range). Oldest first: the rest is above the newest read.
+    """
+    if _is_ascending(stamps):
+        return (max(low + 1, int(max(stamps)) - 1), high)
+    oldest = int(min(stamps)) if stamps else high - 1
+    bound = oldest + FUTURE_SLACK_SECONDS
+    if bound >= high:
+        bound = oldest + 1
+    return (low, min(bound, high - 1))
+
+
 def candidates(source):
     """List new or changed thread candidates; see the module docstring."""
     cfg = settings(source)
@@ -708,7 +892,25 @@ def candidates(source):
     if source.get("_dry_run") and not source.get("_count_only"):
         log("gmail_mcp dry-run: would run 1 search query; no bridge call made")
         return Listing()
+    cursor_id = cursor_ids(source)[CURSOR_KEY]
+    saving = not source.get("_count_only")
     hits, stamps, capped = _search_all(cfg, after, now)
+    ascending = capped and _is_ascending(stamps)
+    unread = []
+    if capped and not ascending:
+        # Newest first: the older end of the window was not reached.
+        unread.append(_unread_range(after, int(now) + 1, stamps))
+    backfill = _load_backfill(cursor_id)
+    if backfill:
+        more, more_stamps, more_capped = _search_all(
+            cfg, backfill["after"], now, backfill["before"]
+        )
+        known = {h["id"] for h in hits}
+        hits.extend(h for h in more if h["id"] not in known)
+        if more_capped:
+            unread.append(_unread_range(
+                backfill["after"], backfill["before"], more_stamps
+            ))
     groups = _group(cfg, hits)
     processed = source.get("_processed")
     settle_before = now - cfg["settle_minutes"] * 60
@@ -746,26 +948,28 @@ def candidates(source):
     # Watermark: nothing at or after the oldest deferred thread, and, for a
     # search that hit its page cap, nothing past what was fully read.
     values = []
-    deferred_floor = min((row[0] for row in waiting + over), default=None)
+    deferred = waiting + over
+    # A deferred thread older than the window can only come from a backfill
+    # listing: the cursor is already past it, so it is kept as backfill too.
+    for row in deferred:
+        if row[0] < after:
+            unread.append((row[0] - 1, row[0] + 1))
+    deferred_floor = min(
+        (row[0] for row in deferred if row[0] >= after), default=None
+    )
     if deferred_floor is not None:
         values.append(deferred_floor)
     overlap = _seconds(cfg["overlap"])
-    if capped:
-        ascending = (
-            len(stamps) > 1 and stamps == sorted(stamps)
-            and stamps[0] != stamps[-1]
-        )
-        if ascending:
-            # Oldest first: the read part is a prefix. Resume just before its
-            # newest message (the next run lists from mark - overlap).
-            values.append(int(max(stamps)) - 1 + overlap)
-        else:
-            # Newest first: the unread part is the older end of the window, so
-            # the cursor cannot advance without skipping it.
-            values.append(after + overlap)
-            log("gmail_mcp: search hit max_search_pages newest first; older "
-                "results were not reached and the cursor stays put "
-                "(raise max_search_pages or narrow the query)")
+    if ascending:
+        # Oldest first: the read part is a prefix. Resume just before its
+        # newest message (the next run lists from mark - overlap).
+        values.append(int(max(stamps)) - 1 + overlap)
+    pending = _hull(unread)
+    if saving and not source.get("_dry_run"):
+        _save_backfill(cursor_id, pending)
+    if pending:
+        log("gmail_mcp: older results not yet read are kept as backfill "
+            "and drained over the next runs")
     runtime = source.get("_gmail_mcp_runtime")
     if runtime is not None:
         runtime["watermarks"] = {CURSOR_KEY: min(values)} if values else {}
