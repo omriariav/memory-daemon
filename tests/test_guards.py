@@ -703,6 +703,8 @@ class UsesClaudeBridgeTest(unittest.TestCase):
         identity = routine("/v", memory={"identity": {"provider": "slack_mcp"}})
         self.assertTrue(uses(identity))
         self.assertTrue(uses({"id": "c", "maintenance": {"kind": "calendar_cache"}}))
+        self.assertTrue(uses({"id": "c", "maintenance": {
+            "kind": "slack_discovery"}}))
         self.assertFalse(uses({"id": "c", "maintenance": {
             "kind": "slack_conversation_census"}}))
         mcp = routine("/v")
