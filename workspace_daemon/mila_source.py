@@ -374,8 +374,8 @@ def _copies(left, right, zone):
     if _overlaps_substantially(left["interval"], right["interval"]):
         return True
     return (
-        left.get("duration") is not None
-        and right.get("duration") is not None
+        (left.get("duration") or 0) > 0
+        and (right.get("duration") or 0) > 0
         and abs(left["duration"] - right["duration"]) <= DUPLICATE_DURATION_SECONDS
         and _same_day(left["interval"][0], right["interval"][0], zone)
         and left.get("title") is not None
@@ -605,7 +605,29 @@ def _disk_path(base_dir, key):
     return Path(base_dir) / "state" / "calendar_windows" / f"{digest}.json"
 
 
+def _prune(base_dir, now):
+    """Delete cached windows past their TTL (any key, any state)."""
+    directory = Path(base_dir) / "state" / "calendar_windows"
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            fetched = _parse_instant(json.loads(path.read_text())["fetched_at"])
+            expired = (now - fetched).total_seconds() > WINDOW_CACHE_TTL
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            expired = True
+        if expired:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def _disk_load(base_dir, key, now):
+    if base_dir is not None:
+        _prune(base_dir, now)
     if base_dir is None or key[5] >= now:  # only fully past windows persist
         return None
     try:
@@ -622,7 +644,10 @@ def _disk_load(base_dir, key, now):
 
 
 def _disk_store(base_dir, key, now, events):
-    if base_dir is None or key[5] >= now:
+    if base_dir is None:
+        return
+    _prune(base_dir, now)
+    if key[5] >= now:
         return
     try:
         state_mod.write_atomic(
@@ -937,6 +962,10 @@ def _rule_match(item, events):
     # is for the model to judge, never for a rule.
     if any(event.get("response_status") == "declined" for event in titled):
         return None
+    if not _meaningful_tokens(item.get("title")):
+        # A generic title ("Meeting", "New recording") is not identity: it may
+        # only confirm an event the recording's time already supports.
+        titled = [event for event in titled if event in plausible]
     if len(titled) == 1:
         reason = (
             "title and time match" if titled[0] in plausible else "title match"
@@ -1036,10 +1065,14 @@ def _copy_of(item, entries, zone):
             continue
         if _overlaps_substantially(mine["interval"], prior["interval"]):
             return prior["source_id"]
-        duration = prior.get("duration")
+        try:
+            duration = float(prior.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
         if (
-            duration is not None
-            and abs(float(duration) - mine["duration"])
+            duration > 0
+            and mine["duration"] > 0
+            and abs(duration - mine["duration"])
             <= DUPLICATE_DURATION_SECONDS
             and _same_day(mine["interval"][0], prior["interval"][0], zone)
         ):

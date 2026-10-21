@@ -1445,8 +1445,8 @@ class MilaConfigTest(unittest.TestCase):
 class ImportTimeScenarioTest(unittest.TestCase):
     """One meeting captured twice; the second copy's createdAt is import time."""
 
-    E1 = ("E1", "X // Y - intro", "2026-07-27T08:00:00Z", "2026-07-27T08:30:00Z")
-    E2 = ("E2", "X / Z - intro", "2026-07-27T09:00:00Z", "2026-07-27T09:30:00Z")
+    E1 = ("E1", "Xavier // Yolanda - intro", "2026-07-27T08:00:00Z", "2026-07-27T08:30:00Z")
+    E2 = ("E2", "Xavier / Zed - intro", "2026-07-27T09:00:00Z", "2026-07-27T09:30:00Z")
 
     def setUp(self):
         mila_source._reset_run()
@@ -1458,10 +1458,10 @@ class ImportTimeScenarioTest(unittest.TestCase):
         self.records = [
             record("A", source="voiceMemo", audio="A.m4a",
                    created="2026-07-27T08:02:49Z", duration=1712,
-                   title="X -- Y - intro", segments=seg),
+                   title="Xavier -- Yolanda - intro", segments=seg),
             record("B", source="systemAudio", audio="B.m4a",
                    created="2026-07-27T08:56:36Z", duration=1712,
-                   title="X -- Y - intro", segments=seg),
+                   title="Xavier -- Yolanda - intro", segments=seg),
         ]
         self.recordings.write_text(json.dumps(self.records))
         self.source = connector_source(
@@ -1486,7 +1486,7 @@ class ImportTimeScenarioTest(unittest.TestCase):
                 for eid, title, start, end in (self.E1, self.E2)]
 
     def item(self, rid, start, end, duration=1712):
-        it = match_item(title="X -- Y - intro", events=self.events())
+        it = match_item(title="Xavier -- Yolanda - intro", events=self.events())
         it["source_id"] = f"mila:{rid}"
         it["frontmatter"].update(
             mila_recording_start=start, mila_recording_end=end,
@@ -1820,3 +1820,89 @@ class ClaudeMatchLeakTest(unittest.TestCase):
         ), self.assertRaises(RuntimeError) as ctx:
             mila_source.match_calendar(routine("/tmp/s", source), source, item)
         self.assertNotIn("TRANSCRIPT-LEAK", str(ctx.exception))
+
+
+class FollowUpTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+
+    def test_generic_title_never_matches_outside_the_plausible_range(self):
+        far = event("far", "Meeting", start="2026-07-27T23:00:00Z",
+                    end="2026-07-27T23:30:00Z")
+        for title in ("Meeting", "Call", "New recording"):
+            mila_source._reset_run()
+            reply = {"matched": False, "event_id": None,
+                     "confidence": "low", "reason": ""}
+            with mock.patch.object(
+                local_llm, "chat_json", return_value=reply
+            ) as chat:
+                accepted, _ = mila_source.match_calendar(
+                    routine("/tmp/s", local_source()), local_source(),
+                    match_item(title=title, events=[far]),
+                )
+            self.assertFalse(accepted, msg=title)
+            chat.assert_called_once()
+
+    def test_generic_title_still_confirms_a_plausible_event(self):
+        mila_source._reset_run()
+        accepted, match = mila_source.match_calendar(
+            routine("/tmp/s", local_source()), local_source(),
+            match_item(title="Meeting",
+                       events=[event("near", "Meeting")]),
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(match["reason"], "title and time match")
+
+    def test_missing_duration_never_makes_copies(self):
+        zone = datetime.timezone.utc
+        a = {"interval": (datetime.datetime(2026, 7, 27, 8, tzinfo=zone),
+                          datetime.datetime(2026, 7, 27, 8, 5, tzinfo=zone)),
+             "duration": 0, "title": "alpha"}
+        b = {"interval": (datetime.datetime(2026, 7, 27, 12, tzinfo=zone),
+                          datetime.datetime(2026, 7, 27, 12, 5, tzinfo=zone)),
+             "duration": 0, "title": "alpha"}
+        self.assertFalse(mila_source._copies(a, b, zone))
+        b["duration"] = None
+        self.assertFalse(mila_source._copies(a, b, zone))
+        mine = match_item(events=[])
+        mine["frontmatter"]["mila_duration_seconds"] = 0
+        mine["frontmatter"]["mila_recording_start"] = "2026-07-27T12:00:00Z"
+        mine["frontmatter"]["mila_recording_end"] = "2026-07-27T12:05:00Z"
+        prior = [dict(a, source_id="mila:OTHER")]
+        self.assertIsNone(mila_source._copy_of(mine, prior, zone))
+        prior[0]["duration"] = None
+        self.assertIsNone(mila_source._copy_of(mine, prior, zone))
+
+    def test_expired_window_files_are_pruned_on_load_and_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "state" / "calendar_windows"
+            directory.mkdir(parents=True)
+            now = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+            old = directory / "old.json"
+            old.write_text(json.dumps({
+                "fetched_at": (now - datetime.timedelta(days=3)).isoformat(),
+                "events": [],
+            }))
+            fresh = directory / "fresh.json"
+            fresh.write_text(json.dumps({
+                "fetched_at": (now - datetime.timedelta(hours=1)).isoformat(),
+                "events": [],
+            }))
+            junk = directory / "junk.json"
+            junk.write_text("not json")
+            key = ("primary", LIST_TOOL, "UTC", 250, now, now)
+            mila_source._disk_load(tmp, key, now)
+            self.assertFalse(old.exists())
+            self.assertFalse(junk.exists())
+            self.assertTrue(fresh.exists())
+
+            stale = directory / "stale.json"
+            stale.write_text(json.dumps({
+                "fetched_at": (now - datetime.timedelta(days=9)).isoformat(),
+                "events": [],
+            }))
+            past = now - datetime.timedelta(days=1)
+            mila_source._disk_store(tmp, ("p", LIST_TOOL, "UTC", 250, past, past),
+                                    now, [])
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
