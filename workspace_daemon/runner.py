@@ -2561,6 +2561,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             "calendar_event_id": meta["calendar_event_id"],
             "recording_start": meta.get("mila_recording_start"),
             "recording_end": meta.get("mila_recording_end"),
+            "duration_seconds": meta.get("mila_duration_seconds"),
         })
     canonical_memory_source_id = memory_sink.source_id_for(item)
     active_followup = (

@@ -1074,8 +1074,17 @@ analyze:
   discarded, and neither it nor transcript text is logged. If Ollama is down,
   slow or returns garbage the recording stays unmatched and is retried next
   run; there is never a silent cloud fallback.
+- Title beats time: a recording title that equals exactly one candidate's
+  title selects that event even when the computed interval misses it (a
+  copy's `createdAt` can be an import time). The start is the Meet filename
+  stamp, then the capture stamp in the filename, then `createdAt`. The
+  sole-overlap rule is skipped when another candidate's title matches or the
+  recording's descriptive title shares no words with the overlapping event
+  (generic titles such as "New recording" still qualify); those go to the
+  local model.
 - Duplicates: a meeting captured twice (`systemAudio` plus `voiceMemo`) is
-  recognised when two recordings overlap and match the same Calendar event.
+  recognised when two recordings match the same Calendar event and either
+  overlap or have durations within 3 seconds on the same local day.
   One memory is written (preferring `systemAudio`, else the longest); the
   other is ledgered as `duplicate_of` without analysis. Recordings that are
   still `running` are skipped until `completed`.

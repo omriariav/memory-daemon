@@ -85,6 +85,12 @@ def _recording_interval(record, zone=None):
     Google Meet recordings carry the scheduled start as a local-time stamp in
     the title portion, which wins over the (later) capture stamp; ``zone`` is
     the routine's calendar timezone used to interpret it.
+
+    Start-time precedence: Meet scheduled-start stamp in the audio filename,
+    then the capture stamp in the filename (non-voiceMemo), then ``createdAt``
+    (the start for voiceMemo, the end otherwise).  ``createdAt`` can be an
+    import time, so when a candidate event's title matches the recording the
+    event's time, not the computed interval, is the reference for matching.
     """
     duration = max(0.0, float(record.get("duration") or 0))
     source = str(record.get("source") or "")
@@ -319,7 +325,7 @@ def candidates(source):
         found.values(),
         key=lambda item: item["raw"].get("recording_start") or "",
         reverse=True,
-    ))
+    ), zone)
     limit = int(source.get("max_results", 0))
     return ordered[:limit] if limit else ordered
 
@@ -344,6 +350,32 @@ def _run_state():
 
 def _overlap_seconds(a_start, a_end, b_start, b_end):
     return max(0.0, (min(a_end, b_end) - max(a_start, b_start)).total_seconds())
+
+
+DUPLICATE_DURATION_SECONDS = 3.0
+
+
+def _same_day(a, b, zone):
+    return a.astimezone(zone).date() == b.astimezone(zone).date()
+
+
+def _copies(left, right, zone):
+    """Two captures of one meeting: overlap, or same title/length/day.
+
+    ``left``/``right`` are dicts with ``interval``, ``duration`` and (for
+    grouping) ``title``.  An import time can shift a copy's computed interval
+    off the original, so near-identical duration on one local day also counts.
+    """
+    if _overlaps_substantially(left["interval"], right["interval"]):
+        return True
+    return (
+        left.get("duration") is not None
+        and right.get("duration") is not None
+        and abs(left["duration"] - right["duration"]) <= DUPLICATE_DURATION_SECONDS
+        and _same_day(left["interval"][0], right["interval"][0], zone)
+        and left.get("title") is not None
+        and left.get("title") == right.get("title")
+    )
 
 
 def _overlaps_substantially(a, b):
@@ -377,14 +409,29 @@ def _interval(candidate):
     )
 
 
-def _group_overlapping(ordered):
+def _traits(candidate, zone):
+    interval = _interval(candidate)
+    if interval is None:
+        return None
+    record = candidate["raw"].get("recording") or {}
+    try:
+        duration = float(record.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = None
+    return {
+        "interval": interval, "duration": duration,
+        "title": normalize_title(candidate.get("title")),
+    }
+
+
+def _group_overlapping(ordered, zone=datetime.timezone.utc):
     """Order candidates so the preferred capture of a meeting comes first.
 
     Groups are overlap-connected recordings; groups keep newest-first order and
     each group is sorted by ``_preference`` so a duplicate is seen only after
     the capture it duplicates has registered its calendar event.
     """
-    intervals = [_interval(candidate) for candidate in ordered]
+    intervals = [_traits(candidate, zone) for candidate in ordered]
     parent = list(range(len(ordered)))
 
     def find(index):
@@ -397,7 +444,7 @@ def _group_overlapping(ordered):
         for j in range(i + 1, len(ordered)):
             if (
                 intervals[i] and intervals[j]
-                and _overlaps_substantially(intervals[i], intervals[j])
+                and _copies(intervals[i], intervals[j], zone)
             ):
                 parent[find(j)] = find(i)
     groups = {}
@@ -441,6 +488,7 @@ def prime(entries):
             continue
         state["captured"].setdefault(event_id, []).append({
             "source_id": entry.get("source_id"), "interval": interval,
+            "duration": entry.get("duration_seconds"),
         })
 
 
@@ -765,16 +813,61 @@ def _has_other_attendee(event):
     )
 
 
+_STOPWORDS = {
+    "the", "and", "for", "with", "of", "to", "in", "on", "at", "a", "an",
+    "sync", "meeting", "call", "weekly", "daily", "intro",
+}
+_GENERIC_TITLE = {
+    "new", "recording", "recordings", "voice", "memo", "memos", "untitled",
+    "audio", "system", "note", "notes", "meeting", "call", "imported",
+}
+
+
+def _meaningful_tokens(value):
+    return {
+        token for token in normalize_title(value).split()
+        if len(token) > 1 and not token.isdigit()
+        and token not in _STOPWORDS and token not in _GENERIC_TITLE
+    }
+
+
+def _title_conflicts(title, event):
+    """A descriptive recording title that shares nothing with the event's."""
+    tokens = _meaningful_tokens(title)
+    return bool(tokens) and tokens.isdisjoint(
+        _meaningful_tokens(event.get("summary"))
+    )
+
+
 def _rule_match(item, events):
-    """Deterministic match: ``(event, reason)`` or ``None`` when ambiguous."""
+    """Deterministic match: ``(event, reason)`` or ``None`` when ambiguous.
+
+    Title evidence beats time: Mila copies the Calendar event's title, while a
+    recording's computed interval can be an import time.  A title that names
+    exactly one candidate selects it even if the interval misses it.  Time
+    alone (sole overlapping event with another attendee) is used only when no
+    candidate's title matches and the recording title does not conflict.
+    """
     plausible = [event for event in events if _plausible(item, event)]
     titled = [
-        event for event in plausible
+        event for event in events
         if titles_match(item.get("title"), event.get("summary"))
     ]
     if len(titled) == 1:
-        return titled[0], "title and time match"
-    if not titled and len(plausible) == 1 and _has_other_attendee(plausible[0]):
+        reason = (
+            "title and time match" if titled[0] in plausible else "title match"
+        )
+        return titled[0], reason
+    if titled:
+        both = [event for event in titled if event in plausible]
+        if len(both) == 1:
+            return both[0], "title and time match"
+        return None
+    if (
+        len(plausible) == 1
+        and _has_other_attendee(plausible[0])
+        and not _title_conflicts(item.get("title"), plausible[0])
+    ):
         return plausible[0], "sole overlapping event"
     return None
 
@@ -840,16 +933,36 @@ def _model_match(routine, source, item, events):
     return accepted, match
 
 
-def _duplicate_of(item, event_id):
-    """Source id of an earlier capture of this event overlapping this one."""
-    mine = (
-        _parse_instant(item["frontmatter"]["mila_recording_start"]),
-        _parse_instant(item["frontmatter"]["mila_recording_end"]),
-    )
+def _item_trait(item):
+    meta = item["frontmatter"]
+    return {
+        "interval": (
+            _parse_instant(meta["mila_recording_start"]),
+            _parse_instant(meta["mila_recording_end"]),
+        ),
+        "duration": float(meta.get("mila_duration_seconds") or 0),
+    }
+
+
+def _duplicate_of(item, event_id, zone):
+    """Source id of an earlier capture of this event that is a copy of it.
+
+    The event id already ties the two recordings together; they are copies
+    when they overlap or have near-identical length on the same local day.
+    """
+    mine = _item_trait(item)
     for prior in _run_state()["captured"].get(event_id, []):
         if prior["source_id"] == item.get("source_id"):
             continue
-        if _overlaps_substantially(mine, prior["interval"]):
+        if _overlaps_substantially(mine["interval"], prior["interval"]):
+            return prior["source_id"]
+        duration = prior.get("duration")
+        if (
+            duration is not None
+            and abs(float(duration) - mine["duration"])
+            <= DUPLICATE_DURATION_SECONDS
+            and _same_day(mine["interval"][0], prior["interval"][0], zone)
+        ):
             return prior["source_id"]
     return None
 
@@ -885,19 +998,16 @@ def match_calendar(routine, source, item):
             return False, match
         event = next(e for e in events if e.get("id") == match["event_id"])
 
-    prior = _duplicate_of(item, event["id"])
+    zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
+    prior = _duplicate_of(item, event["id"], zone)
     if prior:
         return False, dict(match, duplicate_of=prior, reason="duplicate capture")
     transcripts.accept_event(
         item, event, match["confidence"], match["reason"]
     )
-    _run_state()["captured"].setdefault(event["id"], []).append({
-        "source_id": item.get("source_id"),
-        "interval": (
-            _parse_instant(item["frontmatter"]["mila_recording_start"]),
-            _parse_instant(item["frontmatter"]["mila_recording_end"]),
-        ),
-    })
+    _run_state()["captured"].setdefault(event["id"], []).append(
+        dict(_item_trait(item), source_id=item.get("source_id"))
+    )
     return True, match
 
 

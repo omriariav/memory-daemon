@@ -1349,6 +1349,7 @@ class DuplicateCaptureTest(unittest.TestCase):
         second["source_id"] = "mila:LATER"
         second["frontmatter"]["mila_recording_start"] = "2026-07-27T21:00:00Z"
         second["frontmatter"]["mila_recording_end"] = "2026-07-27T21:20:00Z"
+        second["frontmatter"]["mila_duration_seconds"] = 1200
         r = routine("/tmp/store", local_source())
         self.assertTrue(mila_source.match_calendar(r, local_source(), first)[0])
         self.assertTrue(mila_source.match_calendar(r, local_source(), second)[0])
@@ -1426,3 +1427,149 @@ class MilaConfigTest(unittest.TestCase):
         self.assertTrue(bounded.startswith("ש"))
         self.assertTrue(bounded.endswith("ת"))
         self.assertEqual(mila_source._bounded("short", 1000), "short")
+
+
+class ImportTimeScenarioTest(unittest.TestCase):
+    """One meeting captured twice; the second copy's createdAt is import time."""
+
+    E1 = ("E1", "X // Y - intro", "2026-07-27T08:00:00Z", "2026-07-27T08:30:00Z")
+    E2 = ("E2", "X / Z - intro", "2026-07-27T09:00:00Z", "2026-07-27T09:30:00Z")
+
+    def setUp(self):
+        mila_source._reset_run()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.recordings = self.base / "recordings.json"
+        seg = [{"start": 0, "end": 1, "text": "שלום"}]
+        self.records = [
+            record("A", source="voiceMemo", audio="A.m4a",
+                   created="2026-07-27T08:02:49Z", duration=1712,
+                   title="X -- Y - intro", segments=seg),
+            record("B", source="systemAudio", audio="B.m4a",
+                   created="2026-07-27T08:56:36Z", duration=1712,
+                   title="X -- Y - intro", segments=seg),
+        ]
+        self.recordings.write_text(json.dumps(self.records))
+        self.source = connector_source(
+            recordings_file=str(self.recordings), max_results=0,
+            calendar_timezone="UTC",
+        )
+        self.routine = routine(self.base / "memory", self.source)
+        self.routine["analyze"] = {"provider": "claude", "model": "sonnet",
+                                   "instruction": "Keep durable facts."}
+        lines = ["Found 2 event(s):\n"]
+        for eid, title, start, end in (self.E1, self.E2):
+            lines.append(
+                f"- {title}\n  Time: {start} - {end}\n  ID: {eid}\n"
+                "  Organizer: host@example.com\n"
+                "  Attendees: host@example.com (accepted), "
+                "me@example.com (accepted, self)\n"
+            )
+        self.bridge = fake_call_tools("\n".join(lines))
+
+    def events(self):
+        return [event(eid, title, start=start, end=end)
+                for eid, title, start, end in (self.E1, self.E2)]
+
+    def item(self, rid, start, end, duration=1712):
+        it = match_item(title="X -- Y - intro", events=self.events())
+        it["source_id"] = f"mila:{rid}"
+        it["frontmatter"].update(
+            mila_recording_start=start, mila_recording_end=end,
+            mila_duration_seconds=duration,
+        )
+        return it
+
+    def test_title_beats_a_sole_overlap_with_another_event(self):
+        # B's computed interval sits on E2, but its title names E1.
+        item = self.item("B", "2026-07-27T09:02:00Z", "2026-07-27T09:30:30Z")
+        r = routine("/tmp/store", local_source())
+        with mock.patch.object(local_llm, "chat_json") as chat:
+            accepted, match = mila_source.match_calendar(r, local_source(), item)
+        chat.assert_not_called()
+        self.assertTrue(accepted)
+        self.assertEqual(match["event_id"], "E1")
+
+    def test_title_match_accepts_even_when_interval_misses_the_event(self):
+        item = self.item("B", "2026-07-27T11:00:00Z", "2026-07-27T11:28:00Z")
+        r = routine("/tmp/store", local_source())
+        accepted, match = mila_source.match_calendar(r, local_source(), item)
+        self.assertTrue(accepted)
+        self.assertEqual(match["event_id"], "E1")
+
+    def test_sole_overlap_is_refused_when_titles_conflict(self):
+        item = match_item(
+            title="Budget review",
+            events=[event("only", "Planning offsite")],
+        )
+        with mock.patch.object(
+            local_llm, "chat_json",
+            return_value={"matched": False, "event_id": None,
+                          "confidence": "low", "reason": ""},
+        ) as chat:
+            accepted, _ = mila_source.match_calendar(
+                routine("/tmp/store", local_source()), local_source(), item
+            )
+        chat.assert_called_once()
+        self.assertFalse(accepted)
+
+    def test_generic_title_still_accepts_sole_overlap(self):
+        for title in ("New recording", "Voice memo 12", ""):
+            mila_source._reset_run()
+            item = match_item(title=title, events=[event("only", "Planning")])
+            accepted, match = mila_source.match_calendar(
+                routine("/tmp/store", local_source()), local_source(), item
+            )
+            self.assertTrue(accepted, msg=title)
+            self.assertEqual(match["reason"], "sole overlapping event")
+
+    def test_copies_collapse_in_either_processing_order(self):
+        a = ("A", "2026-07-27T08:02:49Z", "2026-07-27T08:31:21Z")
+        b = ("B", "2026-07-27T08:28:04Z", "2026-07-27T08:56:36Z")
+        r = routine("/tmp/store", local_source())
+        for first, second in ((a, b), (b, a)):
+            mila_source._reset_run()
+            one = self.item(*first)
+            two = self.item(*second)
+            self.assertTrue(
+                mila_source.match_calendar(r, local_source(), one)[0]
+            )
+            accepted, match = mila_source.match_calendar(
+                r, local_source(), two
+            )
+            self.assertFalse(accepted)
+            self.assertEqual(match["duplicate_of"], f"mila:{first[0]}")
+            self.assertEqual(match["event_id"], "E1")
+
+    def test_end_to_end_one_memory_for_both_copies(self):
+        with mock.patch.object(
+            claude_bridge, "call_tools", self.bridge
+        ), mock.patch.object(
+            llm, "analyze", return_value="Durable decision."
+        ) as analyze, mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "e"},
+        ) as capture, mock.patch.object(local_llm, "chat_json") as chat:
+            runner.run(self.base, [self.routine])
+        chat.assert_not_called()
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args[0][1]["source_id"], "mila:B")
+        ledger = {e["source_id"]: e for e in state.load(self.base).values()}
+        self.assertEqual(ledger["mila:A"]["duplicate_of"], "mila:B")
+        self.assertEqual(ledger["mila:B"]["calendar_event_id"], "E1")
+
+    def test_same_title_length_and_day_group_without_interval_overlap(self):
+        order = [c["raw"]["source_id"]
+                 for c in mila_source.candidates(self.source)]
+        self.assertEqual(order, ["mila:B", "mila:A"])
+        self.records[1]["duration"] = 1720  # more than 3s apart: not copies
+        self.recordings.write_text(json.dumps(self.records))
+        traits = [
+            mila_source._traits(c, datetime.timezone.utc)
+            for c in mila_source.candidates(self.source)
+        ]
+        self.assertFalse(mila_source._copies(
+            traits[0], traits[1], datetime.timezone.utc
+        ))
