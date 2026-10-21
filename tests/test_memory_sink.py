@@ -558,13 +558,35 @@ class CaptureValidationTest(unittest.TestCase):
         self.item["body"] = "thread text"
         with mock.patch.object(
             memory_sink, "_operator_confirmed_summary",
-            side_effect=RuntimeError("no summary"),
+            side_effect=memory_sink.NoUsableSummary("no summary"),
         ):
             outcome, calls = self._run_capture(
                 None, summary="NOT MEMORY-WORTHY",
             )
         self.assertEqual(outcome["memory"], "created")
         self.assertIn("thread text", calls["stdin"])
+        self.assertIn("Raw untrusted thread text", calls["stdin"])
+
+    def test_saved_fallback_keeps_the_personal_keyword_backstop(self):
+        self.saved()
+        self.routine["memory"]["personal_keywords"] = ["zebrasecret"]
+        self.item["body"] = "talking about zebrasecret here"
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            side_effect=memory_sink.NoUsableSummary("no summary"),
+        ):
+            _, calls = self._run_capture(None, summary="NOT MEMORY-WORTHY")
+        self.assertIn(memory_sink.personal.DEFAULT_PERSONAL_TAG, self.tags(calls))
+
+    def test_saved_transient_errors_propagate_for_a_retry(self):
+        from workspace_daemon import claude_bridge
+        self.saved()
+        for exc in (claude_bridge.BridgeError("down"), OSError("io")):
+            with self.subTest(exc=exc), mock.patch.object(
+                memory_sink, "_operator_confirmed_summary", side_effect=exc,
+            ):
+                with self.assertRaises(type(exc)):
+                    self._run_capture(None, summary="NOT MEMORY-WORTHY")
 
     def test_unsaved_not_worthy_source_analysis_is_still_skipped(self):
         outcome, _ = self._run_capture(None, summary="NOT MEMORY-WORTHY")

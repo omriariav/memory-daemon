@@ -1133,6 +1133,7 @@ def thread_item(candidate, messages, names, source=None, self_id=None,
     extra = {}
     if save_tag:
         extra["slack_save_tag"] = save_tag
+        extra["slack_latest_ts"] = latest_ts
         if saved:
             extra["slack_saved"] = True
     return {

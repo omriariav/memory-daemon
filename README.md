@@ -1508,10 +1508,16 @@ the others up to `max_search_pages`.
 
 Slack's `after:` filter applies to the message date, not the reaction date, and
 the owner often reacts to an older message, so a saved query does not use a
-cursor. It lists a fixed look-back, `save_reaction_lookback_days` (default 30,
+cursor. It lists a fixed look-back, `save_reaction_lookback_days` (default 14,
 1 to 90), every run, oldest first, and the processed ledger does the
 deduplication. If a saved query hits `max_search_pages` the run logs it; shorten
 the look-back or raise the cap.
+
+Cost: each emoji is one search (plus follow-up pages) on every run, whether or
+not anything new was reacted, so keep the look-back short. Setting
+`save_reactions` also widens the failure scope: a saved thread can sit in any
+channel, so the source's ownership scope is workspace-wide, as with
+`include_mentions`.
 
 A hit is grouped into its thread like any other and the whole thread is read.
 A saved thread:
@@ -1532,7 +1538,12 @@ thread captured earlier through the normal path is reprocessed once when it is
 reacted (the memory is updated in place by its source id, and the tag is added);
 a failure before the write leaves no ledger entry and the next run retries it;
 and new replies on a saved thread go through the normal path as before, keeping
-the tag and the `saved` evidence. Un-reacting does nothing. A reaction older
+the tag and the `saved` evidence. The saved ledger row records how far the
+capture read (`saved_covered_ts`), so the ordinary hit for a message the save
+already covered is not captured a second time; only a newer reply is. A saved
+thread whose memory write fails is retried for at most 3 runs, then recorded as
+failed under its saved key (logged by id only) so it cannot hold
+`max_threads_per_run` slots. Un-reacting does nothing. A reaction older
 than the look-back is not seen, so react again if it was missed.
 `run --count-only` prints how many listed threads were saved by reaction;
 `--dry-run` makes no bridge call, so it can only report how many saved queries
@@ -1563,7 +1574,9 @@ calls are dropped, never used; a missing planned call is re-issued once).
 Search pages and thread pages must have exactly one structurally consistent
 parse, so a message that imitates the connector's format cannot add or reorder
 hits. If a page still has several valid readings, only the hits all of them
-agree on are kept, and an unparseable page fails just its own query: that
+agree on order the hits and bound the watermark (every reading's hits are
+still kept after the per-query cross-checks, except for saved-reaction queries,
+which accept only the agreed hits), and an unparseable page fails just its own query: that
 query's cursor is held while the others advance. A thread whose item fails holds
 only the cursors of the queries that found it, at its timestamp. A read outage
 (no usable result at all in a session) fails the run without counting an

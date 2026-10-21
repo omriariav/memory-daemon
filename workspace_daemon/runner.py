@@ -2769,6 +2769,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         record["memory_operator_confirmed"] = True
     if meta.get("slack_saved") is True:
         record["memory_saved_by_reaction"] = True
+        # How far the saved capture read: ordinary hits up to here are covered.
+        record["saved_covered_ts"] = meta.get("slack_latest_ts")
     if (
         meta.get("gmail_chat_followup_managed") is True
         and meta.get("gmail_chat_followup_active") is True

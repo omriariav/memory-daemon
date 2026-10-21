@@ -49,7 +49,7 @@ source:
   # Save by reaction (the emoji names come from the watch file's
   # `save_reactions`): reacted messages are listed over a fixed look-back, not
   # the cursor, because Slack filters by message date, not reaction date.
-  # save_reaction_lookback_days: 30   # 1 to 90
+  # save_reaction_lookback_days: 14   # 1 to 90
   # save_reaction_tag: saved          # tag added to a saved thread's memory
   # Count-only cost estimate per thread until analyze history exists.
   estimate_analyze_usd: 0.12

@@ -26,7 +26,7 @@ no default, the names are deployment-specific). Reacting to any message with
 one of them marks its thread for capture: one query per emoji searches
 `hasmy::<name>:`. Slack's `after:` filter applies to the message date, not the
 reaction date, so these queries ignore the cursors and list a fixed look-back
-(`save_reaction_lookback_days`, default 30) every run; the processed ledger
+(`save_reaction_lookback_days`, default 14) every run; the processed ledger
 (key `saved:<slack:<ch>:<root>>`, recorded only after the memory write) is what
 dedupes them. A saved thread skips the settle delay and the triviality and
 not-worthy filters, carries the `saved` owner-evidence reason and the
@@ -91,7 +91,7 @@ DEFAULTS = {
     "max_queries_per_run": 20,
     "calls_per_session": 15,
     "estimate_analyze_usd": 0.12,
-    "save_reaction_lookback_days": 30,
+    "save_reaction_lookback_days": 14,
     "save_reaction_tag": "saved",
 }
 # Keys only a slack_mcp source may carry (validated, not global source keys).
@@ -866,8 +866,14 @@ def _search_all(cfg, queries, afters, now):
                 failed.update(query["keys"])
                 log(f"slack_mcp: {query['kind']} search failed: {exc}")
                 continue
+            # A reaction query has no cursor to protect and its hits become
+            # paid captures, so it accepts only what every reading agrees on.
+            usable = (
+                trusted if query["kind"] == "saved" and trusted is not None
+                else hits
+            )
             accepted = [
-                h for h in hits if _valid_hit(query, h, after, now, cfg)
+                h for h in usable if _valid_hit(query, h, after, now, cfg)
             ]
             if stamps:
                 # Parsed hits, in validated ascending order, bound the
@@ -938,6 +944,42 @@ def _already_done(processed, candidate_id):
         and "memory_error" not in entry
         and "expand_fallback" not in entry
     )
+
+
+MAX_SAVED_ATTEMPTS = 3
+
+
+def _covered_by_save(processed, saved_key, ts):
+    entry = processed.get(saved_key) or {}
+    try:
+        return float(ts) <= float(entry["saved_covered_ts"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _saved_gave_up(source, processed, saved_key):
+    """True once a saved thread's memory write failed MAX_SAVED_ATTEMPTS runs.
+
+    The failure is then recorded terminally under the saved key, so a thread
+    that cannot be written stops taking `max_threads_per_run` slots. Counted
+    one per listing that finds the previous attempt failed; a preview never
+    counts.
+    """
+    entry = processed.get(saved_key) if processed is not None else None
+    if not entry or "memory_error" not in entry or source.get("_count_only"):
+        return False
+    if _bump_attempts(saved_key) < MAX_SAVED_ATTEMPTS:
+        return False
+    record = {k: v for k, v in entry.items() if k != "memory_error"}
+    record.update({
+        "slack_mcp": "failed", "reason": "memory write failed repeatedly",
+        "processed_at": utc_now_iso(),
+    })
+    processed.record(saved_key, record)
+    _clear_attempts(saved_key)
+    log(f"slack_mcp: saved thread {saved_key} gave up after "
+        f"{MAX_SAVED_ATTEMPTS} failed runs")
+    return True
 
 
 def _saved_done(processed, key):
@@ -1034,6 +1076,10 @@ def candidates(source):
         saved_before = bool(cfg["save_reactions"]) and _saved_done(
             processed, saved_key
         )
+        if group["saved"] and not saved_before and _saved_gave_up(
+            source, processed, saved_key
+        ):
+            continue
         if group["saved"] and not saved_before:
             # One candidate per thread: it covers any ordinary hits too (the
             # whole thread is read), and bypasses the settle delay.
@@ -1049,6 +1095,12 @@ def candidates(source):
         candidate_id = f"{anchor_id}@{group['normal_ts']}"
         current[anchor_id] = candidate_id
         if _already_done(processed, candidate_id):
+            continue
+        if saved_before and _covered_by_save(
+            processed, saved_key, group["normal_ts"]
+        ):
+            # The saved capture already read this far; only a genuinely newer
+            # reply is ordinary work.
             continue
         row = (float(group["normal_ts"]), candidate_id, anchor_id, channel,
                root, group)
