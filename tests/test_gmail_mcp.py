@@ -187,7 +187,8 @@ class SearchParserTest(unittest.TestCase):
 
     def test_empty_variants_and_unknown_shapes(self):
         for text in ("Found 0 message(s)", "Found 0 message(s):",
-                     "No messages found.", "Found 0 message(s)\n"):
+                     "No messages found.", "Found 0 message(s)\n",
+                     "No messages found matching your search query."):
             with self.subTest(text=text):
                 self.assertEqual(
                     list(gmail_mcp.parse_search(text)[0]), []
