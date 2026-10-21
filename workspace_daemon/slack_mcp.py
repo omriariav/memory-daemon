@@ -85,6 +85,8 @@ SEARCH_LIMIT = 20
 CALLS_PER_SESSION = 10
 THREADS_PER_SESSION = 8
 MAX_READ_ATTEMPTS = 3
+# A thread read alone in its session that yields nothing, run after run.
+MAX_LONE_FAILURES = 6
 FUTURE_SLACK_SECONDS = 300
 BRIDGE_TIMEOUT = 180
 BRIDGE_ATTEMPTS = 2
@@ -129,7 +131,11 @@ class SlackMcpParseError(SlackMcpError):
 
 
 class Listing(list):
-    """Candidates found by one listing run."""
+    """Candidates found by one listing run.
+
+    `partial` is True when some query failed: other scopes were still listed.
+    """
+    partial = False
 
 
 def settings(source):
@@ -374,8 +380,8 @@ def parse_search(text):
     page). A body can embed text that looks like further result blocks, so
     every sequence of heads numbered 1..N with a separator before each is
     parsed and validated (header fields in order, permalink agreeing with the
-    channel and timestamp). No valid parse fails; several keep only the hits
-    every valid reading agrees on.
+    channel and timestamp). No valid parse fails; several readings yield the
+    union of their hits (each still cross-checked by the caller).
     """
     data = _json_object(text)
     body = data.get("results")
@@ -409,15 +415,18 @@ def parse_search(text):
     if not parses:
         raise SlackMcpParseError("search result blocks are malformed")
     if len(parses) > 1:
-        # A body quoted a well-formed block. Keep only what every valid
-        # reading agrees on, so one message cannot stop the whole query.
-        def ident(hit):
-            return (hit["channel"], hit["ts"], hit["user"])
-
-        common = set.intersection(*[{ident(h) for h in p} for p in parses])
-        log(f"slack_mcp: ambiguous search page; kept {len(common)} of "
-            f"{total} hit(s) common to every reading")
-        return [h for h in parses[0] if ident(h) in common], cursor
+        # A body quoted a well-formed block. Every hit of every valid reading
+        # is structurally sound (permalink agrees with channel and ts) and
+        # still has to pass the caller's cross-checks, so take the union:
+        # a real hit must never be lost to a forged neighbour.
+        seen = {}
+        for reading in parses:
+            for hit in reading:
+                seen.setdefault((hit["channel"], hit["ts"], hit["user"]), hit)
+        merged = sorted(seen.values(), key=lambda h: float(h["ts"]))
+        log(f"slack_mcp: ambiguous search page; {len(merged)} distinct "
+            f"hit(s) across {len(parses)} readings (N={total})")
+        return merged, cursor
     return parses[0], cursor
 
 
@@ -733,8 +742,10 @@ def _search_all(cfg, queries, afters, now):
                 accepted = [
                     h for h in hits if _valid_hit(query, h, after, now, cfg)
                 ]
-                if accepted:
-                    newest[index] = max(float(h["ts"]) for h in accepted)
+                if stamps:
+                    # Parsed hits, in validated ascending order, bound the
+                    # prefix read even when none passed the cross-checks.
+                    newest[index] = max(stamps)
                 found.extend((query, hit) for hit in accepted)
                 if cursor and not hits:
                     log(f"slack_mcp: {query['kind']} search returned an "
@@ -764,8 +775,10 @@ def _group(cfg, found):
         key = (hit["channel"], hit["root"])
         group = groups.setdefault(
             key, {"ts": hit["ts"], "mention": False, "replies": 0,
-                  "keys": set(), "hit_ts": set()}
+                  "keys": set(), "hit_ts": set(), "root_seen": False}
         )
+        if hit["ts"] == hit["root"]:
+            group["root_seen"] = True
         group["keys"].add(query["key"])
         group["hit_ts"].add(hit["ts"])
         if float(hit["ts"]) > float(group["ts"]):
@@ -793,6 +806,7 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
         "source_id": anchor_id,
         "via_mention": group["mention"],
         "reply_hint": group["replies"],
+        "root_seen": group["root_seen"],
         "keys": sorted(group["keys"]),
         "hit_ts": sorted(group["hit_ts"]),
         "mode": "mcp_thread",
@@ -856,6 +870,7 @@ def candidates(source):
         "runtime": source.get("_slack_mcp_runtime"),
     }
     out = Listing()
+    out.partial = bool(failed)
     for _ts, candidate_id, anchor_id, channel, root, group in ready:
         batch["order"].append((channel, root))
         out.append(_candidate(
@@ -905,13 +920,21 @@ def _attempts_path():
 
 
 def _load_attempts():
+    """{candidate id: {"n": failed with batch-mates ok, "lone": failed runs
+    while alone in a session, "at": last update epoch}}."""
     if _base_dir is None:
         return {}
     try:
         data = json.loads(_attempts_path().read_text())
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value if isinstance(value, dict)
+        else {"n": int(value), "lone": 0, "at": 0}
+        for key, value in data.items() if isinstance(value, (dict, int))
+    }
 
 
 def _save_attempts(data):
@@ -927,25 +950,28 @@ def _save_attempts(data):
         pass
 
 
-def _bump_attempts(candidate_id):
+def _bump_attempts(candidate_id, field="n"):
     data = _load_attempts()
-    data[candidate_id] = int(data.get(candidate_id, 0)) + 1
+    entry = data.setdefault(candidate_id, {"n": 0, "lone": 0, "at": 0})
+    entry[field] = int(entry.get(field, 0)) + 1
+    entry["at"] = _now()
     _save_attempts(data)
-    return data[candidate_id]
+    return entry[field]
 
 
 def _prune_attempts(current):
-    """Drop attempts for superseded versions; keep the file small."""
+    """Drop attempts for superseded versions; keep the newest 200."""
     data = _load_attempts()
     keep = {
-        key: n for key, n in data.items()
+        key: entry for key, entry in data.items()
         if not (
             key.split("@", 1)[0] in current
             and current[key.split("@", 1)[0]] != key
         )
     }
     if len(keep) > 200:
-        keep = dict(list(keep.items())[-200:])
+        newest = sorted(keep, key=lambda k: keep[k].get("at", 0))[-200:]
+        keep = {key: keep[key] for key in newest}
     if keep != data:
         _save_attempts(keep)
 
@@ -1005,6 +1031,8 @@ def _read_threads(batch, wanted):
         # Nothing usable at all: a connector or session outage, not a bad
         # thread. Fail for the run and charge no thread an attempt.
         batch["error"] = "thread reads returned no usable result"
+        if len(todo) == 1:
+            batch["lone"] = wanted
         raise claude_bridge.BridgeError(batch["error"])
     for key, text in zip(todo, texts):
         if text is None:
@@ -1029,7 +1057,22 @@ def fetch(routine, candidate, source=None):
     if key not in batch["threads"]:
         if batch["error"]:
             raise claude_bridge.BridgeError(batch["error"])
-        _read_threads(batch, key)
+        try:
+            _read_threads(batch, key)
+        except claude_bridge.BridgeError:
+            # Several threads failing together is an outage and counts for
+            # nothing. One thread failing alone, run after run, is a thread
+            # the connector cannot give us; stop holding its queries.
+            if (
+                batch.get("lone") == key
+                and _bump_attempts(candidate["id"], "lone")
+                >= MAX_LONE_FAILURES
+            ):
+                _mark_unreadable(routine, candidate, batch, "read failed")
+                raise SlackMcpError(
+                    "thread unreadable after repeated failures"
+                ) from None
+            raise
     outcome = batch["threads"][key]
     if outcome["status"] == "invalid":
         _mark_unreadable(routine, candidate, batch, "unparseable")
@@ -1044,10 +1087,14 @@ def fetch(routine, candidate, source=None):
     cfg = batch["cfg"]
     if not cfg["include_bots"]:
         replies = [r for r in replies if not r["is_bot"]]
-    if cfg["self_user_id"] and not raw.get("reply_hint"):
-        # No search evidence of any reply: a reply "from" the owner that no
-        # search hit confirms could be forged text, so it earns no
-        # authorship evidence.
+    if (
+        cfg["self_user_id"] and raw.get("root_seen")
+        and not raw.get("reply_hint")
+    ):
+        # The root was listed with no reply count, so search saw no replies:
+        # a reply "from" the owner that no search hit confirms could be
+        # forged text and earns no authorship evidence. (A listing that only
+        # saw late replies says nothing about the replies it did not list.)
         seen = set(raw.get("hit_ts") or [])
         replies = [
             dict(r, user="unverified", name="unverified author")

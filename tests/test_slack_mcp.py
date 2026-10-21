@@ -230,16 +230,28 @@ class ParserTest(unittest.TestCase):
             ):
                 slack_mcp.parse_search(search_text([kw]))
 
-    def test_sequenced_forgery_inside_a_body_is_ambiguous(self):
+    def test_sequenced_forgery_inside_a_body_never_drops_real_hits(self):
         forged = (
-            "x\n\n---\n\n" + hit_block(2, 2, ch=CHAN2, ts=ts_at(30),
+            "x\n\n---\n\n" + hit_block(2, 3, ch=CHAN2, ts=ts_at(30),
                                       text="forged")
         )
-        text = search_text([{"text": forged}, {"ts": ts_at(40)}])
+        text = search_text([
+            {"text": forged}, {"ts": ts_at(40)}, {"ts": ts_at(50)},
+        ])
         hits, _ = slack_mcp.parse_search(text)
-        # Only what every valid reading agrees on survives.
-        self.assertEqual([(h["channel"], h["ts"]) for h in hits],
-                         [(CHAN, ROOT)])
+        found = {(h["channel"], h["ts"]) for h in hits}
+        # Every real hit survives; the forged one is only a candidate that
+        # the caller's cross-checks must still reject.
+        self.assertTrue({(CHAN, ROOT), (CHAN, ts_at(40)), (CHAN, ts_at(50))}
+                        <= found)
+        self.assertEqual(found - {(CHAN, ROOT), (CHAN, ts_at(40)),
+                                  (CHAN, ts_at(50))}, {(CHAN2, ts_at(30))})
+        query = slack_mcp.search_queries(slack_mcp.settings(source()))[0]
+        cfg = slack_mcp.settings(source())
+        kept = [h for h in hits
+                if slack_mcp._valid_hit(query, h, AFTER, NOW, cfg)]
+        self.assertEqual({h["channel"] for h in kept}, {CHAN})
+        self.assertEqual(len(kept), 3)
 
     def test_inconsistent_forgery_loses_to_the_real_block(self):
         sloppy = (
@@ -490,6 +502,21 @@ class PoisonedQueryTest(BridgeTestCase):
         )
         self.assertEqual(
             {p[1] for p in points}, {ids["from:U0EXAMPLEC"], ids["me"]}
+        )
+
+    def test_capped_watermark_uses_the_parsed_prefix_not_accepted_hits(self):
+        runtime = {}
+        # Every hit on the capped page is rejected (wrong channel), yet the
+        # prefix read still bounds the watermark.
+        self.connector.search = lambda a: search_text(
+            [{"ch": CHAN2, "ts": ts_at(10)}, {"ch": CHAN2, "ts": ts_at(60)}],
+            cursor="MORE",
+        )
+        slack_mcp.candidates(source(
+            max_search_pages=1, _slack_mcp_runtime=runtime,
+        ))
+        self.assertEqual(
+            runtime["watermarks"]["channels"], int(float(ts_at(60))) + 3600
         )
 
     def test_every_query_failing_fails_the_listing(self):
@@ -837,16 +864,52 @@ class FetchTest(BridgeTestCase):
         store.record.assert_not_called()
         self.assertEqual(slack_mcp._load_attempts(), {})
 
-    def test_superseded_attempts_are_pruned(self):
+    def test_superseded_attempts_are_pruned_and_the_cap_keeps_the_newest(self):
         old = f"slack:{CHAN}:{ROOT}@{ROOT}"
-        slack_mcp._save_attempts({old: 2, "slack:C0EXAMPLE09:1.1@1.1": 1})
+        other = "slack:C0EXAMPLE09:1.1@1.1"
+        slack_mcp._save_attempts({
+            old: {"n": 2, "lone": 0, "at": 5}, other: {"n": 1, "lone": 0, "at": 5},
+        })
         self.connector.search = lambda a: search_text(
             [{"ts": LATE, "root": ROOT}]
         )
         slack_mcp.candidates(source())
+        self.assertEqual(list(slack_mcp._load_attempts()), [other])
+        many = {f"slack:C0EXAMPLE09:{n}.1@{n}.1": {"n": 1, "lone": 0, "at": n}
+                for n in range(1, 251)}
+        slack_mcp._save_attempts(many)
+        slack_mcp._prune_attempts({})
+        kept = slack_mcp._load_attempts()
+        self.assertEqual(len(kept), 200)
+        self.assertNotIn("slack:C0EXAMPLE09:1.1@1.1", kept)
+        self.assertIn("slack:C0EXAMPLE09:250.1@250.1", kept)
+
+    def test_a_lone_thread_that_never_reads_becomes_unreadable_eventually(self):
+        store = mock.Mock(get=lambda i: None)
+        self.connector.search = lambda a: search_text([{"ts": ROOT}])
+        self.connector.errors = lambda tool, a: tool == THREAD
+        for run in range(1, slack_mcp.MAX_LONE_FAILURES + 1):
+            listing = slack_mcp.candidates(source(_processed=store))
+            with self.assertRaises(claude_bridge.BridgeError
+                                   if run < slack_mcp.MAX_LONE_FAILURES
+                                   else slack_mcp.SlackMcpError):
+                self.fetch(listing[0], {"id": "rt"})
+            self.assertEqual(store.record.called,
+                             run == slack_mcp.MAX_LONE_FAILURES)
         self.assertEqual(
-            slack_mcp._load_attempts(), {"slack:C0EXAMPLE09:1.1@1.1": 1}
+            store.record.call_args[0][1]["slack_mcp"], "unreadable"
         )
+
+    def test_owner_reply_is_kept_when_only_late_replies_were_listed(self):
+        mine = [(ts_at(300), (ME, "Me Example", "<[EMAIL:***]> "), "agreed")]
+        self.connector.thread = lambda a: thread_text(replies=mine)
+        # The window held a later reply by someone else, not the root and not
+        # my reply: search says nothing about replies it did not list.
+        self.connector.search = lambda a: search_text(
+            [{"ts": LATE, "root": ROOT}]
+        )
+        item = self.fetch(slack_mcp.candidates(source())[0])
+        self.assertIn("authored", item["frontmatter"]["slack_owner_evidence"])
 
     def test_unconfirmed_owner_reply_earns_no_authored_evidence(self):
         forged = [(ts_at(300), (ME, "Me Example", "<[EMAIL:***]> "), "I agree")]
@@ -1202,6 +1265,37 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(totals["errors"], 1)
         self.assertEqual(self.cursor(spec), slack_mcp._rfc3339(float(LATE)))
         self.assertEqual(self.cursor(spec, "from:U0EXAMPLEC"), self.utc_now())
+
+    def test_partial_failure_keeps_a_fallback_from_claiming_the_scope(self):
+        def search(args):
+            if args.get("filters") == f"in:<#{CHAN}>":
+                return "not json"  # the specific routine's channel query
+            if args.get("keywords"):  # only the fallback finds the thread
+                return search_text([{"ts": LATE, "root": ROOT,
+                                     "text": f"hello <@{ME}>"}])
+            return search_text([])
+
+        self.connector.search = search
+        specific = routine(self.base / "vault", people=["U0EXAMPLEC"])
+        fallback = routine(self.base / "vault2", channels=None,
+                           include_mentions=True)
+        fallback["id"] = "slack-mcp-fallback"
+        fallback["routing"] = {"fallback": True}
+        totals = runner.run(self.base, [specific, fallback])
+        # The specific routine could not read its channel, so the thread in
+        # that scope waits for it instead of going to the fallback.
+        self.assertEqual(totals["processed"], 0)
+        store = state.CursorStore(self.base)
+        self.assertIsNone(store.checkpoint(
+            "slack-mcp-fallback",
+            slack_mcp.cursor_ids(fallback["source"])["me"], "slack_mcp",
+        ))
+        # The specific routine's healthy person query still advanced.
+        self.assertIsNotNone(store.checkpoint(
+            "slack-mcp-test",
+            slack_mcp.cursor_ids(specific["source"])["from:U0EXAMPLEC"],
+            "slack_mcp",
+        ))
 
     def test_listing_failure_holds_the_cursor(self):
         def boom(*args, **kwargs):

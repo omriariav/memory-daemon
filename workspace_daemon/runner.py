@@ -1685,6 +1685,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
             listed_routing_ids.update(normal_ids)
+            if getattr(candidates, "partial", False):
+                # Some of this source's queries failed. Its listed threads are
+                # fine, but a lower-ranked routine must not claim threads in
+                # the scope it could not fully read.
+                failures.append(_failure(
+                    routine, source, known_ids=normal_ids,
+                    ownership_class=ownership_class,
+                ))
             if kind == "gmail":
                 gmail_listed_ids[rid].update(normal_ids)
 
