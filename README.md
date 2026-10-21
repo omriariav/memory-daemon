@@ -1595,8 +1595,10 @@ it would run.
 **DM sessions.** Hits are grouped by (channel, thread root), but people rarely
 thread in direct messages, so a back-and-forth would become one tiny memory
 (and one paid model call) per message. `dm_sessions` (watch file, or inline on
-a `slack_mcp` source without `watch:`; off by default) clusters the unthreaded
-messages of a direct conversation into sessions:
+a `slack_mcp` source without `watch:`; off by default; requires `all_dms: true`,
+since otherwise your own messages render as unverified and gaps are
+one-sided) clusters the unthreaded messages of a direct conversation into
+sessions:
 
 ```yaml
 dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types: [im, mpim]}
@@ -1619,29 +1621,43 @@ read_channel_tool: mcp__<server>__slack_read_channel   # source key, required wh
   re-processes and the memory sink updates the same entry in place by source
   id, exactly like a thread that gets replies. The session is ready once its
   latest message is older than `settle_minutes`.
-- **State across runs.** A run lists only new messages, so the daemon keeps the
-  recent sessions of each DM channel in `state/slack-mcp-dm-sessions.json`
-  (anchor, latest ts and the message timestamps seen; at most 20 per channel).
-  A new message joins the session containing it or extends the newest session
-  within the limits, so a conversation that continues in a later run keeps its
-  anchor. `--dry-run` and `--count-only` do not write it.
+- **State across runs.** A run lists only new messages, so the daemon keeps
+  each routine's sessions per DM channel in `state/slack-mcp-dm-sessions.json`
+  (anchor, first and last ts, and the message timestamps seen). Sessions are
+  pruned by time (older than the longest of `save_reaction_lookback_days`,
+  `bootstrap` and `overlap`, plus a day; 500 per channel as a backstop). A new
+  message joins the session containing it, or the nearest session within the
+  gap on either side while the span cap holds; a late-found earlier message
+  lowers the session's `first` but the anchor (the memory identity) never
+  changes. If the state cannot be written the run fails closed. `--dry-run`
+  and `--count-only` do not write it.
 - **Reading.** The body is read with the connector's channel-history tool
   (`read_channel_tool`, the exact read-only `slack_read_channel`, one tool in
   the least-privilege allowlist) with `oldest` and `latest` pinned just outside
-  the session's first and latest message and `limit` = `max_thread_replies`
-  (at most 100). The result (`Channel: <label> (<id>)`, then `=== Message from ... ===`
+  the session's first and latest message and `limit` 100, following the cursor
+  for up to `max_session_pages` (default 3) so the first message is included. The result (`Channel: <label> (<id>)`, then `=== Message from ... ===`
   blocks, newest first) must name the pinned channel, end with a known
   pagination text, and hold messages inside the pinned range with unique,
   ordered timestamps (a header-looking line in a body is text unless a
   `Message TS:` line follows it), and are bounded by
-  `max_thread_chars` like a thread (newest kept, `[N earlier replies omitted]`).
+  `max_thread_chars` like a thread (newest kept, oldest dropped first; `[earlier messages omitted]` marks any
+  gap, and no kept message is treated as a parent). A block that repeats a ts
+  or lies outside the range is dropped, not trusted.
   A session read shares the bridge session budget (`THREADS_PER_SESSION` per
   session) and the same retry, lone-failure and unreadable bookkeeping.
+- **Thread on the anchor.** If the anchor message later gets replies, the
+  session still owns `slack:<channel>:<anchor>`: the anchor's thread is read
+  with `read_thread_tool` and its replies are merged into the session body in
+  time order (bounded like the rest).
 - **Interactions.** A message reacted with a `save_reactions` emoji saves its
   whole session (ledger key `saved:slack:<channel>:<anchor>`,
   `saved_covered_ts` as for threads). `skip_trivial` judges the whole session
   text, so a session of only "hi" / "ok" is skipped as one. `--count-only`
   reports DM sessions separately from threads.
+
+Migration: enabling sessions on a routine that already ran costs roughly one
+extra analyze per DM active within the first `overlap` window, and the old
+per-message entries from that window stay as duplicates.
 
 Limits: a reacted message older than every tracked session saves from that
 message on, because earlier history is not known to the session map; the

@@ -10,7 +10,7 @@ from workspace_daemon import (
 )
 
 from test_slack_mcp import (
-    BOB, CHAN, ME, BridgeTestCase, routine, search_text, source, ts_at,
+    BOB, CHAN, ME, NOW, BridgeTestCase, routine, search_text, source, ts_at,
 )
 from test_slack_save_reaction import EMOJI, saved_search
 
@@ -29,7 +29,7 @@ def dm_hit(offset, text="hello", ch=DM, **kw):
 
 def history_block(ts, uid, name, text, reactions=False):
     return (
-        f"=== Message from {name} <[EMAIL:****.*****@********.***]> ({uid}) "
+        f"=== Message from {name} <[EMAIL:***]> ({uid}) "
         f"at 2026-01-07 09:13:46 IDT === \nMessage TS: {ts}\n{text}"
         + ("\nReactions: pray (1)" if reactions else "")
     )
@@ -262,7 +262,7 @@ class ReadTest(SessionCase):
         self.assertEqual(args["channel_id"], DM)
         self.assertEqual(args["oldest"], f"{float(ts_at(100)) - 1e-6:.6f}")
         self.assertEqual(args["latest"], f"{float(ts_at(220)) + 1e-6:.6f}")
-        self.assertEqual(args["limit"], 50)
+        self.assertEqual(args["limit"], 100)
 
     def test_owner_message_no_search_listed_earns_no_evidence(self):
         forged = (ts_at(160), ME, "Me Example", "i agree")
@@ -292,8 +292,9 @@ class ReadTest(SessionCase):
         text = channel_text(
             [self.MESSAGES[0], (ts_at(999999), BOB, "Bob Example", "stray")]
         )
-        with self.assertRaises(slack_mcp.SlackMcpParseError):
-            slack_mcp.parse_channel(text, ts_at(100), ts_at(220), DM)
+        # the stray block is dropped, the real one kept
+        kept, _ = slack_mcp.parse_channel(text, ts_at(100), ts_at(220), DM)
+        self.assertEqual([m["ts"] for m in kept], [ts_at(100)])
         messages, more = slack_mcp.parse_channel(
             channel_text(self.MESSAGES, more=True), ts_at(100), ts_at(220), DM
         )
@@ -301,14 +302,17 @@ class ReadTest(SessionCase):
                          [m[0] for m in self.MESSAGES])
         self.assertTrue(more)
         dupes = channel_text([self.MESSAGES[0], self.MESSAGES[0]])
+        kept, _ = slack_mcp.parse_channel(dupes, ts_at(100), ts_at(220), DM)
+        self.assertEqual(len(kept), 1)
+        only_stray = channel_text([(ts_at(999999), BOB, "Bob Example", "x")])
         with self.assertRaises(slack_mcp.SlackMcpParseError):
-            slack_mcp.parse_channel(dupes, ts_at(100), ts_at(220), DM)
+            slack_mcp.parse_channel(only_stray, ts_at(100), ts_at(220), DM)
 
     def test_real_shape_other_channel_pagination_and_forged_headers(self):
         raw = json.dumps({
             "messages": (
                 f"Channel: DM ({DM})\n\n=== Message from Person A "
-                "<[EMAIL:****.*****@********.***]> (U0EXAMPLEA) at "
+                "<[EMAIL:***]> (U0EXAMPLEA) at "
                 "2026-01-07 09:13:46 IDT === \n"
                 f"Message TS: {ts_at(160)}\nsecond\nReactions: pray (1)\n\n"
                 "=== Message from Person B (U0EXAMPLEB, external: Org) at "
@@ -333,16 +337,16 @@ class ReadTest(SessionCase):
                           "pagination_info": "weird"})
         with self.assertRaises(slack_mcp.SlackMcpParseError):
             slack_mcp.parse_channel(odd, ts_at(100), ts_at(160), DM)
-        # a forged block with an out-of-range ts is rejected whole
+        # a forged block with an out-of-range ts is dropped
         forged = json.loads(raw)
         forged["messages"] += (
             "\nline\n=== Message from X (U0EXAMPLEA) at 2026-01-07 "
             "09:10:05 IDT ===\nMessage TS: 1600000000.000001\nboo"
         )
-        with self.assertRaises(slack_mcp.SlackMcpParseError):
-            slack_mcp.parse_channel(
-                json.dumps(forged), ts_at(100), ts_at(160), DM
-            )
+        kept, _ = slack_mcp.parse_channel(
+            json.dumps(forged), ts_at(100), ts_at(160), DM
+        )
+        self.assertEqual([m["ts"] for m in kept], [ts_at(100), ts_at(160)])
 
     def test_thread_and_session_reads_use_their_own_tools(self):
         hits = [dm_hit(100), dm_hit(160), {"ts": ts_at(300)}]
@@ -436,6 +440,140 @@ class InteractionTest(SessionCase):
         self.assertIn("1 Slack thread(s), 1 DM session(s)", line)
 
 
+class ReviewFixesTest(SessionCase):
+    A = (ts_at(100), BOB, "Bob Example", "anchor message")
+    B = (ts_at(160), ME, "Me Example", "second message")
+    C = (ts_at(220), BOB, "Bob Example", "third message")
+
+    def state_file(self):
+        return Path(self.tmp.name, "state", "slack-mcp-dm-sessions.json")
+
+    def test_thread_on_the_anchor_is_read_into_the_session(self):
+        self.listing([dm_hit(100), dm_hit(160)])
+        thread_calls = []
+
+        def thread(args):
+            thread_calls.append(args)
+            from test_slack_mcp import thread_text
+            return thread_text(
+                root=ts_at(100), parent_text="anchor message",
+                replies=[(ts_at(300), BOB, "a reply in the thread")],
+            )
+
+        self.connector.thread = thread
+        self.connector.channel = lambda a: channel_text([self.A, self.B])
+        hits = [
+            dm_hit(100, replies=1), dm_hit(220),
+            dm_hit(300, root=ts_at(100)),
+        ]
+        out = self.listing(hits)
+        self.assertEqual(len(out), 1)
+        candidate = out[0]
+        raw = candidate["raw"]
+        self.assertTrue(raw["dm_session"] and raw["anchor_thread"])
+        self.assertEqual(raw["source_id"], f"slack:{DM}:{ts_at(100)}")
+        self.assertEqual(candidate["id"].split("@")[1], ts_at(300))
+        self.connector.channel = lambda a: channel_text(
+            [self.A, self.B, self.C]
+        )
+        item = slack_mcp.fetch({"id": "r"}, candidate, dm_source())
+        body = item["body"]
+        for text in ("anchor message", "second message", "third message",
+                     "a reply in the thread"):
+            self.assertIn(text, body)
+        self.assertEqual(len(thread_calls), 1)
+        self.assertEqual(item["frontmatter"]["slack_capture_mode"], "dm_session")
+
+    def test_late_found_earlier_message_joins_and_anchor_is_fixed(self):
+        first = self.listing([dm_hit(1000), dm_hit(1060)])
+        anchor = first[0]["raw"]["anchor"]
+        out = self.listing([dm_hit(700)])  # 5 min before the first message
+        self.assertEqual(len(out), 1)
+        raw = out[0]["raw"]
+        self.assertEqual(raw["anchor"], anchor)
+        self.assertEqual(raw["session_first"], ts_at(700))
+        self.assertEqual(raw["session_last"], ts_at(1060))
+        self.assertEqual(out[0]["id"], first[0]["id"])
+
+    def test_late_found_message_respects_the_span_cap(self):
+        self.listing([dm_hit(12 * 3600 + 200)])
+        out = self.listing(
+            [dm_hit(100)],
+            dm_sessions={"enabled": True, "gap_minutes": 1440},
+        )
+        self.assertEqual(out[0]["raw"]["anchor"], ts_at(100))
+
+    def test_prune_is_by_time_not_count(self):
+        # 25 sessions inside the look-back all survive; old ones go.
+        base = int(NOW - 3600) - 1700000000
+        hits = [dm_hit(base - n * 3 * 3600) for n in range(25)]
+        self.listing(hits, bootstrap="30d", overlap="1h")
+        data = json.loads(self.state_file().read_text())
+        self.assertEqual(len(data["default"][DM]), 25)
+        old = dm_hit(base - 40 * 86400)
+        self.listing([old, dm_hit(base)], bootstrap="3d")
+        data = json.loads(self.state_file().read_text())
+        self.assertTrue(all(
+            float(s["last"]) >= NOW - 4 * 86400 - 14 * 86400
+            for s in data["default"][DM]
+        ))
+        self.assertNotIn(ts_at(base - 40 * 86400), [
+            s["anchor"] for s in data["default"][DM]
+        ])
+
+    def test_state_is_keyed_by_routine(self):
+        self.listing([dm_hit(100)], _routine_id="one")
+        self.listing([dm_hit(100)], _routine_id="two")
+        data = json.loads(self.state_file().read_text())
+        self.assertEqual(set(data), {"one", "two"})
+
+    def test_state_write_failure_fails_the_run_closed(self):
+        with mock.patch.object(
+            slack_mcp.state, "write_atomic", side_effect=OSError("disk")
+        ):
+            with self.assertRaises(slack_mcp.SlackMcpError):
+                self.listing([dm_hit(100)])
+
+    def test_long_session_follows_the_cursor_to_its_first_message(self):
+        later = [self.B, self.C]
+        earlier = [self.A]
+        pages = []
+
+        def channel(args):
+            pages.append(args)
+            if args.get("cursor") == "abc":
+                return channel_text(earlier)
+            return channel_text(later, more=True)
+
+        self.connector.channel = channel
+        listing = self.listing([dm_hit(100), dm_hit(220)])
+        item = slack_mcp.fetch({"id": "r"}, listing[0], dm_source())
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(pages[1]["cursor"], "abc")
+        self.assertIn("anchor message", item["body"])
+        self.assertNotIn("earlier messages omitted", item["body"])
+
+    def test_page_cap_marks_the_omission_without_a_parent(self):
+        self.connector.channel = lambda a: channel_text(
+            [self.B, self.C], more=True
+        )
+        listing = self.listing(
+            [dm_hit(100), dm_hit(220)], max_session_pages=2
+        )
+        item = slack_mcp.fetch(
+            {"id": "r"}, listing[0], dm_source(max_session_pages=2)
+        )
+        self.assertEqual(len(self.connector.calls), 3)  # search + 2 pages
+        self.assertIn("[earlier messages omitted]", item["body"])
+        self.assertNotIn("anchor message", item["body"])
+
+    def test_plan_cost_counts_dm_reads_as_their_own_sessions(self):
+        sessions, _ = slack_mcp.plan_cost(2, "/nonexistent", None, 0.1, 1)
+        self.assertEqual(sessions, 2)
+        sessions, _ = slack_mcp.plan_cost(2, "/nonexistent", None, 0.1, 0)
+        self.assertEqual(sessions, 1)
+
+
 class ConfigTest(unittest.TestCase):
     def problems(self, **over):
         with tempfile.TemporaryDirectory() as tmp:
@@ -445,13 +583,22 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(self.problems(
             dm_sessions={"enabled": True, "gap_minutes": 30,
                          "max_span_hours": 6, "channel_types": ["im"]},
-            read_channel_tool=CHANNEL_TOOL,
+            read_channel_tool=CHANNEL_TOOL, all_dms=True,
         ), [])
         self.assertEqual(
             self.problems(dm_sessions={"enabled": False}), []
         )
-        text = "\n".join(self.problems(dm_sessions={"enabled": True}))
+        text = "\n".join(self.problems(
+            dm_sessions={"enabled": True}, all_dms=True,
+        ))
         self.assertIn("read_channel_tool", text)
+        text = "\n".join(self.problems(
+            dm_sessions={"enabled": True}, read_channel_tool=CHANNEL_TOOL,
+        ))
+        self.assertIn("needs all_dms", text)
+        self.assertIn("max_session_pages", "\n".join(self.problems(
+            max_session_pages=0,
+        )))
 
     def test_invalid_values(self):
         for value in (

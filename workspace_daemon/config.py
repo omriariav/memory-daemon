@@ -1642,6 +1642,14 @@ def _validate_slack_mcp(prefix, source):
         why = slack_watch.dm_sessions_problem(sessions)
         if why:
             problems.append(f"{prefix}.dm_sessions {why}")
+    if (
+        isinstance(sessions, dict) and sessions.get("enabled") is True
+        and source.get("all_dms") is not True
+    ):
+        problems.append(
+            f"{prefix}.dm_sessions needs all_dms: true (owner-side messages "
+            "are otherwise unverified and gaps one-sided)"
+        )
     channel_tool = source.get("read_channel_tool")
     if (
         isinstance(sessions, dict) and sessions.get("enabled") is True
@@ -1722,7 +1730,7 @@ def _validate_slack_mcp(prefix, source):
         ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 60),
         ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
-        ("save_reaction_lookback_days", 1, 90),
+        ("save_reaction_lookback_days", 1, 90), ("max_session_pages", 1, 10),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(

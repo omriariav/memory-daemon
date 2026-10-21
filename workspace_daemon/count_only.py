@@ -37,8 +37,11 @@ def report(owned, processed, base_dir, totals):
                 "estimate_analyze_usd",
                 slack_mcp.DEFAULTS["estimate_analyze_usd"],
             )
+            dm_reads = sum(
+                1 for c in mcp if c["candidate"]["raw"].get("dm_session")
+            )
             sessions, cost = slack_mcp.plan_cost(
-                len(mcp), usage, rid, default
+                len(mcp), usage, rid, default, dm_reads
             )
             saved = sum(
                 1 for c in mcp if c["candidate"]["raw"].get("saved")
