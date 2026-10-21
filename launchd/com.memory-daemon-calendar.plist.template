@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional calendar-cache coordinator: the cheap, frequent calendar refresh
+     runs in its own job so a long maintenance run (Slack census) never delays
+     it. Render beside the primary plist. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memory-daemon-calendar</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO_DIR__/daemon.py</string>
+        <string>tick</string>
+        <string>--group</string>
+        <string>calendar</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/node-current/bin:/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:__HOME__/go/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

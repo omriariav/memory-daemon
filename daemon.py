@@ -113,48 +113,66 @@ def cmd_validate(args):
 
 # --- run --------------------------------------------------------------------
 
+CENSUS_KIND = "slack_conversation_census"
+CALENDAR_KIND = "calendar_cache"
+
+
+def _maintenance_kind(routine):
+    if not config.is_maintenance(routine):
+        return None
+    return (routine.get("maintenance") or {}).get("kind")
+
+
 def _execution_groups(routines, active_ids):
-    """Partition work by the lock that protects its mutable state."""
+    """Partition work by the lock that protects its mutable state.
+
+    Each group runs under its own lock. The calendar cache is only scheduled
+    by the `calendar` tick job (or `all`), so a long Slack census in the
+    `maintenance` job never delays it; a manual `run` orders census first.
+    """
     selected = [
         routine for routine in routines
         if routine.get("enabled", True) and routine["id"] in active_ids
     ]
+
+    def ids(predicate):
+        return {r["id"] for r in selected if predicate(_maintenance_kind(r))}
+
     return [
+        (ids(lambda kind: kind is None), "run"),
         (
-            {
-                routine["id"] for routine in selected
-                if not config.is_maintenance(routine)
-            },
+            ids(lambda kind: kind is not None
+                and kind not in (CENSUS_KIND, CALENDAR_KIND)),
             "run",
         ),
-        (
-            {
-                routine["id"] for routine in selected
-                if config.is_maintenance(routine)
-                and (routine.get("maintenance") or {}).get("kind")
-                != "slack_conversation_census"
-            },
-            "run",
-        ),
-        (
-            {
-                routine["id"] for routine in selected
-                if config.is_maintenance(routine)
-                and (routine.get("maintenance") or {}).get("kind")
-                == "slack_conversation_census"
-            },
-            "slack-census",
-        ),
+        # Within one `all` tick the cheap calendar refresh runs before the census.
+        (ids(lambda kind: kind == CALENDAR_KIND), "calendar-cache"),
+        (ids(lambda kind: kind == CENSUS_KIND), "slack-census"),
     ]
 
 
+def _in_tick_group(routine, group):
+    """Whether `tick --group <group>` considers this routine."""
+    kind = _maintenance_kind(routine)
+    if group == "capture":
+        return kind is None
+    if group == "calendar":
+        return kind == CALENDAR_KIND
+    if group == "maintenance":
+        return kind is not None and kind != CALENDAR_KIND
+    return True
+
+
 def _manual_execution_groups(routines, active_ids):
-    """Refresh census first, then preserve the runner's maintenance ordering."""
-    capture, maintenance, census = _execution_groups(routines, active_ids)
+    """Refresh census and calendar first, then the runner's maintenance order."""
+    capture, maintenance, calendar, census = _execution_groups(
+        routines, active_ids
+    )
     capture_ids, _ = capture
     maintenance_ids, _ = maintenance
     return [
         census,
+        calendar,
         (capture_ids | maintenance_ids, "run"),
     ]
 
@@ -276,11 +294,7 @@ def cmd_tick(args):
         r for r in routines
         if (
             r.get("enabled", True)
-            and (
-                group == "all"
-                or (group == "capture" and not config.is_maintenance(r))
-                or (group == "maintenance" and config.is_maintenance(r))
-            )
+            and _in_tick_group(r, group)
         )
     ]
     due = [
@@ -454,8 +468,9 @@ def main(argv=None):
         "tick", help="run only enabled routines whose schedule is due"
     )
     p_tick.add_argument(
-        "--group", choices=("all", "capture", "maintenance"), default="all",
-        help="run all due routines, capture only, or maintenance only",
+        "--group", choices=("all", "capture", "maintenance", "calendar"), default="all",
+        help="run all due routines, capture only, maintenance only (without "
+             "the calendar cache), or the calendar cache only",
     )
     p_tick.add_argument(
         "-n", "--dry-run", action="store_true",

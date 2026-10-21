@@ -11,9 +11,11 @@ fi
 
 LABEL="${MEMORY_DAEMON_LAUNCHD_LABEL:-com.memory-daemon}"
 MAINTENANCE_LABEL="${MEMORY_DAEMON_MAINTENANCE_LAUNCHD_LABEL:-com.memory-daemon-maintenance}"
+CALENDAR_LABEL="${MEMORY_DAEMON_CALENDAR_LAUNCHD_LABEL:-com.memory-daemon-calendar}"
 DOMAIN="${MEMORY_DAEMON_LAUNCHD_DOMAIN:-gui/$(id -u)}"
 PLIST="${MEMORY_DAEMON_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 MAINTENANCE_PLIST="${MEMORY_DAEMON_MAINTENANCE_PLIST:-$HOME/Library/LaunchAgents/$MAINTENANCE_LABEL.plist}"
+CALENDAR_PLIST="${MEMORY_DAEMON_CALENDAR_PLIST:-$HOME/Library/LaunchAgents/$CALENDAR_LABEL.plist}"
 LAUNCHCTL="${MEMORY_DAEMON_LAUNCHCTL:-launchctl}"
 PYTHON="${MEMORY_DAEMON_PYTHON:-python3}"
 
@@ -52,14 +54,25 @@ load_scheduler() {
 
 load_scheduler "$LABEL" "$PLIST"
 load_scheduler "$MAINTENANCE_LABEL" "$MAINTENANCE_PLIST"
+# The calendar job is optional: only load it once its plist has been rendered.
+CALENDAR_ENABLED=0
+if [[ -f "$CALENDAR_PLIST" ]]; then
+  CALENDAR_ENABLED=1
+  load_scheduler "$CALENDAR_LABEL" "$CALENDAR_PLIST"
+fi
 
 TARGET="$DOMAIN/$LABEL"
 MAINTENANCE_TARGET="$DOMAIN/$MAINTENANCE_LABEL"
+CALENDAR_TARGET="$DOMAIN/$CALENDAR_LABEL"
 
 echo "Starting one capture coordinator tick for due routines..."
 "$LAUNCHCTL" kickstart "$TARGET"
 echo "Starting one maintenance coordinator tick for due routines..."
 "$LAUNCHCTL" kickstart "$MAINTENANCE_TARGET"
+if (( CALENDAR_ENABLED )); then
+  echo "Starting one calendar coordinator tick for due routines..."
+  "$LAUNCHCTL" kickstart "$CALENDAR_TARGET"
+fi
 
 echo
 echo "Scheduler started. Current status:"

@@ -637,6 +637,107 @@ flag, so a very small race remains between each last read and its subsequent
 write. A divergence that remains visible is caught as a conflict on the
 following run.
 
+### Calendar cache for prompt injection
+
+`maintenance.kind: calendar_cache` keeps a compact, rolling view of your Google
+Calendar on disk. Each run fetches the next `window_hours` through the
+[headless Claude bridge](#headless-claude-bridge-and-analyzeprovider-claude)
+(a claude.ai Google Calendar connector; Claude only transports the tool
+results) and Python parses and renders them into `output` (text) and the same
+path with a `.json` extension (normalized events plus `refreshed_at`, for other
+routines). Both files are written atomically (mode 0600, parent directory 0700
+when created); `output` must be an absolute or `~` path. The list call's
+`calendar_id`, `time_min`, `time_max` and `max_results` are all computed in
+Python and pinned in the bridge allowlist, and events outside the window are
+dropped. If the bridge call or parsing fails the run errors and the previous
+files stay untouched. A result that cannot be parsed is a failure, never "0
+events": only a whole-text "No events found" / "Found 0 event(s)" counts as
+empty. Once the last good refresh is older than `stale_after` (default `2h`), a
+failed run rewrites the text file with a `# Calendar STALE: last refreshed ...`
+header and drops events that already ended (the JSON twin is left as is).
+
+Calendar refreshes run in their own tick group, never in `maintenance`: install
+the optional `com.memory-daemon-calendar` job (`tick --group calendar`) so a
+long Slack census in the maintenance job cannot delay it. A calendar_cache
+routine also runs under `tick` / `tick --group all`, but not under
+`--group maintenance`, so without the calendar job (or an `all` tick) it never
+refreshes. The routine keeps its own lock (`calendar-cache.lock`). The bridge
+call times out after 180s (2 attempts), and at most `max_details` (default 20,
+soonest first) event lookups are made per run. See
+`routines/_example-calendar-cache.yaml`; `checkpoint` is not used.
+
+```yaml
+maintenance:
+  kind: calendar_cache
+  calendar_id: primary                 # pinned in the bridge allowlist
+  window_hours: 48
+  timezone: UTC                        # rendering timezone (IANA)
+  owner_email: me@example.com          # "my RSVP"; organizer => "organizer"
+  internal_domains: [example.com]      # agendas/links only for these organizers
+  output: ~/.cache/claude-calendar/next48h.txt
+  skip_titles: [Office, Home]          # all-day markers to drop
+  max_attendee_names: 0                # N > 0: counts only above N attendees
+  model: haiku
+  list_tool: mcp__claude_ai_Example_Calendar__list_events
+  get_tool: mcp__claude_ai_Example_Calendar__get_event
+  max_events: 50
+  max_details: 20                      # get_event lookups per run, soonest first
+  stale_after: 2h                      # mark the text file STALE after this
+  conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]
+```
+
+`owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
+are exact MCP names from your connector and are never defaulted.
+
+Output, one block per event sorted by start (declined events are kept; rooms
+are shown only under `where`, not counted as attendees):
+
+```
+# Calendar next 48h (refreshed 2026-10-20 17:30 UTC)
+Tue 20 Oct 12:00-13:00 | Weekly sync | my RSVP: accepted
+  organizer: Alice Smith | where: Room 1 (8) (room accepted); https://zoom.example.com/j/123
+  attendees (3): accepted: Alice Smith (organizer), Me; no reply: Bob Jones
+  agenda: Review the plan.
+  links: https://docs.example.com/d/1
+  recurring: yes | event id: 1abc_20261020T090000Z
+```
+
+Print it into every prompt with a Claude Code `UserPromptSubmit` hook in
+`~/.claude/settings.json` (stdout of a `UserPromptSubmit` hook is added to the
+context):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command",
+                  "command": "cat ~/.cache/claude-calendar/next48h.txt 2>/dev/null || true"}]}
+    ]
+  }
+}
+```
+
+Security notes:
+
+- Only the two read-only tools you configure are allowlisted, and the list
+  call's arguments (calendar, window, size) are pinned, so the bridge refuses
+  any other calendar, window or tool. Claude never writes the files.
+- Everything in the file is injected into every prompt, so event text is
+  treated as untrusted: control characters are stripped and each field is one
+  line. An event is internal only when its organizer's email domain is exactly
+  in `internal_domains` (no suffix matching), or a shared calendar organizes it
+  and its creator is internal and the event type is `default`. The creator
+  alone never makes an event internal.
+- Agendas (description, collapsed, 300 characters) and extra links are kept only
+  for internal events, and conference links never carry query strings, so
+  passcodes are not written. For events from outside, what can still reach the
+  prompt is: the title (100 characters), the location (80 characters, links
+  removed), organizer and attendee names derived from email addresses (at most
+  3 words / 30 characters each), RSVP statuses, room names, and a conference
+  link only if its host is in `conference_hosts` (or a subdomain of it).
+  Internal descriptions are still prompt input; list only domains you trust.
+- The cache contains meeting titles and attendee names, so it is written 0600.
+
 `daemon.py run` is manual and ignores cadence. `daemon.py tick` is the
 scheduler entrypoint: it reads `schedule.every` plus an optional timezone-aware
 `schedule.work_hours` override, runs due owners sequentially under the existing
@@ -649,7 +750,7 @@ Routines without `schedule.every` retain the legacy hourly cadence; the template
 sets `4h` explicitly for new routines.
 
 See `_example-domain-routine.yaml`, `_example-fallback-sweep.yaml`, and
-`_example-google-tasks-sync.yaml`.
+`_example-google-tasks-sync.yaml`, and `_example-calendar-cache.yaml`.
 
 ## Adding a routine
 
@@ -1027,12 +1128,17 @@ sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HO
 sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
   launchd/com.memory-daemon-maintenance.plist.template \
   > ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
+# Optional: only needed for a calendar_cache routine (see "Calendar cache").
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$(command -v python3)|g; s|__HOME__|$HOME|g" \
+  launchd/com.memory-daemon-calendar.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon-calendar.plist
 
 # Replace REPLACE_ME with your provider API key, then keep both rendered
 # definitions private. The maintenance job does not receive the provider key.
 $EDITOR ~/Library/LaunchAgents/com.memory-daemon.plist
 chmod 600 ~/Library/LaunchAgents/com.memory-daemon.plist \
   ~/Library/LaunchAgents/com.memory-daemon-maintenance.plist
+chmod 600 ~/Library/LaunchAgents/com.memory-daemon-calendar.plist 2>/dev/null || true
 
 # One-time cleanup when upgrading from the former workspace-daemon label.
 launchctl bootout gui/$(id -u)/com.workspace-daemon 2>/dev/null || true
@@ -1094,11 +1200,13 @@ the LaunchAgent or a routine needs attention, so it can also be used by a
 separate monitor. Set `MEMORY_DAEMON_LAUNCHD_LABEL` (or pass `--label`) if the
 installed job uses a different label.
 
-Rollback both jobs with:
+`run.sh` loads and kicks the calendar job only when its rendered plist exists.
+Rollback the jobs with:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.memory-daemon
 launchctl bootout gui/$(id -u)/com.memory-daemon-maintenance
+launchctl bootout gui/$(id -u)/com.memory-daemon-calendar 2>/dev/null || true
 ```
 
 The rendered plist holds an API key and absolute paths, so `launchd/*.plist` is
@@ -1122,6 +1230,7 @@ workspace_daemon/
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
   transcripts.py           shared transcript-source Calendar gate + receipts
   google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync
+  calendar_cache.py        rolling calendar cache (text + JSON) via the Claude bridge
   llm.py                   yoetz/Claude adapter, prompt building, label extraction
   claude_bridge.py         least-privilege headless `claude -p` runner (+ PreToolUse hook)
   notes.py                 frontmatter + note writing
@@ -1129,7 +1238,7 @@ workspace_daemon/
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
-launchd/                   capture + maintenance LaunchAgent templates
+launchd/                   capture, maintenance + calendar LaunchAgent templates
 state/  logs/              runtime, gitignored
 ```
 
