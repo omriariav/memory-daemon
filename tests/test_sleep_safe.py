@@ -315,6 +315,11 @@ class BridgeOutageTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        # CI has no claude binary; the spawn itself is mocked below.
+        patcher = mock.patch.object(
+            claude_bridge, "claude_bin", lambda: "/bin/true")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def attempt(self, span_cls):
         def timed_out(*a, **k):
