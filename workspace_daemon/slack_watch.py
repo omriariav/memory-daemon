@@ -28,9 +28,12 @@ WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap",
 }
-_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
-_USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
+CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
+USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
+
+
+_WARNED = set()  # warn once per process, not on every tick
 
 
 class WatchError(ValueError):
@@ -67,7 +70,8 @@ def load(path):
     if not path.is_absolute():
         raise WatchError("watch path must be absolute or start with ~")
     try:
-        if os.stat(path).st_mode & 0o077:
+        if os.stat(path).st_mode & 0o077 and str(path) not in _WARNED:
+            _WARNED.add(str(path))
             log("slack watch file is readable by group or others; "
                 "run chmod 600 on it")
         with open(path) as handle:
@@ -92,11 +96,11 @@ def load(path):
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
     return {
-        "channels": _ids(data, "channels", _CHANNEL_ID, "channel"),
-        "people": _ids(data, "people", _USER_ID, "user"),
+        "channels": _ids(data, "channels", CHANNEL_ID, "channel"),
+        "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
         "owner_action_channels": _ids(
-            data, "owner_action_channels", _CHANNEL_ID, "channel"
+            data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
         "bootstrap": bootstrap,
     }

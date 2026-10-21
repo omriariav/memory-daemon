@@ -78,10 +78,12 @@ class LoaderTest(unittest.TestCase):
                 self.assertIn(fragment, str(caught.exception))
 
     def test_loose_permissions_warn(self):
+        slack_watch._WARNED.clear()
         path = write(self.tmp.name, "watch.yaml", WATCH)
         path.chmod(0o644)
         with mock.patch.object(slack_watch, "log") as log:
             slack_watch.load(path)
+            slack_watch.load(path)  # once per process, not every tick
         log.assert_called_once()
         path.chmod(0o600)
         with mock.patch.object(slack_watch, "log") as log:
