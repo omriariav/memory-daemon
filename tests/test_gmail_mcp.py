@@ -367,6 +367,18 @@ class MessageParserTest(unittest.TestCase):
         self.assertNotIn("Weekly sync", msg["body"])  # the real part is cut
         self.assertNotIn("drop me", msg["body"])
 
+    def test_real_html_with_unclosed_inner_tags_is_cut_keeping_prose(self):
+        real = ("<!DOCTYPE html>\n<html><body><span>Hello <font>there"
+                "<p>Open the portal</body></html>")
+        body = 'Quote:\n\n  <html lang="en">\n\nThen reply.'
+        msg = gmail_mcp.parse_message(message_text(body=body, html=real))
+        self.assertIn('<html lang="en">', msg["body"])
+        self.assertIn("Then reply.", msg["body"])
+        for dropped in ("Hello", "portal", "DOCTYPE", "<span>"):
+            self.assertNotIn(dropped, msg["body"])
+        only = gmail_mcp.parse_message(message_text(body="Plain.", html=real))
+        self.assertEqual(only["body"], "Plain.")
+
     def test_trailing_ltr_div_that_repeats_the_text_is_cut(self):
         dup = '<div dir="ltr">Plain body text.<br><br>--<br>Ann</div>'
         msg = gmail_mcp.parse_message(message_text(
@@ -671,8 +683,25 @@ class WatermarkTest(BridgeTestCase):
         )
         self.assertLessEqual(len(listing), 4)
         # The cursor resumes exactly at the window's end.
-        self.assertEqual(runtime["watermarks"], {"mail": end + 3600})
+        self.assertEqual(runtime["watermarks"], {"mail": end + 3600 - 60})
         self.assertEqual(runtime["lossy_windows"], 0)
+
+    def test_a_message_at_the_window_edge_second_is_listed_next_run(self):
+        edge = AFTER + (int(NOW) - AFTER) // 2
+        messages = [(n, n, edge + 10 * (n - 1)) for n in range(1, 5)]
+        self.connector.search = ranged_search(messages, page=2)
+        runtime = {}
+        first = gmail_mcp.candidates(source(
+            max_search_pages=1, settle_minutes=0, _gmail_mcp_runtime=runtime))
+        self.assertEqual(first, [])  # before:edge excludes the edge second
+        mark = runtime["watermarks"]["mail"]
+        since = gmail_mcp.since_for(source(), gmail_mcp._rfc3339(mark))
+        self.assertEqual(
+            int(gmail_mcp.slack_source._rfc3339_epoch(since)), edge - 60)
+        gmail_mcp._last_session[0] = 0.0
+        again = gmail_mcp.candidates(source(
+            max_search_pages=5, settle_minutes=0, _since_map={"mail": since}))
+        self.assertIn(hexid(1), {c["raw"]["thread_id"] for c in again})
 
     def test_a_one_hour_window_over_the_cap_is_taken_as_is_with_a_warning(self):
         messages = [(n, n, int(NOW) - 600 + n) for n in range(1, 11)]

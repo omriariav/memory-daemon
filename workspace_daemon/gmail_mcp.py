@@ -96,6 +96,7 @@ MAX_READINGS = 200
 MAX_ATTACHMENTS = 10
 MAX_BISECTIONS = 6
 MIN_WINDOW_SECONDS = 3600
+WINDOW_EDGE_SECONDS = 60
 SEARCH_TOOL_NAME = "search"
 FETCH_TOOL_NAME = "fetch_message"
 
@@ -490,6 +491,21 @@ def split_markup(body):
             and re.search(r"</html\s*>\s*\Z", rest, re.I)
         ):
             return body[:match.start()], rest
+    last = None
+    for last in _DOC_START.finditer(body):
+        pass
+    if last is not None and re.search(
+        r"</html\s*>\s*\Z", body[last.start():], re.I
+    ):
+        # Real HTML with unbalanced inner markup: cut at the last doc line
+        # (a prose line before it stays), taking a doctype line just above.
+        start = last.start()
+        above = re.search(
+            r"^[ \t]*<!doctype[^>]*>[ \t]*\n[ \t]*\Z", body[:start], re.I | re.M
+        )
+        if above:
+            start = above.start()
+        return body[:start], body[start:]
     for match in list(_LTR_DIV.finditer(body))[:20]:
         rest = body[match.start():]
         text = body[:match.start()]
@@ -894,9 +910,10 @@ def candidates(source):
         values.append(deferred_floor)
     overlap = _seconds(cfg["overlap"])
     if window_end is not None:
-        # Only [after, window_end) was listed: resume exactly there (the next
-        # run lists from cursor - overlap, so add the overlap back).
-        values.append(window_end + overlap)
+        # Only [after, window_end) was listed: resume just before its end (the
+        # next run lists from cursor - overlap, so add the overlap back; the
+        # margin keeps a message at the edge second, the ledger skips repeats).
+        values.append(window_end + overlap - WINDOW_EDGE_SECONDS)
     runtime = source.get("_gmail_mcp_runtime")
     if runtime is not None:
         runtime["watermarks"] = {CURSOR_KEY: min(values)} if values else {}
