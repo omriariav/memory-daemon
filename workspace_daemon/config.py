@@ -1974,6 +1974,15 @@ def _validate_mila_match(source, prefix):
                         f"{prefix}.app_summary.{key} must be a number from "
                         f"{low} to {high}"
                     )
+    if isinstance(app, dict) and isinstance(
+        app.get("wait_minutes"), (int, float)
+    ) and not isinstance(app.get("wait_minutes"), bool):
+        hours = source.get("calendar_match_hours", 6)
+        if isinstance(hours, (int, float)) and app["wait_minutes"] >= hours * 60:
+            problems.append(
+                f"{prefix}.app_summary.wait_minutes must be less than "
+                "calendar_match_hours * 60"
+            )
     limit = source.get("max_transcript_chars")
     if limit is not None and (
         not isinstance(limit, int) or isinstance(limit, bool)
@@ -2486,7 +2495,8 @@ def _validate_source(routine, source, prefix):
         problems.extend(_validate_mila_match(source, prefix))
     elif any(key in source for key in ("calendar", "match", "max_transcript_chars", "app_summary")):
         problems.append(
-            f"{prefix}: calendar, match and max_transcript_chars are only "
+            f"{prefix}: calendar, match, max_transcript_chars and "
+            f"app_summary are only "
             f"supported for kind mila"
         )
 

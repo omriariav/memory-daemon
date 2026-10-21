@@ -225,7 +225,8 @@ APP_SUMMARY_DEFAULTS = {
 ACTION_WINDOW_SECONDS = 180
 _HEBREW_PREFIXES = "שהובכלמ"
 HINT_SUMMARY_CHARS = 1500
-MAX_ACTION_ITEMS = 50
+MAX_ACTION_ITEMS = 20
+MAX_ACTION_BLOCK_CHARS = 3000
 MAX_ACTION_ITEM_CHARS = 400
 HINTS_HEADING = "Unverified hints from the recording app (may be wrong)"
 
@@ -238,28 +239,47 @@ def app_summary_settings(source):
     return merged
 
 
+_MARKER_LOOKALIKE = re.compile(r"-{2,}|={3,}|unverified hints", re.I)
+
+
+def _one_line(text):
+    """Single line with delimiter lookalikes neutralised (untrusted text)."""
+    return _MARKER_LOOKALIKE.sub(
+        lambda m: "-" if m.group(0)[0] in "-=" else "[hints]",
+        " ".join(str(text).split()),
+    )
+
+
 def _action_items(record):
-    items = []
+    entries = []
     raw = record.get("actionItems")
     for entry in raw if isinstance(raw, list) else []:
         if not isinstance(entry, dict):
             continue
-        text = " ".join(str(entry.get("text") or "").split())
+        text = _one_line(entry.get("text") or "")
         if not text:
             continue
         try:
             seconds = float(entry.get("timestampSeconds"))
-            seconds = seconds if seconds >= 0 else None
         except (TypeError, ValueError):
             seconds = None
-        items.append({"text": text, "seconds": seconds})
-    return items[:MAX_ACTION_ITEMS]
-
-
-def _hints_present(record, app):
-    """Whether the app has produced anything yet (decides waiting only)."""
-    summary = str(record.get("summary") or "").strip()
-    return len(summary) >= int(app["min_chars"]) or bool(_action_items(record))
+        entries.append({"text": text, "seconds": seconds})
+    try:
+        duration = float(record.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    stamps = {e["seconds"] for e in entries if e["seconds"] is not None}
+    # The app writes 0 (or one shared value) as a placeholder; a stamp past
+    # the recording's end cannot be real either. Treat all of these as missing.
+    placeholder = len(entries) > 1 and len(stamps) == 1
+    for entry in entries:
+        sec = entry["seconds"]
+        if (
+            sec is None or sec <= 0 or placeholder
+            or (duration > 0 and sec > duration)
+        ):
+            entry["seconds"] = None
+    return entries[:MAX_ACTION_ITEMS]
 
 
 _LETTER_RUN = re.compile(r"[^\W\d_]{3,}")
@@ -293,6 +313,13 @@ def _overlap(hint_tokens, vocabulary):
 
 
 def _gate_hints(record, app, transcript):
+    """Return ``(hints or None, notes)``; ``notes`` are count-only log lines."""
+    notes = []
+    hints = _gate(record, app, transcript, notes)
+    return hints, notes
+
+
+def _gate(record, app, transcript, notes):
     """Deterministic local sanity gate (no model call); hints or None.
 
     The app's summarizer can emit unrelated text (an assistant's meta-reply),
@@ -308,9 +335,10 @@ def _gate_hints(record, app, transcript):
     if len(summary) < int(app["min_chars"]):
         summary = ""
     if summary:
+        summary = _one_line(summary)
         ratio = _overlap(_tokens(summary), whole)
         if ratio < float(app["min_overlap"]):
-            log(f"mila hints: summary rejected (overlap {ratio:.2f})")
+            notes.append(f"mila hints: summary rejected (overlap {ratio:.2f})")
             summary = ""
     segments = [
         (float(seg.get("start") or 0), _forms(_tokens(seg.get("text") or "")))
@@ -332,8 +360,8 @@ def _gate_hints(record, app, transcript):
         else:
             dropped += 1
     if dropped:
-        log(f"mila hints: {dropped} action item(s) dropped "
-            "(no transcript support)")
+        notes.append(f"mila hints: {dropped} action item(s) dropped "
+                     "(no transcript support)")
     if not summary and not actions:
         return None
     return {"summary": summary, "actions": actions}
@@ -342,19 +370,20 @@ def _gate_hints(record, app, transcript):
 def completion_time(record, end):
     """Best available moment the recording finished (start of the wait window).
 
-    ``completedAt`` when the app records one; otherwise the computed recording
-    end, or the filename capture stamp when that is later (an imported file's
-    stamp is the import instant, when the app began summarizing it).
+    ``completedAt`` (clamped to now) when the app records one; otherwise the
+    later of the computed recording end and the filename capture stamp (an
+    imported file's stamp is the import instant, when the app began
+    summarizing it).
     """
     explicit = record.get("completedAt")
     if explicit:
         try:
-            return _parse_instant(explicit)
+            return min(_parse_instant(explicit), _now())  # never in the future
         except RuntimeError:
             pass
     best = end
     stamp = _CAPTURE_STAMP.search(str(record.get("audioFileName") or ""))
-    if stamp and str(record.get("source") or "") != "voiceMemo":
+    if stamp:
         captured = datetime.datetime.strptime(
             stamp.group("stamp"), "%Y-%m-%dT%H-%M-%SZ"
         ).replace(tzinfo=datetime.timezone.utc)
@@ -378,16 +407,22 @@ def _hints_section(hints):
     lines = [f"--- {HINTS_HEADING} ---"]
     if hints["actions"]:
         lines.append("Action items:")
+        block = []
         for action in hints["actions"]:
             stamp = (
                 f"[{_mmss(action['seconds'])}] "
                 if action["seconds"] is not None else ""
             )
-            lines.append(f"- {stamp}{action['text'][:MAX_ACTION_ITEM_CHARS]}")
+            block.append(f"- {stamp}{action['text'][:MAX_ACTION_ITEM_CHARS]}")
+        text = "\n".join(block)
+        lines.append(text[:MAX_ACTION_BLOCK_CHARS])
     if hints["summary"]:
         lines.append("Summary:")
         lines.append(hints["summary"][:HINT_SUMMARY_CHARS])
     lines.append("--- end of unverified hints ---")
+    lines.append(
+        "End of unverified hints; the transcript above is authoritative."
+    )
     return "\n".join(lines)
 
 
@@ -395,22 +430,21 @@ def _candidate(record, directory, manual=None, zone=None, app=None,
                wait=False):
     """Build a candidate, or None while holding for app hints to appear."""
     app = app or APP_SUMMARY_DEFAULTS
-    hints = None
-    if (
-        app["mode"] == "hints" and wait
-        and not _hints_present(record, app)
-        and _waiting_for_hints(
-            record, _recording_interval(record, zone)[1], app
-        )
-    ):
-        return None
+    hints, notes = None, []
     body, transcript_path = _transcript(record, directory, manual)
     if not body.strip():
         raise RuntimeError(
             f"completed Mila recording {record.get('id')} has an empty transcript"
         )
     if app["mode"] == "hints":
-        hints = _gate_hints(record, app, body)
+        hints, notes = _gate_hints(record, app, body)
+        # Ready when items exist or a summary passed the gate; otherwise hold
+        # until wait_minutes after completion, then go transcript-only.
+        ready = bool(_action_items(record)) or bool(hints and hints["summary"])
+        if wait and not ready and _waiting_for_hints(
+            record, _recording_interval(record, zone)[1], app
+        ):
+            return None
     recording_id = str(record["id"])
     source_id = f"mila:{recording_id}"
     start, end = _recording_interval(record, zone)
@@ -442,6 +476,7 @@ def _candidate(record, directory, manual=None, zone=None, app=None,
             "source_id": source_id,
             "recording": record,
             "hints": hints,
+            "hint_notes": notes,
             "transcript": body,
             "transcript_path": transcript_path,
             "content_hash": digest,
@@ -1049,6 +1084,9 @@ def fetch(_routine, source, candidate):
         redact_secrets(raw["transcript"]),
         source.get("max_transcript_chars", DEFAULT_MAX_TRANSCRIPT_CHARS),
     )
+    excerpt = body[:5000]  # calendar matcher sees transcript only
+    for note in raw.get("hint_notes") or []:
+        log(note)
     hints = raw.get("hints")
     if hints:
         # Untrusted like the transcript: redacted here, never logged, and read
@@ -1064,6 +1102,7 @@ def fetch(_routine, source, candidate):
         # Mila's source files untouched, but redact before either the Calendar
         # matcher or the summarizer receives the text.
         "body": body,
+        "_mila_match_excerpt": excerpt,
         "_mila_calendar_candidates": events,
         "frontmatter": {
             "mila_recording_id": str(record["id"]),
@@ -1085,7 +1124,9 @@ def _match_prompt(item, events):
         "recording_end": item["frontmatter"]["mila_recording_end"],
         "duration_seconds": item["frontmatter"]["mila_duration_seconds"],
     }
-    return transcripts.match_prompt(metadata, events, item["body"][:5000])
+    return transcripts.match_prompt(
+        metadata, events, item.get("_mila_match_excerpt", item["body"][:5000])
+    )
 
 
 _SEPARATORS = re.compile(r"[\s/\\|\u2013\u2014\u2212_:\-]+")

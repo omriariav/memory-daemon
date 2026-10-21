@@ -1199,8 +1199,14 @@ source:
 
 - The transcript stays the analysis input exactly as before. In `hints` mode a
   delimited block, "Unverified hints from the recording app (may be wrong)",
-  is appended after it: the action items (`[mm:ss] text`, at most 50) and the
-  summary truncated to 1500 characters. The analysis prompt gains one short
+  is appended after it: up to 20 action items (`[mm:ss] text`, block capped at
+  3000 characters) and the summary truncated to 1500 characters. Summary and
+  items are collapsed to single lines and delimiter lookalikes (`--` runs, the
+  marker phrase) are neutralised, so they cannot close the block. Timestamps
+  that are 0, shared by all items, or beyond the recording length are the
+  app's placeholders: they are treated as missing (no stamp rendered, gate
+  against the whole transcript). The Calendar matcher only ever sees the
+  transcript excerpt, never the hints. The analysis prompt gains one short
   instruction: use a hint only as a candidate, keep an action item or decision
   only if the transcript supports it, cite the transcript timestamp, and take
   the owner from the transcript, never from the hint's wording. Ownership is
@@ -1217,13 +1223,13 @@ source:
   transcript when it has none or the window is empty). Both checks are
   deterministic; no model is called.
   Only counts and the overlap ratio are logged, never text. A rejected hint
-  does not restart the wait.
-- Waiting: if the app has produced neither a long-enough summary nor action
-  items yet, the recording is held (not a candidate, not ledgered) until
+  does not end the wait early.
+- Waiting: until action items exist or a summary that passes the gate exists
+  (a rejected summary does not end the wait), the recording is held (not a candidate, not ledgered) until
   `wait_minutes` after completion, then processed transcript-only. Completion
-  is `completedAt` when the record has one, else the recording end, or the
-  filename capture stamp if later (an imported file's stamp is the import
-  instant). Explicit `manual_recordings` never wait.
+  is `completedAt` (clamped to now) when the record has one, else the later of
+  the recording end and the filename capture stamp (an imported file's stamp is
+  the import instant). `wait_minutes` must be below `calendar_match_hours * 60`. Explicit `manual_recordings` never wait.
 - No reprocessing: hints do not change the candidate id, so a summary that
   appears after capture does nothing, and corrected transcripts still version
   the entry as before.
