@@ -190,11 +190,11 @@ def _merge_totals(totals, additions):
             totals[key] = totals.get(key, 0) + value
 
 
-def _pause_reason(args):
+def _pause_reason(args, prefix=""):
     """Log and return the kill-switch reason when this invocation must not run."""
     reason = state.paused(BASE_DIR)
     if reason and not getattr(args, "ignore_pause", False):
-        log(f"paused: {reason}")
+        log(f"{prefix}paused: {reason}")
         return reason
     return None
 
@@ -261,6 +261,9 @@ def cmd_run(args):
                 f"{exc}"
             )
             continue
+        except state.Paused as exc:
+            log(f"run stopped: {exc}")
+            return 0
         _merge_totals(totals, group_totals)
 
     verb = "would process" if args.dry_run else "processed"
@@ -287,11 +290,16 @@ def cmd_run(args):
 def cmd_tick(args):
     """Run enabled routines whose individual cadence has elapsed."""
     set_log_file(LOG_FILE)
-    if _pause_reason(args):
+    tick_id = uuid.uuid4().hex[:12]
+    group = getattr(args, "group", "all")
+    tick_name = f"tick[{tick_id}]"
+    if group != "all":
+        tick_name += f"({group})"
+    # Tick-prefixed so `status` reads a paused tick as a healthy no-op.
+    if _pause_reason(args, f"{tick_name}: "):
         return 0
     if not args.dry_run:
         config.secure_routine_files(BASE_DIR)
-    tick_id = uuid.uuid4().hex[:12]
     routines = config.discover(BASE_DIR)
     problems = [p for r in routines for p in config.validate(r)]
     if problems:
@@ -300,10 +308,6 @@ def cmd_tick(args):
         return 1
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
-    group = getattr(args, "group", "all")
-    tick_name = f"tick[{tick_id}]"
-    if group != "all":
-        tick_name += f"({group})"
     selected = [
         r for r in routines
         if (
@@ -348,7 +352,12 @@ def cmd_tick(args):
                 f"{exc}{mode}"
             )
             continue
-        schedule.mark_attempted(group_ids, now=group_started_epoch)
+        except state.Paused as exc:
+            log(f"{tick_name}: {exc}{mode}")
+            return 0
+        # A routine held by a cap or the pause switch did not really attempt.
+        held = set(group_totals.get("held_ids", ()))
+        schedule.mark_attempted(group_ids - held, now=group_started_epoch)
         _merge_totals(totals, group_totals)
     log(
         f"{tick_name} done: {totals['processed']} processed, "

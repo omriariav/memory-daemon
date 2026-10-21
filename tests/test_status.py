@@ -694,14 +694,88 @@ class RenderStatusTest(unittest.TestCase):
         self.assertIn("  beta: $0.25", text)
         self.assertIn("  (unattributed): $0.10", text)
         rows = {
-            line.split()[0]: line for line in text.splitlines()
+            line.split()[0]: line.split("  ") for line in text.splitlines()
             if line.startswith("srv_")
         }
-        self.assertIn("1h ago", rows["srv_a"])
-        self.assertIn("30m ago", rows["srv_a"])
-        self.assertIn("never", rows["srv_b"])
+        cells = lambda name: [c.strip() for c in rows[name] if c.strip()]
+        # srv_a: last ok 1h ago; it was only part of the later failed call.
+        self.assertEqual(cells("srv_a"), ["srv_a", "1h ago", "never", "30m ago"])
+        # srv_b: the failure names it.
+        self.assertEqual(cells("srv_b"), ["srv_b", "never", "30m ago", "never"])
+        self.assertIn("IN FAILED CALL", text)
         self.assertIn(
             "Last error: 30m ago — error: tool returned an error", text)
+
+    def test_paused_tick_noop_is_healthy_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.log"
+            log.write_text(
+                "2026-07-29T10:00:00Z tick[abc](capture): due=alpha\n"
+                "2026-07-29T11:00:00Z tick[def](capture): paused: cost review\n"
+            )
+            history = status.read_tick_history(log)
+        self.assertEqual(history["latest_by_group"]["capture"]["state"], "idle")
+        self.assertEqual(history["routines"]["alpha"]["state"], "incomplete")
+
+    def test_paused_daemon_skips_staleness_and_marks_routines_paused(self):
+        launchd = {
+            "loaded": True, "label": "com.memory-daemon", "state": "not running",
+            "pid": None, "runs": 4, "last_exit": 0, "interval_seconds": 900,
+        }
+        routine = {"id": "alpha", "schedule": {"every": "1h"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "logs").mkdir()
+            (base / "logs" / "run.log").write_text(
+                "2026-07-29T10:00:00Z tick[abc](capture): paused: x\n")
+            (base / "state").mkdir()
+            with mock.patch.object(
+                status, "probe_launchd", side_effect=self.probe(launchd)
+            ):
+                healthy_text, healthy = status.render(base, [routine], now=2e9)
+                self.assertFalse(healthy)  # stale: not paused yet
+                (base / "state" / "PAUSED").write_text("x\n")
+                text, healthy = status.render(base, [routine], now=2e9)
+        self.assertTrue(healthy, text)
+        self.assertIn("paused", text.split("ROUTINE")[1])
+
+    def test_budget_held_routines_are_labelled(self):
+        launchd = {"loaded": False, "detail": "not loaded"}
+        now = datetime.datetime(
+            2026, 3, 10, 20, 0, tzinfo=datetime.timezone.utc).timestamp()
+        routine = {"id": "alpha", "budget": {"daily_usd": 1}}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "state").mkdir()
+            (base / "state" / "budget.yaml").write_text("day_timezone: UTC\n")
+            (base / "state" / "claude-usage.jsonl").write_text(json.dumps({
+                "ts": "2026-03-10T19:00:00Z", "tools": [], "outcome": "ok",
+                "total_cost_usd": 2.0, "routine": "alpha"}) + "\n")
+            with mock.patch.object(
+                status, "probe_launchd", side_effect=self.probe(launchd)
+            ):
+                text, _ = status.render(base, [routine], now=now)
+        self.assertIn("budget held", text)
+
+    def test_bad_budget_file_and_write_failures_are_unhealthy(self):
+        launchd = {"loaded": False, "detail": "not loaded"}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "state").mkdir()
+            (base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+            with mock.patch.object(
+                status, "probe_launchd", side_effect=self.probe(launchd)
+            ):
+                text, healthy = status.render(base, [], now=1100)
+            self.assertFalse(healthy)
+            self.assertIn("ATTENTION: state/budget.yaml", text)
+            (base / "state" / "budget.yaml").unlink()
+            (base / "state" / "claude-usage-write-failed").write_text("T\n")
+            with mock.patch.object(
+                status, "probe_launchd", side_effect=self.probe(launchd)
+            ):
+                text, _ = status.render(base, [], now=1100)
+        self.assertIn("usage log write failed", text)
 
     def test_no_bridge_activity_adds_no_block_or_banner(self):
         with tempfile.TemporaryDirectory() as tmp:

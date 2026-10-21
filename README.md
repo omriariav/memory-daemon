@@ -1154,14 +1154,20 @@ daily_usd: 10
 day_timezone: Europe/London   # optional IANA name; default is local time
 ```
 
-A routine at its cap is skipped for the run (`budget exhausted` in the log):
-no listing, no cursor advance, nothing marked processed, so it catches up
-after the day rolls over. Once the global cap is reached the bridge refuses new
-calls with `daily budget exhausted`. A malformed `state/budget.yaml` also
-refuses calls rather than lifting the cap. Only the last 7 days of the log are
-read. `daemon.py status` shows today's spend (global and per routine) and the
-last ok and last error time per connector, derived from the `mcp__<server>__`
-prefix of logged tool names.
+A routine at its cap, or any routine once the global cap is reached (or
+`state/budget.yaml` is malformed), is held for the run: it is still listed so
+a fallback routine cannot take its items, but nothing is analyzed, no cursor
+advances, nothing is marked processed, and `tick` does not count it as
+attempted, so it catches up after the day rolls over. A cap reached mid-run
+stops that routine's remaining items the same way (counted as skipped, not as
+errors), and the bridge refuses new calls with `daily budget exhausted`. A call
+that never reported a cost (timeout, crash) is counted at its
+`--max-budget-usd` ceiling. Only the last 7 days of the log are read; an
+unreadable log counts as exhausted. `daemon.py status` shows today's spend
+(global and per routine), `budget held` routines, and per connector the last ok
+time, last error that names it, and last time it was part of a failed call
+(from the `mcp__<server>__` prefix of logged tool names); a malformed budget
+file or a failed usage-log write makes it report unhealthy.
 
 ### Label caching
 

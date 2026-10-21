@@ -175,6 +175,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
+        stack.enter_context(claude_bridge.pause_override(ignore_pause))
         lock = (
             stack.enter_context(state.RunLock(base_dir, name=lock_name))
             if not dry_run else None
@@ -185,12 +186,9 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
 
 
 def _budget_hold(base_dir, routine):
-    """Reason a routine's own daily cap (or the global one) blocks it, else None."""
-    cap = (routine.get("budget") or {}).get("daily_usd")
-    if cap is None:
-        return None
+    """Reason the global cap, a bad budget file, or the routine's own cap holds it."""
     return claude_bridge.budget_exhausted(
-        base_dir, routine["id"], routine_cap=cap
+        base_dir, routine["id"], routine_cap=config.budget_cap(routine)
     )
 
 
@@ -200,6 +198,17 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     active_ids = set(active_ids) if active_ids is not None else {
         r["id"] for r in routines if r.get("enabled", True)
     }
+    # A routine over its cap becomes an inactive owner for this run: its
+    # sources are still listed so fallbacks cannot take its items, but it
+    # processes nothing and its catch-up cursor does not move.
+    held_ids = set()
+    for routine in routines:
+        if routine.get("enabled", True) and routine["id"] in active_ids:
+            held = _budget_hold(base_dir, routine)
+            if held:
+                held_ids.add(routine["id"])
+                log(f"routine={routine['id']} budget exhausted ({held}), holding")
+    active_ids -= held_ids
     active = [
         r for r in routines
         if r.get("enabled", True) and r["id"] in active_ids
@@ -248,12 +257,6 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if routine["id"] not in active_ids:
                 valid.append(routine)
                 continue
-            held = _budget_hold(base_dir, routine)
-            if held:
-                # Not in `valid`: no listing, no cursor advance, nothing marked
-                # processed. Other routines still route around its claims.
-                log(f"routine={routine['id']} budget exhausted ({held}), skipping")
-                continue
             if config.is_maintenance(routine):
                 valid.append(routine)
                 continue
@@ -281,8 +284,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         ):
             continue
         try:
-            with claude_bridge.usage_scope(routine["id"]):
+            with claude_bridge.usage_scope(
+                routine["id"], config.budget_cap(routine)
+            ):
                 maintenance.run(base_dir, routine, dry_run=dry_run)
+        except claude_bridge.GUARD_STOPS as exc:
+            held_ids.add(routine["id"])
+            log(f"routine={routine['id']} maintenance held: {exc}")
         except Exception as exc:
             totals["errors"] += 1
             log(
@@ -432,11 +440,13 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             continue
         rid = routine["id"]
         routine_claims = owned.get(rid, [])
-        with claude_bridge.usage_scope(rid):
+        with claude_bridge.usage_scope(rid, config.budget_cap(routine)) as scope:
             failed_source_keys.update(_run_owned(
                 routine, routine_claims, processed, label_catalog, dry_run,
                 totals, lock, catalog, base_dir, shared_circuit,
             ))
+        if scope.stop is not None:
+            held_ids.add(rid)
 
     # A manually self-forwarded Chat message uses Gmail's Inbox as an explicit
     # follow-up queue. Reconcile after capture so an archived item whose prior
@@ -522,6 +532,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     if held:
         log(f"catch-up cursor held for {held} failed source(s)")
 
+    if held_ids:
+        totals["held_ids"] = sorted(held_ids)
     return totals
 
 
@@ -1631,12 +1643,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             ownership_class = spec["ownership_class"]
             log(f"routine={rid} querying {spec_label}: {_scope(spec_source)}")
             try:
-                with claude_bridge.usage_scope(rid):
-                    candidates = list_candidates(spec_source)
+                candidates = list_candidates(spec_source)
             except Exception as exc:
                 coverage_problems.append(f"{spec_label} listing failed: {exc}")
-                totals["errors"] += 1
-                log(f"routine={rid} source={spec_label} FATAL: {exc}")
+                if isinstance(exc, claude_bridge.GUARD_STOPS):
+                    log(f"routine={rid} source={spec_label} listing held: {exc}")
+                else:
+                    totals["errors"] += 1
+                    log(f"routine={rid} source={spec_label} FATAL: {exc}")
                 failures.append(
                     _failure(
                         routine, source,
@@ -1674,8 +1688,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     f"scan to {discovery_limit}"
                 )
                 try:
-                    with claude_bridge.usage_scope(rid):
-                        discovery = list_candidates(expanded_source)
+                    discovery = list_candidates(expanded_source)
                 except Exception as exc:
                     totals["errors"] += 1
                     log(
@@ -2118,6 +2131,17 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         ):
             totals["skipped"] += 1
             continue
+        stop = claude_bridge.scope_stop()
+        if stop is not None and not dry_run:
+            hold_claim(claim)
+            totals["skipped"] += 1
+            if not circuit_reported:
+                log(
+                    f"routine={rid} stopped by guard ({stop}); "
+                    "holding remaining candidates"
+                )
+                circuit_reported = True
+            continue
         if shared_circuit and not dry_run:
             hold_claim(claim)
             totals["skipped"] += 1
@@ -2168,6 +2192,10 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 managed_followup_claim=managed_followup_claim,
             )
             if totals["errors"] > errors_before:
+                if claude_bridge.scope_stop() is not None:
+                    # Stopped by a cap or the pause switch, not a failure.
+                    totals["errors"] = errors_before
+                    totals["skipped"] += 1
                 hold_claim(claim)
             if (
                 isinstance(outcome_record, dict)
@@ -2179,8 +2207,15 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         except state.AlreadyRunning:
             raise
         except Exception as exc:  # per-item failures are isolated
-            totals["errors"] += 1
             hold_claim(claim)
+            if (
+                isinstance(exc, claude_bridge.GUARD_STOPS)
+                or claude_bridge.scope_stop() is not None
+            ):
+                totals["skipped"] += 1
+                log(f"routine={rid} held id={candidate['id']}: {exc}")
+                continue
+            totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):
                 shared_circuit["error"] = str(exc)[:300]

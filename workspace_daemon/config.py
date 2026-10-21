@@ -443,6 +443,14 @@ def discover(base_dir, routine_id=None):
     return found
 
 
+def budget_cap(routine):
+    """The routine's budget.daily_usd, or None when unset or malformed."""
+    budget = routine.get("budget")
+    cap = budget.get("daily_usd") if isinstance(budget, dict) else None
+    ok = isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0
+    return cap if ok else None
+
+
 def _budget_problems(rid, routine):
     if "budget" not in routine:
         return []

@@ -2,8 +2,10 @@
 import datetime
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -122,7 +124,9 @@ class PausedCliTest(TempBase):
              mock.patch.object(daemon_cli, "log") as log:
             self.assertEqual(daemon_cli.cmd_tick(self.tick_args()), 0)
         run.assert_not_called()
-        log.assert_called_once_with("paused: cost spike")
+        self.assertEqual(log.call_count, 1)
+        message = log.call_args.args[0]
+        self.assertRegex(message, r"^tick\[[0-9a-f]{12}\]: paused: cost spike$")
         self.assertFalse((self.base / "state" / "schedule.json").exists())
 
     def test_run_logs_and_runs_nothing(self):
@@ -176,7 +180,7 @@ class StubbedRunnerBase(TempBase):
         saved = {
             "search": gmail.search, "read": gmail.read_message,
             "user_labels": gmail.user_labels, "lab_gmail": labels.gmail,
-            "analyze": llm.analyze,
+            "analyze": llm.analyze, "read_thread": gmail.read_thread,
         }
 
         def restore():
@@ -185,16 +189,16 @@ class StubbedRunnerBase(TempBase):
             gmail.user_labels = saved["user_labels"]
             labels.gmail = saved["lab_gmail"]
             llm.analyze = saved["analyze"]
+            gmail.read_thread = saved["read_thread"]
 
         self.addCleanup(restore)
 
         def search(query, max_results=20):
             self.searched.append(query)
-            self.scopes.append(("search", claude_bridge._USAGE_SCOPE.get()))
             return [{"message_id": "m1", "thread_id": "m1", "subject": "S"}]
 
         def analyze(r, prompt):
-            self.scopes.append(("analyze", claude_bridge._USAGE_SCOPE.get()))
+            self.scopes.append(("analyze", claude_bridge.current_tag()))
             return "a summary"
 
         gmail.search = search
@@ -203,6 +207,11 @@ class StubbedRunnerBase(TempBase):
                         "date": "Sun, 19 Jul 2026 15:46:29 +0000"},
             "body": "body",
         }
+        gmail.read_thread = lambda tid: {"messages": [{
+            "id": tid, "labels": ["INBOX"], "body": "body",
+            "headers": {"subject": "S", "from": "Sender",
+                        "date": "Sun, 19 Jul 2026 15:46:29 +0000"},
+        }]}
         gmail.user_labels = lambda: []
         labels.gmail = gmail
         llm.analyze = analyze
@@ -213,12 +222,11 @@ class StubbedRunnerBase(TempBase):
 
 
 class UsageScopeTest(StubbedRunnerBase):
-    def test_runner_tags_listing_and_analysis_with_the_routine(self):
+    def test_runner_tags_analysis_with_the_routine(self):
         totals = runner.run(self.base, [routine(self.vault)])
         self.assertEqual(totals["processed"], 1)
-        self.assertIn(("search", "guarded"), self.scopes)
         self.assertIn(("analyze", "guarded"), self.scopes)
-        self.assertIsNone(claude_bridge._USAGE_SCOPE.get())
+        self.assertIsNone(claude_bridge.current_tag())
 
     def test_maintenance_run_is_tagged(self):
         seen = []
@@ -233,7 +241,7 @@ class UsageScopeTest(StubbedRunnerBase):
         with mock.patch.object(
             runner.maintenance, "run",
             side_effect=lambda *a, **k: seen.append(
-                claude_bridge._USAGE_SCOPE.get()),
+                claude_bridge.current_tag()),
         ):
             runner.run(self.base, [census], dry_run=True)
         self.assertEqual(seen, ["sweeper"])
@@ -274,12 +282,43 @@ class SpentTodayTest(TempBase):
             self.base, tz=UTC, now=self.NOW), 3.0)
 
     def test_default_timezone_is_local_time(self):
-        now = 1_800_000_900.0
-        ts = datetime.datetime.fromtimestamp(now - 5, UTC).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
-        write_usage(self.base, [usage_entry(ts, 0.3)])
+        # 20:00Z is 09:00 on Mar 11 in Auckland (+13): local midnight is
+        # 11:00Z on Mar 10, long after UTC midnight.
+        write_usage(self.base, [
+            usage_entry("2026-03-10T10:59:59Z", 1.0),  # local Mar 10, UTC Mar 10
+            usage_entry("2026-03-10T11:00:00Z", 2.0),  # local Mar 11
+        ])
+        saved = os.environ.get("TZ")
+
+        def restore():
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+
+        self.addCleanup(restore)
+        os.environ["TZ"] = "Pacific/Auckland"
+        time.tzset()
         self.assertAlmostEqual(
-            claude_bridge.spent_today(self.base, now=now), 0.3)
+            claude_bridge.spent_today(self.base, now=self.NOW), 2.0)
+        self.assertAlmostEqual(claude_bridge.spent_today(
+            self.base, tz=UTC, now=self.NOW), 3.0)
+
+    def test_cost_estimate_counts_when_no_cost_was_reported(self):
+        write_usage(self.base, [
+            usage_entry("2026-03-10T19:00:00Z", None, cost_estimate_usd=0.25),
+        ])
+        self.assertAlmostEqual(
+            claude_bridge.spent_today(self.base, tz=UTC, now=self.NOW), 0.25)
+
+    def test_unreadable_log_fails_closed(self):
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.spent_today(self.base, now=self.NOW)
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: 5\n")
+        self.assertIn("unreadable", claude_bridge.budget_exhausted(
+            self.base, now=self.NOW))
 
     def test_missing_or_garbled_log_is_zero_spend(self):
         self.assertEqual(claude_bridge.spent_today(self.base, now=self.NOW), 0)
@@ -378,30 +417,78 @@ class BudgetFileTest(TempBase):
 
 
 class RoutineBudgetRunTest(StubbedRunnerBase):
+    def setUp(self):
+        super().setUp()
+        self.analyzed = []
+        inner = llm.analyze
+        llm.analyze = lambda r, p: (self.analyzed.append(r["id"]), inner(r, p))[1]
+
     def spend(self, cost, rid="guarded"):
         ts = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         write_usage(self.base, [usage_entry(ts, cost, rid)])
 
-    def run_with(self, **budget):
-        r = routine(self.vault, budget=budget)
+    def run_with(self, routines=None, **budget):
+        routines = routines or [routine(self.vault, budget=budget)]
         with mock.patch.object(runner, "log") as log:
-            totals = runner.run(self.base, [r])
+            totals = runner.run(self.base, routines)
         return totals, [c.args[0] for c in log.call_args_list]
 
-    def test_capped_routine_is_skipped_without_side_effects(self):
+    def test_capped_routine_is_held_without_side_effects(self):
         self.spend(2.0)
         totals, logged = self.run_with(daily_usd=1.5)
-        self.assertEqual(self.searched, [])
+        self.assertEqual(self.analyzed, [])
         self.assertEqual(self.ledger(), {})
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["held_ids"], ["guarded"])
         self.assertTrue(any("budget exhausted" in m for m in logged))
+        self.assertFalse(any("ERROR" in m or "FATAL" in m for m in logged))
         self.assertFalse((self.base / "state" / "cursors.json").exists())
+        self.assertEqual(list(self.vault.glob("*.md")) if self.vault.exists()
+                         else [], [])
+
+    def test_fallback_cannot_take_a_held_routines_items(self):
+        self.spend(2.0, rid="domain")
+        domain = routine(self.vault, rid="domain", budget={"daily_usd": 1})
+        fallback = routine(self.vault, rid="general",
+                           routing={"fallback": True})
+        totals, _ = self.run_with([domain, fallback])
+        self.assertTrue(self.searched)  # listed, so ownership is known
+        self.assertEqual(self.analyzed, [])
+        self.assertEqual(self.ledger(), {})
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(totals["held_ids"], ["domain"])
+        # Once the domain routine is allowed again it, not the fallback, wins.
+        domain["budget"]["daily_usd"] = 100
+        totals, _ = self.run_with([domain, fallback])
+        self.assertEqual(self.analyzed, ["domain"])
+        self.assertEqual(self.ledger()["m1"]["rule_id"], "domain")
+
+    def test_held_catch_up_routine_keeps_its_cursor(self):
+        source = {
+            "kind": "gmail", "query": "in:inbox", "max_results": 0,
+            "catch_up": True, "catch_up_after": "2026-07-01T00:00:00Z",
+        }
+        r = routine(self.vault, budget={"daily_usd": 1})
+        del r["source"]
+        r["sources"] = [source]
+        cursor_id = runner._catch_up_cursor_id(source)
+        state.CursorStore(self.base).mark_successful_at(
+            [("guarded", cursor_id, "gmail", "2026-07-20T00:00:00Z")])
+        self.spend(2.0)
+        self.run_with([r])
+        self.assertEqual(
+            state.CursorStore(self.base).checkpoint(
+                "guarded", cursor_id, "gmail"),
+            "2026-07-20T00:00:00Z",
+        )
+        self.assertEqual(self.ledger(), {})
 
     def test_routine_under_its_cap_runs(self):
         self.spend(1.0)
         totals, logged = self.run_with(daily_usd=1.5)
         self.assertEqual(totals["processed"], 1)
+        self.assertNotIn("held_ids", totals)
         self.assertFalse(any("budget exhausted" in m for m in logged))
 
     def test_other_routines_spend_does_not_block(self):
@@ -409,11 +496,74 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
         totals, _ = self.run_with(daily_usd=1.5)
         self.assertEqual(totals["processed"], 1)
 
-    def test_skipped_routine_catches_up_once_the_cap_lifts(self):
+    def test_held_routine_catches_up_once_the_cap_lifts(self):
         self.spend(2.0)
         self.run_with(daily_usd=1.5)
         totals, _ = self.run_with(daily_usd=10)
         self.assertEqual(totals["processed"], 1)
+
+    def test_global_cap_holds_every_routine_quietly(self):
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 1\nday_timezone: UTC\n")
+        self.spend(5.0, rid="someone-else")
+        totals, logged = self.run_with([routine(self.vault)])
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["held_ids"], ["guarded"])
+        self.assertFalse(any("ERROR" in m or "FATAL" in m for m in logged))
+
+    def test_malformed_budget_file_holds_instead_of_erroring(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: nope\n")
+        totals, logged = self.run_with([routine(self.vault)])
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["held_ids"], ["guarded"])
+
+    def test_cap_reached_mid_run_stops_the_routine_without_errors(self):
+        self.spend(0.9)
+        gmail.search = lambda q, m=20: [
+            {"message_id": f"m{i}", "thread_id": f"m{i}", "subject": "S"}
+            for i in (1, 2)
+        ]
+
+        def analyze(r, prompt):
+            self.analyzed.append(r["id"])
+            # This item's call lands the routine over its cap...
+            ts = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with open(self.base / "state" / "claude-usage.jsonl", "a") as f:
+                f.write(json.dumps(usage_entry(ts, 0.3, "guarded")) + "\n")
+            # ...so the next bridge call is refused.
+            return claude_bridge.complete(
+                prompt, model="haiku", base_dir=self.base)
+
+        llm.analyze = analyze
+        totals, logged = self.run_with(daily_usd=1.0)
+        self.assertEqual(self.analyzed, ["guarded"])  # item 2 never started
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(totals["skipped"], 2)
+        self.assertEqual(self.ledger(), {})
+        self.assertEqual(totals["held_ids"], ["guarded"])
+        self.assertFalse(any("ERROR" in m or "FATAL" in m for m in logged))
+
+    def test_pause_mid_run_stops_spending(self):
+        gmail.search = lambda q, m=20: [
+            {"message_id": f"m{i}", "thread_id": f"m{i}", "subject": "S"}
+            for i in (1, 2)
+        ]
+
+        def analyze(r, prompt):
+            self.analyzed.append(r["id"])
+            (self.base / "state" / "PAUSED").write_text("flipped\n")
+            return claude_bridge.complete(
+                prompt, model="haiku", base_dir=self.base)
+
+        llm.analyze = analyze
+        with mock.patch.object(state, "paused", side_effect=[None, "flipped"]):
+            totals, _ = self.run_with([routine(self.vault)])
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(self.analyzed, ["guarded"])
+        self.assertEqual(self.ledger(), {})
 
     def test_capped_maintenance_routine_does_not_run(self):
         self.spend(2.0, rid="sweeper")
@@ -426,8 +576,55 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
             },
         }
         with mock.patch.object(runner.maintenance, "run") as run:
-            runner.run(self.base, [census])
+            totals, _ = self.run_with([census])
         run.assert_not_called()
+        self.assertEqual(totals["held_ids"], ["sweeper"])
+
+
+class TickHeldAndMidRunPauseTest(TempBase):
+    def setUp(self):
+        super().setUp()
+        self.routine = routine(self.vault, rid="domain", schedule={"every": "1h"})
+        patches = [
+            mock.patch.object(daemon_cli, "BASE_DIR", self.base),
+            mock.patch.object(daemon_cli, "set_log_file"),
+            mock.patch.object(daemon_cli.config, "discover",
+                              return_value=[self.routine]),
+            mock.patch.object(daemon_cli.config, "secure_routine_files"),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.args = SimpleNamespace(
+            dry_run=False, refresh_labels=False, group="all")
+
+    def test_held_routines_are_not_marked_attempted(self):
+        totals = dict(EMPTY_TOTALS, held_ids=["domain"])
+        with mock.patch.object(daemon_cli.runner, "run", return_value=totals), \
+             mock.patch.object(daemon_cli, "log"):
+            self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
+        self.assertNotIn("domain", state.ScheduleStore(self.base).entries)
+
+    def test_pause_appearing_mid_tick_is_a_clean_stop(self):
+        with mock.patch.object(
+                daemon_cli.runner, "run",
+                side_effect=state.Paused("paused: late")), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
+        self.assertRegex(log.call_args.args[0], r"^tick\[[0-9a-f]+\]: paused: late")
+        self.assertNotIn("domain", state.ScheduleStore(self.base).entries)
+
+    def test_pause_appearing_mid_run_is_a_clean_stop(self):
+        args = SimpleNamespace(
+            dry_run=False, refresh_labels=False, routine=None,
+            include_disabled=False, ignore_pause=False)
+        with mock.patch.object(
+                daemon_cli.runner, "run",
+                side_effect=state.Paused("paused: late")), \
+             mock.patch.object(daemon_cli, "log") as log:
+            self.assertEqual(daemon_cli.cmd_run(args), 0)
+        self.assertIn(mock.call("run stopped: paused: late"),
+                      log.call_args_list)
 
 
 class BudgetKeyValidationTest(unittest.TestCase):
