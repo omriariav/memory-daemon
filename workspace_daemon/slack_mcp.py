@@ -17,6 +17,10 @@ Routine config (the watched ids normally come from a private `watch:` file):
       settle_minutes: 15
       include_bots: false
 
+The watch file may also set `all_dms: true`: one more query (`dms`) searches
+`with:<@owner>` over `channel_types=im,mpim`, so every direct and group message
+involving the owner is listed without naming each conversation.
+
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
 else (planning, parsing, grouping, bounding, versioning) is deterministic
@@ -28,8 +32,8 @@ in chunks, one per watched person, one for mentions) returns every new root and
 reply, so a late reply to an old thread surfaces without reading channels.
 Hits are grouped by (channel, thread root).
 
-Cursors are per query (`channels`, `from:<id>`, `me`) and advance to a
-watermark rather than all-or-nothing: the older of the run's start, the newest
+Cursors are per query key (`channels:<id>` per channel, `from:<id>`, `me`,
+`dms`) and advance to a watermark rather than all-or-nothing: the older of the run's start, the newest
 timestamp of the oldest thread left for later (still settling, or over
 `max_threads_per_run`) and, for a search that hit `max_search_pages`, a point
 that resumes right after the newest hit actually read. Because pages arrive
@@ -73,16 +77,17 @@ DEFAULTS = {
     "mention_keywords": ["<@{self_user_id}>"],
     "min_seconds_between_searches": 3,
     "max_queries_per_run": 20,
+    "calls_per_session": 15,
     "estimate_analyze_usd": 0.12,
 }
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
+    "all_dms",
 }
 CURSOR_SCHEMA = 1
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
-CALLS_PER_SESSION = 10
 THREADS_PER_SESSION = 8
 MAX_READ_ATTEMPTS = 3
 # A thread read alone in its session that yields nothing, run after run.
@@ -98,8 +103,11 @@ PINNED_SEARCH = {
 # `## <name>` sections a search result may carry besides the messages.
 KNOWN_SECTIONS = {"Messages", "Files", "Channels", "Users"}
 RESERVED_SEARCH_ARGS = set(PINNED_SEARCH) | {
-    "filters", "keywords", "after", "cursor", "limit",
+    "filters", "keywords", "after", "cursor", "limit", "channel_types",
 }
+# The one query that also fixes the conversation types searched.
+DM_CHANNEL_TYPES = "im,mpim"
+DM_LABELS = {"DM", "Group DM"}
 # Argument names of the connector's thread reader.
 THREAD_CHANNEL_ARG = "channel_id"
 THREAD_TS_ARG = "message_ts"
@@ -147,6 +155,7 @@ def settings(source):
     for key in ("channels", "people"):
         cfg[key] = list(source.get(key) or [])
     cfg["include_mentions"] = source.get("include_mentions") is True
+    cfg["all_dms"] = source.get("all_dms") is True
     cfg["search_args"] = dict(source.get("search_args") or {})
     return cfg
 
@@ -172,17 +181,35 @@ def cursor_ids(source):
     """{query key: cursor id}: a scope change moves only the changed cursor."""
     cfg = settings(source)
     ids = {}
-    if cfg["channels"]:
-        ids["channels"] = "slack_mcp:channels:" + _digest(
-            sorted(cfg["channels"]), CURSOR_SCHEMA
-        )
+    for channel in cfg["channels"]:
+        ids[f"channels:{channel}"] = f"slack_mcp:channel:{channel}:v{CURSOR_SCHEMA}"
     for person in cfg["people"]:
         ids[f"from:{person}"] = f"slack_mcp:from:{person}:v{CURSOR_SCHEMA}"
     if cfg["include_mentions"]:
         ids["me"] = "slack_mcp:me:" + _digest(
             cfg["self_user_id"], cfg["mention_keywords"], CURSOR_SCHEMA
         )
+    if cfg["all_dms"]:
+        ids["dms"] = "slack_mcp:dms:" + _digest(
+            cfg["self_user_id"], CURSOR_SCHEMA
+        )
     return ids
+
+
+def legacy_cursor_ids(source):
+    """{channel cursor key: the old hashed `channels` cursor id}.
+
+    Channels used to share one cursor keyed by the whole set. A channel with
+    no cursor of its own is seeded from it, so the first run after the change
+    does not re-read every channel from `bootstrap`.
+    """
+    cfg = settings(source)
+    if not cfg["channels"]:
+        return {}
+    old = "slack_mcp:channels:" + _digest(
+        sorted(cfg["channels"]), CURSOR_SCHEMA
+    )
+    return {f"channels:{c}": old for c in cfg["channels"]}
 
 
 def note_failure(candidate):
@@ -273,8 +300,8 @@ _RESULT_HEAD = re.compile(r"^### Result (\d+) of (\d+)$", re.M)
 _CURSOR = re.compile(r"cursor:?\s*`([^`\s]+)`")
 _EMAIL_MASK = re.compile(r"\s*<\[?EMAIL:[^>]*>")
 _HIT_HEADER = re.compile(
-    r"Channel: [^\n]*\(ID: (?P<channel>[A-Z0-9]+)\)\n"
-    r"(?:Participants: [^\n]*\n)?"
+    r"Channel: (?P<label>[^\n]*)\(ID: (?P<channel>[A-Z0-9]+)\)\n"
+    r"(?:Participants: (?P<people>[^\n]*)\n)?"
     r"From: (?P<author>[^\n]*?)\(ID: (?P<user>[A-Z0-9]+)\)[ \t]*"
     r"(?P<bot>\[BOT\])?[ \t]*\n"
     r"Time: [^\n]*\n"
@@ -283,6 +310,7 @@ _HIT_HEADER = re.compile(
     r"Permalink: (?P<link>[^\n]*)\n"
     r"Text:"
 )
+_PARTICIPANT = re.compile(r"\(ID: ([A-Z0-9]+)\)")
 _ARCHIVE = re.compile(r"/archives/([A-Z0-9]+)/p(\d+)")
 _LINK_THREAD = re.compile(r"[?&]thread_ts=(\d+\.\d+)")
 MAX_CHAINS = 500
@@ -330,6 +358,8 @@ def _parse_hit(block):
     body = body[1:] if body.startswith(" ") else body
     return {
         "channel": match.group("channel"),
+        "label": match.group("label").strip(),
+        "participants": _PARTICIPANT.findall(match.group("people") or ""),
         "user": match.group("user"),
         "name": _clean_name(match.group("author")),
         "is_bot": bool(match.group("bot")),
@@ -607,7 +637,7 @@ def _one_session(cfg, tool, pins, calls, what, required):
         base_dir=_base_dir,
         max_turns=len(calls) + 4,
         max_budget_usd=round(0.1 + 0.03 * len(calls), 2),
-        timeout=BRIDGE_TIMEOUT,
+        timeout=max(BRIDGE_TIMEOUT, 60 + 8 * len(calls)),
         attempts=BRIDGE_ATTEMPTS,
         required=required,
         accept_partial=True,
@@ -647,8 +677,20 @@ def _search_pins(cfg):
     return dict(PINNED_SEARCH, **cfg["search_args"])
 
 
+def _session_pins(cfg, calls):
+    """Pins for one session: the shared ones, plus `channel_types` when every
+    call of the session is the DM query (a mixed session cannot pin it, but
+    the planned-call match still holds each call to its own arguments)."""
+    pins = _search_pins(cfg)
+    if calls and all(c.get("channel_types") == DM_CHANNEL_TYPES for c in calls):
+        pins["channel_types"] = DM_CHANNEL_TYPES
+    return pins
+
+
 def _search_args(cfg, query, after, cursor=None):
     args = dict(_search_pins(cfg), after=after, limit=SEARCH_LIMIT)
+    if query.get("channel_types"):
+        args["channel_types"] = query["channel_types"]
     if query["filters"]:
         args["filters"] = query["filters"]
     if query["keywords"]:
@@ -658,17 +700,28 @@ def _search_args(cfg, query, after, cursor=None):
     return args
 
 
-def search_queries(cfg):
-    """Planned queries in run order (cursor key, kind, constraints)."""
+def _channel_groups(channels, since):
+    """Channel lists to chunk: with `since` (keys that have a cursor), channels
+    that have none are searched apart so a new one bootstraps alone."""
+    if since is None:
+        return [channels]
+    known = [c for c in channels if f"channels:{c}" in since]
+    fresh = [c for c in channels if f"channels:{c}" not in since]
+    return [group for group in (known, fresh) if group]
+
+
+def search_queries(cfg, since=None):
+    """Planned queries in run order (cursor keys, kind, constraints)."""
     queries = []
-    channels = cfg["channels"]
-    for start in range(0, len(channels), CHANNELS_PER_QUERY):
-        chunk = channels[start:start + CHANNELS_PER_QUERY]
-        queries.append({
-            "key": "channels", "kind": "channels", "allowed": set(chunk),
-            "user": None, "keywords": None,
-            "filters": " ".join(f"in:<#{c}>" for c in chunk),
-        })
+    for group in _channel_groups(cfg["channels"], since):
+        for start in range(0, len(group), CHANNELS_PER_QUERY):
+            chunk = group[start:start + CHANNELS_PER_QUERY]
+            queries.append({
+                "key": f"channels:{chunk[0]}", "kind": "channels",
+                "keys": [f"channels:{c}" for c in chunk],
+                "allowed": set(chunk), "user": None, "keywords": None,
+                "filters": " ".join(f"in:<#{c}>" for c in chunk),
+            })
     for person in cfg["people"]:
         queries.append({
             "key": f"from:{person}", "kind": "from", "allowed": None,
@@ -679,6 +732,14 @@ def search_queries(cfg):
             "key": "me", "kind": "mentions", "allowed": None, "user": None,
             "keywords": mention_keywords(cfg), "filters": None,
         })
+    if cfg["all_dms"]:
+        queries.append({
+            "key": "dms", "kind": "dms", "allowed": None, "user": None,
+            "keywords": None, "filters": f"with:<@{cfg['self_user_id']}>",
+            "channel_types": DM_CHANNEL_TYPES,
+        })
+    for query in queries:
+        query.setdefault("keys", [query["key"]])
     return queries
 
 
@@ -705,6 +766,12 @@ def _valid_hit(query, hit, after, now, cfg):
         f"<@{cfg['self_user_id']}" not in hit["text"]
     ):
         return False
+    if query["kind"] == "dms" and not (
+        hit["label"] in DM_LABELS
+        and hit["channel"][:1] in "CDG"
+        and cfg["self_user_id"] in hit["participants"]
+    ):
+        return False
     return True
 
 
@@ -716,7 +783,7 @@ def _search_all(cfg, queries, afters, now):
     parsed fails only its own query; a failed bridge session fails the run.
     """
     pending = {
-        index: _search_args(cfg, query, afters[query["key"]])
+        index: _search_args(cfg, query, afters[index])
         for index, query in enumerate(queries)
     }
     found = []
@@ -726,59 +793,63 @@ def _search_all(cfg, queries, afters, now):
     for page in range(cfg["max_search_pages"]):
         order = sorted(pending)
         following = {}
-        for start in range(0, len(order), CALLS_PER_SESSION):
-            part = order[start:start + CALLS_PER_SESSION]
+        # The calls of a page round do not depend on each other, so they share
+        # a session (each carries a fixed cost), up to calls_per_session.
+        size = cfg["calls_per_session"]
+        parts = [order[i:i + size] for i in range(0, len(order), size)]
+        results = []
+        for part in parts:
+            calls = [pending[i] for i in part]
             _pace(cfg)
-            texts = _session(
-                cfg, cfg["search_tool"], _search_pins(cfg),
-                [pending[i] for i in part], "search", [cfg["search_tool"]],
-                pace=True,
-            )
-            for index, text in zip(part, texts):
-                if text is None:
-                    raise claude_bridge.BridgeError(
-                        "a planned search call returned no result"
-                    )
-                query = queries[index]
-                key = query["key"]
-                after = afters[key]
-                try:
-                    hits, cursor = parse_search(text)
-                    trusted = getattr(hits, "trusted", None)
-                    stamps = [
-                        float(h["ts"])
-                        for h in (hits if trusted is None else trusted)
-                    ]
-                    last = newest.get(index)
-                    if cursor and stamps and (
-                        stamps != sorted(stamps)
-                        or (last is not None and stamps[0] < last)
-                    ):
-                        raise SlackMcpError(
-                            "search results are not in ascending order"
-                        )
-                except SlackMcpError as exc:
-                    failed.add(key)
-                    log(f"slack_mcp: {query['kind']} search failed: {exc}")
-                    continue
-                accepted = [
-                    h for h in hits if _valid_hit(query, h, after, now, cfg)
+            results.extend(zip(part, _session(
+                cfg, cfg["search_tool"], _session_pins(cfg, calls), calls,
+                "search", [cfg["search_tool"]], pace=True,
+            )))
+        for index, text in results:
+            if text is None:
+                raise claude_bridge.BridgeError(
+                    "a planned search call returned no result"
+                )
+            query = queries[index]
+            after = afters[index]
+            try:
+                hits, cursor = parse_search(text)
+                trusted = getattr(hits, "trusted", None)
+                stamps = [
+                    float(h["ts"])
+                    for h in (hits if trusted is None else trusted)
                 ]
-                if stamps:
-                    # Parsed hits, in validated ascending order, bound the
-                    # prefix read even when none passed the cross-checks.
-                    newest[index] = max(stamps)
-                found.extend((query, hit) for hit in accepted)
-                if cursor and not hits:
-                    log(f"slack_mcp: {query['kind']} search returned an "
-                        "empty page with a cursor; treating it as the end")
-                elif cursor and page + 1 >= cfg["max_search_pages"]:
-                    mark = newest.get(index, float(after))
-                    capped[key] = min(capped.get(key, mark), mark)
-                elif cursor:
-                    following[index] = _search_args(
-                        cfg, query, after, cursor
+                last = newest.get(index)
+                if cursor and stamps and (
+                    stamps != sorted(stamps)
+                    or (last is not None and stamps[0] < last)
+                ):
+                    raise SlackMcpError(
+                        "search results are not in ascending order"
                     )
+            except SlackMcpError as exc:
+                failed.update(query["keys"])
+                log(f"slack_mcp: {query['kind']} search failed: {exc}")
+                continue
+            accepted = [
+                h for h in hits if _valid_hit(query, h, after, now, cfg)
+            ]
+            if stamps:
+                # Parsed hits, in validated ascending order, bound the
+                # prefix read even when none passed the cross-checks.
+                newest[index] = max(stamps)
+            found.extend((query, hit) for hit in accepted)
+            if cursor and not hits:
+                log(f"slack_mcp: {query['kind']} search returned an "
+                    "empty page with a cursor; treating it as the end")
+            elif cursor and page + 1 >= cfg["max_search_pages"]:
+                mark = newest.get(index, float(after))
+                for key in query["keys"]:
+                    capped[key] = min(capped.get(key, mark), mark)
+            elif cursor:
+                following[index] = _search_args(
+                    cfg, query, after, cursor
+                )
         pending = following
         if not pending:
             break
@@ -801,7 +872,10 @@ def _group(cfg, found):
         )
         if hit["ts"] == hit["root"]:
             group["root_seen"] = True
-        group["keys"].add(query["key"])
+        group["keys"].add(
+            f"channels:{hit['channel']}" if query["kind"] == "channels"
+            else query["key"]
+        )
         group["hit_ts"].add(hit["ts"])
         if float(hit["ts"]) > float(group["ts"]):
             group["ts"] = hit["ts"]
@@ -847,19 +921,26 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
 def candidates(source):
     """List new or changed thread candidates; see the module docstring."""
     cfg = settings(source)
-    queries = search_queries(cfg)
+    now = _now()
+    since_map = source.get("_since_map") or {}
+    queries = search_queries(cfg, since_map)
+    if len(queries) > cfg["max_queries_per_run"]:
+        # Splitting new channels from known ones can add a query; fall back
+        # to the plain chunking before giving up.
+        queries = search_queries(cfg)
     if len(queries) > cfg["max_queries_per_run"]:
         raise SlackMcpError(
             f"{len(queries)} planned searches exceed max_queries_per_run"
         )
-    now = _now()
-    since_map = source.get("_since_map") or {}
-    afters = {
-        query["key"]: int(slack_source._rfc3339_epoch(
-            since_map.get(query["key"]) or since_for(source, None, now)
-        ))
+    fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
+    afters = [
+        min(
+            int(slack_source._rfc3339_epoch(since_map[key]))
+            if since_map.get(key) else fresh
+            for key in query["keys"]
+        )
         for query in queries
-    }
+    ]
     if source.get("_dry_run") and not source.get("_count_only"):
         log(
             f"slack_mcp dry-run: would run {len(queries)} search "
@@ -867,7 +948,7 @@ def candidates(source):
         )
         return Listing()
     found, capped, failed = _search_all(cfg, queries, afters, now)
-    if failed and len(failed) == len({q["key"] for q in queries}):
+    if failed and failed >= {k for q in queries for k in q["keys"]}:
         raise SlackMcpError("every search query failed")
     groups = _group(cfg, found)
     processed = source.get("_processed")
@@ -911,15 +992,16 @@ def candidates(source):
     marks = {}
     overlap = _seconds(cfg["overlap"])
     for query in queries:
-        key = query["key"]
-        values = [deferred_floor] if deferred_floor is not None else []
-        if key in capped:
-            # Resume exactly at the read prefix: the next run lists from
-            # cursor - overlap, so add the overlap back. Otherwise a window
-            # holding more than max_search_pages hits would be re-read forever.
-            values.append(int(capped[key]) + overlap)
-        if values:
-            marks[key] = min(values)
+        for key in query["keys"]:
+            values = [deferred_floor] if deferred_floor is not None else []
+            if key in capped:
+                # Resume exactly at the read prefix: the next run lists from
+                # cursor - overlap, so add the overlap back. Otherwise a
+                # window holding more than max_search_pages hits would be
+                # re-read forever.
+                values.append(int(capped[key]) + overlap)
+            if values:
+                marks[key] = min(values)
     runtime = source.get("_slack_mcp_runtime")
     if runtime is not None:
         runtime["watermarks"] = marks

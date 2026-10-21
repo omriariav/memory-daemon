@@ -1202,12 +1202,13 @@ channels:                  # channels, private channels and DMs
   - {id: C0EXAMPLE02, name: example-team}   # names are local labels only
 people: [U0EXAMPLEA]       # slack_mcp only: authors watched in any channel
 include_mentions: true
+all_dms: true              # slack_mcp only: every DM and group DM of the owner
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
-`include_mentions` and `owner_action_channels` keys; unknown keys and malformed
+`include_mentions`, `all_dms` and `owner_action_channels` keys; unknown keys and malformed
 ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
 are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
 `people` list unless it sets `ignore_people: true`, which keeps the exit path a
@@ -1218,16 +1219,29 @@ connector, so people are identified by Slack user id only.
 
 How a run works:
 
-1. Search is the lister, oldest first. One bridge session runs the planned
-   searches: the watched channels (`in:<#id>` terms, 15 per query), one
+1. Search is the lister, oldest first. One bridge session runs the first page
+   of every planned search (each session carries a fixed cost, so up to
+   `calls_per_session` calls, default 15, max 20, share one; more are split
+   across paced sessions): the watched channels (`in:<#id>` terms, 15 per query), one
    `from:<@id>` query per person, and one mention query by keyword
    (`mention_keywords`, default `<@{self_user_id}>`). Each uses
    `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
    `include_context=false`, `content_types=messages`,
    `response_format=detailed` and `limit=20`; pages that
-   report a cursor are followed in later sessions, up to `max_search_pages`.
-   Searches are spaced `min_seconds_between_searches` apart and a run plans at
-   most `max_queries_per_run`. Every new root and reply comes back with its
+   report a cursor are followed in later sessions, one session per page round
+   for all queries still paging, up to `max_search_pages`.
+   Sessions are spaced `min_seconds_between_searches` apart and a run plans at
+   most `max_queries_per_run`. With `all_dms: true` one more query (cursor
+   key `dms`) searches `with:<@owner>` and pins `channel_types=im,mpim`, which
+   returns every direct and group message involving the owner, the owner's own
+   included; no per-conversation list is needed. A DM hit is accepted only when
+   its result header says `DM` or `Group DM` and its `Participants:` line
+   lists the owner. A 1:1 DM thread (a `D` id) carries the usual
+   `direct-message` owner evidence; a group DM carries none beyond a mention or
+   the owner's own message, so it never turns another person's discussion into
+   the owner's task. The mixed first-page session cannot pin
+   `channel_types` for the other queries, so the call match enforces it; a
+   session holding only the DM query pins it. Every new root and reply comes back with its
    channel, author, timestamp and thread root, so late replies to old threads
    surface without reading channels. Mention and DM hits parse like any other.
 2. Hits are cross-checked (the permalink must agree with the channel and
@@ -1247,9 +1261,12 @@ How a run works:
    (the count appears when a search reported the thread's reply count). Bot
    replies follow `include_bots`.
 
-Cursors are per query: `channels` (hashed by the channel set), `from:<id>` for
-each person and `me` for mentions, so changing the watch list restarts only the
-query that changed (the first run starts `bootstrap` ago). A run commits each
+Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
+each person, `me` for mentions and `dms`, so changing the watch list restarts
+only what changed: a new channel is searched apart from the known ones and
+bootstraps alone (the first run starts `bootstrap` ago). A channel with no
+cursor of its own is seeded once from the old whole-set `channels` cursor. A
+chunk of channels lists from the oldest cursor among them. A run commits each
 cursor to a watermark instead of holding everything: the older of the run's
 start, the newest message of the oldest deferred thread, and, for a search that
 hit `max_search_pages`, the point right after the last hit read (oldest-first
@@ -1275,6 +1292,58 @@ only the cursors of the queries that found it, at its timestamp. A read outage
 (no usable result at all in a session) fails the run without counting an
 attempt against any thread. Errors and logs carry counts only, never tool inputs or message text, and
 the runner's item titles for these threads are the channel and timestamp.
+
+### Slack channel discovery
+
+`maintenance.kind: slack_discovery` keeps a private list of the channels you
+are active in, so a connector-backed `slack_mcp` watch does not need every
+channel typed by hand. Run it daily (`schedule.every: 1d`). See
+`routines/_example-slack-discovery.yaml`.
+
+It searches the last `active_days` (default 14) twice through the same
+least-privilege bridge as `slack_mcp`: messages you posted (`from:<@you>`) and
+messages that mention you (keyword `<@you>`), newest first, at most
+`max_search_pages` pages (default 5) of 20 hits each, both searches sharing one
+session per page round. A public or private channel with such a hit is
+recorded as `{id, name?, last_active, reason: posted|mentioned}` in a separate
+private YAML file (`maintenance.discovered`); DMs and group DMs, bot messages
+and hits that do not match their search are never recorded. An entry with no
+activity for `idle_days` (default 30) is dropped, and at most `max_channels`
+(default 45, the most recently active) are kept so the watch stays within
+`max_queries_per_run`.
+
+```yaml
+# watch file (hand-written)
+channels: [C0EXAMPLE01]
+ignore_channels: [C0EXAMPLE09]       # discovery never adds these
+discover_from: ~/path/slack-discovered.yaml
+```
+
+`discover_from` merges the discovered channels after the hand-written ones when
+the watch loads: hand-written `channels` always stay, an `ignore_channels`
+entry is never merged in, and a missing discovered file adds nothing. Give the
+routine the watch file with `maintenance.watch` so it also skips channels you
+already list. Cursors are per channel, so adding or dropping a discovered
+channel never re-reads the others.
+
+A channel qualifies on any message you posted there, or on `min_mentions`
+(default 2) distinct messages mentioning you within `active_days`, so a single
+passing ping does not add a channel. A discovered file that fails validation is
+moved aside as `<name>.corrupt-<stamp>` and rebuilt from the next search; the
+watch loader meanwhile treats it as empty with a logged warning, so
+hand-written channels keep working. `daemon.py validate` prints a warning (not
+an error) when a watch's `discover_from` is not written by any
+`slack_discovery` routine in the config set, or a discovery routine's file is
+read by no watch.
+
+A run that cannot read every page it started (an unparseable page, a missing
+result) leaves the file untouched, and only hits that every valid reading of a
+page agrees on count, so a message quoting a result block cannot add a channel.
+The tool name goes through the same validation as `slack_mcp`'s search tool
+(exact read-only `slack_search_*`) and the session allowlists that single tool.
+Calls run under the routine's `budget` and usage scope like any other bridge
+work. Logs carry counts and channel ids only (`added_ids=`, `removed_ids=`),
+never message text; a dry run makes no connector call and writes nothing.
 
 ### Label caching
 
@@ -1448,6 +1517,7 @@ workspace_daemon/
   slack_source.py          Slack thread discovery and rendering
   slack_watch.py           private Slack watch file loader (`watch:`)
   slack_mcp.py             Slack source through a claude.ai connector (headless bridge)
+  slack_discovery.py       daily Slack channel discovery through the connector
   count_only.py            `run --count-only` report
   mila_source.py           read-only Mila + Calendar matching
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching

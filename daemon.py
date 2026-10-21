@@ -104,6 +104,8 @@ def cmd_validate(args):
                 print(f"    {p}")
         else:
             print(f"✓ {source}")
+    for warning in config.discovery_warnings(routines):
+        print(f"warning: {warning}")
     if all_problems:
         print(f"\n{len(all_problems)} problem(s) found")
         return 1

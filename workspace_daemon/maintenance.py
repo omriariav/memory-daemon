@@ -2,7 +2,10 @@
 import json
 from pathlib import Path
 
-from . import calendar_cache, google_tasks_sync, slack_census, slack_cli
+from . import (
+    calendar_cache, google_tasks_sync, slack_census, slack_cli,
+    slack_discovery,
+)
 from .shell import log
 
 
@@ -61,6 +64,22 @@ def run(base_dir, routine, dry_run=False):
             f"routine={routine_id} maintenance={kind} "
             f"events={report['events']} dry_run={report['dry_run']}"
         )
+        return report
+    if kind == "slack_discovery":
+        mode = "previewing" if dry_run else "discovering"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = slack_discovery.run(cfg, base_dir, dry_run=dry_run)
+        log(
+            f"routine={routine_id} maintenance={kind} "
+            f"added={len(report['added'])} removed={len(report['removed'])} "
+            f"kept={report['kept']} dry_run={report['dry_run']}"
+        )
+        for label in ("added", "removed"):
+            if report[label]:
+                log(
+                    f"routine={routine_id} maintenance={kind} "
+                    f"{label}_ids={','.join(report[label])}"
+                )
         return report
     if kind != "slack_conversation_census":
         raise RuntimeError(f"unsupported maintenance kind {kind!r}")

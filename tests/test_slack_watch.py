@@ -52,6 +52,13 @@ class LoaderTest(unittest.TestCase):
         self.assertEqual(loaded["owner_action_channels"], ["C0EXAMPLE01"])
         self.assertEqual(loaded["bootstrap"], "12h")
 
+    def test_all_dms_is_a_boolean_defaulting_to_false(self):
+        self.assertFalse(self.load("channels: [C0EXAMPLE01]\n")["all_dms"])
+        self.assertTrue(self.load("all_dms: true\n")["all_dms"])
+        with self.assertRaises(slack_watch.WatchError) as caught:
+            self.load("all_dms: sometimes\n")
+        self.assertIn("all_dms", str(caught.exception))
+
     def test_defaults_and_duplicates(self):
         loaded = self.load("channels: [C0EXAMPLE01, C0EXAMPLE01]\n")
         self.assertEqual(loaded["channels"], ["C0EXAMPLE01"])
@@ -122,6 +129,27 @@ class RoutineExpansionTest(unittest.TestCase):
         self.assertEqual(config.validate(self.routine(
             extra="  ignore_people: true\n"
         )), [])
+
+    def test_all_dms_expands_for_slack_mcp_only(self):
+        write(self.base, "dms.yaml", "channels: [C0EXAMPLE01]\nall_dms: true\n")
+        extra = (
+            "  search_tool: mcp__example__slack_search_public_and_private\n"
+            "  read_thread_tool: mcp__example__slack_read_thread\n"
+            "  self_user_id: U0EXAMPLEA\n"
+        )
+        mcp = self.routine(
+            kind="slack_mcp", extra=extra, watch=self.base / "dms.yaml"
+        )
+        self.assertIs(mcp["source"]["all_dms"], True)
+        self.assertEqual(config.validate(mcp), [])
+        legacy = self.routine(watch=self.base / "dms.yaml")
+        self.assertNotIn("all_dms", legacy["source"])
+        self.assertEqual(config.validate(legacy), [])
+        problems = config.validate(self.routine(
+            kind="slack_mcp", extra=extra + "  all_dms: true\n",
+            watch=self.base / "dms.yaml",
+        ))
+        self.assertTrue(any("cannot be combined" in p for p in problems))
 
     def test_kind_slack_rejects_people_unless_ignored(self):
         problems = config.validate(self.routine())
