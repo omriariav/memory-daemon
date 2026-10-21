@@ -36,6 +36,12 @@ schedule:
 #   priority: 100
 #   fallback: false
 
+# Optional daily cost cap in USD for this routine's Claude bridge calls. Once
+# today's spend (state/claude-usage.jsonl) reaches it, the routine is skipped
+# until the day rolls over. A global cap lives in state/budget.yaml.
+# budget:
+#   daily_usd: 2.50
+
 # Use `source:` for one transport. A domain routine can instead use `sources:`
 # with a list of Gmail / Drive / Slack / Google Chat / Mila blocks. A general
 # medium routine may also put narrow deterministic queries first, add

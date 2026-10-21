@@ -25,6 +25,30 @@ class AlreadyRunning(Exception):
     pass
 
 
+class Paused(StateError):
+    pass
+
+
+def pause_file(base_dir):
+    return Path(base_dir) / "state" / "PAUSED"
+
+
+def paused(base_dir):
+    """Kill switch: the first line of state/PAUSED (or "paused"), None if absent.
+
+    Any content or none at all pauses; an unreadable file pauses too, since the
+    safe reading of a switch someone flipped is "stopped".
+    """
+    try:
+        text = pause_file(base_dir).read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return "paused"
+    lines = text.splitlines()
+    return (lines[0].strip() if lines else "") or "paused"
+
+
 def ensure_private_dir(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -444,6 +468,7 @@ class Store:
                 and (
                     value.get("calendar_match_rejected")
                     or value.get("memory_error")
+                    or value.get("memory_held")
                     or value.get("expand_fallback")
                 )
                 and (

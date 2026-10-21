@@ -122,6 +122,132 @@ class BridgeBase(unittest.TestCase):
         return [json.loads(x) for x in path.read_text().splitlines()]
 
 
+class UsageScopeAndBudgetTest(BridgeBase):
+    def test_usage_scope_tags_log_lines_and_resets(self):
+        self.stream(good_stream())
+        with claude_bridge.usage_scope("alpha"):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        claude_bridge.call_tools(
+            SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base, connect_delay=0,
+        )
+        first, second = self.usage_lines()
+        self.assertEqual(first["routine"], "alpha")
+        self.assertNotIn("routine", second)
+
+    def write_spend(self, cost):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        path = self.base / "state" / "claude-usage.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"ts": ts, "total_cost_usd": cost}) + "\n")
+
+    def test_global_cap_refuses_before_spawning(self):
+        self.stream(good_stream())
+        self.write_spend(3.0)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 2\nday_timezone: UTC\n")
+        with self.assertRaisesRegex(
+                claude_bridge.BridgeError, "^daily budget exhausted$"):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.complete(
+                SECRET_PROMPT, model="haiku", base_dir=self.base)
+        self.assertEqual(self.invocations(), 0)
+        self.assertEqual(len(self.usage_lines()), 1)  # nothing new logged
+
+    def test_global_refusal_is_a_budget_exhausted_error(self):
+        self.write_spend(3.0)
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: 2\n")
+        with self.assertRaises(claude_bridge.BudgetExhausted):
+            claude_bridge.complete("p", model="haiku", base_dir=self.base)
+
+    def test_scope_cap_refuses_only_that_routine(self):
+        self.stream(good_stream())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        path = self.base / "state" / "claude-usage.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(
+            {"ts": ts, "total_cost_usd": 2.0, "routine": "alpha"}) + "\n")
+        with claude_bridge.usage_scope("alpha", daily_usd=1.0) as scope:
+            with self.assertRaises(claude_bridge.BudgetExhausted):
+                claude_bridge.complete("p", model="haiku", base_dir=self.base)
+            self.assertIsInstance(scope.stop, claude_bridge.BudgetExhausted)
+            self.assertIs(claude_bridge.scope_stop(), scope.stop)
+        with claude_bridge.usage_scope("beta", daily_usd=1.0):
+            claude_bridge.call_tools(
+                "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+        self.assertIsNone(claude_bridge.scope_stop())
+
+    def test_pause_refuses_calls_unless_overridden(self):
+        self.stream(good_stream())
+        (self.base / "state").mkdir()
+        (self.base / "state" / "PAUSED").write_text("hold on\n")
+        with self.assertRaisesRegex(claude_bridge.PausedError, "hold on"):
+            claude_bridge.call_tools(
+                "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+        self.assertEqual(self.invocations(), 0)
+        with claude_bridge.pause_override(True):
+            out = claude_bridge.call_tools(
+                "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+        self.assertEqual(out[0]["text"], "item one")
+
+    def test_run_without_a_result_logs_its_budget_as_an_estimate(self):
+        (self.stub_dir / "sleep").write_text("")
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.call_tools(
+                "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0,
+                timeout=1, attempts=1, max_budget_usd=0.4)
+        entry = self.usage_lines()[0]
+        self.assertIsNone(entry["total_cost_usd"])
+        self.assertEqual(entry["cost_estimate_usd"], 0.4)
+        self.assertAlmostEqual(
+            claude_bridge.spent_today(self.base, tz=claude_bridge.zoneinfo.ZoneInfo("UTC")),
+            0.4)
+
+    def test_failed_usage_write_leaves_a_marker_until_the_next_success(self):
+        self.stream(good_stream())
+        real_open = os.open
+
+        def failing_open(path, *args, **kwargs):
+            if str(path).endswith("claude-usage.jsonl"):
+                raise OSError("disk full")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(claude_bridge.os, "open", failing_open):
+            claude_bridge.call_tools(
+                "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+        self.assertIsNotNone(claude_bridge.usage_write_failed(self.base))
+        claude_bridge.call_tools(
+            "p", {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+        self.assertIsNone(claude_bridge.usage_write_failed(self.base))
+
+    def test_under_the_cap_still_runs(self):
+        self.stream(good_stream())
+        self.write_spend(1.0)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 2\nday_timezone: UTC\n")
+        out = claude_bridge.call_tools(
+            SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base, connect_delay=0,
+        )
+        self.assertEqual(out[0]["text"], "item one")
+
+    def test_unreadable_budget_file_fails_closed(self):
+        self.stream(good_stream())
+        (self.base / "state").mkdir()
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: nope\n")
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.call_tools(
+                SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base,
+                connect_delay=0,
+            )
+        self.assertEqual(self.invocations(), 0)
+
+
 class CallToolsTest(BridgeBase):
     def call(self, tools=None, **kw):
         kw.setdefault("base_dir", self.base)

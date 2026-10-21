@@ -1003,16 +1003,21 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertNotIn("expand_fallback", self.ledger()["m1"])
 
     def test_archived_historical_memory_error_replays_without_gmail_actions(self):
+        self._replay_archived_failed_capture({"memory_error": "legacy store outage"})
+
+    def test_archived_guard_held_capture_replays_without_gmail_actions(self):
+        self._replay_archived_failed_capture({"memory_held": True})
+
+    def _replay_archived_failed_capture(self, failure):
         processed = state.Store(self.base)
-        processed.record("m1", {
+        processed.record("m1", dict({
             "rule_id": "wiring",
             "handler_id": "meeting-notes",
             "source_kind": "gmail",
             "source_id": "gmail:thread-1",
             "memory_source_id": "gmail:thread-1",
-            "memory_error": "legacy store outage",
             "processed_at": "2026-08-01T08:00:00Z",
-        })
+        }, **failure))
         gmail.search = lambda query, max_results=20: []
         gmail.read_thread = lambda thread_id: {
             "messages": [{
@@ -1068,6 +1073,7 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(record["handler_id"], "meeting-notes")
         self.assertEqual(record["memory"], "created")
         self.assertNotIn("memory_error", record)
+        self.assertNotIn("memory_held", record)
 
     def test_new_operator_confirmation_replays_archived_not_worthy_thread(self):
         r = routine(
