@@ -658,41 +658,83 @@ def parse_thread(text, now=None):
     return valid[0][0], valid[0][1], more
 
 
-_CHANNEL_SPLIT = re.compile(
-    r"\n\n(?=From: [^\n]*\nTime: [^\n]*\nMessage TS: \d+\.\d+(?:\n|$))"
+_CHANNEL_HEAD = re.compile(r"\AChannel: (?P<label>[^\n]*?) \((?P<id>[A-Z0-9]+)\)\n")
+_CHANNEL_BLOCK = re.compile(
+    r"(?m)^=== Message from (?P<author>[^\n]*?) at "
+    r"(?P<time>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [A-Za-z0-9+:-]+) ===[ \t]*$"
 )
+_CHANNEL_AUTHOR = re.compile(
+    r"^(?P<name>.*?)[ \t]*(?:<\[?EMAIL:[^>\n]*>[ \t]*)?"
+    r"\((?P<id>[A-Z][A-Z0-9]*)(?:, external: [^\n]*?)?\)[ \t]*"
+    r"(?P<bot>\[BOT\])?[ \t]*$"
+)
+# Metadata lines a detailed read may put right after `Message TS:`.
+_CHANNEL_META = re.compile(
+    r"^(?:Thread TS|Reply count|Replies|Latest reply|Thread): [^\n]*$"
+)
+_NO_MORE = re.compile(r"no more messages")
 
 
-def parse_channel(text, lo, hi):
+def parse_channel(text, lo, hi, channel):
     """Parse one channel-history page into (messages oldest first, more).
 
-    The page holds message blocks in the same shape as thread replies
-    (`From:`, `Time:`, `Message TS:`, body), newest first. Every message must
-    lie inside [lo, hi] (the pinned range), timestamps must be unique, and
-    the order must be strictly monotonic. `more` means the connector reports
-    older messages it did not return.
+    Shape: `Channel: <label> (<id>)`, then blocks
+    `=== Message from <author> at <time> ===`, `Message TS: <ts>`, optional
+    known metadata lines, the text and an optional trailing `Reactions:`
+    line; newest first. The channel id must equal the pinned `channel`,
+    every ts must lie inside [lo, hi] and be unique, and the order must be
+    strictly monotonic, so a header-looking line inside a body cannot add a
+    message outside the range or out of order. `more` is a cursor on
+    `pagination_info` (older messages not returned); any other pagination
+    text is rejected (fail closed).
     """
     data = _json_object(text)
     body = data.get("messages")
     if not isinstance(body, str):
         raise SlackMcpParseError("channel result has no messages text")
     pagination = data.get("pagination_info")
-    more = isinstance(pagination, str) and bool(_CURSOR.search(pagination))
-    body = body.strip("\n")
-    start = re.search(r"(?m)^From: ", body)
-    if not start:
-        raise SlackMcpParseError("channel result has an unknown shape")
-    if any(
-        line.strip() and not line.startswith("===")
-        for line in body[:start.start()].split("\n")
-    ):
-        raise SlackMcpParseError("channel result has an unknown shape")
-    messages = [
-        _thread_message(piece.rstrip("\n"))
-        for piece in _CHANNEL_SPLIT.split(body[start.start():])
+    if not isinstance(pagination, str):
+        raise SlackMcpParseError("channel result has no pagination info")
+    more = bool(_CURSOR.search(pagination))
+    if not more and not _NO_MORE.search(pagination):
+        raise SlackMcpParseError("channel result has unknown pagination")
+    head = _CHANNEL_HEAD.match(body.lstrip("\n"))
+    if not head or head.group("id") != channel:
+        raise SlackMcpParseError("channel result is for another channel")
+    rest = body.lstrip("\n")[head.end():]
+    # A header-looking line not followed by `Message TS:` is body text.
+    marks = [
+        m for m in _CHANNEL_BLOCK.finditer(rest)
+        if re.match(r"\nMessage TS: \d+\.\d+(?:\n|\Z)", rest[m.end():m.end() + 60])
     ]
-    if not messages or any(m is None for m in messages):
-        raise SlackMcpParseError("channel result is malformed")
+    if not marks or rest[:marks[0].start()].strip():
+        raise SlackMcpParseError("channel result has an unknown shape")
+    messages = []
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(rest)
+        lines = rest[mark.end():end].strip("\n").split("\n")
+        stamp = _THREAD_TS.match(lines[0]) if lines else None
+        if not stamp:
+            raise SlackMcpParseError("channel result is malformed")
+        lines = lines[1:]
+        while lines and _CHANNEL_META.match(lines[0]):
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and lines[-1].startswith("Reactions: "):
+            lines.pop()
+        who = _CHANNEL_AUTHOR.match(mark.group("author"))
+        uid = who.group("id") if who else "unknown"
+        messages.append({
+            "ts": stamp.group(1),
+            "user": uid,
+            "name": _clean_name(
+                who.group("name") if who else mark.group("author")
+            ),
+            "is_bot": bool(who and who.group("bot")) or uid.startswith("B")
+            or not who,
+            "text": "\n".join(lines).strip(),
+        })
     stamps = [float(m["ts"]) for m in messages]
     if stamps != sorted(stamps, reverse=True) and stamps != sorted(stamps):
         raise SlackMcpParseError("channel result is not ordered")
@@ -1634,7 +1676,7 @@ def _read_dm_sessions(batch, wanted):
             continue
         first, last = spans[key]
         try:
-            parsed = parse_channel(text, first, last)
+            parsed = parse_channel(text, first, last, key[0])
         except SlackMcpParseError:
             batch["threads"][key] = {"status": "invalid"}
             continue

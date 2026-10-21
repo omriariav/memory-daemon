@@ -1629,8 +1629,11 @@ read_channel_tool: mcp__<server>__slack_read_channel   # source key, required wh
   (`read_channel_tool`, the exact read-only `slack_read_channel`, one tool in
   the least-privilege allowlist) with `oldest` and `latest` pinned just outside
   the session's first and latest message and `limit` = `max_thread_replies`
-  (at most 100). Messages are parsed in the thread-reply block shape, must lie
-  in the pinned range and have unique, ordered timestamps, and are bounded by
+  (at most 100). The result (`Channel: <label> (<id>)`, then `=== Message from ... ===`
+  blocks, newest first) must name the pinned channel, end with a known
+  pagination text, and hold messages inside the pinned range with unique,
+  ordered timestamps (a header-looking line in a body is text unless a
+  `Message TS:` line follows it), and are bounded by
   `max_thread_chars` like a thread (newest kept, `[N earlier replies omitted]`).
   A session read shares the bridge session budget (`THREADS_PER_SESSION` per
   session) and the same retry, lone-failure and unreadable bookkeeping.
