@@ -316,6 +316,7 @@ class CallToolsTest(BridgeBase):
         self.assertEqual(value("--allowedTools"),
                          f"ToolSearch,{TOOL_B},{TOOL_A}")
         self.assertNotIn("--tools", argv)
+        self.assertNotIn("--append-system-prompt", argv)
         settings = json.loads((self.stub_dir / "settings-1.json").read_text())
         hook = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(hook["matcher"], ".*")
@@ -647,6 +648,9 @@ class CompleteTest(BridgeBase):
         self.assertEqual(out, "the summary")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "")
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1],
+                         claude_bridge.NO_TOOLS_NOTE)
+        self.assertNotIn("--tools", argv)
         self.assertEqual(argv[argv.index("--max-turns") + 1], "1")
         self.assertIn(SECRET_PROMPT, (self.stub_dir / "stdin-1.txt").read_text())
         self.assertNotIn(SECRET_PROMPT, " ".join(argv))
