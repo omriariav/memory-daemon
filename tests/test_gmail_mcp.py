@@ -357,12 +357,31 @@ class MessageParserTest(unittest.TestCase):
             body="See this:\n" + doc + "\nand after it more prose."))
         self.assertIn("more prose", again["body"])
 
-    def test_trailing_html_part_without_a_doctype_is_cut(self):
+    def test_prose_html_line_followed_by_a_real_html_part(self):
+        body = ('Check the page source:\n\n  <html lang="en">\n\n'
+                "Then reply.")
+        msg = gmail_mcp.parse_message(message_text(
+            body=body, html=INVITE_HTML))
+        self.assertIn('<html lang="en">', msg["body"])
+        self.assertIn("Then reply.", msg["body"])
+        self.assertNotIn("Weekly sync", msg["body"])  # the real part is cut
+        self.assertNotIn("drop me", msg["body"])
+
+    def test_trailing_ltr_div_that_repeats_the_text_is_cut(self):
         dup = '<div dir="ltr">Plain body text.<br><br>--<br>Ann</div>'
         msg = gmail_mcp.parse_message(message_text(
             body="Plain body text.\n\n--\nAnn", html=dup))
         self.assertEqual(msg["body"], "Plain body text.\n\n--\nAnn")
-        # An unbalanced or prose-bearing tail is left alone.
+
+    def test_small_html_snippets_in_plain_text_are_never_cut(self):
+        snippet = 'Use this:\n<div class="x">\n  hello\n</div>'
+        msg = gmail_mcp.parse_message(message_text(body=snippet))
+        self.assertIn('<div class="x">', msg["body"])
+        self.assertIn("</div>", msg["body"])
+        unrelated = ('Plain words here.\n\n<div dir="ltr">completely '
+                     "different content altogether</div>")
+        msg = gmail_mcp.parse_message(message_text(body=unrelated))
+        self.assertIn("completely different", msg["body"])
         msg = gmail_mcp.parse_message(message_text(
             body="Intro\n<div>half open\nmore words"))
         self.assertIn("more words", msg["body"])
@@ -605,7 +624,8 @@ class WatermarkTest(BridgeTestCase):
     def test_clean_listing_sets_no_watermark(self):
         _, runtime = self.run_listing({None: search_text(
             [{"mid": 1, "thread": 1, "epoch": T1}])}, settle_minutes=0)
-        self.assertEqual(runtime, {"watermarks": {}, "listed": True})
+        self.assertEqual(runtime, {"watermarks": {}, "listed": True,
+                                   "lossy_windows": 0})
 
     def test_settling_thread_holds_the_cursor_at_its_date(self):
         young = int(NOW) - 120
@@ -629,92 +649,59 @@ class WatermarkTest(BridgeTestCase):
                          [False, False, True])
         self.assertEqual(runtime["watermarks"], {"mail": T3})
 
-    def test_capped_newest_first_search_keeps_the_rest_as_backfill(self):
-        pages = {
-            None: search_text([{"mid": 3, "thread": 3, "epoch": T3}], token="P2"),
-            "P2": search_text([{"mid": 2, "thread": 2, "epoch": T2}], token="P3"),
-        }
-        _, runtime = self.run_listing(pages, max_search_pages=2,
-                                      settle_minutes=0)
-        # The cursor is free to advance; the unread older part is remembered.
-        self.assertEqual(runtime["watermarks"], {})
-        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
-        saved = gmail_mcp._load_backfill(cursor_id)
-        self.assertEqual(saved["after"], AFTER)
-        self.assertEqual(saved["before"], T2 + gmail_mcp.FUTURE_SLACK_SECONDS)
-        self.assertEqual(len(self.connector.calls), 2)
-
-    def test_backfill_drains_over_runs_while_new_windows_still_list(self):
-        # 9 messages, newest first, 2 per page, 2 pages per query: a run lists
-        # at most 4 from each of the new window and the backfill range.
-        base = int(NOW) - 6 * 3600
-        messages = [(n, n, base + n * 600) for n in range(1, 10)]
+    def test_over_cap_window_is_bisected_until_it_fits(self):
+        span = int(NOW) - AFTER
+        messages = [(n, n, AFTER + (n * span) // 9) for n in range(1, 9)]
         calls = []
-        search = ranged_search(messages, calls)
-        self.connector.search = search
-        done = set()
-        store = mock.Mock()
-        store.get = lambda i: {"rule_id": "r"} if i in done else None
-        listed = []
-        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
-        for run in range(1, 6):
-            gmail_mcp._last_session[0] = 0.0
-            before = len(calls)
-            since = {} if run == 1 else {
-                "mail": gmail_mcp._rfc3339(int(NOW) - 100)}
-            if run == 4:
-                # a new message arrives while the backfill is still pending
-                messages.append((10, 10, int(NOW) - 50))
-            listing = gmail_mcp.candidates(source(
-                _processed=store, settle_minutes=0, max_search_pages=2,
-                _since_map=since,
-            ))
-            self.assertLessEqual(len(calls) - before, 4)
-            listed.extend(c["raw"]["thread_id"] for c in listing)
-            done.update(c["id"] for c in listing)
-            if run >= 4 and gmail_mcp._load_backfill(cursor_id) is None:
-                break
-        self.assertEqual(
-            sorted(listed), sorted(hexid(n) for n in range(1, 11)))
-        self.assertEqual(len(listed), len(set(listed)))
-        self.assertIsNone(gmail_mcp._load_backfill(cursor_id))
-        self.assertTrue(any("before:" in q for q in calls))
-
-    def test_dry_run_and_count_only_never_write_backfill(self):
-        pages = {
-            None: search_text([{"mid": 3, "thread": 3, "epoch": T3}], token="P2"),
-            "P2": search_text([{"mid": 2, "thread": 2, "epoch": T2}], token="P3"),
-        }
-        self.run_listing(pages, max_search_pages=2, settle_minutes=0,
-                         _count_only=True, _dry_run=True)
-        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
-        self.assertIsNone(gmail_mcp._load_backfill(cursor_id))
-
-    def test_old_deferred_backfill_threads_are_kept_as_backfill(self):
-        cursor_id = gmail_mcp.cursor_ids(source())["mail"]
-        gmail_mcp._save_backfill(cursor_id, {"after": T1 - 10, "before": T3 + 10})
-        self.connector.search = ranged_search(
-            [(1, 1, T1), (2, 2, T2), (3, 3, T3)], page=50)
+        self.connector.search = ranged_search(messages, calls, page=2)
+        runtime = {}
         listing = gmail_mcp.candidates(source(
-            max_threads_per_run=1, settle_minutes=0,
-            _since_map={"mail": gmail_mcp._rfc3339(int(NOW) - 100)},
+            max_search_pages=2, settle_minutes=0, _gmail_mcp_runtime=runtime,
         ))
-        self.assertEqual([bool(c["raw"].get("_deferred")) for c in listing],
-                         [False, True, True])
-        saved = gmail_mcp._load_backfill(cursor_id)
-        self.assertTrue(saved["after"] < T2 < saved["before"])
-        self.assertTrue(saved["after"] < T3 < saved["before"])
+        queries = list(dict.fromkeys(calls))
+        self.assertEqual(queries[0], f"(in:inbox) after:{AFTER}")
+        self.assertTrue(all("before:" in q for q in queries[1:]))
+        ends = [int(re.search(r"before:(\d+)", q).group(1)) for q in queries[1:]]
+        self.assertEqual(ends, sorted(ends, reverse=True))  # halving
+        end = ends[-1]
+        self.assertTrue(all(c["raw"]["newest_ts"] < end for c in listing))
+        self.assertEqual(
+            {c["raw"]["thread_id"] for c in listing},
+            {hexid(n) for n, _, e in messages if e < end},
+        )
+        self.assertLessEqual(len(listing), 4)
+        # The cursor resumes exactly at the window's end.
+        self.assertEqual(runtime["watermarks"], {"mail": end + 3600})
+        self.assertEqual(runtime["lossy_windows"], 0)
 
-    def test_capped_oldest_first_search_resumes_after_the_prefix(self):
-        pages = {
-            None: search_text([
-                {"mid": 1, "thread": 1, "epoch": T1},
-                {"mid": 2, "thread": 2, "epoch": T2},
-            ], token="P2"),
-        }
-        _, runtime = self.run_listing(pages, max_search_pages=1,
-                                      settle_minutes=0)
-        self.assertEqual(runtime["watermarks"], {"mail": T2 - 1 + 3600})
+    def test_a_one_hour_window_over_the_cap_is_taken_as_is_with_a_warning(self):
+        messages = [(n, n, int(NOW) - 600 + n) for n in range(1, 11)]
+        self.connector.search = ranged_search(messages, page=2)
+        runtime, lines = {}, []
+        with mock.patch.object(gmail_mcp, "log", lines.append):
+            listing = gmail_mcp.candidates(source(
+                max_search_pages=2, settle_minutes=0,
+                _gmail_mcp_runtime=runtime,
+                _since_map={"mail": gmail_mcp._rfc3339(int(NOW) - 1800)},
+            ))
+        self.assertEqual(len(listing), 4)  # newest first, first pages only
+        self.assertEqual(runtime["lossy_windows"], 1)
+        self.assertTrue(any("WARN" in line for line in lines))
+
+    def test_bisection_steps_are_bounded(self):
+        calls = []
+        messages = [(n, n, AFTER + 10 + n) for n in range(1, 200)]
+        self.connector.search = ranged_search(messages, calls, page=2)
+        gmail_mcp.candidates(source(max_search_pages=1, settle_minutes=0))
+        firsts = list(dict.fromkeys(calls))
+        self.assertLessEqual(len(firsts), gmail_mcp.MAX_BISECTIONS + 1)
+
+    def test_dry_run_and_count_only_write_no_state(self):
+        self.run_listing({None: search_text(
+            [{"mid": 3, "thread": 3, "epoch": T3}])},
+            _count_only=True, _dry_run=True, settle_minutes=0)
+        self.assertEqual(
+            [p.name for p in Path(self.tmp.name).rglob("*") if p.is_file()], [])
 
     def test_commit_points_take_the_older_of_scan_start_and_watermark(self):
         cursors = mock.Mock()
@@ -1155,6 +1142,57 @@ class RunnerTest(unittest.TestCase):
                          {f"gmail:{hexid(1)}"})
         self.assertEqual({e["source_kind"] for e in ledger.values()},
                          {"gmail_mcp"})
+
+    def burst(self, count=10):
+        base = int(NOW) - 40000
+        messages = [(n, n, base + n * 3000) for n in range(1, count + 1)]
+        self.connector.search = ranged_search(messages, page=2)
+        self.connector.fetch = lambda mid: message_text(
+            thread=int(mid, 16), epoch=base + int(mid, 16) * 3000,
+            body=f"body {int(mid, 16)}")
+        return messages
+
+    def test_a_burst_over_the_cap_drains_over_runs_each_thread_once(self):
+        self.burst()
+        spec = routine(self.base / "vault", max_search_pages=2,
+                       settle_minutes=0)
+        runs = []
+        for _ in range(14):
+            runs.append(runner.run(self.base, [spec])["processed"])
+        self.assertGreater(len([n for n in runs if n]), 1)
+        self.assertEqual(sum(runs), 10)
+        ledger = json.loads((self.base / "state" / "processed.json").read_text())
+        self.assertEqual(len(ledger), 10)
+        self.assertEqual(
+            sorted(e["source_id"] for e in ledger.values()),
+            sorted(f"gmail:{hexid(n)}" for n in range(1, 11)),
+        )
+        self.assertEqual(len(self.prompts), 10)
+
+    def test_a_failure_inside_a_fitted_window_is_listed_again(self):
+        self.burst(4)
+        spec = routine(self.base / "vault", max_search_pages=2,
+                       settle_minutes=0)
+        bad = hexid(2)
+        self.connector.errors = lambda tool, a: (
+            tool == FETCH and a["message_id"] == bad)
+        first = runner.run(self.base, [spec])
+        self.assertEqual(first["errors"], 1)
+        self.connector.errors = lambda tool, a: False
+        before = len(self.prompts)
+        runner.run(self.base, [spec])
+        ledger = json.loads((self.base / "state" / "processed.json").read_text())
+        self.assertIn(f"gmail:{bad}@{bad}", ledger)
+        self.assertEqual(len(ledger), 4)
+        self.assertGreater(len(self.prompts), before)
+
+    def test_a_routine_that_is_not_due_moves_nothing(self):
+        self.burst()
+        spec = routine(self.base / "vault", max_search_pages=2)
+        runner.run(self.base, [spec], active_ids=set())
+        self.assertEqual(self.connector.calls, [])
+        self.assertFalse((self.base / "state" / "cursors.json").exists())
+        self.assertFalse((self.base / "state" / "processed.json").exists())
 
     def test_first_run_bootstraps_and_later_runs_use_overlap(self):
         seen = []

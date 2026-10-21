@@ -1498,12 +1498,12 @@ start, the newest message of the oldest deferred thread and, when a failed item
 holds it, that item's date. Search membership is authoritative (Gmail's `after:`
 uses the received time), so the sender's `Date` header never drops a hit; it
 only orders and settles messages, clamped to the search window. Gmail lists
-newest first, so a search that hits `max_search_pages` leaves the older end of
-its window unread. That range is kept as backfill state
-(`state/gmail-mcp-backfill.json`) and drained over the following runs with a
-`before:<oldest epoch read>` search of its own, at most `max_search_pages`
-pages per run, while the cursor moves on and new windows keep listing. The
-state is removed once the range is drained. A thread whose newest message
+newest first, so a window with more results than `max_search_pages` would lose
+its older end; the window is bisected in time instead (`before:<mid>`, at most
+6 halvings) until the newest-first search fits, only that window is processed,
+and the cursor commits to its end so the next run continues from there (no
+extra state). If even a one-hour window exceeds the cap, its first pages are
+taken and a `WARN` is logged: that rare loss is accepted. A thread whose newest message
 fails to read three times, or cannot be parsed, is recorded in the ledger as
 unreadable (`gmail_mcp: unreadable`, no text); a session-wide outage counts
 against no thread.
