@@ -6,7 +6,7 @@ them. Output is counts and an estimate only; no item text is printed.
 """
 from pathlib import Path
 
-from . import slack_mcp
+from . import gmail_mcp, slack_mcp
 from .shell import log
 
 
@@ -42,6 +42,23 @@ def report(owned, processed, base_dir, totals):
             )
             line += (
                 f" ({len(mcp)} Slack thread(s), {sessions} planned thread "
+                f"read session(s), estimated cost ${cost:.2f}; an estimate "
+                "from past sessions, or estimate_analyze_usd per thread "
+                "without history)"
+            )
+        mail = [c for c in claims if c["source"].get("kind") == "gmail_mcp"]
+        if mail:
+            source = mail[0]["source"]
+            cfg = gmail_mcp.settings(source)
+            reads = sum(
+                len(claim["candidate"]["raw"]["fetch_ids"]) for claim in mail
+            )
+            sessions, cost = gmail_mcp.plan_cost(
+                reads, len(mail), cfg["calls_per_session"], usage, rid,
+                cfg["estimate_analyze_usd"],
+            )
+            line += (
+                f" ({len(mail)} Gmail thread(s), {sessions} planned message "
                 f"read session(s), estimated cost ${cost:.2f}; an estimate "
                 "from past sessions, or estimate_analyze_usd per thread "
                 "without history)"

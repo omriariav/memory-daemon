@@ -1,0 +1,51 @@
+# Example: sweep Gmail threads into a personal-memory store through a claude.ai
+# Gmail connector (no Gmail credentials on this machine).
+#
+# Headless Claude only transports: through the least-privilege bridge it calls
+# two read-only connector tools (`search`, then `fetch_message`) and hands back
+# their raw text; Python parses, groups, bounds and versions everything. See
+# "Gmail via a connector" in the README. Items have the shape of the `gmail`
+# source (memory id gmail:<thread id>), so handlers, routing and analysis work
+# the same. Gmail actions (label, archive, mark read) are not supported here.
+#
+# Requires the Claude Code CLI logged in to an account with the Gmail connector
+# authorized, and a personal-memory instance for the `memory:` block.
+id: example-gmail-mcp-to-memory
+enabled: false
+description: Distill Gmail threads into memory entries.
+
+source:
+  kind: gmail_mcp
+  # Exact MCP tool names as your connector exposes them (`claude mcp list`).
+  # Validation accepts only the read-only `search` and `fetch_message` tools.
+  search_tool: mcp__claude_ai_Example_Gmail__search
+  fetch_tool: mcp__claude_ai_Example_Gmail__fetch_message
+  # A Gmail search. Do not add newer_than:/after:/before: -- the source adds
+  # `after:<unix>` from its cursor itself.
+  query: 'in:inbox -category:promotions -category:social'
+  owner_email: me@example.com
+  model: haiku                  # bridge model; it only transports tool results
+  max_threads_per_run: 15       # extra threads wait for the next run
+  max_messages_per_thread: 8    # newest messages read per thread
+  max_message_chars: 6000       # per message; the rest is cut and marked
+  max_search_pages: 3           # 50 results per page, newest first
+  overlap: 1h                   # re-list this much before the cursor
+  bootstrap: 2d                 # first-run look-back
+  settle_minutes: 10            # a thread waits until its newest message is this old
+  calls_per_session: 15         # message reads per bridge session (max 20)
+  min_seconds_between_sessions: 3
+  read_thread: true             # false: the newest message only
+  exclude_self_only: false      # true: skip threads written only by owner_email
+  # Count-only cost estimate per thread until analyze history exists.
+  estimate_analyze_usd: 0.12
+
+analyze:
+  provider: claude
+  model: sonnet
+  max_output_tokens: 4096
+  instruction_from_connector: gmail
+
+memory:
+  store: /absolute/path/to/your/personal-memory
+  type: note
+  tags: [gmail]
