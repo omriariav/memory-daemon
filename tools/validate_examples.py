@@ -19,18 +19,6 @@ sys.path.insert(0, str(ROOT))
 from workspace_daemon import config  # noqa: E402
 
 
-def stand_in_for_watch_files(data):
-    """Examples point `watch:` at a private file that does not exist here.
-
-    Validate the rest of the block as if that file listed one mention source.
-    """
-    blocks = data.get("sources") or [data.get("source")]
-    for block in blocks:
-        if isinstance(block, dict) and "watch" in block:
-            del block["watch"]
-            block["include_mentions"] = True
-
-
 def main():
     paths = sorted(config.routines_dir(ROOT).glob("_*.yaml"))
     if not paths:
@@ -45,7 +33,8 @@ def main():
             failed += 1
             continue
         data.setdefault("id", path.stem.lstrip("_"))
-        stand_in_for_watch_files(data)
+        # Examples may name a private watch file that does not exist here.
+        config.expand_watch_files(data, missing_ok=True)
         problems = config.validate(data)
         print(f"{'✗' if problems else '✓'} {path.name}")
         for problem in problems:
