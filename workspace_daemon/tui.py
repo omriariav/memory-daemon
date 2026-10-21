@@ -867,10 +867,10 @@ class App:
         self.ui.prompt = Prompt(f"Tick group: {legend}", "".join(groups), chosen)
 
     def _ask_reload(self):
+        if self._blocked():
+            return
         if sys.platform != "darwin" or not self.snap["have_launchctl"]:
             self.ui.message = "reload: needs macOS launchctl; skipped"
-            return
-        if self._blocked():
             return
         loaded = [j for j in self.snap["jobs"] if j.get("loaded")]
         labels = [j["label"] for j in loaded]
