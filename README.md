@@ -1926,15 +1926,23 @@ authorship check marks owner messages no search listed as unverified.
 **Comms inbox.** `comms_inbox` (watch file, or inline on the source) keeps
 `state/comms-inbox.jsonl`, a local record a reply tracker can read instead of
 fetching Slack again. It reuses the hits this run's searches already returned:
-no extra read, no model call, and no settle delay (a message is recorded in the
+no extra read, no model call (unless `reactions_tool` is set, below), and no settle delay (a message is recorded in the
 run that first lists it, even while its thread is still settling).
 
 ```yaml
 comms_inbox:
   channels: [C0EXAMPLE01, D0EXAMPLE03]   # conversations to record
   all_dms: true          # also every DM / group DM the `dms` query lists (needs all_dms: true)
-  reactions: [eyes]      # owner reactions to record, at most 5 (default none)
+  reactions: [pray]      # owner reactions found by search, at most 5 (default none)
   retention_days: 14     # 1 to 90
+  reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
+  reaction_check_hours: 72   # how long an unanswered message is re-checked
+```
+
+and on the routine's source (not the watch file):
+
+```yaml
+reactions_tool: mcp__<server>__slack_get_reactions
 ```
 
 One JSON object per line, oldest message first:
@@ -1950,12 +1958,24 @@ One JSON object per line, oldest message first:
   replies, from every query (channels, people, mentions, `dms`, reactions).
   A conversation appears only when some query lists it: put channels in
   `channels` (or rely on `all_dms` for DMs).
-- Owner reactions: search results and reads carry no reactor ids, so the only
-  source is Slack's `hasmy::<emoji>:` filter. Each `reactions` emoji adds one
+- Owner reactions, any emoji: search results and thread/channel reads carry
+  no reactor ids, but the connector's `slack_get_reactions` does. With
+  `reactions_tool` set, each run reads the reactions of up to
+  `reaction_checks` open messages in one extra bridge session (skipped when
+  none is due). A message is open while it is the newest of its conversation
+  (a channel's top level, or one thread), is not the owner's or a bot's, has
+  no recorded owner reaction and is younger than `reaction_check_hours`. A
+  reaction adds no search hit, so open messages are polled: again only after
+  a quarter of the message's age has passed since the last read (at most 6h);
+  `state/comms-inbox-checks.json` keeps the last read per message. A failed
+  session is logged and leaves the messages due; an unparseable result
+  records nothing; a budget or pause stop propagates.
+- Owner reactions by search: Slack's `hasmy::<emoji>:` filter finds the listed
+  emoji on any message, not just the newest. Each `reactions` emoji adds one
   search per run (a `save_reactions` emoji reuses its existing search), looking
   back `retention_days` and ignoring the cursors; its hits are recorded only
   and never become captures. A `save_reactions` reaction on an inbox
-  conversation is recorded too. Reactions with other emoji are not seen.
+  conversation is recorded too.
 - Lines are never edited: messages dedupe on (`channel_id`, `ts`) and
   reactions on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
   are not reflected. Lines whose `ts` is older than `retention_days` are
@@ -1964,8 +1984,11 @@ One JSON object per line, oldest message first:
 - Hits that only some reading of an ambiguous search page holds are never
   recorded (a forged block must not mark a conversation answered). Text is
   passed through the secret redactor and cut at 4000 characters.
-- `--count-only` and `--dry-run` write nothing; a write failure is logged and
-  does not fail the run.
+- `--count-only` and `--dry-run` write nothing and read no reactions; a write
+  failure is logged and does not fail the run.
+- Security: `reactions_tool` must be exactly `mcp__<server>__slack_get_reactions`
+  (validated like the other read tools); its result holds emoji names and
+  user ids only, never message text.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

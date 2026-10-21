@@ -207,6 +207,173 @@ class ReactionTest(InboxTestCase):
             ))
 
 
+REACTIONS_TOOL = "mcp__example_slack__slack_get_reactions"
+
+
+def reactions_text(*lines):
+    if not lines:
+        return json.dumps({"result": "No reactions on this message."})
+    return json.dumps({"result": "Reactions on message:\n\n" + "\n".join(
+        f":{emoji}: \u00d7 {len(who)} \u2014 "
+        + ", ".join(f"Person {uid} ({uid})" for uid in who)
+        for emoji, who in lines
+    )})
+
+
+def message(ts, user=BOB, thread=None, ch=CHAN):
+    return {
+        "type": "message", "channel_id": ch, "thread_ts": thread or ts,
+        "ts": ts, "user_id": user, "is_owner": user == ME, "is_bot": False,
+        "text": "x",
+    }
+
+
+class ParseReactionsTest(unittest.TestCase):
+    def test_owner_emoji_are_returned(self):
+        text = reactions_text(
+            ("pray", [BOB, ME]), ("+1::skin-tone-2", [ME]), ("eyes", [BOB]),
+        )
+        self.assertEqual(
+            comms_inbox.parse_reactions(text, ME), ["pray", "+1::skin-tone-2"]
+        )
+
+    def test_no_reactions(self):
+        self.assertEqual(comms_inbox.parse_reactions(reactions_text(), ME), [])
+
+    def test_unknown_shapes_raise(self):
+        for text in (
+            "not json at all", json.dumps({"other": 1}),
+            json.dumps({"result": "Reactions on message:\n\nsomething odd"}),
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    comms_inbox.parse_reactions(text, ME)
+
+
+class DueChecksTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def due(self, rows, now=NOW, limit=10, hours=72):
+        comms_inbox.record(self.tmp.name, rows, 14, now=now)
+        return [
+            d["ts"] for d in comms_inbox.due_checks(
+                self.tmp.name, ME, limit, hours, now=now,
+            )
+        ]
+
+    def test_only_the_newest_non_owner_message_per_conversation(self):
+        t1, t2, t3 = (f"{int(NOW) - n}.000100" for n in (300, 200, 100))
+        self.assertEqual(self.due([
+            message(t1), message(t2),                      # top level: t2
+            message(t3, user=ME, thread=t1),               # thread: owner last
+        ]), [t2])
+
+    def test_reacted_old_and_bot_messages_are_closed(self):
+        old = f"{int(NOW) - 80 * 3600}.000100"
+        reacted = f"{int(NOW) - 100}.000100"
+        bot = dict(message(f"{int(NOW) - 50}.000100", ch=CHAN2), is_bot=True)
+        rows = [
+            message(old, ch=DM), message(reacted), bot,
+            comms_inbox.reaction_row(
+                {"channel": CHAN, "ts": reacted, "root": reacted}, "pray"
+            ),
+        ]
+        self.assertEqual(self.due(rows), [])
+
+    def test_back_off_is_a_quarter_of_the_age(self):
+        # Due again once the elapsed time reaches a quarter of the age then:
+        # e >= (4h + e) / 4, so e >= 4800s.
+        ts = f"{int(NOW) - 4 * 3600}.000100"
+        self.assertEqual(self.due([message(ts)]), [ts])
+        comms_inbox.mark_checked(self.tmp.name, [f"{CHAN}:{ts}"], 72, now=NOW)
+        self.assertEqual(self.due([], now=NOW + 4799), [])
+        self.assertEqual(self.due([], now=NOW + 4800), [ts])
+
+    def test_newest_first_up_to_the_limit(self):
+        stamps = [f"{int(NOW) - n}.000100" for n in (30, 20, 10)]
+        rows = [message(t, ch=c) for t, c in zip(stamps, (CHAN, CHAN2, DM))]
+        self.assertEqual(self.due(rows, limit=2), stamps[::-1][:2])
+
+
+class ReactionReadTest(InboxTestCase):
+    def setUp(self):
+        super().setUp()
+        self.reads = []
+        self.answer = reactions_text(("pray", [ME]))
+
+        def thread(args):
+            if "limit" in args:
+                return json.dumps({"messages": ""})
+            self.reads.append(args)
+            return self.answer
+
+        self.connector.thread = thread
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10)},
+        ]})
+
+    def run_once(self, **over):
+        return slack_mcp.candidates(inbox_source(
+            reactions_tool=REACTIONS_TOOL, **over
+        ))
+
+    def test_owner_reaction_is_recorded_and_closes_the_message(self):
+        self.run_once()
+        self.assertEqual(
+            self.reads, [{"channel_id": CHAN, "message_ts": ts_at(10)}]
+        )
+        self.assertEqual(
+            [(r["ts"], r["emoji"]) for r in self.reactions()],
+            [(ts_at(10), "pray")],
+        )
+        calls = len(self.connector.calls)
+        self.run_once()
+        self.assertEqual(len(self.reads), 1)
+        self.assertEqual(len(self.connector.calls), calls + 1)  # search only
+
+    def test_message_without_owner_reaction_stays_open(self):
+        self.answer = reactions_text(("pray", [BOB]))
+        self.run_once()
+        self.assertEqual(self.reactions(), [])
+        state = Path(self.tmp.name, "state", comms_inbox.CHECKS_FILE)
+        self.assertIn(f"{CHAN}:{ts_at(10)}", json.loads(state.read_text()))
+
+    def test_without_the_tool_nothing_is_read(self):
+        slack_mcp.candidates(inbox_source())
+        self.assertEqual(self.reads, [])
+
+    def test_unparseable_result_records_nothing(self):
+        self.answer = "garbage"
+        listing = self.run_once()
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(self.reactions(), [])
+
+    def test_bridge_failure_does_not_fail_the_listing(self):
+        real = self.connector.__call__
+
+        def call(prompt, tools, **kw):
+            if REACTIONS_TOOL in tools:
+                raise slack_mcp.claude_bridge.BridgeError("down")
+            return real(prompt, tools, **kw)
+
+        with mock.patch.object(slack_mcp.claude_bridge, "call_tools", call):
+            listing = self.run_once()
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(self.reactions(), [])
+
+    def test_budget_stop_propagates(self):
+        def call(prompt, tools, **kw):
+            if REACTIONS_TOOL in tools:
+                raise slack_mcp.claude_bridge.BudgetExhausted("cap")
+            return self.connector(prompt, tools, **kw)
+
+        with mock.patch.object(slack_mcp.claude_bridge, "call_tools", call):
+            with self.assertRaises(slack_mcp.claude_bridge.BudgetExhausted):
+                self.run_once()
+
+
 class ConfigTest(unittest.TestCase):
     def problems(self, **over):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,12 +394,27 @@ class ConfigTest(unittest.TestCase):
             {"channels": [CHAN], "reactions": [":eyes:"]},
             {"channels": [CHAN], "reactions": ["a", "b", "c", "d", "e", "f"]},
             {"channels": [CHAN], "retention_days": 0},
+            {"channels": [CHAN], "reaction_checks": 31},
+            {"channels": [CHAN], "reaction_check_hours": 0},
             {"all_dms": "yes"},
         ):
             with self.subTest(block=block):
                 self.assertTrue(any(
                     "comms_inbox" in p for p in self.problems(comms_inbox=block)
                 ))
+
+    def test_reactions_tool_must_be_the_read_only_reader(self):
+        self.assertEqual(self.problems(
+            reactions_tool="mcp__example_slack__slack_get_reactions",
+            comms_inbox={"channels": [CHAN], "reaction_checks": 5},
+        ), [])
+        for tool in (
+            "mcp__s__slack_add_reaction", "mcp__s__slack_get_reactions_and_add",
+            "slack_get_reactions", "mcp__s__slack_read_thread",
+        ):
+            with self.subTest(tool=tool):
+                text = "\n".join(self.problems(reactions_tool=tool))
+                self.assertIn("reactions_tool", text)
 
     def test_inbox_all_dms_needs_the_dms_query(self):
         text = "\n".join(self.problems(comms_inbox={"all_dms": True}))

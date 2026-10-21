@@ -1690,6 +1690,15 @@ def _validate_slack_mcp(prefix, source):
             f"{prefix}.comms_inbox.all_dms needs all_dms: true (no other "
             "query lists every DM)"
         )
+    reactions_tool = source.get("reactions_tool")
+    if reactions_tool is not None and not (
+        _read_only_tool(reactions_tool, "slack_get_reactions")
+        and _MCP_TOOL.match(reactions_tool).group(1) == "slack_get_reactions"
+    ):
+        problems.append(
+            f"{prefix}.reactions_tool must be the exact read-only MCP tool "
+            "mcp__<server>__slack_get_reactions"
+        )
     owner = source.get("self_user_id")
     if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
         problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")

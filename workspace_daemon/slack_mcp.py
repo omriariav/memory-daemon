@@ -66,7 +66,9 @@ key `saved:slack:<ch>:<anchor>`, `saved_covered_ts` as for threads).
 The watch file (or the source) may also set `comms_inbox` to record the hits
 of chosen conversations, and the owner's reactions with chosen emoji, in
 `state/comms-inbox.jsonl` for a reply tracker; see `comms_inbox.py`. Its
-reaction searches (`reacted:<emoji>`) have no cursor and never capture.
+reaction searches (`reacted:<emoji>`) have no cursor and never capture; with
+`reactions_tool` (mcp__<server>__slack_get_reactions) a run also reads the
+reactions of open inbox messages in one more bridge session.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
@@ -137,7 +139,7 @@ DEFAULTS = {
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
     "all_dms", "save_reactions", "dm_sessions", "read_channel_tool",
-    "comms_inbox",
+    "comms_inbox", "reactions_tool",
 }
 CURSOR_SCHEMA = 1
 # Query keys and ledger keys of the reaction-saved path.
@@ -231,6 +233,7 @@ def settings(source):
     cfg["read_channel_tool"] = source.get("read_channel_tool")
     cfg["dm_sessions"] = dm_session_cfg(source.get("dm_sessions"))
     cfg["comms_inbox"] = comms_inbox.settings(source.get("comms_inbox"))
+    cfg["reactions_tool"] = source.get("reactions_tool")
     return cfg
 
 
@@ -1546,6 +1549,7 @@ def candidates(source):
     if cfg["comms_inbox"] and not source.get("_count_only"):
         # Before DM sessions re-point `root`: the inbox keeps the real thread.
         _record_inbox(cfg, found, now)
+        _check_reactions(cfg, now)
     # Inbox-only reaction hits never become candidates.
     found = [(query, hit) for query, hit in found if query["kind"] != "reacted"]
     n_sessions = assign_dm_sessions(
@@ -1706,6 +1710,56 @@ def _record_inbox(cfg, found, now):
     added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
     if added:
         log(f"slack_mcp: comms inbox recorded {added} new line(s)")
+
+
+def _check_reactions(cfg, now):
+    """Read the reactions of open inbox messages; record the owner's.
+
+    One bridge session for every due message. A failure is logged and costs
+    nothing but this run's checks (the messages stay due); a budget or pause
+    stop propagates like any other bridge call.
+    """
+    inbox = cfg["comms_inbox"]
+    tool = cfg["reactions_tool"]
+    if not tool or not inbox["reaction_checks"]:
+        return
+    due = comms_inbox.due_checks(
+        _base_dir, cfg["self_user_id"], inbox["reaction_checks"],
+        inbox["reaction_check_hours"], now,
+    )
+    if not due:
+        return
+    calls = [
+        {THREAD_CHANNEL_ARG: d["channel_id"], THREAD_TS_ARG: d["ts"]}
+        for d in due
+    ]
+    try:
+        texts = _session(cfg, tool, {}, calls, "reaction read", [])
+    except claude_bridge.GUARD_STOPS:
+        raise
+    except claude_bridge.BridgeError as exc:
+        log(f"slack_mcp: comms inbox reaction reads failed: {exc}")
+        return
+    rows, checked, bad = [], [], 0
+    for message, text in zip(due, texts):
+        if text is None:
+            continue
+        try:
+            emoji = comms_inbox.parse_reactions(text, cfg["self_user_id"])
+        except ValueError:
+            bad += 1
+            emoji = []
+        checked.append(f"{message['channel_id']}:{message['ts']}")
+        hit = {"channel": message["channel_id"], "ts": message["ts"],
+               "root": message["thread_ts"]}
+        rows.extend(comms_inbox.reaction_row(hit, name) for name in emoji)
+    added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
+    comms_inbox.mark_checked(
+        _base_dir, checked, inbox["reaction_check_hours"], now
+    )
+    log(f"slack_mcp: comms inbox read reactions of {len(checked)}/{len(due)} "
+        f"open message(s), {added} owner reaction(s) new"
+        + (f", {bad} unparseable" if bad else ""))
 
 
 def _inherited_tag(cfg, processed, anchor_id):
