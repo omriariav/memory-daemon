@@ -1287,6 +1287,46 @@ time, last error that names it, and last time it was part of a failed call
 (from the `mcp__<server>__` prefix of logged tool names); a malformed budget
 file or a failed usage-log write makes it report unhealthy.
 
+### Personal content
+
+Captures from any source (Gmail, Chat, Slack, Mila, calendar-derived items)
+pass through one shared path in the memory sink, which flags personal content
+and redacts government-ID-like numbers. Config lives in the `memory:` block:
+
+```yaml
+memory:
+  store: /absolute/path/to/personal-memory
+  personal_tag: personal      # default; null/false disables flagging
+  redact_ids: true            # default
+  # personal_keywords: [payroll, salary, ...]  # replaces the built-in list
+```
+
+- **Flagging.** The extraction pass asks for `personal: true|false` (plus an
+  optional `personal_reason` category: payroll, compensation, hr, health,
+  family, finance, legal, immigration, id_number, other). Python accepts only a
+  real boolean, and a valid `personal: false` is final. `personal_keywords` (a
+  small first-person/HR list in English and Hebrew by default; Hebrew terms
+  match whole words with one attached prefix letter; `[]` turns it off) only
+  backstops a missing or malformed verdict. A personal ID number in the source
+  or summary always forces the flag. Insurance vocabulary is deliberately not
+  in the defaults. The flag becomes the `personal_tag` on the entry. Only the
+  reason category is ever logged.
+- **Redaction.** With `redact_ids`, ID-like numbers become `[ID]` before any
+  model call (`llm.analyze` for routines with a `memory:` block) and before the
+  entry is saved: Israeli ID numbers after a personal-ID label (ת"ז, תעודת
+  זהות, identity, Israeli/national ID) that pass the check digit, or bare
+  9-digit numbers that pass it and sit within ~20 characters of such a word;
+  passport/SSN-labelled values; card numbers passing Luhn (13-19 digits); and
+  IBANs passing mod-97. A plain "ID" label is not treated as personal, so claim,
+  policy, order, ticket, and meeting ids, dates, amounts, phone numbers, and
+  Slack timestamps, and ticket ids are left alone. Logs carry counts, never
+  values. Vault notes written by routines are not redacted.
+
+Tagging only marks entries; it does not keep them out of shared graphs. Add an
+exclusion for the tag on the memory store side: in each distribution rule
+(tag/type to graph) exclude `personal`, and have promotion flows skip entries
+carrying it. That exclusion is not implemented in memory-daemon.
+
 ### Slack via a connector
 
 `kind: slack_mcp` reads Slack through a claude.ai Slack connector driven by the
