@@ -550,6 +550,23 @@ class OutageTest(ProviderBase):
         self.assertEqual(call.call_count, 1)
         self.assertFalse(self.cache_file.exists())
 
+    def test_guard_stop_is_not_latched_for_other_routines(self):
+        provider = self.provider()  # shared by every routine using this config
+        addr = "alice.smith@" + self.cfg["internal_domains"][0]
+        with mock.patch.object(
+            claude_bridge, "call_tools",
+            side_effect=[
+                claude_bridge.BudgetExhausted("routine cap $1 reached"),
+                alice_results(),
+            ],
+        ) as call:
+            with self.assertRaises(claude_bridge.BudgetExhausted):
+                provider.resolve_email(addr)  # routine A
+            person = provider.resolve_email(addr)  # routine B
+        self.assertEqual(person["email"], addr)
+        self.assertEqual(call.call_count, 2)
+        self.assertIsNone(provider._failure)
+
     def test_clear_cache_unlatches(self):
         provider = self.provider()
         with mock.patch.object(

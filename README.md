@@ -1154,8 +1154,11 @@ daily_usd: 10
 day_timezone: Europe/London   # optional IANA name; default is local time
 ```
 
-A routine at its cap, or any routine once the global cap is reached (or
-`state/budget.yaml` is malformed), is held for the run: it is still listed so
+A routine at its own cap, or a routine that can use the Claude bridge
+(`analyze.provider: claude`, a `slack_mcp` identity or source, a calendar
+cache) once the global cap is reached (or `state/budget.yaml` is malformed), is
+held for the run; routines that never call Claude ignore the global cap. A hold
+is logged once per day: it is still listed so
 a fallback routine cannot take its items, but nothing is analyzed, no cursor
 advances, nothing is marked processed, and `tick` does not count it as
 attempted, so it catches up after the day rolls over. A cap reached mid-run

@@ -451,6 +451,33 @@ def budget_cap(routine):
     return cap if ok else None
 
 
+def uses_claude_bridge(routine):
+    """Whether any of the routine's work can spend through the Claude bridge.
+
+    Global caps (and a broken budget file) only matter to such routines; a
+    routine that never calls Claude has nothing to hold.
+    """
+    profiles = [routine]
+    handlers = routine.get("handlers")
+    if isinstance(handlers, dict):
+        profiles.extend(h for h in handlers.values() if isinstance(h, dict))
+    for profile in profiles:
+        analyze = profile.get("analyze")
+        if isinstance(analyze, dict) and analyze.get("provider") == "claude":
+            return True
+        memory = profile.get("memory")
+        identity = memory.get("identity") if isinstance(memory, dict) else None
+        if isinstance(identity, dict) and identity.get("provider") == "slack_mcp":
+            return True
+    maintenance = routine.get("maintenance")
+    if isinstance(maintenance, dict) and maintenance.get("kind") == "calendar_cache":
+        return True
+    return any(
+        isinstance(source, dict) and source.get("kind") == "slack_mcp"
+        for source in sources(routine)
+    )
+
+
 def _budget_problems(rid, routine):
     if "budget" not in routine:
         return []

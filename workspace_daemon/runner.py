@@ -9,6 +9,7 @@ import json
 import math
 import re
 from contextlib import ExitStack
+from pathlib import Path
 from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
@@ -188,8 +189,30 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
 def _budget_hold(base_dir, routine):
     """Reason the global cap, a bad budget file, or the routine's own cap holds it."""
     return claude_bridge.budget_exhausted(
-        base_dir, routine["id"], routine_cap=config.budget_cap(routine)
+        base_dir, routine["id"], routine_cap=config.budget_cap(routine),
+        include_global=config.uses_claude_bridge(routine),
     )
+
+
+def _log_hold_once(base_dir, rid, message, dry_run):
+    """Log a budget hold the first time each day, not on every tick."""
+    path = Path(base_dir) / "state" / "budget-hold-log.json"
+    today = datetime.date.today().isoformat()
+    try:
+        logged = json.loads(path.read_text())
+        logged = logged if isinstance(logged, dict) else {}
+    except (OSError, ValueError):
+        logged = {}
+    if logged.get(rid) == today:
+        return
+    log(message)
+    if dry_run:
+        return
+    logged[rid] = today
+    try:
+        state.write_atomic(path, json.dumps(logged, sort_keys=True), mode=0o600)
+    except OSError:
+        pass
 
 
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
@@ -207,7 +230,11 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             held = _budget_hold(base_dir, routine)
             if held:
                 held_ids.add(routine["id"])
-                log(f"routine={routine['id']} budget exhausted ({held}), holding")
+                _log_hold_once(
+                    base_dir, routine["id"],
+                    f"routine={routine['id']} budget exhausted ({held}), holding",
+                    dry_run,
+                )
     active_ids -= held_ids
     active = [
         r for r in routines
@@ -2110,7 +2137,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
         # prevents the sink from ever being retried.
         retry_memory = (
             existing is not None
-            and "memory_error" in existing
+            and ("memory_error" in existing or existing.get("memory_held"))
         )
         retry_expansion = (
             existing is not None
@@ -2203,7 +2230,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 and _is_shared_dependency_failure(outcome_record["memory_error"])
             ):
                 shared_circuit["error"] = outcome_record["memory_error"]
-            totals["processed"] += 1
+            if isinstance(outcome_record, dict) and outcome_record.get("memory_held"):
+                hold_claim(claim)
+                totals["skipped"] += 1
+            else:
+                totals["processed"] += 1
         except state.AlreadyRunning:
             raise
         except Exception as exc:  # per-item failures are isolated
@@ -2460,6 +2491,12 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     "an active self-forwarded Chat follow-up was rejected "
                     "as not memory-worthy"
                 )
+        except claude_bridge.GUARD_STOPS as exc:
+            # A cap or the pause switch interrupted the capture: not a failure.
+            # Tag it so the next run retries it; withhold Gmail actions.
+            record["memory_held"] = True
+            memory_failed = True
+            log(f"routine={rid} memory capture held: {exc}")
         except Exception as exc:
             record["memory_error"] = str(exc)[:300]
             memory_failed = True
@@ -2490,7 +2527,10 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     if actions_to_apply:
         record["actions_pending"] = list(actions_to_apply)
     if transcript_module is not None and base_dir is not None:
-        receipt_status = "failed" if record.get("memory_error") else "processed"
+        receipt_status = (
+            "failed" if record.get("memory_error") or record.get("memory_held")
+            else "processed"
+        )
         details = {
             "calendar_match": calendar_match,
             "memory": record.get("memory"),
@@ -2505,7 +2545,10 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
-    elif not record.get("memory_error") and not record.get("expand_fallback"):
+    elif (
+        not record.get("memory_error") and not record.get("memory_held")
+        and not record.get("expand_fallback")
+    ):
         processed.record_resolving(
             item["id"], record, record.get("memory_source_id") or item.get("source_id")
         )

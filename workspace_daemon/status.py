@@ -219,6 +219,7 @@ def read_tick_history(path):
                         and error_count > 0
                         and attributed_count >= error_count
                     )
+                    paused = " (paused)" in message
                     for routine_id in block["due_ids"]:
                         routine_error_count = routine_errors.get(
                             routine_id, 0
@@ -228,7 +229,10 @@ def read_tick_history(path):
                             or routine_error_count > 0
                         )
                         routine_results[routine_id] = {
-                            "state": "error" if failed else "ok",
+                            "state": (
+                                "error" if failed
+                                else "paused" if paused else "ok"
+                            ),
                             "at": at,
                             "group": block["group"],
                         }
@@ -494,13 +498,19 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     for row in rows:
         if row["status"] in ("disabled", "in-tick"):
             continue
+        routine = by_id.get(row["routine"]) or {}
         if pause:
-            row["status"] = "paused"
+            label = "paused"
         elif claude_bridge.budget_exhausted(
-            base_dir, row["routine"],
-            config.budget_cap(by_id.get(row["routine"]) or {}), now=now,
+            base_dir, row["routine"], config.budget_cap(routine), now=now,
+            include_global=config.uses_claude_bridge(routine),
         ):
-            row["status"] = "budget held"
+            label = "budget held"
+        else:
+            continue
+        row["status"] = (
+            f"{label} (attention)" if row["issues"] != "-" else label
+        )
 
     if launchd["loaded"]:
         state_name = launchd.get("state") or "loaded"

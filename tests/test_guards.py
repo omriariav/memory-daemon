@@ -423,9 +423,24 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
         inner = llm.analyze
         llm.analyze = lambda r, p: (self.analyzed.append(r["id"]), inner(r, p))[1]
 
+    def forbid_spawn(self):
+        """A regression must fail the test, never launch the real CLI."""
+        for target, name in (
+            (claude_bridge, "claude_bin"), (claude_bridge.subprocess, "Popen"),
+        ):
+            patcher = mock.patch.object(
+                target, name, side_effect=AssertionError("claude was spawned"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def spend(self, cost, rid="guarded"):
         ts = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         write_usage(self.base, [usage_entry(ts, cost, rid)])
+
+    def bridge_routine(self, **extra):
+        r = routine(self.vault, **extra)
+        r["analyze"] = dict(r["analyze"], provider="claude", model="haiku")
+        return r
 
     def run_with(self, routines=None, **budget):
         routines = routines or [routine(self.vault, budget=budget)]
@@ -484,6 +499,35 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
         )
         self.assertEqual(self.ledger(), {})
 
+    def test_hold_is_logged_once_per_day(self):
+        self.spend(2.0)
+        _, first = self.run_with(daily_usd=1.5)
+        _, second = self.run_with(daily_usd=1.5)
+        self.assertEqual(sum("budget exhausted" in m for m in first), 1)
+        self.assertEqual(sum("budget exhausted" in m for m in second), 0)
+
+    def test_guard_stop_during_memory_capture_is_held_not_failed(self):
+        r = routine(self.vault, memory={"store": str(self.base / "store")})
+        self.forbid_spawn()
+        with mock.patch.object(
+            runner.memory_sink, "capture",
+            side_effect=claude_bridge.BudgetExhausted("routine cap $1 reached"),
+        ):
+            with mock.patch.object(runner, "log"):
+                totals = runner.run(self.base, [r])
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 0)
+        record = self.ledger()["m1"]
+        self.assertTrue(record["memory_held"])
+        self.assertNotIn("memory_error", record)
+        # The next run retries it.
+        with mock.patch.object(
+            runner.memory_sink, "capture", return_value={"memory": "ok"}
+        ), mock.patch.object(runner, "log"):
+            totals = runner.run(self.base, [r])
+        self.assertEqual(totals["processed"], 1)
+        self.assertNotIn("memory_held", self.ledger()["m1"])
+
     def test_routine_under_its_cap_runs(self):
         self.spend(1.0)
         totals, logged = self.run_with(daily_usd=1.5)
@@ -506,18 +550,34 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
         (self.base / "state" / "budget.yaml").write_text(
             "daily_usd: 1\nday_timezone: UTC\n")
         self.spend(5.0, rid="someone-else")
-        totals, logged = self.run_with([routine(self.vault)])
+        totals, logged = self.run_with([self.bridge_routine()])
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(totals["errors"], 0)
         self.assertEqual(totals["held_ids"], ["guarded"])
         self.assertFalse(any("ERROR" in m or "FATAL" in m for m in logged))
 
+    def test_global_cap_leaves_routines_that_never_call_claude_alone(self):
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 1\nday_timezone: UTC\n")
+        self.spend(5.0, rid="someone-else")
+        totals, _ = self.run_with([routine(self.vault)])  # gemini provider
+        self.assertEqual(totals["processed"], 1)
+        self.assertNotIn("held_ids", totals)
+
+    def test_own_cap_still_holds_a_routine_that_never_calls_claude(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: 100\n")
+        self.spend(2.0)
+        totals, _ = self.run_with(daily_usd=1.5)
+        self.assertEqual(totals["held_ids"], ["guarded"])
+
     def test_malformed_budget_file_holds_instead_of_erroring(self):
         (self.base / "state" / "budget.yaml").write_text("daily_usd: nope\n")
-        totals, logged = self.run_with([routine(self.vault)])
+        totals, logged = self.run_with([self.bridge_routine()])
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(totals["errors"], 0)
         self.assertEqual(totals["held_ids"], ["guarded"])
+        totals, _ = self.run_with([routine(self.vault)])  # no bridge: runs
+        self.assertEqual(totals["processed"], 1)
 
     def test_cap_reached_mid_run_stops_the_routine_without_errors(self):
         self.spend(0.9)
@@ -537,6 +597,7 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
                 prompt, model="haiku", base_dir=self.base)
 
         llm.analyze = analyze
+        self.forbid_spawn()
         totals, logged = self.run_with(daily_usd=1.0)
         self.assertEqual(self.analyzed, ["guarded"])  # item 2 never started
         self.assertEqual(totals["errors"], 0)
@@ -559,6 +620,7 @@ class RoutineBudgetRunTest(StubbedRunnerBase):
                 prompt, model="haiku", base_dir=self.base)
 
         llm.analyze = analyze
+        self.forbid_spawn()
         with mock.patch.object(state, "paused", side_effect=[None, "flipped"]):
             totals, _ = self.run_with([routine(self.vault)])
         self.assertEqual(totals["errors"], 0)
@@ -605,13 +667,15 @@ class TickHeldAndMidRunPauseTest(TempBase):
             self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
         self.assertNotIn("domain", state.ScheduleStore(self.base).entries)
 
-    def test_pause_appearing_mid_tick_is_a_clean_stop(self):
+    def test_pause_appearing_mid_tick_stops_but_closes_the_tick(self):
         with mock.patch.object(
                 daemon_cli.runner, "run",
                 side_effect=state.Paused("paused: late")), \
              mock.patch.object(daemon_cli, "log") as log:
             self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
-        self.assertRegex(log.call_args.args[0], r"^tick\[[0-9a-f]+\]: paused: late")
+        messages = [c.args[0] for c in log.call_args_list]
+        self.assertRegex(messages[-1], r"^tick\[[0-9a-f]+\] done: .* \(paused\)$")
+        self.assertTrue(any("stopped early" in m for m in messages))
         self.assertNotIn("domain", state.ScheduleStore(self.base).entries)
 
     def test_pause_appearing_mid_run_is_a_clean_stop(self):
@@ -625,6 +689,25 @@ class TickHeldAndMidRunPauseTest(TempBase):
             self.assertEqual(daemon_cli.cmd_run(args), 0)
         self.assertIn(mock.call("run stopped: paused: late"),
                       log.call_args_list)
+
+
+class UsesClaudeBridgeTest(unittest.TestCase):
+    def test_detection(self):
+        uses = config.uses_claude_bridge
+        self.assertFalse(uses(routine("/v")))
+        claude = routine("/v")
+        claude["analyze"]["provider"] = "claude"
+        self.assertTrue(uses(claude))
+        handler = routine("/v", handlers={"h": {"analyze": {"provider": "claude"}}})
+        self.assertTrue(uses(handler))
+        identity = routine("/v", memory={"identity": {"provider": "slack_mcp"}})
+        self.assertTrue(uses(identity))
+        self.assertTrue(uses({"id": "c", "maintenance": {"kind": "calendar_cache"}}))
+        self.assertFalse(uses({"id": "c", "maintenance": {
+            "kind": "slack_conversation_census"}}))
+        mcp = routine("/v")
+        mcp["source"] = {"kind": "slack_mcp"}
+        self.assertTrue(uses(mcp))
 
 
 class BudgetKeyValidationTest(unittest.TestCase):

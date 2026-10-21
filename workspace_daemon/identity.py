@@ -467,6 +467,10 @@ class SlackMcpProvider:
             )
         except claude_bridge.BridgeDryRun:
             self._fail("identity lookup skipped: dry run")
+        except claude_bridge.GUARD_STOPS:
+            # A cap or pause belongs to the calling routine, not to this
+            # shared provider: never latch it for everyone else.
+            raise
         except claude_bridge.BridgeError as exc:
             self._fail(f"slack identity lookup failed: {exc}")
 

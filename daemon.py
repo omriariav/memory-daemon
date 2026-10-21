@@ -332,6 +332,7 @@ def cmd_tick(args):
     # can take tens of minutes). Persist each group's attempt immediately, so
     # the next tick cannot repeat capture merely because maintenance was slow.
     groups = _execution_groups(routines, due_ids)
+    paused_mid_tick = False
     for group_ids, lock_name in groups:
         if not group_ids:
             continue
@@ -353,8 +354,11 @@ def cmd_tick(args):
             )
             continue
         except state.Paused as exc:
-            log(f"{tick_name}: {exc}{mode}")
-            return 0
+            # Stop here, but close the tick normally so status sees a finished
+            # (paused) tick rather than an incomplete one.
+            log(f"{tick_name} stopped early — {exc}{mode}")
+            paused_mid_tick = True
+            break
         # A routine held by a cap or the pause switch did not really attempt.
         held = set(group_totals.get("held_ids", ()))
         schedule.mark_attempted(group_ids - held, now=group_started_epoch)
@@ -362,7 +366,7 @@ def cmd_tick(args):
     log(
         f"{tick_name} done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
-        f"{mode}"
+        f"{' (paused)' if paused_mid_tick else ''}{mode}"
     )
     return 1 if totals["errors"] else 0
 

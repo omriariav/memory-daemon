@@ -309,15 +309,25 @@ def spent_today(base_dir, routine=None, tz=None, now=None):
     return total
 
 
-def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None):
+def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
+                     include_global=True):
     """Why new work should not start now, or None.
 
     Fails closed: a malformed budget file or an unreadable usage log counts as
-    exhausted, since spend can no longer be known.
+    exhausted, since spend can no longer be known. include_global=False is for
+    routines that never use the bridge: only their own cap applies to them.
     """
+    if not include_global and routine_cap is None:
+        return None
     try:
-        cap, tz = load_budget(base_dir)
-        if cap is not None and spent_today(base_dir, None, tz, now) >= cap:
+        try:
+            cap, tz = load_budget(base_dir)
+        except BridgeError:
+            if include_global:
+                raise
+            cap, tz = None, None
+        if include_global and cap is not None \
+                and spent_today(base_dir, None, tz, now) >= cap:
             return f"global cap ${cap:g} reached"
         if routine_cap is not None and routine is not None \
                 and spent_today(base_dir, routine, tz, now) >= routine_cap:
