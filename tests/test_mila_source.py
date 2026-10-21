@@ -725,6 +725,11 @@ class MilaRunnerTest(unittest.TestCase):
             "reason": "Calendar was corrected.",
         }
         with self.patched_source(), mock.patch.object(
+            mila_source, "_now",
+            return_value=datetime.datetime(
+                2026, 7, 27, 11, 0, tzinfo=datetime.timezone.utc
+            ),
+        ), mock.patch.object(
             mila_source, "match_calendar",
             side_effect=[(False, rejected), (True, accepted)],
         ) as match, mock.patch.object(
@@ -1100,6 +1105,12 @@ def fake_call_tools(text=CALENDAR_TEXT):
 class ConnectorCalendarTest(unittest.TestCase):
     def setUp(self):
         mila_source._reset_run()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        patcher = mock.patch.object(llm, "_base_dir", self.base)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.start = datetime.datetime(
             2026, 7, 27, 19, 2, 44, tzinfo=datetime.timezone.utc
         )
@@ -1190,7 +1201,7 @@ class ConnectorCalendarTest(unittest.TestCase):
         self.assertIn("calendar", run.call_args[0][0])
 
 
-class DuplicateCaptureTest(unittest.TestCase):
+class DuplicateFixture(unittest.TestCase):
     def setUp(self):
         mila_source._reset_run()
         self.tmp = tempfile.TemporaryDirectory()
@@ -1231,6 +1242,8 @@ class DuplicateCaptureTest(unittest.TestCase):
         chat.assert_not_called()
         return analyze, capture
 
+
+class DuplicateCaptureTest(DuplicateFixture):
     def test_running_recording_is_skipped_until_completed(self):
         found = mila_source.candidates(self.source)
         self.assertEqual(
@@ -1535,6 +1548,7 @@ class ImportTimeScenarioTest(unittest.TestCase):
             self.assertTrue(
                 mila_source.match_calendar(r, local_source(), one)[0]
             )
+            mila_source.confirm(one, {})
             accepted, match = mila_source.match_calendar(
                 r, local_source(), two
             )
@@ -1573,3 +1587,236 @@ class ImportTimeScenarioTest(unittest.TestCase):
         self.assertFalse(mila_source._copies(
             traits[0], traits[1], datetime.timezone.utc
         ))
+
+
+NOW_PAST = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+
+
+class SavedBeforeDuplicateTest(DuplicateFixture):
+    def test_failed_primary_holds_copy_then_next_run_captures_correctly(self):
+        self.bridge = fake_call_tools()
+
+        def run(analyze_effect):
+            mila_source._reset_run()
+            with mock.patch.object(
+                claude_bridge, "call_tools", self.bridge
+            ), mock.patch.object(
+                llm, "analyze", side_effect=analyze_effect
+            ) as analyze, mock.patch.object(
+                memory_sink, "capture",
+                return_value={"memory": "created", "memory_entry_id": "e"},
+            ) as capture, mock.patch.object(local_llm, "chat_json"):
+                totals = runner.run(self.base, [self.routine])
+            return totals, analyze, capture
+
+        totals, analyze, capture = run(RuntimeError("model exploded"))
+        self.assertEqual(analyze.call_count, 1)  # copy never analysed
+        capture.assert_not_called()
+        ledger = state.load(self.base)
+        self.assertFalse(any(e.get("duplicate_of") for e in ledger.values()))
+        self.assertNotIn("mila:MEMO", {e.get("source_id") for e in ledger.values()})
+
+        totals, analyze, capture = run(["Durable decision."])
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args[0][1]["source_id"], "mila:SYS")
+        ledger = {e["source_id"]: e for e in state.load(self.base).values()}
+        self.assertEqual(ledger["mila:MEMO"]["duplicate_of"], "mila:SYS")
+
+    def test_copy_waits_while_primary_is_unsaved(self):
+        r = routine("/tmp/store", local_source())
+        one = match_item(events=[event("e", "Alpha // Beta - intro")])
+        two = match_item(events=[event("e", "Alpha // Beta - intro")])
+        two["source_id"] = "mila:COPY"
+        mila_source._reset_run()
+        self.assertTrue(mila_source.match_calendar(r, local_source(), one)[0])
+        accepted, match = mila_source.match_calendar(r, local_source(), two)
+        self.assertFalse(accepted)
+        self.assertTrue(match["held"])
+        self.assertNotIn("duplicate_of", match)
+        mila_source.confirm(one, {})
+        accepted, match = mila_source.match_calendar(r, local_source(), two)
+        self.assertEqual(match["duplicate_of"], "mila:R")
+
+
+class StrictRuleTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+
+    def run_match(self, item):
+        reply = {"matched": False, "event_id": None, "confidence": "low",
+                 "reason": ""}
+        with mock.patch.object(local_llm, "chat_json", return_value=reply) as chat:
+            accepted, _ = mila_source.match_calendar(
+                routine("/tmp/store", local_source()), local_source(), item
+            )
+        return accepted, chat
+
+    def test_declined_sole_event_goes_to_model(self):
+        declined = dict(event("d", "Planning"), response_status="declined")
+        accepted, chat = self.run_match(
+            match_item(title="New recording", events=[declined])
+        )
+        chat.assert_called_once()
+        self.assertFalse(accepted)
+
+    def test_declined_title_match_goes_to_model(self):
+        declined = dict(event("d", "Alpha // Beta - intro"),
+                        response_status="declined")
+        _, chat = self.run_match(match_item(events=[declined]))
+        chat.assert_called_once()
+
+    def test_short_event_inside_long_recording_goes_to_model(self):
+        short = event("s", "Planning", start="2026-07-27T19:10:00Z",
+                      end="2026-07-27T19:25:00Z")
+        item = match_item(title="New recording", events=[short])
+        item["frontmatter"]["mila_recording_end"] = "2026-07-27T20:02:44Z"
+        _, chat = self.run_match(item)
+        chat.assert_called_once()
+
+    def test_long_event_barely_touched_goes_to_model(self):
+        long_event = event("l", "Planning", start="2026-07-27T19:25:00Z",
+                           end="2026-07-27T22:00:00Z")
+        _, chat = self.run_match(
+            match_item(title="New recording", events=[long_event])
+        )
+        chat.assert_called_once()
+
+
+class RetryBoundTest(DuplicateFixture):
+    def setUp(self):
+        super().setUp()
+        data = json.loads(self.recordings.read_text())
+        self.recordings.write_text(json.dumps([data[1]]))
+        # Two same-title events: ambiguous, so the model decides.
+        self.bridge = fake_call_tools(
+            CALENDAR_TEXT.replace("Focus block", "Alpha // Beta - intro")
+        )
+
+    def run_with(self, chat, now):
+        mila_source._reset_run()
+        with mock.patch.object(
+            claude_bridge, "call_tools", self.bridge
+        ), mock.patch.object(mila_source, "_now", return_value=now), \
+             mock.patch.object(llm, "analyze", return_value="x"), \
+             mock.patch.object(
+                 memory_sink, "capture",
+                 return_value={"memory": "created", "memory_entry_id": "e"},
+             ), mock.patch.object(local_llm, "chat_json", chat):
+            runner.run(self.base, [self.routine])
+
+    def entry(self):
+        return next(iter(state.load(self.base).values()))
+
+    def test_old_recording_miss_is_final_and_makes_no_more_calls(self):
+        no = mock.Mock(return_value={"matched": False, "event_id": None,
+                                     "confidence": "low", "reason": ""})
+        late = datetime.datetime(2026, 7, 28, tzinfo=datetime.timezone.utc)
+        self.run_with(no, late)
+        self.assertTrue(self.entry()["calendar_match_final"])
+        calls = self.bridge.call_count
+        self.run_with(no, late)
+        self.assertEqual(self.bridge.call_count, calls)
+        self.assertEqual(no.call_count, 1)
+
+    def test_recent_miss_retries_up_to_three_attempts(self):
+        no = mock.Mock(return_value={"matched": False, "event_id": None,
+                                     "confidence": "low", "reason": ""})
+        soon = datetime.datetime(2026, 7, 27, 19, 40, tzinfo=datetime.timezone.utc)
+        for expected in (1, 2):
+            self.run_with(no, soon)
+            self.assertEqual(self.entry()["calendar_match_attempts"], expected)
+            self.assertNotIn("calendar_match_final", self.entry())
+        self.run_with(no, soon)
+        self.assertTrue(self.entry()["calendar_match_final"])
+        self.run_with(no, soon)
+        self.assertEqual(no.call_count, 3)
+
+    def test_ollama_down_is_never_final(self):
+        down = mock.Mock(side_effect=local_llm.LocalLLMUnavailable("down"))
+        late = datetime.datetime(2026, 12, 1, tzinfo=datetime.timezone.utc)
+        for _ in range(5):
+            self.run_with(down, late)
+        self.assertNotIn("calendar_match_final", self.entry())
+        self.assertEqual(down.call_count, 5)
+
+
+class WindowCacheTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        for patcher in (
+            mock.patch.object(llm, "_base_dir", self.base),
+            mock.patch.object(mila_source, "_now", return_value=NOW_PAST),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.start = datetime.datetime(
+            2026, 7, 27, 19, 2, tzinfo=datetime.timezone.utc
+        )
+        self.end = self.start + datetime.timedelta(minutes=30)
+
+    def fetch(self, source, bridge):
+        with mock.patch.object(claude_bridge, "call_tools", bridge):
+            return mila_source._raw_calendar_events(source, self.start, self.end)
+
+    def test_past_window_is_cached_on_disk_across_runs(self):
+        bridge = fake_call_tools()
+        first = self.fetch(connector_source(), bridge)
+        mila_source._reset_run()
+        second = self.fetch(connector_source(), bridge)
+        self.assertEqual(bridge.call_count, 1)
+        self.assertEqual(first, second)
+        files = list((self.base / "state" / "calendar_windows").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+
+    def test_cache_expires_after_a_day_and_is_keyed_by_config(self):
+        bridge = fake_call_tools()
+        self.fetch(connector_source(), bridge)
+        mila_source._reset_run()
+        self.fetch(connector_source(calendar_max_results=100), bridge)
+        self.assertEqual(bridge.call_count, 2)  # max_results is in the key
+        mila_source._reset_run()
+        with mock.patch.object(
+            mila_source, "_now",
+            return_value=NOW_PAST + datetime.timedelta(days=2),
+        ):
+            self.fetch(connector_source(), bridge)
+        self.assertEqual(bridge.call_count, 3)
+
+    def test_in_run_cache_is_keyed_by_calendar_id(self):
+        bridge = fake_call_tools()
+        other = connector_source()
+        other["calendar"] = dict(other["calendar"], calendar_id="team")
+        self.fetch(connector_source(), bridge)
+        self.fetch(other, bridge)
+        self.assertEqual(bridge.call_count, 2)
+
+    def test_window_not_entirely_past_is_not_persisted(self):
+        bridge = fake_call_tools()
+        with mock.patch.object(
+            mila_source, "_now",
+            return_value=self.start,
+        ):
+            self.fetch(connector_source(), bridge)
+        self.assertFalse((self.base / "state" / "calendar_windows").exists())
+
+    def test_exactly_max_results_fails_loudly(self):
+        with self.assertRaisesRegex(RuntimeError, "calendar_max_results"):
+            self.fetch(connector_source(calendar_max_results=2), fake_call_tools())
+
+
+class ClaudeMatchLeakTest(unittest.TestCase):
+    def test_non_json_reply_never_appears_in_the_error(self):
+        mila_source._reset_run()
+        source = {"kind": "mila",
+                  "match": {"provider": "claude", "model": "sonnet"}}
+        item = match_item(events=[event("a", "Weekly"), event("b", "Weekly")],
+                          title="Weekly")
+        with mock.patch.object(
+            claude_bridge, "complete", return_value="TRANSCRIPT-LEAK not json"
+        ), self.assertRaises(RuntimeError) as ctx:
+            mila_source.match_calendar(routine("/tmp/s", source), source, item)
+        self.assertNotIn("TRANSCRIPT-LEAK", str(ctx.exception))

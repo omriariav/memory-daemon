@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import calendar_cache, claude_bridge, llm, local_llm, transcripts
+from . import state as state_mod
 from .chat_text import redact_secrets
 from .shell import gws_bin, log, run_json, yoetz_bin
 
@@ -339,7 +340,11 @@ _RUN = {}
 
 def _reset_run():
     _RUN.clear()
-    _RUN.update({"windows": [], "captured": {}, "seeded": False})
+    # captured: saved primaries (ledger-backed); pending: accepted but not yet
+    # saved, or saved with a memory error and still awaiting retry.
+    _RUN.update({
+        "windows": [], "captured": {}, "pending": {}, "seeded": False,
+    })
 
 
 def _run_state():
@@ -486,7 +491,10 @@ def prime(entries):
             )
         except RuntimeError:
             continue
-        state["captured"].setdefault(event_id, []).append({
+        unsettled = entry.get("memory_error") or entry.get("memory_held")
+        state["pending" if unsettled else "captured"].setdefault(
+            event_id, []
+        ).append({
             "source_id": entry.get("source_id"), "interval": interval,
             "duration": entry.get("duration_seconds"),
         })
@@ -501,6 +509,10 @@ CALENDAR_PROVIDERS = ("gws", "connector")
 CONNECTOR_TIMEOUT = 180
 CONNECTOR_ATTEMPTS = 2
 DEFAULT_MAX_TRANSCRIPT_CHARS = 60000
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def calendar_provider(source):
@@ -574,30 +586,89 @@ def _event_dict(raw, owner):
     }
 
 
+WINDOW_CACHE_TTL = 86400
+
+
+def _window_key(cfg, source, low, high):
+    return (
+        cfg.get("calendar_id", "primary"), cfg["list_tool"],
+        source.get("calendar_timezone", "UTC"),
+        int(source.get("calendar_max_results", 250)),
+        low, high,
+    )
+
+
+def _disk_path(base_dir, key):
+    digest = hashlib.sha256(
+        json.dumps([str(part) for part in key]).encode("utf-8")
+    ).hexdigest()[:24]
+    return Path(base_dir) / "state" / "calendar_windows" / f"{digest}.json"
+
+
+def _disk_load(base_dir, key, now):
+    if base_dir is None or key[5] >= now:  # only fully past windows persist
+        return None
+    try:
+        data = json.loads(_disk_path(base_dir, key).read_text())
+        fetched = _parse_instant(data["fetched_at"])
+        events = data["events"]
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+    if (now - fetched).total_seconds() > WINDOW_CACHE_TTL or not isinstance(
+        events, list
+    ):
+        return None
+    return events
+
+
+def _disk_store(base_dir, key, now, events):
+    if base_dir is None or key[5] >= now:
+        return
+    try:
+        state_mod.write_atomic(
+            _disk_path(base_dir, key),
+            json.dumps({
+                "fetched_at": now.isoformat(), "events": events,
+            }, ensure_ascii=False) + "\n",
+            mode=0o600,
+        )
+    except OSError as exc:
+        log(f"mila: calendar window cache write failed: {exc}")
+
+
 def _connector_events(source, recording_start, recording_end):
     cfg = source.get("calendar") or {}
     list_tool = cfg["list_tool"]
     horizon_hours = float(source.get("calendar_match_hours", 6))
     low, high = _window(recording_start, recording_end, horizon_hours)
+    key_head = _window_key(cfg, source, low, high)[:4]
     windows = _run_state()["windows"]
-    for w_low, w_high, events in windows:
-        if w_low <= low and high <= w_high:
+    for w_key, events in windows:
+        if w_key[:4] == key_head and w_key[4] <= low and high <= w_key[5]:
             return events
+    key = key_head + (low, high)
+    now = _now()
+    base_dir = llm.base_dir()
+    cached = _disk_load(base_dir, key, now)
+    if cached is not None:
+        windows.append((key, cached))
+        return cached
     if source.get("_dry_run"):
         log("mila: dry-run, calendar connector not called")
         return []
     fmt = "%Y-%m-%dT%H:%M:%SZ"
+    max_results = int(source.get("calendar_max_results", 250))
     args = {
         "calendar_id": cfg.get("calendar_id", "primary"),
         "time_min": low.strftime(fmt),
         "time_max": high.strftime(fmt),
-        "max_results": int(source.get("calendar_max_results", 250)),
+        "max_results": max_results,
     }
     results = claude_bridge.call_tools(
         _fetch_prompt(list_tool, args),
         {list_tool: args},
         model=cfg.get("model", "haiku"),
-        base_dir=llm.base_dir(),
+        base_dir=base_dir,
         max_turns=4,
         max_budget_usd=0.1,
         timeout=CONNECTOR_TIMEOUT,
@@ -619,9 +690,16 @@ def _connector_events(source, recording_start, recording_end):
         listed = calendar_cache.parse_list(listing["text"], zone)
     except calendar_cache.CalendarParseError as exc:
         raise RuntimeError(f"calendar connector output not recognised: {exc}")
+    if len(listed) >= max_results:
+        raise RuntimeError(
+            f"calendar window returned {len(listed)} events, the "
+            "calendar_max_results cap; raise calendar_max_results so no "
+            "candidate is silently dropped"
+        )
     owner = str(cfg.get("owner_email") or "").strip().casefold()
     events = [_event_dict(raw, owner) for raw in listed]
-    windows.append((low, high, events))
+    windows.append((key, events))
+    _disk_store(base_dir, key, now, events)
     return events
 
 
@@ -793,16 +871,18 @@ def titles_match(left, right):
 
 
 def _plausible(item, event):
-    """Event overlaps the recording by at least half of the shorter of the two."""
+    """Overlap covers at least half of the recording AND half of the event."""
     start = _parse_instant(item["frontmatter"]["mila_recording_start"])
     end = _parse_instant(item["frontmatter"]["mila_recording_end"])
     event_start = _event_instant(event.get("start"))
     event_end = _event_instant(event.get("end"))
     if not event_start or not event_end:
         return False
-    shorter = max(1.0, min((end - start).total_seconds(),
-                           (event_end - event_start).total_seconds()))
-    return _overlap_seconds(start, end, event_start, event_end) / shorter >= 0.5
+    overlap = _overlap_seconds(start, end, event_start, event_end)
+    return (
+        overlap / max(1.0, (end - start).total_seconds()) >= 0.5
+        and overlap / max(1.0, (event_end - event_start).total_seconds()) >= 0.5
+    )
 
 
 def _has_other_attendee(event):
@@ -853,6 +933,10 @@ def _rule_match(item, events):
         event for event in events
         if titles_match(item.get("title"), event.get("summary"))
     ]
+    # A declined invite may still be the meeting that was recorded, but that
+    # is for the model to judge, never for a rule.
+    if any(event.get("response_status") == "declined" for event in titled):
+        return None
     if len(titled) == 1:
         reason = (
             "title and time match" if titled[0] in plausible else "title match"
@@ -865,6 +949,7 @@ def _rule_match(item, events):
         return None
     if (
         len(plausible) == 1
+        and plausible[0].get("response_status") != "declined"
         and _has_other_attendee(plausible[0])
         and not _title_conflicts(item.get("title"), plausible[0])
     ):
@@ -922,13 +1007,13 @@ def _model_match(routine, source, item, events):
             timeout=cfg.get("timeout", local_llm.DEFAULT_TIMEOUT),
         )
     except local_llm.LocalLLMUnavailable:
-        return False, _unmatched(LOCAL_UNAVAILABLE)
+        return False, _unmatched(LOCAL_UNAVAILABLE, retry=True)
     except local_llm.LocalLLMError:
-        return False, _unmatched(LOCAL_INVALID)
+        return False, _unmatched(LOCAL_INVALID, retry=True)
     try:
         accepted, match = transcripts.validate_match(raw, ids)
     except RuntimeError:
-        return False, _unmatched(LOCAL_INVALID)
+        return False, _unmatched(LOCAL_INVALID, retry=True)
     match["reason"] = LOCAL_DECLINED if accepted else LOCAL_REJECTED
     return accepted, match
 
@@ -944,14 +1029,9 @@ def _item_trait(item):
     }
 
 
-def _duplicate_of(item, event_id, zone):
-    """Source id of an earlier capture of this event that is a copy of it.
-
-    The event id already ties the two recordings together; they are copies
-    when they overlap or have near-identical length on the same local day.
-    """
+def _copy_of(item, entries, zone):
     mine = _item_trait(item)
-    for prior in _run_state()["captured"].get(event_id, []):
+    for prior in entries:
         if prior["source_id"] == item.get("source_id"):
             continue
         if _overlaps_substantially(mine["interval"], prior["interval"]):
@@ -965,6 +1045,44 @@ def _duplicate_of(item, event_id, zone):
         ):
             return prior["source_id"]
     return None
+
+
+def confirm(item, record):
+    """Runner hook: the item's record is saved; settle its capture claim.
+
+    Only now does a capture count as the one memory of its meeting.  A record
+    saved with a memory error stays pending so copies wait for its retry.
+    """
+    state = _run_state()
+    event_id = (item.get("frontmatter") or {}).get("calendar_event_id")
+    source_id = item.get("source_id")
+    if not event_id:
+        return
+    pending = state["pending"].get(event_id, [])
+    mine = next((p for p in pending if p["source_id"] == source_id), None)
+    if mine is None:
+        return
+    if record.get("memory_error") or record.get("memory_held"):
+        return
+    pending.remove(mine)
+    state["captured"].setdefault(event_id, []).append(mine)
+
+
+def match_is_final(source, item, match, attempts):
+    """A non-retryable miss stops being retried once it cannot improve.
+
+    Ollama down or invalid output is free to retry and never final.  Anything
+    else is final after 3 attempts or once the recording is older than the
+    match horizon (the Calendar will not change in a way that helps).
+    """
+    if match.get("retry"):
+        return False
+    if attempts >= 3:
+        return True
+    end = _parse_instant(item["frontmatter"]["mila_recording_end"])
+    hours = float(source.get("calendar_match_hours", 6))
+    age = (_now() - end).total_seconds()
+    return age > hours * 3600
 
 
 def match_calendar(routine, source, item):
@@ -999,15 +1117,24 @@ def match_calendar(routine, source, item):
         event = next(e for e in events if e.get("id") == match["event_id"])
 
     zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
-    prior = _duplicate_of(item, event["id"], zone)
+    state = _run_state()
+    prior = _copy_of(item, state["captured"].get(event["id"], []), zone)
     if prior:
         return False, dict(match, duplicate_of=prior, reason="duplicate capture")
+    waiting = _copy_of(item, state["pending"].get(event["id"], []), zone)
+    if waiting:
+        # The primary is accepted but not saved yet; never ledger a copy
+        # against a capture that may still fail.
+        return False, dict(
+            match, held=True, waiting_for=waiting,
+            reason="waiting for primary capture",
+        )
     transcripts.accept_event(
         item, event, match["confidence"], match["reason"]
     )
-    _run_state()["captured"].setdefault(event["id"], []).append(
-        dict(_item_trait(item), source_id=item.get("source_id"))
-    )
+    entries = state["pending"].setdefault(event["id"], [])
+    entries[:] = [p for p in entries if p["source_id"] != item.get("source_id")]
+    entries.append(dict(_item_trait(item), source_id=item.get("source_id")))
     return True, match
 
 

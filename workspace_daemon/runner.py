@@ -2232,6 +2232,7 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             existing is not None
             and claim["source"].get("kind") in TRANSCRIPT_SOURCES
             and existing.get("calendar_match_rejected") is True
+            and not existing.get("calendar_match_final")
         )
         if (
             existing is not None
@@ -2497,15 +2498,38 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                 f"{calendar_match['duplicate_of']}; not analyzed"
             )
             return record
+        if not accepted and calendar_match.get("held"):
+            # The primary capture of this meeting is still in flight; save
+            # nothing so this copy is decided after the primary is settled.
+            log(
+                f"routine={rid} id={item['id']} held: waiting for "
+                f"{calendar_match['waiting_for']} to be saved"
+            )
+            return {"memory_held": True, "calendar_hold": True}
         if not accepted:
+            attempts = int(
+                (processed.get(item["id"]) or {}).get(
+                    "calendar_match_attempts", 0
+                )
+            )
+            final = False
+            if not calendar_match.get("retry"):
+                attempts += 1
+                checker = getattr(transcript_module, "match_is_final", None)
+                final = bool(
+                    checker and checker(source, item, calendar_match, attempts)
+                )
             record = {
                 "rule_id": rid,
                 "source_kind": source["kind"],
                 "source_id": item["source_id"],
                 "processed_at": utc_now_iso(),
                 "calendar_match_rejected": True,
+                "calendar_match_attempts": attempts,
                 "calendar_match": calendar_match,
             }
+            if final:
+                record["calendar_match_final"] = True
             if handler_id:
                 record["handler_id"] = handler_id
             if base_dir is not None:
@@ -2514,6 +2538,7 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
                     {
                         "failure_kind": "calendar-match",
                         "calendar_match": calendar_match,
+                        "final": final,
                     },
                 )
             processed.record(item["id"], record)
@@ -2670,6 +2695,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         processed.record_resolving(
             item["id"], record, item["source_id"]
         )
+        confirm = getattr(transcript_module, "confirm", None)
+        if confirm is not None:
+            confirm(item, record)
     elif (
         not record.get("memory_error") and not record.get("memory_held")
         and not record.get("expand_fallback")
