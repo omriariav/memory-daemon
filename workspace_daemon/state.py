@@ -468,6 +468,7 @@ class Store:
                 and (
                     value.get("calendar_match_rejected")
                     or value.get("memory_error")
+                    or value.get("memory_held")
                     or value.get("expand_fallback")
                 )
                 and (

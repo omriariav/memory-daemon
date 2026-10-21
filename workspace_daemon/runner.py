@@ -1822,7 +1822,8 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             if marker > latest_by_source.get(source_id, (("", ""), None))[0]:
                 latest_by_source[source_id] = (marker, entry)
         for source_id, (_, entry) in latest_by_source.items():
-            if "memory_error" not in entry:
+            # A guard-held capture heals the same way as a failed one.
+            if "memory_error" not in entry and not entry.get("memory_held"):
                 continue
             replay = requested.setdefault(source_id, {})
             replay["memory_error"] = True
