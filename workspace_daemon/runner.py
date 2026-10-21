@@ -1482,7 +1482,10 @@ def _source_scopes(source):
         }
         return values or {(kind, "*")}
     if kind == "slack_mcp":
-        if source.get("include_mentions") or source.get("people"):
+        if (
+            source.get("include_mentions") or source.get("people")
+            or source.get("save_reactions")
+        ):
             return {(kind, "*")}
         return {(kind, c) for c in source.get("channels", [])
                 if isinstance(c, str)} or {(kind, "*")}
@@ -2518,6 +2521,9 @@ def _trivial_verdict(routine, item):
         return None
     if memory_sink.is_operator_confirmed(routine, item):
         return None
+    if (item.get("frontmatter") or {}).get("slack_saved") is True:
+        # The owner reacted to save this thread: never small talk.
+        return None
     max_chars = cfg.get("trivial_max_chars")
     if type(max_chars) is not int or max_chars < 1:
         max_chars = triviality.DEFAULT_MAX_CHARS
@@ -2761,6 +2767,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     operator_confirmed = memory_sink.is_operator_confirmed(routine, item)
     if operator_confirmed:
         record["memory_operator_confirmed"] = True
+    if meta.get("slack_saved") is True:
+        record["memory_saved_by_reaction"] = True
     if (
         meta.get("gmail_chat_followup_managed") is True
         and meta.get("gmail_chat_followup_active") is True

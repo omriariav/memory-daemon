@@ -15,6 +15,9 @@
 #   all_dms: true   # one extra search for every DM and group DM of the owner
 # (1:1 DMs carry direct-message owner evidence; group DMs carry none). It can
 # also set
+#   save_reactions: [save-for-later-example]   # emoji names, at most 3, no colons
+# so reacting to any message with one of them captures its thread (one extra
+# search per emoji; the look-back and tag are set below). It can also set
 #   discover_from: ~/path/slack-discovered.yaml   # channels found by the
 #   ignore_channels: [C0EXAMPLE09]                # slack_discovery routine; never added
 # (see routines/_example-slack-discovery.yaml).
@@ -43,6 +46,11 @@ source:
   min_seconds_between_searches: 3
   max_queries_per_run: 20    # at most 60
   calls_per_session: 15      # searches per bridge session (max 20)
+  # Save by reaction (the emoji names come from the watch file's
+  # `save_reactions`): reacted messages are listed over a fixed look-back, not
+  # the cursor, because Slack filters by message date, not reaction date.
+  # save_reaction_lookback_days: 30   # 1 to 90
+  # save_reaction_tag: saved          # tag added to a saved thread's memory
   # Count-only cost estimate per thread until analyze history exists.
   estimate_analyze_usd: 0.12
   # Extra scalar arguments for every search, pinned in the bridge. The daemon

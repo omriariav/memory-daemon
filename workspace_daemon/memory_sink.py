@@ -49,6 +49,7 @@ AUTO_TAG = "auto-captured"
 # downgraded to a note for lack of ownership evidence. Briefing and triage
 # flows must treat entries carrying it as FYI, never as "waiting on me".
 NO_OWNER_ACTION_TAG = "no-owner-action"
+SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 MAX_SOURCE_PEOPLE = 20
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -804,6 +805,15 @@ def _operator_confirmed_summary(routine, item):
     return summary
 
 
+def _saved_fallback_summary(item):
+    """Plain summary of a saved thread when the forced summary cannot run."""
+    body = (item.get("body") or "").strip()
+    return (
+        "Saved by the memory owner with a reaction. Source thread text:\n\n"
+        + body[:2000]
+    )
+
+
 def capture(routine, item, summary, dry_run=False):
     """Distill `summary` into one memory entry and store it via the CLI.
 
@@ -836,6 +846,16 @@ def capture(routine, item, summary, dry_run=False):
     operator_confirmed = is_operator_confirmed_source_id(
         routine, canonical_source_id
     )
+    # The owner reacted to this Slack thread with a save emoji: an explicit
+    # request that must not be dropped as "not memory-worthy".
+    saved_request = meta.get("slack_saved") is True
+    save_tag = meta.get("slack_save_tag")
+    if not (isinstance(save_tag, str) and SAVE_TAG_RE.fullmatch(save_tag)):
+        save_tag = None
+    saved_signal = save_tag is not None and "saved" in [
+        v for v in (meta.get("slack_owner_evidence") or [])
+        if isinstance(v, str)
+    ]
 
     if dry_run:
         # Honor the daemon's dry-run contract: no LLM call, no store write. The
@@ -866,6 +886,23 @@ def capture(routine, item, summary, dry_run=False):
             "operator-confirmed, forcing durable summarization"
         )
         summary = _operator_confirmed_summary(routine, item)
+    if (
+        summary.strip() == "NOT MEMORY-WORTHY"
+        and saved_request
+        and not active_chat_followup
+    ):
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "saved by reaction, forcing durable summarization"
+        )
+        try:
+            summary = _operator_confirmed_summary(routine, item)
+        except claude_bridge.GUARD_STOPS:
+            raise
+        except Exception as exc:
+            log(f"routine={rid} memory WARN: forced summary failed ({exc}); "
+                "saving the bounded thread text")
+            summary = _saved_fallback_summary(item)
     if summary.strip() == "NOT MEMORY-WORTHY" and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
@@ -928,7 +965,7 @@ def capture(routine, item, summary, dry_run=False):
         except Exception as exc:
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
-            keep = operator_confirmed or active_chat_followup
+            keep = operator_confirmed or active_chat_followup or saved_request
             # Only a model that answered badly twice on a short chat item is
             # dropped; transport/timeout failures keep the old behaviour.
             if (
@@ -957,6 +994,16 @@ def capture(routine, item, summary, dry_run=False):
             "operator confirmation overrode extraction veto"
         )
         entry["worthy"] = True
+    if (
+        not entry.get("worthy", True)
+        and saved_request
+        and not active_chat_followup
+    ):
+        log(
+            f"routine={rid} memory source_id={source_id}: "
+            "saved by reaction overrode extraction veto"
+        )
+        entry["worthy"] = True
     if not entry.get("worthy", True) and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
@@ -967,8 +1014,10 @@ def capture(routine, item, summary, dry_run=False):
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")
     has_no_owner_marker = _has_no_owner_action_marker(summary)
+    # A save reaction is the owner affirming attention themselves.
     owner_attention_denied = has_no_owner_marker or (
         extraction_succeeded and entry.get("owner_attention") is not True
+        and not saved_signal
     )
     downgraded_no_owner = False
     if etype in {"todo", "pending-decision"} and owner_attention_denied:
@@ -1022,6 +1071,8 @@ def capture(routine, item, summary, dry_run=False):
     )
     tags = [t for t in entry.get("tags") or [] if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(t))]
     tags += list(cfg.get("tags") or [])
+    if save_tag:
+        tags.append(save_tag)
     if active_chat_followup:
         tags.append("gmail-followup")
     if operator_confirmed:

@@ -869,7 +869,8 @@ def _mentions_self(text, self_id):
     return f"<@{self_id}>" in text or f"<@{self_id}|" in text
 
 
-def _owner_evidence(source, channel, messages=(), texts=(), self_id=None):
+def _owner_evidence(source, channel, messages=(), texts=(), self_id=None,
+                    saved=False):
     """Deterministic reasons this item may assign an action to the owner.
 
     Topical relevance is deliberately not a reason: without one of these
@@ -882,9 +883,12 @@ def _owner_evidence(source, channel, messages=(), texts=(), self_id=None):
     private channels); an action there qualifies via mention or authorship.
 
     `self_id` lets a caller that already knows the owner's Slack id (from
-    config) skip the auth-test lookup.
+    config) skip the auth-test lookup. `saved` means the owner marked the
+    thread with a save reaction, an explicit personal signal.
     """
     reasons = []
+    if saved:
+        reasons.append("saved")
     if channel in ((source or {}).get("owner_action_channels") or []):
         reasons.append("channel-rule")
     if channel.startswith("D"):
@@ -1087,13 +1091,16 @@ def fetch(routine, candidate, source=None):
 
 
 def thread_item(candidate, messages, names, source=None, self_id=None,
-                source_people=()):
+                source_people=(), save_tag=None, saved=False):
     """Render one thread's messages as a fetched item.
 
     Shared by the CLI-backed `slack` source and connector-backed readers so a
     thread has one item shape whichever transport listed it. `messages` are
     ordered Slack-shaped dicts (ts, user, text); `names` maps user id to a
-    display name; `self_id` is the owner's Slack id when known.
+    display name; `self_id` is the owner's Slack id when known. `save_tag`
+    marks a thread the owner saved by reaction (tag + `saved` evidence);
+    `saved` is that request being served now, which bypasses the capture
+    filters.
     """
     anchor = candidate["raw"]["anchor"]
     channel = candidate["raw"]["channel"]
@@ -1123,6 +1130,11 @@ def thread_item(candidate, messages, names, source=None, self_id=None,
     date = _message_day(latest_ts)
 
     title = candidate["title"] or f"slack thread in {channel}"
+    extra = {}
+    if save_tag:
+        extra["slack_save_tag"] = save_tag
+        if saved:
+            extra["slack_saved"] = True
     return {
         "id": candidate["id"],
         "source_id": candidate["raw"]["source_id"],
@@ -1139,7 +1151,9 @@ def thread_item(candidate, messages, names, source=None, self_id=None,
             "first_message_at": slack_timestamp_iso(first_ts),
             "latest_message_at": slack_timestamp_iso(latest_ts),
             "slack_owner_evidence": _owner_evidence(
-                source, channel, messages, self_id=self_id
+                source, channel, messages, self_id=self_id,
+                saved=bool(save_tag),
             ),
+            **extra,
         },
     }

@@ -21,6 +21,18 @@ The watch file may also set `all_dms: true`: one more query (`dms`) searches
 `with:<@owner>` over `channel_types=im,mpim`, so every direct and group message
 involving the owner is listed without naming each conversation.
 
+The watch file may also list `save_reactions: [<emoji name>, ...]` (at most 3;
+no default, the names are deployment-specific). Reacting to any message with
+one of them marks its thread for capture: one query per emoji searches
+`hasmy::<name>:`. Slack's `after:` filter applies to the message date, not the
+reaction date, so these queries ignore the cursors and list a fixed look-back
+(`save_reaction_lookback_days`, default 30) every run; the processed ledger
+(key `saved:<slack:<ch>:<root>>`, recorded only after the memory write) is what
+dedupes them. A saved thread skips the settle delay and the triviality and
+not-worthy filters, carries the `saved` owner-evidence reason and the
+`save_reaction_tag` tag (default `saved`), and is read and captured like any
+other thread, so its memory is updated in place by source id.
+
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
 else (planning, parsing, grouping, bounding, versioning) is deterministic
@@ -79,13 +91,17 @@ DEFAULTS = {
     "max_queries_per_run": 20,
     "calls_per_session": 15,
     "estimate_analyze_usd": 0.12,
+    "save_reaction_lookback_days": 30,
+    "save_reaction_tag": "saved",
 }
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
-    "all_dms",
+    "all_dms", "save_reactions",
 }
 CURSOR_SCHEMA = 1
+# Query keys and ledger keys of the reaction-saved path.
+SAVED_PREFIX = "saved:"
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
 THREADS_PER_SESSION = 8
@@ -156,6 +172,7 @@ def settings(source):
         cfg[key] = list(source.get(key) or [])
     cfg["include_mentions"] = source.get("include_mentions") is True
     cfg["all_dms"] = source.get("all_dms") is True
+    cfg["save_reactions"] = list(source.get("save_reactions") or [])
     cfg["search_args"] = dict(source.get("search_args") or {})
     return cfg
 
@@ -222,10 +239,22 @@ def note_failure(candidate):
     keys = raw.get("keys")
     if runtime is None or not keys:
         return False
-    try:
-        stamp = float(candidate["id"].rsplit("@", 1)[1])
-    except (IndexError, ValueError):
-        return False
+    if candidate["id"].startswith(SAVED_PREFIX):
+        # A saved thread has no cursor of its own (its queries ignore them) and
+        # is retried by the next run's look-back; hold only the ordinary
+        # queries that also listed it, at the newest ordinary hit.
+        keys = [k for k in keys if not k.startswith(SAVED_PREFIX)]
+        if not keys:
+            return True
+        try:
+            stamp = float(raw["hold_ts"])
+        except (KeyError, TypeError, ValueError):
+            return False
+    else:
+        try:
+            stamp = float(candidate["id"].rsplit("@", 1)[1])
+        except (IndexError, ValueError):
+            return False
     floor = runtime.setdefault("failed_floor", {})
     for key in keys:
         floor[key] = min(floor.get(key, stamp), stamp)
@@ -739,6 +768,11 @@ def search_queries(cfg, since=None):
             "keywords": None, "filters": f"with:<@{cfg['self_user_id']}>",
             "channel_types": DM_CHANNEL_TYPES,
         })
+    for name in cfg["save_reactions"]:
+        queries.append({
+            "key": f"{SAVED_PREFIX}{name}", "kind": "saved", "allowed": None,
+            "user": None, "keywords": None, "filters": f"hasmy::{name}:",
+        })
     for query in queries:
         query.setdefault("keys", [query["key"]])
     return queries
@@ -864,13 +898,24 @@ def _group(cfg, found):
     watched = set(cfg["channels"])
     groups = {}
     for query, hit in found:
-        if hit["is_bot"] and not cfg["include_bots"]:
+        saved = query["kind"] == "saved"
+        # The owner explicitly reacted, so a bot's message is kept too (its
+        # replies in the thread are still filtered by include_bots).
+        if hit["is_bot"] and not cfg["include_bots"] and not saved:
             continue
         key = (hit["channel"], hit["root"])
         group = groups.setdefault(
             key, {"ts": hit["ts"], "mention": False, "replies": 0,
-                  "keys": set(), "hit_ts": set(), "root_seen": False}
+                  "keys": set(), "hit_ts": set(), "root_seen": False,
+                  "saved": False, "normal_ts": None}
         )
+        if saved:
+            group["saved"] = True
+        elif (
+            group["normal_ts"] is None
+            or float(hit["ts"]) > float(group["normal_ts"])
+        ):
+            group["normal_ts"] = hit["ts"]
         if hit["ts"] == hit["root"]:
             group["root_seen"] = True
         group["keys"].add(
@@ -895,8 +940,15 @@ def _already_done(processed, candidate_id):
     )
 
 
+def _saved_done(processed, key):
+    """A saved thread is done once its memory write succeeded; a capture held
+    by a budget stop (`memory_held`) is listed again by the look-back."""
+    entry = processed.get(key) if processed is not None else None
+    return _already_done(processed, key) and not entry.get("memory_held")
+
+
 def _candidate(candidate_id, anchor_id, channel, root, group, batch,
-               deferred=False):
+               deferred=False, saved=False, save_tag=None):
     raw = {
         "channel": channel,
         "anchor": root,
@@ -911,6 +963,12 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
     }
     if deferred:
         raw["_deferred"] = True
+    if save_tag:
+        # Evidence and tag; `saved` additionally bypasses the filters.
+        raw["save_tag"] = save_tag
+    if saved:
+        raw["saved"] = True
+        raw["hold_ts"] = group["normal_ts"] or group["ts"]
     return {
         "id": candidate_id,
         # Never message text: the runner logs titles.
@@ -934,40 +992,79 @@ def candidates(source):
             f"{len(queries)} planned searches exceed max_queries_per_run"
         )
     fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
+    saved_after = int(now) - cfg["save_reaction_lookback_days"] * 86400
+    # Saved queries ignore the cursors: Slack's `after:` is the message date,
+    # and the owner reacts to old messages.
     afters = [
-        min(
+        saved_after if query["kind"] == "saved" else min(
             int(slack_source._rfc3339_epoch(since_map[key]))
             if since_map.get(key) else fresh
             for key in query["keys"]
         )
         for query in queries
     ]
+    n_saved_queries = sum(1 for q in queries if q["kind"] == "saved")
     if source.get("_dry_run") and not source.get("_count_only"):
         log(
             f"slack_mcp dry-run: would run {len(queries)} search "
-            f"quer{'y' if len(queries) == 1 else 'ies'}; no bridge call made"
+            f"quer{'y' if len(queries) == 1 else 'ies'} "
+            f"({n_saved_queries} for saved-reaction emoji); "
+            "no bridge call made"
         )
         return Listing()
     found, capped, failed = _search_all(cfg, queries, afters, now)
     if failed and failed >= {k for q in queries for k in q["keys"]}:
         raise SlackMcpError("every search query failed")
+    for key in sorted(capped):
+        if key.startswith(SAVED_PREFIX):
+            log("slack_mcp: a saved-reaction search hit max_search_pages; "
+                "newer reacted messages may wait (shorten "
+                "save_reaction_lookback_days or raise max_search_pages)")
     groups = _group(cfg, found)
     processed = source.get("_processed")
     settle_before = now - cfg["settle_minutes"] * 60
     ready, waiting = [], []
+    saved_rows = []
     current = {}
     for (channel, root), group in groups.items():
         anchor_id = f"slack:{channel}:{root}"
-        candidate_id = f"{anchor_id}@{group['ts']}"
+        saved_key = f"{SAVED_PREFIX}{anchor_id}"
+        # A thread saved earlier keeps its tag and evidence when replies
+        # later update its memory through the ordinary path.
+        saved_before = bool(cfg["save_reactions"]) and _saved_done(
+            processed, saved_key
+        )
+        if group["saved"] and not saved_before:
+            # One candidate per thread: it covers any ordinary hits too (the
+            # whole thread is read), and bypasses the settle delay.
+            current[saved_key] = saved_key
+            saved_rows.append((
+                float(group["ts"]), saved_key, anchor_id, channel, root, group,
+            ))
+            continue
+        if not group["normal_ts"]:
+            # Only a reaction listed it and that was already captured: replies
+            # reach it through the ordinary queries.
+            continue
+        candidate_id = f"{anchor_id}@{group['normal_ts']}"
         current[anchor_id] = candidate_id
         if _already_done(processed, candidate_id):
             continue
-        row = (float(group["ts"]), candidate_id, anchor_id, channel, root,
-               group)
-        (waiting if float(group["ts"]) > settle_before else ready).append(row)
+        row = (float(group["normal_ts"]), candidate_id, anchor_id, channel,
+               root, group)
+        (waiting if float(group["normal_ts"]) > settle_before
+         else ready).append(row)
+    saved_rows.sort(key=lambda row: (row[0], row[1]))
     ready.sort(key=lambda row: (row[0], row[1]))
-    over = ready[cfg["max_threads_per_run"]:]
-    ready = ready[:cfg["max_threads_per_run"]]
+    budget = cfg["max_threads_per_run"]
+    saved_take = saved_rows[:budget]
+    if len(saved_rows) > len(saved_take):
+        # No deferred claim and no watermark: the look-back lists them again.
+        log(f"slack_mcp: {len(saved_rows) - len(saved_take)} saved thread(s) "
+            "over the per-run cap wait for the next run")
+    room = max(0, budget - len(saved_take))
+    over = ready[room:]
+    ready = ready[:room]
     batch = {
         "cfg": cfg, "order": [], "threads": {}, "error": None,
         "processed": processed,
@@ -975,15 +1072,23 @@ def candidates(source):
     }
     out = Listing()
     out.partial = bool(failed)
+    for _ts, candidate_id, anchor_id, channel, root, group in saved_take:
+        batch["order"].append((channel, root))
+        out.append(_candidate(
+            candidate_id, anchor_id, channel, root, group, batch,
+            saved=True, save_tag=cfg["save_reaction_tag"],
+        ))
     for _ts, candidate_id, anchor_id, channel, root, group in ready:
         batch["order"].append((channel, root))
         out.append(_candidate(
-            candidate_id, anchor_id, channel, root, group, batch
+            candidate_id, anchor_id, channel, root, group, batch,
+            save_tag=_inherited_tag(cfg, processed, anchor_id),
         ))
     for _ts, candidate_id, anchor_id, channel, root, group in waiting + over:
         out.append(_candidate(
             candidate_id, anchor_id, channel, root, group, batch,
             deferred=True,
+            save_tag=_inherited_tag(cfg, processed, anchor_id),
         ))
     # Watermarks: nothing at or after the oldest deferred thread, or past a
     # capped search's fully read prefix, may be committed.
@@ -993,6 +1098,8 @@ def candidates(source):
     marks = {}
     overlap = _seconds(cfg["overlap"])
     for query in queries:
+        if query["kind"] == "saved":
+            continue
         for key in query["keys"]:
             values = [deferred_floor] if deferred_floor is not None else []
             if key in capped:
@@ -1012,10 +1119,20 @@ def candidates(source):
         _prune_attempts(current)
     log(
         f"slack_mcp: {len(found)} hit(s) in {len(groups)} thread(s); "
-        f"{len(ready)} to process, {len(waiting)} settling, {len(over)} over "
-        f"the per-run cap, {len(capped)} capped search(es)"
+        f"{len(saved_take) + len(ready)} to process "
+        f"({len(saved_take)} saved by reaction), {len(waiting)} settling, "
+        f"{len(over)} over the per-run cap, {len(capped)} capped search(es)"
     )
     return out
+
+
+def _inherited_tag(cfg, processed, anchor_id):
+    """The save tag for an ordinary candidate of an already-saved thread."""
+    if cfg["save_reactions"] and _saved_done(
+        processed, f"{SAVED_PREFIX}{anchor_id}"
+    ):
+        return cfg["save_reaction_tag"]
+    return None
 
 
 # --- fetch -------------------------------------------------------------------
@@ -1223,6 +1340,7 @@ def fetch(routine, candidate, source=None):
     return slack_source.thread_item(
         titled, slack_messages, names, source,
         self_id=cfg["self_user_id"] or "", source_people=[],
+        save_tag=raw.get("save_tag"), saved=raw.get("saved") is True,
     )
 
 
