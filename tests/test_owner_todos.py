@@ -273,13 +273,12 @@ class CaptureTest(unittest.TestCase):
             act("Send the revised plan"),
             act("Invented commitment", ts="00:59:59"),
             act("Book the review room", ts="00:15:10"),   # Bob's line
-            act("Call the clinic back", ts="00:16:00"),   # generic speaker
+            act("Call the clinic back", ts="00:16:00"),   # unnamed, owner mapped
         ]))
         titles = {r["flags"]["--title"] for r in self.store.todos().values()}
-        self.assertEqual(titles, {"Send the revised plan",
-                                  "Call the clinic back"})
-        self.assertEqual(out["memory_owner_todos"], 2)
-        self.assertIn("2 ungrounded", self.logged)
+        self.assertEqual(titles, {"Send the revised plan"})
+        self.assertEqual(out["memory_owner_todos"], 1)
+        self.assertIn("3 ungrounded", self.logged)
 
     def test_timestamp_formats_are_matched(self):
         for ts in ("00:12:03", "12:03", "[00:12:03]", "00:12:03,000"):
@@ -288,6 +287,35 @@ class CaptureTest(unittest.TestCase):
                     TRANSCRIPT, ts, [NAME]))
         self.assertFalse(owner_todos.grounded_in_transcript(
             TRANSCRIPT, "garbage", [NAME]))
+
+    def test_owner_mapped_requires_owner_line(self):
+        body = (f"[00:00:05] {NAME}: I will send it.\n"
+                "[00:00:09] SPEAKER_01: Please also fix the build.")
+        self.assertTrue(owner_todos.grounded_in_transcript(
+            body, "00:00:05", [NAME]))
+        self.assertFalse(owner_todos.grounded_in_transcript(
+            body, "00:00:09", [NAME]))
+
+    def test_owner_mapped_in_recording_metadata_rejects_raw_keys(self):
+        body = ("[00:00:05] SPEAKER_00: I will send it.\n"
+                "[00:00:09] SPEAKER_01: Please also fix the build.")
+        self.assertTrue(owner_todos.grounded_in_transcript(
+            body, "00:00:09", [NAME]))   # owner unmapped: unnamed passes
+        self.assertFalse(owner_todos.grounded_in_transcript(
+            body, "00:00:09", [NAME], mapped_names=[NAME]))
+        self.assertFalse(owner_todos.grounded_in_transcript(
+            body, "00:00:05", [NAME], mapped_names=[NAME]))
+
+    def test_owner_unmapped_fallback(self):
+        body = ("[00:00:05] Bob Stone: I will send it.\n"
+                "[00:00:09] SPEAKER_01: Sure.\n"
+                "[00:00:11] No label here")
+        self.assertFalse(owner_todos.grounded_in_transcript(
+            body, "00:00:05", [NAME]))
+        self.assertTrue(owner_todos.grounded_in_transcript(
+            body, "00:00:09", [NAME]))
+        self.assertTrue(owner_todos.grounded_in_transcript(
+            body, "00:00:11", [NAME]))
 
     def test_alias_name_matches_speaker(self):
         body = "[00:01:00] M. Example: I will send the plan."

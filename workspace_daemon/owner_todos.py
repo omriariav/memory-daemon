@@ -259,21 +259,35 @@ def _name_match(label, names):
     )
 
 
-def grounded_in_transcript(body, evidence_ts, names):
+def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
     """True when `evidence_ts` heads a transcript line (rendered as
-    `[ts] Speaker: text`) and that line's speaker, if it is a real name, is
-    the owner. Missing or generic speaker labels cannot be checked and pass."""
+    `[ts] Speaker: text`) spoken by the owner.
+
+    When the owner is mapped to a speaker in this recording (a line in the body
+    carries an owner name, or `mapped_names` lists one) only the owner's own
+    lines ground an action: lines from any other key, named or raw
+    `SPEAKER_NN`, fail. When the owner is not mapped at all, a named
+    non-owner fails and an unnamed or missing label passes."""
     want = _norm_ts(evidence_ts or "")
     if want is None:
         return False
+    rows = []
     for line in str(body or "").splitlines():
         m = _LINE_RE.match(line.strip())
-        if not m or _norm_ts(m.group("ts")) != want:
+        if not m:
             continue
         who = _SPEAKER_RE.match(m.group("rest"))
-        if not who or _GENERIC_SPEAKER_RE.match(who.group("who").strip()):
+        rows.append((_norm_ts(m.group("ts")),
+                     who.group("who").strip() if who else None))
+    owner_mapped = any(_name_match(n, names) for n in mapped_names) or any(
+        label and _name_match(label, names) for _, label in rows
+    )
+    for ts, label in rows:
+        if ts != want:
+            continue
+        if label and _name_match(label, names):
             return True
-        if _name_match(who.group("who"), names):
+        if not owner_mapped and (not label or _GENERIC_SPEAKER_RE.match(label)):
             return True
     return False
 

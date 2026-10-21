@@ -1310,8 +1310,12 @@ memory:
   for the meeting are offered so a repeat run reuses them verbatim.
 - Deterministic grounding (live capture): `evidence_ts` is required and must
   head a `[hh:mm:ss] Speaker: text` line of the transcript; when that line has
-  a real speaker name it must match an owner name (generic `Speaker N` labels
-  cannot be checked). Other actions are dropped; logs carry counts only.
+  a real speaker name it must match an owner name. When the owner is mapped to a
+  speaker in the recording (Mila `speakerNames`, or an owner-named line), only
+  the owner's own lines ground an action: any other key, named or a raw
+  `SPEAKER_NN`, fails. If the owner is not mapped at all, a named non-owner
+  fails and an unnamed label passes. Other actions are dropped; logs carry
+  counts only.
 - Each action becomes its own `todo`: title = the action text, people = the
   owner slug, tags = `tag` + the routine's tags minus source-type noise,
   body = one line naming the meeting entry id, timestamp and

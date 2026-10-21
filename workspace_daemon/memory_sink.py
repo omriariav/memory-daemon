@@ -1319,7 +1319,8 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
         return {}
     grounded = [
         a for a in actions if owner_todos.grounded_in_transcript(
-            item.get("body", ""), a.get("evidence_ts"), names)
+            item.get("body", ""), a.get("evidence_ts"), names,
+            (item.get("frontmatter") or {}).get("mila_speaker_names") or ())
     ]
     ungrounded = len(actions) - len(grounded)
     if dropped or ungrounded:

@@ -1112,6 +1112,10 @@ def fetch(_routine, source, candidate):
             "mila_duration_seconds": float(record.get("duration") or 0),
             "mila_content_hash": raw["content_hash"],
             "mila_app_hints": bool(hints),
+            "mila_speaker_names": sorted({
+                str(v) for v in (record.get("speakerNames") or {}).values()
+                if isinstance(v, str) and v.strip()
+            }),
             "calendar_candidate_count": len(events),
         },
     }
