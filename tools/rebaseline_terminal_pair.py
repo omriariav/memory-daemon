@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--key", required=True, help="<tasklist_id>:<task_id>")
     parser.add_argument("--checkpoint", default="state/google-tasks-sync.json")
-    parser.add_argument("--store", default="/Users/omri.a/Code/omri-mem")
+    parser.add_argument("--store", required=True, help="path to the memory store")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
