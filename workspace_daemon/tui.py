@@ -387,9 +387,14 @@ class Collector:
                 "flags": flags,
             })
 
+        problems.extend(status.skip_streak_problems(
+            self.base_dir, history, now))
         latest = history.get("latest")
         last_tick = (
-            f"{status._iso_age(latest['at'], now)} ({latest['state']})"
+            f"{status._iso_age(latest['at'], now)} ("
+            + (f"skipped: {latest['reason']}"
+               if latest.get("state") == "preflight_skipped"
+               else latest["state"]) + ")"
             if latest else "never recorded"
         )
         attention = (bool(problems) or bool(target["conflict"])

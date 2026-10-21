@@ -27,6 +27,8 @@ _SHARED_DEPENDENCY_ERRORS = (
     "network is unreachable", "connection refused", "connection reset",
     "connection timed out", "timed out", "too many requests", "rate limit",
     "quota exceeded", "unauthenticated", "invalid api key",
+    # claude_bridge.BridgeOutage: the call failed across a machine sleep.
+    "machine slept",
 )
 
 

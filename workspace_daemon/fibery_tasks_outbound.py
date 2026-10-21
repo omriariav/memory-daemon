@@ -17,7 +17,7 @@ import json
 import re
 from pathlib import Path
 
-from . import claude_bridge, personal, state
+from . import claude_bridge, personal, sleepclock, state
 from .fibery_tasks_inbound import (
     MEM_RE, OUTBOUND_CHECKPOINT, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document, pending_ids,
     valid_read_tool, _document_text, _text_of,
@@ -416,9 +416,27 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
     _save_checkpoint(checkpoint_path, checkpoint)
     log("fibery_tasks_outbound: writing "
         f"{len(ids)} item(s) mode={cfg['write_mode']}: " + ", ".join(ids))
-    write(cfg, base_dir, inserts)
-
-    after = markers_in(fetch(cfg, base_dir))
+    try:
+        write(cfg, base_dir, inserts)
+        after = markers_in(fetch(cfg, base_dir))
+    except claude_bridge.GUARD_STOPS:
+        raise
+    except Exception as exc:
+        if not sleepclock.looks_offline(exc):
+            raise
+        # The rows stay `attempted`: same fail-safe as a failed verification,
+        # but say plainly that nothing is known about the write.
+        log("fibery_tasks_outbound: write outcome unknown (machine "
+            "slept/offline); left attempted, not retried: "
+            + ", ".join(ids)
+            + f" ({type(exc).__name__}: "
+            + str(exc).replace(cfg["document_secret"], "<secret>")[:200]
+            + ")")
+        raise RuntimeError(
+            "Fibery export: write outcome unknown (machine slept/offline); "
+            f"{len(ids)} item(s) left unconfirmed and will not be retried "
+            "automatically"
+        ) from None
     missing = [i for i in ids if i not in after]
     if missing:
         log("fibery_tasks_outbound: VERIFY FAILED, markers missing for: "

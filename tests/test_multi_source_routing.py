@@ -9,6 +9,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import daemon as daemon_cli
+import preflight_off
 from workspace_daemon import (
     actions,
     config,
@@ -2533,6 +2534,7 @@ class RunCommandTest(unittest.TestCase):
 
 class TickCommandTest(unittest.TestCase):
     def setUp(self):
+        preflight_off.disable(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)

@@ -63,7 +63,7 @@ import re
 import time
 from pathlib import Path
 
-from . import claude_bridge, slack_mcp, slack_source, state
+from . import claude_bridge, slack_mcp, slack_source, sleepclock, state
 from .shell import log, utc_now_iso
 
 DEFAULTS = {
@@ -653,18 +653,26 @@ def _call_prompt(tool, calls, what):
 
 
 def _one_session(cfg, tool, pins, calls, what, required):
-    results = claude_bridge.call_tools(
-        _call_prompt(tool, calls, what),
-        {tool: pins},
-        model=cfg["model"],
-        base_dir=_base_dir,
-        max_turns=len(calls) + 4,
-        max_budget_usd=round(0.1 + 0.03 * len(calls), 2),
-        timeout=max(BRIDGE_TIMEOUT, 60 + 8 * len(calls)),
-        attempts=BRIDGE_ATTEMPTS,
-        required=required,
-        accept_partial=True,
-    )
+    span = sleepclock.Span()
+    try:
+        results = claude_bridge.call_tools(
+            _call_prompt(tool, calls, what),
+            {tool: pins},
+            model=cfg["model"],
+            base_dir=_base_dir,
+            max_turns=len(calls) + 4,
+            max_budget_usd=round(0.1 + 0.03 * len(calls), 2),
+            timeout=max(BRIDGE_TIMEOUT, 60 + 8 * len(calls)),
+            attempts=BRIDGE_ATTEMPTS,
+            required=required,
+            accept_partial=True,
+        )
+    except claude_bridge.BridgeError as exc:
+        if isinstance(exc, (claude_bridge.BridgeOutage,)
+                      + claude_bridge.GUARD_STOPS) or not span.slept():
+            raise
+        raise claude_bridge.BridgeOutage(
+            f"{exc} ({sleepclock.OUTAGE_NOTE})") from None
     texts = [None] * len(calls)
     for result in results:
         if result["name"] != tool:
@@ -675,6 +683,12 @@ def _one_session(cfg, tool, pins, calls, what, required):
                     texts[index] = result["text"]
                 break
         # A call matching no planned argument set is dropped, never used.
+    if span.slept() and any(text is None for text in texts):
+        # Results lost across a machine sleep say nothing about the threads:
+        # an outage, so no per-thread attempt or lone-failure counter moves.
+        raise claude_bridge.BridgeOutage(
+            f"{what} incomplete ({sleepclock.OUTAGE_NOTE})"
+        )
     return texts
 
 
