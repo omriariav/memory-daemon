@@ -302,7 +302,7 @@ _EMAIL_MASK = re.compile(r"\s*<\[?EMAIL:[^>]*>")
 _HIT_HEADER = re.compile(
     r"Channel: (?P<label>[^\n]*)\(ID: (?P<channel>[A-Z0-9]+)\)\n"
     r"(?:Participants: (?P<people>[^\n]*)\n)?"
-    r"From: (?P<author>[^\n]*?)\(ID: (?P<user>[A-Z0-9]+)(?:, external: [^)\n]*)?\)[ \t]*"
+    r"From: (?P<author>[^\n]*?)\(ID: (?P<user>[A-Z0-9]+)(?:, external: [^\n]*?)?\)[ \t]*"
     r"(?P<bot>\[BOT\])?[ \t]*\n"
     r"Time: [^\n]*\n"
     r"Message_ts: (?P<ts>\d+\.\d+)\n"
@@ -484,7 +484,7 @@ _THREAD_MARKER = re.compile(r"\n\n=== THREAD REPLIES \((\d+) total\) ===\n\n")
 # Slack Connect members carry an org suffix: "(U0…, external: <org>)".
 _THREAD_AUTHOR = re.compile(
     r"^From: (?P<name>.*?)[ \t]*(?:<\[?EMAIL:[^>\n]*>[ \t]*)?"
-    r"\((?P<id>[UWB][A-Z0-9]+)(?:, external: [^)\n]*)?\)[ \t]*(?P<bot>\[BOT\])?[ \t]*$"
+    r"\((?P<id>[UWB][A-Z0-9]+)(?:, external: [^\n]*?)?\)[ \t]*(?P<bot>\[BOT\])?[ \t]*$"
 )
 _THREAD_TS = re.compile(r"^Message TS: (\d+\.\d+)$")
 
