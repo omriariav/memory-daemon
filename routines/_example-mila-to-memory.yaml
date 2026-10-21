@@ -82,3 +82,10 @@ memory:
   store: /absolute/path/to/private-memory
   type: note
   tags: [meeting, transcription, mila]
+  # Optional: also file the owner's own action items as separate `todo`
+  # entries (ids `<source id>#action-<hash>`), so the Fibery export sees them.
+  owner_todos:
+    enabled: false
+    max_per_item: 5
+    tag: from-meeting
+    owner_slug: me-example

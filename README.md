@@ -1282,6 +1282,48 @@ source:
   `transcript only`); `--count-only` and every listing log
   `mila: app hints: N with hints, M transcript-only, K waiting for hints`.
 
+#### Owner action items as todos (`memory.owner_todos`)
+
+A meeting yields one `meeting` entry, so the owner's action items are only body
+text and never reach the Fibery export, which selects `todo` entries. Opt in on
+a capture routine (Mila, Whisper, transcripts, meeting notes):
+
+```yaml
+memory:
+  owner_todos:
+    enabled: true          # default false
+    max_per_item: 5        # 1-20
+    tag: from-meeting
+    owner_slug: me-example # optional; default is the verified owner slug
+```
+
+- The extraction prompt gains one key, `owner_actions: [{text, due?,
+  evidence_ts?}]`: only what the owner explicitly committed to, or was
+  explicitly asked to do and accepted, grounded in the transcript. Other
+  people's actions stay in the meeting body; app hints are candidates only.
+- Each action becomes its own `todo` entry: title = the action text, people =
+  the owner slug, tags = `tag` + the routine's tags minus source-type noise
+  (`meeting`, `transcription`, `mila`, ...), body = one line naming the meeting
+  entry id, the evidence timestamp and `meeting-owner-action` evidence.
+- Id scheme: `<meeting source id>#action-<k>`, `k` = short hash of the
+  normalized action text (case, punctuation, whitespace ignored), so
+  re-processing the meeting updates the same todos. An action a later run no
+  longer returns is never deleted. `from_sources: ["mila:"]` on the outbound
+  routine matches these ids.
+- Invalid `owner_actions` (any malformed element) files no todos; the meeting
+  entry is still saved. Logs carry counts only.
+- A personal-flagged meeting makes personal-tagged todos, so the export skips
+  them; redaction applies to titles.
+- Backfill an already-captured meeting from its stored body (no transcript or
+  source access needed):
+
+  ```bash
+  ./daemon.py backfill-owner-todos --routine meeting-transcriptions \
+      --entry <meeting-entry-id> [--dry-run]
+  ```
+
+  `--dry-run` calls the model and reports the count but writes nothing.
+
 ### Whisper pipeline transcriptions
 
 `source.kind: whisper` ingests finished transcripts from the local
