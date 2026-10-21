@@ -9,6 +9,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
+from . import slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
@@ -75,7 +76,7 @@ SOURCE_KEYS = {
     "owner_action_channels",
     "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
     "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
-    "session_gap_minutes",
+    "session_gap_minutes", "watch", "people", "ignore_people",
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
@@ -424,6 +425,7 @@ def discover(base_dir, routine_id=None):
             raise RoutineError(f"{path.name}: top level must be a mapping, got {type(data).__name__}")
         data["_source_file"] = str(path)
         data.setdefault("id", path.stem)
+        expand_watch_files(data)
         found.append(data)
 
     seen = {}
@@ -441,6 +443,35 @@ def discover(base_dir, routine_id=None):
         if not found:
             raise RoutineError(f"no routine with id '{routine_id}'")
     return found
+
+
+def expand_watch_files(routine, missing_ok=False):
+    """Apply each source's `watch:` file in place; idempotent.
+
+    A failure is kept on the source as `_watch_error` for validate() to report.
+    `missing_ok` (documentation examples) tolerates an absent file: the block
+    is marked `_watch_unread` and validated without its watched ids.
+    """
+    if isinstance(routine.get("sources"), list):
+        blocks = routine["sources"]
+        for index, block in enumerate(blocks):
+            if isinstance(block, dict):
+                blocks[index] = _expanded(block, missing_ok)
+    elif isinstance(routine.get("source"), dict):
+        routine["source"] = _expanded(routine["source"], missing_ok)
+    return routine
+
+
+def _expanded(source, missing_ok=False):
+    if "watch" not in source or source.get("_watch_done"):
+        return source
+    if missing_ok and not Path(str(source["watch"])).expanduser().exists():
+        return dict(source, _watch_unread=True)
+    merged, error = slack_watch.expand(source)
+    merged = dict(merged, _watch_done=True)
+    if error:
+        merged["_watch_error"] = error
+    return merged
 
 
 def budget_cap(routine):
@@ -1282,7 +1313,10 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    unknown_source = set(source) - SOURCE_KEYS
+    unknown_source = {
+        key for key in set(source) - SOURCE_KEYS
+        if not str(key).startswith("_watch")
+    }
     if unknown_source:
         problems.append(
             f"{prefix} has unknown key(s) {', '.join(sorted(unknown_source))}"
@@ -1295,6 +1329,19 @@ def _validate_source(routine, source, prefix):
         )
     if kind in ("gmail", "drive_docs") and not source.get("query"):
         problems.append(f"{prefix}.query is required")
+    if "watch" in source:
+        if kind not in {"slack", "slack_mcp"}:
+            problems.append(f"{prefix}.watch is supported only for slack sources")
+        if source.get("_watch_error"):
+            problems.append(f"{prefix}.watch: {source['_watch_error']}")
+    ignore_people = source.get("ignore_people")
+    if ignore_people is not None and not isinstance(ignore_people, bool):
+        problems.append(f"{prefix}.ignore_people must be true or false")
+    if kind == "slack" and source.get("people") and ignore_people is not True:
+        problems.append(
+            f"{prefix}.people is not read by source.kind 'slack'; set "
+            "ignore_people: true to share a watch file with a slack_mcp source"
+        )
     action_list = source_actions(routine, source)
     if "actions" in source and not isinstance(source.get("actions"), list):
         problems.append(f"{prefix}.actions must be a list")
@@ -1496,6 +1543,7 @@ def _validate_source(routine, source, prefix):
             not configured
             and not source.get("include_mentions")
             and not active_conversations
+            and not source.get("_watch_unread")
         ):
             problems.append(
                 f"{prefix}: source.kind 'slack' needs channels, ada_channels, "

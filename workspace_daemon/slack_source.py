@@ -869,7 +869,7 @@ def _mentions_self(text, self_id):
     return f"<@{self_id}>" in text or f"<@{self_id}|" in text
 
 
-def _owner_evidence(source, channel, messages=(), texts=()):
+def _owner_evidence(source, channel, messages=(), texts=(), self_id=None):
     """Deterministic reasons this item may assign an action to the owner.
 
     Topical relevance is deliberately not a reason: without one of these
@@ -880,13 +880,17 @@ def _owner_evidence(source, channel, messages=(), texts=()):
     in a pinged group is not a personal assignment. Group DMs carry no
     direct-message signal either (their G prefix is shared with legacy
     private channels); an action there qualifies via mention or authorship.
+
+    `self_id` lets a caller that already knows the owner's Slack id (from
+    config) skip the auth-test lookup.
     """
     reasons = []
     if channel in ((source or {}).get("owner_action_channels") or []):
         reasons.append("channel-rule")
     if channel.startswith("D"):
         reasons.append("direct-message")
-    self_id = _self_user_id()
+    if self_id is None:
+        self_id = _self_user_id()
     if self_id:
         if any(message.get("user") == self_id for message in messages):
             reasons.append("authored")
@@ -1076,7 +1080,28 @@ def fetch(routine, candidate, source=None):
     if not messages:
         raise RuntimeError("empty thread")
 
-    names, user_ids, source_people = _resolve_people(messages)
+    names, _, source_people = _resolve_people(messages)
+    return thread_item(
+        candidate, messages, names, source, source_people=source_people
+    )
+
+
+def thread_item(candidate, messages, names, source=None, self_id=None,
+                source_people=()):
+    """Render one thread's messages as a fetched item.
+
+    Shared by the CLI-backed `slack` source and connector-backed readers so a
+    thread has one item shape whichever transport listed it. `messages` are
+    ordered Slack-shaped dicts (ts, user, text); `names` maps user id to a
+    display name; `self_id` is the owner's Slack id when known.
+    """
+    anchor = candidate["raw"]["anchor"]
+    channel = candidate["raw"]["channel"]
+    user_ids = sorted({
+        message["user"]
+        for message in messages
+        if message.get("user", "").startswith("U")
+    })
     lines = [
         timestamped_line(
             slack_timestamp_iso(message.get("ts")),
@@ -1109,10 +1134,12 @@ def fetch(routine, candidate, source=None):
             "slack_thread_ts": anchor,
             "slack_capture_mode": "thread",
             "slack_participants": sorted(set(names.values())) or user_ids,
-            "source_people": source_people,
+            "source_people": list(source_people),
             "via_mention": bool(candidate["raw"].get("via_mention")),
             "first_message_at": slack_timestamp_iso(first_ts),
             "latest_message_at": slack_timestamp_iso(latest_ts),
-            "slack_owner_evidence": _owner_evidence(source, channel, messages),
+            "slack_owner_evidence": _owner_evidence(
+                source, channel, messages, self_id=self_id
+            ),
         },
     }

@@ -323,7 +323,7 @@ def _validate_routine_candidate(repo, rid, raw, target):
         )
     data["_source_file"] = str(target)
     config = _load_daemon_config(repo)
-    problems = config.validate(data)
+    problems = config.validate(config.expand_watch_files(data))
     if problems:
         raise AdminError("candidate routine is invalid:\n- " + "\n- ".join(problems))
 
