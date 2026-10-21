@@ -1287,6 +1287,41 @@ time, last error that names it, and last time it was part of a failed call
 (from the `mcp__<server>__` prefix of logged tool names); a malformed budget
 file or a failed usage-log write makes it report unhealthy.
 
+### Personal content
+
+Captures from any source (Gmail, Chat, Slack, Mila, calendar-derived items)
+pass through one shared path in the memory sink, which flags personal content
+and redacts government-ID-like numbers. Config lives in the `memory:` block:
+
+```yaml
+memory:
+  store: /absolute/path/to/personal-memory
+  personal_tag: personal      # default; null/false disables flagging
+  redact_ids: true            # default
+  # personal_keywords: [payroll, salary, ...]  # replaces the built-in list
+```
+
+- **Flagging.** The extraction pass asks for `personal: true|false` (plus an
+  optional `personal_reason` category: payroll, compensation, hr, health,
+  family, finance, legal, immigration, id_number, other). Python accepts only a
+  real boolean. A deterministic backstop forces the flag when the source text
+  or summary matches `personal_keywords` (a small English + Hebrew list by
+  default; set `[]` to turn it off) or contains an ID number. A malformed model
+  value is treated as personal only if that backstop fires. The flag becomes
+  the `personal_tag` on the entry. Only the reason category is ever logged.
+- **Redaction.** With `redact_ids`, ID-like numbers become `[ID]` before any
+  model call (`llm.analyze` for routines with a `memory:` block) and before the
+  entry is saved: Israeli ID numbers (valid check digit, or any number after an
+  ID label such as ID, identity, passport, SSN), card numbers passing Luhn
+  (13-19 digits), and IBANs passing mod-97. Dates, amounts, phone numbers,
+  Slack timestamps, and ticket ids are left alone. Logs carry counts, never
+  values. Vault notes written by routines are not redacted.
+
+Tagging only marks entries; it does not keep them out of shared graphs. Add an
+exclusion for the tag on the memory store side: in each distribution rule
+(tag/type to graph) exclude `personal`, and have promotion flows skip entries
+carrying it. That exclusion is not implemented in memory-daemon.
+
 ### Slack via a connector
 
 `kind: slack_mcp` reads Slack through a claude.ai Slack connector driven by the

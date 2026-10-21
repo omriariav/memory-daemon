@@ -1,7 +1,7 @@
 """LLM analysis over the `yoetz` CLI, plus label extraction/validation."""
 from .connector_prompts import resolve_instruction
-from . import claude_bridge
-from .shell import run_json, yoetz_bin
+from . import claude_bridge, personal
+from .shell import log, run_json, yoetz_bin
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
@@ -207,6 +207,13 @@ def build_prompt(routine, item, label_catalog):
 def analyze(routine, prompt):
     """Call the configured provider (yoetz, or headless Claude) and return the text."""
     cfg = routine["analyze"]
+    mem = personal.memory_cfg(routine)
+    if mem and personal.redact_enabled(mem):
+        # Every model call for a memory-capturing routine sees redacted text.
+        prompt, redacted = personal.redact(prompt)
+        if redacted:
+            log(f"routine={routine.get('id')} redacted {redacted} ID-like "
+                "value(s) before the model call")
     if cfg["provider"] == "claude":
         if _base_dir is None:
             raise RuntimeError("analyze.provider claude needs llm.configure(base_dir)")
