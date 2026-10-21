@@ -1,5 +1,6 @@
 """Inbound Fibery task document -> memory todo import."""
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -88,18 +89,43 @@ def simple_doc(*specs):
 
 
 class FakeMemory:
-    def __init__(self):
+    """Fake memory CLI that persists entries as files like the real store."""
+
+    def __init__(self, store):
+        self.store = Path(store)
+        self.entries = self.store / "memory" / "entries"
+        self.entries.mkdir(parents=True, exist_ok=True)
         self.calls = []
         self.count = 0
+        self.timeout_when = None  # predicate(args) -> write, then time out
+
+    @staticmethod
+    def _opt(args, flag):
+        return args[args.index(flag) + 1] if flag in args else None
 
     def __call__(self, store, args, timeout=180):
         self.calls.append(args)
         if "--update" in args:
-            entry = args[args.index("--update") + 1]
-            out = f"updated {entry}"
+            entry_id = self._opt(args, "--update")
+            out = f"updated {entry_id}"
         else:
             self.count += 1
-            out = f"created entry-{self.count}"
+            entry_id = f"entry-{self.count}"
+            out = f"created {entry_id}"
+        follows = self._opt(args, "--follows")
+        lines = [
+            "---", f"id: {entry_id}", "date: '2026-08-02'",
+            f"type: {self._opt(args, '--type')}",
+            f"title: {json.dumps(self._opt(args, '--title'))}",
+            "people: []", "teams: []", "tags: []",
+            "source_ids:", f"  - '{self._opt(args, '--source-ids')}'",
+        ]
+        if follows:
+            lines.extend(["follows:", f"  - {follows}"])
+        lines.extend(["---", "", self._opt(args, "--body"), ""])
+        (self.entries / f"{entry_id}.md").write_text("\n".join(lines))
+        if self.timeout_when and self.timeout_when(args):
+            raise subprocess.TimeoutExpired(args, 1)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     def of(self, kind):
@@ -117,7 +143,7 @@ class RunBase(unittest.TestCase):
             "store": str(self.dir / "store"), "owner_slug": "example-owner",
             "tags": ["fibery"],
         }
-        self.memory = FakeMemory()
+        self.memory = FakeMemory(self.dir / "store")
         self.calls = []
         self.text = simple_doc()
         for patcher in (
@@ -420,6 +446,91 @@ class SafetyTest(RunBase):
         with self.assertRaises(RuntimeError):
             self.run_once()
         self.assertEqual(self.calls, [])
+
+
+class DuplicateSafetyTest(RunBase):
+    def entry_count(self):
+        return len(list(self.memory.entries.glob("*.md")))
+
+    def test_timeout_after_create_does_not_duplicate_todo(self):
+        self.memory.timeout_when = lambda a: True
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.assertEqual(self.entry_count(), 1)
+        self.assertEqual(self.items()[bid(1)]["entry_id"], "entry-1")
+        self.memory.timeout_when = None
+        self.run_once()
+        self.assertEqual(self.entry_count(), 1)
+
+    def test_killed_before_checkpoint_adopts_existing_todo(self):
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.checkpoint.unlink()
+        report = self.run_once()
+        self.assertEqual(self.entry_count(), 1)
+        self.assertEqual(len(self.memory.calls), 1)
+        self.assertEqual(self.items()[bid(1)]["entry_id"], "entry-1")
+        self.assertEqual(report["created"], 1)
+
+    def test_timeout_after_done_note_does_not_duplicate(self):
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.memory.timeout_when = lambda a: "--follows" in a
+        self.run_once(simple_doc((1, "DONE", "A", "S")))
+        self.assertEqual(self.entry_count(), 2)
+        self.memory.timeout_when = None
+        self.run_once()
+        self.assertEqual(self.entry_count(), 2)
+
+    def test_unrecorded_done_note_is_adopted_on_rerun(self):
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.run_once(simple_doc((1, "DONE", "A", "S")))
+        rows = json.loads(self.checkpoint.read_text())
+        rows["items"][bid(1)].update(state="TODO", transitions=0)
+        self.checkpoint.write_text(json.dumps(rows))
+        self.run_once()
+        self.assertEqual(self.entry_count(), 2)
+
+    def test_timeout_after_reopened_note_does_not_duplicate(self):
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.run_once(simple_doc((1, "DONE", "A", "S")))
+        self.memory.timeout_when = lambda a: "--follows" in a
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.assertEqual(self.entry_count(), 3)
+        self.memory.timeout_when = None
+        self.run_once()
+        self.assertEqual(self.entry_count(), 3)
+
+    def test_reopen_note_persisted_before_failed_update(self):
+        self.run_once(simple_doc((1, "TODO", "A", "S")))
+        self.run_once(simple_doc((1, "DONE", "A", "S")))
+
+        def fail_update(store, args, timeout=180):
+            if "--update" in args:
+                return SimpleNamespace(returncode=1, stdout="", stderr="bad")
+            return self.memory(store, args)
+
+        with mock.patch.object(fti, "_memory_cli", fail_update):
+            with self.assertRaises(RuntimeError):
+                self.run_once(simple_doc((1, "TODO", "A edited", "S")))
+        self.assertEqual(self.entry_count(), 3)
+        self.assertEqual(self.items()[bid(1)]["state"], "TODO")
+        report = self.run_once()
+        self.assertEqual(self.entry_count(), 3)
+        self.assertEqual(report["edited"], 1)
+
+    def test_import_done_failed_note_retries_via_done_path(self):
+        def fail_note(store, args, timeout=180):
+            if "--follows" in args:
+                return SimpleNamespace(returncode=1, stdout="", stderr="bad")
+            return self.memory(store, args)
+
+        text = simple_doc((1, "DONE", "Old", "S"))
+        with mock.patch.object(fti, "_memory_cli", fail_note):
+            with self.assertRaises(RuntimeError):
+                self.run_once(text, import_done=True)
+        self.assertEqual(self.items()[bid(1)]["state"], "TODO")
+        report = self.run_once(import_done=True)
+        self.assertEqual(report["done"], 1)
+        self.assertEqual(self.items()[bid(1)]["state"], "DONE")
+        self.assertEqual(self.entry_count(), 2)
 
 
 class WiringTest(unittest.TestCase):

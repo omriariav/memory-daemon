@@ -12,10 +12,13 @@ import datetime
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 
 from . import claude_bridge, state
-from .google_tasks_sync import _memory_cli, _memory_result_id
+from .google_tasks_sync import (
+    _load_memory_entries, _memory_cli, _memory_result_id,
+)
 from .memory_sink import _commit_store
 from .shell import log
 
@@ -378,8 +381,33 @@ def _people(cfg):
     return ["--people", owner] if owner else []
 
 
+def _existing_entry(store, source_id):
+    """Id of the entry already carrying this exact source id, else None."""
+    matches = [
+        entry["id"] for entry in _load_memory_entries(store).values()
+        if source_id in entry["source_ids"]
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"{len(matches)} memory entries share source id {source_id!r}"
+        )
+    return matches[0] if matches else None
+
+
+def _cli(store, args, source_id, expected):
+    """Run the memory CLI; an unconfirmed write is verified on disk."""
+    try:
+        result = _memory_cli(store, args)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        result = subprocess.CompletedProcess(args, 1, "", str(exc))
+    return _memory_result_id(result, store, source_id, expected)
+
+
 def _create_todo(cfg, store, task, date):
     source_id = SOURCE_PREFIX + task["block_id"]
+    adopted = _existing_entry(store, source_id)
+    if adopted:
+        return adopted
     title, body = _title(task["text"]), _body(task)
     args = ["add", "--title", title, "--type", "todo", "--date", date,
             "--source-ids", source_id, "--body", body, *_people(cfg),
@@ -387,8 +415,7 @@ def _create_todo(cfg, store, task, date):
     tags = _tags(cfg, task)
     if tags:
         args.extend(["--tags", tags])
-    result = _memory_cli(store, args)
-    return _memory_result_id(result, store, source_id, {
+    return _cli(store, args, source_id, {
         "title": title, "type": "todo", "body": body,
         "source_ids": [source_id],
     })
@@ -403,8 +430,7 @@ def _update_todo(cfg, store, task, entry_id, date):
     tags = _tags(cfg, task)
     if tags:
         args.extend(["--tags", tags])
-    result = _memory_cli(store, args)
-    return _memory_result_id(result, store, source_id, {
+    return _cli(store, args, source_id, {
         "id": entry_id, "title": title, "type": "todo", "body": body,
         "source_ids": [source_id],
     })
@@ -412,6 +438,9 @@ def _update_todo(cfg, store, task, entry_id, date):
 
 def _transition_note(cfg, store, task, entry_id, label, number, date):
     source_id = f"{SOURCE_PREFIX}{task['block_id']}:{label}-{number}"
+    adopted = _existing_entry(store, source_id)
+    if adopted:
+        return adopted
     title = f"{label}: {_title(task['text'])}"
     body = f"Fibery marked this task {label}."
     args = ["add", "--title", title, "--type", "note", "--date", date,
@@ -420,8 +449,7 @@ def _transition_note(cfg, store, task, entry_id, label, number, date):
     tags = ",".join(dict.fromkeys([*(cfg.get("tags") or []),
                                    f"task-{label}"]))
     args.extend(["--tags", tags])
-    result = _memory_cli(store, args)
-    return _memory_result_id(result, store, source_id, {
+    return _cli(store, args, source_id, {
         "title": title, "type": "note", "body": body,
         "source_ids": [source_id], "follows": [entry_id],
     })
@@ -537,14 +565,17 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
             report["pending"] += 1
             continue
         entry_id = _write(_create_todo, cfg, store, task, date)
-        put(task, entry_id)
-        if task["state"] == "DONE":
-            _write(_transition_note, cfg, store, task, entry_id,
-                   "done", 1, date)
-            items[task["block_id"]]["transitions"] = 1
+        # Checkpoint as TODO until the done note lands, so a failed note is
+        # retried through the normal TODO -> DONE path.
+        put(dict(task, state="TODO"), entry_id)
         created += 1
         report["created"] += 1
         save()
+        if task["state"] == "DONE":
+            _write(_transition_note, cfg, store, task, entry_id,
+                   "done", 1, date)
+            put(task, entry_id, transitions=1)
+            save()
         log(f"fibery_tasks_inbound: created todo block={task['block_id']}")
     for task in plan["edited"]:
         row = items[task["block_id"]]
@@ -578,6 +609,11 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         else:
             _write(_transition_note, cfg, store, task, entry_id,
                    "reopened", number, date)
+            # Persist the note before the update so a later failure does not
+            # rewrite it; stale hashes keep the edit pending.
+            row.update({"state": "TODO", "transitions": number})
+            row.pop("gone", None)
+            save()
             if row["content"] != _task_hashes(task)[1]:
                 _write(_update_todo, cfg, store, task, entry_id, row["date"])
         put(task, entry_id, transitions=number)
