@@ -1,0 +1,61 @@
+# Example: sweep Slack channels, people and @mentions into a personal-memory
+# store through a claude.ai Slack connector (no Slack token on this machine).
+#
+# Headless Claude only transports: through the least-privilege bridge it calls
+# two read-only connector tools (one search, one thread read) and hands back
+# their raw text; Python parses, groups, bounds and versions everything. See
+# "Slack via a connector" in the README. Thread ids match the `slack` source
+# (slack:<channel>:<root>), so changing `kind:` later keeps the same memories.
+#
+# Requires the Claude Code CLI logged in to an account with the Slack connector
+# authorized, and a personal-memory instance for the `memory:` block.
+#
+# The watched ids live in a private file outside the repository (its shape is
+# in the README), not in this routine.
+id: example-slack-mcp-to-memory
+enabled: false
+description: Distill watched Slack threads and mentions into memory entries.
+
+source:
+  kind: slack_mcp
+  watch: ~/path/slack-watch.yaml
+  # Exact MCP tool names as your connector exposes them (`claude mcp list`).
+  # Validation accepts only read-only Slack search/read tools.
+  search_tool: mcp__claude_ai_Example_Slack__slack_search_public_and_private
+  read_thread_tool: mcp__claude_ai_Example_Slack__slack_read_thread
+  self_user_id: U0EXAMPLEA   # your Slack user id (owner-evidence and mentions)
+  model: haiku               # bridge model; it only transports tool results
+  max_threads_per_run: 15    # extra threads wait for the next run
+  max_thread_replies: 50     # newest replies read per thread
+  max_thread_chars: 8000     # newest kept first; omissions are marked
+  max_search_pages: 5        # 20 hits per page, oldest first
+  overlap: 1h                # re-list this much before each cursor
+  settle_minutes: 15         # a thread waits until its newest message is this old
+  include_bots: false
+  # Pacing and budget: seconds between search sessions, and the most searches
+  # one run may plan (channel chunks + people + mentions).
+  min_seconds_between_searches: 3
+  max_queries_per_run: 20
+  # Count-only cost estimate per thread until analyze history exists.
+  estimate_analyze_usd: 0.12
+  # Extra scalar arguments for every search, pinned in the bridge. The daemon
+  # fixes sort, sort_dir, include_context and content_types itself.
+  # search_args:
+  #   workspace: example
+  # Mentions are searched by keyword; {self_user_id} is the only placeholder.
+  # mention_keywords: ["<@{self_user_id}>"]
+
+analyze:
+  provider: claude
+  model: sonnet
+  max_output_tokens: 4096
+  instruction_from_connector: slack
+  # Optional: stream-specific guidance appended to the connector body.
+  instruction_extra: >-
+    This sweep covers the team's project channels. Treat rollout steps and
+    config changes as high value even when they look routine.
+
+memory:
+  store: /absolute/path/to/your/personal-memory
+  type: note
+  tags: [slack]

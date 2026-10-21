@@ -13,7 +13,9 @@ from . import slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
-VALID_SOURCE_KINDS = {"gmail", "drive_docs", "slack", "gchat", "mila", "whisper"}
+VALID_SOURCE_KINDS = {
+    "gmail", "drive_docs", "slack", "slack_mcp", "gchat", "mila", "whisper",
+}
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
 }
@@ -1287,6 +1289,156 @@ def _validate_calendar_cache(rid, cfg):
     return problems
 
 
+_FORBIDDEN_TOOL_WORDS = (
+    "send", "schedule", "create", "update", "add", "delete", "upload",
+    "complete",
+)
+_MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_-]+__([A-Za-z0-9_-]+)$")
+
+
+def _read_only_tool(value, family):
+    """Whether `value` is an exact connector tool of a read-only family."""
+    match = _MCP_TOOL.match(value) if isinstance(value, str) else None
+    if not match:
+        return False
+    name = match.group(1)
+    return name.startswith(family) and not any(
+        word in name for word in _FORBIDDEN_TOOL_WORDS
+    )
+
+
+def _bounded_int(value, lower, upper):
+    return (
+        isinstance(value, int) and not isinstance(value, bool)
+        and lower <= value <= upper
+    )
+
+
+def _validate_slack_mcp(prefix, source):
+    """Connector-backed Slack source: read-only tools and bounded budgets."""
+    problems = []
+    for key, family in (
+        ("search_tool", "slack_search_"), ("read_thread_tool", "slack_read_"),
+    ):
+        if not _read_only_tool(source.get(key), family):
+            problems.append(
+                f"{prefix}.{key} must be an exact read-only MCP tool name "
+                f"(mcp__<server>__{family}...)"
+            )
+    if source.get("search_tool") == source.get("read_thread_tool"):
+        problems.append(f"{prefix}: search_tool and read_thread_tool must differ")
+    owner = source.get("self_user_id")
+    if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
+        problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")
+    for key, pattern in (
+        ("channels", slack_watch.CHANNEL_ID),
+        ("owner_action_channels", slack_watch.CHANNEL_ID),
+        ("people", slack_watch.USER_ID),
+    ):
+        values = source.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list) or not all(
+            isinstance(v, str) and pattern.match(v) for v in values
+        ):
+            problems.append(f"{prefix}.{key} must be a list of Slack ids")
+    if not (
+        source.get("channels") or source.get("people")
+        or source.get("include_mentions") is True
+        or source.get("_watch_unread")
+    ):
+        problems.append(
+            f"{prefix}: source.kind 'slack_mcp' needs channels, people "
+            "and/or include_mentions: true (inline or via watch)"
+        )
+    if "include_mentions" in source and not isinstance(
+        source["include_mentions"], bool
+    ):
+        problems.append(f"{prefix}.include_mentions must be true or false")
+    for key, lower, upper in (
+        ("max_threads_per_run", 1, 100), ("max_thread_replies", 1, 500),
+        ("max_thread_chars", 500, 100000), ("max_search_pages", 1, 20),
+        ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 100),
+        ("min_seconds_between_searches", 0, 120),
+    ):
+        if key in source and not _bounded_int(source[key], lower, upper):
+            problems.append(
+                f"{prefix}.{key} must be an integer from {lower} to {upper}"
+            )
+    for key in ("bootstrap", "overlap"):
+        if key in source:
+            try:
+                duration_seconds(source[key])
+            except RoutineError:
+                problems.append(
+                    f"{prefix}.{key} must look like '15m', '4h', or '1d'"
+                )
+    estimate = source.get("estimate_analyze_usd")
+    if estimate is not None and (
+        not isinstance(estimate, (int, float)) or isinstance(estimate, bool)
+        or not 0 <= estimate <= 10
+    ):
+        problems.append(
+            f"{prefix}.estimate_analyze_usd must be a number from 0 to 10"
+        )
+    if "include_bots" in source and not isinstance(source["include_bots"], bool):
+        problems.append(f"{prefix}.include_bots must be true or false")
+    if "model" in source and not _non_empty_str(source["model"]):
+        problems.append(f"{prefix}.model must be a non-empty string")
+    keywords = source.get("mention_keywords")
+    if keywords is not None:
+        try:
+            ok = (
+                isinstance(keywords, list) and keywords
+                and all(isinstance(w, str) and w for w in keywords)
+                and all(
+                    {f for _, f, _, _ in Formatter().parse(w) if f}
+                    <= {"self_user_id"}
+                    for w in keywords
+                )
+            )
+        except ValueError:
+            ok = False
+        if not ok:
+            problems.append(
+                f"{prefix}.mention_keywords must be a non-empty list of "
+                "strings using only the {self_user_id} placeholder"
+            )
+    extra = source.get("search_args")
+    if extra is not None:
+        from . import slack_mcp
+        if not isinstance(extra, dict) or not all(
+            isinstance(k, str) and isinstance(v, (str, int, float, bool))
+            for k, v in extra.items()
+        ):
+            problems.append(
+                f"{prefix}.search_args must map extra scalar arguments"
+            )
+        elif set(extra) & slack_mcp.RESERVED_SEARCH_ARGS:
+            problems.append(
+                f"{prefix}.search_args cannot set "
+                f"{', '.join(sorted(set(extra) & slack_mcp.RESERVED_SEARCH_ARGS))} "
+                "(fixed by the daemon)"
+            )
+    planned = (
+        -(-len(source.get("channels") or []) // 15)
+        + len(source.get("people") or [])
+        + (1 if source.get("include_mentions") is True else 0)
+    )
+    cap = source.get("max_queries_per_run", 20)
+    if _bounded_int(cap, 1, 100) and planned > cap:
+        problems.append(
+            f"{prefix}: {planned} planned searches exceed "
+            f"max_queries_per_run ({cap})"
+        )
+    if "max_results" in source:
+        problems.append(
+            f"{prefix}.max_results is not used by slack_mcp; use "
+            "max_threads_per_run"
+        )
+    return problems
+
+
 def _validate_schedule(routine):
     """Validate the cadence shared by capture and maintenance routines."""
     problems = []
@@ -1313,8 +1465,12 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
+    from . import slack_mcp
+    allowed = SOURCE_KEYS | (
+        slack_mcp.SOURCE_KEYS if source.get("kind") == "slack_mcp" else set()
+    )
     unknown_source = {
-        key for key in set(source) - SOURCE_KEYS
+        key for key in set(source) - allowed
         if not str(key).startswith("_watch")
     }
     if unknown_source:
@@ -1610,6 +1766,8 @@ def _validate_source(routine, source, prefix):
                         f"{prefix}.reply_roots_after must not be later than "
                         "catch_up_after"
                     )
+    if kind == "slack_mcp":
+        problems.extend(_validate_slack_mcp(prefix, source))
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)

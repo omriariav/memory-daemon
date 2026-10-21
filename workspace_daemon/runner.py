@@ -13,6 +13,8 @@ from pathlib import Path
 from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from .count_only import report as count_report
+from . import slack_mcp
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -153,7 +155,7 @@ def _needs_label_catalog(routines):
 
 
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
-        lock_name="run", ignore_pause=False):
+        lock_name="run", count_only=False, ignore_pause=False):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -182,7 +184,8 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
             if not dry_run else None
         )
         return _run_locked(
-            base_dir, routines, dry_run, lock, refresh_labels, active_ids=active_ids
+            base_dir, routines, dry_run, lock, refresh_labels,
+            active_ids=active_ids, count_only=count_only,
         )
 
 
@@ -216,7 +219,7 @@ def _log_hold_once(base_dir, rid, message, dry_run):
 
 
 def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
-                active_ids=None):
+                active_ids=None, count_only=False):
     scan_started_at = utc_now_iso()
     active_ids = set(active_ids) if active_ids is not None else {
         r["id"] for r in routines if r.get("enabled", True)
@@ -241,6 +244,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         if r.get("enabled", True) and r["id"] in active_ids
     ]
     llm.configure(base_dir)
+    slack_mcp.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
@@ -332,10 +336,35 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     }
     source_overrides = {}
     catch_up_sources = []
+    slack_mcp_sources = []
     active_conversation_sources = []
     for routine in valid:
         routine_active = routine["id"] in active_ids
         for source_index, source in enumerate(config.sources(routine)):
+            if (
+                source.get("kind") == "slack_mcp"
+                and "slack_mcp" in active_source_kinds
+            ):
+                # One cursor per query (channels, each person, mentions); the
+                # source reports a watermark per cursor instead of holding.
+                ids = slack_mcp.cursor_ids(source)
+                runtime = {}
+                source_overrides[(routine["id"], source_index)] = {
+                    "_since_map": {
+                        key: slack_mcp.since_for(
+                            source, cursors.checkpoint(
+                                routine["id"], cursor_id, "slack_mcp"
+                            ),
+                        )
+                        for key, cursor_id in ids.items()
+                    },
+                    "_slack_mcp_runtime": runtime,
+                }
+                if routine_active:
+                    slack_mcp_sources.append(
+                        (routine["id"], source_index, ids, runtime)
+                    )
+                continue
             if (
                 source.get("catch_up") is not True
                 or source.get("kind") not in active_source_kinds
@@ -406,6 +435,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 (routine["id"], source_index), {}
             )
             override["_dry_run"] = dry_run
+            override["_count_only"] = count_only
 
     source_coverage = {}
     claims, listing_failures = _collect_claims(
@@ -445,6 +475,8 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         claims, totals, failures=[*routing_failures, *listing_failures],
         held_source_keys=routing_holds,
     )
+    if count_only:
+        return count_report(owned, processed, base_dir, totals)
     failed_source_keys = {
         key for key, problem in source_coverage.items() if problem
     }
@@ -539,6 +571,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 f"routine={routine_id} source={kind} FATAL: "
                 "Slack census did not report its discovery boundary"
             )
+
+    for rid, index, ids, runtime in slack_mcp_sources:
+        if not source_coverage.get((rid, index)):
+            successful_points.extend(slack_mcp.commit_points(
+                rid, ids, runtime, scan_started_at, cursors
+            ))
 
     if successful_points:
         cursors.mark_successful_at(successful_points)
@@ -1245,6 +1283,9 @@ SOURCES = {
                   routine, candidate, source)),
     "gchat": (gchat_source.candidates,
               lambda routine, source, candidate: gchat_source.fetch(routine, candidate)),
+    "slack_mcp": (slack_mcp.candidates,
+                  lambda routine, source, candidate: slack_mcp.fetch(
+                      routine, candidate, source)),
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
 }
@@ -1262,6 +1303,8 @@ TRANSCRIPT_SOURCES = {
 # --- candidate ownership and run loop --------------------------------------
 
 def _scope(source):
+    if source.get("kind") == "slack_mcp":
+        return "Slack via connector"
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
     if source.get("kind") == "slack" and source.get("active_conversations"):
@@ -1305,6 +1348,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "gmail": 20,
     "drive_docs": 50,
     "slack": 30,
+    "slack_mcp": 0,
     "gchat": 50,
     "mila": 0,
     "whisper": 0,
@@ -1330,6 +1374,11 @@ def _source_scopes(source):
             if isinstance(space, str)
         }
         return values or {(kind, "*")}
+    if kind == "slack_mcp":
+        if source.get("include_mentions") or source.get("people"):
+            return {(kind, "*")}
+        return {(kind, c) for c in source.get("channels", [])
+                if isinstance(c, str)} or {(kind, "*")}
     if kind == "slack":
         if source.get("include_mentions"):
             # A workspace-wide mention can originate in any channel.
@@ -1362,7 +1411,7 @@ def _candidate_scopes(source, candidate):
     raw = candidate.get("raw")
     raw = raw if isinstance(raw, dict) else {}
     kind = source.get("kind")
-    if kind == "slack" and isinstance(raw.get("channel"), str):
+    if kind in ("slack", "slack_mcp") and isinstance(raw.get("channel"), str):
         return {(kind, raw["channel"])}
     if kind == "gchat" and isinstance(raw.get("space"), str):
         return {(kind, raw["space"])}
@@ -1453,6 +1502,8 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
+    if source.get("kind") == "slack_mcp":
+        return None  # the source reports watermarks, not a hold
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
     if (
@@ -1589,6 +1640,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         list_candidates, fetch = SOURCES[kind]
         override = source_overrides.get((rid, source_index))
         listing_source = dict(source, **override) if override else source
+        if kind == "slack_mcp":
+            # Listing skips threads the ledger already holds, so the cap and
+            # settle window apply to new work only.
+            listing_source = dict(listing_source, _processed=processed)
         if kind == "slack" and source.get("include_mentions"):
             # Mentions are workspace-wide. Exclude every explicitly owned
             # channel, including channels owned by another routine whose digest
@@ -1696,6 +1751,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
             listed_routing_ids.update(normal_ids)
+            if getattr(candidates, "partial", False):
+                # Some of this source's queries failed. Its listed threads are
+                # fine, but a lower-ranked routine must not claim threads in
+                # the scope it could not fully read.
+                failures.append(_failure(
+                    routine, source, known_ids=normal_ids,
+                    ownership_class=ownership_class,
+                ))
             if kind == "gmail":
                 gmail_listed_ids[rid].update(normal_ids)
 
@@ -1730,7 +1793,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     )
 
             candidates_with_budget = [
-                (candidate, True) for candidate in candidates
+                # A deferred thread (settling or over the per-run cap) still
+                # claims ownership so another routine cannot take it.
+                (candidate, not (candidate.get("raw") or {}).get("_deferred"))
+                for candidate in candidates
             ]
             candidates_with_budget.extend(
                 (candidate, False)
@@ -2037,9 +2103,15 @@ def _route_claims(claims, totals, failures=(), held_source_keys=None):
             )
             continue
         if not claim.get("processable", True):
+            deferred = (claim["candidate"].get("raw") or {}).get("_deferred")
             log(
                 f"ownership held source={kind} id={item_id}: "
-                f"owner {claim['routine']['id']} reached its processing cap"
+                + (
+                    "deferred (settling or over the per-run cap) by "
+                    f"{claim['routine']['id']}" if deferred
+                    else f"owner {claim['routine']['id']} reached its "
+                         "processing cap"
+                )
             )
             continue
         if kind == "gmail" and len(candidates) > 1:
@@ -2071,6 +2143,12 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     circuit_reported = False
 
     def hold_claim(claim):
+        if (
+            claim["source"].get("kind") == "slack_mcp"
+            and slack_mcp.note_failure(claim["candidate"])
+        ):
+            # Hold only the queries that found this thread, at its timestamp.
+            return
         keys = claim.get("_claimant_source_keys")
         if keys:
             failed_source_keys.update(keys)

@@ -253,6 +253,7 @@ python3 -m workspace_daemon.slack_cli auth-test
 ./memory-daemon-status.sh                     # scheduler + health of every routine
 ./daemon.py validate                          # check all routine YAML
 ./daemon.py run --dry-run                     # preview; data and state unchanged
+./daemon.py run --count-only                  # list only: new/changed counts + cost estimate
 ./daemon.py run --routine weekly-report       # run one routine for real
 ./daemon.py run                               # run everything enabled
 ./daemon.py tick                              # run only routines whose cadence is due
@@ -263,7 +264,19 @@ python3 -m workspace_daemon.slack_cli auth-test
 `--dry-run` makes **no** LLM call, **no** source mutation, and **no** vault,
 memory-store, or state write. It still performs real source reads so the preview
 reflects reality, and appends to `logs/run.log` so failed previews remain
-diagnosable.
+diagnosable. The one exception to "real source reads" is a `slack_mcp`
+source, whose listing needs an LLM bridge session: a dry run only logs its plan.
+
+`--count-only` cannot be combined with `--dry-run`. It is the cheap way to see what a run would do. It lists and routes
+candidates against the read-only ledger and cursors, then prints the number of
+new or changed items per routine and, for `slack_mcp`, the planned thread-read
+sessions and a cost estimate (mean past session cost times planned sessions,
+plus mean past analyze cost times threads, from `state/claude-usage.jsonl`;
+with `estimate_analyze_usd`, default 0.12 per thread, standing in for analyze
+history that does not exist yet). It fetches nothing, calls no analysis model, and
+writes no ledger, cursor, store, or vault file (the bridge still logs its own
+session metadata to `state/claude-usage.jsonl`); maintenance routines are not
+run.
 
 ## Codex and Claude Code plugin
 
@@ -781,7 +794,7 @@ enabled: true
 description: Summarize the weekly report email.
 
 source:
-  kind: gmail                  # gmail, drive_docs, slack, gchat, mila, or whisper
+  kind: gmail                  # gmail, drive_docs, slack, slack_mcp, gchat, mila, or whisper
   query: 'from:reports@example.com subject:"Weekly Report" is:unread'
   max_results: 20              # optional, default 20
 
@@ -1172,6 +1185,97 @@ time, last error that names it, and last time it was part of a failed call
 (from the `mcp__<server>__` prefix of logged tool names); a malformed budget
 file or a failed usage-log write makes it report unhealthy.
 
+### Slack via a connector
+
+`kind: slack_mcp` reads Slack through a claude.ai Slack connector driven by the
+headless bridge, so no Slack token lives on the machine. Claude only transports
+two read-only tool calls; Python plans, parses, groups, bounds and versions
+everything. See `routines/_example-slack-mcp-to-memory.yaml`.
+
+The watched ids live in a private file referenced with `watch:` (an absolute or
+`~` path; a `slack` source accepts it too), so ids never enter the repository
+or the routine:
+
+```yaml
+channels:                  # channels, private channels and DMs
+  - C0EXAMPLE01
+  - {id: C0EXAMPLE02, name: example-team}   # names are local labels only
+people: [U0EXAMPLEA]       # slack_mcp only: authors watched in any channel
+include_mentions: true
+owner_action_channels: [C0EXAMPLE01]
+bootstrap: 3d              # slack_mcp first-run look-back
+```
+
+The file expands at routine load into the legacy `channels`, `people`,
+`include_mentions` and `owner_action_channels` keys; unknown keys and malformed
+ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
+are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
+`people` list unless it sets `ignore_people: true`, which keeps the exit path a
+one-line `kind:` change. Thread ids are identical for both kinds
+(`slack:<channel>:<root>@<newest ts>`; the memory source id drops the version),
+so switching keeps updating the same memories. Emails are masked by the
+connector, so people are identified by Slack user id only.
+
+How a run works:
+
+1. Search is the lister, oldest first. One bridge session runs the planned
+   searches: the watched channels (`in:<#id>` terms, 15 per query), one
+   `from:<@id>` query per person, and one mention query by keyword
+   (`mention_keywords`, default `<@{self_user_id}>`). Each uses
+   `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
+   `include_context=false`, `content_types=messages`,
+   `response_format=detailed` and `limit=20`; pages that
+   report a cursor are followed in later sessions, up to `max_search_pages`.
+   Searches are spaced `min_seconds_between_searches` apart and a run plans at
+   most `max_queries_per_run`. Every new root and reply comes back with its
+   channel, author, timestamp and thread root, so late replies to old threads
+   surface without reading channels. Mention and DM hits parse like any other.
+2. Hits are cross-checked (the permalink must agree with the channel and
+   timestamp, a `from:` hit must be by that person, an `in:` hit must be in
+   the queried channels, timestamps must be plausible) and grouped by (channel,
+   thread root). Bots are dropped in Python unless `include_bots`. Threads
+   already in the ledger are skipped; of the rest, threads whose newest message
+   is younger than `settle_minutes`, and anything beyond `max_threads_per_run`
+   (oldest first), are deferred. Deferred threads still claim ownership, so
+   another routine cannot take them.
+3. Threads are read lazily from `fetch()`, up to eight per bridge session, only
+   for items the run actually processes, with `limit = max_thread_replies`. The
+   connector returns the parent plus the newest replies (oldest to newest) in
+   one page and reports when earlier replies exist; the item keeps the parent
+   and as many of the newest replies as fit `max_thread_chars` (the newest is
+   never dropped, only truncated), with an `[N earlier replies omitted]` note
+   (the count appears when a search reported the thread's reply count). Bot
+   replies follow `include_bots`.
+
+Cursors are per query: `channels` (hashed by the channel set), `from:<id>` for
+each person and `me` for mentions, so changing the watch list restarts only the
+query that changed (the first run starts `bootstrap` ago). A run commits each
+cursor to a watermark instead of holding everything: the older of the run's
+start, the newest message of the oldest deferred thread, and, for a search that
+hit `max_search_pages`, the point right after the last hit read (oldest-first
+paging leaves a contiguous prefix, so the next run continues from there). A
+failed or rate-limited listing, or any failed item, still holds the cursors.
+A thread whose read fails three times, or whose result cannot be parsed, is
+recorded in the ledger as unreadable (`slack_mcp: unreadable`, no message text)
+so it cannot block the cursor; a later reply makes a new version that is tried
+again. The ledger stores ids and outcomes, never message bodies.
+
+Security: validation accepts only exact `mcp__<server>__slack_search_*` /
+`slack_read_*` tool names without send, schedule, create, update, add, delete,
+upload or complete in them; each session allowlists a single read tool. Message
+text is untrusted data: the prompts say so and never contain it, and Python
+accepts a tool result only when its input equals a planned call (unplanned
+calls are dropped, never used; a missing planned call is re-issued once).
+Search pages and thread pages must have exactly one structurally consistent
+parse, so a message that imitates the connector's format cannot add or reorder
+hits. If a page still has several valid readings, only the hits all of them
+agree on are kept, and an unparseable page fails just its own query: that
+query's cursor is held while the others advance. A thread whose item fails holds
+only the cursors of the queries that found it, at its timestamp. A read outage
+(no usable result at all in a session) fails the run without counting an
+attempt against any thread. Errors and logs carry counts only, never tool inputs or message text, and
+the runner's item titles for these threads are the channel and timestamp.
+
 ### Label caching
 
 The user-label catalog is ~940 names and changes maybe monthly, so it is cached
@@ -1342,6 +1446,9 @@ workspace_daemon/
   identity.py              pluggable identity providers (gws, slack_mcp)
   slack_cli.py             built-in read-only Slack Web API client
   slack_source.py          Slack thread discovery and rendering
+  slack_watch.py           private Slack watch file loader (`watch:`)
+  slack_mcp.py             Slack source through a claude.ai connector (headless bridge)
+  count_only.py            `run --count-only` report
   mila_source.py           read-only Mila + Calendar matching
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
   transcripts.py           shared transcript-source Calendar gate + receipts
