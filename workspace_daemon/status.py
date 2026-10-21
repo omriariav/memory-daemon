@@ -360,7 +360,14 @@ def routine_rows(
         # fetched"; expose it here so the distinction does not require
         # reading raw daemon logs.
         skipped_not_worthy = sum(
-            entry.get("memory") == "skipped_not_worthy" for entry in entries
+            entry.get("memory") in ("skipped_not_worthy", "skipped_trivial")
+            for entry in entries
+        )
+        extract_failed = sum(
+            entry.get("memory") == "skipped_extract_failed"
+            and _within(entry.get("processed_at"), now,
+                        MEMORY_ERROR_WINDOW_SECONDS)
+            for entry in entries
         )
         expansion_fallbacks = sum(
             bool(entry.get("expand_fallback")) for entry in entries
@@ -456,6 +463,7 @@ def routine_rows(
                 else str(skipped_not_worthy)
             ),
             "issues": ", ".join(issues) or "-",
+            "extract_failed": extract_failed,
         })
     return rows
 
@@ -611,6 +619,12 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         for row in rows
     ]
     lines.extend(_table(headers, values))
+    for row in rows:
+        if row.get("extract_failed"):
+            lines.append(
+                f"Info: {row['routine']}: {row['extract_failed']} item(s) "
+                "not stored after extraction failed twice (last 24h)"
+            )
     bridge_text, bridge_problems = bridge_lines(base_dir, now)
     lines.extend(bridge_text)
     lines.extend([
