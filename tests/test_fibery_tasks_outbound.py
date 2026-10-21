@@ -431,6 +431,13 @@ class LiveFormatTest(unittest.TestCase):
     def test_inbound_imports_nothing_from_it(self):
         self.assertEqual(fti.parse_tasks(self.pending_doc()), [])
 
+    def test_inline_ins_heading_is_pending(self):
+        doc = Doc()
+        doc.heading("<ins>Inbox</ins>")
+        info = fto.inspect(toon(doc), "Inbox")
+        self.assertIsNone(info["heading_id"])
+        self.assertTrue(info["pending_heading"])
+
     def test_deleted_heading_suggestion_keeps_accepted_heading(self):
         doc = Doc()
         doc.heading("Inbox")

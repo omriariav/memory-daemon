@@ -163,7 +163,7 @@ def inspect(text, heading):
                 continue
             if block["type"] == "heading":
                 break
-            if block["type"] == "bullet_list" and root not in pending:
+            if block["type"] == "bullet_list":
                 items = [c for c in block["childIds"]
                          if blocks[c]["type"] == "list_item"
                          and c not in pending]

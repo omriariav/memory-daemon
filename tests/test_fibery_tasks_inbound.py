@@ -295,9 +295,48 @@ class LiveFormatTest(RunBase):
         doc = Doc()
         doc.heading("Work")
         doc.bullets([(bid(1), "TODO", [q("A")]), (bid(2), "DONE", [q("B")])])
-        doc.suggest([doc.roots[0]], kind="inserted", inline=False)
+        doc.heading("Later")
+        doc.suggest([doc.roots[-1]])  # only the last heading is pending
         tasks = fti.parse_tasks(doc.text())
         self.assertEqual([t["block_id"] for t in tasks], [bid(1), bid(2)])
+        self.assertEqual({t["section"] for t in tasks}, {"Work"})
+
+    def _tolerant(self, entry_lines, header="suggestions[1]:"):
+        doc = Doc()
+        doc.heading("Inbox")
+        doc.bullets([(bid(1), "TODO", [q("Pending")])])
+        base = doc.text(wrap=False)
+        ids = ",".join(doc.roots)
+        lines = [header, "  - id: sg-1", "    kind: inserted",
+                 f"    blockIds[{len(doc.roots)}]: {ids}", *entry_lines]
+        return base + "\n" + "\n".join(lines)
+
+    def test_missing_or_null_inline_counts_as_pending(self):
+        for extra in ([], ["    inline: null"]):
+            self.assertEqual(
+                fti.parse_tasks(self._tolerant(extra)), [], msg=extra)
+
+    def test_unknown_fields_and_maps_are_ignored(self):
+        extras = [
+            ["    inline: false", "    replyIds[0]:"],
+            ["    inline: false", "    commentIds[1]: c1"],
+            ["    inline: false", "    meta:", "      a: 1", "      b:",
+             "        c: 2"],
+            ["    inline: false", "    baggage:", "      - one", "      - two"],
+            ["    inline: false", "    comments[2]{id,text}:",
+             "      c1,hello", "      c2,world"],
+        ]
+        for extra in extras:
+            self.assertEqual(
+                fti.parse_tasks(self._tolerant(extra)), [], msg=extra)
+
+    def test_bare_suggestions_header_is_a_countless_list(self):
+        text = self._tolerant(["    inline: false"], header="suggestions:")
+        self.assertEqual(fti.parse_tasks(text), [])
+
+    def test_inline_true_is_not_pending(self):
+        text = self._tolerant(["    inline: true"])
+        self.assertEqual(len(fti.parse_tasks(text)), 1)
 
     def test_accepted_doc_with_inline_suggestion_unchanged(self):
         doc = Doc()

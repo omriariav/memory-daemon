@@ -187,7 +187,7 @@ def parse_document(text):
         raise FiberyParseError("document header is incomplete")
     if declared != len(blocks):
         raise FiberyParseError("block count does not match its header")
-    suggestions = _parse_suggestions(suggestion_lines, suggestions_count or 0)
+    suggestions = _parse_suggestions(suggestion_lines, suggestions_count)
     for suggestion in suggestions:
         if any(b not in blocks for b in suggestion["blockIds"]):
             raise FiberyParseError("suggestion references an unknown block")
@@ -195,62 +195,61 @@ def parse_document(text):
 
 
 def _suggestions_header(count, raw):
+    """Declared entry count, or None for a bare count-less ``suggestions:``."""
     raw = (raw or "").strip()
     if count is None:
         if raw in ("[]", "null"):
             return 0
-        raise FiberyParseError("suggestions header has no count")
+        if raw == "":
+            return None
+        raise FiberyParseError("suggestions header has trailing text")
     if raw:
         raise FiberyParseError("suggestions header has trailing text")
     return int(count)
 
 
+SUGGESTION_KEY_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9._-]*)(?:\[(\d+)\])?(?:\{[^}]*\})?:(?: (.*))?$")
+
+
 def _parse_suggestions(lines, declared):
-    """Parse the ``suggestions[N]:`` entries (2-space indented TOON list)."""
+    """Parse the ``suggestions`` entries (2-space indented TOON list).
+
+    Only id, kind, blockIds and inline matter. Any other field, nested map,
+    dash-list or tabular array (everything indented below a field) is
+    tolerated and ignored.
+    """
     items = []
     for indent, body in lines:
         if body.startswith("- ") and indent == 2:
-            items.append([body[2:]])
+            items.append([(4, body[2:])])
         elif not items:
             raise FiberyParseError("unexpected line in suggestions")
+        elif indent < 4:
+            raise FiberyParseError("unexpected suggestion indentation")
         else:
-            if indent < 4:
-                raise FiberyParseError("unexpected suggestion indentation")
             items[-1].append((indent, body))
-    if len(items) != declared:
+    if declared is not None and len(items) != declared:
         raise FiberyParseError("suggestion count does not match its header")
     parsed = []
     for item in items:
-        entry = {"blockIds": [], "inline": None, "baggage": False}
-        pairs = [(4, item[0])] + item[1:]
-        in_map = False
-        for indent, body in pairs:
-            if indent >= 6:
-                if not in_map or ":" not in body:
-                    raise FiberyParseError("unexpected nested suggestion line")
-                continue
-            in_map = False
-            match = KEY_RE.match(body)
+        entry = {"blockIds": [], "inline": None}
+        for indent, body in item:
+            if indent > 4:
+                continue  # child of an ignored or nested field
+            match = SUGGESTION_KEY_RE.match(body)
             if not match:
                 raise FiberyParseError("unrecognised suggestion line")
             key, count, value = match.groups()
             value = (value or "").strip()
-            if key in ("blockIds", "commentIds") and count is not None:
+            if key == "blockIds" and count is not None:
                 entry[key] = _id_list(count, value, key)
-            elif key == "commentIds" and value in ("[]", ""):
-                entry[key] = []
-            elif key == "baggage" and count is None:
-                in_map = value == ""
-                if value not in ("", "null", "{}"):
-                    raise FiberyParseError("baggage must be a mapping")
             elif key == "inline" and count is None:
-                if value not in ("true", "false"):
+                if value not in ("true", "false", "null"):
                     raise FiberyParseError("suggestion inline is not a boolean")
-                entry["inline"] = value == "true"
-            elif count is None:
+                entry[key] = {"true": True, "false": False}.get(value)
+            elif key in ("id", "kind") and count is None:
                 entry[key] = _scalar(value, key)
-            else:
-                raise FiberyParseError("unexpected array field in a suggestion")
         if not entry.get("id") or not entry.get("kind"):
             raise FiberyParseError("suggestion without an id or kind")
         parsed.append(entry)
@@ -260,14 +259,15 @@ def _parse_suggestions(lines, declared):
 def pending_ids(blocks, suggestions):
     """Ids of blocks that exist only as unaccepted block-level insertions.
 
-    Only ``kind: inserted`` with ``inline: false`` counts; the listed blocks
+    Only ``kind: inserted`` that is not ``inline: true`` counts (a missing
+    inline flag is treated as a block insert, fail safe); the listed blocks
     and all their descendants are pending. Any other kind (a pending
     deletion, say) or an inline change leaves the block as accepted content.
     """
     pending = set()
     stack = []
     for suggestion in suggestions:
-        if suggestion["kind"] == "inserted" and suggestion["inline"] is False:
+        if suggestion["kind"] == "inserted" and suggestion["inline"] is not True:
             stack.extend(suggestion["blockIds"])
     while stack:
         block_id = stack.pop()
