@@ -2255,8 +2255,6 @@ class AppHintsTest(unittest.TestCase):
         # A completedAt in the future is clamped to now (cannot extend the wait).
         self.write(completedAt="2030-01-01T00:00:00Z")
         self.assertEqual(len(self.candidates(now_minutes=46)), 0)
-        later = mila_source.completion_time(
-            {"completedAt": "2030-01-01T00:00:00Z"}, at(0))
         with mock.patch.object(mila_source, "_now", return_value=at(10)):
             self.assertEqual(mila_source.completion_time(
                 {"completedAt": "2030-01-01T00:00:00Z"}, at(0)), at(10))
