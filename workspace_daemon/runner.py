@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, triviality, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
 from . import gmail_mcp, slack_mcp
 from .shell import log, utc_now_iso
@@ -2476,6 +2476,10 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                     )
     if new == 0:
         log(f"routine={rid} no new matches")
+    try:
+        person_briefs.process(routine, base_dir, dry_run)
+    except Exception as exc:  # briefs are best effort, never a run failure
+        log(f"routine={rid} person-briefs WARN: {exc}")
     return failed_source_keys
 
 
@@ -2861,6 +2865,13 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             outcome = memory_sink.capture(routine, item, summary)
             if outcome:
                 record.update(outcome)
+                try:
+                    person_briefs.enqueue(
+                        routine, item, outcome, source.get("kind"),
+                        base_dir, dry_run,
+                    )
+                except Exception as exc:  # never fail a capture over a brief
+                    log(f"routine={rid} person-briefs WARN enqueue: {exc}")
                 if outcome.get("memory") == "skipped_extract_failed":
                     totals["extract_failed"] = totals.get("extract_failed", 0) + 1
             if (

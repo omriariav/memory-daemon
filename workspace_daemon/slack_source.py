@@ -1147,6 +1147,12 @@ def thread_item(candidate, messages, names, source=None, self_id=None,
             "slack_thread_ts": anchor,
             "slack_capture_mode": "thread",
             "slack_participants": sorted(set(names.values())) or user_ids,
+            # display name -> Slack user id, so a later step can look up a
+            # profile for a person the memory store has not seen before.
+            "slack_user_ids": {
+                names[uid]: uid for uid in user_ids
+                if uid != self_id and names.get(uid)
+            },
             "source_people": list(source_people),
             "via_mention": bool(candidate["raw"].get("via_mention")),
             "first_message_at": slack_timestamp_iso(first_ts),

@@ -1122,6 +1122,61 @@ queue to retry on the next run.
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
 
+### Person briefs
+
+When a capture introduces a person the store has no brief for, the daemon can
+write one short brief, once, cheaply. Off by default:
+
+```yaml
+memory:
+  person_briefs:
+    enabled: true
+    max_per_run: 3          # briefs written per routine run
+    max_per_day: 15         # per routine per local day
+    type: note              # the store has no `person` type, so note + tag
+    tag: person-brief
+    sources: [slack_mcp, mila, gmail_mcp]
+    model: haiku            # must be valid for the routine's analyze.provider
+    # exclude_slugs: [some-slug]   # never briefed (the identity owner_slug always is)
+```
+
+- **Trigger.** After a successful capture (`created`, `updated`, `unchanged`,
+  or `verified`) from a listed source, each slug in the entry's `people` is
+  queued in `state/person-briefs.json`. The owner is never queued. At the end
+  of the routine's run, inside its budget scope, the queue is worked off up to
+  the run and day caps; the rest waits. A PAUSED switch, a cap, or a store
+  error holds the queue untouched.
+- **"Has a brief."** Read once per run through the store CLI
+  (`list --tag person-brief`, plus `list --tag people-brief`, the tag the
+  user-level slack-context skill uses): an entry tagged with either whose
+  `people` includes the slug, or whose source id is `person:<slug>`. If one
+  exists the slug is dropped, whoever wrote it. Briefs are written once and
+  never updated or overwritten, so a hand-edited brief is always safe.
+- **Data, cheapest first, no message search.** (a) Slack profile fields
+  (title, team, timezone or location, manager) through one bridge call pinned
+  to the identity block's `profile_tool` and the person's user id, only for
+  `slack_mcp` items whose participant id is known (it matches a known slug by
+  display name). (b) What the store knows, via `person <slug>`: first entry,
+  open `todo` / `pending-decision` entries not yet followed, and frequent
+  co-occurring people. (c) For meetings and email, display name and email
+  domain only.
+- **Brief.** One no-tools `llm.analyze` call (default `haiku`) turns the
+  structured facts into 3-6 lines: role, team, first meeting (entry id and
+  date), open threads (entry ids). Output citing an entry id that was not in
+  the facts is rejected and replaced by a plain brief assembled from the facts.
+  With no profile data and at most one cited entry, no model is called.
+- **Write.** `add --type note --title "Person brief: <name>" --people <slug>
+  --tags person-brief,people-brief,auto-captured --source-ids person:<slug>`
+  (plus `slack-profile:<user-id>` when known, so a later slack-context run
+  enriches the same entry). The `auto-captured` tag marks it as machine-made.
+- **Privacy.** Briefs never contain message bodies. Entries tagged with the
+  personal tag are not cited, and ID-like numbers are redacted. Profile and
+  display text is untrusted: cleaned to one bounded line each, and the model
+  call has no tools.
+- **Cost.** Each run logs the count written and the estimated spend from the
+  bridge usage log. Calls count against the routine's `budget.daily_usd` and
+  the global budget.
+
 ### Mila meeting transcriptions
 
 `source.kind: mila` reads completed recordings without modifying Mila's live

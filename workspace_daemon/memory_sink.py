@@ -188,7 +188,7 @@ def validate(routine):
     unknown = set(cfg) - {
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
         "identity", "personal_tag", "redact_ids", "personal_keywords",
-        "extract_model", "owner_todos",
+        "extract_model", "owner_todos", "person_briefs",
     }
     if unknown:
         problems.append(
@@ -214,6 +214,8 @@ def validate(routine):
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
     problems.extend(owner_todos.validate(cfg, rid))
+    from . import person_briefs  # late import: person_briefs imports this module
+    problems.extend(person_briefs.validate(cfg, rid, MEMORY_TYPES))
     confirmed = cfg.get("operator_confirmed_source_ids")
     if confirmed is not None and (
         not isinstance(confirmed, list)

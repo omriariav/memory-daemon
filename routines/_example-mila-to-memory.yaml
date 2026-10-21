@@ -90,3 +90,8 @@ memory:
     tag: from-meeting
     owner_slug: me-example
     owner_name: Me Example   # required; fail closed without it
+  # Optional: a short brief for each person met for the first time (display
+  # name and email domain only here; see "Person briefs" in the README).
+  person_briefs:
+    enabled: false
+    sources: [mila]
