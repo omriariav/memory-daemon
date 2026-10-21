@@ -380,6 +380,12 @@ class ExtractSchemaTest(unittest.TestCase):
 
 
 class AnalyzeRedactionTest(unittest.TestCase):
+    def setUp(self):
+        # CI has no yoetz on PATH; the command is never run (run_json is mocked).
+        patcher = mock.patch.object(llm, "yoetz_bin", return_value="yoetz")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_prompt_redacted_before_model_call(self):
         ident = make_il_id()
         routine = {"id": "r", "analyze": {"provider": "gemini", "model": "m"},
