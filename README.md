@@ -1122,6 +1122,75 @@ queue to retry on the next run.
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
 
+### Person briefs
+
+When a capture introduces a person the store has no brief for, the daemon can
+write one short brief, once, cheaply. Off by default:
+
+```yaml
+memory:
+  person_briefs:
+    enabled: true
+    max_per_run: 3          # briefs written per routine run
+    max_per_day: 15         # per routine per local day
+    type: note              # the store has no `person` type, so note + tag
+    tag: person-brief
+    sources: [slack_mcp, mila, gmail_mcp]
+    model: haiku            # must be valid for the routine's analyze.provider
+    # owner_slug: me-example       # or memory.owner_todos / memory.identity owner_slug
+    # exclude_slugs: [some-slug]   # never briefed
+```
+
+- **Trigger.** After a successful capture (`created`, `updated`, `unchanged`,
+  or `verified`) from a listed source, each slug in the entry's `people` is
+  queued in `state/person-briefs.json`. Personal-tagged captures queue nobody,
+  and the owner is never queued: the owner slug comes from
+  `memory.owner_todos.owner_slug`, `memory.identity.owner_slug` or
+  `person_briefs.owner_slug`, and validation fails when enabled with none.
+  Briefed slugs are remembered in state (no store scan in steady state), and a
+  slug whose brief failed three times is not retried for 14 days. At the end
+  of the routine's run, inside its budget scope, the queue is worked off up to
+  the run and day caps; the rest waits. A PAUSED switch, a cap, or a store
+  error holds the queue untouched.
+- **"Has a brief."** `add` replaces an entry in place when any source id
+  matches, so the check is strict and runs before anything is written: the
+  slug's `person <slug>` entries (no line cap) and a store-wide
+  `list --tag person-brief` / `list --tag people-brief` index (built once per
+  run, only when a brief is about to be written) are searched for a brief tag
+  about the slug, source id `person:<slug>`, or the person's
+  `slack-profile:<user-id>`. The `people-brief` tag (the slack-context skill's)
+  is recognised on read only and never written. If a brief exists, the slug is
+  dropped and nothing is written. Briefs are never updated, so a hand-edited
+  brief is safe. If `add` still reports `updated`, it is logged as an error
+  and not counted as written. Day and run caps are checked before any scan.
+- **Data, cheapest first, no message search.** (a) Slack profile fields
+  (title, team, timezone or location, manager) through one bridge call pinned
+  to the identity block's `profile_tool` and the person's user id, only for
+  `slack_mcp` items whose participant id is known (a full-name match with at
+  least two name tokens and one id; ambiguous names are dropped) and whose
+  fetched real name slugifies to the same slug, else no profile is used. (b) What the store knows, via `person <slug>`: first entry,
+  open `todo` / `pending-decision` entries not yet followed, and frequent
+  co-occurring people. (c) For meetings and email, display name and email
+  domain only.
+- **Brief.** One no-tools `llm.analyze` call (default `haiku`) turns the
+  structured facts into 3-6 lines: role, team, first meeting (entry id and
+  date), open threads (entry ids). Output citing an entry id that was not in
+  the facts is rejected and replaced by a plain brief assembled from the facts.
+  With no profile data and at most one cited entry, no model is called.
+- **Write.** `add --type note --title "Person brief: <name>" --people <slug>
+  --tags person-brief,auto-captured --source-ids person:<slug> --force-new`
+  (plus `slack-profile:<user-id>` when the profile was verified, so a later
+  slack-context run enriches the same entry; `--force-new` because the source
+  id already dedups and the near-duplicate guard would reject templated briefs).
+  The `auto-captured` tag marks it as machine-made.
+- **Privacy.** Briefs never contain message bodies. Entries tagged with the
+  personal tag are not cited, and ID-like numbers are redacted. Profile and
+  display text is untrusted: cleaned to one bounded line each, and the model
+  call has no tools.
+- **Cost.** Each run logs the count written and the estimated spend from the
+  bridge usage log. Calls count against the routine's `budget.daily_usd` and
+  the global budget.
+
 ### Mila meeting transcriptions
 
 `source.kind: mila` reads completed recordings without modifying Mila's live

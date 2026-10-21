@@ -93,3 +93,21 @@ memory:
   store: /absolute/path/to/your/personal-memory
   type: note
   tags: [slack]
+  # Optional: Slack profile lookups (also used by person_briefs below). The
+  # profile tool is called read-only, pinned to one user id.
+  # identity:
+  #   provider: slack_mcp
+  #   owner_email: me@example.com
+  #   owner_slug: me-example
+  #   search_tool: mcp__claude_ai_Example_Slack__slack_search_users
+  #   profile_tool: mcp__claude_ai_Example_Slack__slack_read_user_profile
+  #   internal_domains: [example.com]
+  # Optional: one short brief the first time a person appears in a capture
+  # (see "Person briefs" in the README).
+  person_briefs:
+    enabled: false
+    max_per_run: 3
+    max_per_day: 15
+    type: note
+    tag: person-brief
+    sources: [slack_mcp, mila, gmail_mcp]
