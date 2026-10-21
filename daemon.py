@@ -222,7 +222,9 @@ def _retry_unconfirmed(args, routines):
         raise config.RoutineError(
             "--retry-unconfirmed needs --routine and cannot be a dry run"
         )
-    routine = next(r for r in routines if r["id"] == args.routine)
+    routine = next((r for r in routines if r["id"] == args.routine), None)
+    if routine is None:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
     maintenance_cfg = routine.get("maintenance")
     if not (isinstance(maintenance_cfg, dict)
             and maintenance_cfg.get("kind") == "fibery_tasks_outbound"):

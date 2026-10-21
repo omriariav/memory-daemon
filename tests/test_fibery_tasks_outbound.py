@@ -1,5 +1,6 @@
 """Outbound memory todo -> Fibery inbox export, and inbound coordination."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -620,6 +621,10 @@ class CrossValidationTest(unittest.TestCase):
             "kind": "fibery_tasks_inbound"}}
         self.assertTrue(config.cross_problems([outbound, inbound])["inb"])
         inbound["maintenance"]["outbound_checkpoint"] = "state/./custom.json"
+        self.assertEqual(config.cross_problems([outbound, inbound]), {})
+        # The absolute spelling of the same file matches the relative one.
+        inbound["maintenance"]["outbound_checkpoint"] = os.path.join(
+            config._REPO_ROOT, "state", "custom.json")
         self.assertEqual(config.cross_problems([outbound, inbound]), {})
         # No outbound routine: nothing to match.
         inbound["maintenance"]["outbound_checkpoint"] = "state/other.json"

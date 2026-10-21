@@ -595,8 +595,16 @@ def _budget_problems(rid, routine):
     return problems
 
 
+# Relative state paths resolve against the repository root (the daemon's base
+# directory), so `state/x.json` and its absolute spelling compare equal.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _norm_path(value):
-    return os.path.normpath(os.path.expanduser(str(value).strip()))
+    path = os.path.expanduser(str(value).strip())
+    if not os.path.isabs(path):
+        path = os.path.join(_REPO_ROOT, path)
+    return os.path.normpath(path)
 
 
 def cross_problems(routines):
