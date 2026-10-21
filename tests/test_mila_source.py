@@ -844,3 +844,585 @@ class MilaRunnerTest(unittest.TestCase):
 
         self.assertEqual(second["errors"], 0)
         self.assertIn(self.candidate["id"], state.load(self.base))
+
+
+# --- on-device matching, connector calendar, duplicate captures -----------------
+
+from workspace_daemon import claude_bridge, local_llm  # noqa: E402
+
+LIST_TOOL = "mcp__example_calendar__list_events"
+
+CALENDAR_TEXT = """Found 2 event(s):
+
+- Alpha // Beta - intro
+  Time: 2026-07-27T22:00:00+03:00 - 2026-07-27T22:35:00+03:00
+  ID: evt-intro
+  Organizer: host@example.com
+  Attendees: host@example.com (accepted), me@example.com (accepted, self), room-1@resource.calendar.google.com (accepted)
+
+- Focus block
+  Time: 2026-07-27T22:00:00+03:00 - 2026-07-27T22:30:00+03:00
+  ID: evt-focus
+  Organizer: me@example.com
+  Attendees: me@example.com (accepted, self)
+"""
+
+LOCAL_MATCH = {
+    "provider": "ollama",
+    "model": "example-model",
+    "base_url": "http://localhost:11434",
+}
+
+
+def event(event_id, summary, attendees=True, start="2026-07-27T19:00:00Z",
+          end="2026-07-27T19:35:00Z"):
+    return {
+        "id": event_id, "summary": summary, "start": start, "end": end,
+        "event_type": "default",
+        "attendees": (
+            [{"email": "guest@example.com"},
+             {"email": "me@example.com", "self": True}]
+            if attendees else [{"email": "me@example.com", "self": True}]
+        ),
+    }
+
+
+def match_item(title="Alpha -- Beta - intro", events=(), body="Transcript"):
+    return {
+        "id": "mila:R@hash", "source_id": "mila:R", "title": title,
+        "date": "2026-07-27", "body": body,
+        "_mila_calendar_candidates": list(events),
+        "frontmatter": {
+            "mila_recording_start": "2026-07-27T19:02:44Z",
+            "mila_recording_end": "2026-07-27T19:32:44Z",
+            "mila_duration_seconds": 1800,
+        },
+    }
+
+
+def local_source(**extra):
+    return {"kind": "mila", "match": dict(LOCAL_MATCH), **extra}
+
+
+class LocalMatchTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+        self.routine = routine("/tmp/store", local_source())
+
+    def match(self, item, source=None):
+        return mila_source.match_calendar(
+            self.routine, source or local_source(), item
+        )
+
+    def test_normalized_titles_ignore_separators_case_and_diacritics(self):
+        self.assertTrue(mila_source.titles_match(
+            "Alpha -- Beta - intro", "ALPHA // beta – Intro"
+        ))
+        self.assertTrue(mila_source.titles_match("Café | sync", "cafe sync"))
+        self.assertTrue(mila_source.titles_match(
+            "פגישה -- סיכום",
+            "פגישה // סיכום",
+        ))
+        self.assertFalse(mila_source.titles_match("Alpha sync", "Beta review"))
+        self.assertFalse(mila_source.titles_match("", ""))
+
+    def test_title_and_time_rule_accepts_without_any_model(self):
+        item = match_item(events=[
+            event("evt-intro", "Alpha // Beta - intro"),
+            event("evt-other", "Unrelated weekly"),
+        ])
+        with mock.patch.object(local_llm, "chat_json") as chat:
+            accepted, match = self.match(item)
+        chat.assert_not_called()
+        self.assertTrue(accepted)
+        self.assertEqual(match["event_id"], "evt-intro")
+        self.assertEqual(match["confidence"], "high")
+        self.assertEqual(item["frontmatter"]["calendar_event_id"], "evt-intro")
+
+    def test_sole_overlapping_event_with_other_attendee_is_accepted(self):
+        item = match_item(title="New Recording", events=[event("only", "Planning")])
+        with mock.patch.object(local_llm, "chat_json") as chat:
+            accepted, match = self.match(item)
+        chat.assert_not_called()
+        self.assertTrue(accepted)
+        self.assertEqual(match["reason"], "sole overlapping event")
+
+    def test_solo_block_is_not_auto_accepted(self):
+        item = match_item(
+            title="New Recording",
+            events=[event("solo", "Focus", attendees=False)],
+        )
+        with mock.patch.object(
+            local_llm, "chat_json",
+            return_value={"matched": False, "event_id": None,
+                          "confidence": "low", "reason": "x"},
+        ) as chat:
+            accepted, _match = self.match(item)
+        chat.assert_called_once()
+        self.assertFalse(accepted)
+
+    def test_ambiguous_candidates_go_to_local_model(self):
+        item = match_item(title="Weekly", body="שלום לכולם",
+                          events=[event("a", "Weekly"), event("b", "Weekly")])
+        reply = {"matched": True, "event_id": "b", "confidence": "high",
+                 "reason": "transcript text that must never be kept"}
+        with mock.patch.object(local_llm, "chat_json", return_value=reply) as chat:
+            accepted, match = self.match(item)
+        self.assertTrue(accepted)
+        self.assertEqual(match["event_id"], "b")
+        self.assertNotIn("transcript text", json.dumps(match))
+        self.assertNotIn("transcript text", json.dumps(item["frontmatter"]))
+        args = chat.call_args[0]
+        self.assertEqual(args[0], "http://localhost:11434")
+        self.assertEqual(args[1], "example-model")
+        self.assertIn("שלום", args[2][0]["content"])
+        self.assertIs(args[3], transcripts_schema())
+
+    def test_local_model_cannot_select_an_unsupplied_event(self):
+        item = match_item(events=[event("a", "Weekly"), event("b", "Weekly")],
+                          title="Weekly")
+        reply = {"matched": True, "event_id": "invented",
+                 "confidence": "high", "reason": ""}
+        with mock.patch.object(local_llm, "chat_json", return_value=reply):
+            accepted, match = self.match(item)
+        self.assertFalse(accepted)
+        self.assertEqual(match["confidence"], "low")
+
+    def test_medium_confidence_is_not_accepted(self):
+        item = match_item(events=[event("a", "Weekly"), event("b", "Weekly")],
+                          title="Weekly")
+        reply = {"matched": True, "event_id": "a", "confidence": "medium",
+                 "reason": ""}
+        with mock.patch.object(local_llm, "chat_json", return_value=reply):
+            accepted, _match = self.match(item)
+        self.assertFalse(accepted)
+
+    def test_ollama_down_leaves_unmatched_and_never_uses_a_cloud_model(self):
+        item = match_item(events=[event("a", "Weekly"), event("b", "Weekly")],
+                          title="Weekly")
+        with mock.patch.object(
+            local_llm, "chat_json",
+            side_effect=local_llm.LocalLLMUnavailable("down"),
+        ), mock.patch.object(mila_source, "run_json") as yoetz, \
+             mock.patch.object(claude_bridge, "complete") as claude:
+            accepted, match = self.match(item)
+        self.assertFalse(accepted)
+        self.assertFalse(match["matched"])
+        yoetz.assert_not_called()
+        claude.assert_not_called()
+
+    def test_chat_json_maps_network_failure_to_unavailable(self):
+        import urllib.error
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.URLError("refused")
+        with mock.patch(
+            "urllib.request.build_opener", return_value=opener
+        ), self.assertRaises(local_llm.LocalLLMUnavailable):
+            local_llm.chat_json("http://localhost:1", "m", [], {})
+
+    def test_chat_json_sends_schema_temperature_and_utf8(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"message": {"content": '{"ok": true}'}}).encode()
+
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        schema = {"type": "object"}
+        with mock.patch("urllib.request.build_opener", return_value=opener):
+            result = local_llm.chat_json(
+                "http://localhost:11434/", "m",
+                [{"role": "user", "content": "שלום"}],
+                schema, timeout=5,
+            )
+        self.assertEqual(result, {"ok": True})
+        request = opener.open.call_args[0][0]
+        self.assertEqual(request.full_url, "http://localhost:11434/api/chat")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["format"], schema)
+        self.assertEqual(body["options"]["temperature"], 0)
+        self.assertFalse(body["stream"])
+        self.assertIn("שלום", request.data.decode("utf-8"))
+
+    def test_chat_json_rejects_malformed_reply_without_echoing_it(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"message": {"content": "SECRET not json"}}).encode()
+
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        with mock.patch("urllib.request.build_opener", return_value=opener):
+            with self.assertRaises(local_llm.LocalLLMError) as ctx:
+                local_llm.chat_json("http://localhost:1", "m", [], {})
+        self.assertNotIn("SECRET", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, local_llm.LocalLLMUnavailable)
+
+
+def transcripts_schema():
+    from workspace_daemon import transcripts
+    return transcripts.MATCH_SCHEMA
+
+
+def connector_source(**extra):
+    return {
+        "kind": "mila",
+        "calendar": {
+            "provider": "connector", "list_tool": LIST_TOOL,
+            "calendar_id": "primary", "owner_email": "me@example.com",
+        },
+        "calendar_timezone": "Asia/Jerusalem",
+        "calendar_match_hours": 6,
+        "match": dict(LOCAL_MATCH),
+        **extra,
+    }
+
+
+def fake_call_tools(text=CALENDAR_TEXT):
+    def call(prompt, tools, **kwargs):
+        return claude_bridge.ToolResults([
+            {"name": name, "input": dict(args), "text": text, "is_error": False}
+            for name, args in tools.items()
+        ])
+    return mock.Mock(side_effect=call)
+
+
+class ConnectorCalendarTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+        self.start = datetime.datetime(
+            2026, 7, 27, 19, 2, 44, tzinfo=datetime.timezone.utc
+        )
+        self.end = self.start + datetime.timedelta(minutes=30)
+
+    def test_one_pinned_read_only_call_returns_normalized_events(self):
+        bridge = fake_call_tools()
+        with mock.patch.object(claude_bridge, "call_tools", bridge):
+            events = mila_source._raw_calendar_events(
+                connector_source(), self.start, self.end
+            )
+        bridge.assert_called_once()
+        tools = bridge.call_args[0][1]
+        self.assertEqual(list(tools), [LIST_TOOL])
+        self.assertEqual(tools[LIST_TOOL], {
+            "calendar_id": "primary",
+            "time_min": "2026-07-27T13:00:00Z",
+            "time_max": "2026-07-28T02:00:00Z",
+            "max_results": 250,
+        })
+        self.assertEqual(bridge.call_args[1]["required"], [LIST_TOOL])
+        by_id = {e["id"]: e for e in events}
+        intro = by_id["evt-intro"]
+        self.assertEqual(intro["summary"], "Alpha // Beta - intro")
+        self.assertEqual(intro["organizer"], "host@example.com")
+        self.assertEqual(
+            [a["email"] for a in intro["attendees"]],
+            ["host@example.com", "me@example.com"],  # room dropped
+        )
+        self.assertTrue(intro["attendees"][1]["self"])
+        self.assertEqual(intro["response_status"], "accepted")
+
+    def test_recordings_in_one_window_cost_one_call(self):
+        bridge = fake_call_tools()
+        with mock.patch.object(claude_bridge, "call_tools", bridge):
+            first = mila_source._raw_calendar_events(
+                connector_source(), self.start, self.end
+            )
+            second = mila_source._raw_calendar_events(
+                connector_source(),
+                self.start + datetime.timedelta(seconds=26),
+                self.end - datetime.timedelta(minutes=2),
+            )
+        self.assertEqual(bridge.call_count, 1)
+        self.assertIs(first, second)
+
+    def test_distant_recording_makes_a_second_call(self):
+        bridge = fake_call_tools()
+        with mock.patch.object(claude_bridge, "call_tools", bridge):
+            mila_source._raw_calendar_events(
+                connector_source(), self.start, self.end
+            )
+            mila_source._raw_calendar_events(
+                connector_source(),
+                self.start + datetime.timedelta(days=2),
+                self.end + datetime.timedelta(days=2),
+            )
+        self.assertEqual(bridge.call_count, 2)
+
+    def test_unrecognised_connector_text_fails_loudly(self):
+        with mock.patch.object(
+            claude_bridge, "call_tools", fake_call_tools("garbage")
+        ), self.assertRaisesRegex(RuntimeError, "not recognised"):
+            mila_source._raw_calendar_events(
+                connector_source(), self.start, self.end
+            )
+
+    def test_dry_run_never_calls_the_connector(self):
+        bridge = fake_call_tools()
+        with mock.patch.object(claude_bridge, "call_tools", bridge):
+            events = mila_source._raw_calendar_events(
+                connector_source(_dry_run=True), self.start, self.end
+            )
+        self.assertEqual(events, [])
+        bridge.assert_not_called()
+
+    def test_gws_remains_the_default_provider(self):
+        with mock.patch.object(
+            mila_source, "run_json", return_value={"events": [{"id": "x"}]}
+        ) as run, mock.patch.object(
+            mila_source, "gws_bin", return_value="gws"
+        ), mock.patch.object(claude_bridge, "call_tools") as bridge:
+            events = mila_source._raw_calendar_events(
+                {"calendar_timezone": "UTC"}, self.start, self.end
+            )
+        self.assertEqual(events, [{"id": "x"}])
+        bridge.assert_not_called()
+        self.assertIn("calendar", run.call_args[0][0])
+
+
+class DuplicateCaptureTest(unittest.TestCase):
+    def setUp(self):
+        mila_source._reset_run()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.recordings = self.base / "recordings.json"
+        segment = [{"start": 0, "end": 1, "text": "שלום"}]
+        self.recordings.write_text(json.dumps([
+            record("MEMO", source="voiceMemo", audio="Memo.m4a",
+                   created="2026-07-27T19:03:10Z", duration=1780,
+                   title="Alpha -- Beta - intro", segments=segment),
+            record("SYS", source="systemAudio", duration=1800,
+                   title="Alpha -- Beta - intro", segments=segment),
+            record("RUNNING", status="running", source="systemAudio",
+                   title="Alpha -- Beta - intro", segments=segment),
+        ]))
+        self.source = connector_source(
+            recordings_file=str(self.recordings), max_results=0,
+        )
+        self.routine = routine(self.base / "memory", self.source)
+        self.routine["analyze"] = {
+            "provider": "claude", "model": "sonnet",
+            "instruction": "Keep durable meeting facts.",
+        }
+
+    def run_once(self):
+        with mock.patch.object(
+            claude_bridge, "call_tools", self.bridge
+        ), mock.patch.object(
+            llm, "analyze", return_value="Durable decision."
+        ) as analyze, mock.patch.object(
+            memory_sink, "capture",
+            return_value={"memory": "created", "memory_entry_id": "entry"},
+        ) as capture, mock.patch.object(
+            local_llm, "chat_json"
+        ) as chat:
+            runner.run(self.base, [self.routine])
+        chat.assert_not_called()
+        return analyze, capture
+
+    def test_running_recording_is_skipped_until_completed(self):
+        found = mila_source.candidates(self.source)
+        self.assertEqual(
+            {c["raw"]["source_id"] for c in found}, {"mila:MEMO", "mila:SYS"}
+        )
+        data = json.loads(self.recordings.read_text())
+        data[2]["status"] = "completed"
+        self.recordings.write_text(json.dumps(data))
+        self.assertIn(
+            "mila:RUNNING",
+            {c["raw"]["source_id"] for c in mila_source.candidates(self.source)},
+        )
+
+    def test_preferred_capture_comes_first(self):
+        order = [c["raw"]["source_id"] for c in mila_source.candidates(self.source)]
+        self.assertEqual(order, ["mila:SYS", "mila:MEMO"])
+
+    def test_longest_wins_when_neither_is_system_audio(self):
+        data = json.loads(self.recordings.read_text())
+        data[1]["source"] = "voiceMemo"
+        data[1]["createdAt"] = "2026-07-27T19:02:44Z"
+        data[1]["duration"] = 1500
+        self.recordings.write_text(json.dumps(data))
+        order = [c["raw"]["source_id"] for c in mila_source.candidates(self.source)]
+        self.assertEqual(order, ["mila:MEMO", "mila:SYS"])
+
+    def test_two_captures_of_one_meeting_yield_one_memory(self):
+        self.bridge = fake_call_tools()
+        analyze, capture = self.run_once()
+
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(self.bridge.call_count, 1)  # one window, one read
+        self.assertEqual(
+            capture.call_args[0][1]["source_id"], "mila:SYS"
+        )
+        ledger = state.load(self.base)
+        by_source = {entry["source_id"]: entry for entry in ledger.values()}
+        self.assertEqual(by_source["mila:MEMO"]["duplicate_of"], "mila:SYS")
+        self.assertNotIn("duplicate_of", by_source["mila:SYS"])
+        self.assertEqual(by_source["mila:SYS"]["calendar_event_id"], "evt-intro")
+        self.assertNotIn("calendar_match_rejected", by_source["mila:MEMO"])
+        processed = list(
+            (self.base / "state" / "transcriptions" / "processed").glob("*.json")
+        )
+        self.assertEqual(len(processed), 2)
+        self.assertFalse(
+            list((self.base / "state" / "transcriptions" / "failed").glob("*.json"))
+        )
+
+        # A later run leaves both settled.
+        mila_source._reset_run()
+        analyze, capture = self.run_once()
+        analyze.assert_not_called()
+        capture.assert_not_called()
+
+    def test_later_import_of_same_meeting_is_a_duplicate_across_runs(self):
+        data = json.loads(self.recordings.read_text())
+        self.recordings.write_text(json.dumps([data[1]]))  # only SYS first
+        self.bridge = fake_call_tools()
+        self.run_once()
+        self.recordings.write_text(json.dumps([data[0], data[1]]))  # MEMO arrives
+        mila_source._reset_run()
+        analyze, capture = self.run_once()
+        analyze.assert_not_called()
+        capture.assert_not_called()
+        ledger = state.load(self.base)
+        memo = next(e for e in ledger.values() if e["source_id"] == "mila:MEMO")
+        self.assertEqual(memo["duplicate_of"], "mila:SYS")
+
+    def test_ollama_down_is_unmatched_then_retried_next_run(self):
+        data = json.loads(self.recordings.read_text())
+        self.recordings.write_text(json.dumps([data[1]]))
+        twin = CALENDAR_TEXT.replace("Focus block", "Alpha // Beta - intro")
+        self.bridge = fake_call_tools(twin)
+
+        def run(chat):
+            mila_source._reset_run()
+            with mock.patch.object(
+                claude_bridge, "call_tools", self.bridge
+            ), mock.patch.object(
+                llm, "analyze", return_value="Durable decision."
+            ), mock.patch.object(
+                memory_sink, "capture",
+                return_value={"memory": "created", "memory_entry_id": "e"},
+            ) as capture, mock.patch.object(
+                local_llm, "chat_json", chat
+            ), mock.patch.object(claude_bridge, "complete") as cloud:
+                runner.run(self.base, [self.routine])
+            cloud.assert_not_called()
+            return capture
+
+        down = mock.Mock(side_effect=local_llm.LocalLLMUnavailable("down"))
+        capture = run(down)
+        capture.assert_not_called()
+        entry = next(iter(state.load(self.base).values()))
+        self.assertTrue(entry["calendar_match_rejected"])
+
+        up = mock.Mock(return_value={
+            "matched": True, "event_id": "evt-focus",
+            "confidence": "high", "reason": "x",
+        })
+        capture = run(up)
+        capture.assert_called_once()
+        entry = next(iter(state.load(self.base).values()))
+        self.assertNotIn("calendar_match_rejected", entry)
+        self.assertEqual(entry["calendar_event_id"], "evt-focus")
+
+    def test_non_overlapping_recordings_of_one_event_are_not_duplicates(self):
+        mila_source._reset_run()
+        long_event = event(
+            "e", "Alpha // Beta - intro", end="2026-07-27T22:00:00Z"
+        )
+        first = match_item(events=[long_event])
+        second = match_item(events=[long_event])
+        second["source_id"] = "mila:LATER"
+        second["frontmatter"]["mila_recording_start"] = "2026-07-27T21:00:00Z"
+        second["frontmatter"]["mila_recording_end"] = "2026-07-27T21:20:00Z"
+        r = routine("/tmp/store", local_source())
+        self.assertTrue(mila_source.match_calendar(r, local_source(), first)[0])
+        self.assertTrue(mila_source.match_calendar(r, local_source(), second)[0])
+
+
+class MilaConfigTest(unittest.TestCase):
+    def problems(self, **source_extra):
+        source = {"kind": "mila", "recordings_file": "/tmp/mila/recordings.json",
+                  **source_extra}
+        return config.validate(routine("/tmp/store", source))
+
+    def test_connector_and_ollama_config_is_valid(self):
+        self.assertEqual(self.problems(
+            calendar={"provider": "connector", "list_tool": LIST_TOOL,
+                      "calendar_id": "primary", "owner_email": "me@example.com"},
+            match=dict(LOCAL_MATCH),
+            max_transcript_chars=20000,
+        ), [])
+
+    def test_list_tool_must_be_a_read_only_list_name(self):
+        for bad in (
+            "mcp__example_calendar__create_event",
+            "mcp__example_calendar__delete_event",
+            "mcp__example_calendar__update_events",
+            "list_events",
+            "mcp__example_calendar__get_event",
+            None,
+        ):
+            problems = self.problems(
+                calendar={"provider": "connector", "list_tool": bad}
+            )
+            self.assertTrue(
+                any("list_tool" in p for p in problems), msg=str(bad)
+            )
+        self.assertTrue(mila_source.valid_list_tool(
+            "mcp__example-cal_1__list_events"
+        ))
+
+    def test_gws_remains_valid_default(self):
+        self.assertEqual(self.problems(calendar={"provider": "gws"}), [])
+        self.assertTrue(any(
+            "provider" in p for p in self.problems(calendar={"provider": "x"})
+        ))
+
+    def test_match_requires_local_base_url_and_known_provider(self):
+        self.assertTrue(any("localhost" in p for p in self.problems(
+            match={"provider": "ollama", "model": "m",
+                   "base_url": "http://example.com:11434"}
+        )))
+        self.assertTrue(any("match.provider" in p for p in self.problems(
+            match={"provider": "gemini", "model": "m"}
+        )))
+        self.assertTrue(any("match.model" in p for p in self.problems(
+            match={"provider": "ollama"}
+        )))
+
+    def test_claude_analyze_needs_a_match_block_for_mila(self):
+        source = {"kind": "mila", "recordings_file": "/tmp/mila/recordings.json"}
+        configured = routine("/tmp/store", source)
+        configured["analyze"] = {"provider": "claude", "model": "sonnet",
+                                 "instruction": "x"}
+        self.assertTrue(any(
+            "claude is not supported" in p for p in config.validate(configured)
+        ))
+        source["match"] = dict(LOCAL_MATCH)
+        self.assertEqual(config.validate(configured), [])
+
+    def test_transcript_bound_is_validated_and_applied(self):
+        self.assertTrue(any("max_transcript_chars" in p
+                            for p in self.problems(max_transcript_chars=5)))
+        text = "ש" * 1000 + "MIDDLE" + "ת" * 1000
+        bounded = mila_source._bounded(text, 1000)
+        self.assertLess(len(bounded), len(text))
+        self.assertIn("truncated", bounded)
+        self.assertTrue(bounded.startswith("ש"))
+        self.assertTrue(bounded.endswith("ת"))
+        self.assertEqual(mila_source._bounded("short", 1000), "short")

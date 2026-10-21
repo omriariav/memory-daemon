@@ -1031,10 +1031,58 @@ filenames carry the recording start; for imported Voice Memos, the original
 `createdAt` is the start. This distinction prevents a 30-minute meeting from
 being matched to Calendar 30 minutes late.
 
-Before normal analysis, the source reads nearby Calendar events and asks Yoetz
-to select only from that bounded candidate list. A capture proceeds only when
-the matcher returns `matched: true`, a supplied event ID, and `confidence:
-high`. Medium, low, missing, or invented matches never reach memory.
+Before normal analysis, the source reads nearby Calendar events and selects
+among that bounded candidate list. A capture proceeds only when the matcher
+returns `matched: true`, a supplied event ID, and `confidence: high`. Medium,
+low, missing, or invented matches never reach memory.
+
+By default candidates come from `gws` and matching uses the `analyze` model via
+Yoetz. Where `gws` (own Google OAuth) is not allowed and transcripts must not
+reach a cloud model for matching, configure both blocks:
+
+```yaml
+source:
+  kind: mila
+  calendar:
+    provider: connector            # default: gws
+    list_tool: mcp__<server>__list_events   # exact, read-only list tool
+    calendar_id: primary
+    owner_email: me@example.com    # optional, marks "self" attendees
+  match:
+    provider: ollama               # or claude (explicit opt-in to a cloud model)
+    model: qwen2.5:7b-instruct
+    base_url: http://localhost:11434   # must be localhost
+  max_transcript_chars: 60000      # bound on text sent to analysis
+analyze:
+  provider: claude                 # allowed for mila once source.match is set
+  model: sonnet
+```
+
+- Connector calendar: one read-only bridge call per recording window
+  (`calendar_id`, `time_min`/`time_max` = recording +/- `calendar_match_hours`
+  aligned to whole hours, `max_results` pinned) parsed with the Calendar-cache
+  parser. Windows are cached for the run, so recordings in one window cost one
+  call. `list_tool` must be a `list_events`-style name; write tools are
+  rejected.
+- Matching order: (1) rules, no model: a single time-plausible event (overlap
+  of at least half the shorter side) whose normalized title equals the
+  recording title (case, diacritics and the separators `/ // -- - | en/em
+  dash` ignored; Mila rewrites `/` in titles) is accepted as high, as is the
+  sole overlapping event that has another attendee; (2) ambiguous cases go to
+  the local model through Ollama's JSON-schema `format` at temperature 0, with
+  the same prompt and validation as before. The model's free-text reason is
+  discarded, and neither it nor transcript text is logged. If Ollama is down,
+  slow or returns garbage the recording stays unmatched and is retried next
+  run; there is never a silent cloud fallback.
+- Duplicates: a meeting captured twice (`systemAudio` plus `voiceMemo`) is
+  recognised when two recordings overlap and match the same Calendar event.
+  One memory is written (preferring `systemAudio`, else the longest); the
+  other is ledgered as `duplicate_of` without analysis. Recordings that are
+  still `running` are skipped until `completed`.
+- Calendar-event identity is kept in the ledger, so a copy that arrives in a
+  later run is still recognised as a duplicate. If the preferred copy failed to
+  match in an earlier run and the other copy was captured, the later preferred
+  copy is ledgered as the duplicate instead.
 
 Mila's directory is read-only. The daemon writes small, private receipts under
 `state/transcriptions/processed/` and `state/transcriptions/failed/`; it never
@@ -1554,7 +1602,8 @@ workspace_daemon/
   slack_mcp.py             Slack source through a claude.ai connector (headless bridge)
   slack_discovery.py       daily Slack channel discovery through the connector
   count_only.py            `run --count-only` report
-  mila_source.py           read-only Mila + Calendar matching
+  mila_source.py           read-only Mila + Calendar matching (rules, local model)
+  local_llm.py             on-device Ollama JSON chat (stdlib urllib)
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
   transcripts.py           shared transcript-source Calendar gate + receipts
   google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync

@@ -3,6 +3,7 @@ import datetime
 import re
 from pathlib import Path
 from string import Formatter
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -96,7 +97,7 @@ SOURCE_KEYS = {
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
-    "calendar_match_hours",
+    "calendar_match_hours", "calendar", "match", "max_transcript_chars",
     "transcriptions_dir", "min_quiet_seconds", "exclude_base_names",
 }
 
@@ -836,14 +837,18 @@ def validate(routine):
     for key in ("provider", "model"):
         if not analyze.get(key):
             problems.append(f"{rid}: analyze.{key} is required")
-    # Transcript calendar matching still calls yoetz with analyze.provider.
-    transcript_kinds = sorted({
-        s.get("kind") for s in sources(routine) if s.get("kind") in ("mila", "whisper")
+    # Whisper calendar matching still calls yoetz with analyze.provider; Mila
+    # matches through source.match (rules + local model) instead.
+    claude_blocked = sorted({
+        s.get("kind") for s in sources(routine)
+        if s.get("kind") == "whisper"
+        or (s.get("kind") == "mila" and not s.get("match"))
     })
-    if analyze.get("provider") == "claude" and transcript_kinds:
+    if analyze.get("provider") == "claude" and claude_blocked:
         problems.append(
             f"{rid}: analyze.provider claude is not supported for "
-            f"{', '.join(transcript_kinds)} sources yet (calendar matching uses yoetz)"
+            f"{', '.join(claude_blocked)} sources without a source.match "
+            f"block (calendar matching would use yoetz)"
         )
     # The instruction may be inline or sourced from a store connector body.
     from . import connector_prompts
@@ -1616,6 +1621,107 @@ def _validate_schedule(routine):
     return problems
 
 
+def _validate_mila_match(source, prefix):
+    from . import local_llm, mila_source
+    problems = []
+    calendar = source.get("calendar")
+    if calendar is not None:
+        if not isinstance(calendar, dict):
+            problems.append(f"{prefix}.calendar must be a mapping")
+        else:
+            unknown = set(calendar) - mila_source.CALENDAR_KEYS
+            if unknown:
+                problems.append(
+                    f"{prefix}.calendar has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}"
+                )
+            provider = calendar.get("provider", "gws")
+            if provider not in mila_source.CALENDAR_PROVIDERS:
+                problems.append(
+                    f"{prefix}.calendar.provider must be one of "
+                    f"{', '.join(mila_source.CALENDAR_PROVIDERS)}"
+                )
+            elif provider == "connector":
+                if not mila_source.valid_list_tool(calendar.get("list_tool")):
+                    problems.append(
+                        f"{prefix}.calendar.list_tool must be an exact "
+                        "read-only MCP list tool name "
+                        "(mcp__<server>__list_events)"
+                    )
+                if "calendar_id" in calendar and not _non_empty_str(
+                    calendar["calendar_id"]
+                ):
+                    problems.append(
+                        f"{prefix}.calendar.calendar_id must be a non-empty string"
+                    )
+                owner = calendar.get("owner_email")
+                if owner is not None and not (
+                    _non_empty_str(owner) and re.fullmatch(r"[^@\s]+@[^@\s]+", owner)
+                ):
+                    problems.append(
+                        f"{prefix}.calendar.owner_email must be an email address"
+                    )
+                if "model" in calendar and not _non_empty_str(calendar["model"]):
+                    problems.append(
+                        f"{prefix}.calendar.model must be a non-empty string"
+                    )
+            elif set(calendar) - {"provider"}:
+                problems.append(
+                    f"{prefix}.calendar: list_tool, calendar_id, owner_email and "
+                    "model apply only to provider connector"
+                )
+    match = source.get("match")
+    if match is not None:
+        if not isinstance(match, dict):
+            problems.append(f"{prefix}.match must be a mapping")
+        else:
+            unknown = set(match) - {"provider", "model", "base_url", "timeout"}
+            if unknown:
+                problems.append(
+                    f"{prefix}.match has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}"
+                )
+            if match.get("provider") not in mila_source.MATCH_PROVIDERS:
+                problems.append(
+                    f"{prefix}.match.provider must be one of "
+                    f"{', '.join(mila_source.MATCH_PROVIDERS)}"
+                )
+            if not _non_empty_str(match.get("model")):
+                problems.append(f"{prefix}.match.model is required")
+            timeout = match.get("timeout")
+            if timeout is not None and (
+                not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+                or not 1 <= timeout <= 600
+            ):
+                problems.append(
+                    f"{prefix}.match.timeout must be a number from 1 to 600"
+                )
+            if match.get("provider") == "ollama":
+                base_url = match.get("base_url", local_llm.DEFAULT_BASE_URL)
+                host = urlparse(base_url).hostname if isinstance(base_url, str) else None
+                scheme = urlparse(base_url).scheme if isinstance(base_url, str) else None
+                if scheme not in ("http", "https") or host not in (
+                    "localhost", "127.0.0.1", "::1"
+                ):
+                    problems.append(
+                        f"{prefix}.match.base_url must be an http(s) URL on "
+                        "localhost (transcripts must stay on this machine)"
+                    )
+            elif "base_url" in match:
+                problems.append(
+                    f"{prefix}.match.base_url applies only to provider ollama"
+                )
+    limit = source.get("max_transcript_chars")
+    if limit is not None and (
+        not isinstance(limit, int) or isinstance(limit, bool)
+        or not 1000 <= limit <= 1000000
+    ):
+        problems.append(
+            f"{prefix}.max_transcript_chars must be an integer from 1000 to 1000000"
+        )
+    return problems
+
+
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
@@ -2103,6 +2209,14 @@ def _validate_source(routine, source, prefix):
                         problems.append(
                             f"{entry_prefix}.transcript_file is required"
                         )
+
+    if kind == "mila":
+        problems.extend(_validate_mila_match(source, prefix))
+    elif any(key in source for key in ("calendar", "match", "max_transcript_chars")):
+        problems.append(
+            f"{prefix}: calendar, match and max_transcript_chars are only "
+            f"supported for kind mila"
+        )
 
     if kind == "whisper":
         transcriptions_dir = source.get("transcriptions_dir")

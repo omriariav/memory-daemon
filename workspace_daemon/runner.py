@@ -2462,9 +2462,41 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
 
     calendar_match = None
     if transcript_module is not None:
+        prime = getattr(transcript_module, "prime", None)
+        if prime is not None:
+            prime(processed.items())
         accepted, calendar_match = transcript_module.match_calendar(
             routine, source, item
         )
+        if not accepted and calendar_match.get("duplicate_of"):
+            # Another overlapping recording already supplies this meeting's
+            # memory; ledger this one as a duplicate without any analysis.
+            record = {
+                "rule_id": rid,
+                "source_kind": source["kind"],
+                "source_id": item["source_id"],
+                "processed_at": utc_now_iso(),
+                "duplicate_of": calendar_match["duplicate_of"],
+                "calendar_event_id": calendar_match["event_id"],
+            }
+            if handler_id:
+                record["handler_id"] = handler_id
+            if base_dir is not None:
+                transcript_module.write_receipt(
+                    base_dir, "processed", item,
+                    {
+                        "duplicate_of": calendar_match["duplicate_of"],
+                        "calendar_event_id": calendar_match["event_id"],
+                    },
+                )
+            processed.record_resolving(
+                item["id"], record, item["source_id"]
+            )
+            log(
+                f"routine={rid} id={item['id']} duplicate of "
+                f"{calendar_match['duplicate_of']}; not analyzed"
+            )
+            return record
         if not accepted:
             record = {
                 "rule_id": rid,
@@ -2523,6 +2555,13 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     }
     if handler_id:
         record["handler_id"] = handler_id
+    if transcript_module is not None and meta.get("calendar_event_id"):
+        # Lets a later run recognise a second capture of the same meeting.
+        record.update({
+            "calendar_event_id": meta["calendar_event_id"],
+            "recording_start": meta.get("mila_recording_start"),
+            "recording_end": meta.get("mila_recording_end"),
+        })
     canonical_memory_source_id = memory_sink.source_id_for(item)
     active_followup = (
         meta.get("gmail_chat_followup_managed") is True

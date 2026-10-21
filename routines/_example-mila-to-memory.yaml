@@ -33,11 +33,30 @@ source:
   calendar_match_hours: 6
   max_calendar_candidates: 8
   calendar_max_results: 250
-  match_max_output_tokens: 2048
+  # Upper bound on transcript characters sent to analysis (head and tail are
+  # kept). Counts characters, so it is script-agnostic (Hebrew, etc.).
+  max_transcript_chars: 60000
+
+  # Calendar candidates through the connector (read-only list tool, one pinned
+  # call per recording window, cached for the run) instead of the default
+  # `provider: gws`, which needs its own Google OAuth.
+  calendar:
+    provider: connector
+    list_tool: mcp__claude_ai_Example_Calendar__list_events
+    calendar_id: primary
+    owner_email: me@example.com
+
+  # On-device matching: deterministic title + time rules first, then a local
+  # Ollama model only for ambiguous recordings, so raw transcripts never reach
+  # a cloud model for matching. Ollama down means "unmatched, retry next run".
+  match:
+    provider: ollama
+    model: qwen2.5:7b-instruct
+    base_url: http://localhost:11434
 
 analyze:
-  provider: gemini
-  model: gemini/gemini-3.1-pro-preview
+  provider: claude          # headless Claude bridge; summaries only, no tools
+  model: sonnet
   max_output_tokens: 4096
   instruction: >-
     The source is a meeting transcript and may not be in English. Write the
