@@ -1588,6 +1588,53 @@ model. Three config-driven guards, all safe by default:
   titled with the summary's first sentence (never the raw message text) and
   tagged `extract-degraded`.
 
+#### Local triage (free pre-filter)
+
+`analyze.local_triage` puts a small on-device model (Ollama) in front of the
+paid `analyze` call for chat sources (`slack`, `slack_mcp`, `gchat`) on
+memory-only routines. It runs after the deterministic `skip_trivial` check and
+labels the conversation `small_talk`, `logistics` or `substantive` with a
+confidence. Off by default.
+
+```yaml
+analyze:
+  local_triage:
+    enabled: true
+    mode: shadow                 # shadow | enforce (default shadow)
+    provider: ollama
+    model: "qwen2.5:7b-instruct"
+    base_url: "http://localhost:11434"
+    max_chars: 4000
+    timeout_seconds: 20
+    min_confidence: 0.85
+    skip_labels: [small_talk]    # logistics is never skipped unless listed
+```
+
+- **Protected, never judged** (the model is not even called): items saved by
+  reaction; owner evidence `mentioned`, `channel-rule` or `saved`; request
+  forms; links; files or attachments; conversations longer than `max_chars`;
+  operator-confirmed sources.
+- **Fail open.** Server down, timeout, HTTP error, invalid JSON or an
+  out-of-range answer counts as `substantive`: the paid call runs as today.
+  The conversation text is sent only to the local server and never logged.
+- **`shadow`** never skips. Each item logs one line (label and confidence, no
+  text) and the ledger row gains `local_triage`
+  (`label`, `confidence`, `reason`, `mode`; `protected` or `failed` when the
+  model gave no verdict).
+- **`enforce`** skips the paid call only when the label is in `skip_labels`,
+  confidence is at least `min_confidence` and the item is not protected. The
+  row is ledgered as `memory: skipped_trivial` with
+  `trivial_reason: local-triage:<label>`.
+
+Rollout: run in `shadow` for a week or two, then
+`python3 daemon.py triage-report [--days N]`. It prints, per local label, how
+the paid pipeline ended (`created`, `skipped_not_worthy`, ...) and a
+`small_talk agreement` line. Switch to `enforce` once `small_talk` rows are
+almost all `skipped_not_worthy`; each `small_talk` row that was `created` is a
+memory enforcement would have lost. Raise `min_confidence` to trade savings for
+safety. The first call after Ollama loads the model is slow (several seconds);
+later calls are well under a second on Apple silicon.
+
 ### Slack via a connector
 
 `kind: slack_mcp` reads Slack through a claude.ai Slack connector driven by the

@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, triviality, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
 from . import gmail_mcp, slack_mcp
 from .shell import log, utc_now_iso
@@ -2535,6 +2535,33 @@ def _trivial_verdict(routine, item):
     return reason if trivial else None
 
 
+def _local_triage_verdict(routine, item):
+    """Local-model verdict dict for a chat item, else None (not applicable).
+
+    Same eligibility as `_trivial_verdict`: memory-only routine, chat source,
+    not operator-confirmed. Protected items come back as `{"protected": why}`
+    without the model being consulted.
+    """
+    cfg = local_triage.settings(config.analyze_cfg(routine))
+    if cfg is None or not triviality.is_chat_kind(item.get("source_kind")):
+        return None
+    if routine.get("output") or not memory_sink.memory_cfg(routine):
+        return None
+    if memory_sink.is_operator_confirmed(routine, item):
+        return None
+    verdict = local_triage.triage(item, cfg)
+    if verdict.get("protected"):
+        log(f"routine={routine['id']} id={item['id']} local triage: protected")
+    else:
+        log(
+            f"routine={routine['id']} id={item['id']} local triage "
+            f"mode={cfg['mode']} label={verdict['label']} "
+            f"confidence={verdict['confidence']}"
+            f"{' (failed open)' if verdict.get('failed') else ''}"
+        )
+    return verdict
+
+
 def _process(routine, source, candidate, fetch, processed, label_catalog,
              dry_run, totals, catalog=None, base_dir=None,
              prefetched_item=None, followup_predecessor_entry_id=None,
@@ -2718,6 +2745,31 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
             f"event={calendar_match['event_id']}"
         )
 
+    triage_verdict = _local_triage_verdict(routine, item)
+    if triage_verdict and triage_verdict.get("skip"):
+        reason = f"local-triage:{triage_verdict['label']}"
+        record = {
+            "rule_id": rid,
+            "source_kind": source["kind"],
+            "source_id": item.get("source_id"),
+            "processed_at": utc_now_iso(),
+            "output_file": None,
+            "memory": "skipped_trivial",
+            "trivial_reason": reason,
+            "local_triage": local_triage.ledger_field(triage_verdict),
+        }
+        memory_source_id = memory_sink.source_id_for(item)
+        if memory_source_id:
+            record["memory_source_id"] = memory_source_id
+        if handler_id:
+            record["handler_id"] = handler_id
+        processed.record_resolving(
+            item["id"], record, memory_source_id or item.get("source_id")
+        )
+        totals["trivial"] = totals.get("trivial", 0) + 1
+        log(f"routine={rid} id={item['id']} skipped ({reason}); no paid call")
+        return record
+
     _attach_related_memories(routine, source, item)
     prompt = llm.build_prompt(routine, item, label_catalog)
     content = llm.analyze(routine, prompt)
@@ -2745,6 +2797,8 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
     }
     if handler_id:
         record["handler_id"] = handler_id
+    if triage_verdict:
+        record["local_triage"] = local_triage.ledger_field(triage_verdict)
     if transcript_module is not None and meta.get("calendar_event_id"):
         # Lets a later run recognise a second capture of the same meeting.
         record.update({
