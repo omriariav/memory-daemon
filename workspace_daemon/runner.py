@@ -37,8 +37,6 @@ def _is_shared_dependency_failure(value):
 def _catch_up_cursor_id(source):
     """Stable cursor namespace for each supported catch-up source shape."""
     kind = source["kind"]
-    if kind == "slack_mcp":
-        return slack_mcp.cursor_id(source)
     if kind == "gchat":
         # Preserve the original namespace for legacy unbatched configurations.
         # Once batching is configured, fingerprint the construction contract:
@@ -280,13 +278,37 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     }
     source_overrides = {}
     catch_up_sources = []
+    slack_mcp_sources = []
     active_conversation_sources = []
     for routine in valid:
         routine_active = routine["id"] in active_ids
         for source_index, source in enumerate(config.sources(routine)):
             if (
-                (source.get("catch_up") is not True
-                 and source.get("kind") != "slack_mcp")
+                source.get("kind") == "slack_mcp"
+                and "slack_mcp" in active_source_kinds
+            ):
+                # One cursor per query (channels, each person, mentions); the
+                # source reports a watermark per cursor instead of holding.
+                ids = slack_mcp.cursor_ids(source)
+                runtime = {}
+                source_overrides[(routine["id"], source_index)] = {
+                    "_since_map": {
+                        key: slack_mcp.since_for(
+                            source, cursors.checkpoint(
+                                routine["id"], cursor_id, "slack_mcp"
+                            ),
+                        )
+                        for key, cursor_id in ids.items()
+                    },
+                    "_slack_mcp_runtime": runtime,
+                }
+                if routine_active:
+                    slack_mcp_sources.append(
+                        (routine["id"], source_index, ids, runtime)
+                    )
+                continue
+            if (
+                source.get("catch_up") is not True
                 or source.get("kind") not in active_source_kinds
             ):
                 continue
@@ -298,7 +320,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             if checkpoint:
                 second, _ = time_utils.rfc3339_key(checkpoint)
                 overlap = config.duration_seconds(
-                    source.get("catch_up_overlap") or source.get("overlap", "1h")
+                    source.get("catch_up_overlap", "1h")
                 )
                 since = (
                     second - datetime.timedelta(seconds=overlap)
@@ -307,8 +329,6 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 since = (
                     source.get("catch_up_after")
                     or source.get("batch_messages_after")
-                    or (slack_mcp.bootstrap_since(source)
-                        if kind == "slack_mcp" else None)
                 )
             if since:
                 override = {"_since": since}
@@ -490,6 +510,12 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 f"routine={routine_id} source={kind} FATAL: "
                 "Slack census did not report its discovery boundary"
             )
+
+    for rid, index, ids, runtime in slack_mcp_sources:
+        if not source_coverage.get((rid, index)):
+            successful_points.extend(slack_mcp.commit_points(
+                rid, ids, runtime, scan_started_at, cursors
+            ))
 
     if successful_points:
         cursors.mark_successful_at(successful_points)
@@ -1214,6 +1240,8 @@ TRANSCRIPT_SOURCES = {
 # --- candidate ownership and run loop --------------------------------------
 
 def _scope(source):
+    if source.get("kind") == "slack_mcp":
+        return "Slack via connector"
     if source.get("kind") == "gchat" and source.get("all_spaces"):
         return "all active Google Chat conversations"
     if source.get("kind") == "slack" and source.get("active_conversations"):
@@ -1412,7 +1440,7 @@ def _ownership_limit(source, sources):
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
     if source.get("kind") == "slack_mcp":
-        return slack_mcp.coverage_problem(candidates)
+        return None  # the source reports watermarks, not a hold
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
     if (
@@ -1691,7 +1719,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     )
 
             candidates_with_budget = [
-                (candidate, True) for candidate in candidates
+                # A deferred thread (settling or over the per-run cap) still
+                # claims ownership so another routine cannot take it.
+                (candidate, not (candidate.get("raw") or {}).get("_deferred"))
+                for candidate in candidates
             ]
             candidates_with_budget.extend(
                 (candidate, False)

@@ -10,8 +10,8 @@
 # Requires the Claude Code CLI logged in to an account with the Slack connector
 # authorized, and a personal-memory instance for the `memory:` block.
 #
-# The watched ids live in a private file outside the repository (shape in
-# the README for its shape), not in this routine.
+# The watched ids live in a private file outside the repository (its shape is
+# in the README), not in this routine.
 id: example-slack-mcp-to-memory
 enabled: false
 description: Distill watched Slack threads and mentions into memory entries.
@@ -26,18 +26,22 @@ source:
   self_user_id: U0EXAMPLEA   # your Slack user id (owner-evidence and mentions)
   model: haiku               # bridge model; it only transports tool results
   max_threads_per_run: 15    # extra threads wait for the next run
-  max_thread_replies: 50     # newest replies kept; older ones are noted
-  max_thread_chars: 8000
-  max_search_pages: 5        # 20 hits per page; hitting the cap holds the cursor
-  overlap: 1h                # re-list this much before the last clean run
+  max_thread_replies: 50     # newest replies read per thread
+  max_thread_chars: 8000     # newest kept first; omissions are marked
+  max_search_pages: 5        # 20 hits per page, oldest first
+  overlap: 1h                # re-list this much before each cursor
   settle_minutes: 15         # a thread waits until its newest message is this old
   include_bots: false
-  # Extra scalar arguments passed to every search (and pinned in the bridge).
+  # Pacing and budget: seconds between search sessions, and the most searches
+  # one run may plan (channel chunks + people + mentions).
+  min_seconds_between_searches: 3
+  max_queries_per_run: 20
+  # Extra scalar arguments for every search, pinned in the bridge. The daemon
+  # fixes sort, sort_dir, include_context and content_types itself.
   # search_args:
-  #   sort_dir: asc
-  # Mentions are searched with this filter text; {self_user_id} is the only
-  # placeholder.
-  # mention_filter: "<@{self_user_id}>"
+  #   workspace: example
+  # Mentions are searched by keyword; {self_user_id} is the only placeholder.
+  # mention_keywords: ["<@{self_user_id}>"]
 
 analyze:
   provider: claude

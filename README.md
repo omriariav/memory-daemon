@@ -267,13 +267,14 @@ reflects reality, and appends to `logs/run.log` so failed previews remain
 diagnosable. The one exception to "real source reads" is a `slack_mcp`
 source, whose listing needs an LLM bridge session: a dry run only logs its plan.
 
-`--count-only` is the cheap way to see what a run would do. It lists and routes
+`--count-only` cannot be combined with `--dry-run`. It is the cheap way to see what a run would do. It lists and routes
 candidates against the read-only ledger and cursors, then prints the number of
 new or changed items per routine and, for `slack_mcp`, the planned thread-read
 sessions and a cost estimate (mean past session cost times planned sessions,
 plus mean past analyze cost times threads, from `state/claude-usage.jsonl`;
 "unknown" with no history). It fetches nothing, calls no analysis model, and
-writes no ledger, cursor, store, or vault file; maintenance routines are not
+writes no ledger, cursor, store, or vault file (the bridge still logs its own
+session metadata to `state/claude-usage.jsonl`); maintenance routines are not
 run.
 
 ## Codex and Claude Code plugin
@@ -1164,43 +1165,58 @@ connector, so people are identified by Slack user id only.
 
 How a run works:
 
-1. Search is the lister. One bridge session runs the planned searches: the
-   watched channels (`in:<#id>` terms, 15 per query), one `from:<@id>` query per
-   person, and one mention query (`mention_filter`, default `<@{self_user_id}>`).
-   Each uses `after=<cursor minus overlap>`, `sort=timestamp`,
-   `include_context=false` and `limit=20`; pages that report a cursor are
-   followed in later sessions, up to `max_search_pages`. A search returns every
-   new root and reply with its channel, author, timestamp and thread root, so
-   late replies to old threads surface without reading channels.
-2. Hits are grouped by (channel, thread root). Bots are dropped unless
-   `include_bots`. Threads whose newest message is younger than
-   `settle_minutes` wait for the next run, and at most `max_threads_per_run`
-   (oldest first) are listed; threads already in the ledger are not listed.
+1. Search is the lister, oldest first. One bridge session runs the planned
+   searches: the watched channels (`in:<#id>` terms, 15 per query), one
+   `from:<@id>` query per person, and one mention query by keyword
+   (`mention_keywords`, default `<@{self_user_id}>`). Each uses
+   `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
+   `include_context=false`, `content_types=messages` and `limit=20`; pages that
+   report a cursor are followed in later sessions, up to `max_search_pages`.
+   Searches are spaced `min_seconds_between_searches` apart and a run plans at
+   most `max_queries_per_run`. Every new root and reply comes back with its
+   channel, author, timestamp and thread root, so late replies to old threads
+   surface without reading channels. Mention and DM hits parse like any other.
+2. Hits are cross-checked (the permalink must agree with the channel and
+   timestamp, a `from:` hit must be by that person, an `in:` hit must be in
+   the queried channels, timestamps must be plausible) and grouped by (channel,
+   thread root). Bots are dropped in Python unless `include_bots`. Threads
+   already in the ledger are skipped; of the rest, threads whose newest message
+   is younger than `settle_minutes`, and anything beyond `max_threads_per_run`
+   (oldest first), are deferred. Deferred threads still claim ownership, so
+   another routine cannot take them.
 3. Threads are read lazily from `fetch()`, up to eight per bridge session, only
-   for items the run actually processes. A thread keeps the parent and the
-   newest replies within `max_thread_replies` and `max_thread_chars`, with a
-   note for omitted earlier replies.
+   for items the run actually processes, with `limit = max_thread_replies`. The
+   connector returns the parent plus the newest replies (oldest to newest) in
+   one page and reports when earlier replies exist; the item keeps the parent
+   and as many of the newest replies as fit `max_thread_chars` (the newest is
+   never dropped, only truncated), with an `[N earlier replies omitted]` note
+   (the count appears when a search reported the thread's reply count). Bot
+   replies follow `include_bots`.
 
-Cursors reuse the catch-up machinery with no extra config: one cursor per
-watched scope, the first run starts `bootstrap` ago, later runs re-list from the
-last clean run minus `overlap`, and changing the watched scope starts a new
-cursor. The cursor advances only when the listing was complete and every item
-succeeded; a failed or rate-limited session, a settling or over-cap thread, or a
-capped search holds it (search is limited to about 20 calls a minute, so calls
-are sequential). The ledger stores ids and outcomes, never message bodies. If a
-window holds more hits than `max_search_pages * 20`, raise the cap or, when the
-connector supports it, set `search_args: {sort_dir: asc}` (extra scalar
-arguments, pinned in the bridge) so the oldest hits are read first.
+Cursors are per query: `channels` (hashed by the channel set), `from:<id>` for
+each person and `me` for mentions, so changing the watch list restarts only the
+query that changed (the first run starts `bootstrap` ago). A run commits each
+cursor to a watermark instead of holding everything: the older of the run's
+start, the newest message of the oldest deferred thread, and, for a search that
+hit `max_search_pages`, the point right after the last hit read (oldest-first
+paging leaves a contiguous prefix, so the next run continues from there). A
+failed or rate-limited listing, or any failed item, still holds the cursors.
+A thread whose read fails three times, or whose result cannot be parsed, is
+recorded in the ledger as unreadable (`slack_mcp: unreadable`, no message text)
+so it cannot block the cursor; a later reply makes a new version that is tried
+again. The ledger stores ids and outcomes, never message bodies.
 
 Security: validation accepts only exact `mcp__<server>__slack_search_*` /
 `slack_read_*` tool names without send, schedule, create, update, add, delete,
 upload or complete in them; each session allowlists a single read tool. Message
-text is untrusted data: the prompts say so, and Python accepts a tool result
-only when its input equals a planned call (more than two unplanned calls fail
-the listing). Search blocks must arrive in strict `Result k of N` order and are
-filtered to the channels each query asked for, so a message that mimics the
-format cannot add hits for other channels. Errors and logs carry counts only,
-never tool inputs or message text.
+text is untrusted data: the prompts say so and never contain it, and Python
+accepts a tool result only when its input equals a planned call (unplanned
+calls are dropped, never used; a missing planned call is re-issued once).
+Search pages and thread pages must have exactly one structurally consistent
+parse, so a message that imitates the connector's format cannot add or reorder
+hits; an ambiguous page fails the listing and holds the cursors until it ages
+out. Errors and logs carry counts only, never tool inputs or message text, and
+the runner's item titles for these threads are the channel and timestamp.
 
 ### Label caching
 

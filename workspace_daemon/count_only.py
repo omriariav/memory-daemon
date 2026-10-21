@@ -10,12 +10,22 @@ from . import slack_mcp
 from .shell import log
 
 
+def _is_new(processed, item_id):
+    """New, changed, or a failed sink that the next run would retry."""
+    entry = processed.get(item_id)
+    return (
+        entry is None
+        or "memory_error" in entry
+        or "expand_fallback" in entry
+    )
+
+
 def report(owned, processed, base_dir, totals):
     usage = Path(base_dir) / "state" / "claude-usage.jsonl"
     for rid in sorted(owned):
         claims = [
             claim for claim in owned[rid]
-            if claim["candidate"]["id"] not in processed
+            if _is_new(processed, claim["candidate"]["id"])
         ]
         totals["matched"] += len(owned[rid])
         totals["processed"] += len(claims)
@@ -23,7 +33,7 @@ def report(owned, processed, base_dir, totals):
         mcp = [c for c in claims if c["source"].get("kind") == "slack_mcp"]
         line = f"count-only routine={rid}: {len(claims)} new or changed item(s)"
         if mcp:
-            sessions, cost = slack_mcp.plan_cost(len(mcp), usage)
+            sessions, cost = slack_mcp.plan_cost(len(mcp), usage, rid)
             line += (
                 f" ({len(mcp)} Slack thread(s), {sessions} planned thread "
                 "read session(s), estimated cost "

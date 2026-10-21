@@ -23,19 +23,30 @@ else (planning, parsing, grouping, bounding, versioning) is deterministic
 Python, and the candidate ids match the `slack` source (`slack:<ch>:<root>`
 plus a `@<newest ts>` version), so switching `kind:` keeps the same memories.
 
-Listing is search-driven: one `search` call per query (channels in chunks,
-one per watched person, one for mentions) covers every new root and every
+Listing is search-driven, oldest first: one `search` call per query (channels
+in chunks, one per watched person, one for mentions) returns every new root and
 reply, so a late reply to an old thread surfaces without reading channels.
-Hits are grouped by (channel, thread root). A thread whose newest message is
-younger than `settle_minutes`, or beyond `max_threads_per_run`, is left for
-the next run and the runner holds its cursor. Thread bodies are read lazily
-from `fetch()`, a batch of threads per bridge session, only for candidates the
-runner actually processes.
+Hits are grouped by (channel, thread root).
 
-Message text is untrusted: the bridge exposes read tools only, the prompts
-tell the model to treat results as data, and Python accepts a result only when
-its tool input exactly equals a planned call. Errors and logs carry counts
-only, never tool inputs or message text.
+Cursors are per query (`channels`, `from:<id>`, `me`) and advance to a
+watermark rather than all-or-nothing: the older of the run's start, the newest
+timestamp of the oldest thread left for later (still settling, or over
+`max_threads_per_run`) and, for a search that hit `max_search_pages`, a point
+that resumes right after the newest hit actually read. Because pages arrive
+oldest first, a capped search leaves a contiguous fully-read prefix, so every
+run makes progress.
+
+Thread bodies are read lazily from `fetch()`, a batch of threads per bridge
+session, only for candidates the runner processes. A thread that cannot be
+parsed, or whose read fails three times, is recorded as unreadable in the
+ledger so one bad thread cannot block the cursor forever.
+
+Message text is untrusted: the bridge exposes read tools only, the prompts say
+results are data, and Python accepts a result only when its tool input equals
+a planned call (extra calls are dropped, never used). Search blocks and thread
+replies must form exactly one structurally consistent parse, otherwise the
+result is rejected as ambiguous. Errors and logs carry counts only, never tool
+inputs or message text.
 """
 import datetime
 import hashlib
@@ -43,10 +54,11 @@ import json
 import math
 import re
 import time
+from pathlib import Path
 
-from . import claude_bridge, slack_source
+from . import claude_bridge, slack_source, state
 from .chat_text import redact_secrets
-from .shell import log
+from .shell import log, utc_now_iso
 
 DEFAULTS = {
     "model": "haiku",
@@ -58,24 +70,38 @@ DEFAULTS = {
     "overlap": "1h",
     "settle_minutes": 15,
     "include_bots": False,
-    "mention_filter": "<@{self_user_id}>",
+    "mention_keywords": ["<@{self_user_id}>"],
+    "min_seconds_between_searches": 3,
+    "max_queries_per_run": 20,
+}
+# Keys only a slack_mcp source may carry (validated, not global source keys).
+SOURCE_KEYS = set(DEFAULTS) | {
+    "search_tool", "read_thread_tool", "self_user_id", "search_args",
 }
 CURSOR_SCHEMA = 1
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
 CALLS_PER_SESSION = 10
 THREADS_PER_SESSION = 8
-MAX_UNPLANNED_CALLS = 2
+MAX_READ_ATTEMPTS = 3
+FUTURE_SLACK_SECONDS = 300
 BRIDGE_TIMEOUT = 180
 BRIDGE_ATTEMPTS = 2
-# Search arguments that never vary; pinned in the bridge allowlist too.
-PINNED_SEARCH = {"sort": "timestamp", "include_context": False}
+# Search arguments we fix; search_args may not override them.
+PINNED_SEARCH = {
+    "sort": "timestamp", "sort_dir": "asc", "include_context": False,
+    "content_types": "messages",
+}
+RESERVED_SEARCH_ARGS = set(PINNED_SEARCH) | {
+    "filters", "keywords", "after", "cursor", "limit",
+}
 # Argument names of the connector's thread reader.
 THREAD_CHANNEL_ARG = "channel_id"
 THREAD_TS_ARG = "message_ts"
 THREAD_LIMIT_ARG = "limit"
 
 _base_dir = None
+_last_search = [0.0]
 
 
 def configure(base_dir):
@@ -87,6 +113,10 @@ def _now():
     return time.time()
 
 
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
 class SlackMcpError(RuntimeError):
     pass
 
@@ -96,8 +126,7 @@ class SlackMcpParseError(SlackMcpError):
 
 
 class Listing(list):
-    """Candidates plus `hold`: why the cursor must not advance (or None)."""
-    hold = None
+    """Candidates found by one listing run."""
 
 
 def settings(source):
@@ -117,28 +146,71 @@ def _seconds(value):
     return int(value[:-1]) * {"m": 60, "h": 3600, "d": 86400}[value[-1]]
 
 
-def cursor_id(source):
-    """Cursor namespace: a changed watch scope bootstraps afresh."""
-    scope = {
-        "channels": sorted(source.get("channels") or []),
-        "people": sorted(source.get("people") or []),
-        "include_mentions": source.get("include_mentions") is True,
-        "self_user_id": source.get("self_user_id"),
-        "schema": CURSOR_SCHEMA,
-    }
-    digest = hashlib.sha256(
-        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:16]
-    return f"slack_mcp:{digest}"
+def _digest(*parts):
+    return hashlib.sha256(
+        json.dumps(parts, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:12]
 
 
-def bootstrap_since(source, now=None):
-    """RFC3339 instant the first run looks back to."""
-    seconds = _seconds(source.get("bootstrap", DEFAULTS["bootstrap"]))
-    when = datetime.datetime.fromtimestamp(
-        (now if now is not None else _now()) - seconds, datetime.timezone.utc
-    )
+def mention_keywords(cfg):
+    return [
+        word.format(self_user_id=cfg["self_user_id"])
+        for word in cfg["mention_keywords"]
+    ]
+
+
+def cursor_ids(source):
+    """{query key: cursor id}: a scope change moves only the changed cursor."""
+    cfg = settings(source)
+    ids = {}
+    if cfg["channels"]:
+        ids["channels"] = "slack_mcp:channels:" + _digest(
+            sorted(cfg["channels"]), CURSOR_SCHEMA
+        )
+    for person in cfg["people"]:
+        ids[f"from:{person}"] = f"slack_mcp:from:{person}:v{CURSOR_SCHEMA}"
+    if cfg["include_mentions"]:
+        ids["me"] = "slack_mcp:me:" + _digest(
+            cfg["self_user_id"], cfg["mention_keywords"], CURSOR_SCHEMA
+        )
+    return ids
+
+
+def _rfc3339(epoch):
+    when = datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def since_for(source, checkpoint, now=None):
+    """RFC3339 instant one query lists from: checkpoint - overlap, or bootstrap."""
+    cfg = settings(source)
+    if checkpoint:
+        base = slack_source._rfc3339_epoch(checkpoint) - _seconds(cfg["overlap"])
+    else:
+        base = (now if now is not None else _now()) - _seconds(cfg["bootstrap"])
+    return _rfc3339(base)
+
+
+def commit_points(routine_id, ids, runtime, scan_started_at, cursors):
+    """Cursor stamps to commit after a clean run: min(scan start, watermark).
+
+    Never moves a cursor backwards; nothing is committed unless the listing
+    completed.
+    """
+    if not runtime.get("listed"):
+        return []
+    start = slack_source._rfc3339_epoch(scan_started_at)
+    points = []
+    for key, cursor_id in ids.items():
+        stamp = start
+        mark = runtime.get("watermarks", {}).get(key)
+        if mark is not None:
+            stamp = min(stamp, mark)
+        existing = cursors.checkpoint(routine_id, cursor_id, "slack_mcp")
+        if existing:
+            stamp = max(stamp, slack_source._rfc3339_epoch(existing))
+        points.append((routine_id, cursor_id, "slack_mcp", _rfc3339(stamp)))
+    return points
 
 
 # --- argument matching -------------------------------------------------------
@@ -148,6 +220,8 @@ def _norm(value):
         return "true" if value else "false"
     if isinstance(value, float) and value == int(value):
         value = int(value)
+    if isinstance(value, (list, tuple)):
+        return json.dumps([_norm(v) for v in value])
     return str(value)
 
 
@@ -158,19 +232,26 @@ def same_args(planned, given):
     return all(_norm(planned[k]) == _norm(given[k]) for k in planned)
 
 
-# --- search ------------------------------------------------------------------
+# --- search parsing ----------------------------------------------------------
 
 _COUNT_HEAD = re.compile(r"^## Messages \((\d+) results?\)$", re.M)
 _RESULT_HEAD = re.compile(r"^### Result (\d+) of (\d+)$", re.M)
 _CURSOR = re.compile(r"cursor:?\s*`([^`\s]+)`")
 _EMAIL_MASK = re.compile(r"\s*<\[?EMAIL:[^>]*>")
-_CHANNEL_LINE = re.compile(r"^Channel:.*\(ID: ([A-Z0-9]+)\)\s*$", re.M)
-_FROM_LINE = re.compile(
-    r"^From:\s*(.*?)\s*\(ID: ([A-Z0-9]+)\)\s*(\[BOT\])?\s*$", re.M
+_HIT_HEADER = re.compile(
+    r"Channel: [^\n]*\(ID: (?P<channel>[A-Z0-9]+)\)\n"
+    r"(?:Participants: [^\n]*\n)?"
+    r"From: (?P<author>[^\n]*?)\(ID: (?P<user>[A-Z0-9]+)\)[ \t]*"
+    r"(?P<bot>\[BOT\])?[ \t]*\n"
+    r"Time: [^\n]*\n"
+    r"Message_ts: (?P<ts>\d+\.\d+)\n"
+    r"(?:Reply count: (?P<replies>\d+)\n)?"
+    r"Permalink: (?P<link>[^\n]*)\n"
+    r"Text:"
 )
-_TS_LINE = re.compile(r"^Message_ts: (\d+\.\d+)\s*$", re.M)
-_REPLY_COUNT = re.compile(r"^Reply count: (\d+)\s*$", re.M)
-_THREAD_TS = re.compile(r"^Permalink:.*[?&]thread_ts=(\d+\.\d+)", re.M)
+_ARCHIVE = re.compile(r"/archives/([A-Z0-9]+)/p(\d+)")
+_LINK_THREAD = re.compile(r"[?&]thread_ts=(\d+\.\d+)")
+MAX_CHAINS = 500
 
 
 def _json_object(text):
@@ -188,35 +269,85 @@ def _clean_name(name):
 
 
 def _parse_hit(block):
-    header, sep, body = block.partition("\nText:")
-    if not sep:
-        raise SlackMcpParseError("search result has no Text section")
-    channel = _CHANNEL_LINE.search(header)
-    author = _FROM_LINE.search(header)
-    stamp = _TS_LINE.search(header)
-    if not (channel and author and stamp):
-        raise SlackMcpParseError("search result is missing a required field")
-    thread = _THREAD_TS.search(header)
+    """One result block, or None when its structure is not consistent."""
+    match = _HIT_HEADER.match(block)
+    if not match:
+        return None
+    archive = _ARCHIVE.search(match.group("link"))
+    ts = match.group("ts")
+    # The permalink must agree with the Channel and Message_ts lines.
+    if (
+        not archive
+        or archive.group(1) != match.group("channel")
+        or archive.group(2) != ts.replace(".", "")
+    ):
+        return None
+    thread = _LINK_THREAD.search(match.group("link"))
+    body = block[match.end():]
     body = body[1:] if body.startswith(" ") else body
     return {
-        "channel": channel.group(1),
-        "user": author.group(2),
-        "name": _clean_name(author.group(1)),
-        "is_bot": bool(author.group(3)),
-        "ts": stamp.group(1),
-        "root": thread.group(1) if thread else stamp.group(1),
+        "channel": match.group("channel"),
+        "user": match.group("user"),
+        "name": _clean_name(match.group("author")),
+        "is_bot": bool(match.group("bot")),
+        "ts": ts,
+        "root": thread.group(1) if thread else ts,
+        "replies": int(match.group("replies") or 0),
         "text": body.strip(),
     }
 
 
-def parse_search(text):
-    """Parse one search_public_and_private result into (hits, next cursor).
+def _chains(heads, total, rest):
+    """Every increasing selection of heads numbered 1..total with separators."""
+    found = []
 
-    Block boundaries are only accepted in strict sequence (Result k of N, with
-    the separator or section header just before), so a message body that
-    mimics a result header cannot add or reorder hits. A body can still forge
-    a perfectly sequenced block; hits are therefore filtered by the caller to
-    the channels the query asked for.
+    def extend(prefix, start):
+        if len(found) > MAX_CHAINS:
+            return
+        index = len(prefix) + 1
+        if index > total:
+            found.append(list(prefix))
+            return
+        for position in range(start, len(heads)):
+            head = heads[position]
+            if int(head.group(1)) != index:
+                continue
+            before = rest[:head.start()]
+            boundary = (
+                before.strip() == "" if index == 1
+                else before.endswith("\n---\n\n")
+            )
+            if boundary:
+                prefix.append(head)
+                extend(prefix, position + 1)
+                prefix.pop()
+
+    extend([], 0)
+    return found
+
+
+def _blocks(rest, chain):
+    hits = []
+    for index, head in enumerate(chain):
+        end = chain[index + 1].start() if index + 1 < len(chain) else len(rest)
+        block = re.sub(r"\n*---\s*$", "", rest[head.end():end].strip("\n"))
+        # The last block ends the text; an inner block ends at its separator.
+        hit = _parse_hit(block)
+        if hit is None:
+            return None
+        hits.append(hit)
+    return hits
+
+
+def parse_search(text):
+    """Parse one search result page into (hits, next cursor).
+
+    Numbering restarts on every page (`Result 1..N of N`, N = hits on this
+    page). A body can embed text that looks like further result blocks, so
+    every sequence of heads numbered 1..N with a separator before each is
+    parsed and validated (header fields in order, permalink agreeing with the
+    channel and timestamp). Exactly one valid parse is accepted; none or more
+    than one fails closed as ambiguous.
     """
     data = _json_object(text)
     body = data.get("results")
@@ -229,78 +360,87 @@ def parse_search(text):
         cursor = found.group(1) if found else None
     count = _COUNT_HEAD.search(body)
     if not count:
-        if re.search(r"^No results found\.?\s*$", body, re.M):
-            return [], None
+        if re.search(r"^No results found\.?\s*$", body, re.M) or re.search(
+            r"^## [A-Za-z]", body, re.M
+        ):
+            return [], cursor
         raise SlackMcpParseError("search result has an unknown shape")
     total = int(count.group(1))
     rest = body[count.end():]
-    heads = []
-    for match in _RESULT_HEAD.finditer(rest):
-        expect = len(heads) + 1
-        before = rest[:match.start()]
-        boundary = (
-            before.strip() == "" if expect == 1 else before.endswith("\n---\n\n")
+    heads = [
+        m for m in _RESULT_HEAD.finditer(rest) if int(m.group(2)) == total
+    ]
+    if len(heads) > total + 20:
+        raise SlackMcpParseError("search result has too many block headers")
+    parses = []
+    for chain in _chains(heads, total, rest):
+        hits = _blocks(rest, chain)
+        if hits is not None:
+            parses.append(hits)
+    if len(parses) != 1:
+        raise SlackMcpParseError(
+            "search result is ambiguous" if parses
+            else "search result blocks are malformed"
         )
-        if (
-            int(match.group(1)) == expect
-            and int(match.group(2)) == total
-            and boundary
-        ):
-            heads.append(match)
-    if len(heads) != total:
-        raise SlackMcpParseError("search result count does not match its blocks")
-    hits = []
-    for index, head in enumerate(heads):
-        end = heads[index + 1].start() if index + 1 < len(heads) else len(rest)
-        block = re.sub(r"\n*---\s*$", "", rest[head.end():end].strip("\n"))
-        hits.append(_parse_hit(block))
-    return hits, cursor
+    return parses[0], cursor
 
 
 # --- thread parsing ----------------------------------------------------------
 
 _THREAD_MARKER = re.compile(r"\n\n=== THREAD REPLIES \((\d+) total\) ===\n\n")
-_FROM_THREAD = re.compile(r"^From:\s*(.*?)\s*\(([A-Z0-9]+)\)\s*$")
-_TS_THREAD = re.compile(r"^Message TS: (\d+\.\d+)\s*$")
+_THREAD_AUTHOR = re.compile(
+    r"^From: (?P<name>.*?)[ \t]*(?:<\[?EMAIL:[^>\n]*>[ \t]*)?"
+    r"\((?P<id>[UWB][A-Z0-9]+)\)[ \t]*(?P<bot>\[BOT\])?[ \t]*$"
+)
+_THREAD_TS = re.compile(r"^Message TS: (\d+\.\d+)$")
 
 
 def _thread_message(block):
     lines = block.split("\n")
-    if len(lines) < 3 or lines[1].split(":", 1)[0] != "Time":
-        raise SlackMcpParseError("thread message header is malformed")
-    author = _FROM_THREAD.match(lines[0])
-    stamp = _TS_THREAD.match(lines[2])
+    if len(lines) < 3 or not lines[1].startswith("Time: "):
+        return None
+    author = _THREAD_AUTHOR.match(lines[0])
+    stamp = _THREAD_TS.match(lines[2])
     if not (author and stamp):
-        raise SlackMcpParseError("thread message header is malformed")
+        return None
     body = lines[3:]
     if body and body[-1].startswith("Reactions: "):
         body = body[:-1]
+    uid = author.group("id")
     return {
         "ts": stamp.group(1),
-        "user": author.group(2),
-        "name": _clean_name(author.group(1)),
+        "user": uid,
+        "name": _clean_name(author.group("name")),
+        "is_bot": bool(author.group("bot")) or uid.startswith("B"),
         "text": "\n".join(body).strip(),
     }
 
 
-def _replies(text, total):
-    """Reply blocks in strict sequence; None when the region is inconsistent."""
+def _reply_blocks(text, total):
+    """Reply blocks in strict sequence; None when inconsistent."""
     pieces = re.split(r"(?:^|\n\n)--- Reply (\d+) of (\d+) ---\n", text)
     if pieces[0].strip():
         return None
     out = []
     for index in range(1, len(pieces), 3):
-        if (
-            int(pieces[index]) != len(out) + 1
-            or int(pieces[index + 1]) != total
-        ):
+        if int(pieces[index]) != len(out) + 1 or int(pieces[index + 1]) != total:
             return None
-        out.append(_thread_message(pieces[index + 2].rstrip("\n")))
+        message = _thread_message(pieces[index + 2].rstrip("\n"))
+        if message is None:
+            return None
+        out.append(message)
     return out if len(out) == total else None
 
 
-def parse_thread(text):
-    """Parse one read_thread result into (parent, replies, total, more)."""
+def parse_thread(text, now=None):
+    """Parse one read_thread page into (parent, replies, more).
+
+    The page holds the parent and the newest replies requested; the counts in
+    its headers are per page. `more` means the connector reports earlier
+    replies it did not return. Reply timestamps must be after the parent's,
+    non-decreasing and not in the future. Exactly one consistent parse is
+    accepted.
+    """
     data = _json_object(text)
     body = data.get("messages")
     if not isinstance(body, str):
@@ -311,45 +451,70 @@ def parse_thread(text):
     if not body.startswith(head):
         raise SlackMcpParseError("thread result has an unknown shape")
     body = body[len(head):]
+    limit = (now if now is not None else _now()) + FUTURE_SLACK_SECONDS
+    parses = []
     markers = list(_THREAD_MARKER.finditer(body))
     if not markers:
-        return _thread_message(body.rstrip("\n")), [], 0, more
-    # A parent body can contain a forged marker; the real one is the first
-    # whose reply region parses consistently to its declared total.
+        parent = _thread_message(body.rstrip("\n"))
+        if parent:
+            parses.append((parent, []))
     for marker in markers:
-        total = int(marker.group(1))
-        replies = _replies(body[marker.end():], total)
-        if replies is not None:
-            return (
-                _thread_message(body[:marker.start()].rstrip("\n")),
-                replies, total, more,
-            )
-    raise SlackMcpParseError("thread replies are inconsistent")
+        replies = _reply_blocks(body[marker.end():], int(marker.group(1)))
+        parent = _thread_message(body[:marker.start()].rstrip("\n"))
+        if replies is not None and parent:
+            parses.append((parent, replies))
+    valid = []
+    for parent, replies in parses:
+        first = float(parent["ts"])
+        stamps = [float(r["ts"]) for r in replies]
+        if (
+            first <= limit
+            and all(t > first for t in stamps)
+            and stamps == sorted(stamps)
+            and all(t <= limit for t in stamps)
+        ):
+            valid.append((parent, replies))
+    if len(valid) != 1:
+        raise SlackMcpParseError(
+            "thread result is ambiguous" if valid
+            else "thread result is malformed"
+        )
+    return valid[0][0], valid[0][1], more
 
 
-def _bound_thread(parent, replies, more, max_chars):
-    """Parent + newest replies within max_chars, with omission markers."""
-    budget = max(200, int(max_chars))
-    parent = dict(parent, text=parent["text"][: budget // 2])
+def _truncate(text, limit):
+    return text if len(text) <= limit else text[:limit].rstrip() + " [truncated]"
+
+
+def bound_thread(parent, replies, more, max_chars, reply_hint=0):
+    """Parent + newest replies within max_chars, with omission markers.
+
+    The newest reply is always kept (truncated only if it alone exceeds the
+    budget). Older replies are dropped first.
+    """
+    budget = max(500, int(max_chars))
+    parent = dict(parent, text=_truncate(parent["text"], budget // 4))
     used = len(parent["text"])
     kept = []
     for reply in reversed(replies):
-        cost = len(reply["text"])
-        if used + cost > budget and kept:
+        text = reply["text"]
+        if not kept:
+            text = _truncate(text, max(200, budget - used))
+        elif used + len(text) > budget:
             break
-        text = reply["text"][: max(0, budget - used)] if not kept else reply["text"]
         kept.append(dict(reply, text=text))
         used += len(text)
     kept.reverse()
-    earlier = len(replies) - len(kept)
-    if earlier and kept:
-        kept[0]["text"] = f"[{earlier} earlier replies omitted]\n{kept[0]['text']}"
-    elif earlier:
-        parent["text"] += f"\n[{earlier} earlier replies omitted]"
-    if more:
-        # The connector paged the thread; the newest replies were not read.
-        last = kept[-1] if kept else parent
-        last["text"] += "\n[later replies not read]"
+    dropped = len(replies) - len(kept)
+    if more or dropped:
+        known = max(0, reply_hint - len(kept)) if reply_hint else 0
+        count = known if (more and known) else dropped
+        note = (
+            f"[{count} earlier replies omitted]" if count
+            else "[earlier replies omitted]"
+        )
+        target = kept[0] if kept else parent
+        target["text"] = f"{note}\n{target['text']}"
     return [parent] + kept
 
 
@@ -371,8 +536,7 @@ def _call_prompt(tool, calls, what):
     )
 
 
-def _session(cfg, tool, pins, calls, what):
-    """One bridge session; returns the result text for each planned call."""
+def _one_session(cfg, tool, pins, calls, what, required):
     results = claude_bridge.call_tools(
         _call_prompt(tool, calls, what),
         {tool: pins},
@@ -382,11 +546,10 @@ def _session(cfg, tool, pins, calls, what):
         max_budget_usd=round(0.1 + 0.03 * len(calls), 2),
         timeout=BRIDGE_TIMEOUT,
         attempts=BRIDGE_ATTEMPTS,
-        required=[tool],
+        required=required,
         accept_partial=True,
     )
     texts = [None] * len(calls)
-    unplanned = 0
     for result in results:
         if result["name"] != tool:
             continue
@@ -395,12 +558,23 @@ def _session(cfg, tool, pins, calls, what):
                 if texts[index] is None and not result.get("is_error"):
                     texts[index] = result["text"]
                 break
-        else:
-            unplanned += 1
-    if unplanned > MAX_UNPLANNED_CALLS:
-        raise claude_bridge.BridgeError(
-            f"{unplanned} unplanned {what} call(s) from the bridge"
+        # A call matching no planned argument set is dropped, never used.
+    return texts
+
+
+def _session(cfg, tool, pins, calls, what, required):
+    """Result text per planned call (None = no usable result).
+
+    Missing calls are re-issued once in a fresh session.
+    """
+    texts = _one_session(cfg, tool, pins, calls, what, required)
+    missing = [i for i, text in enumerate(texts) if text is None]
+    if missing:
+        again = _one_session(
+            cfg, tool, pins, [calls[i] for i in missing], what, required
         )
+        for index, text in zip(missing, again):
+            texts[index] = text
     return texts
 
 
@@ -408,62 +582,120 @@ def _search_pins(cfg):
     return dict(PINNED_SEARCH, **cfg["search_args"])
 
 
-def _search_args(cfg, filters, after, cursor=None):
-    args = dict(_search_pins(cfg), filters=filters, after=after,
-                limit=SEARCH_LIMIT)
+def _search_args(cfg, query, after, cursor=None):
+    args = dict(_search_pins(cfg), after=after, limit=SEARCH_LIMIT)
+    if query["filters"]:
+        args["filters"] = query["filters"]
+    if query["keywords"]:
+        args["keywords"] = query["keywords"]
     if cursor:
         args["cursor"] = cursor
     return args
 
 
 def search_queries(cfg):
-    """Planned queries: (kind, allowed channels or None, filters)."""
+    """Planned queries in run order (cursor key, kind, constraints)."""
     queries = []
     channels = cfg["channels"]
     for start in range(0, len(channels), CHANNELS_PER_QUERY):
         chunk = channels[start:start + CHANNELS_PER_QUERY]
-        queries.append((
-            "channels", set(chunk), " ".join(f"in:<#{c}>" for c in chunk),
-        ))
+        queries.append({
+            "key": "channels", "kind": "channels", "allowed": set(chunk),
+            "user": None, "keywords": None,
+            "filters": " ".join(f"in:<#{c}>" for c in chunk),
+        })
     for person in cfg["people"]:
-        queries.append(("from", None, f"from:<@{person}>"))
+        queries.append({
+            "key": f"from:{person}", "kind": "from", "allowed": None,
+            "user": person, "keywords": None, "filters": f"from:<@{person}>",
+        })
     if cfg["include_mentions"]:
-        queries.append((
-            "mentions", None,
-            cfg["mention_filter"].format(self_user_id=cfg["self_user_id"]),
-        ))
+        queries.append({
+            "key": "me", "kind": "mentions", "allowed": None, "user": None,
+            "keywords": mention_keywords(cfg), "filters": None,
+        })
     return queries
 
 
-def _search_all(cfg, queries, after):
-    """Run every query to completion; returns ([(query, hit)], capped)."""
+def _pace(cfg):
+    """Space search sessions apart (the connector rate-limits searches)."""
+    current = _now()
+    wait = cfg["min_seconds_between_searches"] - (current - _last_search[0])
+    if _last_search[0] and wait > 0:
+        _sleep(wait)
+        current += wait
+    _last_search[0] = current
+
+
+def _valid_hit(query, hit, after, now, cfg):
+    """Cross-check a parsed hit against the query that returned it."""
+    ts = float(hit["ts"])
+    if ts > now + FUTURE_SLACK_SECONDS or ts < after - FUTURE_SLACK_SECONDS:
+        return False
+    if query["allowed"] is not None and hit["channel"] not in query["allowed"]:
+        return False
+    if query["user"] is not None and hit["user"] != query["user"]:
+        return False
+    if query["kind"] == "mentions" and (
+        f"<@{cfg['self_user_id']}" not in hit["text"]
+    ):
+        return False
+    return True
+
+
+def _search_all(cfg, queries, afters, now):
+    """Run every query to completion or its page cap.
+
+    Returns ([(query, hit)], {cursor key: epoch watermark of a capped query}).
+    """
     pending = {
-        index: _search_args(cfg, query[2], after)
+        index: _search_args(cfg, query, afters[query["key"]])
         for index, query in enumerate(queries)
     }
     found = []
-    capped = False
+    capped = {}
+    newest = {}
     for page in range(cfg["max_search_pages"]):
         order = sorted(pending)
         following = {}
         for start in range(0, len(order), CALLS_PER_SESSION):
             part = order[start:start + CALLS_PER_SESSION]
+            _pace(cfg)
             texts = _session(
                 cfg, cfg["search_tool"], _search_pins(cfg),
-                [pending[i] for i in part], "search",
+                [pending[i] for i in part], "search", [cfg["search_tool"]],
             )
             for index, text in zip(part, texts):
                 if text is None:
                     raise claude_bridge.BridgeError(
                         "a planned search call returned no result"
                     )
+                query = queries[index]
                 hits, cursor = parse_search(text)
-                found.extend((queries[index], hit) for hit in hits)
+                after = afters[query["key"]]
+                accepted = [
+                    h for h in hits if _valid_hit(query, h, after, now, cfg)
+                ]
+                stamps = [float(h["ts"]) for h in hits]
+                last = newest.get(index)
+                if stamps and (
+                    stamps != sorted(stamps)
+                    or (last is not None and stamps[0] < last)
+                ):
+                    if cursor:
+                        raise SlackMcpError(
+                            "search results are not in ascending order"
+                        )
+                if stamps:
+                    newest[index] = max(stamps)
+                found.extend((query, hit) for hit in accepted)
                 if cursor and page + 1 >= cfg["max_search_pages"]:
-                    capped = True
+                    mark = newest.get(index, afters[query["key"]])
+                    key = query["key"]
+                    capped[key] = min(capped.get(key, mark), mark)
                 elif cursor:
                     following[index] = _search_args(
-                        cfg, queries[index][2], after, cursor
+                        cfg, query, after, cursor
                     )
         pending = following
         if not pending:
@@ -473,31 +705,21 @@ def _search_all(cfg, queries, after):
 
 # --- listing -----------------------------------------------------------------
 
-def _after(cfg, source, now):
-    since = source.get("_since")
-    if since:
-        return int(slack_source._rfc3339_epoch(since))
-    return int(now - _seconds(cfg["bootstrap"]))
-
-
 def _group(cfg, found):
     """Group accepted hits by (channel, thread root)."""
     watched = set(cfg["channels"])
     groups = {}
-    for (kind, allowed, _filters), hit in found:
+    for query, hit in found:
         if hit["is_bot"] and not cfg["include_bots"]:
-            continue
-        if allowed is not None and hit["channel"] not in allowed:
             continue
         key = (hit["channel"], hit["root"])
         group = groups.setdefault(
-            key, {"ts": hit["ts"], "title": "", "mention": False}
+            key, {"ts": hit["ts"], "mention": False, "replies": 0}
         )
         if float(hit["ts"]) > float(group["ts"]):
             group["ts"] = hit["ts"]
-        if hit["ts"] == hit["root"] or not group["title"]:
-            group["title"] = hit["text"]
-        if kind == "mentions" and hit["channel"] not in watched:
+        group["replies"] = max(group["replies"], hit["replies"])
+        if query["kind"] == "mentions" and hit["channel"] not in watched:
             group["mention"] = True
     return groups
 
@@ -511,70 +733,167 @@ def _already_done(processed, candidate_id):
     )
 
 
+def _candidate(candidate_id, anchor_id, channel, root, group, batch,
+               deferred=False):
+    raw = {
+        "channel": channel,
+        "anchor": root,
+        "source_id": anchor_id,
+        "via_mention": group["mention"],
+        "reply_hint": group["replies"],
+        "mode": "mcp_thread",
+        "_batch": batch,
+    }
+    if deferred:
+        raw["_deferred"] = True
+    return {
+        "id": candidate_id,
+        # Never message text: the runner logs titles.
+        "title": f"Slack thread {channel} {root}",
+        "raw": raw,
+    }
+
+
 def candidates(source):
     """List new or changed thread candidates; see the module docstring."""
     cfg = settings(source)
     queries = search_queries(cfg)
+    if len(queries) > cfg["max_queries_per_run"]:
+        raise SlackMcpError(
+            f"{len(queries)} planned searches exceed max_queries_per_run"
+        )
     now = _now()
-    after = _after(cfg, source, now)
+    since_map = source.get("_since_map") or {}
+    afters = {
+        query["key"]: int(slack_source._rfc3339_epoch(
+            since_map.get(query["key"]) or since_for(source, None, now)
+        ))
+        for query in queries
+    }
     if source.get("_dry_run") and not source.get("_count_only"):
         log(
             f"slack_mcp dry-run: would run {len(queries)} search "
-            f"quer{'y' if len(queries) == 1 else 'ies'} after={after}; "
-            "no bridge call made"
+            f"quer{'y' if len(queries) == 1 else 'ies'}; no bridge call made"
         )
         return Listing()
-    found, capped = _search_all(cfg, queries, after)
+    found, capped = _search_all(cfg, queries, afters, now)
     groups = _group(cfg, found)
     processed = source.get("_processed")
     settle_before = now - cfg["settle_minutes"] * 60
-    settling = 0
-    ready = []
+    ready, waiting = [], []
     for (channel, root), group in groups.items():
         anchor_id = f"slack:{channel}:{root}"
         candidate_id = f"{anchor_id}@{group['ts']}"
         if _already_done(processed, candidate_id):
             continue
-        if float(group["ts"]) > settle_before:
-            settling += 1
-            continue
-        ready.append((float(group["ts"]), candidate_id, anchor_id, channel,
-                      root, group))
+        row = (float(group["ts"]), candidate_id, anchor_id, channel, root,
+               group)
+        (waiting if float(group["ts"]) > settle_before else ready).append(row)
     ready.sort(key=lambda row: (row[0], row[1]))
-    deferred = max(0, len(ready) - cfg["max_threads_per_run"])
+    over = ready[cfg["max_threads_per_run"]:]
     ready = ready[:cfg["max_threads_per_run"]]
-    batch = {"cfg": cfg, "order": [], "threads": {}, "error": None}
+    batch = {
+        "cfg": cfg, "order": [], "threads": {}, "error": None,
+        "processed": processed,
+    }
     out = Listing()
     for _ts, candidate_id, anchor_id, channel, root, group in ready:
         batch["order"].append((channel, root))
-        out.append({
-            "id": candidate_id,
-            "title": redact_secrets(group["title"].replace("\n", " "))[:90],
-            "raw": {
-                "channel": channel,
-                "anchor": root,
-                "source_id": anchor_id,
-                "via_mention": group["mention"],
-                "mode": "mcp_thread",
-                "_batch": batch,
-            },
-        })
-    holds = []
-    if settling:
-        holds.append(f"{settling} thread(s) still settling")
-    if deferred:
-        holds.append(f"{deferred} thread(s) over max_threads_per_run")
-    if capped:
-        holds.append("search pages capped")
-    out.hold = "slack_mcp " + ", ".join(holds) if holds else None
+        out.append(_candidate(
+            candidate_id, anchor_id, channel, root, group, batch
+        ))
+    for _ts, candidate_id, anchor_id, channel, root, group in waiting + over:
+        out.append(_candidate(
+            candidate_id, anchor_id, channel, root, group, batch,
+            deferred=True,
+        ))
+    # Watermarks: nothing at or after the oldest deferred thread, or past a
+    # capped search's fully read prefix, may be committed.
+    deferred_floor = min(
+        (row[0] for row in waiting + over), default=None
+    )
+    marks = {}
+    overlap = _seconds(cfg["overlap"])
+    for query in queries:
+        key = query["key"]
+        values = [deferred_floor] if deferred_floor is not None else []
+        if key in capped:
+            # Resume exactly at the read prefix: the next run lists from
+            # cursor - overlap, so add the overlap back. Otherwise a window
+            # holding more than max_search_pages hits would be re-read forever.
+            values.append(int(capped[key]) + overlap)
+        if values:
+            marks[key] = min(values)
+    runtime = source.get("_slack_mcp_runtime")
+    if runtime is not None:
+        runtime["watermarks"] = marks
+        runtime["listed"] = True
     log(
         f"slack_mcp: {len(found)} hit(s) in {len(groups)} thread(s); "
-        f"{len(out)} new or changed, {settling} settling, {deferred} deferred"
+        f"{len(ready)} to process, {len(waiting)} settling, {len(over)} over "
+        f"the per-run cap, {len(capped)} capped search(es)"
     )
     return out
 
 
 # --- fetch -------------------------------------------------------------------
+
+def _attempts_path():
+    return Path(_base_dir) / "state" / "slack-mcp-attempts.json"
+
+
+def _load_attempts():
+    if _base_dir is None:
+        return {}
+    try:
+        data = json.loads(_attempts_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_attempts(data):
+    if _base_dir is None:
+        return
+    path = _attempts_path()
+    try:
+        if data:
+            state.write_atomic(path, json.dumps(data, sort_keys=True), mode=0o600)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _bump_attempts(candidate_id):
+    data = _load_attempts()
+    data[candidate_id] = int(data.get(candidate_id, 0)) + 1
+    _save_attempts(data)
+    return data[candidate_id]
+
+
+def _clear_attempts(candidate_id):
+    data = _load_attempts()
+    if data.pop(candidate_id, None) is not None:
+        _save_attempts(data)
+
+
+def _mark_unreadable(routine, candidate, batch, reason):
+    """Terminal ledger entry so one bad thread cannot block the cursor."""
+    store = batch.get("processed")
+    if store is not None:
+        store.record(candidate["id"], {
+            "rule_id": routine.get("id"),
+            "source_kind": "slack_mcp",
+            "source_id": candidate["raw"]["source_id"],
+            "processed_at": utc_now_iso(),
+            "slack_mcp": "unreadable",
+            "reason": reason,
+        })
+    _clear_attempts(candidate["id"])
+    log(f"slack_mcp: thread {candidate['raw']['channel']} "
+        f"{candidate['raw']['anchor']} recorded as unreadable ({reason})")
+
 
 def _read_threads(batch, wanted):
     """One bridge session reading up to THREADS_PER_SESSION threads."""
@@ -589,33 +908,38 @@ def _read_threads(batch, wanted):
         {
             THREAD_CHANNEL_ARG: channel,
             THREAD_TS_ARG: root,
-            THREAD_LIMIT_ARG: cfg["max_thread_replies"] + 1,
+            THREAD_LIMIT_ARG: cfg["max_thread_replies"],
         }
         for channel, root in todo
     ]
     try:
+        # required=[]: one thread's error or empty result must not fail the
+        # whole session; it is judged per thread below.
         texts = _session(
-            cfg, cfg["read_thread_tool"], {}, calls, "thread read"
+            cfg, cfg["read_thread_tool"], {}, calls, "thread read", []
         )
     except claude_bridge.BridgeError as exc:
-        # Stay failed for the rest of the run: retrying a rate-limited or
-        # broken connector once per candidate only burns sessions.
+        # A session-level failure (timeout, rate limit) stays failed for the
+        # rest of the run instead of retrying once per candidate.
         batch["error"] = str(exc)
         raise
     for key, text in zip(todo, texts):
         if text is None:
+            batch["threads"][key] = {"status": "missing"}
             continue
         try:
             parsed = parse_thread(text)
         except SlackMcpParseError:
+            batch["threads"][key] = {"status": "invalid"}
             continue
-        if parsed[0]["ts"] == key[1]:
-            batch["threads"][key] = parsed
+        if parsed[0]["ts"] != key[1]:
+            batch["threads"][key] = {"status": "invalid"}
+        else:
+            batch["threads"][key] = {"status": "ok", "parsed": parsed}
 
 
 def fetch(routine, candidate, source=None):
-    """Render one thread from the batch-read connector text (no network here
-    beyond the lazy read)."""
+    """Render one thread from its connector read."""
     raw = candidate["raw"]
     batch = raw["_batch"]
     key = (raw["channel"], raw["anchor"])
@@ -623,12 +947,24 @@ def fetch(routine, candidate, source=None):
         if batch["error"]:
             raise claude_bridge.BridgeError(batch["error"])
         _read_threads(batch, key)
-    parsed = batch["threads"].get(key)
-    if parsed is None:
-        raise SlackMcpError("thread read returned no usable result")
-    parent, replies, _total, more = parsed
+    outcome = batch["threads"][key]
+    if outcome["status"] == "invalid":
+        _mark_unreadable(routine, candidate, batch, "unparseable")
+        raise SlackMcpError("thread result was unusable; recorded as unreadable")
+    if outcome["status"] == "missing":
+        if _bump_attempts(candidate["id"]) >= MAX_READ_ATTEMPTS:
+            _mark_unreadable(routine, candidate, batch, "read failed")
+            raise SlackMcpError("thread unreadable after repeated failures")
+        raise SlackMcpError("thread read returned no result")
+    _clear_attempts(candidate["id"])
+    parent, replies, more = outcome["parsed"]
     cfg = batch["cfg"]
-    messages = _bound_thread(parent, replies, more, cfg["max_thread_chars"])
+    if not cfg["include_bots"]:
+        replies = [r for r in replies if not r["is_bot"]]
+    messages = bound_thread(
+        parent, replies, more, cfg["max_thread_chars"],
+        raw.get("reply_hint") or 0,
+    )
     names = {}
     for message in messages:
         names.setdefault(message["user"], message["name"] or message["user"])
@@ -645,23 +981,21 @@ def fetch(routine, candidate, source=None):
     )
 
 
-def coverage_problem(candidates_listing):
-    """Runner hook: why a successful listing cannot advance the cursor."""
-    return getattr(candidates_listing, "hold", None)
-
-
 def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def plan_cost(count, usage_path):
+def plan_cost(count, usage_path, routine_id=None):
     """(sessions, estimated USD or None) for `count` new threads.
 
     Uses the mean cost of past bridge sessions (logged with tools) and of
-    no-tool analyze runs from the usage log; None when there is no history.
+    no-tool analyze runs from the usage log. When usage lines carry a routine
+    tag, only this routine's lines are averaged; untagged logs average all.
     """
     sessions = int(math.ceil(count / float(THREADS_PER_SESSION))) if count else 0
-    tool_costs, analyze_costs = [], []
+    if not count:
+        return 0, 0.0
+    entries = []
     try:
         with open(usage_path) as handle:
             for line in handle:
@@ -669,14 +1003,17 @@ def plan_cost(count, usage_path):
                     entry = json.loads(line)
                 except ValueError:
                     continue
-                cost = entry.get("total_cost_usd")
-                if not isinstance(cost, (int, float)) or isinstance(cost, bool):
-                    continue
-                (tool_costs if entry.get("tools") else analyze_costs).append(cost)
+                if isinstance(entry, dict):
+                    entries.append(entry)
     except OSError:
         pass
-    if not count:
-        return 0, 0.0
+    if routine_id and any(e.get("routine") for e in entries):
+        entries = [e for e in entries if e.get("routine") == routine_id]
+    tool_costs, analyze_costs = [], []
+    for entry in entries:
+        cost = entry.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            (tool_costs if entry.get("tools") else analyze_costs).append(cost)
     if not tool_costs and not analyze_costs:
         return sessions, None
     return sessions, round(

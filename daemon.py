@@ -205,6 +205,11 @@ def _count_only(routines, active_ids):
 def cmd_run(args):
     set_log_file(LOG_FILE)
     count_only = getattr(args, "count_only", False)
+    if count_only and args.dry_run:
+        raise config.RoutineError(
+            "--count-only and --dry-run cannot be combined: a dry run makes "
+            "no connector call, so it has nothing to count"
+        )
     if not args.dry_run and not count_only:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)

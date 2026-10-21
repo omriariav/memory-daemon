@@ -79,10 +79,6 @@ SOURCE_KEYS = {
     "reply_roots_after", "spaces", "all_spaces", "hours", "batch_unthreaded",
     "batch_messages", "batch_messages_after", "max_per_space", "expand", "tabs",
     "session_gap_minutes", "watch", "people", "ignore_people",
-    "search_tool", "read_thread_tool", "self_user_id", "model",
-    "max_threads_per_run", "max_thread_replies", "max_thread_chars",
-    "max_search_pages", "bootstrap", "overlap", "settle_minutes",
-    "include_bots", "mention_filter", "search_args",
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
@@ -1292,6 +1288,7 @@ def _validate_slack_mcp(prefix, source):
     if not (
         source.get("channels") or source.get("people")
         or source.get("include_mentions") is True
+        or source.get("_watch_unread")
     ):
         problems.append(
             f"{prefix}: source.kind 'slack_mcp' needs channels, people "
@@ -1304,7 +1301,8 @@ def _validate_slack_mcp(prefix, source):
     for key, lower, upper in (
         ("max_threads_per_run", 1, 100), ("max_thread_replies", 1, 500),
         ("max_thread_chars", 500, 100000), ("max_search_pages", 1, 20),
-        ("settle_minutes", 0, 1440),
+        ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 100),
+        ("min_seconds_between_searches", 0, 120),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(
@@ -1322,33 +1320,51 @@ def _validate_slack_mcp(prefix, source):
         problems.append(f"{prefix}.include_bots must be true or false")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
-    template = source.get("mention_filter")
-    if template is not None:
+    keywords = source.get("mention_keywords")
+    if keywords is not None:
         try:
             ok = (
-                isinstance(template, str)
-                and {f for _, f, _, _ in Formatter().parse(template) if f}
-                <= {"self_user_id"}
+                isinstance(keywords, list) and keywords
+                and all(isinstance(w, str) and w for w in keywords)
+                and all(
+                    {f for _, f, _, _ in Formatter().parse(w) if f}
+                    <= {"self_user_id"}
+                    for w in keywords
+                )
             )
         except ValueError:
             ok = False
         if not ok:
             problems.append(
-                f"{prefix}.mention_filter may only use the {{self_user_id}} "
-                "placeholder"
+                f"{prefix}.mention_keywords must be a non-empty list of "
+                "strings using only the {self_user_id} placeholder"
             )
     extra = source.get("search_args")
-    if extra is not None and (
-        not isinstance(extra, dict)
-        or not all(
+    if extra is not None:
+        from . import slack_mcp
+        if not isinstance(extra, dict) or not all(
             isinstance(k, str) and isinstance(v, (str, int, float, bool))
             for k, v in extra.items()
-        )
-        or {"filters", "after", "cursor", "limit"} & set(extra)
-    ):
+        ):
+            problems.append(
+                f"{prefix}.search_args must map extra scalar arguments"
+            )
+        elif set(extra) & slack_mcp.RESERVED_SEARCH_ARGS:
+            problems.append(
+                f"{prefix}.search_args cannot set "
+                f"{', '.join(sorted(set(extra) & slack_mcp.RESERVED_SEARCH_ARGS))} "
+                "(fixed by the daemon)"
+            )
+    planned = (
+        -(-len(source.get("channels") or []) // 15)
+        + len(source.get("people") or [])
+        + (1 if source.get("include_mentions") is True else 0)
+    )
+    cap = source.get("max_queries_per_run", 20)
+    if _bounded_int(cap, 1, 100) and planned > cap:
         problems.append(
-            f"{prefix}.search_args must map extra scalar arguments (not "
-            "filters, after, cursor or limit)"
+            f"{prefix}: {planned} planned searches exceed "
+            f"max_queries_per_run ({cap})"
         )
     if "max_results" in source:
         problems.append(
@@ -1384,8 +1400,12 @@ def _validate_schedule(routine):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
+    from . import slack_mcp
+    allowed = SOURCE_KEYS | (
+        slack_mcp.SOURCE_KEYS if source.get("kind") == "slack_mcp" else set()
+    )
     unknown_source = {
-        key for key in set(source) - SOURCE_KEYS
+        key for key in set(source) - allowed
         if not str(key).startswith("_watch")
     }
     if unknown_source:
