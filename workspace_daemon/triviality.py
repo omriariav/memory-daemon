@@ -99,6 +99,22 @@ def is_borderline(item, max_chars=DEFAULT_MAX_CHARS):
     return len(human_text(item.get("body", ""))) <= max_chars
 
 
+def guard_reason(item):
+    """Why a chat item has substance the guards always keep, else None.
+
+    Link, file/attachment and request-form checks shared with ``assess``;
+    used to keep a local model from ever judging such items.
+    """
+    body = item.get("body") or ""
+    if _URL_RE.search(body):
+        return "contains a link"
+    if _FILE_RE.search(body):
+        return "contains a file or attachment"
+    if _REQUEST_RE.search(human_text(body)):
+        return "request form"
+    return None
+
+
 def assess(item, max_chars=DEFAULT_MAX_CHARS, extra_words=()):
     """Return (is_trivial, reason) for a chat item; conservative by design."""
     if not is_chat_kind(item.get("source_kind")):

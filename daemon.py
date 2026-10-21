@@ -155,6 +155,17 @@ def cmd_backfill_owner_todos(args):
     return 0
 
 
+# --- triage-report ----------------------------------------------------------
+
+def cmd_triage_report(args):
+    from workspace_daemon import local_triage
+    entries = [e for _k, e in state.Store(BASE_DIR, dry_run=True).items()]
+    matrix = local_triage.report(
+        entries, days=args.days, min_confidence=args.min_confidence)
+    print(local_triage.render_report(matrix))
+    return 0
+
+
 # --- validate ---------------------------------------------------------------
 
 def cmd_validate(args):
@@ -640,6 +651,16 @@ def main(argv=None):
     p_bf.add_argument("-n", "--dry-run", action="store_true",
                       help="extract and count, but write nothing to the store")
     p_bf.set_defaults(func=cmd_backfill_owner_todos)
+    p_tr = sub.add_parser(
+        "triage-report",
+        help="agreement of the local triage label with the paid outcome",
+    )
+    p_tr.add_argument("--days", type=int, default=None,
+                      help="only ledger rows from the last N days")
+    p_tr.add_argument("--min-confidence", type=float, default=0.85,
+                      help="split small_talk rows at this confidence "
+                           "(default: %(default)s)")
+    p_tr.set_defaults(func=cmd_triage_report)
     sub.add_parser("validate", help="check all routine YAML").set_defaults(func=cmd_validate)
     sub.add_parser("new", help="interactive scaffold for a new routine").set_defaults(func=cmd_new)
 

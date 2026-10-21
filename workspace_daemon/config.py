@@ -91,7 +91,7 @@ ANALYZE_KEYS = {
     "provider", "model", "instruction", "instruction_from_connector",
     "instruction_extra", "connector_sweep", "max_output_tokens",
     "focus_domains", "pick_label", "skip_trivial", "trivial_max_chars",
-    "trivial_extra_words",
+    "trivial_extra_words", "local_triage",
 }
 OUTPUT_KEYS = {"vault_dir", "slug_prefix", "filename_template", "kind", "tags"}
 SOURCE_KEYS = {
@@ -931,6 +931,18 @@ def validate(routine):
     ):
         problems.append(
             f"{rid}: analyze.trivial_extra_words must be a list of strings"
+        )
+    from . import local_triage
+    problems.extend(local_triage.validate(rid, analyze))
+    if (
+        isinstance(analyze.get("local_triage"), dict)
+        and analyze["local_triage"].get("enabled") is True
+        and any(s.get("kind") not in ("slack", "slack_mcp", "gchat")
+                for s in source_dicts)
+    ):
+        problems.append(
+            f"{rid}: analyze.local_triage applies to chat sources only "
+            "(slack, slack_mcp, gchat)"
         )
     domains = analyze.get("focus_domains")
     if domains is not None and not isinstance(domains, list):

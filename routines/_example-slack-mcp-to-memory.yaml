@@ -72,6 +72,18 @@ analyze:
   model: sonnet
   max_output_tokens: 4096
   instruction_from_connector: slack
+  # Optional free pre-filter on a local Ollama model (see "Local triage" in
+  # the README). Start in shadow mode, compare with `daemon.py triage-report`,
+  # then switch to enforce. Failures always fall through to the paid call.
+  # local_triage:
+  #   enabled: true
+  #   mode: shadow               # shadow (record only) | enforce
+  #   model: "qwen2.5:7b-instruct"
+  #   base_url: "http://localhost:11434"
+  #   max_chars: 4000            # longer conversations are never judged
+  #   timeout_seconds: 20
+  #   min_confidence: 0.85
+  #   skip_labels: [small_talk]  # logistics is never skipped unless listed
   # Optional: stream-specific guidance appended to the connector body.
   instruction_extra: >-
     This sweep covers the team's project channels. Treat rollout steps and
