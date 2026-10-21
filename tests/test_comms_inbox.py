@@ -374,6 +374,134 @@ class ReactionReadTest(InboxTestCase):
                 self.run_once()
 
 
+TRACK = "track-example"
+TRACK_FILTER = f"hasmy::{TRACK}:"
+
+
+class TrackTest(InboxTestCase):
+    def setUp(self):
+        super().setUp()
+        self.seen = []
+        self.table = {}
+
+        def search(args):
+            self.seen.append(args)
+            return search_text(list(self.table.get(args.get("filters"), ())))
+
+        self.connector.search = search
+
+    def run_once(self, now=NOW, inbox=None, **over):
+        with mock.patch.object(slack_mcp, "_now", return_value=now):
+            return slack_mcp.candidates(inbox_source(
+                inbox or {"track_reactions": [TRACK]}, **over
+            ))
+
+    def tracked(self):
+        return comms_inbox.load_tracked(self.tmp.name)
+
+    def test_track_query_has_no_cursor_and_looks_back_retention(self):
+        src = inbox_source({"track_reactions": [TRACK], "retention_days": 5})
+        slack_mcp.candidates(src)
+        after = {a["filters"]: a["after"] for a in self.seen}
+        self.assertEqual(after[TRACK_FILTER], int(NOW) - 5 * 86400)
+        self.assertEqual(list(slack_mcp.cursor_ids(src)), [f"channels:{CHAN}"])
+
+    def test_track_on_own_dm_message_records_and_tracks_the_dm(self):
+        self.table[TRACK_FILTER] = [{
+            "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,
+            "name": "Me", "ts": ts_at(10), "text": "please approve",
+        }]
+        listing = self.run_once()
+        self.assertEqual(len(listing), 0)
+        tracks = [r for r in self.rows() if r["type"] == "track_request"]
+        self.assertEqual(
+            [(t["channel_id"], t["ts"], t["emoji"]) for t in tracks],
+            [(DM, ts_at(10), TRACK)],
+        )
+        self.assertTrue(self.messages()[0]["is_owner"])
+        self.assertEqual(self.tracked()["conversations"], [{
+            "channel_id": DM, "thread_ts": ts_at(10), "since": ts_at(10),
+            "whole": True,
+        }])
+
+    def test_uncovered_tracked_dm_is_searched_from_the_request(self):
+        self.table[TRACK_FILTER] = [{
+            "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,
+            "ts": ts_at(10),
+        }]
+        self.run_once()
+        self.seen.clear()
+        self.table[f"in:<#{DM}>"] = [
+            {"ch": DM, "dm": True, "people": [BOB, ME], "ts": ts_at(5)},
+            {"ch": DM, "dm": True, "people": [BOB, ME], "ts": ts_at(20),
+             "text": "approved"},
+        ]
+        listing = self.run_once()
+        query = [a for a in self.seen if a["filters"] == f"in:<#{DM}>"][0]
+        self.assertEqual(query["after"], int(float(ts_at(10))) - 1)
+        self.assertEqual(len(listing), 0)
+        self.assertEqual(
+            [r["ts"] for r in self.messages()], [ts_at(10), ts_at(20)]
+        )
+        # The scan mark moves the next search up to now - overlap.
+        self.seen.clear()
+        self.run_once(now=NOW + 600)
+        query = [a for a in self.seen if a["filters"] == f"in:<#{DM}>"][0]
+        self.assertEqual(query["after"], int(NOW) - 3600)
+
+    def test_dm_covered_by_all_dms_needs_no_extra_query(self):
+        self.table[TRACK_FILTER] = [{
+            "ch": DM, "dm": True, "people": [BOB, ME], "ts": ts_at(10),
+        }]
+        self.run_once(all_dms=True)
+        self.seen.clear()
+        self.run_once(all_dms=True)
+        self.assertNotIn(
+            f"in:<#{DM}>", [a.get("filters") for a in self.seen]
+        )
+
+    def test_tracked_thread_in_a_watched_channel(self):
+        self.table[TRACK_FILTER] = [{"ts": ts_at(10)}]
+        self.table[f"in:<#{CHAN}>"] = [
+            {"ts": ts_at(20), "root": ts_at(10), "text": "reply"},
+            {"ts": ts_at(30), "text": "unrelated"},
+        ]
+        self.run_once()
+        self.assertEqual(
+            [r["ts"] for r in self.messages()], [ts_at(10), ts_at(20)]
+        )
+        self.assertEqual(
+            sorted(a.get("filters") for a in self.seen),
+            sorted([f"in:<#{CHAN}>", TRACK_FILTER]),
+        )
+        self.assertEqual(
+            self.tracked()["conversations"][0]["whole"], False
+        )
+
+    def test_requests_expire_with_retention(self):
+        old = f"{int(NOW) - 3 * 86400}.000100"
+        comms_inbox.save_tracked(self.tmp.name, {
+            "conversations": [{"channel_id": DM, "thread_ts": old,
+                               "since": old, "whole": True}],
+            "scanned": {DM: NOW - 3 * 86400},
+        }, retention_days=14, now=NOW)
+        self.run_once(inbox={"track_reactions": [TRACK], "retention_days": 2})
+        self.assertEqual(
+            self.tracked(), {"conversations": [], "scanned": {}}
+        )
+
+    def test_tracked_queries_stay_within_the_query_cap(self):
+        comms_inbox.save_tracked(self.tmp.name, {
+            "conversations": [{"channel_id": DM, "thread_ts": ts_at(10),
+                               "since": ts_at(10), "whole": True}],
+            "scanned": {},
+        }, retention_days=14, now=NOW)
+        self.run_once(max_queries_per_run=2)
+        self.assertNotIn(
+            f"in:<#{DM}>", [a.get("filters") for a in self.seen]
+        )
+
+
 class ConfigTest(unittest.TestCase):
     def problems(self, **over):
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,6 +523,8 @@ class ConfigTest(unittest.TestCase):
             {"channels": [CHAN], "reactions": ["a", "b", "c", "d", "e", "f"]},
             {"channels": [CHAN], "retention_days": 0},
             {"channels": [CHAN], "reaction_checks": 31},
+            {"track_reactions": ["a", "b", "c", "d"]},
+            {"reactions": [ACK], "track_reactions": [ACK]},
             {"channels": [CHAN], "reaction_check_hours": 0},
             {"all_dms": "yes"},
         ):
@@ -415,6 +545,16 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(tool=tool):
                 text = "\n".join(self.problems(reactions_tool=tool))
                 self.assertIn("reactions_tool", text)
+
+    def test_track_reactions_alone_are_enough(self):
+        self.assertEqual(self.problems(
+            comms_inbox={"track_reactions": ["track-example"]},
+        ), [])
+        text = "\n".join(self.problems(
+            max_queries_per_run=1,
+            comms_inbox={"track_reactions": ["track-example"]},
+        ))
+        self.assertIn("2 planned searches", text)
 
     def test_inbox_all_dms_needs_the_dms_query(self):
         text = "\n".join(self.problems(comms_inbox={"all_dms": True}))

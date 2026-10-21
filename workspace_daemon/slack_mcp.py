@@ -66,7 +66,8 @@ key `saved:slack:<ch>:<anchor>`, `saved_covered_ts` as for threads).
 The watch file (or the source) may also set `comms_inbox` to record the hits
 of chosen conversations, and the owner's reactions with chosen emoji, in
 `state/comms-inbox.jsonl` for a reply tracker; see `comms_inbox.py`. Its
-reaction searches (`reacted:<emoji>`) have no cursor and never capture; with
+reaction searches (`reacted:<emoji>`, `track:<emoji>`) and its searches of
+tracked channels (`tracked:<id>`) never capture and keep no cursor; with
 `reactions_tool` (mcp__<server>__slack_get_reactions) a run also reads the
 reactions of open inbox messages in one more bridge session.
 
@@ -146,6 +147,8 @@ CURSOR_SCHEMA = 1
 SAVED_PREFIX = "saved:"
 # Query keys of the comms-inbox reaction searches (record only, never capture).
 REACTED_PREFIX = "reacted:"
+# Comms-inbox query kinds: recorded, never captured, no cursor of their own.
+RECORD_ONLY = ("reacted", "track", "tracked")
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
 THREADS_PER_SESSION = 8
@@ -966,6 +969,12 @@ def search_queries(cfg, since=None):
             "allowed": None, "user": None, "keywords": None,
             "filters": f"hasmy::{name}:",
         })
+    for name in (cfg.get("comms_inbox") or {}).get("track_reactions", []):
+        queries.append({
+            "key": f"track:{name}", "kind": "track",
+            "allowed": None, "user": None, "keywords": None,
+            "filters": f"hasmy::{name}:",
+        })
     for query in queries:
         query.setdefault("keys", [query["key"]])
     return queries
@@ -1073,7 +1082,8 @@ def _search_all(cfg, queries, afters, now):
             # reading agrees on.
             usable = (
                 trusted
-                if query["kind"] in ("saved", "reacted") and trusted is not None
+                if query["kind"] in ("saved", "reacted", "track")
+                and trusted is not None
                 else hits
             )
             if trusted is not None and usable is not trusted:
@@ -1501,6 +1511,12 @@ def candidates(source):
         raise SlackMcpError(
             f"{len(queries)} planned searches exceed max_queries_per_run"
         )
+    tracked = (
+        comms_inbox.load_tracked(_base_dir) if cfg["comms_inbox"] else None
+    )
+    queries += _tracked_queries(
+        cfg, tracked, cfg["max_queries_per_run"] - len(queries), now
+    )
     fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
     saved_after = int(now) - cfg["save_reaction_lookback_days"] * 86400
     reacted_after = int(now) - (
@@ -1511,7 +1527,8 @@ def candidates(source):
     # date, and the owner reacts to old messages.
     afters = [
         saved_after if query["kind"] == "saved"
-        else reacted_after if query["kind"] == "reacted" else min(
+        else reacted_after if query["kind"] in ("reacted", "track")
+        else query["after"] if query["kind"] == "tracked" else min(
             int(slack_source._rfc3339_epoch(since_map[key]))
             if since_map.get(key) else fresh
             for key in query["keys"]
@@ -1542,16 +1559,20 @@ def candidates(source):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
-        elif key.startswith(REACTED_PREFIX):
+        elif key.startswith((REACTED_PREFIX, "track:")):
             log("slack_mcp: a comms-inbox reaction search hit "
                 "max_search_pages; newer reactions are not recorded (shorten "
                 "retention_days or raise max_search_pages)")
     if cfg["comms_inbox"] and not source.get("_count_only"):
         # Before DM sessions re-point `root`: the inbox keeps the real thread.
-        _record_inbox(cfg, found, now)
+        _record_inbox(cfg, found, now, tracked)
+        _mark_scanned(cfg, queries, tracked, capped, failed, now)
         _check_reactions(cfg, now)
-    # Inbox-only reaction hits never become candidates.
-    found = [(query, hit) for query, hit in found if query["kind"] != "reacted"]
+    # Inbox-only hits never become candidates.
+    found = [
+        (query, hit) for query, hit in found
+        if query["kind"] not in RECORD_ONLY
+    ]
     n_sessions = assign_dm_sessions(
         cfg, found, source.get("_routine_id") or "default",
         persist=not source.get("_count_only") and not source.get("_dry_run"),
@@ -1655,7 +1676,7 @@ def candidates(source):
     marks = {}
     overlap = _seconds(cfg["overlap"])
     for query in queries:
-        if query["kind"] in ("saved", "reacted"):
+        if query["kind"] == "saved" or query["kind"] in RECORD_ONLY:
             continue
         for key in query["keys"]:
             values = [deferred_floor] if deferred_floor is not None else []
@@ -1684,11 +1705,77 @@ def candidates(source):
     return out
 
 
-def _record_inbox(cfg, found, now):
+def _tracked_queries(cfg, tracked, room, now):
+    """Searches for tracked channels no other query lists, within `room`.
+
+    Each lists from the channel's scan mark minus the overlap, never before
+    the oldest track request in it.
+    """
+    if not tracked or room <= 0:
+        return []
+    covered = set(cfg["channels"])
+    since = {}
+    for item in tracked["conversations"]:
+        channel = item["channel_id"]
+        if channel in covered or (cfg["all_dms"] and item["whole"]):
+            continue
+        since[channel] = min(
+            float(item["since"]), since.get(channel, float("inf"))
+        )
+    channels = sorted(since)
+    chunks = [
+        channels[i:i + CHANNELS_PER_QUERY]
+        for i in range(0, len(channels), CHANNELS_PER_QUERY)
+    ]
+    limit = min(room, comms_inbox.MAX_TRACKED_QUERIES)
+    if len(chunks) > limit:
+        log(f"slack_mcp: {len(chunks) - limit} tracked-channel search(es) "
+            "skipped (query cap)")
+    overlap = _seconds(cfg["overlap"])
+    queries = []
+    for chunk in chunks[:limit]:
+        starts = []
+        for channel in chunk:
+            mark = tracked["scanned"].get(channel)
+            start = since[channel] - 1
+            if mark is not None:
+                start = max(start, mark - overlap)
+            starts.append(start)
+        queries.append({
+            "key": f"tracked:{chunk[0]}", "kind": "tracked",
+            "keys": [f"tracked:{c}" for c in chunk],
+            "allowed": set(chunk), "user": None, "keywords": None,
+            "filters": " ".join(f"in:<#{c}>" for c in chunk),
+            "after": int(min(starts)),
+        })
+    return queries
+
+
+def _mark_scanned(cfg, queries, tracked, capped, failed, now):
+    """Advance tracked channels' scan marks and save the tracked set."""
+    overlap = _seconds(cfg["overlap"])
+    for query in queries:
+        if query["kind"] != "tracked":
+            continue
+        for key in query["keys"]:
+            if key in failed:
+                continue
+            channel = key.split(":", 1)[1]
+            tracked["scanned"][channel] = (
+                int(capped[key]) + overlap if key in capped else int(now)
+            )
+    comms_inbox.save_tracked(
+        _base_dir, tracked, cfg["comms_inbox"]["retention_days"], now
+    )
+
+
+def _record_inbox(cfg, found, now, tracked):
     """Append this run's hits in the inbox conversations to the comms inbox.
 
-    Messages from every query (both sides of a conversation, bots included);
-    owner reactions from the `hasmy::` searches of inbox and save emoji. Hits
+    Messages from every query (both sides of a conversation, bots included)
+    in inbox channels, DMs (`all_dms`) and tracked conversations; owner
+    reactions from the `hasmy::` searches of inbox and save emoji; track
+    requests from the track emoji searches, which also start tracking. Hits
     that only some reading of an ambiguous page holds are skipped: a forged
     block must not mark a conversation as answered.
     """
@@ -1696,10 +1783,19 @@ def _record_inbox(cfg, found, now):
     channels = set(inbox["channels"])
     reactions = set(inbox["reactions"])
     rows = []
+    started = 0
+    for query, hit in found:
+        if query["kind"] == "track" and not hit.get("untrusted"):
+            emoji = query["key"].split(":", 1)[1]
+            rows.append(comms_inbox.track_row(hit, emoji))
+            started += comms_inbox.add_tracked(
+                tracked, hit, hit["label"] in DM_LABELS
+            )
     for query, hit in found:
         if hit.get("untrusted") or not (
             hit["channel"] in channels
             or (inbox["all_dms"] and hit["label"] in DM_LABELS)
+            or comms_inbox.is_tracked(tracked, hit)
         ):
             continue
         rows.append(comms_inbox.message_row(hit, cfg["self_user_id"]))
@@ -1708,8 +1804,9 @@ def _record_inbox(cfg, found, now):
             if emoji in reactions or query["kind"] == "saved":
                 rows.append(comms_inbox.reaction_row(hit, emoji))
     added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
-    if added:
-        log(f"slack_mcp: comms inbox recorded {added} new line(s)")
+    if added or started:
+        log(f"slack_mcp: comms inbox recorded {added} new line(s), "
+            f"{started} conversation(s) newly tracked")
 
 
 def _check_reactions(cfg, now):

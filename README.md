@@ -1937,6 +1937,7 @@ comms_inbox:
   retention_days: 14     # 1 to 90
   reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
   reaction_check_hours: 72   # how long an unanswered message is re-checked
+  track_reactions: [track-example]   # "watch this conversation", at most 3
 ```
 
 and on the routine's source (not the watch file):
@@ -1950,6 +1951,7 @@ One JSON object per line, oldest message first:
 ```json
 {"type": "message", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "user_id": "U0EXAMPLEB", "is_owner": false, "is_bot": false, "text": "...", "seen_at": "2026-10-21T15:00:00Z"}
 {"type": "owner_reaction", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "emoji": "eyes", "seen_at": "2026-10-21T15:00:00Z"}
+{"type": "track_request", "channel_id": "D0EXAMPLE03", "thread_ts": "1700000300.000100", "ts": "1700000300.000100", "emoji": "track-example", "seen_at": "2026-10-21T15:00:00Z"}
 ```
 
 - `thread_ts` is the thread root, equal to `ts` for a top-level message (DM
@@ -1976,8 +1978,22 @@ One JSON object per line, oldest message first:
   back `retention_days` and ignoring the cursors; its hits are recorded only
   and never become captures. A `save_reactions` reaction on an inbox
   conversation is recorded too.
-- Lines are never edited: messages dedupe on (`channel_id`, `ts`) and
-  reactions on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
+- Track by reaction: the owner reacting with a `track_reactions` emoji on any
+  message, their own included ("waiting for a reply to this"), writes a
+  `track_request` line and starts tracking that conversation: the thread
+  rooted at `thread_ts`, plus, in a DM or group DM, the conversation's top
+  level from that message on. Its messages are then recorded like those of
+  `channels`, even outside `channels` and `all_dms`, until the request is
+  older than `retention_days` (a removed reaction is not seen). One search
+  per emoji per run (`hasmy::<emoji>:`, look-back `retention_days`, no
+  cursor); a tracked channel no other query lists gets an extra search
+  (channels in chunks of 15, at most 2 per run and within
+  `max_queries_per_run`), from a per-channel scan mark that advances like a
+  cursor. The tracked set and marks live in `state/comms-inbox-tracked.json`.
+  A track emoji is independent of `save_reactions`: one message can carry
+  both, and an emoji cannot be in both `reactions` and `track_reactions`.
+- Lines are never edited: messages dedupe on (`channel_id`, `ts`); reactions
+  and track requests on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
   are not reflected. Lines whose `ts` is older than `retention_days` are
   dropped. The file is rewritten atomically with mode 600 and only when
   something changed, so readers never see a partial line.

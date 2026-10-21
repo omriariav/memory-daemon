@@ -15,6 +15,7 @@ Watch file (or source) block:
       retention_days: 14       # default 14
       reaction_checks: 10      # reaction reads per run (needs reactions_tool)
       reaction_check_hours: 72 # how long an unanswered message is re-checked
+      track_reactions: [track-example]   # "watch this conversation" (at most 3)
 
 One JSON object per line, oldest message first:
 
@@ -22,6 +23,19 @@ One JSON object per line, oldest message first:
      "is_owner", "is_bot", "text", "seen_at"}
     {"type": "owner_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
+    {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
+     "seen_at"}
+
+A `track_reactions` emoji the owner puts on any message (found by a
+`hasmy::<emoji>:` search looking back `retention_days`, no cursor) writes a
+`track_request` line for that message and starts tracking its conversation:
+the thread rooted at `thread_ts`, plus the whole conversation from that
+message on when it is a DM or group DM. Messages of tracked conversations are
+recorded like those of `channels`, until the track request is older than
+`retention_days` (removing the reaction is not seen). A tracked channel that
+no other query lists is searched by an extra `tracked` query (channels in
+chunks, at most MAX_TRACKED_QUERIES), from a per-channel scan mark kept with
+the tracked set in `state/comms-inbox-tracked.json`.
 
 Owner reactions come from two places. Search (`hasmy::<emoji>:`) finds the
 listed emoji only. With `reactions_tool` (the connector's read-only
@@ -52,11 +66,14 @@ from .shell import log, utc_now_iso
 FILE_NAME = "comms-inbox.jsonl"
 KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
-    "reaction_check_hours",
+    "reaction_check_hours", "track_reactions",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
-            "reaction_check_hours": 72}
+            "reaction_check_hours": 72, "track_reactions": []}
+TRACKED_FILE = "comms-inbox-tracked.json"
+MAX_TRACK_REACTIONS = 3
+MAX_TRACKED_QUERIES = 2
 CHECKS_FILE = "comms-inbox-checks.json"
 MAX_CHECK_GAP = 6 * 3600
 MAX_REACTIONS = 5
@@ -85,18 +102,27 @@ def problem(value):
         return "`channels` must be a list of Slack channel ids"
     if not isinstance(value.get("all_dms", False), bool):
         return "`all_dms` must be true or false"
-    if not channels and value.get("all_dms") is not True:
-        return "needs `channels` and/or `all_dms: true`"
-    reactions = value.get("reactions", [])
-    if (
-        not isinstance(reactions, list) or len(reactions) > MAX_REACTIONS
-        or not all(isinstance(n, str) and EMOJI.match(n) for n in reactions)
-        or len(set(reactions)) != len(reactions)
+    for key, most in (
+        ("reactions", MAX_REACTIONS), ("track_reactions", MAX_TRACK_REACTIONS),
     ):
-        return (
-            f"`reactions` must be a list of at most {MAX_REACTIONS} distinct "
-            "emoji names (no colons)"
-        )
+        names = value.get(key, [])
+        if (
+            not isinstance(names, list) or len(names) > most
+            or not all(isinstance(n, str) and EMOJI.match(n) for n in names)
+            or len(set(names)) != len(names)
+        ):
+            return (
+                f"`{key}` must be a list of at most {most} distinct emoji "
+                "names (no colons)"
+            )
+    if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
+        return "an emoji cannot be in both `reactions` and `track_reactions`"
+    if (
+        not channels and value.get("all_dms") is not True
+        and not value.get("track_reactions")
+    ):
+        return "needs `channels`, `all_dms: true` and/or `track_reactions`"
+
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),
         ("reaction_checks", 0, 30), ("reaction_check_hours", 1, 336),
@@ -118,6 +144,7 @@ def settings(value):
     cfg.update(value)
     cfg["channels"] = list(cfg["channels"])
     cfg["reactions"] = list(cfg["reactions"])
+    cfg["track_reactions"] = list(cfg["track_reactions"])
     return cfg
 
 
@@ -126,8 +153,8 @@ def path(base_dir):
 
 
 def _key(row):
-    if row.get("type") == "owner_reaction":
-        return ("owner_reaction", row["channel_id"], row["ts"], row["emoji"])
+    if row.get("type") in ("owner_reaction", "track_request"):
+        return (row["type"], row["channel_id"], row["ts"], row["emoji"])
     return ("message", row["channel_id"], row["ts"])
 
 
@@ -172,6 +199,10 @@ def reaction_row(hit, emoji):
         "ts": hit["ts"],
         "emoji": emoji,
     }
+
+
+def track_row(hit, emoji):
+    return dict(reaction_row(hit, emoji), type="track_request")
 
 
 def record(base_dir, rows, retention_days, now=None):
@@ -322,3 +353,99 @@ def parse_reactions(text, owner):
         if owner in _REACTOR.findall(match.group("who")):
             found.append(match.group("emoji"))
     return found
+
+
+# --- tracked conversations ---------------------------------------------------
+
+def _tracked_path(base_dir):
+    return Path(base_dir) / "state" / TRACKED_FILE
+
+
+def load_tracked(base_dir):
+    """{"conversations": [{channel_id, thread_ts, since, whole}],
+    "scanned": {channel: epoch}}; unreadable counts as empty."""
+    empty = {"conversations": [], "scanned": {}}
+    if base_dir is None:
+        return empty
+    try:
+        data = json.loads(_tracked_path(base_dir).read_text())
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError):
+        log("comms inbox: tracked state is unreadable; starting empty")
+        return empty
+    out = {"conversations": [], "scanned": {}}
+    for entry in (data.get("conversations") if isinstance(data, dict) else 0) or []:
+        try:
+            item = {
+                "channel_id": str(entry["channel_id"]),
+                "thread_ts": str(entry["thread_ts"]),
+                "since": str(entry["since"]),
+                "whole": entry.get("whole") is True,
+            }
+            float(item["thread_ts"]), float(item["since"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        out["conversations"].append(item)
+    for channel, when in ((data.get("scanned") or {}).items()):
+        if isinstance(when, (int, float)) and not isinstance(when, bool):
+            out["scanned"][str(channel)] = when
+    return out
+
+
+def save_tracked(base_dir, tracked, retention_days, now=None):
+    """Write the tracked set, dropping requests past retention."""
+    if base_dir is None:
+        return
+    floor = (time.time() if now is None else now) - retention_days * 86400
+    live = [c for c in tracked["conversations"] if float(c["since"]) >= floor]
+    channels = {c["channel_id"] for c in live}
+    data = {
+        "conversations": live,
+        "scanned": {
+            k: v for k, v in tracked["scanned"].items() if k in channels
+        },
+    }
+    try:
+        state.write_atomic(
+            _tracked_path(base_dir), json.dumps(data, sort_keys=True),
+            mode=0o600,
+        )
+    except OSError:
+        log("comms inbox: tracked state could not be written")
+
+
+def add_tracked(tracked, hit, whole):
+    """Track the conversation of `hit`; True when it was new.
+
+    The thread rooted at the hit's root is tracked from the hit on; `whole`
+    (a direct conversation) also tracks the channel's top level. A second
+    request on a known conversation keeps the earlier `since`.
+    """
+    for item in tracked["conversations"]:
+        if item["channel_id"] == hit["channel"] and (
+            item["thread_ts"] == hit["root"] or (whole and item["whole"])
+        ):
+            if float(hit["ts"]) < float(item["since"]):
+                item["since"] = hit["ts"]
+            item["whole"] = item["whole"] or whole
+            return False
+    tracked["conversations"].append({
+        "channel_id": hit["channel"], "thread_ts": hit["root"],
+        "since": hit["ts"], "whole": bool(whole),
+    })
+    return True
+
+
+def is_tracked(tracked, hit):
+    """Whether `hit` belongs to a tracked conversation (at or after `since`)."""
+    for item in tracked["conversations"]:
+        if item["channel_id"] != hit["channel"]:
+            continue
+        if float(hit["ts"]) < float(item["since"]) and not (
+            hit["ts"] == item["thread_ts"]
+        ):
+            continue
+        if item["whole"] or hit["root"] == item["thread_ts"]:
+            return True
+    return False

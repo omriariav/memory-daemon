@@ -1833,6 +1833,7 @@ def _validate_slack_mcp(prefix, source):
         + (
             len(set(inbox.get("reactions") or [])
                 - set(reactions if reactions_ok and reactions else []))
+            + len(inbox.get("track_reactions") or [])
             if inbox is not None and not inbox_problem else 0
         )
     )
