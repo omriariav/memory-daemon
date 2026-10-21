@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 
 from . import (
-    calendar_cache, google_tasks_sync, slack_census, slack_cli,
-    slack_discovery,
+    calendar_cache, fibery_tasks_inbound, google_tasks_sync, slack_census,
+    slack_cli, slack_discovery,
 )
 from .shell import log
 
@@ -63,6 +63,22 @@ def run(base_dir, routine, dry_run=False):
         log(
             f"routine={routine_id} maintenance={kind} "
             f"events={report['events']} dry_run={report['dry_run']}"
+        )
+        return report
+    if kind == "fibery_tasks_inbound":
+        mode = "previewing" if dry_run else "importing"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = fibery_tasks_inbound.run(
+            cfg, base_dir,
+            _path(base_dir, cfg.get("checkpoint", fibery_tasks_inbound.DEFAULT_CHECKPOINT)),
+            dry_run=dry_run,
+        )
+        log(
+            f"routine={routine_id} maintenance={kind} tasks={report['tasks']} "
+            f"created={report['created']} done={report['done']} "
+            f"reopened={report['reopened']} edited={report['edited']} "
+            f"gone={report['gone']} pending={report['pending']} "
+            f"dry_run={report['dry_run']}"
         )
         return report
     if kind == "slack_discovery":
