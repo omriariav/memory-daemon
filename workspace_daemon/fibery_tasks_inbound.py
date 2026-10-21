@@ -36,6 +36,7 @@ DEL_TAG_RE = re.compile(r"</?del>")
 KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)(?:\[(\d+)\])?:(?: (.*))?$")
 TITLE_LIMIT = 120
 DEFAULT_CHECKPOINT = "state/fibery-tasks.json"
+OUTBOUND_CHECKPOINT = "state/fibery-outbound.json"
 DEFAULT_MAX_NEW = 50
 DEFAULT_MAX_CHANGES = 30
 BRIDGE_TIMEOUT = 180
@@ -523,10 +524,33 @@ def _marker(task):
     return match.group(1) if match else None
 
 
-def _linkable_entries(store, tasks, items):
-    """Entry ids named by new marker tasks that exist as memory todos."""
+def _outbound_ids(base_dir, cfg):
+    """Entry ids the outbound routine attempted or exported (fail closed)."""
+    path = Path(cfg.get("outbound_checkpoint", OUTBOUND_CHECKPOINT)).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+        rows = data["items"]
+        return {i for i, r in rows.items()
+                if isinstance(r, dict)
+                and r.get("state") in ("attempted", "exported")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"cannot read the Fibery outbound checkpoint {path}: {exc}"
+        ) from exc
+
+
+def _linkable_entries(store, tasks, items, outbound_ids):
+    """Marker ids that outbound really wrote and that exist as memory todos.
+
+    A mem: marker typed by anyone else (or naming an entry outbound never
+    exported) is just text: that task is imported like any other.
+    """
     wanted = {_marker(t) for t in tasks if t["block_id"] not in items}
-    wanted.discard(None)
+    wanted &= outbound_ids
     if not wanted or not (Path(store) / "memory" / "entries").is_dir():
         return set()
     return {
@@ -535,7 +559,7 @@ def _linkable_entries(store, tasks, items):
     }
 
 
-def _plan(items, tasks, cfg):
+def _plan(items, tasks, cfg, linkable=frozenset()):
     """Classify every task against the checkpoint without writing anything."""
     import_done = cfg.get("import_done", False) is True
     plan = {"new": [], "skip_done": [], "done": [], "reopened": [],
@@ -545,7 +569,7 @@ def _plan(items, tasks, cfg):
         row = items.get(task["block_id"])
         full, content = _task_hashes(task)
         if row is None:
-            if _marker(task):
+            if _marker(task) in linkable:
                 # Exported from memory: link to that entry, never re-import.
                 plan["link"].append(task)
             elif task["state"] == "DONE" and not import_done:
@@ -588,8 +612,9 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     items = checkpoint["items"]
     tasks = parse_tasks(fetch(cfg, base_dir))
     report["tasks"] = len(tasks)
-    plan = _plan(items, tasks, cfg)
-    linkable = _linkable_entries(cfg["store"], plan["link"], items)
+    linkable = _linkable_entries(
+        cfg["store"], tasks, items, _outbound_ids(base_dir, cfg))
+    plan = _plan(items, tasks, cfg, linkable)
 
     changes = len(plan["done"]) + len(plan["reopened"]) \
         + len(plan["edited"]) + len(plan["gone"])
@@ -643,7 +668,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         row.pop("gone", None)
     for task in plan["link"]:
         marker = _marker(task)
-        entry_id = marker if marker in linkable else None
+        entry_id = marker
         if task["state"] == "DONE":
             if entry_id and import_done:
                 _write(_transition_note, cfg, store, task, entry_id,

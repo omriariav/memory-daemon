@@ -812,7 +812,9 @@ Fibery document the inbound routine reads. Selection (all required): type
 affirmed); date on or after `outbound_since` (required, quoted `YYYY-MM-DD`); a
 source id starting with one of `from_sources` (default `slack:`, `mila:`,
 `gmail:`). Never selected: entries with any `fibery:` source id, tags
-`personal` or `no-fibery`, or entries already in the checkpoint.
+`exclude_tags` (default `personal`, `no-fibery`, `no-owner-action`; every
+`memory.personal_tag` configured on any routine is excluded too), or entries
+already in the checkpoint.
 
 Each run, when there is a candidate, reads the document through `read_tool`
 (an exact MCP name ending `__read_document`), finds the top-level heading named
@@ -830,15 +832,21 @@ markdown-escaped, stripped of `<ins>`/`<del>`/`mem:` look-alikes and redacted
 with the personal ID redactor. `write_mode` is `suggest` (default; Fibery
 records tracked changes you accept or reject) or `apply`.
 
-After the write the document is re-read; every exported marker must be present
-(as text or a suggestion) or the run fails and records nothing (a later run
-adopts markers that did land). The checkpoint (default
+Each id is checkpointed `attempted` before the write and `exported` only once a
+read shows its marker; creating the heading is recorded the same way. If the
+re-read lacks a marker the run fails; later runs report those ids (and
+`heading`) as `unconfirmed`, write nothing and never retry on their own. Clear
+them with `retry_unconfirmed: [<entry-id>, heading]` once you have checked the
+document (a marker that did land is simply promoted to `exported`). The checkpoint (default
 `state/fibery-outbound.json`, mode 0600) holds `{entry_id: {state: exported,
 at}}`; no `fibery:` source id is added to memory entries. `--dry-run` selects
 locally and makes no bridge call. Logs carry counts and entry ids only. Inbound
 coordination: an inbound task whose text has `mem:<entry-id>` is linked to that
-entry (done/reopened notes follow it; Fibery edits never rewrite it) instead of
-creating a todo, and unaccepted suggestion blocks are ignored until accepted.
+entry only if the id is `attempted`/`exported` in the outbound checkpoint
+(`outbound_checkpoint` on the inbound routine, default
+`state/fibery-outbound.json`; any other marker is ordinary text and the task is
+imported normally); a linked item adds done/reopened notes to the entry (Fibery
+edits never rewrite it) instead of creating a todo, and unaccepted suggestion blocks are ignored until accepted.
 Disable `google_tasks_sync` for the same todos. See
 `routines/_example-fibery-tasks-outbound.yaml`.
 

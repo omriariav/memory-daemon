@@ -50,12 +50,13 @@ MAINTENANCE_ALLOWED_KEYS = {
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
         "tags", "checkpoint", "store", "import_done", "max_new_per_run",
-        "max_changes_per_run",
+        "max_changes_per_run", "outbound_checkpoint",
     },
     "fibery_tasks_outbound": {
         "kind", "document_secret", "read_tool", "write_tool", "write_mode",
         "model", "owner_slug", "checkpoint", "store", "outbound_since",
-        "from_sources", "inbox_heading", "max_per_run",
+        "from_sources", "inbox_heading", "max_per_run", "exclude_tags",
+        "retry_unconfirmed",
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
@@ -1387,6 +1388,9 @@ def _validate_fibery_tasks_outbound(rid, cfg):
         problems.append(
             f"{rid}: maintenance.inbox_heading must be a short single-line string"
         )
+    for key in ("exclude_tags", "retry_unconfirmed"):
+        if key in cfg and not _str_list(cfg[key]):
+            problems.append(f"{rid}: maintenance.{key} must be a list of strings")
     cap = cfg.get("max_per_run", 5)
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 50:
         problems.append(

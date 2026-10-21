@@ -7,7 +7,23 @@ from . import (
     google_tasks_sync, slack_census,
     slack_cli, slack_discovery,
 )
+from . import config, personal
 from .shell import log
+
+
+def _personal_tags(base_dir):
+    """Every memory.personal_tag configured on any routine or handler."""
+    tags = set()
+    for routine in config.discover(base_dir):
+        profiles = [routine]
+        handlers = routine.get("handlers")
+        if isinstance(handlers, dict):
+            profiles.extend(h for h in handlers.values() if isinstance(h, dict))
+        for profile in profiles:
+            tag = personal.personal_tag(personal.memory_cfg(profile))
+            if tag:
+                tags.add(tag)
+    return tags
 
 
 def _path(base_dir, value):
@@ -89,10 +105,11 @@ def run(base_dir, routine, dry_run=False):
             cfg, base_dir,
             _path(base_dir, cfg.get(
                 "checkpoint", fibery_tasks_outbound.DEFAULT_CHECKPOINT)),
-            dry_run=dry_run,
+            dry_run=dry_run, extra_exclude=_personal_tags(base_dir),
         )
         log(
             f"routine={routine_id} maintenance={kind} "
+            f"unconfirmed={len(report.get('unconfirmed', []))} "
             f"candidates={report['candidates']} exported={report['exported']} "
             f"already_present={report['already_present']} "
             f"mode={report['mode']} dry_run={report['dry_run']}"

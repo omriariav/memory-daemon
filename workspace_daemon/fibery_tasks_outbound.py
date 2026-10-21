@@ -19,28 +19,28 @@ from pathlib import Path
 
 from . import claude_bridge, personal, state
 from .fibery_tasks_inbound import (
-    MEM_RE, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document,
+    MEM_RE, OUTBOUND_CHECKPOINT, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document,
     valid_read_tool, _document_text, _text_of,
 )
 from .google_tasks_sync import _load_memory_entries
 from .shell import log
 
 CHECKPOINT_VERSION = 1
-DEFAULT_CHECKPOINT = "state/fibery-outbound.json"
+DEFAULT_CHECKPOINT = OUTBOUND_CHECKPOINT
 DEFAULT_FROM_SOURCES = ["slack:", "mila:", "gmail:"]
 DEFAULT_HEADING = "Inbox"
 DEFAULT_MAX_PER_RUN = 5
 DEFAULT_WRITE_MODE = "suggest"
 WRITE_MODES = ("suggest", "apply")
 TITLE_LIMIT = 120
-EXCLUDED_TAGS = frozenset({"personal", "no-fibery", "no-owner-action"})
+DEFAULT_EXCLUDE_TAGS = ["personal", "no-fibery", "no-owner-action"]
 ENTRY_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 WRITE_TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__insert_document_blocks$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONTAINER_TYPES = {"bullet_list", "ordered_list"}
 WRITE_TIMEOUT = 180
 TAG_RE = re.compile(r"</?(?:ins|del)>")
-_ESCAPE_RE = re.compile(r"([\\*_\[\]`<>])")
+_ESCAPE_RE = re.compile(r"([\\*_\[\]`<>@~])")
 _LEADING_RE = re.compile(r"^([#\-+>])")
 _MEM_WORD_RE = re.compile(r"(?i)\bmem:")
 
@@ -55,7 +55,14 @@ def _server(tool):
 
 # --- selection --------------------------------------------------------------
 
-def eligible(entry, cfg, exported=()):
+def excluded_tags(cfg, extra=()):
+    base = cfg.get("exclude_tags")
+    if base is None:
+        base = DEFAULT_EXCLUDE_TAGS
+    return set(base) | set(extra or ())
+
+
+def eligible(entry, cfg, exported=(), extra_exclude=()):
     """Whether this memory entry may be exported right now."""
     if entry["type"] != "todo" or entry.get("resolved"):
         return False
@@ -68,7 +75,7 @@ def eligible(entry, cfg, exported=()):
     # (otherwise it is a no-owner-action note) and names the owner.
     if cfg["owner_slug"] not in entry["people"]:
         return False
-    if EXCLUDED_TAGS.intersection(entry["tags"]):
+    if excluded_tags(cfg, extra_exclude).intersection(entry["tags"]):
         return False
     sources = entry["source_ids"]
     if any(s.startswith("fibery:") for s in sources):
@@ -77,8 +84,9 @@ def eligible(entry, cfg, exported=()):
     return any(s.startswith(prefixes) for s in sources)
 
 
-def select_candidates(entries, cfg, exported=()):
-    rows = [e for e in entries.values() if eligible(e, cfg, exported)]
+def select_candidates(entries, cfg, exported=(), extra_exclude=()):
+    rows = [e for e in entries.values()
+            if eligible(e, cfg, exported, extra_exclude)]
     return sorted(rows, key=lambda e: (e["date"], e["id"]))
 
 
@@ -189,9 +197,11 @@ def _load_checkpoint(path):
         or data.get("version") != CHECKPOINT_VERSION
         or not isinstance(data.get("items"), dict)
         or any(
-            not isinstance(row, dict) or row.get("state") != "exported"
+            not isinstance(row, dict)
+            or row.get("state") not in ("exported", "attempted")
             for row in data["items"].values()
         )
+        or not isinstance(data.get("heading", {}), dict)
     ):
         raise RuntimeError(
             f"Fibery outbound checkpoint {path} has an unsupported format")
@@ -262,8 +272,15 @@ def _entries(store):
     return _load_memory_entries(store)
 
 
-def run(cfg, base_dir, checkpoint_path, dry_run=False):
-    """Export a few owner todos to the Fibery inbox; returns a report."""
+def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
+    """Export a few owner todos to the Fibery inbox; returns a report.
+
+    An entry is checkpointed ``attempted`` BEFORE the write and promoted to
+    ``exported`` only when a read shows its marker. An attempted entry whose
+    marker never shows up is reported as ``unconfirmed`` and is never written
+    again automatically (the same holds for creating the heading); the operator
+    clears it with ``retry_unconfirmed: [<entry-id>, ... | heading]``.
+    """
     if not valid_read_tool(cfg.get("read_tool")):
         raise RuntimeError(
             "fibery_tasks_outbound read_tool must end in __read_document")
@@ -285,29 +302,73 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     max_per_run = int(cfg.get("max_per_run", DEFAULT_MAX_PER_RUN))
     report = {"ok": True, "dry_run": bool(dry_run), "candidates": 0,
               "exported": 0, "already_present": 0, "held_pending_heading": False,
-              "heading_created": False, "mode": cfg["write_mode"]}
+              "heading_created": False, "mode": cfg["write_mode"],
+              "unconfirmed": [], "held_unconfirmed": False}
     store = cfg["store"]
     checkpoint = _load_checkpoint(checkpoint_path)
     items = checkpoint["items"]
-    candidates = select_candidates(_entries(store), cfg, set(items))
+    heading_row = checkpoint.get("heading") or {}
+
+    cleared = [i for i in (cfg.get("retry_unconfirmed") or [])]
+    changed = False
+    for entry_id in cleared:
+        if entry_id == "heading":
+            if heading_row.get("state") == "attempted":
+                checkpoint.pop("heading", None)
+                heading_row = {}
+                changed = True
+        elif (items.get(entry_id) or {}).get("state") == "attempted":
+            del items[entry_id]
+            changed = True
+    if changed and not dry_run:
+        _save_checkpoint(checkpoint_path, checkpoint)
+        log("fibery_tasks_outbound: cleared unconfirmed: "
+            + ", ".join(cleared))
+
+    def attempted_ids():
+        return sorted(i for i, r in items.items()
+                      if r.get("state") == "attempted")
+
+    candidates = select_candidates(
+        _entries(store), cfg, set(items), extra_exclude)
     report["candidates"] = len(candidates)
     if dry_run:
+        report["unconfirmed"] = attempted_ids()
         log(f"fibery_tasks_outbound: dry-run {len(candidates)} candidate(s) "
             f"(max_per_run={max_per_run}); no bridge call: "
             + ", ".join(e["id"] for e in candidates[:max_per_run]))
         return report
-    if not candidates:
+    if not candidates and not attempted_ids() \
+            and heading_row.get("state") != "attempted":
         return report
 
     info = inspect(fetch(cfg, base_dir), heading)
+    if info["heading_id"] is not None and heading_row.get("state") != "present":
+        checkpoint["heading"] = heading_row = {"state": "present", "at": _now()}
+        changed = True
+    for entry_id in attempted_ids():
+        if entry_id in info["markers"]:
+            items[entry_id] = {"state": "exported", "at": _now()}
+            changed = True
     present = [e for e in candidates if e["id"] in info["markers"]]
     for entry in present:
         items[entry["id"]] = {"state": "exported", "at": _now()}
+        changed = True
     report["already_present"] = len(present)
-    if present:
+    if changed:
         _save_checkpoint(checkpoint_path, checkpoint)
+    if present:
         log("fibery_tasks_outbound: already in the document: "
             + ", ".join(e["id"] for e in present))
+    report["unconfirmed"] = attempted_ids()
+    if heading_row.get("state") == "attempted" and info["heading_id"] is None:
+        report["unconfirmed"].append("heading")
+    if report["unconfirmed"]:
+        report["held_unconfirmed"] = True
+        log("fibery_tasks_outbound: UNCONFIRMED earlier write(s), not "
+            f"retried ({len(report['unconfirmed'])}): "
+            + ", ".join(report["unconfirmed"]))
+        return report
     todo = [e for e in candidates if e["id"] not in info["markers"]]
     if info["pending_heading"] and todo:
         report["held_pending_heading"] = True
@@ -317,14 +378,22 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     # Re-validate against the store right before the write.
     fresh = _entries(store)
     todo = [e for e in todo if e["id"] in fresh
-            and eligible(fresh[e["id"]], cfg, set(items))]
-    batch = todo[:max_per_run]
+            and eligible(fresh[e["id"]], cfg, set(items), extra_exclude)]
+    batch = [fresh[e["id"]] for e in todo[:max_per_run]]
     if not batch:
         return report
 
-    batch = [fresh[e["id"]] for e in batch]
     inserts = build_inserts([item_line(e) for e in batch], heading, info)
     ids = [e["id"] for e in batch]
+    creating_heading = info["heading_id"] is None
+    stamp = _now()
+    # Record the attempt first: a write whose outcome is unknown must never
+    # be repeated automatically.
+    for entry_id in ids:
+        items[entry_id] = {"state": "attempted", "at": stamp}
+    if creating_heading:
+        checkpoint["heading"] = {"state": "attempted", "at": stamp}
+    _save_checkpoint(checkpoint_path, checkpoint)
     log("fibery_tasks_outbound: writing "
         f"{len(ids)} item(s) mode={cfg['write_mode']}: " + ", ".join(ids))
     write(cfg, base_dir, inserts)
@@ -333,17 +402,20 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     missing = [i for i in ids if i not in after]
     if missing:
         log("fibery_tasks_outbound: VERIFY FAILED, markers missing for: "
-            + ", ".join(missing))
+            + ", ".join(missing) + " (left attempted; not retried)")
         raise RuntimeError(
             f"Fibery export verification failed: {len(missing)} of "
-            f"{len(ids)} marker(s) not found after the write; nothing recorded"
+            f"{len(ids)} marker(s) not found after the write; left "
+            "unconfirmed and will not be retried automatically"
         )
     stamp = _now()
     for entry_id in ids:
         items[entry_id] = {"state": "exported", "at": stamp}
+    if creating_heading:
+        checkpoint["heading"] = {"state": "present", "at": stamp}
     _save_checkpoint(checkpoint_path, checkpoint)
     report["exported"] = len(ids)
-    report["heading_created"] = info["heading_id"] is None
+    report["heading_created"] = creating_heading
     log(f"fibery_tasks_outbound: exported {len(ids)} item(s): "
         + ", ".join(ids))
     return report

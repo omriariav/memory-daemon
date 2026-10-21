@@ -46,3 +46,10 @@ maintenance:
   inbox_heading: Inbox
   max_per_run: 5
   checkpoint: state/fibery-outbound.json
+  # Tags that block export (default shown). Every memory.personal_tag found
+  # on any routine is excluded as well.
+  exclude_tags: [personal, no-fibery, no-owner-action]
+  # A write whose marker never showed up is reported as unconfirmed and is not
+  # retried. After checking the document, list the entry ids (and/or the word
+  # heading) here for one run to clear them, then remove the line.
+  # retry_unconfirmed: []

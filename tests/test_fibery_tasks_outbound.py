@@ -239,8 +239,68 @@ class ExportTest(OutboundBase):
         with self.assertRaises(RuntimeError) as ctx:
             self.run_once()
         self.assertIn("verification failed", str(ctx.exception))
-        self.assertNotIn("a1", str(ctx.exception).replace("1 of 1", ""))
-        self.assertFalse(self.checkpoint.exists())
+        self.assertEqual(self.items()["a1"]["state"], "attempted")
+        self.assertEqual(self.items()["a1"]["state"], "attempted")
+        # The next run still lacks the marker: reported, never rewritten.
+        report = self.run_once()
+        self.assertEqual(report["unconfirmed"], ["a1", "heading"])
+        self.assertEqual(len(self.writes()), 1)
+        self.assertEqual(report["exported"], 0)
+        # Even with a new candidate nothing is written while unconfirmed.
+        write_entry(self.store, "a2")
+        self.run_once()
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_retry_unconfirmed_clears_attempted(self):
+        write_entry(self.store, "a1")
+        self.land = False
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.land = True
+        self.heading = True  # a heading exists now
+        self.run_once(retry_unconfirmed=["a1", "heading"])
+        self.assertEqual(len(self.writes()), 2)
+        self.assertEqual(self.items()["a1"]["state"], "exported")
+
+    def test_attempted_heading_never_created_twice(self):
+        write_entry(self.store, "a1")
+        self.land = False
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.items()["a1"]
+        data = json.loads(self.checkpoint.read_text())
+        self.assertEqual(data["heading"]["state"], "attempted")
+        # Operator clears only the entry, not the heading.
+        report = self.run_once(retry_unconfirmed=["a1"])
+        self.assertTrue(report["held_unconfirmed"])
+        self.assertIn("heading", report["unconfirmed"])
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_attempted_is_promoted_when_marker_appears(self):
+        write_entry(self.store, "a1")
+        self.land = False
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.pending_markers = ["a1"]
+        self.heading = True
+        report = self.run_once()
+        self.assertEqual(report["unconfirmed"], [])
+        self.assertEqual(self.items()["a1"]["state"], "exported")
+        self.assertEqual(
+            json.loads(self.checkpoint.read_text())["heading"]["state"],
+            "present")
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_configurable_exclude_tags_and_extra(self):
+        write_entry(self.store, "a1", tags=["custom"])
+        write_entry(self.store, "a2", tags=["private"])
+        write_entry(self.store, "a3", tags=["personal"])
+        entries = fto._load_memory_entries(self.store)
+        ids = lambda **kw: [e["id"] for e in fto.select_candidates(
+            entries, {**self.cfg, **kw.get("cfg", {})}, extra_exclude=kw.get("extra", ()))]
+        self.assertEqual(ids(), ["a1", "a2"])
+        self.assertEqual(ids(extra=["private"]), ["a1"])
+        self.assertEqual(ids(cfg={"exclude_tags": ["custom"]}), ["a2", "a3"])
 
     def test_next_run_adopts_landed_write(self):
         write_entry(self.store, "a1")
@@ -257,9 +317,10 @@ class ExportTest(OutboundBase):
         with mock.patch.object(fto.claude_bridge, "call_tools", flaky):
             with self.assertRaises(claude_bridge.BridgeError):
                 self.run_once()
-        self.assertFalse(self.checkpoint.exists())
-        report = self.run_once()
-        self.assertEqual(report["already_present"], 1)
+        self.assertEqual(self.items()["a1"]["state"], "attempted")
+        self.heading = True
+        self.run_once()
+        self.assertEqual(self.items()["a1"]["state"], "exported")
         self.assertEqual(len(self.writes()), 1)
 
     def test_write_with_mismatched_input_is_rejected(self):
@@ -275,7 +336,7 @@ class ExportTest(OutboundBase):
         with mock.patch.object(fto.claude_bridge, "call_tools", tamper):
             with self.assertRaises(claude_bridge.BridgeError):
                 self.run_once()
-        self.assertFalse(self.checkpoint.exists())
+        self.assertEqual(self.items()["a1"]["state"], "attempted")
 
     def test_dry_run_makes_no_bridge_call(self):
         write_entry(self.store, "a1")
@@ -331,6 +392,13 @@ class EscapingTest(unittest.TestCase):
         self.assertNotIn("mem:", out)
         self.assertIn("\\*bold\\*", out)
 
+    def test_at_and_tilde_are_escaped(self):
+        out = fto.safe_title("ping @someone ~~strike~~ ~/x")
+        self.assertNotIn(" @", out)
+        self.assertIn("\\@someone", out)
+        self.assertNotIn("~~", out)
+        self.assertIn("\\~\\~strike", out)
+
     def test_redaction_and_leading_dash(self):
         out = fto.safe_title("- Pay card 4111 1111 1111 1111 today")
         self.assertTrue(out.startswith("\\-"))
@@ -372,6 +440,12 @@ class InboundCoordinationTest(unittest.TestCase):
         self.text = text
         return fti.run({**self.cfg, **cfg}, self.dir, self.checkpoint)
 
+    def export(self, *ids, state="exported"):
+        path = self.dir / "state" / "fibery-outbound.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "items": {
+            i: {"state": state, "at": "2026-08-02T00:00:00Z"} for i in ids}}))
+
     def items(self):
         return json.loads(self.checkpoint.read_text())["items"]
 
@@ -383,6 +457,7 @@ class InboundCoordinationTest(unittest.TestCase):
 
     def test_marker_links_instead_of_creating(self):
         write_entry(self.store, "a1")
+        self.export("a1", state="attempted")
         report = self.run_once(self.doc())
         self.assertEqual(report["created"], 0)
         self.assertEqual(report["linked"], 1)
@@ -393,6 +468,7 @@ class InboundCoordinationTest(unittest.TestCase):
 
     def test_linked_done_adds_note_but_edit_never_rewrites(self):
         write_entry(self.store, "a1")
+        self.export("a1")
         self.run_once(self.doc())
         self.run_once(self.doc(text="Reworded (mem:a1)"))
         self.assertEqual(self.memory.calls, [])
@@ -403,18 +479,31 @@ class InboundCoordinationTest(unittest.TestCase):
         self.assertEqual(notes[0][notes[0].index("--follows") + 1], "a1")
         self.assertEqual(self.memory.of("todo"), [])
 
-    def test_unknown_marker_never_creates_a_todo(self):
-        write_entry(self.store, "other")
-        self.run_once(self.doc(text="X (mem:missing)"))
-        self.assertEqual(self.memory.calls, [])
-        self.assertIsNone(self.items()[bid(1)]["entry_id"])
-        # Reopen path must not mint a todo either.
-        self.run_once(self.doc("DONE", "X (mem:missing)"))
-        self.run_once(self.doc("TODO", "X (mem:missing)"))
+    def test_spoofed_marker_is_a_normal_new_task(self):
+        # The entry exists but outbound never exported it.
+        write_entry(self.store, "a1")
+        self.export("other")
+        report = self.run_once(self.doc())
+        self.assertEqual(report["linked"], 0)
+        self.assertEqual(report["created"], 1)
+        self.assertEqual(len(self.memory.of("todo")), 1)
+        self.assertNotEqual(self.items()[bid(1)]["entry_id"], "a1")
+
+    def test_marker_without_outbound_checkpoint_creates(self):
+        write_entry(self.store, "a1")
+        self.assertEqual(self.run_once(self.doc())["created"], 1)
+
+    def test_unreadable_outbound_checkpoint_fails_closed(self):
+        path = self.dir / "state" / "fibery-outbound.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{bad")
+        with self.assertRaises(RuntimeError):
+            self.run_once(self.doc())
         self.assertEqual(self.memory.calls, [])
 
     def test_unmarked_tasks_still_create(self):
         write_entry(self.store, "a1")
+        self.export("a1")
         report = self.run_once(self.doc(text="Plain task"))
         self.assertEqual(report["created"], 1)
 
@@ -452,6 +541,28 @@ class InboundCoordinationTest(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
 
 
+class PersonalTagTest(unittest.TestCase):
+    def test_every_configured_personal_tag_is_excluded(self):
+        from workspace_daemon import maintenance
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "routines"
+            folder.mkdir()
+            (folder / "a.yaml").write_text(
+                "id: a\nrole: maintenance\nmaintenance:\n  kind: calendar_cache\n"
+                "memory:\n  personal_tag: private\n")
+            (folder / "b.yaml").write_text(
+                "id: b\nhandlers:\n  h:\n    memory:\n      personal_tag: secret\n")
+            tags = maintenance._personal_tags(tmp)
+            self.assertTrue({"private", "secret"} <= tags)
+            routine = ConfigTest().routine()
+            with mock.patch.object(fto, "run", return_value={
+                    "candidates": 0, "exported": 0, "already_present": 0,
+                    "mode": "suggest", "dry_run": True}) as run:
+                maintenance.run(Path(tmp), routine, dry_run=True)
+            self.assertTrue(
+                {"private", "secret"} <= run.call_args[1]["extra_exclude"])
+
+
 class ConfigTest(unittest.TestCase):
     def routine(self, **over):
         maintenance = {
@@ -480,6 +591,8 @@ class ConfigTest(unittest.TestCase):
             {"from_sources": []},
             {"inbox_heading": "a\nb"},
             {"max_per_run": 0},
+            {"exclude_tags": "personal"},
+            {"retry_unconfirmed": [1]},
             {"bogus": 1},
         ):
             self.assertTrue(config.validate(self.routine(**over)), over)
