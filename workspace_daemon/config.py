@@ -1345,6 +1345,7 @@ def _validate_slack_mcp(prefix, source):
     if not (
         source.get("channels") or source.get("people")
         or source.get("include_mentions") is True
+        or source.get("all_dms") is True
         or source.get("_watch_unread")
     ):
         problems.append(
@@ -1355,6 +1356,8 @@ def _validate_slack_mcp(prefix, source):
         source["include_mentions"], bool
     ):
         problems.append(f"{prefix}.include_mentions must be true or false")
+    if "all_dms" in source and not isinstance(source["all_dms"], bool):
+        problems.append(f"{prefix}.all_dms must be true or false")
     for key, lower, upper in (
         ("max_threads_per_run", 1, 100), ("max_thread_replies", 1, 500),
         ("max_thread_chars", 500, 100000), ("max_search_pages", 1, 20),
@@ -1424,6 +1427,7 @@ def _validate_slack_mcp(prefix, source):
         -(-len(source.get("channels") or []) // 15)
         + len(source.get("people") or [])
         + (1 if source.get("include_mentions") is True else 0)
+        + (1 if source.get("all_dms") is True else 0)
     )
     cap = source.get("max_queries_per_run", 20)
     if _bounded_int(cap, 1, 100) and planned > cap:

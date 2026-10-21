@@ -1202,12 +1202,13 @@ channels:                  # channels, private channels and DMs
   - {id: C0EXAMPLE02, name: example-team}   # names are local labels only
 people: [U0EXAMPLEA]       # slack_mcp only: authors watched in any channel
 include_mentions: true
+all_dms: true              # slack_mcp only: every DM and group DM of the owner
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
-`include_mentions` and `owner_action_channels` keys; unknown keys and malformed
+`include_mentions`, `all_dms` and `owner_action_channels` keys; unknown keys and malformed
 ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
 are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
 `people` list unless it sets `ignore_people: true`, which keeps the exit path a
@@ -1229,7 +1230,17 @@ How a run works:
    report a cursor are followed in later sessions, one session per page round
    for all queries still paging, up to `max_search_pages`.
    Sessions are spaced `min_seconds_between_searches` apart and a run plans at
-   most `max_queries_per_run`. Every new root and reply comes back with its
+   most `max_queries_per_run`. With `all_dms: true` one more query (cursor
+   key `dms`) searches `with:<@owner>` and pins `channel_types=im,mpim`, which
+   returns every direct and group message involving the owner, the owner's own
+   included; no per-conversation list is needed. A DM hit is accepted only when
+   its result header says `DM` or `Group DM` and its `Participants:` line
+   lists the owner, and only when every valid reading of the page agrees on it
+   (a body quoting a result block cannot add a DM). Threads found this way are
+   direct asks, so they carry the same owner-action evidence as an
+   `owner_action_channels` entry. The mixed first-page session cannot pin
+   `channel_types` for the other queries, so the call match enforces it; a
+   session holding only the DM query pins it. Every new root and reply comes back with its
    channel, author, timestamp and thread root, so late replies to old threads
    surface without reading channels. Mention and DM hits parse like any other.
 2. Hits are cross-checked (the permalink must agree with the channel and

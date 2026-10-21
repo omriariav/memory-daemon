@@ -12,6 +12,7 @@ candidate ids.
     people:                   # authors whose messages are watched anywhere
       - U0EXAMPLEA
     include_mentions: true
+    all_dms: true             # slack_mcp only: every DM and group DM of the owner
     owner_action_channels:
       - C0EXAMPLE01
     bootstrap: 3d             # first-run look-back when no cursor exists
@@ -26,7 +27,7 @@ from .shell import log
 
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
-    "bootstrap",
+    "bootstrap", "all_dms",
 }
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
@@ -92,6 +93,9 @@ def load(path):
     mentions = data.get("include_mentions", False)
     if not isinstance(mentions, bool):
         raise WatchError("`include_mentions` must be true or false")
+    all_dms = data.get("all_dms", False)
+    if not isinstance(all_dms, bool):
+        raise WatchError("`all_dms` must be true or false")
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
@@ -99,6 +103,7 @@ def load(path):
         "channels": _ids(data, "channels", CHANNEL_ID, "channel"),
         "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
+        "all_dms": all_dms,
         "owner_action_channels": _ids(
             data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
@@ -134,6 +139,10 @@ def expand(source):
             # Only the connector-backed source has a look-back of its own;
             # an inline value wins over the file's.
             if source.get("kind") == "slack_mcp" and key not in source:
+                merged[key] = value
+        elif key == "all_dms":
+            # Only the connector-backed source can search every DM.
+            if value and source.get("kind") == "slack_mcp":
                 merged[key] = value
         elif value not in ([], False):
             merged[key] = value

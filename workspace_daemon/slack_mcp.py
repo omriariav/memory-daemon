@@ -17,6 +17,10 @@ Routine config (the watched ids normally come from a private `watch:` file):
       settle_minutes: 15
       include_bots: false
 
+The watch file may also set `all_dms: true`: one more query (`dms`) searches
+`with:<@owner>` over `channel_types=im,mpim`, so every direct and group message
+involving the owner is listed without naming each conversation.
+
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
 else (planning, parsing, grouping, bounding, versioning) is deterministic
@@ -28,7 +32,7 @@ in chunks, one per watched person, one for mentions) returns every new root and
 reply, so a late reply to an old thread surfaces without reading channels.
 Hits are grouped by (channel, thread root).
 
-Cursors are per query (`channels`, `from:<id>`, `me`) and advance to a
+Cursors are per query (`channels`, `from:<id>`, `me`, `dms`) and advance to a
 watermark rather than all-or-nothing: the older of the run's start, the newest
 timestamp of the oldest thread left for later (still settling, or over
 `max_threads_per_run`) and, for a search that hit `max_search_pages`, a point
@@ -78,6 +82,7 @@ DEFAULTS = {
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
+    "all_dms",
 }
 CURSOR_SCHEMA = 1
 CHANNELS_PER_QUERY = 15
@@ -97,8 +102,11 @@ PINNED_SEARCH = {
 # `## <name>` sections a search result may carry besides the messages.
 KNOWN_SECTIONS = {"Messages", "Files", "Channels", "Users"}
 RESERVED_SEARCH_ARGS = set(PINNED_SEARCH) | {
-    "filters", "keywords", "after", "cursor", "limit",
+    "filters", "keywords", "after", "cursor", "limit", "channel_types",
 }
+# The one query that also fixes the conversation types searched.
+DM_CHANNEL_TYPES = "im,mpim"
+DM_LABELS = {"DM", "Group DM"}
 # Argument names of the connector's thread reader.
 THREAD_CHANNEL_ARG = "channel_id"
 THREAD_TS_ARG = "message_ts"
@@ -146,6 +154,7 @@ def settings(source):
     for key in ("channels", "people"):
         cfg[key] = list(source.get(key) or [])
     cfg["include_mentions"] = source.get("include_mentions") is True
+    cfg["all_dms"] = source.get("all_dms") is True
     cfg["search_args"] = dict(source.get("search_args") or {})
     return cfg
 
@@ -180,6 +189,10 @@ def cursor_ids(source):
     if cfg["include_mentions"]:
         ids["me"] = "slack_mcp:me:" + _digest(
             cfg["self_user_id"], cfg["mention_keywords"], CURSOR_SCHEMA
+        )
+    if cfg["all_dms"]:
+        ids["dms"] = "slack_mcp:dms:" + _digest(
+            cfg["self_user_id"], CURSOR_SCHEMA
         )
     return ids
 
@@ -272,8 +285,8 @@ _RESULT_HEAD = re.compile(r"^### Result (\d+) of (\d+)$", re.M)
 _CURSOR = re.compile(r"cursor:?\s*`([^`\s]+)`")
 _EMAIL_MASK = re.compile(r"\s*<\[?EMAIL:[^>]*>")
 _HIT_HEADER = re.compile(
-    r"Channel: [^\n]*\(ID: (?P<channel>[A-Z0-9]+)\)\n"
-    r"(?:Participants: [^\n]*\n)?"
+    r"Channel: (?P<label>[^\n]*)\(ID: (?P<channel>[A-Z0-9]+)\)\n"
+    r"(?:Participants: (?P<people>[^\n]*)\n)?"
     r"From: (?P<author>[^\n]*?)\(ID: (?P<user>[A-Z0-9]+)\)[ \t]*"
     r"(?P<bot>\[BOT\])?[ \t]*\n"
     r"Time: [^\n]*\n"
@@ -282,6 +295,7 @@ _HIT_HEADER = re.compile(
     r"Permalink: (?P<link>[^\n]*)\n"
     r"Text:"
 )
+_PARTICIPANT = re.compile(r"\(ID: ([A-Z0-9]+)\)")
 _ARCHIVE = re.compile(r"/archives/([A-Z0-9]+)/p(\d+)")
 _LINK_THREAD = re.compile(r"[?&]thread_ts=(\d+\.\d+)")
 MAX_CHAINS = 500
@@ -329,6 +343,8 @@ def _parse_hit(block):
     body = body[1:] if body.startswith(" ") else body
     return {
         "channel": match.group("channel"),
+        "label": match.group("label").strip(),
+        "participants": _PARTICIPANT.findall(match.group("people") or ""),
         "user": match.group("user"),
         "name": _clean_name(match.group("author")),
         "is_bot": bool(match.group("bot")),
@@ -646,8 +662,20 @@ def _search_pins(cfg):
     return dict(PINNED_SEARCH, **cfg["search_args"])
 
 
+def _session_pins(cfg, calls):
+    """Pins for one session: the shared ones, plus `channel_types` when every
+    call of the session is the DM query (a mixed session cannot pin it, but
+    the planned-call match still holds each call to its own arguments)."""
+    pins = _search_pins(cfg)
+    if calls and all(c.get("channel_types") == DM_CHANNEL_TYPES for c in calls):
+        pins["channel_types"] = DM_CHANNEL_TYPES
+    return pins
+
+
 def _search_args(cfg, query, after, cursor=None):
     args = dict(_search_pins(cfg), after=after, limit=SEARCH_LIMIT)
+    if query.get("channel_types"):
+        args["channel_types"] = query["channel_types"]
     if query["filters"]:
         args["filters"] = query["filters"]
     if query["keywords"]:
@@ -678,6 +706,12 @@ def search_queries(cfg):
             "key": "me", "kind": "mentions", "allowed": None, "user": None,
             "keywords": mention_keywords(cfg), "filters": None,
         })
+    if cfg["all_dms"]:
+        queries.append({
+            "key": "dms", "kind": "dms", "allowed": None, "user": None,
+            "keywords": None, "filters": f"with:<@{cfg['self_user_id']}>",
+            "channel_types": DM_CHANNEL_TYPES,
+        })
     return queries
 
 
@@ -702,6 +736,12 @@ def _valid_hit(query, hit, after, now, cfg):
         return False
     if query["kind"] == "mentions" and (
         f"<@{cfg['self_user_id']}" not in hit["text"]
+    ):
+        return False
+    if query["kind"] == "dms" and not (
+        hit["label"] in DM_LABELS
+        and hit["channel"][:1] in "CDG"
+        and cfg["self_user_id"] in hit["participants"]
     ):
         return False
     return True
@@ -730,7 +770,7 @@ def _search_all(cfg, queries, afters, now):
         calls = [pending[i] for i in order]
         _pace(cfg)
         texts = _session(
-            cfg, cfg["search_tool"], _search_pins(cfg), calls,
+            cfg, cfg["search_tool"], _session_pins(cfg, calls), calls,
             "search", [cfg["search_tool"]], pace=True,
         )
         for index, text in zip(order, texts):
@@ -763,6 +803,12 @@ def _search_all(cfg, queries, afters, now):
             accepted = [
                 h for h in hits if _valid_hit(query, h, after, now, cfg)
             ]
+            if query["kind"] == "dms":
+                # A DM hit earns owner-action evidence, and a body can quote
+                # a well-formed block naming any channel: keep only the hits
+                # every valid reading of the page agrees on.
+                agreed = {id(h) for h in (hits if trusted is None else trusted)}
+                accepted = [h for h in accepted if id(h) in agreed]
             if stamps:
                 # Parsed hits, in validated ascending order, bound the
                 # prefix read even when none passed the cross-checks.
@@ -796,7 +842,7 @@ def _group(cfg, found):
         key = (hit["channel"], hit["root"])
         group = groups.setdefault(
             key, {"ts": hit["ts"], "mention": False, "replies": 0,
-                  "keys": set(), "hit_ts": set(), "root_seen": False}
+                  "dm": False, "keys": set(), "hit_ts": set(), "root_seen": False}
         )
         if hit["ts"] == hit["root"]:
             group["root_seen"] = True
@@ -807,6 +853,8 @@ def _group(cfg, found):
         group["replies"] = max(group["replies"], hit["replies"])
         if query["kind"] == "mentions" and hit["channel"] not in watched:
             group["mention"] = True
+        if query["kind"] == "dms":
+            group["dm"] = True
     return groups
 
 
@@ -826,6 +874,7 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
         "anchor": root,
         "source_id": anchor_id,
         "via_mention": group["mention"],
+        "via_dm": group["dm"],
         "reply_hint": group["replies"],
         "root_seen": group["root_seen"],
         "keys": sorted(group["keys"]),
@@ -1122,6 +1171,13 @@ def fetch(routine, candidate, source=None):
             if r["user"] == cfg["self_user_id"] and r["ts"] not in seen else r
             for r in replies
         ]
+    if raw.get("via_dm"):
+        # Direct and group messages are direct asks: like an
+        # owner_action_channels entry, they may assign actions to the owner.
+        source = dict(source or {}, owner_action_channels=list(dict.fromkeys(
+            list((source or {}).get("owner_action_channels") or [])
+            + [raw["channel"]]
+        )))
     messages = bound_thread(
         parent, replies, more, cfg["max_thread_chars"],
         raw.get("reply_hint") or 0,
