@@ -49,6 +49,25 @@ def paused(base_dir):
     return (lines[0].strip() if lines else "") or "paused"
 
 
+def pause(base_dir, reason="paused from the terminal UI"):
+    """Create the kill switch. Returns True when it was newly created."""
+    path = pause_file(base_dir)
+    already = path.exists()
+    ensure_private_dir(path.parent)
+    if not already:
+        write_atomic(path, f"{reason}\n", mode=0o600)
+    return not already
+
+
+def resume(base_dir):
+    """Remove the kill switch. Returns True when a switch was removed."""
+    try:
+        pause_file(base_dir).unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def ensure_private_dir(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)

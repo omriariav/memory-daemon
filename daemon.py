@@ -9,6 +9,8 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py run [--routine ID] [-n]    process new matches now (--ignore-pause overrides state/PAUSED)
   daemon.py tick [-n]                  process only routines whose cadence is due
   daemon.py new                        interactive scaffold for a new routine
+  daemon.py tui                        live terminal UI: status, pause, run, tick
+  daemon.py ctl pause|resume|state     non-interactive kill switch and summary
 """
 import argparse
 import os
@@ -22,7 +24,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, runner, state, status
+from workspace_daemon import config, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -84,6 +86,31 @@ def cmd_status(args):
     text, healthy = status.render(BASE_DIR, routines, label=args.label)
     print(text)
     return 0 if healthy else 1
+
+
+# --- tui / ctl --------------------------------------------------------------
+
+def cmd_tui(args):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("tui needs a terminal; use `daemon.py status` or `ctl state`",
+              file=sys.stderr)
+        return 2
+    return tui.run_curses(BASE_DIR, interval=args.interval,
+                          label_prefix=args.label_prefix)
+
+
+def cmd_ctl(args):
+    if args.action == "pause":
+        created = state.pause(BASE_DIR, args.reason)
+        print("paused" if created else "already paused")
+        return 0
+    if args.action == "resume":
+        removed = state.resume(BASE_DIR)
+        print("resumed" if removed else "was not paused")
+        return 0
+    snap = tui.Collector(BASE_DIR, args.label_prefix).snapshot()
+    print(tui.summary_line(snap))
+    return 0
 
 
 # --- validate ---------------------------------------------------------------
@@ -534,6 +561,23 @@ def main(argv=None):
         help="launchd label (default: %(default)s)",
     )
     p_status.set_defaults(func=cmd_status)
+    default_prefix = os.environ.get(
+        "MEMORY_DAEMON_LAUNCHD_LABEL", status.DEFAULT_LAUNCHD_LABEL
+    )
+    p_tui = sub.add_parser("tui", help="live terminal UI (status + controls)")
+    p_tui.add_argument("--interval", type=float, default=2.0,
+                       help="refresh seconds (default: %(default)s)")
+    p_tui.add_argument("--label-prefix", default=default_prefix,
+                       help="show every loaded launchd job whose label starts "
+                            "with this (default: %(default)s)")
+    p_tui.set_defaults(func=cmd_tui)
+    p_ctl = sub.add_parser("ctl", help="pause, resume, or summarize state")
+    p_ctl.add_argument("action", choices=("pause", "resume", "state"))
+    p_ctl.add_argument("--reason", default="paused from the command line",
+                       help="first line written to state/PAUSED")
+    p_ctl.add_argument("--label-prefix", default=default_prefix,
+                       help="launchd label prefix for `state` (default: %(default)s)")
+    p_ctl.set_defaults(func=cmd_ctl)
     sub.add_parser("validate", help="check all routine YAML").set_defaults(func=cmd_validate)
     sub.add_parser("new", help="interactive scaffold for a new routine").set_defaults(func=cmd_new)
 

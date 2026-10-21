@@ -279,6 +279,36 @@ writes no ledger, cursor, store, or vault file (the bridge still logs its own
 session metadata to `state/claude-usage.jsonl`); maintenance routines are not
 run.
 
+### Terminal UI
+
+`./memory-daemon-status.sh` opens a live terminal UI when run in a terminal
+with no arguments (otherwise it prints the plain status, as before). It shows
+overall health, PAUSED or running, every loaded launchd job whose label starts
+with `--label-prefix` (default `com.memory-daemon`), last tick age, today's
+spend against the global cap, a scrollable routine table (schedule, last run
+and result, next due, spend against the routine's `budget.daily_usd`, issue
+flags) and the tail of `logs/run.log`. It refreshes every 2 seconds
+(`--interval`). Python stdlib `curses` only; it degrades to a plain message on
+tiny terminals and works without colors, logs, or `launchctl`.
+
+| Key | Action |
+| --- | --- |
+| `j`/`k`, arrows | select routine |
+| `r` / `d` / `c` | run / dry-run / count-only the selected routine (y/n first) |
+| `t` | tick a group: all, capture, maintenance, calendar (y/n first) |
+| `p` | pause or resume: creates or removes `state/PAUSED` (y/n first) |
+| `l` / `f` | full-screen log / filter the log to the selected routine |
+| `L` | reload launchd jobs, bootout + bootstrap (macOS, y/n first) |
+| `v` | validate routines |
+| `?` / `q` | help / quit |
+
+Actions start `daemon.py` as detached processes with output appended to
+`logs/tui.log`. The UI never starts a second run of a routine it is already
+running. Without a terminal use the subcommands: `./memory-daemon-status.sh
+pause|resume|state|run <id>|logs [-f]|status` (or `daemon.py ctl
+pause|resume|state`). Set `MEMORY_DAEMON_PYTHON` to pick the interpreter; the
+script otherwise prefers `.venv/bin/python` in the repo, then `python3`.
+
 ## Codex and Claude Code plugin
 
 This repository is also a marketplace for the dual-compatible
