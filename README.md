@@ -2009,7 +2009,13 @@ One JSON object per line, oldest message first:
   that cap a thread idle for a day or more is read about 4 times a day, so
   N followed threads outside the searched channels cost about 4N reads a day
   plus the reads of fresh activity. State: `state/comms-inbox-follow.json`
-  (at most 500 threads, most recently active kept). The reaction-check
+  (at most 500 threads, most recently active kept). Routines share it: every
+  routine with a `comms_inbox` block records the followed threads its
+  searches list and publishes the channels it searches, so a thread in a
+  channel another lane searches (e.g. discovered channels on a slower lane)
+  is never polled; a lane's coverage is ignored a day after its last run.
+  Only routines with `follow_threads` run the owner search and the polls,
+  so enable it on one lane. The reaction-check
   window (`reaction_check_hours`) runs from each conversation's newest
   message, so new activity in a thread restarts it.
 - Lines are never edited: messages dedupe on (`channel_id`, `ts`); reactions

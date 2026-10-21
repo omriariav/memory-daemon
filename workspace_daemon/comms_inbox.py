@@ -59,6 +59,11 @@ search; a followed thread elsewhere is read with `read_thread_tool` (newest
 `max_thread_replies` replies), at most `thread_polls` per run in one bridge
 session, again only after a quarter of the time since its last activity has
 passed since its last read (at most 6h). State: `state/comms-inbox-follow.json`.
+Every routine with a `comms_inbox` block shares that state: it records the
+followed threads its own searches list, and publishes the channels it
+searches (`covered`, ignored after COVERED_TTL), so no routine polls a thread
+another routine's search already lists. Only routines with `follow_threads`
+run the owner search and the polls.
 
 `thread_ts` is the thread root (equal to `ts` for a top-level message); an
 `owner_reaction` names the message it was put on. Lines are never changed:
@@ -88,6 +93,7 @@ DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "follow_threads": False, "thread_polls": 10}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
+COVERED_TTL = 86400
 TRACKED_FILE = "comms-inbox-tracked.json"
 MAX_TRACK_REACTIONS = 3
 MAX_TRACKED_QUERIES = 2
@@ -484,7 +490,7 @@ def load_follow(base_dir):
     """{"threads": {"<channel>:<root>": {"last", "checked"}}, "scanned":
     epoch or None}; `last` is the newest known message ts, `checked` the
     epoch of the last thread read. Unreadable counts as empty."""
-    empty = {"threads": {}, "scanned": None}
+    empty = {"threads": {}, "scanned": None, "covered": {}}
     if base_dir is None:
         return empty
     try:
@@ -496,7 +502,15 @@ def load_follow(base_dir):
         return empty
     if not isinstance(data, dict):
         return empty
-    out = {"threads": {}, "scanned": None}
+    out = {"threads": {}, "scanned": None, "covered": {}}
+    for routine, entry in (data.get("covered") or {}).items():
+        try:
+            out["covered"][str(routine)] = {
+                "at": float(entry["at"]),
+                "channels": [str(c) for c in entry["channels"]],
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
     scanned = data.get("scanned")
     if isinstance(scanned, (int, float)) and not isinstance(scanned, bool):
         out["scanned"] = scanned
@@ -527,7 +541,15 @@ def save_follow(base_dir, follow, retention_days, now=None):
     if len(live) > MAX_FOLLOWED:
         newest = sorted(live, key=lambda k: float(live[k]["last"]))
         live = {key: live[key] for key in newest[-MAX_FOLLOWED:]}
-    data = {"threads": live, "scanned": follow["scanned"]}
+    data = {
+        "threads": live, "scanned": follow["scanned"],
+        "covered": {
+            routine: entry
+            for routine, entry in follow.get("covered", {}).items()
+            if entry["at"] >= (time.time() if now is None else now)
+            - COVERED_TTL
+        },
+    }
     try:
         state.write_atomic(
             _follow_path(base_dir), json.dumps(data, sort_keys=True),
@@ -552,6 +574,15 @@ def follow_thread(follow, channel, root, ts):
 
 def is_followed(follow, hit):
     return f"{hit['channel']}:{hit['root']}" in follow["threads"]
+
+
+def covered_channels(follow, now=None):
+    """Channels some routine's search lists (published within COVERED_TTL)."""
+    floor = (time.time() if now is None else now) - COVERED_TTL
+    return {
+        channel for entry in follow["covered"].values()
+        if entry["at"] >= floor for channel in entry["channels"]
+    }
 
 
 def due_polls(follow, covered, limit, now=None):

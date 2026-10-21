@@ -1525,11 +1525,11 @@ def candidates(source):
     queries += _tracked_queries(
         cfg, tracked, cfg["max_queries_per_run"] - len(queries), now
     )
-    follow = (
-        comms_inbox.load_follow(_base_dir)
-        if cfg["comms_inbox"] and cfg["comms_inbox"]["follow_threads"]
-        else None
-    )
+    follow = comms_inbox.load_follow(_base_dir) if cfg["comms_inbox"] else None
+    if follow is not None:
+        follow["covered"][source.get("_routine_id") or "default"] = {
+            "at": now, "channels": sorted(cfg["channels"]),
+        }
     fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
     saved_after = int(now) - cfg["save_reaction_lookback_days"] * 86400
     reacted_after = int(now) - (
@@ -1587,7 +1587,8 @@ def candidates(source):
         _record_inbox(cfg, found, now, tracked, follow)
         _mark_scanned(cfg, queries, tracked, follow, capped, failed, now)
         if follow is not None:
-            _poll_threads(cfg, follow, now)
+            if cfg["comms_inbox"]["follow_threads"]:
+                _poll_threads(cfg, follow, now)
             comms_inbox.save_follow(
                 _base_dir, follow, cfg["comms_inbox"]["retention_days"], now
             )
@@ -1808,7 +1809,9 @@ def _poll_threads(cfg, follow, now):
     """
     inbox = cfg["comms_inbox"]
     due = comms_inbox.due_polls(
-        follow, set(cfg["channels"]), inbox["thread_polls"], now
+        follow,
+        set(cfg["channels"]) | comms_inbox.covered_channels(follow, now),
+        inbox["thread_polls"], now,
     )
     if not due:
         return

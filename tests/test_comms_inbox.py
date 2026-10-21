@@ -623,6 +623,29 @@ class FollowTest(InboxTestCase):
         entry = self.follow()["threads"][f"{OTHER}:{ts_at(10)}"]
         self.assertIsNone(entry["checked"])
 
+    def test_another_routine_searching_the_channel_stops_the_polls(self):
+        root = ts_at(10)
+        self.table[MINE] = [{"ch": OTHER, "uid": ME, "ts": root}]
+        self.run_once(_routine_id="fast")
+        self.assertEqual(len(self.reads), 1)
+        # A lane that searches OTHER, without follow_threads, records the
+        # followed thread's replies and publishes its coverage.
+        self.table = {f"in:<#{OTHER}>": [
+            {"ch": OTHER, "ts": ts_at(20), "root": root, "text": "late"},
+        ]}
+        self.seen.clear()
+        self.run_once(
+            now=NOW + 60, inbox={"channels": [CHAN]}, channels=[OTHER],
+            _routine_id="wide",
+        )
+        self.assertNotIn(MINE, [a.get("filters") for a in self.seen])
+        self.assertIn(ts_at(20), [r["ts"] for r in self.messages()])
+        self.run_once(now=NOW + 86400, _routine_id="fast")
+        self.assertEqual(len(self.reads), 1)
+        # Coverage expires when that lane stops running.
+        self.run_once(now=NOW + 3 * 86400, _routine_id="fast")
+        self.assertEqual(len(self.reads), 2)
+
     def test_poll_cap(self):
         self.table[MINE] = [
             {"ch": OTHER, "uid": ME, "ts": ts_at(n)} for n in (10, 20, 30)
