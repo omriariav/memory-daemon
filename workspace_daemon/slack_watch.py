@@ -16,19 +16,37 @@ candidate ids.
     owner_action_channels:
       - C0EXAMPLE01
     bootstrap: 3d             # first-run look-back when no cursor exists
+    discover_from: ~/path/slack-discovered.yaml   # channels found by discovery
+    ignore_channels: [C0EXAMPLE09]                # never added by discovery
+
+`discover_from` names a separate private file kept by the `slack_discovery`
+maintenance routine; its channels are appended to the hand-written `channels`
+at load (a hand-written entry always wins, an `ignore_channels` entry is never
+merged in). A missing discovered file adds nothing.
+
+The discovered file is YAML written by the daemon, never by hand:
+
+    channels:
+      - {id: C0EXAMPLE05, name: example-name, last_active: 2026-10-20,
+         reason: posted}
 """
+import datetime
 import os
 import re
 from pathlib import Path
 
 import yaml
 
+from . import state
 from .shell import log
 
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
-    "bootstrap", "all_dms",
+    "bootstrap", "all_dms", "discover_from", "ignore_channels",
 }
+DISCOVERED_ID = re.compile(r"^[CG][A-Z0-9]{8,}$")
+DISCOVERED_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+DISCOVERED_REASONS = ("posted", "mentioned")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
@@ -65,22 +83,103 @@ def _ids(data, key, pattern, label):
     return out
 
 
-def load(path):
-    """Parse a watch file into source keys; raises WatchError with the reason."""
-    path = Path(str(path)).expanduser()
+def _private_path(value, label):
+    path = Path(str(value)).expanduser()
     if not path.is_absolute():
-        raise WatchError("watch path must be absolute or start with ~")
+        raise WatchError(f"{label} path must be absolute or start with ~")
+    return path
+
+
+def _read_yaml(path, label):
+    """Parsed YAML of a private file (None when empty); warns on loose modes."""
     try:
         if os.stat(path).st_mode & 0o077 and str(path) not in _WARNED:
             _WARNED.add(str(path))
-            log("slack watch file is readable by group or others; "
+            log(f"slack {label} is readable by group or others; "
                 "run chmod 600 on it")
         with open(path) as handle:
-            data = yaml.safe_load(handle)
+            return yaml.safe_load(handle)
     except OSError as exc:
-        raise WatchError(f"cannot read watch file ({exc.strerror})") from exc
+        raise WatchError(f"cannot read {label} ({exc.strerror})") from exc
     except yaml.YAMLError as exc:
-        raise WatchError("watch file is not valid YAML") from exc
+        raise WatchError(f"{label} is not valid YAML") from exc
+
+
+def _as_date(value):
+    if isinstance(value, datetime.datetime):
+        return None
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.isoformat() == value else None
+    return None
+
+
+def read_discovered(path):
+    """Entries of a discovered-channels file, [] when it does not exist yet.
+
+    Each entry is {"id", "last_active" (date), "reason", "name" (optional)}.
+    A malformed file raises WatchError: it is never half-trusted.
+    """
+    path = _private_path(path, "discovered file")
+    if not path.exists():
+        return []
+    data = _read_yaml(path, "discovered file")
+    if data is None:
+        return []
+    if not isinstance(data, dict) or set(data) - {"channels"}:
+        raise WatchError("discovered file must be a mapping with `channels`")
+    rows = data.get("channels") or []
+    if not isinstance(rows, list):
+        raise WatchError("discovered `channels` must be a list")
+    out, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) - {
+            "id", "name", "last_active", "reason"
+        }:
+            raise WatchError("discovered entries need id, last_active, reason")
+        cid = row.get("id")
+        active = _as_date(row.get("last_active"))
+        if not isinstance(cid, str) or not DISCOVERED_ID.match(cid):
+            raise WatchError("discovered entry has an id that is not a channel")
+        if active is None or row.get("reason") not in DISCOVERED_REASONS:
+            raise WatchError("discovered entry has a bad last_active or reason")
+        name = row.get("name")
+        if name is not None and not (
+            isinstance(name, str) and DISCOVERED_NAME.match(name)
+        ):
+            raise WatchError("discovered entry has a bad name")
+        if cid in seen:
+            raise WatchError("discovered file lists a channel twice")
+        seen.add(cid)
+        entry = {"id": cid, "last_active": active, "reason": row["reason"]}
+        if name:
+            entry["name"] = name
+        out.append(entry)
+    return out
+
+
+def write_discovered(path, entries):
+    """Atomically write the discovered file (mode 600), sorted by id."""
+    path = _private_path(path, "discovered file")
+    rows = [dict(sorted(entry.items())) for entry in
+            sorted(entries, key=lambda e: e["id"])]
+    text = (
+        "# Written by the slack_discovery maintenance routine; do not edit.\n"
+        + yaml.safe_dump({"channels": rows}, sort_keys=False)
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state.write_atomic(path, text, mode=0o600)
+
+
+def _parse(path):
+    """Validated watch-file data (before discovery is merged)."""
+    path = _private_path(path, "watch")
+    data = _read_yaml(path, "watch file")
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -99,8 +198,17 @@ def load(path):
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
+    hand = _ids(data, "channels", CHANNEL_ID, "channel")
+    ignore = _ids(data, "ignore_channels", CHANNEL_ID, "channel")
+    discover_from = data.get("discover_from")
+    if discover_from is not None and not (
+        isinstance(discover_from, str) and discover_from
+    ):
+        raise WatchError("`discover_from` must be a path string")
     return {
-        "channels": _ids(data, "channels", CHANNEL_ID, "channel"),
+        "channels": hand,
+        "ignore_channels": ignore,
+        "discover_from": discover_from,
         "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
         "all_dms": all_dms,
@@ -109,6 +217,30 @@ def load(path):
         ),
         "bootstrap": bootstrap,
     }
+
+
+def hand_written(path):
+    """(channels, ignore_channels) typed by hand in a watch file."""
+    parsed = _parse(path)
+    return parsed["channels"], parsed["ignore_channels"]
+
+
+def load(path):
+    """Parse a watch file into source keys; raises WatchError with the reason.
+
+    Channels of the file named by `discover_from` follow the hand-written
+    ones, minus anything already listed and anything in `ignore_channels`.
+    """
+    parsed = _parse(path)
+    ignore = set(parsed.pop("ignore_channels"))
+    discover_from = parsed.pop("discover_from")
+    if discover_from:
+        known = set(parsed["channels"]) | ignore
+        parsed["channels"] = parsed["channels"] + sorted(
+            entry["id"] for entry in read_discovered(discover_from)
+            if entry["id"] not in known
+        )
+    return parsed
 
 
 def expand(source):

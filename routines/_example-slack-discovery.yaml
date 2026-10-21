@@ -1,0 +1,41 @@
+# Example: keep a private list of the Slack channels you are active in, through
+# a claude.ai Slack connector (no Slack token on this machine).
+#
+# Once a day, two read-only searches (messages you posted, messages that
+# mention you) over the last `active_days` list the public and private channels
+# you are active in. They are recorded in a separate private file; a watch file
+# merges that file into its hand-written channels with `discover_from`. A
+# channel idle for `idle_days` is dropped. See "Slack channel discovery" in the
+# README.
+#
+# Requires the Claude Code CLI logged in to an account with the Slack connector
+# authorized. It writes no memory entries: only channel ids, dates and a reason.
+id: example-slack-discovery
+enabled: false
+description: Discover the Slack channels the owner posts or is mentioned in.
+role: maintenance
+
+schedule:
+  every: 1d
+
+# Optional ceiling for this routine's Claude spend (see the README on budgets).
+# budget:
+#   daily_usd: 0.25
+
+maintenance:
+  kind: slack_discovery
+  # Private file this routine owns; point the watch file's `discover_from` at it.
+  discovered: ~/path/slack-discovered.yaml
+  # Optional: the hand-written watch file. Its `channels` are never recorded
+  # here and its `ignore_channels` are never added.
+  watch: ~/path/slack-watch.yaml
+  # Exact MCP tool name as your connector exposes it (`claude mcp list`).
+  # Validation accepts only read-only slack_search_* tools.
+  search_tool: mcp__claude_ai_Example_Slack__slack_search_public_and_private
+  self_user_id: U0EXAMPLEA   # your Slack user id
+  model: haiku               # bridge model; it only transports tool results
+  active_days: 14            # activity this recent adds a channel
+  idle_days: 30              # no activity for this long drops it
+  max_search_pages: 5        # 20 hits per page, newest first
+  min_seconds_between_searches: 3
+  max_channels: 45           # keep the most recently active

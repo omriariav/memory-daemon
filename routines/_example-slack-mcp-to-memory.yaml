@@ -13,7 +13,10 @@
 # The watched ids live in a private file outside the repository (its shape is
 # in the README), not in this routine. That file may also set
 #   all_dms: true   # one extra search for every DM and group DM of the owner
-# (DM threads count as direct asks, like owner_action_channels).
+# (DM threads count as direct asks, like owner_action_channels). It can also set
+#   discover_from: ~/path/slack-discovered.yaml   # channels found by the
+#   ignore_channels: [C0EXAMPLE09]                # slack_discovery routine; never added
+# (see routines/_example-slack-discovery.yaml).
 id: example-slack-mcp-to-memory
 enabled: false
 description: Distill watched Slack threads and mentions into memory entries.

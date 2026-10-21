@@ -1289,6 +1289,49 @@ only the cursors of the queries that found it, at its timestamp. A read outage
 attempt against any thread. Errors and logs carry counts only, never tool inputs or message text, and
 the runner's item titles for these threads are the channel and timestamp.
 
+### Slack channel discovery
+
+`maintenance.kind: slack_discovery` keeps a private list of the channels you
+are active in, so a connector-backed `slack_mcp` watch does not need every
+channel typed by hand. Run it daily (`schedule.every: 1d`). See
+`routines/_example-slack-discovery.yaml`.
+
+It searches the last `active_days` (default 14) twice through the same
+least-privilege bridge as `slack_mcp`: messages you posted (`from:<@you>`) and
+messages that mention you (keyword `<@you>`), newest first, at most
+`max_search_pages` pages (default 5) of 20 hits each, both searches sharing one
+session per page round. A public or private channel with such a hit is
+recorded as `{id, name?, last_active, reason: posted|mentioned}` in a separate
+private YAML file (`maintenance.discovered`); DMs and group DMs, bot messages
+and hits that do not match their search are never recorded. An entry with no
+activity for `idle_days` (default 30) is dropped, and at most `max_channels`
+(default 45, the most recently active) are kept so the watch stays within
+`max_queries_per_run`.
+
+```yaml
+# watch file (hand-written)
+channels: [C0EXAMPLE01]
+ignore_channels: [C0EXAMPLE09]       # discovery never adds these
+discover_from: ~/path/slack-discovered.yaml
+```
+
+`discover_from` merges the discovered channels after the hand-written ones when
+the watch loads: hand-written `channels` always stay, an `ignore_channels`
+entry is never merged in, and a missing discovered file adds nothing. Give the
+routine the watch file with `maintenance.watch` so it also skips channels you
+already list. Because the `channels` cursor is keyed by the channel set, a
+channel added or dropped restarts that one cursor at `bootstrap`; threads
+already in the ledger are skipped.
+
+A run that cannot read every page it started (an unparseable page, a missing
+result) leaves the file untouched, and only hits that every valid reading of a
+page agrees on count, so a message quoting a result block cannot add a channel.
+The tool name goes through the same validation as `slack_mcp`'s search tool
+(exact read-only `slack_search_*`) and the session allowlists that single tool.
+Calls run under the routine's `budget` and usage scope like any other bridge
+work. Logs carry counts and channel ids only (`added_ids=`, `removed_ids=`),
+never message text; a dry run makes no connector call and writes nothing.
+
 ### Label caching
 
 The user-label catalog is ~940 names and changes maybe monthly, so it is cached
@@ -1461,6 +1504,7 @@ workspace_daemon/
   slack_source.py          Slack thread discovery and rendering
   slack_watch.py           private Slack watch file loader (`watch:`)
   slack_mcp.py             Slack source through a claude.ai connector (headless bridge)
+  slack_discovery.py       daily Slack channel discovery through the connector
   count_only.py            `run --count-only` report
   mila_source.py           read-only Mila + Calendar matching
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching

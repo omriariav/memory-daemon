@@ -21,6 +21,7 @@ VALID_ROUTINE_ROLES = {
 }
 VALID_MAINTENANCE_KINDS = {
     "google_tasks_sync", "slack_conversation_census", "calendar_cache",
+    "slack_discovery",
 }
 MAINTENANCE_ALLOWED_KEYS = {
     "slack_conversation_census": {
@@ -32,6 +33,11 @@ MAINTENANCE_ALLOWED_KEYS = {
         "outbound_tasklist", "outbound_since", "exclude_tags",
         "identity_exclude_people", "max_tasks", "reclassify_non_todo",
     },
+    "slack_discovery": {
+        "kind", "discovered", "watch", "search_tool", "self_user_id", "model",
+        "active_days", "idle_days", "max_search_pages",
+        "min_seconds_between_searches", "max_channels",
+    },
     "calendar_cache": {
         "kind", "calendar_id", "window_hours", "timezone", "owner_email",
         "internal_domains", "output", "skip_titles", "max_attendee_names",
@@ -40,7 +46,7 @@ MAINTENANCE_ALLOWED_KEYS = {
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
-MAINTENANCE_NO_CHECKPOINT = {"calendar_cache"}
+MAINTENANCE_NO_CHECKPOINT = {"calendar_cache", "slack_discovery"}
 # Before per-routine cadence existed, the launchd job ran hourly. Keep omitted
 # schedules at that legacy frequency; new routines write their intended cadence
 # explicitly, so installing `tick` never silently slows an existing routine.
@@ -503,7 +509,9 @@ def uses_claude_bridge(routine):
         if isinstance(identity, dict) and identity.get("provider") == "slack_mcp":
             return True
     maintenance = routine.get("maintenance")
-    if isinstance(maintenance, dict) and maintenance.get("kind") == "calendar_cache":
+    if isinstance(maintenance, dict) and maintenance.get("kind") in (
+        "calendar_cache", "slack_discovery",
+    ):
         return True
     return any(
         isinstance(source, dict) and source.get("kind") == "slack_mcp"
@@ -619,6 +627,8 @@ def validate(routine):
                 problems.append(f"{rid}: maintenance.checkpoint is required")
             if kind == "calendar_cache":
                 problems.extend(_validate_calendar_cache(rid, maintenance))
+            elif kind == "slack_discovery":
+                problems.extend(_validate_slack_discovery(rid, maintenance))
             elif kind == "slack_conversation_census":
                 hours = maintenance.get("hours", 48)
                 if (
@@ -1179,6 +1189,53 @@ def _non_empty_str(value):
 
 def _str_list(value):
     return isinstance(value, list) and all(_non_empty_str(v) for v in value)
+
+
+def _validate_slack_discovery(rid, cfg):
+    problems = []
+    for key in ("discovered", "watch"):
+        value = cfg.get(key)
+        if value is None and key == "watch":
+            continue
+        if not _non_empty_str(value) or not (
+            value.startswith("~") or value.startswith("/")
+        ):
+            problems.append(
+                f"{rid}: maintenance.{key} must be an absolute or ~ path"
+                + ("" if key == "watch" else " (a relative path would land "
+                   "inside the repository)")
+            )
+    if not _read_only_tool(cfg.get("search_tool"), "slack_search_"):
+        problems.append(
+            f"{rid}: maintenance.search_tool must be an exact read-only MCP "
+            "tool name (mcp__<server>__slack_search_...)"
+        )
+    owner = cfg.get("self_user_id")
+    if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
+        problems.append(
+            f"{rid}: maintenance.self_user_id must be the owner's Slack user id"
+        )
+    for key, lower, upper in (
+        ("active_days", 1, 90), ("idle_days", 1, 365),
+        ("max_search_pages", 1, 10), ("max_channels", 1, 200),
+        ("min_seconds_between_searches", 0, 120),
+    ):
+        if key in cfg and not _bounded_int(cfg[key], lower, upper):
+            problems.append(
+                f"{rid}: maintenance.{key} must be an integer from "
+                f"{lower} to {upper}"
+            )
+    active, idle = cfg.get("active_days", 14), cfg.get("idle_days", 30)
+    if (
+        _bounded_int(active, 1, 90) and _bounded_int(idle, 1, 365)
+        and idle < active
+    ):
+        problems.append(
+            f"{rid}: maintenance.idle_days must be at least active_days"
+        )
+    if "model" in cfg and not _non_empty_str(cfg["model"]):
+        problems.append(f"{rid}: maintenance.model must be a non-empty string")
+    return problems
 
 
 def _validate_calendar_cache(rid, cfg):
