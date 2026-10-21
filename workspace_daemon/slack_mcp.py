@@ -33,6 +33,33 @@ not-worthy filters, carries the `saved` owner-evidence reason and the
 `save_reaction_tag` tag (default `saved`), and is read and captured like any
 other thread, so its memory is updated in place by source id.
 
+The watch file (or the source) may also set `dm_sessions` to stop a DM back
+and forth from becoming one tiny memory per message:
+
+    dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12,
+                  channel_types: [im, mpim]}
+    read_channel_tool: mcp__<server>__slack_read_channel   # required then
+
+Direct conversations are detected from the search hit, the only place the
+source learns a channel's type: label `DM` on a `D...` id is an IM, label
+`Group DM` is an mpim. Legacy `G...` private channels are never treated as
+DMs unless Slack labels the hit `Group DM`. Unthreaded messages of a direct
+conversation (no thread, or a thread parent without replies) are clustered
+into sessions: consecutive messages at most `gap_minutes` apart, a session
+spanning at most `max_span_hours`. The session anchor is the ts of its FIRST
+message, so the anchor id is `slack:<ch>:<first ts>` (same format as a
+thread) and the candidate id is `anchor@<latest ts>`: a growing session is
+re-processed and the memory store updates the same entry in place by source
+id. A later run only lists new messages, so open sessions are kept in
+`state/slack-mcp-dm-sessions.json` (channel -> recent sessions with anchor,
+latest ts and the message ts seen); a message joins the session that contains
+it, or extends the newest one when it is within the gap and span limits.
+The session body is read with the connector's channel-history tool, pinned to
+`oldest`/`latest` around the session (read-only, one tool, planned-call match
+as for threads). Threaded messages and all other channels are unchanged. A
+message reacted with a `save_reactions` emoji saves its whole session (saved
+key `saved:slack:<ch>:<anchor>`, `saved_covered_ts` as for threads).
+
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
 else (planning, parsing, grouping, bounding, versioning) is deterministic
@@ -65,6 +92,7 @@ result is rejected as ambiguous. Errors and logs carry counts only, never tool
 inputs or message text.
 """
 import datetime
+import decimal
 import hashlib
 import json
 import math
@@ -72,7 +100,7 @@ import re
 import time
 from pathlib import Path
 
-from . import claude_bridge, slack_source, state
+from . import claude_bridge, slack_source, slack_watch, state
 from .chat_text import redact_secrets
 from .shell import log, utc_now_iso
 
@@ -97,7 +125,7 @@ DEFAULTS = {
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
-    "all_dms", "save_reactions",
+    "all_dms", "save_reactions", "dm_sessions", "read_channel_tool",
 }
 CURSOR_SCHEMA = 1
 # Query keys and ledger keys of the reaction-saved path.
@@ -128,6 +156,18 @@ DM_LABELS = {"DM", "Group DM"}
 THREAD_CHANNEL_ARG = "channel_id"
 THREAD_TS_ARG = "message_ts"
 THREAD_LIMIT_ARG = "limit"
+# Argument names of the connector's channel-history reader (DM sessions).
+CHANNEL_OLDEST_ARG = "oldest"
+CHANNEL_LATEST_ARG = "latest"
+CHANNEL_LIMIT_ARG = "limit"
+CHANNEL_READ_MAX = 100
+DM_SESSION_DEFAULTS = {
+    "enabled": False, "gap_minutes": 120, "max_span_hours": 12,
+    "channel_types": ["im", "mpim"],
+}
+MAX_DM_SESSIONS_PER_CHANNEL = 20
+MAX_DM_CHANNELS = 300
+MAX_SESSION_SEEN = 300
 
 _base_dir = None
 _last_search = [0.0]
@@ -174,6 +214,19 @@ def settings(source):
     cfg["all_dms"] = source.get("all_dms") is True
     cfg["save_reactions"] = list(source.get("save_reactions") or [])
     cfg["search_args"] = dict(source.get("search_args") or {})
+    cfg["read_channel_tool"] = source.get("read_channel_tool")
+    cfg["dm_sessions"] = dm_session_cfg(source.get("dm_sessions"))
+    return cfg
+
+
+def dm_session_cfg(value):
+    """`dm_sessions` merged over its defaults; anything invalid is disabled."""
+    cfg = dict(DM_SESSION_DEFAULTS, channel_types=["im", "mpim"])
+    if isinstance(value, dict) and not slack_watch.dm_sessions_problem(value):
+        cfg.update(value)
+        cfg["channel_types"] = list(cfg["channel_types"])
+    else:
+        cfg["enabled"] = False
     return cfg
 
 
@@ -605,6 +658,53 @@ def parse_thread(text, now=None):
     return valid[0][0], valid[0][1], more
 
 
+_CHANNEL_SPLIT = re.compile(
+    r"\n\n(?=From: [^\n]*\nTime: [^\n]*\nMessage TS: \d+\.\d+(?:\n|$))"
+)
+
+
+def parse_channel(text, lo, hi):
+    """Parse one channel-history page into (messages oldest first, more).
+
+    The page holds message blocks in the same shape as thread replies
+    (`From:`, `Time:`, `Message TS:`, body), newest first. Every message must
+    lie inside [lo, hi] (the pinned range), timestamps must be unique, and
+    the order must be strictly monotonic. `more` means the connector reports
+    older messages it did not return.
+    """
+    data = _json_object(text)
+    body = data.get("messages")
+    if not isinstance(body, str):
+        raise SlackMcpParseError("channel result has no messages text")
+    pagination = data.get("pagination_info")
+    more = isinstance(pagination, str) and bool(_CURSOR.search(pagination))
+    body = body.strip("\n")
+    start = re.search(r"(?m)^From: ", body)
+    if not start:
+        raise SlackMcpParseError("channel result has an unknown shape")
+    if any(
+        line.strip() and not line.startswith("===")
+        for line in body[:start.start()].split("\n")
+    ):
+        raise SlackMcpParseError("channel result has an unknown shape")
+    messages = [
+        _thread_message(piece.rstrip("\n"))
+        for piece in _CHANNEL_SPLIT.split(body[start.start():])
+    ]
+    if not messages or any(m is None for m in messages):
+        raise SlackMcpParseError("channel result is malformed")
+    stamps = [float(m["ts"]) for m in messages]
+    if stamps != sorted(stamps, reverse=True) and stamps != sorted(stamps):
+        raise SlackMcpParseError("channel result is not ordered")
+    if len(set(m["ts"] for m in messages)) != len(messages):
+        raise SlackMcpParseError("channel result repeats a message")
+    if any(not (float(lo) - 1e-6 <= t <= float(hi) + 1e-6) for t in stamps):
+        raise SlackMcpParseError("channel result is outside the read range")
+    if stamps[0] > stamps[-1]:
+        messages.reverse()
+    return messages, more
+
+
 def _truncate(text, limit):
     return text if len(text) <= limit else text[:limit].rstrip() + " [truncated]"
 
@@ -897,6 +997,146 @@ def _search_all(cfg, queries, afters, now):
     return found, capped, failed
 
 
+# --- DM sessions -------------------------------------------------------------
+
+def _dm_state_path():
+    return Path(_base_dir) / "state" / "slack-mcp-dm-sessions.json"
+
+
+def _load_dm_state():
+    """{channel: [{"anchor", "last", "seen": [ts...]}]} of open sessions."""
+    if _base_dir is None:
+        return {}
+    try:
+        data = json.loads(_dm_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for channel, sessions in data.items():
+        if not isinstance(sessions, list):
+            continue
+        kept = []
+        for entry in sessions:
+            try:
+                float(entry["anchor"])
+                float(entry["last"])
+                seen = [t for t in entry.get("seen", []) if float(t) >= 0]
+            except (KeyError, TypeError, ValueError):
+                continue
+            kept.append({
+                "anchor": str(entry["anchor"]), "last": str(entry["last"]),
+                "seen": [str(t) for t in seen],
+            })
+        if kept:
+            out[str(channel)] = kept
+    return out
+
+
+def _save_dm_state(data):
+    if _base_dir is None:
+        return
+    for channel in list(data):
+        data[channel] = sorted(
+            data[channel], key=lambda s: float(s["last"])
+        )[-MAX_DM_SESSIONS_PER_CHANNEL:]
+    if len(data) > MAX_DM_CHANNELS:
+        newest = sorted(
+            data, key=lambda c: max(float(s["last"]) for s in data[c])
+        )[-MAX_DM_CHANNELS:]
+        data = {c: data[c] for c in newest}
+    try:
+        state.write_atomic(
+            _dm_state_path(), json.dumps(data, sort_keys=True), mode=0o600
+        )
+    except OSError:
+        pass
+
+
+def dm_kind(hit):
+    """'im' or 'mpim' for a hit in a direct conversation, else None.
+
+    Only the hit's own label and id say so: `D...` with label DM is an IM;
+    label Group DM is an mpim. A legacy `G...` private channel carries
+    neither label, so it is never taken for a DM.
+    """
+    if hit["label"] == "DM" and hit["channel"].startswith("D"):
+        return "im"
+    if hit["label"] == "Group DM":
+        return "mpim"
+    return None
+
+
+def _place(sessions, ts, gap, span):
+    """The session a message belongs to (created or extended as needed)."""
+    t = float(ts)
+    for session in sessions:
+        if float(session["anchor"]) <= t <= float(session["last"]):
+            break
+    else:
+        newest = max(sessions, key=lambda s: float(s["last"]), default=None)
+        if (
+            newest is not None
+            and t > float(newest["last"])
+            and t - float(newest["last"]) <= gap
+            and t - float(newest["anchor"]) <= span
+        ):
+            session = newest
+            session["last"] = ts
+        else:
+            session = {"anchor": ts, "last": ts, "seen": []}
+            sessions.append(session)
+    if ts not in session["seen"]:
+        session["seen"].append(ts)
+        session["seen"] = sorted(session["seen"], key=float)[-MAX_SESSION_SEEN:]
+    return session
+
+
+def assign_dm_sessions(cfg, found, persist=True):
+    """Point unthreaded direct-conversation hits at their session anchor.
+
+    A hit gets `root` = the session's first-message ts, `dm_session` True,
+    `session_last` (newest ts the session is known to hold) and
+    `session_seen`. Threaded hits and all other channels are left alone.
+    """
+    dm = cfg["dm_sessions"]
+    if not dm["enabled"]:
+        return 0
+    gap = dm["gap_minutes"] * 60
+    span = dm["max_span_hours"] * 3600
+    by_channel = {}
+    for query, hit in found:
+        if dm_kind(hit) not in dm["channel_types"]:
+            continue
+        if hit["root"] != hit["ts"] or hit["replies"]:
+            continue
+        if (
+            hit["is_bot"] and not cfg["include_bots"]
+            and query["kind"] != "saved"
+        ):
+            continue
+        by_channel.setdefault(hit["channel"], []).append(hit)
+    if not by_channel:
+        return 0
+    store = _load_dm_state()
+    placed = []
+    for channel, hits in by_channel.items():
+        sessions = store.setdefault(channel, [])
+        owner = {}
+        for ts in sorted({h["ts"] for h in hits}, key=float):
+            owner[ts] = _place(sessions, ts, gap, span)
+        placed.extend((hit, owner[hit["ts"]]) for hit in hits)
+    for hit, session in placed:
+        hit["root"] = session["anchor"]
+        hit["dm_session"] = True
+        hit["session_last"] = session["last"]
+        hit["session_seen"] = list(session["seen"])
+    if persist:
+        _save_dm_state(store)
+    return len({(h["channel"], h["root"]) for h, _ in placed})
+
+
 # --- listing -----------------------------------------------------------------
 
 def _group(cfg, found):
@@ -913,8 +1153,14 @@ def _group(cfg, found):
         group = groups.setdefault(
             key, {"ts": hit["ts"], "mention": False, "replies": 0,
                   "keys": set(), "hit_ts": set(), "root_seen": False,
-                  "saved": False, "normal_ts": None}
+                  "saved": False, "normal_ts": None,
+                  "dm": bool(hit.get("dm_session")),
+                  "session_last": hit.get("session_last"),
+                  "session_seen": hit.get("session_seen") or []}
         )
+        if not hit.get("dm_session") or hit["replies"]:
+            # A threaded hit sharing the anchor makes it a thread, read whole.
+            group["dm"] = False
         if saved:
             group["saved"] = True
         elif (
@@ -1003,6 +1249,13 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
         "mode": "mcp_thread",
         "_batch": batch,
     }
+    if group.get("dm"):
+        raw["dm_session"] = True
+        raw["session_last"] = group["session_last"]
+        raw["seen_ts"] = list(group["session_seen"])
+        batch.setdefault("spans", {})[(channel, root)] = (
+            root, group["session_last"]
+        )
     if deferred:
         raw["_deferred"] = True
     if save_tag:
@@ -1014,7 +1267,10 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
     return {
         "id": candidate_id,
         # Never message text: the runner logs titles.
-        "title": f"Slack thread {channel} {root}",
+        "title": (
+            f"Slack DM session {channel} {root}" if group.get("dm")
+            else f"Slack thread {channel} {root}"
+        ),
         "raw": raw,
     }
 
@@ -1062,6 +1318,10 @@ def candidates(source):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
+    n_sessions = assign_dm_sessions(
+        cfg, found,
+        persist=not source.get("_count_only") and not source.get("_dry_run"),
+    )
     groups = _group(cfg, found)
     processed = source.get("_processed")
     settle_before = now - cfg["settle_minutes"] * 60
@@ -1092,6 +1352,12 @@ def candidates(source):
             # Only a reaction listed it and that was already captured: replies
             # reach it through the ordinary queries.
             continue
+        if group["dm"]:
+            # The session's version is its newest known message, even when
+            # this run's hits are older (an overlap re-list).
+            group["normal_ts"] = max(
+                group["normal_ts"], group["session_last"], key=float
+            )
         candidate_id = f"{anchor_id}@{group['normal_ts']}"
         current[anchor_id] = candidate_id
         if _already_done(processed, candidate_id):
@@ -1118,7 +1384,7 @@ def candidates(source):
     over = ready[room:]
     ready = ready[:room]
     batch = {
-        "cfg": cfg, "order": [], "threads": {}, "error": None,
+        "cfg": cfg, "order": [], "threads": {}, "error": None, "spans": {},
         "processed": processed,
         "runtime": source.get("_slack_mcp_runtime"),
     }
@@ -1170,7 +1436,8 @@ def candidates(source):
     if not source.get("_count_only"):
         _prune_attempts(current)
     log(
-        f"slack_mcp: {len(found)} hit(s) in {len(groups)} thread(s); "
+        f"slack_mcp: {len(found)} hit(s) in {len(groups)} thread(s) "
+        f"({n_sessions} DM session(s)); "
         f"{len(saved_take) + len(ready)} to process "
         f"({len(saved_take)} saved by reaction), {len(waiting)} settling, "
         f"{len(over)} over the per-run cap, {len(capped)} capped search(es)"
@@ -1279,7 +1546,7 @@ def _read_threads(batch, wanted):
     order = batch["order"]
     todo = [wanted] + [
         key for key in order[order.index(wanted) + 1:]
-        if key not in batch["threads"]
+        if key not in batch["threads"] and key not in batch.get("spans", {})
     ]
     todo = todo[:THREADS_PER_SESSION]
     calls = [
@@ -1323,16 +1590,110 @@ def _read_threads(batch, wanted):
             batch["threads"][key] = {"status": "ok", "parsed": parsed}
 
 
+def _ts_bound(ts, delta):
+    """`ts` moved by `delta` microseconds, as a 6-decimal Slack timestamp."""
+    return f"{decimal.Decimal(ts) + decimal.Decimal(delta) / 1000000:.6f}"
+
+
+def _read_dm_sessions(batch, wanted):
+    """One bridge session reading up to THREADS_PER_SESSION DM sessions."""
+    cfg = batch["cfg"]
+    spans = batch["spans"]
+    order = batch["order"]
+    todo = [wanted] + [
+        key for key in order[order.index(wanted) + 1:]
+        if key in spans and key not in batch["threads"]
+    ]
+    todo = todo[:THREADS_PER_SESSION]
+    limit = min(CHANNEL_READ_MAX, cfg["max_thread_replies"])
+    calls = [
+        {
+            THREAD_CHANNEL_ARG: channel,
+            CHANNEL_OLDEST_ARG: _ts_bound(spans[(channel, root)][0], -1),
+            CHANNEL_LATEST_ARG: _ts_bound(spans[(channel, root)][1], 1),
+            CHANNEL_LIMIT_ARG: limit,
+        }
+        for channel, root in todo
+    ]
+    try:
+        texts = _session(
+            cfg, cfg["read_channel_tool"], {}, calls, "channel history read",
+            [],
+        )
+    except claude_bridge.BridgeError as exc:
+        batch["error"] = str(exc)
+        raise
+    if all(text is None for text in texts):
+        batch["error"] = "channel reads returned no usable result"
+        if len(todo) == 1:
+            batch["lone"] = wanted
+        raise claude_bridge.BridgeError(batch["error"])
+    for key, text in zip(todo, texts):
+        if text is None:
+            batch["threads"][key] = {"status": "missing"}
+            continue
+        first, last = spans[key]
+        try:
+            parsed = parse_channel(text, first, last)
+        except SlackMcpParseError:
+            batch["threads"][key] = {"status": "invalid"}
+            continue
+        batch["threads"][key] = {"status": "ok", "parsed": parsed}
+
+
+def _render_dm_session(candidate, outcome, batch, source):
+    raw = candidate["raw"]
+    cfg = batch["cfg"]
+    messages, more = outcome["parsed"]
+    if not cfg["include_bots"]:
+        messages = [m for m in messages if not m["is_bot"]]
+    if not messages:
+        return None
+    if cfg["self_user_id"]:
+        # Only messages some search listed may claim the owner's authorship:
+        # a forged block inside a body earns no evidence.
+        seen = set(raw.get("seen_ts") or []) | set(raw.get("hit_ts") or [])
+        messages = [
+            dict(m, user="unverified", name="unverified author")
+            if m["user"] == cfg["self_user_id"] and m["ts"] not in seen else m
+            for m in messages
+        ]
+    bounded = bound_thread(
+        messages[0], messages[1:], more, cfg["max_thread_chars"], 0
+    )
+    names = {}
+    for message in bounded:
+        names.setdefault(message["user"], message["name"] or message["user"])
+    slack_messages = [
+        {"ts": m["ts"], "user": m["user"], "text": m["text"]} for m in bounded
+    ]
+    titled = dict(candidate, title=(
+        redact_secrets(messages[0]["text"].replace("\n", " "))[:90]
+        or candidate.get("title", "")
+    ))
+    item = slack_source.thread_item(
+        titled, slack_messages, names, source,
+        self_id=cfg["self_user_id"] or "", source_people=[],
+        save_tag=raw.get("save_tag"), saved=raw.get("saved") is True,
+    )
+    item["frontmatter"]["slack_capture_mode"] = "dm_session"
+    return item
+
+
 def fetch(routine, candidate, source=None):
     """Render one thread from its connector read."""
     raw = candidate["raw"]
     batch = raw["_batch"]
     key = (raw["channel"], raw["anchor"])
+    is_session = bool(raw.get("dm_session"))
     if key not in batch["threads"]:
         if batch["error"]:
             raise claude_bridge.BridgeError(batch["error"])
         try:
-            _read_threads(batch, key)
+            if is_session:
+                _read_dm_sessions(batch, key)
+            else:
+                _read_threads(batch, key)
         except claude_bridge.BridgeError:
             # Several threads failing together is an outage and counts for
             # nothing. One thread failing alone, run after run, is a thread
@@ -1357,6 +1718,12 @@ def fetch(routine, candidate, source=None):
             raise SlackMcpError("thread unreadable after repeated failures")
         raise SlackMcpError("thread read returned no result")
     _clear_attempts(candidate["id"])
+    if is_session:
+        item = _render_dm_session(candidate, outcome, batch, source)
+        if item is None:
+            _mark_unreadable(routine, candidate, batch, "no readable messages")
+            raise SlackMcpError("session had no readable messages")
+        return item
     parent, replies, more = outcome["parsed"]
     cfg = batch["cfg"]
     if not cfg["include_bots"]:
