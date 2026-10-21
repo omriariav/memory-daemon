@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 
 from . import (
-    calendar_cache, fibery_tasks_inbound, google_tasks_sync, slack_census,
+    calendar_cache, fibery_tasks_inbound, fibery_tasks_outbound,
+    google_tasks_sync, slack_census,
     slack_cli, slack_discovery,
 )
 from .shell import log
@@ -78,7 +79,23 @@ def run(base_dir, routine, dry_run=False):
             f"created={report['created']} done={report['done']} "
             f"reopened={report['reopened']} edited={report['edited']} "
             f"gone={report['gone']} pending={report['pending']} "
-            f"dry_run={report['dry_run']}"
+            f"linked={report.get('linked', 0)} dry_run={report['dry_run']}"
+        )
+        return report
+    if kind == "fibery_tasks_outbound":
+        mode = "previewing" if dry_run else "exporting"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = fibery_tasks_outbound.run(
+            cfg, base_dir,
+            _path(base_dir, cfg.get(
+                "checkpoint", fibery_tasks_outbound.DEFAULT_CHECKPOINT)),
+            dry_run=dry_run,
+        )
+        log(
+            f"routine={routine_id} maintenance={kind} "
+            f"candidates={report['candidates']} exported={report['exported']} "
+            f"already_present={report['already_present']} "
+            f"mode={report['mode']} dry_run={report['dry_run']}"
         )
         return report
     if kind == "slack_discovery":

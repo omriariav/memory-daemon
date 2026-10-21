@@ -764,8 +764,8 @@ Routines without `schedule.every` retain the legacy hourly cadence; the template
 sets `4h` explicitly for new routines.
 
 See `_example-domain-routine.yaml`, `_example-fallback-sweep.yaml`, and
-`_example-google-tasks-sync.yaml`, `_example-calendar-cache.yaml`, and
-`_example-fibery-tasks-inbound.yaml`.
+`_example-google-tasks-sync.yaml`, `_example-calendar-cache.yaml`,
+`_example-fibery-tasks-inbound.yaml`, and `_example-fibery-tasks-outbound.yaml`.
 
 ### Fibery tasks → memory (inbound)
 
@@ -800,6 +800,47 @@ a "held" error until you raise the limit. `--dry-run` makes no bridge call and
 no write. Logs carry counts and block ids only, never task text or the secret.
 `store` is the personal-memory repository. See
 `routines/_example-fibery-tasks-inbound.yaml`.
+
+### Memory todos → Fibery (outbound)
+
+`maintenance.kind: fibery_tasks_outbound` is the first daemon feature that
+writes to an external system, so it is narrow by design. It exports at most
+`max_per_run` (default 5) open `todo` entries to an inbox section of the same
+Fibery document the inbound routine reads. Selection (all required): type
+`todo` and unresolved; `owner_slug` (required) among the entry's `people` and no
+`no-owner-action` tag (the sink only keeps a `todo` when the owner is
+affirmed); date on or after `outbound_since` (required, quoted `YYYY-MM-DD`); a
+source id starting with one of `from_sources` (default `slack:`, `mila:`,
+`gmail:`). Never selected: entries with any `fibery:` source id, tags
+`personal` or `no-fibery`, or entries already in the checkpoint.
+
+Each run, when there is a candidate, reads the document through `read_tool`
+(an exact MCP name ending `__read_document`), finds the top-level heading named
+`inbox_heading` (default `Inbox`) and collects every `mem:<entry-id>` marker in
+accepted text or pending suggestions; those entries are adopted into the
+checkpoint instead of written again. If the heading is missing it is inserted
+once, at the document end, in the same write; if it exists only as an
+unaccepted suggestion the run writes nothing. The write is a separate bridge
+session whose only tool is `write_tool` (ending `__insert_document_blocks`, same
+connector as `read_tool`), with `secret`, `mode` and the entire `inserts`
+payload pinned, so the model cannot alter it, and with no retries. Items are
+`- [ ] <title> (mem:<entry-id>)` appended after the last Inbox list item (or the
+heading when empty). Titles are single-line, at most 120 characters,
+markdown-escaped, stripped of `<ins>`/`<del>`/`mem:` look-alikes and redacted
+with the personal ID redactor. `write_mode` is `suggest` (default; Fibery
+records tracked changes you accept or reject) or `apply`.
+
+After the write the document is re-read; every exported marker must be present
+(as text or a suggestion) or the run fails and records nothing (a later run
+adopts markers that did land). The checkpoint (default
+`state/fibery-outbound.json`, mode 0600) holds `{entry_id: {state: exported,
+at}}`; no `fibery:` source id is added to memory entries. `--dry-run` selects
+locally and makes no bridge call. Logs carry counts and entry ids only. Inbound
+coordination: an inbound task whose text has `mem:<entry-id>` is linked to that
+entry (done/reopened notes follow it; Fibery edits never rewrite it) instead of
+creating a todo, and unaccepted suggestion blocks are ignored until accepted.
+Disable `google_tasks_sync` for the same todos. See
+`routines/_example-fibery-tasks-outbound.yaml`.
 
 ## Adding a routine
 
