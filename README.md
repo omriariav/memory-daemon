@@ -1088,6 +1088,16 @@ analyze:
   One memory is written (preferring `systemAudio`, else the longest); the
   other is ledgered as `duplicate_of` without analysis. Recordings that are
   still `running` are skipped until `completed`.
+- Rules are strict: the overlap must cover at least half of the recording and
+  half of the event, and declined invites never match by rule (the model may
+  still choose them). A copy is only ledgered as a duplicate once its primary
+  is saved; until then the copy is held, so a failed primary never strands it.
+- Retries: Ollama down or invalid output retries every run at no cost. Any
+  other miss is retried until the recording is older than
+  `calendar_match_hours` or has had 3 attempts, then recorded as final
+  (`calendar_match_final`) with no further connector calls. Past connector
+  windows are cached under `state/calendar_windows/` for a day, and a window
+  returning exactly `calendar_max_results` events fails loudly.
 - Calendar-event identity is kept in the ledger, so a copy that arrives in a
   later run is still recognised as a duplicate. If the preferred copy failed to
   match in an earlier run and the other copy was captured, the later preferred

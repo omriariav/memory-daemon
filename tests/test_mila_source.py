@@ -1710,7 +1710,7 @@ class RetryBoundTest(DuplicateFixture):
     def test_old_recording_miss_is_final_and_makes_no_more_calls(self):
         no = mock.Mock(return_value={"matched": False, "event_id": None,
                                      "confidence": "low", "reason": ""})
-        late = datetime.datetime(2026, 7, 28, tzinfo=datetime.timezone.utc)
+        late = datetime.datetime(2026, 7, 28, 12, tzinfo=datetime.timezone.utc)
         self.run_with(no, late)
         self.assertTrue(self.entry()["calendar_match_final"])
         calls = self.bridge.call_count
