@@ -15,6 +15,11 @@ candidate ids.
     all_dms: true             # slack_mcp only: every DM and group DM of the owner
     save_reactions:           # slack_mcp only: emoji names that mean "save this"
       - save-for-later-example
+    dm_sessions:              # slack_mcp only: one memory per DM conversation
+      enabled: true           # (default false); unthreaded DM messages are
+      gap_minutes: 120        # grouped while gaps stay within this
+      max_span_hours: 12
+      channel_types: [im, mpim]
     owner_action_channels:
       - C0EXAMPLE01
     bootstrap: 3d             # first-run look-back when no cursor exists
@@ -46,8 +51,10 @@ from .shell import log
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap", "all_dms", "discover_from", "ignore_channels",
-    "save_reactions",
+    "save_reactions", "dm_sessions",
 }
+DM_SESSION_KEYS = {"enabled", "gap_minutes", "max_span_hours", "channel_types"}
+DM_SESSION_TYPES = ("im", "mpim")
 # Emoji names (without colons) the owner reacts with to save a message.
 SAVE_REACTION = re.compile(r"^[a-z0-9][a-z0-9_+'-]{0,99}$")
 MAX_SAVE_REACTIONS = 3
@@ -226,6 +233,12 @@ def _parse(path):
             f"`save_reactions` must be a list of at most {MAX_SAVE_REACTIONS} "
             "distinct emoji names (letters, digits, _ + ' -; no colons)"
         )
+    dm_sessions = data.get("dm_sessions")
+    if dm_sessions is not None:
+        problem = dm_sessions_problem(dm_sessions)
+        if problem:
+            raise WatchError(f"`dm_sessions` {problem}")
+        dm_sessions = dict(dm_sessions)
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
@@ -244,6 +257,7 @@ def _parse(path):
         "include_mentions": mentions,
         "all_dms": all_dms,
         "save_reactions": reactions,
+        "dm_sessions": dm_sessions,
         "owner_action_channels": _ids(
             data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
@@ -255,6 +269,31 @@ def hand_written(path):
     """(channels, ignore_channels) typed by hand in a watch file."""
     parsed = _parse(path)
     return parsed["channels"], parsed["ignore_channels"]
+
+
+def dm_sessions_problem(value):
+    """Why `value` is not a valid `dm_sessions` block, or None."""
+    if not isinstance(value, dict):
+        return "must be a mapping"
+    unknown = set(value) - DM_SESSION_KEYS
+    if unknown:
+        return f"has unknown key(s): {', '.join(sorted(map(str, unknown)))}"
+    if "enabled" in value and not isinstance(value["enabled"], bool):
+        return "`enabled` must be true or false"
+    for key, upper in (("gap_minutes", 1440), ("max_span_hours", 72)):
+        if key in value and not (
+            isinstance(value[key], int) and not isinstance(value[key], bool)
+            and 1 <= value[key] <= upper
+        ):
+            return f"`{key}` must be an integer from 1 to {upper}"
+    types = value.get("channel_types")
+    if "channel_types" in value and not (
+        isinstance(types, list) and types
+        and all(t in DM_SESSION_TYPES for t in types)
+        and len(set(types)) == len(types)
+    ):
+        return "`channel_types` must be a non-empty list of im and/or mpim"
+    return None
 
 
 def load(path):
@@ -323,6 +362,10 @@ def expand(source):
             # Only the connector-backed source can search by reaction.
             if value and source.get("kind") == "slack_mcp":
                 merged[key] = list(value)
+        elif key == "dm_sessions":
+            # Only the connector-backed source can read a DM conversation.
+            if value and source.get("kind") == "slack_mcp":
+                merged[key] = dict(value)
         elif value not in ([], False):
             merged[key] = value
     return merged, None

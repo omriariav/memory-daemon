@@ -117,6 +117,7 @@ class Connector:
     def __init__(self):
         self.search = lambda args: search_text([])
         self.thread = lambda args: thread_text(args["message_ts"])
+        self.channel = lambda args: json.dumps({"messages": ""})
         self.calls = []
         self.allowlists = []
         self.prompts = []
@@ -138,7 +139,11 @@ class Connector:
         for args in planned + self.extra:
             if self.skip(tool, args, session):
                 continue
-            handler = self.search if tool == SEARCH else self.thread
+            handler = (
+                self.search if tool == SEARCH
+                else self.channel if tool.endswith("slack_read_channel")
+                else self.thread
+            )
             failed = self.errors(tool, args)
             out.append({
                 "name": tool, "input": args,

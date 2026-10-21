@@ -37,15 +37,21 @@ def report(owned, processed, base_dir, totals):
                 "estimate_analyze_usd",
                 slack_mcp.DEFAULTS["estimate_analyze_usd"],
             )
+            dm_reads = sum(
+                1 for c in mcp if c["candidate"]["raw"].get("dm_session")
+            )
             sessions, cost = slack_mcp.plan_cost(
-                len(mcp), usage, rid, default
+                len(mcp), usage, rid, default, dm_reads
             )
             saved = sum(
                 1 for c in mcp if c["candidate"]["raw"].get("saved")
             )
+            dms = sum(
+                1 for c in mcp if c["candidate"]["raw"].get("dm_session")
+            )
             line += (
-                f" ({len(mcp)} Slack thread(s), {saved} of them saved by "
-                f"reaction, {sessions} planned thread "
+                f" ({len(mcp) - dms} Slack thread(s), {dms} DM session(s), "
+                f"{saved} of them saved by reaction, {sessions} planned thread "
                 f"read session(s), estimated cost ${cost:.2f}; an estimate "
                 "from past sessions, or estimate_analyze_usd per thread "
                 "without history)"

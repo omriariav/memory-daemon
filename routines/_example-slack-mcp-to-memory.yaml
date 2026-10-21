@@ -20,7 +20,11 @@
 # search per emoji; the look-back and tag are set below). It can also set
 #   discover_from: ~/path/slack-discovered.yaml   # channels found by the
 #   ignore_channels: [C0EXAMPLE09]                # slack_discovery routine; never added
-# (see routines/_example-slack-discovery.yaml).
+# (see routines/_example-slack-discovery.yaml). It can also set
+#   dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12,
+#                 channel_types: [im, mpim]}
+# to merge a DM back and forth into one memory per conversation session
+# (needs `read_channel_tool` below; see "DM sessions" in the README).
 id: example-slack-mcp-to-memory
 enabled: false
 description: Distill watched Slack threads and mentions into memory entries.
@@ -32,6 +36,9 @@ source:
   # Validation accepts only read-only Slack search/read tools.
   search_tool: mcp__claude_ai_Example_Slack__slack_search_public_and_private
   read_thread_tool: mcp__claude_ai_Example_Slack__slack_read_thread
+  # Only needed with `dm_sessions` (set in the watch file): reads a DM
+  # conversation's messages between the session's first and latest message.
+  # read_channel_tool: mcp__claude_ai_Example_Slack__slack_read_channel
   self_user_id: U0EXAMPLEA   # your Slack user id (owner-evidence and mentions)
   model: haiku               # bridge model; it only transports tool results
   max_threads_per_run: 15    # extra threads wait for the next run

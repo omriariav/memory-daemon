@@ -369,6 +369,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
                 source_overrides[(routine["id"], source_index)] = {
                     "_since_map": since_map,
                     "_slack_mcp_runtime": runtime,
+                    "_routine_id": routine["id"],
                 }
                 if routine_active:
                     slack_mcp_sources.append(

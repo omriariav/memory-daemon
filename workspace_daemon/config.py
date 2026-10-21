@@ -1637,6 +1637,35 @@ def _validate_slack_mcp(prefix, source):
             )
     if source.get("search_tool") == source.get("read_thread_tool"):
         problems.append(f"{prefix}: search_tool and read_thread_tool must differ")
+    sessions = source.get("dm_sessions")
+    if sessions is not None:
+        why = slack_watch.dm_sessions_problem(sessions)
+        if why:
+            problems.append(f"{prefix}.dm_sessions {why}")
+    if (
+        isinstance(sessions, dict) and sessions.get("enabled") is True
+        and source.get("all_dms") is not True
+    ):
+        problems.append(
+            f"{prefix}.dm_sessions needs all_dms: true (owner-side messages "
+            "are otherwise unverified and gaps one-sided)"
+        )
+    channel_tool = source.get("read_channel_tool")
+    if (
+        isinstance(sessions, dict) and sessions.get("enabled") is True
+        and not _exact_tool(channel_tool, "slack_read_channel")
+    ):
+        problems.append(
+            f"{prefix}.read_channel_tool must be the exact read-only MCP tool "
+            "mcp__<server>__slack_read_channel when dm_sessions is enabled"
+        )
+    elif channel_tool is not None and not _exact_tool(
+        channel_tool, "slack_read_channel"
+    ):
+        problems.append(
+            f"{prefix}.read_channel_tool must be the exact read-only MCP tool "
+            "mcp__<server>__slack_read_channel"
+        )
     owner = source.get("self_user_id")
     if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
         problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")
@@ -1701,7 +1730,7 @@ def _validate_slack_mcp(prefix, source):
         ("settle_minutes", 0, 1440), ("max_queries_per_run", 1, 60),
         ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
-        ("save_reaction_lookback_days", 1, 90),
+        ("save_reaction_lookback_days", 1, 90), ("max_session_pages", 1, 10),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(

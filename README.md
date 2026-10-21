@@ -1607,12 +1607,13 @@ people: [U0EXAMPLEA]       # slack_mcp only: authors watched in any channel
 include_mentions: true
 all_dms: true              # slack_mcp only: every DM and group DM of the owner
 save_reactions: [save-for-later-example]   # slack_mcp only: emoji that mean "save this"
+dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types: [im, mpim]}   # slack_mcp only
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
-`include_mentions`, `all_dms`, `save_reactions` and `owner_action_channels` keys; unknown keys and malformed
+`include_mentions`, `all_dms`, `save_reactions`, `dm_sessions` and `owner_action_channels` keys; unknown keys and malformed
 ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
 are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
 `people` list unless it sets `ignore_people: true`, which keeps the exit path a
@@ -1717,6 +1718,81 @@ than the look-back is not seen, so react again if it was missed.
 `run --count-only` prints how many listed threads were saved by reaction;
 `--dry-run` makes no bridge call, so it can only report how many saved queries
 it would run.
+
+**DM sessions.** Hits are grouped by (channel, thread root), but people rarely
+thread in direct messages, so a back-and-forth would become one tiny memory
+(and one paid model call) per message. `dm_sessions` (watch file, or inline on
+a `slack_mcp` source without `watch:`; off by default; requires `all_dms: true`,
+since otherwise your own messages render as unverified and gaps are
+one-sided) clusters the unthreaded messages of a direct conversation into
+sessions:
+
+```yaml
+dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types: [im, mpim]}
+read_channel_tool: mcp__<server>__slack_read_channel   # source key, required when enabled
+```
+
+- **Detection.** The source learns a channel's type only from the search hit:
+  label `DM` on a `D...` id is an IM, label `Group DM` is an mpim.
+  `channel_types` picks which count. Legacy `G...` private channels are never
+  treated as DMs unless Slack labels the hit `Group DM`. Channels (`C...`) are
+  untouched.
+- **Clustering.** An unthreaded message (no thread, or a thread parent with no
+  replies) joins a session while the gap to the previous message is at most
+  `gap_minutes` and the session spans at most `max_span_hours` (a message past
+  either limit starts a new session). Threaded DM messages keep the per-thread
+  behaviour.
+- **Ids.** The anchor is the ts of the session's first message, so its id is
+  `slack:<channel>:<first ts>` (the same format as a thread) and the candidate
+  id is `slack:<channel>:<first ts>@<latest ts>`. A growing session therefore
+  re-processes and the memory sink updates the same entry in place by source
+  id, exactly like a thread that gets replies. The session is ready once its
+  latest message is older than `settle_minutes`.
+- **State across runs.** A run lists only new messages, so the daemon keeps
+  each routine's sessions per DM channel in `state/slack-mcp-dm-sessions.json`
+  (anchor, first and last ts, and the message timestamps seen). Sessions are
+  pruned by time (older than the longest of `save_reaction_lookback_days`,
+  `bootstrap` and `overlap`, plus a day; 500 per channel as a backstop). A new
+  message joins the session containing it, or the nearest session within the
+  gap on either side while the span cap holds; a late-found earlier message
+  lowers the session's `first` but the anchor (the memory identity) never
+  changes. If the state cannot be written the run fails closed. `--dry-run`
+  and `--count-only` do not write it.
+- **Reading.** The body is read with the connector's channel-history tool
+  (`read_channel_tool`, the exact read-only `slack_read_channel`, one tool in
+  the least-privilege allowlist) with `oldest` and `latest` pinned just outside
+  the session's first and latest message and `limit` 100, following the cursor
+  for up to `max_session_pages` (default 3) so the first message is included. The result (`Channel: <label> (<id>)`, then `=== Message from ... ===`
+  blocks, newest first) must name the pinned channel, end with a known
+  pagination text, and hold messages inside the pinned range with unique,
+  ordered timestamps (a header-looking line in a body is text unless a
+  `Message TS:` line follows it), and are bounded by
+  `max_thread_chars` like a thread (newest kept, oldest dropped first; `[earlier messages omitted]` marks any
+  gap, and no kept message is treated as a parent). A block that repeats a ts
+  or lies outside the range is dropped, not trusted.
+  A session read shares the bridge session budget (`THREADS_PER_SESSION` per
+  session) and the same retry, lone-failure and unreadable bookkeeping.
+- **Late-found start.** When a late message moves a session's start earlier,
+  the candidate id becomes `slack:<channel>:<anchor>@<latest ts>~<first ts>`
+  (a new version, processed once; the memory source id is unchanged).
+- **Thread on the anchor.** If the anchor message later gets replies, the
+  session still owns `slack:<channel>:<anchor>`: the anchor's thread is read
+  with `read_thread_tool` and its replies (even when a run lists only a reply)
+  are merged into the session body in
+  time order (bounded like the rest).
+- **Interactions.** A message reacted with a `save_reactions` emoji saves its
+  whole session (ledger key `saved:slack:<channel>:<anchor>`,
+  `saved_covered_ts` as for threads). `skip_trivial` judges the whole session
+  text, so a session of only "hi" / "ok" is skipped as one. `--count-only`
+  reports DM sessions separately from threads.
+
+Migration: enabling sessions on a routine that already ran costs roughly one
+extra analyze per DM active within the first `overlap` window, and the old
+per-message entries from that window stay as duplicates.
+
+Limits: a reacted message older than every tracked session saves from that
+message on, because earlier history is not known to the session map; the
+authorship check marks owner messages no search listed as unverified.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts
