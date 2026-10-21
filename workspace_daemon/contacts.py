@@ -28,6 +28,9 @@ def _slug(name):
     return re.sub(r"(^-+|-+$)", "", re.sub(r"[^a-z0-9]+", "-", ascii_name))
 
 
+slugify = _slug
+
+
 @lru_cache(maxsize=512)
 def _resolve_normalized_email(wanted):
     """Cached directory outcome: ``(person, error)``.

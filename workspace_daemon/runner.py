@@ -11,7 +11,7 @@ import re
 from contextlib import ExitStack
 from email.utils import getaddresses
 
-from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
+from . import actions, chat_text, config, contacts, drive, gchat_source, gmail, identity, labels, llm, maintenance, memory_sink, mila_source, notes, slack_source, state, time_utils, whisper_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -165,6 +165,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     """
     contacts.clear_cache()
     drive.clear_identity_cache()
+    identity.clear_cache()
     # A dry run mutates nothing and reads through atomic replaces, so it does
     # not need the lock and must not be blocked by a real run in progress.
     with ExitStack() as stack:
@@ -188,6 +189,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
         if r.get("enabled", True) and r["id"] in active_ids
     ]
     llm.configure(base_dir)
+    identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
     catalog = None

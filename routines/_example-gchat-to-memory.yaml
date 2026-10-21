@@ -34,3 +34,19 @@ memory:
   store: /absolute/path/to/your/personal-memory
   type: note
   tags: [gchat]
+  # Optional: resolve people through a claude.ai Slack connector instead of the
+  # Workspace directory (default `provider: gws`). Uses the headless
+  # Claude bridge (see README "Identity providers"); tool names are connector-specific.
+  identity:
+    provider: slack_mcp
+    owner_email: me@example.com
+    owner_slug: me-example
+    owner_name: Me Example
+    internal_domains: [example.com]   # only these domains are looked up
+    search_tool: mcp__claude_ai_Example_Slack__slack_search_users
+    profile_tool: mcp__claude_ai_Example_Slack__slack_read_user_profile
+    model: haiku
+    cache: state/identity-cache.json
+    hit_ttl_days: 30
+    miss_ttl_days: 1
+    batch_size: 15
