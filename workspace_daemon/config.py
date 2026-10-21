@@ -107,7 +107,7 @@ SOURCE_KEYS = {
     "mime_type", "name_contains", "recordings_file", "exclude_recording_ids",
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
-    "calendar_match_hours", "calendar", "match", "max_transcript_chars",
+    "calendar_match_hours", "calendar", "match", "max_transcript_chars", "app_summary",
     "transcriptions_dir", "min_quiet_seconds", "exclude_base_names",
 }
 
@@ -1974,6 +1974,44 @@ def _validate_mila_match(source, prefix):
                 problems.append(
                     f"{prefix}.match.base_url applies only to provider ollama"
                 )
+    app = source.get("app_summary")
+    if app is not None:
+        if not isinstance(app, dict):
+            problems.append(f"{prefix}.app_summary must be a mapping")
+        else:
+            unknown = set(app) - mila_source.APP_SUMMARY_KEYS
+            if unknown:
+                problems.append(
+                    f"{prefix}.app_summary has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}"
+                )
+            if app.get("mode", "off") not in mila_source.APP_SUMMARY_MODES:
+                problems.append(
+                    f"{prefix}.app_summary.mode must be one of "
+                    f"{', '.join(mila_source.APP_SUMMARY_MODES)}"
+                )
+            for key, low, high in (("wait_minutes", 0, 1440),
+                                   ("min_chars", 1, 100000),
+                                   ("min_overlap", 0, 1),
+                                   ("item_min_overlap", 0, 1)):
+                value = app.get(key)
+                if value is not None and (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool) or not low <= value <= high
+                ):
+                    problems.append(
+                        f"{prefix}.app_summary.{key} must be a number from "
+                        f"{low} to {high}"
+                    )
+    if isinstance(app, dict) and isinstance(
+        app.get("wait_minutes"), (int, float)
+    ) and not isinstance(app.get("wait_minutes"), bool):
+        hours = source.get("calendar_match_hours", 6)
+        if isinstance(hours, (int, float)) and app["wait_minutes"] >= hours * 60:
+            problems.append(
+                f"{prefix}.app_summary.wait_minutes must be less than "
+                "calendar_match_hours * 60"
+            )
     limit = source.get("max_transcript_chars")
     if limit is not None and (
         not isinstance(limit, int) or isinstance(limit, bool)
@@ -2484,9 +2522,10 @@ def _validate_source(routine, source, prefix):
 
     if kind == "mila":
         problems.extend(_validate_mila_match(source, prefix))
-    elif any(key in source for key in ("calendar", "match", "max_transcript_chars")):
+    elif any(key in source for key in ("calendar", "match", "max_transcript_chars", "app_summary")):
         problems.append(
-            f"{prefix}: calendar, match and max_transcript_chars are only "
+            f"{prefix}: calendar, match, max_transcript_chars and "
+            f"app_summary are only "
             f"supported for kind mila"
         )
 

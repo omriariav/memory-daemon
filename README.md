@@ -1222,6 +1222,66 @@ explicit `.srt`/`.txt` pair and the Mila index that still owns its metadata.
 That provides a trustworthy UUID and time without hand-editing the active app
 database. See `_example-mila-to-memory.yaml`.
 
+#### Recording-app hints (`app_summary`)
+
+Newer Mila builds add an app-generated `summary` (markdown) and `actionItems`
+to a recording, sometimes only after `status: completed`. They are cheap but
+unverified, so they are **hints, never the input**:
+
+```yaml
+source:
+  kind: mila
+  app_summary:
+    mode: hints          # off (default) | hints
+    wait_minutes: 45     # hold a recording this long for hints to appear
+    min_chars: 200       # shorter summaries are ignored
+    min_overlap: 0.3       # min share of summary words found in the transcript
+    item_min_overlap: 0.25 # same, per action item, within +/-180s of its timestamp
+```
+
+- The transcript stays the analysis input exactly as before. In `hints` mode a
+  delimited block, "Unverified hints from the recording app (may be wrong)",
+  is appended after it: up to 20 action items (`[mm:ss] text`, block capped at
+  3000 characters) and the summary truncated to 1500 characters. Summary and
+  items are collapsed to single lines and delimiter lookalikes (`--` runs, the
+  marker phrase) are neutralised, so they cannot close the block. Timestamps
+  that are 0, shared by all items, or beyond the recording length are the
+  app's placeholders: they are treated as missing (no stamp rendered, gate
+  against the whole transcript). The Calendar matcher only ever sees the
+  transcript excerpt, never the hints. The analysis prompt gains one short
+  instruction: use a hint only as a candidate, keep an action item or decision
+  only if the transcript supports it, cite the transcript timestamp, and take
+  the owner from the transcript, never from the hint's wording. Ownership is
+  still decided by the existing owner logic in the extraction step, which only
+  sees the distilled note, so it never reads the hints directly. The pipeline
+  produces one entry per meeting; supported action items end up in that entry's
+  body.
+- Local sanity gate, before any hint is used (the app's summarizer is an LLM
+  session and can emit an unrelated meta-reply): a summary is dropped if it is
+  shorter than `min_chars` or fewer than `min_overlap` of its meaningful
+  words occur in the transcript (Hebrew one-letter prefixes are tolerated); an
+  action item is dropped when fewer than `item_min_overlap` (0.25) of its words occur
+  in the transcript within 180 seconds of its `timestampSeconds` (whole
+  transcript when it has none or the window is empty). Both checks are
+  deterministic; no model is called.
+  Only counts and the overlap ratio are logged, never text. A rejected hint
+  does not end the wait early.
+- Waiting: until action items exist or a summary that passes the gate exists
+  (a rejected summary does not end the wait), the recording is held (not a candidate, not ledgered) until
+  `wait_minutes` after completion, then processed transcript-only. Completion
+  is `completedAt` (clamped to now) when the record has one, else the later of
+  the recording end and the filename capture stamp (an imported file's stamp is
+  the import instant). `wait_minutes` must be below `calendar_match_hours * 60`. Explicit `manual_recordings` never wait.
+- No reprocessing: hints do not change the candidate id, so a summary that
+  appears after capture does nothing, and corrected transcripts still version
+  the entry as before.
+- Hints are untrusted like transcripts: secrets are redacted on fetch, the
+  `memory.personal_tag` / `redact_ids` handling applies to the whole body,
+  bodies are never logged, and analysis sessions have no write tools.
+- `run --dry-run` shows the input per item (`transcript + app hints` or
+  `transcript only`); `--count-only` and every listing log
+  `mila: app hints: N with hints, M transcript-only, K waiting for hints`.
+
 ### Whisper pipeline transcriptions
 
 `source.kind: whisper` ingests finished transcripts from the local

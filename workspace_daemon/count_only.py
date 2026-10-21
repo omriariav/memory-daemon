@@ -67,6 +67,16 @@ def report(owned, processed, base_dir, totals):
                 "from past sessions, or estimate_analyze_usd per thread "
                 "without history)"
             )
+        mila = [c for c in claims if c["source"].get("kind") == "mila"
+                and (c["source"].get("app_summary") or {}).get("mode") == "hints"]
+        if mila:
+            hinted = sum(1 for c in mila if c["candidate"]["raw"].get("hints"))
+            line += (
+                f" (Mila app hints: {hinted} with hints, "
+                f"{len(mila) - hinted} transcript-only; items still waiting "
+                "for hints are not candidates and are counted in the "
+                "'mila: app hints' log line)"
+            )
         log(line)
     log("count-only: no ledger, cursor or store was written")
     return totals
