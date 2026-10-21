@@ -53,7 +53,8 @@ DEFAULTS = {
     "sources": ["slack_mcp", "mila", "gmail_mcp"],
     "model": "haiku",
 }
-KNOWN_KEYS = set(DEFAULTS) | {"exclude_slugs"}
+KNOWN_KEYS = set(DEFAULTS) | {"exclude_slugs", "owner_slug"}
+FAILURE_COOLDOWN_DAYS = 14
 ALLOWED_SOURCES = {"slack_mcp", "mila", "gmail_mcp"}
 # Tag the user-level slack-context skill puts on its briefs; recognised so a
 # person it already briefed is not briefed twice.
@@ -61,7 +62,6 @@ COMPAT_TAG = "people-brief"
 QUEUE_FILE = "person-briefs.json"
 QUEUE_VERSION = 1
 MAX_QUEUE = 200
-MAX_ENTRY_FILES = 500
 MAX_CITED = 5
 MAX_OPEN_THREADS = 3
 MAX_LINES = 6
@@ -164,10 +164,23 @@ def validate(memory_cfg, rid, memory_types):
             f"{rid}: memory.person_briefs.sources must be a non-empty list of "
             f"{', '.join(sorted(ALLOWED_SOURCES))}"
         )
+    owner = raw.get("owner_slug")
+    if "owner_slug" in raw and (
+        not isinstance(owner, str) or contacts.slugify(owner) != owner
+    ):
+        problems.append(
+            f"{rid}: memory.person_briefs.owner_slug must be a kebab-case slug"
+        )
     if "model" in raw and (
         not isinstance(raw["model"], str) or not raw["model"].strip()
     ):
         problems.append(f"{rid}: memory.person_briefs.model must be a non-empty string")
+    if raw.get("enabled") is True and not _owner_from_cfg(memory_cfg):
+        problems.append(
+            f"{rid}: memory.person_briefs needs an owner slug "
+            "(memory.owner_todos.owner_slug, memory.identity.owner_slug, or "
+            "memory.person_briefs.owner_slug) so the owner is never briefed"
+        )
     excluded = raw.get("exclude_slugs")
     if "exclude_slugs" in raw and (
         not isinstance(excluded, list)
@@ -179,13 +192,24 @@ def validate(memory_cfg, rid, memory_types):
     return problems
 
 
+def _owner_from_cfg(memory_cfg):
+    """Owner slugs the memory block names (same sources the sink uses)."""
+    found = set()
+    todos = memory_cfg.get("owner_todos")
+    ident = memory_cfg.get("identity")
+    briefs = memory_cfg.get("person_briefs")
+    for block, key in ((todos, "owner_slug"), (ident, "owner_slug"),
+                       (briefs, "owner_slug")):
+        value = block.get(key) if isinstance(block, dict) else None
+        if isinstance(value, str) and value:
+            found.add(value)
+    return found
+
+
 def _owner_slugs(routine):
-    """Slugs that never get a brief: the configured owner and exclusions."""
-    out = set(cfg(routine).get("exclude_slugs") or [])
-    ident = memory_sink.memory_cfg(routine).get("identity")
-    if isinstance(ident, dict) and isinstance(ident.get("owner_slug"), str):
-        out.add(ident["owner_slug"])
-    return out
+    """Slugs that never get a brief: the owner and configured exclusions."""
+    memory_cfg = memory_sink.memory_cfg(routine)
+    return _owner_from_cfg(memory_cfg) | set(cfg(routine).get("exclude_slugs") or [])
 
 
 # -- untrusted text -----------------------------------------------------------
@@ -209,7 +233,8 @@ def _queue_path(base_dir):
 
 
 def _load(base_dir):
-    empty = {"version": QUEUE_VERSION, "queue": [], "days": {}}
+    empty = {"version": QUEUE_VERSION, "queue": [], "days": {},
+             "briefed": {}, "failed": {}}
     path = _queue_path(base_dir)
     try:
         data = json.loads(path.read_text())
@@ -223,19 +248,34 @@ def _load(base_dir):
         or not isinstance(data.get("queue"), list)
     ):
         return empty
-    if not isinstance(data.get("days"), dict):
-        data["days"] = {}
+    for key in ("days", "briefed", "failed"):
+        if not isinstance(data.get(key), dict):
+            data[key] = {}
+    data["_snapshot"] = json.dumps(
+        {k: v for k, v in data.items() if k != "_snapshot"}, sort_keys=True)
     return data
 
 
 def _save(base_dir, data):
-    import json
+    """Write the state file only when something changed."""
     data["queue"] = data["queue"][-MAX_QUEUE:]
+    body = {k: v for k, v in data.items() if k != "_snapshot"}
+    if json.dumps(body, sort_keys=True) == data.get("_snapshot"):
+        return
     state.write_atomic(
         _queue_path(base_dir),
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        json.dumps(body, indent=2, sort_keys=True) + "\n",
         mode=0o600,
     )
+    data["_snapshot"] = json.dumps(body, sort_keys=True)
+
+
+def _recent(day, days):
+    try:
+        then = datetime.date.fromisoformat(str(day))
+    except ValueError:
+        return False
+    return (datetime.date.today() - then).days < days
 
 
 def _today():
@@ -256,14 +296,26 @@ def _bump_day(data, rid):
 # -- enqueue ------------------------------------------------------------------
 
 def _hints(item, slug):
-    """Display name, Slack user id and email domain the item offers for slug."""
-    meta = item.get("frontmatter") or {}
+    """Display name, Slack user id and email domain the item offers for slug.
+
+    A Slack id is offered only for an unambiguous, full-name match: at least
+    two name tokens, and exactly one id behind every label that slugifies to
+    the slug.
+    """
     name = uid = domain = None
-    for label, user_id in (meta.get("slack_user_ids") or {}).items():
-        if contacts.slugify(label) == slug and isinstance(user_id, str) \
-                and SLACK_ID_RE.fullmatch(user_id):
-            name, uid = _clean(label, 80), user_id
-            break
+    ids = {
+        user_id for label, user_id in
+        (item.get("_slack_user_ids") or {}).items()
+        if contacts.slugify(label) == slug and isinstance(user_id, str)
+        and SLACK_ID_RE.fullmatch(user_id)
+    }
+    if len(ids) == 1 and len(slug.split("-")) >= 2:
+        uid = next(iter(ids))
+        for label, user_id in item["_slack_user_ids"].items():
+            if user_id == uid and contacts.slugify(label) == slug:
+                name = _clean(label, 80)
+                break
+    meta = item.get("frontmatter") or {}
     for person in meta.get("source_people") or []:
         if not isinstance(person, dict):
             continue
@@ -291,6 +343,8 @@ def enqueue(routine, item, outcome, source_kind, base_dir, dry_run=False):
         return 0
     if not isinstance(outcome, dict) or outcome.get("memory") not in CAPTURED:
         return 0
+    if outcome.get("memory_personal") is True:
+        return 0  # personal captures never introduce people into briefs
     entry_id = outcome.get("memory_entry_id")
     if not isinstance(entry_id, str) or not entry_id:
         return 0
@@ -304,6 +358,11 @@ def enqueue(routine, item, outcome, source_kind, base_dir, dry_run=False):
             not isinstance(slug, str) or slug in skip
             or contacts.slugify(slug) != slug
         ):
+            continue
+        marker = f"{rid}:{slug}"
+        if marker in data["briefed"]:
+            continue  # known briefed: steady state does no store scan
+        if _recent(data["failed"].get(marker), FAILURE_COOLDOWN_DAYS):
             continue
         hints = _hints(item, slug)
         existing = known.get((rid, slug))
@@ -319,8 +378,7 @@ def enqueue(routine, item, outcome, source_kind, base_dir, dry_run=False):
         data["queue"].append(row)
         known[(rid, slug)] = row
         queued += 1
-    if queued or data["queue"]:
-        _save(base_dir, data)
+    _save(base_dir, data)
     if queued:
         log(f"routine={rid} person-briefs: queued {queued} candidate(s)")
     return queued
@@ -372,15 +430,15 @@ def _read_entry(store, relpath):
 
 
 def _cli_entries(store, args):
-    """Entries a `list`/`person` CLI call printed (frontmatter read locally)."""
+    """Entries a `list`/`person` CLI call printed (frontmatter read locally).
+
+    No line cap: a cap could hide the very brief the check is looking for.
+    """
     result = memory_sink._cli(store, args)
     if result.returncode != 0:
-        raise RuntimeError(
-            "store query failed: "
-            f"{memory_sink._head_and_tail((result.stdout or '') + (result.stderr or ''))}"
-        )
+        raise RuntimeError(f"store query failed (exit {result.returncode})")
     entries = []
-    for line in (result.stdout or "").splitlines()[:MAX_ENTRY_FILES]:
+    for line in (result.stdout or "").splitlines():
         match = LIST_PATH_RE.search(line)
         if match:
             entry = _read_entry(store, match.group("path"))
@@ -390,22 +448,38 @@ def _cli_entries(store, args):
 
 
 def brief_index(store, tag):
-    """slug -> brief entry, for every brief the store already has.
+    """(by_slug, by_source_id) over every brief-tagged entry in the store.
 
-    A brief is an entry tagged `tag` (or the compat tag the slack-context skill
-    uses) that is about the slug, or any entry with source id `person:<slug>`.
+    Brief tags are `tag` and the compat tag the slack-context skill writes
+    (recognised on read only). `add` replaces an entry in place when ANY
+    source id matches, so source ids (`person:<slug>`, `slack-profile:<id>`)
+    are indexed as well as people.
     """
-    found = {}
+    by_slug, by_sid = {}, {}
     for brief_tag in dict.fromkeys([tag, COMPAT_TAG]):
         for entry in _cli_entries(store, ["list", "--tag", brief_tag]):
-            slugs = set(entry["people"])
-            slugs.update(
-                s[len("person:"):] for s in entry["source_ids"]
-                if s.startswith("person:")
-            )
-            for slug in slugs:
-                found.setdefault(slug, entry)
-    return found
+            for slug in entry["people"]:
+                by_slug.setdefault(slug, entry)
+            for sid in entry["source_ids"]:
+                by_sid.setdefault(sid, entry)
+    return by_slug, by_sid
+
+
+def find_brief(slug, uid, tag, person_entries, index):
+    """The existing brief for slug (or its Slack id), or None.
+
+    `person_entries` come from `person <slug>`; `index` is a callable giving
+    the lazily built store-wide (by_slug, by_sid).
+    """
+    for entry in person_entries:
+        if _is_brief(entry, tag) or f"person:{slug}" in entry["source_ids"]:
+            return entry
+    by_slug, by_sid = index()
+    keys = [f"person:{slug}"] + ([f"slack-profile:{uid}"] if uid else [])
+    for key in keys:
+        if key in by_sid:
+            return by_sid[key]
+    return by_slug.get(slug)
 
 
 def brief_state(entry):
@@ -424,11 +498,10 @@ def _is_brief(entry, tag):
     return bool({tag, COMPAT_TAG} & set(entry["tags"]))
 
 
-def _facts_from_store(store, slug, routine, tag):
+def _facts_from_store(entries, slug, routine, tag):
     """Cited entries and co-occurrence for slug; no message bodies, no model."""
     ptag = personal.personal_tag(memory_sink.memory_cfg(routine))
     owner = _owner_slugs(routine)
-    entries = _cli_entries(store, ["person", slug])
     resolved = {f for e in entries for f in e["follows"]}
     usable = [
         e for e in entries
@@ -454,15 +527,19 @@ def _facts_from_store(store, slug, routine, tag):
 
 # -- Slack profile (one pinned read-only call) -------------------------------
 
-def _slack_profile(routine, uid, base_dir):
-    """Cleaned profile fields, or {} when unavailable. Guard stops propagate."""
+def _slack_profile(routine, uid, slug, base_dir):
+    """(profile, verified): cleaned fields, only for a name-confirmed profile.
+
+    Guard stops propagate. A profile whose real name does not slugify to the
+    slug is discarded, so a wrong person's data never lands in a brief.
+    """
     try:
         provider = identity_providers.provider_for(routine)
     except Exception:
-        return {}
+        return {}, False
     tool = getattr(provider, "profile_tool", None)
     if not tool or not uid:
-        return {}
+        return {}, False
     prompt = (
         f"Call the {tool} tool exactly once with user_id set to {uid}. "
         "Make no other tool calls and do not write any summary."
@@ -477,12 +554,17 @@ def _slack_profile(routine, uid, base_dir):
         raise
     except claude_bridge.BridgeError as exc:
         log(f"person-briefs WARN profile lookup failed: {type(exc).__name__}")
-        return {}
+        return {}, False
     fields = {}
     for result in results:
         if result.get("name") == tool and not result.get("is_error"):
             fields = identity_providers.parse_profile(result.get("text"))
             break
+    real = fields.get("Real Name") or fields.get("Display Name")
+    if not real or contacts.slugify(real) != slug:
+        log("person-briefs WARN fetched profile does not match the person; "
+            "briefing without it")
+        return {}, False
     profile = {}
     for key, labels in PROFILE_KEYS:
         for label in labels:
@@ -490,7 +572,7 @@ def _slack_profile(routine, uid, base_dir):
             if value:
                 profile[key] = value
                 break
-    return profile
+    return profile, True
 
 
 # -- brief text ---------------------------------------------------------------
@@ -602,33 +684,39 @@ def _compose(routine, row, name, facts):
 
 # -- processing ---------------------------------------------------------------
 
+class AlreadyBriefed(RuntimeError):
+    """`add` matched an existing entry by source id (pre-check missed it)."""
+
+
 def _write_brief(routine, store, row, name, lines):
     settings = cfg(routine)
     slug = row["slug"]
-    tags = [settings["tag"], COMPAT_TAG, memory_sink.AUTO_TAG]
+    # The compat tag is deliberately not written: it tells the slack-context
+    # skill the person was fully swept, which an auto brief is not.
+    tags = [settings["tag"], memory_sink.AUTO_TAG]
     source_ids = [f"person:{slug}"]
-    if row.get("slack_user_id"):
+    if row.get("slack_user_id") and row.get("profile_verified"):
         # The slack-context skill anchors its brief on this id, so a later
         # manual run enriches this entry in place instead of adding another.
         source_ids.append(f"slack-profile:{row['slack_user_id']}")
     body = _redact(routine, "\n".join(lines))
     title = _redact(routine, f"Person brief: {name}")
+    # --force-new: the person:<slug> anchor already dedups, and the store's
+    # near-duplicate guard would reject templated briefs of different people.
     args = [
         "add", "--type", settings["type"], "--title", title,
         "--date", _today(), "--people", slug,
         "--tags", ",".join(dict.fromkeys(tags)),
-        "--source-ids", ",".join(source_ids),
+        "--source-ids", ",".join(source_ids), "--force-new",
     ]
     result = memory_sink._cli(store, args, stdin_text=body, timeout=300)
     out = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+\S+", out)
+    if result.returncode != 0 or not match:
+        raise RuntimeError(f"person brief add failed (exit {result.returncode})")
     memory_sink._commit_store(store, f"memory: {routine.get('id')} person brief")
-    if result.returncode != 0 or not re.search(
-        r"[✓↻]\s+(created|updated|unchanged)\s+\S+", out
-    ):
-        raise RuntimeError(
-            f"person brief add failed (exit {result.returncode}): "
-            f"{memory_sink._head_and_tail(out)}"
-        )
+    if match.group(1) != "created":
+        raise AlreadyBriefed(f"add reported {match.group(1)}")
 
 
 def _blocked(routine, base_dir):
@@ -660,19 +748,24 @@ def process(routine, base_dir, dry_run=False):
             "none written")
         return summary
     settings = cfg(routine)
-    store = memory_sink.memory_cfg(routine)["store"]
-    skip = _owner_slugs(routine)
+    summary["held"] = len(mine)
+    # Caps and guards first: nothing below touches the store or the bridge
+    # when no brief may be written now.
+    if _day_count(data, rid) >= settings["max_per_day"]:
+        log(f"routine={rid} person-briefs: day cap reached, {len(mine)} waiting")
+        return summary
     blocked = _blocked(routine, base_dir)
     if blocked:
         log(f"routine={rid} person-briefs: held {len(mine)} ({blocked})")
-        summary["held"] = len(mine)
         return summary
-    try:
-        existing = brief_index(store, settings["tag"])
-    except Exception as exc:
-        log(f"routine={rid} person-briefs WARN store query failed, held: {exc}")
-        summary["held"] = len(mine)
-        return summary
+    store = memory_sink.memory_cfg(routine)["store"]
+    skip = _owner_slugs(routine)
+    cached = []
+
+    def index():
+        if not cached:
+            cached.append(brief_index(store, settings["tag"]))
+        return cached[0]
 
     try:
         spent_before = claude_bridge.spent_today(base_dir, rid)
@@ -683,14 +776,9 @@ def process(routine, base_dir, dry_run=False):
     try:
         for row in mine:
             slug = row.get("slug")
+            marker = f"{rid}:{slug}"
             if slug in skip:
                 done.append(row)
-                continue
-            if slug in existing:
-                done.append(row)
-                summary["skipped_existing"] += 1
-                log(f"routine={rid} person-briefs: {slug} already has a brief "
-                    f"({brief_state(existing[slug])}); left untouched")
                 continue
             if (
                 run_written >= settings["max_per_run"]
@@ -698,31 +786,54 @@ def process(routine, base_dir, dry_run=False):
             ):
                 break  # the rest wait for a later run or day
             try:
-                store_facts = _facts_from_store(store, slug, routine, settings["tag"])
+                person_entries = _cli_entries(store, ["person", slug])
+                existing = find_brief(
+                    slug, row.get("slack_user_id"), settings["tag"],
+                    person_entries, index)
+                if existing is not None:
+                    done.append(row)
+                    data["briefed"][marker] = _today()
+                    summary["skipped_existing"] += 1
+                    log(f"routine={rid} person-briefs: existing "
+                        f"{brief_state(existing)} brief found; left untouched")
+                    continue
+                store_facts = _facts_from_store(
+                    person_entries, slug, routine, settings["tag"])
                 name = row.get("name") or _title_case_slug(slug)
                 profile = {}
+                row["profile_verified"] = False
                 if row.get("slack_user_id") and row.get("source_kind") == "slack_mcp":
-                    profile = _slack_profile(routine, row["slack_user_id"], base_dir)
+                    profile, row["profile_verified"] = _slack_profile(
+                        routine, row["slack_user_id"], slug, base_dir)
                 facts = _fact_dict(row, name, profile, store_facts)
                 lines, _used_model = _compose(routine, row, name, facts)
                 _write_brief(routine, store, row, name, lines)
             except claude_bridge.GUARD_STOPS as exc:
                 log(f"routine={rid} person-briefs: stopped by guard ({exc})")
                 break
+            except AlreadyBriefed as exc:
+                # The pre-check missed an existing entry and `add` matched it.
+                done.append(row)
+                data["briefed"][marker] = _today()
+                summary["failed"] += 1
+                log(f"routine={rid} person-briefs ERROR: {exc}; an existing "
+                    "entry may have been replaced, check the store")
+                continue
             except Exception as exc:
                 summary["failed"] += 1
                 row["attempts"] = row.get("attempts", 0) + 1
                 if row["attempts"] >= 3:
                     done.append(row)
-                log(f"routine={rid} person-briefs ERROR {slug}: {exc}")
+                    data["failed"][marker] = _today()
+                log(f"routine={rid} person-briefs ERROR: "
+                    f"{type(exc).__name__}: {exc}")
                 continue
             run_written += 1
             summary["written"] += 1
             _bump_day(data, rid)
+            data["briefed"][marker] = _today()
             done.append(row)
-            existing[slug] = {"tags": [memory_sink.AUTO_TAG], "updated": "",
-                              "date": _today()}
-            log(f"routine={rid} person-briefs: wrote brief for {slug}")
+            log(f"routine={rid} person-briefs: wrote a brief")
     finally:
         finished = {id(r) for r in done}
         data["queue"] = [q for q in data["queue"] if id(q) not in finished]

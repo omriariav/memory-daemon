@@ -21,6 +21,8 @@ class FakeStore:
         self.root = Path(root)
         (self.root / "memory" / "entries").mkdir(parents=True)
         self.adds = []
+        self.add_verdict = "created"
+        self.cli_calls = []
 
     def put(self, eid, etype="note", people=(), tags=(), source_ids=(),
             follows=(), date="2026-01-05", title="A title", updated=None):
@@ -40,6 +42,7 @@ class FakeStore:
         return out
 
     def cli(self, store, args, stdin_text=None, timeout=120):
+        self.cli_calls.append(args[0])
         if args[0] == "list":
             tag = args[args.index("--tag") + 1]
             rows = [(m, p) for m, p in self.entries() if tag in m["tags"]]
@@ -49,8 +52,11 @@ class FakeStore:
             rows = [(m, p) for m, p in self.entries() if slug in m["people"]]
             return Result("\n".join(self._line(m, p) for m, p in rows))
         if args[0] == "add":
+            args = [a for a in args if a != "--force-new"]
             opts = dict(zip(args[1::2], args[2::2]))
             self.adds.append((opts, stdin_text))
+            if self.add_verdict != "created":
+                return Result(f"↻ {self.add_verdict} 2026-01-02-x\n")
             self.put(
                 "2026-02-01-" + opts["--people"] + "-brief", opts["--type"],
                 opts["--people"].split(","), opts["--tags"].split(","),
@@ -132,6 +138,7 @@ class PersonBriefTests(unittest.TestCase):
         self.assertEqual(opts["--people"], "jane-doe")
         self.assertIn("person:jane-doe", opts["--source-ids"])
         self.assertIn("person-brief", opts["--tags"])
+        self.assertNotIn("people-brief", opts["--tags"])
         self.assertIn("auto-captured", opts["--tags"])
         self.assertEqual(opts["--type"], "note")
         self.assertEqual(self.analyze.call_args.kwargs["model"], "haiku")
@@ -156,7 +163,7 @@ class PersonBriefTests(unittest.TestCase):
         self.store.put("2026-01-02-mine", people=["jane-doe"],
                        tags=["person-brief"], source_ids=["person:jane-doe"])
         entry = person_briefs.brief_index(
-            str(self.store.root), "person-brief")["jane-doe"]
+            str(self.store.root), "person-brief")[0]["jane-doe"]
         self.assertEqual(person_briefs.brief_state(entry), "user")
         edited = dict(entry, tags=["auto-captured"], updated="2026-03-01")
         self.assertEqual(person_briefs.brief_state(edited), "user")
@@ -216,7 +223,7 @@ class PersonBriefTests(unittest.TestCase):
 
     def test_slack_profile_one_pinned_call_and_untrusted_fields(self):
         self.seed_person("jane-doe", 2)
-        item = {"frontmatter": {"slack_user_ids": {"Jane Doe": "UAAAA1"}}}
+        item = {"frontmatter": {}, "_slack_user_ids": {"Jane Doe": "UAAAA1"}}
         self.capture(["jane-doe"], kind="slack_mcp", item=item)
         profile = ("Real Name: Jane Doe\nTitle: Staff Engineer\n"
                    "Timezone: Europe/Example\nManager: Sam Lead\n")
@@ -276,10 +283,94 @@ class PersonBriefTests(unittest.TestCase):
         self.assertEqual(out["written"], 0)
         self.assertEqual(person_briefs.pending(self.base), 1)
 
+    def test_owner_from_owner_todos(self):
+        routine = make_routine(self.store.root)
+        del routine["memory"]["identity"]
+        routine["memory"]["owner_todos"] = {"owner_slug": "todo-owner"}
+        self.routine = routine
+        self.assertEqual(self.capture(["todo-owner", "ann-one"]), 1)
+
+    def test_personal_capture_not_queued(self):
+        outcome = {"memory": "created", "memory_entry_id": "e",
+                   "memory_people": ["ann-one"], "memory_personal": True}
+        self.assertEqual(person_briefs.enqueue(
+            self.routine, {}, outcome, "mila", self.base), 0)
+
+    def test_failure_tombstone_blocks_requeue(self):
+        self.seed_person("ann-one")
+        self.capture(["ann-one"])
+        self.store.add_verdict = "boom"
+        for _ in range(3):
+            person_briefs.process(self.routine, self.base)
+        self.assertEqual(person_briefs.pending(self.base), 0)
+        self.assertEqual(self.capture(["ann-one"]), 0)
+
+    def test_skill_brief_with_same_slack_id_not_overwritten(self):
+        self.seed_person("jane-doe", 2)
+        self.store.put("2026-01-02-skill", people=["dana"],
+                       tags=["people-brief"],
+                       source_ids=["slack-profile:UAAAA1"])
+        item = {"frontmatter": {}, "_slack_user_ids": {"Jane Doe": "UAAAA1"}}
+        self.capture(["jane-doe"], kind="slack_mcp", item=item)
+        out = person_briefs.process(self.routine, self.base)
+        self.assertEqual((out["written"], out["skipped_existing"]), (0, 1))
+        self.assertEqual(self.store.adds, [])
+
+    def test_add_reporting_update_is_not_counted_as_written(self):
+        self.seed_person("ann-one")
+        self.capture(["ann-one"])
+        self.store.add_verdict = "updated"
+        out = person_briefs.process(self.routine, self.base)
+        self.assertEqual((out["written"], out["failed"]), (0, 1))
+        self.assertEqual(person_briefs.pending(self.base), 0)
+
+    def test_day_cap_blocks_store_scans(self):
+        self.routine = make_routine(self.store.root, max_per_run=1,
+                                    max_per_day=1)
+        self.seed_person("ann-one")
+        self.seed_person("bob-two")
+        self.capture(["ann-one", "bob-two"])
+        person_briefs.process(self.routine, self.base)
+        self.store.cli_calls.clear()
+        out = person_briefs.process(self.routine, self.base)
+        self.assertEqual(out["written"], 0)
+        self.assertEqual(self.store.cli_calls, [])
+
+    def test_briefed_cache_skips_enqueue(self):
+        self.seed_person("ann-one")
+        self.capture(["ann-one"])
+        person_briefs.process(self.routine, self.base)
+        self.assertEqual(self.capture(["ann-one"]), 0)
+
+    def test_ambiguous_or_single_token_names_get_no_slack_id(self):
+        hints = person_briefs._hints
+        dup = {"_slack_user_ids": {"Jane Doe": "UAAAA1", "jane  doe": "UBBBB2"}}
+        self.assertIsNone(hints(dup, "jane-doe")["slack_user_id"])
+        single = {"_slack_user_ids": {"Jane": "UAAAA1"}}
+        self.assertIsNone(hints(single, "jane")["slack_user_id"])
+        ok = {"_slack_user_ids": {"Jane Doe": "UAAAA1"}}
+        self.assertEqual(hints(ok, "jane-doe")["slack_user_id"], "UAAAA1")
+
+    def test_mismatched_profile_name_is_discarded(self):
+        self.seed_person("jane-doe", 2)
+        item = {"frontmatter": {}, "_slack_user_ids": {"Jane Doe": "UAAAA1"}}
+        self.capture(["jane-doe"], kind="slack_mcp", item=item)
+        wrong = [{"name": "mcp__x__profile", "input": {"user_id": "UAAAA1"},
+                  "text": "Real Name: Someone Else\nTitle: CEO\n",
+                  "is_error": False}]
+        with mock.patch.object(claude_bridge, "call_tools",
+                               return_value=wrong):
+            person_briefs.process(self.routine, self.base)
+        self.assertNotIn("CEO", self.analyze.call_args.args[1])
+        self.assertNotIn("slack-profile", self.store.adds[0][0]["--source-ids"])
+
     def test_validate(self):
         types = memory_sink.MEMORY_TYPES
-        ok = {"person_briefs": {"enabled": True, "sources": ["mila"]}}
+        ok = {"person_briefs": {"enabled": True, "sources": ["mila"]},
+              "owner_todos": {"owner_slug": "me-example"}}
         self.assertEqual(person_briefs.validate(ok, "r", types), [])
+        no_owner = {"person_briefs": {"enabled": True}}
+        self.assertEqual(len(person_briefs.validate(no_owner, "r", types)), 1)
         bad = {"person_briefs": {"type": "person", "max_per_run": 0,
                                  "sources": ["slack"], "bogus": 1}}
         self.assertEqual(len(person_briefs.validate(bad, "r", types)), 4)

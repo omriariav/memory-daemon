@@ -1136,23 +1136,28 @@ def thread_item(candidate, messages, names, source=None, self_id=None,
         extra["slack_latest_ts"] = latest_ts
         if saved:
             extra["slack_saved"] = True
+    # display name -> Slack user id for the person-brief step. Kept out of
+    # frontmatter (which reaches vault notes). Names shared by two ids are
+    # ambiguous and dropped.
+    by_name = {}
+    for uid in user_ids:
+        if uid != self_id and names.get(uid):
+            by_name.setdefault(names[uid], set()).add(uid)
     return {
         "id": candidate["id"],
         "source_id": candidate["raw"]["source_id"],
         "title": title,
         "date": date,
         "body": "\n".join(lines),
+        "_slack_user_ids": {
+            name: next(iter(ids)) for name, ids in by_name.items()
+            if len(ids) == 1
+        },
         "frontmatter": {
             "slack_channel": channel,
             "slack_thread_ts": anchor,
             "slack_capture_mode": "thread",
             "slack_participants": sorted(set(names.values())) or user_ids,
-            # display name -> Slack user id, so a later step can look up a
-            # profile for a person the memory store has not seen before.
-            "slack_user_ids": {
-                names[uid]: uid for uid in user_ids
-                if uid != self_id and names.get(uid)
-            },
             "source_people": list(source_people),
             "via_mention": bool(candidate["raw"].get("via_mention")),
             "first_message_at": slack_timestamp_iso(first_ts),

@@ -1251,6 +1251,7 @@ def capture(routine, item, summary, dry_run=False):
         "memory_entry_id": entry_id,
         "memory_people": people,
         "memory_source_id": source_id,
+        "memory_personal": bool(ptag) and ptag in tags,
     }
     if (
         etype == "meeting" and extraction_succeeded and source_id
