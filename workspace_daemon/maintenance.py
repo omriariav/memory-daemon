@@ -3,10 +3,27 @@ import json
 from pathlib import Path
 
 from . import (
-    calendar_cache, fibery_tasks_inbound, google_tasks_sync, slack_census,
+    calendar_cache, fibery_tasks_inbound, fibery_tasks_outbound,
+    google_tasks_sync, slack_census,
     slack_cli, slack_discovery,
 )
+from . import config, personal
 from .shell import log
+
+
+def _personal_tags(base_dir):
+    """Every memory.personal_tag configured on any routine or handler."""
+    tags = set()
+    for routine in config.discover(base_dir):
+        profiles = [routine]
+        handlers = routine.get("handlers")
+        if isinstance(handlers, dict):
+            profiles.extend(h for h in handlers.values() if isinstance(h, dict))
+        for profile in profiles:
+            tag = personal.personal_tag(personal.memory_cfg(profile))
+            if tag:
+                tags.add(tag)
+    return tags
 
 
 def _path(base_dir, value):
@@ -78,7 +95,32 @@ def run(base_dir, routine, dry_run=False):
             f"created={report['created']} done={report['done']} "
             f"reopened={report['reopened']} edited={report['edited']} "
             f"gone={report['gone']} pending={report['pending']} "
-            f"dry_run={report['dry_run']}"
+            f"linked={report.get('linked', 0)} dry_run={report['dry_run']}"
+        )
+        return report
+    if kind == "fibery_tasks_outbound":
+        mode = "previewing" if dry_run else "exporting"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = fibery_tasks_outbound.run(
+            cfg, base_dir,
+            _path(base_dir, cfg.get(
+                "checkpoint", fibery_tasks_outbound.DEFAULT_CHECKPOINT)),
+            dry_run=dry_run, extra_exclude=_personal_tags(base_dir),
+        )
+        held = report.get("unconfirmed", [])
+        if held:
+            message = f"unconfirmed export held ({len(held)} ids)"
+            log(f"routine={routine_id} maintenance={kind} ERROR: {message}: "
+                + ", ".join(held))
+            raise fibery_tasks_outbound.UnconfirmedHeld(
+                f"{message}; check the document, then run with "
+                "--retry-unconfirmed to clear")
+        log(
+            f"routine={routine_id} maintenance={kind} "
+            f"unconfirmed={len(held)} "
+            f"candidates={report['candidates']} exported={report['exported']} "
+            f"already_present={report['already_present']} "
+            f"mode={report['mode']} dry_run={report['dry_run']}"
         )
         return report
     if kind == "slack_discovery":

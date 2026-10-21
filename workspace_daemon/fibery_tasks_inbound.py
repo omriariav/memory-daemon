@@ -29,9 +29,14 @@ SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ALERT_RE = re.compile(r"\s*\balert:([A-Za-z0-9_-]+)")
+# Marker the outbound routine embeds so an exported item is never re-imported.
+MEM_RE = re.compile(r"(?<![A-Za-z0-9])mem:([a-z0-9]+(?:-[a-z0-9]+)*)")
+INS_RE = re.compile(r"<ins>.*?</ins>", re.DOTALL)
+DEL_TAG_RE = re.compile(r"</?del>")
 KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)(?:\[(\d+)\])?:(?: (.*))?$")
 TITLE_LIMIT = 120
 DEFAULT_CHECKPOINT = "state/fibery-tasks.json"
+OUTBOUND_CHECKPOINT = "state/fibery-outbound.json"
 DEFAULT_MAX_NEW = 50
 DEFAULT_MAX_CHANGES = 30
 BRIDGE_TIMEOUT = 180
@@ -91,13 +96,42 @@ def _document_text(text):
     return stripped
 
 
+def accepted_text(raw):
+    """Text as accepted: pending insertions removed, pending deletions kept."""
+    if "<ins" not in raw and "<del" not in raw:
+        return raw
+    return DEL_TAG_RE.sub("", INS_RE.sub("", raw))
+
+
+def _is_pending(block):
+    """Whether the block itself is an unaccepted suggestion."""
+    for key, value in block["attrs"].items():
+        if key.lower().startswith("suggest") \
+                and value not in (None, "", "null", "false"):
+            return True
+    return False
+
+
 def parse_blocks(text):
     """Parse the TOON document into (root ids, {id: block})."""
+    roots, blocks, _suggestions = parse_document(text)
+    return roots, blocks
+
+
+def parse_document(text):
+    """Parse the TOON text into (root ids, {id: block}, suggestions text).
+
+    The optional top-level ``suggestions`` section (pending tracked changes)
+    is never interpreted as blocks; its raw text is returned for callers that
+    only need to know what is pending.
+    """
     lines = [ln.rstrip("\r") for ln in _document_text(text).split("\n")]
     roots = None
     blocks = {}
     declared = None
     seen_version = False
+    suggestions = []
+    in_suggestions = False
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -106,7 +140,11 @@ def parse_blocks(text):
             continue
         indent = len(line) - len(line.lstrip(" "))
         body = line.strip()
+        if indent > 0 and in_suggestions:
+            suggestions.append(body)
+            continue
         if indent == 0:
+            in_suggestions = False
             match = KEY_RE.match(body)
             if not match:
                 raise FiberyParseError("unrecognised top-level line")
@@ -119,6 +157,10 @@ def parse_blocks(text):
                 roots = _id_list(count, raw, "rootBlockIds")
             elif key == "blocks" and count is not None and not (raw or "").strip():
                 declared = int(count)
+            elif key == "suggestions":
+                in_suggestions = True
+                if (raw or "").strip() not in ("", "null"):
+                    suggestions.append(raw.strip())
             else:
                 raise FiberyParseError("unrecognised top-level key")
             continue
@@ -144,7 +186,7 @@ def parse_blocks(text):
         raise FiberyParseError("document header is incomplete")
     if declared != len(blocks):
         raise FiberyParseError("block count does not match its header")
-    return roots, blocks
+    return roots, blocks, "\n".join(suggestions)
 
 
 def _parse_block(item_lines):
@@ -217,14 +259,25 @@ def parse_tasks(text):
             if state_value not in (None, "TODO", "DONE"):
                 raise FiberyParseError("unknown list item state")
             paragraphs = []
+            pending_pieces = 0
             for child_id in block["childIds"]:
                 child = blocks[child_id]
                 if child["type"] == "paragraph":
                     seen.add(child_id)
-                    piece = _text_of(child).strip()
+                    raw_piece = _text_of(child).strip()
+                    piece = accepted_text(raw_piece).strip()
                     if piece:
                         paragraphs.append(piece)
-            if state_value is not None:
+                    elif raw_piece:
+                        pending_pieces += 1
+                    if _is_pending(child):
+                        pending_pieces += 1
+                        paragraphs = []
+            # An item that only exists as a pending suggestion is not a task
+            # yet; it is picked up once the user accepts it.
+            pending_item = _is_pending(block) or (
+                pending_pieces and not paragraphs)
+            if state_value is not None and not pending_item:
                 joined = "\n".join(paragraphs)
                 alert = ALERT_RE.search(joined)
                 task = {
@@ -465,17 +518,61 @@ def _today():
     return datetime.date.today().isoformat()
 
 
-def _plan(items, tasks, cfg):
+def _marker(task):
+    """Memory entry id the outbound routine embedded in this task, if any."""
+    match = MEM_RE.search(task["text"])
+    return match.group(1) if match else None
+
+
+def _outbound_ids(base_dir, cfg):
+    """Entry ids the outbound routine attempted or exported (fail closed)."""
+    path = Path(cfg.get("outbound_checkpoint", OUTBOUND_CHECKPOINT)).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+        rows = data["items"]
+        return {i for i, r in rows.items()
+                if isinstance(r, dict)
+                and r.get("state") in ("attempted", "exported")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"cannot read the Fibery outbound checkpoint {path}: {exc}"
+        ) from exc
+
+
+def _linkable_entries(store, tasks, items, outbound_ids):
+    """Marker ids that outbound really wrote and that exist as memory todos.
+
+    A mem: marker typed by anyone else (or naming an entry outbound never
+    exported) is just text: that task is imported like any other.
+    """
+    wanted = {_marker(t) for t in tasks if t["block_id"] not in items}
+    wanted &= outbound_ids
+    if not wanted or not (Path(store) / "memory" / "entries").is_dir():
+        return set()
+    return {
+        entry["id"] for entry in _load_memory_entries(store).values()
+        if entry["id"] in wanted and entry["type"] == "todo"
+    }
+
+
+def _plan(items, tasks, cfg, linkable=frozenset()):
     """Classify every task against the checkpoint without writing anything."""
     import_done = cfg.get("import_done", False) is True
     plan = {"new": [], "skip_done": [], "done": [], "reopened": [],
-            "edited": [], "unchanged": [], "revived": []}
+            "edited": [], "unchanged": [], "revived": [], "link": []}
     current = {t["block_id"]: t for t in tasks}
     for task in tasks:
         row = items.get(task["block_id"])
         full, content = _task_hashes(task)
         if row is None:
-            if task["state"] == "DONE" and not import_done:
+            if _marker(task) in linkable:
+                # Exported from memory: link to that entry, never re-import.
+                plan["link"].append(task)
+            elif task["state"] == "DONE" and not import_done:
                 plan["skip_done"].append(task)
             else:
                 plan["new"].append(task)
@@ -505,7 +602,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     max_changes = int(cfg.get("max_changes_per_run", DEFAULT_MAX_CHANGES))
     report = {"ok": True, "dry_run": bool(dry_run), "tasks": 0, "created": 0,
               "done": 0, "reopened": 0, "edited": 0, "gone": 0,
-              "skipped_done": 0, "pending": 0, "held": False}
+              "skipped_done": 0, "pending": 0, "held": False,
+              "linked": 0}
     if dry_run:
         log("fibery_tasks_inbound: dry-run would read the document via "
             f"{tool} and diff it against the checkpoint")
@@ -514,7 +612,9 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     items = checkpoint["items"]
     tasks = parse_tasks(fetch(cfg, base_dir))
     report["tasks"] = len(tasks)
-    plan = _plan(items, tasks, cfg)
+    linkable = _linkable_entries(
+        cfg["store"], tasks, items, _outbound_ids(base_dir, cfg))
+    plan = _plan(items, tasks, cfg, linkable)
 
     changes = len(plan["done"]) + len(plan["reopened"]) \
         + len(plan["edited"]) + len(plan["gone"])
@@ -530,6 +630,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
 
     store = cfg["store"]
     date = _today()
+    import_done = cfg.get("import_done", False) is True
 
     def save():
         _save_checkpoint(checkpoint_path, checkpoint)
@@ -540,6 +641,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         row = {"hash": full, "content": content, "state": task["state"],
                "entry_id": entry_id, "date": prior.get("date") or date,
                "transitions": prior.get("transitions", 0)}
+        if prior.get("linked"):
+            row["linked"] = True
         row.update(extra)
         items[task["block_id"]] = row
         return row
@@ -563,6 +666,22 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         row = items[task["block_id"]]
         row.update({"hash": full, "content": content})
         row.pop("gone", None)
+    for task in plan["link"]:
+        marker = _marker(task)
+        entry_id = marker
+        if task["state"] == "DONE":
+            if entry_id and import_done:
+                _write(_transition_note, cfg, store, task, entry_id,
+                       "done", 1, date)
+                put(task, entry_id, linked=True, transitions=1)
+            else:
+                put(task, entry_id, linked=True)
+        else:
+            put(task, entry_id, linked=True)
+        report["linked"] += 1
+        save()
+        log(f"fibery_tasks_inbound: linked block={task['block_id']} "
+            f"entry={entry_id or 'unknown'}")
     created = 0
     for task in plan["new"]:
         if created >= max_new:
@@ -583,7 +702,9 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         log(f"fibery_tasks_inbound: created todo block={task['block_id']}")
     for task in plan["edited"]:
         row = items[task["block_id"]]
-        if row.get("entry_id"):
+        # A linked memory todo keeps its own wording; Fibery edits to the
+        # exported copy never rewrite it.
+        if row.get("entry_id") and not row.get("linked"):
             _write(_update_todo, cfg, store, task, row["entry_id"], row["date"])
         put(task, row.get("entry_id"))
         report["edited"] += 1
@@ -603,6 +724,11 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         row = items[task["block_id"]]
         number = row.get("transitions", 0) + 1
         entry_id = row.get("entry_id")
+        if not entry_id and row.get("linked"):
+            put(task, None, transitions=number)
+            report["reopened"] += 1
+            save()
+            continue
         if not entry_id:
             if created >= max_new:
                 report["pending"] += 1
@@ -618,7 +744,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
             row.update({"state": "TODO", "transitions": number})
             row.pop("gone", None)
             save()
-            if row["content"] != _task_hashes(task)[1]:
+            if row["content"] != _task_hashes(task)[1] \
+                    and not row.get("linked"):
                 _write(_update_todo, cfg, store, task, entry_id, row["date"])
         put(task, entry_id, transitions=number)
         report["reopened"] += 1

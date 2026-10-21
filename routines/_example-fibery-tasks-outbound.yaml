@@ -1,0 +1,55 @@
+# Memory todos -> a Fibery document inbox. The first routine that WRITES to an
+# external system, so it is deliberately narrow.
+#
+# Python selects at most max_per_run open todos that are the owner's action
+# (owner_slug in the entry's people, not a no-owner-action note), created on or
+# after outbound_since, from the listed source id prefixes. Entries tagged
+# personal or no-fibery, entries that already carry a fibery: source id and
+# entries already exported are never selected.
+# The write goes through a separate headless Claude bridge session whose only
+# tool is write_tool, with secret, mode and the whole inserts payload pinned,
+# so the model cannot change what is written. write_mode "suggest" (default)
+# records tracked-change suggestions you accept or reject in Fibery; "apply"
+# edits the document directly. Each item ends with a mem:<entry-id> marker
+# that makes reruns idempotent and lets fibery-tasks-inbound link instead of
+# re-importing. The result is re-read and verified before anything is recorded.
+#
+# Tool names are the exact MCP tool names your connector exposes and must come
+# from the same connector. Keep the real secret out of version control (real
+# routines are gitignored). Disable google_tasks_sync for the same todos.
+id: fibery-tasks-outbound
+enabled: false
+description: Suggest memory todos into a Fibery inbox section.
+role: maintenance
+
+schedule:
+  every: 1h
+
+budget:
+  daily_usd: 0.5
+
+maintenance:
+  kind: fibery_tasks_outbound
+  document_secret: 00000000-0000-0000-0000-000000000000
+  read_tool: mcp__claude_ai_Example_Fibery__read_document
+  write_tool: mcp__claude_ai_Example_Fibery__insert_document_blocks
+  write_mode: suggest
+  model: haiku
+  store: /absolute/path/to/personal-memory
+  # Existing person slug; only todos naming this person are exported.
+  owner_slug: example-owner
+  # Only todos dated on or after this day (quoted so YAML keeps a string).
+  outbound_since: "2026-01-01"
+  # Source id prefixes eligible for export.
+  from_sources: ["slack:", "mila:", "gmail:"]
+  # Section the items are appended to (created once at the end if missing).
+  inbox_heading: Inbox
+  max_per_run: 5
+  checkpoint: state/fibery-outbound.json
+  # Tags that block export (default shown). Every memory.personal_tag found
+  # on any routine is excluded as well.
+  exclude_tags: [personal, no-fibery, no-owner-action]
+  # A write whose marker never showed up is reported as unconfirmed, fails every
+  # run (status shows the routine unhealthy) and is never retried on its own.
+  # After checking the document, clear it once with:
+  #   ./daemon.py run --routine fibery-tasks-outbound --retry-unconfirmed ID[,ID...|heading]
