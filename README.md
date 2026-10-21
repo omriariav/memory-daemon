@@ -272,7 +272,8 @@ candidates against the read-only ledger and cursors, then prints the number of
 new or changed items per routine and, for `slack_mcp`, the planned thread-read
 sessions and a cost estimate (mean past session cost times planned sessions,
 plus mean past analyze cost times threads, from `state/claude-usage.jsonl`;
-"unknown" with no history). It fetches nothing, calls no analysis model, and
+with `estimate_analyze_usd`, default 0.12 per thread, standing in for analyze
+history that does not exist yet). It fetches nothing, calls no analysis model, and
 writes no ledger, cursor, store, or vault file (the bridge still logs its own
 session metadata to `state/claude-usage.jsonl`); maintenance routines are not
 run.
@@ -1170,7 +1171,8 @@ How a run works:
    `from:<@id>` query per person, and one mention query by keyword
    (`mention_keywords`, default `<@{self_user_id}>`). Each uses
    `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
-   `include_context=false`, `content_types=messages` and `limit=20`; pages that
+   `include_context=false`, `content_types=messages`,
+   `response_format=detailed` and `limit=20`; pages that
    report a cursor are followed in later sessions, up to `max_search_pages`.
    Searches are spaced `min_seconds_between_searches` apart and a run plans at
    most `max_queries_per_run`. Every new root and reply comes back with its
@@ -1214,8 +1216,12 @@ accepts a tool result only when its input equals a planned call (unplanned
 calls are dropped, never used; a missing planned call is re-issued once).
 Search pages and thread pages must have exactly one structurally consistent
 parse, so a message that imitates the connector's format cannot add or reorder
-hits; an ambiguous page fails the listing and holds the cursors until it ages
-out. Errors and logs carry counts only, never tool inputs or message text, and
+hits. If a page still has several valid readings, only the hits all of them
+agree on are kept, and an unparseable page fails just its own query: that
+query's cursor is held while the others advance. A thread whose item fails holds
+only the cursors of the queries that found it, at its timestamp. A read outage
+(no usable result at all in a session) fails the run without counting an
+attempt against any thread. Errors and logs carry counts only, never tool inputs or message text, and
 the runner's item titles for these threads are the channel and timestamp.
 
 ### Label caching

@@ -2028,9 +2028,15 @@ def _route_claims(claims, totals, failures=(), held_source_keys=None):
             )
             continue
         if not claim.get("processable", True):
+            deferred = (claim["candidate"].get("raw") or {}).get("_deferred")
             log(
                 f"ownership held source={kind} id={item_id}: "
-                f"owner {claim['routine']['id']} reached its processing cap"
+                + (
+                    "deferred (settling or over the per-run cap) by "
+                    f"{claim['routine']['id']}" if deferred
+                    else f"owner {claim['routine']['id']} reached its "
+                         "processing cap"
+                )
             )
             continue
         if kind == "gmail" and len(candidates) > 1:
@@ -2062,6 +2068,12 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     circuit_reported = False
 
     def hold_claim(claim):
+        if (
+            claim["source"].get("kind") == "slack_mcp"
+            and slack_mcp.note_failure(claim["candidate"])
+        ):
+            # Hold only the queries that found this thread, at its timestamp.
+            return
         keys = claim.get("_claimant_source_keys")
         if keys:
             failed_source_keys.update(keys)

@@ -33,6 +33,9 @@ USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
 
 
+_WARNED = set()  # warn once per process, not on every tick
+
+
 class WatchError(ValueError):
     pass
 
@@ -67,7 +70,8 @@ def load(path):
     if not path.is_absolute():
         raise WatchError("watch path must be absolute or start with ~")
     try:
-        if os.stat(path).st_mode & 0o077:
+        if os.stat(path).st_mode & 0o077 and str(path) not in _WARNED:
+            _WARNED.add(str(path))
             log("slack watch file is readable by group or others; "
                 "run chmod 600 on it")
         with open(path) as handle:

@@ -33,12 +33,18 @@ def report(owned, processed, base_dir, totals):
         mcp = [c for c in claims if c["source"].get("kind") == "slack_mcp"]
         line = f"count-only routine={rid}: {len(claims)} new or changed item(s)"
         if mcp:
-            sessions, cost = slack_mcp.plan_cost(len(mcp), usage, rid)
+            default = mcp[0]["source"].get(
+                "estimate_analyze_usd",
+                slack_mcp.DEFAULTS["estimate_analyze_usd"],
+            )
+            sessions, cost = slack_mcp.plan_cost(
+                len(mcp), usage, rid, default
+            )
             line += (
                 f" ({len(mcp)} Slack thread(s), {sessions} planned thread "
-                "read session(s), estimated cost "
-                + ("unknown, no usage history" if cost is None else f"${cost:.2f}")
-                + ")"
+                f"read session(s), estimated cost ${cost:.2f}; an estimate "
+                "from past sessions, or estimate_analyze_usd per thread "
+                "without history)"
             )
         log(line)
     log("count-only: no ledger, cursor or store was written")

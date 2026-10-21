@@ -36,6 +36,8 @@ source:
   # one run may plan (channel chunks + people + mentions).
   min_seconds_between_searches: 3
   max_queries_per_run: 20
+  # Count-only cost estimate per thread until analyze history exists.
+  estimate_analyze_usd: 0.12
   # Extra scalar arguments for every search, pinned in the bridge. The daemon
   # fixes sort, sort_dir, include_context and content_types itself.
   # search_args:

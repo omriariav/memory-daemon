@@ -73,6 +73,7 @@ DEFAULTS = {
     "mention_keywords": ["<@{self_user_id}>"],
     "min_seconds_between_searches": 3,
     "max_queries_per_run": 20,
+    "estimate_analyze_usd": 0.12,
 }
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
@@ -90,8 +91,10 @@ BRIDGE_ATTEMPTS = 2
 # Search arguments we fix; search_args may not override them.
 PINNED_SEARCH = {
     "sort": "timestamp", "sort_dir": "asc", "include_context": False,
-    "content_types": "messages",
+    "content_types": "messages", "response_format": "detailed",
 }
+# `## <name>` sections a search result may carry besides the messages.
+KNOWN_SECTIONS = {"Messages", "Files", "Channels", "Users"}
 RESERVED_SEARCH_ARGS = set(PINNED_SEARCH) | {
     "filters", "keywords", "after", "cursor", "limit",
 }
@@ -176,6 +179,26 @@ def cursor_ids(source):
     return ids
 
 
+def note_failure(candidate):
+    """Hold the cursors of the queries that found a failed thread at its ts.
+
+    Returns False when it cannot (the caller then fails the whole source).
+    """
+    raw = candidate.get("raw") or {}
+    runtime = (raw.get("_batch") or {}).get("runtime")
+    keys = raw.get("keys")
+    if runtime is None or not keys:
+        return False
+    try:
+        stamp = float(candidate["id"].rsplit("@", 1)[1])
+    except (IndexError, ValueError):
+        return False
+    floor = runtime.setdefault("failed_floor", {})
+    for key in keys:
+        floor[key] = min(floor.get(key, stamp), stamp)
+    return True
+
+
 def _rfc3339(epoch):
     when = datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -202,10 +225,15 @@ def commit_points(routine_id, ids, runtime, scan_started_at, cursors):
     start = slack_source._rfc3339_epoch(scan_started_at)
     points = []
     for key, cursor_id in ids.items():
+        if key in runtime.get("failed_keys", ()):
+            continue
         stamp = start
-        mark = runtime.get("watermarks", {}).get(key)
-        if mark is not None:
-            stamp = min(stamp, mark)
+        for mark in (
+            runtime.get("watermarks", {}).get(key),
+            runtime.get("failed_floor", {}).get(key),
+        ):
+            if mark is not None:
+                stamp = min(stamp, mark)
         existing = cursors.checkpoint(routine_id, cursor_id, "slack_mcp")
         if existing:
             stamp = max(stamp, slack_source._rfc3339_epoch(existing))
@@ -346,8 +374,8 @@ def parse_search(text):
     page). A body can embed text that looks like further result blocks, so
     every sequence of heads numbered 1..N with a separator before each is
     parsed and validated (header fields in order, permalink agreeing with the
-    channel and timestamp). Exactly one valid parse is accepted; none or more
-    than one fails closed as ambiguous.
+    channel and timestamp). No valid parse fails; several keep only the hits
+    every valid reading agrees on.
     """
     data = _json_object(text)
     body = data.get("results")
@@ -360,8 +388,9 @@ def parse_search(text):
         cursor = found.group(1) if found else None
     count = _COUNT_HEAD.search(body)
     if not count:
-        if re.search(r"^No results found\.?\s*$", body, re.M) or re.search(
-            r"^## [A-Za-z]", body, re.M
+        sections = re.findall(r"^## ([A-Za-z]+)", body, re.M)
+        if re.search(r"^No results found\.?\s*$", body, re.M) or (
+            sections and set(sections) <= KNOWN_SECTIONS
         ):
             return [], cursor
         raise SlackMcpParseError("search result has an unknown shape")
@@ -377,11 +406,18 @@ def parse_search(text):
         hits = _blocks(rest, chain)
         if hits is not None:
             parses.append(hits)
-    if len(parses) != 1:
-        raise SlackMcpParseError(
-            "search result is ambiguous" if parses
-            else "search result blocks are malformed"
-        )
+    if not parses:
+        raise SlackMcpParseError("search result blocks are malformed")
+    if len(parses) > 1:
+        # A body quoted a well-formed block. Keep only what every valid
+        # reading agrees on, so one message cannot stop the whole query.
+        def ident(hit):
+            return (hit["channel"], hit["ts"], hit["user"])
+
+        common = set.intersection(*[{ident(h) for h in p} for p in parses])
+        log(f"slack_mcp: ambiguous search page; kept {len(common)} of "
+            f"{total} hit(s) common to every reading")
+        return [h for h in parses[0] if ident(h) in common], cursor
     return parses[0], cursor
 
 
@@ -562,7 +598,7 @@ def _one_session(cfg, tool, pins, calls, what, required):
     return texts
 
 
-def _session(cfg, tool, pins, calls, what, required):
+def _session(cfg, tool, pins, calls, what, required, pace=False):
     """Result text per planned call (None = no usable result).
 
     Missing calls are re-issued once in a fresh session.
@@ -570,6 +606,8 @@ def _session(cfg, tool, pins, calls, what, required):
     texts = _one_session(cfg, tool, pins, calls, what, required)
     missing = [i for i, text in enumerate(texts) if text is None]
     if missing:
+        if pace:
+            _pace(cfg)
         again = _one_session(
             cfg, tool, pins, [calls[i] for i in missing], what, required
         )
@@ -646,7 +684,9 @@ def _valid_hit(query, hit, after, now, cfg):
 def _search_all(cfg, queries, afters, now):
     """Run every query to completion or its page cap.
 
-    Returns ([(query, hit)], {cursor key: epoch watermark of a capped query}).
+    Returns ([(query, hit)], {cursor key: epoch of the newest hit read by a
+    capped query}, {cursor keys whose query failed}). A page that cannot be
+    parsed fails only its own query; a failed bridge session fails the run.
     """
     pending = {
         index: _search_args(cfg, query, afters[query["key"]])
@@ -655,6 +695,7 @@ def _search_all(cfg, queries, afters, now):
     found = []
     capped = {}
     newest = {}
+    failed = set()
     for page in range(cfg["max_search_pages"]):
         order = sorted(pending)
         following = {}
@@ -664,6 +705,7 @@ def _search_all(cfg, queries, afters, now):
             texts = _session(
                 cfg, cfg["search_tool"], _search_pins(cfg),
                 [pending[i] for i in part], "search", [cfg["search_tool"]],
+                pace=True,
             )
             for index, text in zip(part, texts):
                 if text is None:
@@ -671,27 +713,34 @@ def _search_all(cfg, queries, afters, now):
                         "a planned search call returned no result"
                     )
                 query = queries[index]
-                hits, cursor = parse_search(text)
-                after = afters[query["key"]]
-                accepted = [
-                    h for h in hits if _valid_hit(query, h, after, now, cfg)
-                ]
-                stamps = [float(h["ts"]) for h in hits]
-                last = newest.get(index)
-                if stamps and (
-                    stamps != sorted(stamps)
-                    or (last is not None and stamps[0] < last)
-                ):
-                    if cursor:
+                key = query["key"]
+                after = afters[key]
+                try:
+                    hits, cursor = parse_search(text)
+                    stamps = [float(h["ts"]) for h in hits]
+                    last = newest.get(index)
+                    if cursor and stamps and (
+                        stamps != sorted(stamps)
+                        or (last is not None and stamps[0] < last)
+                    ):
                         raise SlackMcpError(
                             "search results are not in ascending order"
                         )
-                if stamps:
-                    newest[index] = max(stamps)
+                except SlackMcpError as exc:
+                    failed.add(key)
+                    log(f"slack_mcp: {query['kind']} search failed: {exc}")
+                    continue
+                accepted = [
+                    h for h in hits if _valid_hit(query, h, after, now, cfg)
+                ]
+                if accepted:
+                    newest[index] = max(float(h["ts"]) for h in accepted)
                 found.extend((query, hit) for hit in accepted)
-                if cursor and page + 1 >= cfg["max_search_pages"]:
-                    mark = newest.get(index, afters[query["key"]])
-                    key = query["key"]
+                if cursor and not hits:
+                    log(f"slack_mcp: {query['kind']} search returned an "
+                        "empty page with a cursor; treating it as the end")
+                elif cursor and page + 1 >= cfg["max_search_pages"]:
+                    mark = newest.get(index, float(after))
                     capped[key] = min(capped.get(key, mark), mark)
                 elif cursor:
                     following[index] = _search_args(
@@ -700,7 +749,7 @@ def _search_all(cfg, queries, afters, now):
         pending = following
         if not pending:
             break
-    return found, capped
+    return found, capped, failed
 
 
 # --- listing -----------------------------------------------------------------
@@ -714,8 +763,11 @@ def _group(cfg, found):
             continue
         key = (hit["channel"], hit["root"])
         group = groups.setdefault(
-            key, {"ts": hit["ts"], "mention": False, "replies": 0}
+            key, {"ts": hit["ts"], "mention": False, "replies": 0,
+                  "keys": set(), "hit_ts": set()}
         )
+        group["keys"].add(query["key"])
+        group["hit_ts"].add(hit["ts"])
         if float(hit["ts"]) > float(group["ts"]):
             group["ts"] = hit["ts"]
         group["replies"] = max(group["replies"], hit["replies"])
@@ -741,6 +793,8 @@ def _candidate(candidate_id, anchor_id, channel, root, group, batch,
         "source_id": anchor_id,
         "via_mention": group["mention"],
         "reply_hint": group["replies"],
+        "keys": sorted(group["keys"]),
+        "hit_ts": sorted(group["hit_ts"]),
         "mode": "mcp_thread",
         "_batch": batch,
     }
@@ -776,14 +830,18 @@ def candidates(source):
             f"quer{'y' if len(queries) == 1 else 'ies'}; no bridge call made"
         )
         return Listing()
-    found, capped = _search_all(cfg, queries, afters, now)
+    found, capped, failed = _search_all(cfg, queries, afters, now)
+    if failed and len(failed) == len({q["key"] for q in queries}):
+        raise SlackMcpError("every search query failed")
     groups = _group(cfg, found)
     processed = source.get("_processed")
     settle_before = now - cfg["settle_minutes"] * 60
     ready, waiting = [], []
+    current = {}
     for (channel, root), group in groups.items():
         anchor_id = f"slack:{channel}:{root}"
         candidate_id = f"{anchor_id}@{group['ts']}"
+        current[anchor_id] = candidate_id
         if _already_done(processed, candidate_id):
             continue
         row = (float(group["ts"]), candidate_id, anchor_id, channel, root,
@@ -795,6 +853,7 @@ def candidates(source):
     batch = {
         "cfg": cfg, "order": [], "threads": {}, "error": None,
         "processed": processed,
+        "runtime": source.get("_slack_mcp_runtime"),
     }
     out = Listing()
     for _ts, candidate_id, anchor_id, channel, root, group in ready:
@@ -827,7 +886,10 @@ def candidates(source):
     runtime = source.get("_slack_mcp_runtime")
     if runtime is not None:
         runtime["watermarks"] = marks
+        runtime["failed_keys"] = sorted(failed)
         runtime["listed"] = True
+    if not source.get("_count_only"):
+        _prune_attempts(current)
     log(
         f"slack_mcp: {len(found)} hit(s) in {len(groups)} thread(s); "
         f"{len(ready)} to process, {len(waiting)} settling, {len(over)} over "
@@ -870,6 +932,22 @@ def _bump_attempts(candidate_id):
     data[candidate_id] = int(data.get(candidate_id, 0)) + 1
     _save_attempts(data)
     return data[candidate_id]
+
+
+def _prune_attempts(current):
+    """Drop attempts for superseded versions; keep the file small."""
+    data = _load_attempts()
+    keep = {
+        key: n for key, n in data.items()
+        if not (
+            key.split("@", 1)[0] in current
+            and current[key.split("@", 1)[0]] != key
+        )
+    }
+    if len(keep) > 200:
+        keep = dict(list(keep.items())[-200:])
+    if keep != data:
+        _save_attempts(keep)
 
 
 def _clear_attempts(candidate_id):
@@ -923,6 +1001,11 @@ def _read_threads(batch, wanted):
         # rest of the run instead of retrying once per candidate.
         batch["error"] = str(exc)
         raise
+    if all(text is None for text in texts):
+        # Nothing usable at all: a connector or session outage, not a bad
+        # thread. Fail for the run and charge no thread an attempt.
+        batch["error"] = "thread reads returned no usable result"
+        raise claude_bridge.BridgeError(batch["error"])
     for key, text in zip(todo, texts):
         if text is None:
             batch["threads"][key] = {"status": "missing"}
@@ -961,6 +1044,16 @@ def fetch(routine, candidate, source=None):
     cfg = batch["cfg"]
     if not cfg["include_bots"]:
         replies = [r for r in replies if not r["is_bot"]]
+    if cfg["self_user_id"] and not raw.get("reply_hint"):
+        # No search evidence of any reply: a reply "from" the owner that no
+        # search hit confirms could be forged text, so it earns no
+        # authorship evidence.
+        seen = set(raw.get("hit_ts") or [])
+        replies = [
+            dict(r, user="unverified", name="unverified author")
+            if r["user"] == cfg["self_user_id"] and r["ts"] not in seen else r
+            for r in replies
+        ]
     messages = bound_thread(
         parent, replies, more, cfg["max_thread_chars"],
         raw.get("reply_hint") or 0,
@@ -985,16 +1078,17 @@ def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def plan_cost(count, usage_path, routine_id=None):
-    """(sessions, estimated USD or None) for `count` new threads.
+def plan_cost(count, usage_path, routine_id=None, analyze_default=0.12):
+    """(sessions, estimated USD) for `count` new threads.
 
     Uses the mean cost of past bridge sessions (logged with tools) and of
-    no-tool analyze runs from the usage log. When usage lines carry a routine
-    tag, only this routine's lines are averaged; untagged logs average all.
+    no-tool analyze runs from the usage log; with no analyze history,
+    `analyze_default` per thread. When usage lines carry a routine tag, only
+    this routine's lines are averaged; untagged logs average all.
     """
-    sessions = int(math.ceil(count / float(THREADS_PER_SESSION))) if count else 0
     if not count:
         return 0, 0.0
+    sessions = int(math.ceil(count / float(THREADS_PER_SESSION)))
     entries = []
     try:
         with open(usage_path) as handle:
@@ -1014,8 +1108,5 @@ def plan_cost(count, usage_path, routine_id=None):
         cost = entry.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             (tool_costs if entry.get("tools") else analyze_costs).append(cost)
-    if not tool_costs and not analyze_costs:
-        return sessions, None
-    return sessions, round(
-        _mean(tool_costs) * sessions + _mean(analyze_costs) * count, 2
-    )
+    analyze = _mean(analyze_costs) if analyze_costs else analyze_default
+    return sessions, round(_mean(tool_costs) * sessions + analyze * count, 2)

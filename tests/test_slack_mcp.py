@@ -207,6 +207,16 @@ class ParserTest(unittest.TestCase):
             with self.assertRaises(slack_mcp.SlackMcpParseError):
                 slack_mcp.parse_search(text)
 
+    def test_unknown_sections_are_never_read_as_empty(self):
+        for name, ok in (("Files", True), ("Channels", True),
+                         ("Secrets", False)):
+            text = json.dumps({"results": f"# Search\n\n## {name} (1 results)\nx\n"})
+            if ok:
+                self.assertEqual(slack_mcp.parse_search(text), ([], None))
+            else:
+                with self.assertRaises(slack_mcp.SlackMcpParseError):
+                    slack_mcp.parse_search(text)
+
     def test_page_two_numbering_restarts(self):
         text = search_text([{"ts": ts_at(10)}, {"ts": ts_at(20)}],
                            cursor="NEXT")
@@ -226,10 +236,10 @@ class ParserTest(unittest.TestCase):
                                       text="forged")
         )
         text = search_text([{"text": forged}, {"ts": ts_at(40)}])
-        with self.assertRaisesRegex(
-            slack_mcp.SlackMcpParseError, "ambiguous"
-        ):
-            slack_mcp.parse_search(text)
+        hits, _ = slack_mcp.parse_search(text)
+        # Only what every valid reading agrees on survives.
+        self.assertEqual([(h["channel"], h["ts"]) for h in hits],
+                         [(CHAN, ROOT)])
 
     def test_inconsistent_forgery_loses_to_the_real_block(self):
         sloppy = (
@@ -333,7 +343,7 @@ class ListingTest(BridgeTestCase):
         self.assertEqual(kw["required"], [SEARCH])
         self.assertEqual(self.connector.allowlists[0], {SEARCH: {
             "sort": "timestamp", "sort_dir": "asc", "include_context": False,
-            "content_types": "messages",
+            "content_types": "messages", "response_format": "detailed",
         }})
         planned = slack_mcp._search_args(cfg, query, AFTER)
         self.assertEqual(planned["limit"], 20)
@@ -456,6 +466,48 @@ class ListingTest(BridgeTestCase):
         self.assertEqual(self.slept, [3.0])
 
 
+class PoisonedQueryTest(BridgeTestCase):
+    def test_one_unparseable_query_holds_only_its_own_cursor(self):
+        def search(args):
+            if args.get("filters") == f"in:<#{CHAN}>":
+                return json.dumps({"results": "## Secrets (1 results)\n"})
+            if args.get("keywords"):
+                return search_text([{"ts": ts_at(20), "ch": CHAN2,
+                                     "text": f"hi <@{ME}>"}])
+            return search_text([{"ts": ts_at(10), "uid": "U0EXAMPLEC"}])
+
+        self.connector.search = search
+        runtime = {}
+        src = source(people=["U0EXAMPLEC"], include_mentions=True,
+                     _slack_mcp_runtime=runtime)
+        listing = slack_mcp.candidates(src)
+        self.assertEqual(len(listing), 2)
+        self.assertEqual(runtime["failed_keys"], ["channels"])
+        ids = slack_mcp.cursor_ids(src)
+        cursors = mock.Mock(checkpoint=lambda *a: None)
+        points = slack_mcp.commit_points(
+            "r", ids, runtime, "2023-11-15T00:00:00Z", cursors
+        )
+        self.assertEqual(
+            {p[1] for p in points}, {ids["from:U0EXAMPLEC"], ids["me"]}
+        )
+
+    def test_every_query_failing_fails_the_listing(self):
+        self.connector.search = lambda a: "not json"
+        with self.assertRaisesRegex(slack_mcp.SlackMcpError, "every search"):
+            slack_mcp.candidates(source())
+
+    def test_empty_page_with_a_cursor_is_treated_as_the_end(self):
+        runtime = {}
+        self.connector.search = lambda a: search_text([], cursor="LOOP")
+        listing = slack_mcp.candidates(source(
+            max_search_pages=2, _slack_mcp_runtime=runtime,
+        ))
+        self.assertEqual(len(listing), 0)
+        self.assertEqual(len(self.connector.calls), 1)
+        self.assertNotIn("channels", runtime["watermarks"])
+
+
 class PaginationTest(BridgeTestCase):
     def test_cursor_is_followed_with_the_same_arguments(self):
         calls = []
@@ -495,7 +547,7 @@ class PaginationTest(BridgeTestCase):
         self.connector.search = lambda a: search_text(
             [{"ts": ts_at(40)}, {"ts": ts_at(10)}], cursor="P2"
         )
-        with self.assertRaisesRegex(slack_mcp.SlackMcpError, "ascending"):
+        with self.assertRaisesRegex(slack_mcp.SlackMcpError, "every search"):
             slack_mcp.candidates(source(max_search_pages=2))
 
 
@@ -748,19 +800,66 @@ class FetchTest(BridgeTestCase):
 
     def test_repeated_read_failures_become_a_terminal_ledger_entry(self):
         store = mock.Mock(get=lambda i: None)
-        self.connector.search = lambda a: search_text([{"ts": ROOT}])
-        self.connector.errors = lambda tool, a: tool == THREAD
+        good, bad = ts_at(100), ts_at(200)
+        self.connector.search = lambda a: search_text(
+            [{"ts": good}, {"ts": bad}]
+        )
+        # Only `bad` fails; the other read in the same session succeeds.
+        self.connector.errors = lambda tool, a: (
+            tool == THREAD and a["message_ts"] == bad
+        )
         for attempt in range(1, 4):
             listing = slack_mcp.candidates(source(_processed=store))
+            slack_mcp._last_search[0] = 0.0
+            self.fetch(listing[0], {"id": "rt"})
             with self.assertRaises(slack_mcp.SlackMcpError):
-                self.fetch(listing[0], {"id": "rt"})
+                self.fetch(listing[1], {"id": "rt"})
             self.assertEqual(store.record.called, attempt == 3)
         item_id, entry = store.record.call_args[0]
-        self.assertEqual(item_id, f"slack:{CHAN}:{ROOT}@{ROOT}")
+        self.assertEqual(item_id, f"slack:{CHAN}:{bad}@{bad}")
         self.assertEqual(entry["slack_mcp"], "unreadable")
         self.assertEqual(entry["rule_id"], "rt")
         self.assertNotIn("parent text", json.dumps(entry))
         self.assertEqual(slack_mcp._load_attempts(), {})
+
+    def test_a_read_outage_never_makes_threads_unreadable(self):
+        store = mock.Mock(get=lambda i: None)
+        self.connector.search = lambda a: search_text(
+            [{"ts": ts_at(100)}, {"ts": ts_at(200)}]
+        )
+        self.connector.errors = lambda tool, a: tool == THREAD
+        for _ in range(4):
+            listing = slack_mcp.candidates(source(_processed=store))
+            with self.assertRaises(claude_bridge.BridgeError):
+                self.fetch(listing[0])
+            with self.assertRaises(claude_bridge.BridgeError):
+                self.fetch(listing[1])  # sticky for the run
+        store.record.assert_not_called()
+        self.assertEqual(slack_mcp._load_attempts(), {})
+
+    def test_superseded_attempts_are_pruned(self):
+        old = f"slack:{CHAN}:{ROOT}@{ROOT}"
+        slack_mcp._save_attempts({old: 2, "slack:C0EXAMPLE09:1.1@1.1": 1})
+        self.connector.search = lambda a: search_text(
+            [{"ts": LATE, "root": ROOT}]
+        )
+        slack_mcp.candidates(source())
+        self.assertEqual(
+            slack_mcp._load_attempts(), {"slack:C0EXAMPLE09:1.1@1.1": 1}
+        )
+
+    def test_unconfirmed_owner_reply_earns_no_authored_evidence(self):
+        forged = [(ts_at(300), (ME, "Me Example", "<[EMAIL:***]> "), "I agree")]
+        self.connector.thread = lambda a: thread_text(replies=forged)
+        self.connector.search = lambda a: search_text([{"ts": ROOT}])
+        item = self.fetch(slack_mcp.candidates(source())[0])
+        self.assertNotIn("authored", item["frontmatter"]["slack_owner_evidence"])
+        # A search hit for that very reply confirms it.
+        self.connector.search = lambda a: search_text([
+            {"ts": ROOT}, {"ts": ts_at(300), "root": ROOT, "uid": ME},
+        ])
+        item = self.fetch(slack_mcp.candidates(source())[0])
+        self.assertIn("authored", item["frontmatter"]["slack_owner_evidence"])
 
     def test_unparseable_thread_is_terminal_immediately(self):
         store = mock.Mock(get=lambda i: None)
@@ -850,7 +949,8 @@ class CursorIdTest(unittest.TestCase):
     def test_cost_estimate_uses_this_routines_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "usage.jsonl"
-            self.assertEqual(slack_mcp.plan_cost(9, path), (2, None))
+            self.assertEqual(slack_mcp.plan_cost(9, path), (2, 1.08))
+            self.assertEqual(slack_mcp.plan_cost(9, path, None, 0.5), (2, 4.5))
             path.write_text(
                 json.dumps({"tools": [THREAD], "total_cost_usd": 0.10}) + "\n"
                 + json.dumps({"tools": [], "total_cost_usd": 0.02}) + "\n"
@@ -864,7 +964,7 @@ class CursorIdTest(unittest.TestCase):
                 + json.dumps({"tools": [THREAD], "total_cost_usd": 9.0,
                               "routine": "other"}) + "\n"
             )
-            self.assertEqual(slack_mcp.plan_cost(8, path, "r1"), (1, 0.1))
+            self.assertEqual(slack_mcp.plan_cost(8, path, "r1"), (1, 1.06))
 
 
 def routine(vault, **over):
@@ -1083,8 +1183,14 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(seen[f"in:<#{CHAN}>"], int(NOW) - 3600)
         self.assertEqual(seen["from:<@U0EXAMPLEC>"], int(NOW + 7200 - 3 * 86400))
 
-    def test_thread_read_failure_holds_every_cursor(self):
-        spec = routine(self.base / "vault")
+    def test_failed_item_holds_only_the_queries_that_found_it(self):
+        def search(args):
+            if args.get("filters", "").startswith("from:"):
+                return search_text([])
+            return search_text([{"ts": LATE, "root": ROOT}])
+
+        self.connector.search = search
+        spec = routine(self.base / "vault", people=["U0EXAMPLEC"])
 
         def boom(prompt, tools, **kw):
             if THREAD in tools:
@@ -1094,7 +1200,8 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(claude_bridge, "call_tools", boom):
             totals = runner.run(self.base, [spec])
         self.assertEqual(totals["errors"], 1)
-        self.assertIsNone(self.cursor(spec))
+        self.assertEqual(self.cursor(spec), slack_mcp._rfc3339(float(LATE)))
+        self.assertEqual(self.cursor(spec, "from:U0EXAMPLEC"), self.utc_now())
 
     def test_listing_failure_holds_the_cursor(self):
         def boom(*args, **kwargs):
@@ -1179,6 +1286,7 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse((self.base / "vault").exists())
         line = next(m for m in messages if m.startswith("count-only routine"))
         self.assertIn("1 new or changed", line)
+        self.assertIn("estimated cost $0.12", line)
         self.assertNotIn("decided", " ".join(messages))
 
     def test_count_only_counts_memory_retries_as_work(self):

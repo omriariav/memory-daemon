@@ -1316,6 +1316,14 @@ def _validate_slack_mcp(prefix, source):
                 problems.append(
                     f"{prefix}.{key} must look like '15m', '4h', or '1d'"
                 )
+    estimate = source.get("estimate_analyze_usd")
+    if estimate is not None and (
+        not isinstance(estimate, (int, float)) or isinstance(estimate, bool)
+        or not 0 <= estimate <= 10
+    ):
+        problems.append(
+            f"{prefix}.estimate_analyze_usd must be a number from 0 to 10"
+        )
     if "include_bots" in source and not isinstance(source["include_bots"], bool):
         problems.append(f"{prefix}.include_bots must be true or false")
     if "model" in source and not _non_empty_str(source["model"]):
