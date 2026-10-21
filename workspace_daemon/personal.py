@@ -14,13 +14,12 @@ PERSONAL_REASONS = {
 ID_PLACEHOLDER = "[ID]"
 
 DEFAULT_PERSONAL_KEYWORDS = [
-    # English
-    "payroll", "salary", "salaries", "payslip", "pay slip", "pension",
-    "insurance policy", "medical", "sick leave", "divorce", "lawyer",
-    "passport",
+    # English (first-person / HR phrasing; insurance vocabulary is work content)
+    "my salary", "my pension", "payslip", "pay slip", "sick leave",
+    "divorce", "passport",
     # Hebrew
-    "שכר", "משכורת", "תלוש", "פנסיה", "ביטוח", "קרן השתלמות", "מחלה",
-    'ת"ז', "תעודת זהות",
+    "תלוש שכר", "תלוש", "משכורת", "פנסיה", "קרן השתלמות", "ימי מחלה",
+    "גירושין", "דרכון", 'ת"ז', "תעודת זהות",
 ]
 
 _HEBREW_RE = re.compile(r"[֐-׿]")
@@ -118,16 +117,28 @@ def iban_valid(value):
 
 # --- redaction ---------------------------------------------------------------
 
-_LABEL = (
-    r"(?:ת[\"״'׳]?\.?ז\.?|תעודת\s+זהות|\bI\.?D\.?(?=\W)|identity|passport"
-    r"|\bSSN\b|social\s+security)"
+_IL_LABEL = (
+    r"(?:ת[\"״'׳]?\.?ז\.?|תעודת\s+זהות|מספר\s+זהות|identity"
+    r"|(?:israeli|national|personal|government|citizen)\s+I\.?D\.?)"
+    r"(?:\s*(?:no\.?|number|num\.?|#|card))?"
 )
+_PASSPORT_LABEL = r"(?:passport|דרכון)(?:\s*(?:no\.?|number|num\.?|#))?"
+_SSN_LABEL = r"(?:\bSSN\b|social\s+security)(?:\s*(?:no\.?|number|num\.?|#))?"
+_SEP = r"\s*[:=#\-–]?\s*"
+_TAIL = r"(?!\d)(?![.,]\d)"
 _LABELLED_RE = re.compile(
-    r"(?P<label>" + _LABEL + r"(?:\s*(?:no\.?|number|num\.?|#|card))?"
-    r"\s*[:=#\-–]?\s*)"
-    r"(?P<num>[A-Za-z]{0,2}\d[\d\-]{4,14}\d)(?!\d)(?![.,]\d)",
+    r"(?P<il>" + _IL_LABEL + _SEP + r")(?P<ilnum>\d[\d \-]{6,14}\d)" + _TAIL
+    + r"|(?P<pp>" + _PASSPORT_LABEL + _SEP + r")(?P<ppnum>[A-Za-z]{0,2}\d{6,9})" + _TAIL
+    + r"|(?P<ss>" + _SSN_LABEL + _SEP + r")(?P<ssnum>\d{3}[- ]?\d{2}[- ]?\d{4})" + _TAIL,
     re.IGNORECASE,
 )
+# Context words that make a bare checksum-valid 9-digit number an ID.
+_CONTEXT_RE = re.compile(
+    r"ת[\"״'׳]?\.?ז\b|תעודת\s+זהות|מספר\s+זהות|identity|passport|דרכון"
+    r"|\bSSN\b|social\s+security|(?:israeli|national|personal)\s+ID",
+    re.IGNORECASE,
+)
+_CONTEXT_WINDOW = 20
 _IBAN_RE = re.compile(r"(?<![\w])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{3,4}){3,8}(?: ?[A-Z0-9]{1,2})?(?![\w])")
 _CARD_RE = re.compile(r"(?<![\w.+,])\d(?:[ -]?\d){12,18}(?![\w])(?![.,]\d)")
 _BARE_ID_RE = re.compile(r"(?<![\w.\-/:+,])\d{9}(?![\w]|[.,\-/:]\w)")
@@ -138,6 +149,8 @@ def redact(text):
     if not isinstance(text, str) or not text:
         return text, 0
     count = 0
+    text_in = text
+    # `bare` reads text_in (the text the current pattern is scanning).
 
     def counted(fn):
         def inner(match):
@@ -149,9 +162,15 @@ def redact(text):
         return inner
 
     def labelled(match):
-        if sum(c.isdigit() for c in match.group("num")) < 6:
-            return match.group(0)
-        return match.group("label") + ID_PLACEHOLDER
+        if match.group("ilnum"):
+            digits = re.sub(r"\D", "", match.group("ilnum"))
+            if len(digits) >= 8 and israeli_id_valid(digits):
+                return match.group("il") + ID_PLACEHOLDER
+        elif match.group("ssnum"):
+            return match.group("ss") + ID_PLACEHOLDER
+        elif match.group("ppnum"):
+            return match.group("pp") + ID_PLACEHOLDER
+        return match.group(0)
 
     def iban(match):
         return ID_PLACEHOLDER if iban_valid(match.group(0)) else match.group(0)
@@ -163,12 +182,19 @@ def redact(text):
         return match.group(0)
 
     def bare(match):
-        return ID_PLACEHOLDER if israeli_id_valid(match.group(0)) else match.group(0)
+        if not israeli_id_valid(match.group(0)):
+            return match.group(0)
+        near = (
+            text_in[max(0, match.start() - _CONTEXT_WINDOW):match.start()]
+            + " " + text_in[match.end():match.end() + _CONTEXT_WINDOW]
+        )
+        return ID_PLACEHOLDER if _CONTEXT_RE.search(near) else match.group(0)
 
     for pattern, fn in (
         (_LABELLED_RE, labelled), (_IBAN_RE, iban),
         (_CARD_RE, card), (_BARE_ID_RE, bare),
     ):
+        text_in = text
         text = pattern.sub(counted(fn), text)
     return text, count
 
@@ -178,22 +204,30 @@ def has_id_numbers(text):
 
 
 def keyword_hit(text, kws):
-    """True when any configured keyword appears (case-insensitive)."""
+    """True when any configured keyword appears (case-insensitive).
+
+    Hebrew keywords match whole words, allowing one attached prefix letter
+    (ה/ב/ל/ו/מ/ש/כ), so שכר does not match השכרה or נשכר.
+    """
     if not isinstance(text, str) or not text or not kws:
         return False
     folded = text.casefold()
     for kw in kws:
         needle = kw.casefold().strip()
         if _HEBREW_RE.search(needle):
-            # Hebrew takes attached prefixes (ה/ב/ל...), so match substrings.
-            if needle in folded:
-                return True
-        elif re.search(r"(?<!\w)" + re.escape(needle) + r"\w*", folded):
+            pat = (r"(?<![\u0590-\u05ff])[הבלומשכ]?" + re.escape(needle)
+                   + r"(?![\u0590-\u05ff])")
+        else:
+            pat = r"(?<!\w)" + re.escape(needle) + r"\w*"
+        if re.search(pat, folded):
             return True
     return False
 
 
-def deterministic_personal(cfg, *texts):
-    """Model-free backstop: keyword or ID-number match in any text."""
+def keywords_detected(cfg, *texts):
     kws = keywords(cfg)
-    return any(keyword_hit(t, kws) or has_id_numbers(t) for t in texts if t)
+    return any(keyword_hit(t, kws) for t in texts if t)
+
+
+def ids_detected(*texts):
+    return any(has_id_numbers(t) for t in texts if t)

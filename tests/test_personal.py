@@ -43,19 +43,56 @@ class RedactTest(unittest.TestCase):
 
     def test_valid_bare_id_redacted_invalid_kept(self):
         valid, invalid = make_il_id(), make_invalid_il_id()
-        out, n = personal.redact(f"id {valid} and number {invalid}.")
+        out, n = personal.redact(f"ת\"ז של דנה: {valid} and number {invalid}.")
         self.assertIn("[ID]", out)
         self.assertNotIn(valid, out)
         self.assertIn(invalid, out)
         self.assertEqual(n, 1)
 
-    def test_labelled_invalid_id_redacted(self):
-        invalid = make_invalid_il_id()
-        for label in ('ת"ז', "ID", "identity number", "passport no.", "SSN"):
-            out, n = personal.redact(f"{label}: {invalid}")
+    def test_bare_valid_id_without_context_kept(self):
+        valid = make_il_id()
+        self.assertEqual(personal.redact(f"order {valid} shipped"),
+                         (f"order {valid} shipped", 0))
+
+    def test_labelled_valid_id_redacted_invalid_kept(self):
+        valid, invalid = make_il_id(), make_invalid_il_id()
+        for label in ('ת"ז', "ת.ז.", "תעודת זהות", "מספר זהות",
+                      "identity number", "Israeli ID number", "national ID no."):
+            out, n = personal.redact(f"{label}: {valid}")
             self.assertEqual(n, 1, label)
-            self.assertNotIn(invalid, out)
+            self.assertNotIn(valid, out)
             self.assertIn("[ID]", out)
+            self.assertEqual(personal.redact(f"{label}: {invalid}")[1], 0, label)
+
+    def test_labelled_id_with_inner_spaces_and_dashes(self):
+        valid = make_il_id()
+        spaced = f"{valid[:3]} {valid[3:6]} {valid[6:]}"
+        dashed = f"{valid[:3]}-{valid[3:6]}-{valid[6:]}"
+        for v in (spaced, dashed):
+            out, n = personal.redact(f"ת.ז. {v}")
+            self.assertEqual((out, n), ("ת.ז. [ID]", 1))
+
+    def test_passport_and_ssn(self):
+        out, n = personal.redact("passport no. 12345678 and דרכון: X1234567")
+        self.assertEqual(n, 2)
+        self.assertNotIn("1234567", out)
+        out, n = personal.redact("SSN 123-45-6789 on file")
+        self.assertEqual((out, n), ("SSN [ID] on file", 1))
+
+    def test_work_identifiers_unchanged(self):
+        for text in (
+            "Claim ID: 4821937", "Policy ID: LP1234567", "Order id 98765432",
+            "Zoom Meeting ID: 91234567890", "Jira ticket ID 100234",
+            "user id: 123456", "ID: 123456782", "id 987654321",
+            "landline 031234567 and 021234567", "order number 123456782",
+        ):
+            self.assertEqual(personal.redact(text), (text, 0), text)
+
+    def test_bare_valid_id_near_context_word_redacted(self):
+        valid = make_il_id()
+        out, n = personal.redact(f"identity doc, see {valid} attached")
+        self.assertEqual(n, 1)
+        self.assertNotIn(valid, out)
 
     def test_labelled_ssn_with_dashes(self):
         out, n = personal.redact("SSN 123-45-6789 on file")
@@ -107,24 +144,34 @@ class KeywordTest(unittest.TestCase):
     def test_english_and_hebrew(self):
         kws = personal.DEFAULT_PERSONAL_KEYWORDS
         for text in (
-            "Please send the Payroll export", "my salary review",
-            "Lawyers called about the divorce", "renew my passport",
-            "תלוש שכר חודשי", "פרטי הפנסיה שלי", 'מספר ת"ז', "הביטוח החדש",
-            "יום מחלה", "קרן השתלמות",
+            "Please resend my payslip", "my salary review", "taking sick leave",
+            "going through a divorce", "renew my passport",
+            "תלוש שכר חודשי", "פרטי הפנסיה שלי", 'מספר ת"ז', "המשכורת שלי",
+            "ימי מחלה", "קרן השתלמות", "גירושין", "הדרכון שלי",
         ):
             self.assertTrue(personal.keyword_hit(text, kws), text)
 
-    def test_unrelated_text_and_word_boundaries(self):
+    def test_work_vocabulary_not_flagged(self):
         kws = personal.DEFAULT_PERSONAL_KEYWORDS
-        for text in ("Roadmap review for Q3", "the unmedical term", "ship it"):
+        for text in (
+            "Roadmap review for Q3", "insurance policy renewal flow",
+            "medical claims triage", "our lawyer reviewed the filing",
+            "פוליסת ביטוח חדשה", "תביעת ביטוח רפואי", "ביטוח דירה ללקוחות",
+        ):
             self.assertFalse(personal.keyword_hit(text, kws), text)
+
+    def test_hebrew_whole_word_with_one_prefix(self):
+        self.assertTrue(personal.keyword_hit("השכר עלה", ["שכר"]))
+        self.assertTrue(personal.keyword_hit("שכר", ["שכר"]))
+        for text in ("השכרה של משרד", "הוא נשכר אתמול", "שכרתי רכב"):
+            self.assertFalse(personal.keyword_hit(text, ["שכר"]), text)
 
     def test_custom_keywords(self):
         cfg = {"personal_keywords": ["custody"]}
-        self.assertTrue(personal.deterministic_personal(cfg, "custody hearing"))
-        self.assertFalse(personal.deterministic_personal(cfg, "payroll"))
-        self.assertFalse(personal.deterministic_personal(
-            {"personal_keywords": []}, "payroll"))
+        self.assertTrue(personal.keywords_detected(cfg, "custody hearing"))
+        self.assertFalse(personal.keywords_detected(cfg, "payslip"))
+        self.assertFalse(personal.keywords_detected(
+            {"personal_keywords": []}, "payslip"))
 
 
 class ConfigTest(unittest.TestCase):
@@ -221,7 +268,7 @@ class CaptureTest(unittest.TestCase):
             tags, _, _ = self.capture(self.extraction(personal=bad))
             self.assertNotIn("personal", tags, bad)
             tags, _, _ = self.capture(
-                self.extraction(personal=bad), summary="Payroll question")
+                self.extraction(personal=bad), summary="Question about my payslip")
             self.assertIn("personal", tags, bad)
 
     def test_invalid_reason_not_logged(self):
@@ -230,24 +277,38 @@ class CaptureTest(unittest.TestCase):
             personal=True, personal_reason=secret))
         self.assertFalse(any(secret in l for l in logs))
 
-    def test_keyword_backstop_overrides_model_false(self):
+    def test_valid_model_false_beats_keywords(self):
+        for summary, body in (
+            ("insurance policy renewal and medical claims", "x"),
+            ("תביעת ביטוח רפואי של לקוח", "פוליסת ביטוח"),
+            ("my payslip", "תלוש שכר"),
+        ):
+            tags, _, _ = self.capture(
+                self.extraction(personal=False), summary=summary, body=body)
+            self.assertNotIn("personal", tags, summary)
+
+    def test_rental_and_hiring_words_not_tagged(self):
+        tags, _, _ = self.capture(summary="השכרה של משרד, נשכר עובד חדש")
+        self.assertNotIn("personal", tags)
+
+    def test_keywords_backstop_missing_verdict(self):
         tags, _, _ = self.capture(
-            self.extraction(personal=False), summary="Updated salary bands")
+            self.extraction(), summary="Updated my salary bands")
         self.assertIn("personal", tags)
-        tags, _, _ = self.capture(
-            self.extraction(personal=False), body="שלחתי את תלוש המשכורת")
+        tags, _, _ = self.capture(body="שלחתי את תלוש השכר")
         self.assertIn("personal", tags)
 
     def test_backstop_without_extraction(self):
-        tags, _, _ = self.capture(summary="insurance policy renewal")
+        tags, _, _ = self.capture(summary="please resend my payslip")
         self.assertIn("personal", tags)
 
     def test_id_number_forces_personal_and_redacts_body(self):
         ident = make_il_id()
         tags, stdin, logs = self.capture(
-            self.extraction(personal=False, body=f"Applicant {ident} filed."),
-            body=f"applicant {ident}")
+            self.extraction(personal=False, body=f'ת"ז {ident} filed.'),
+            body=f'applicant ת"ז {ident}')
         self.assertIn("personal", tags)
+        self.assertTrue(any("reason=id_number" in l for l in logs))
         self.assertNotIn(ident, stdin)
         self.assertIn("[ID]", stdin)
         self.assertTrue(any("redacted" in l for l in logs))
@@ -255,7 +316,7 @@ class CaptureTest(unittest.TestCase):
 
     def test_summary_redacted_when_extract_disabled(self):
         ident = make_il_id()
-        _, stdin, _ = self.capture(summary=f"ID {ident} noted")
+        _, stdin, _ = self.capture(summary=f"passport {ident} noted")
         self.assertNotIn(ident, stdin)
 
     def test_custom_tag(self):
@@ -267,22 +328,22 @@ class CaptureTest(unittest.TestCase):
     def test_disabled_tag(self):
         tags, _, _ = self.capture(
             self.extraction(personal=True), personal_tag=None,
-            summary="payroll")
+            summary="my payslip")
         self.assertNotIn("personal", tags)
 
     def test_redaction_disabled_keeps_text(self):
         ident = make_il_id()
-        _, stdin, _ = self.capture(summary=f"ID {ident} noted", redact_ids=False)
+        _, stdin, _ = self.capture(summary=f"passport {ident} noted", redact_ids=False)
         self.assertIn(ident, stdin)
 
     def test_nothing_sensitive_logged(self):
         ident = make_il_id()
         _, _, logs = self.capture(
             self.extraction(personal=True, personal_reason="payroll"),
-            body=f"salary for {ident}")
+            body=f"my salary and passport {ident}")
         joined = "\n".join(logs)
         self.assertNotIn(ident, joined)
-        self.assertNotIn("salary", joined)
+        self.assertNotIn("my salary", joined)
 
 
 class ExtractSchemaTest(unittest.TestCase):
@@ -326,7 +387,7 @@ class AnalyzeRedactionTest(unittest.TestCase):
         with mock.patch.object(llm, "run_json",
                                return_value={"content": "ok"}) as run, \
                 mock.patch.object(llm, "log") as log:
-            llm.analyze(routine, f"body with ID {ident} inside")
+            llm.analyze(routine, f"body with passport {ident} inside")
         sent = run.call_args.args[0][run.call_args.args[0].index("-p") + 1]
         self.assertNotIn(ident, sent)
         self.assertIn("[ID]", sent)
@@ -340,7 +401,7 @@ class AnalyzeRedactionTest(unittest.TestCase):
                 routine["memory"] = mem
             with mock.patch.object(llm, "run_json",
                                    return_value={"content": "ok"}) as run:
-                llm.analyze(routine, f"ID {ident}")
+                llm.analyze(routine, f"passport {ident}")
             sent = run.call_args.args[0][run.call_args.args[0].index("-p") + 1]
             self.assertIn(ident, sent)
 

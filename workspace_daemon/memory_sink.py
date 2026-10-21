@@ -821,9 +821,9 @@ def capture(routine, item, summary, dry_run=False):
     # Deterministic personal backstop runs on the raw source + summary; the
     # redaction below only changes what the models and the store ever see.
     ptag = personal.personal_tag(cfg)
-    deterministic_personal = bool(ptag) and personal.deterministic_personal(
-        cfg, item.get("title", ""), item.get("body", ""), summary
-    )
+    raw_texts = (item.get("title", ""), item.get("body", ""), summary)
+    id_hit = bool(ptag) and personal.ids_detected(*raw_texts)
+    keyword_hit = bool(ptag) and personal.keywords_detected(cfg, *raw_texts)
     if personal.redact_enabled(cfg):
         summary, redacted = personal.redact(summary)
         if redacted:
@@ -982,23 +982,19 @@ def capture(routine, item, summary, dry_run=False):
         tags.append("extract-degraded")
     if ptag:
         model_flag = entry.get("personal") if extraction_succeeded else None
-        if type(model_flag) is bool:
-            is_personal = model_flag or deterministic_personal
-        else:
-            # Missing/non-bool model verdict: trust only the deterministic rule.
-            is_personal = deterministic_personal
+        valid_verdict = type(model_flag) is bool
+        # A valid model verdict wins over keywords; keywords only backstop a
+        # missing/invalid verdict. A personal ID number always forces the flag.
+        is_personal = (model_flag if valid_verdict else keyword_hit) or id_hit
         if is_personal:
             tags.append(ptag)
             reason = entry.get("personal_reason")
             if reason not in personal.PERSONAL_REASONS:
-                reason = "id_number" if (
-                    deterministic_personal and not model_flag
-                    and personal.has_id_numbers(item.get("body", "") + summary)
-                ) else None
+                reason = "id_number" if id_hit else None
             log(
                 f"routine={rid} memory: flagged personal"
                 + (f" reason={reason}" if reason else "")
-                + (" (deterministic)" if deterministic_personal else "")
+                + (" (deterministic)" if id_hit or not valid_verdict else "")
             )
     title = (entry.get("title") or item.get("title") or "untitled")[:120]
     body = entry.get("body") or summary

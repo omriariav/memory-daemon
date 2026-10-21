@@ -1304,16 +1304,21 @@ memory:
 - **Flagging.** The extraction pass asks for `personal: true|false` (plus an
   optional `personal_reason` category: payroll, compensation, hr, health,
   family, finance, legal, immigration, id_number, other). Python accepts only a
-  real boolean. A deterministic backstop forces the flag when the source text
-  or summary matches `personal_keywords` (a small English + Hebrew list by
-  default; set `[]` to turn it off) or contains an ID number. A malformed model
-  value is treated as personal only if that backstop fires. The flag becomes
-  the `personal_tag` on the entry. Only the reason category is ever logged.
+  real boolean, and a valid `personal: false` is final. `personal_keywords` (a
+  small first-person/HR list in English and Hebrew by default; Hebrew terms
+  match whole words with one attached prefix letter; `[]` turns it off) only
+  backstops a missing or malformed verdict. A personal ID number in the source
+  or summary always forces the flag. Insurance vocabulary is deliberately not
+  in the defaults. The flag becomes the `personal_tag` on the entry. Only the
+  reason category is ever logged.
 - **Redaction.** With `redact_ids`, ID-like numbers become `[ID]` before any
   model call (`llm.analyze` for routines with a `memory:` block) and before the
-  entry is saved: Israeli ID numbers (valid check digit, or any number after an
-  ID label such as ID, identity, passport, SSN), card numbers passing Luhn
-  (13-19 digits), and IBANs passing mod-97. Dates, amounts, phone numbers,
+  entry is saved: Israeli ID numbers after a personal-ID label (ת"ז, תעודת
+  זהות, identity, Israeli/national ID) that pass the check digit, or bare
+  9-digit numbers that pass it and sit within ~20 characters of such a word;
+  passport/SSN-labelled values; card numbers passing Luhn (13-19 digits); and
+  IBANs passing mod-97. A plain "ID" label is not treated as personal, so claim,
+  policy, order, ticket, and meeting ids, dates, amounts, phone numbers, and
   Slack timestamps, and ticket ids are left alone. Logs carry counts, never
   values. Vault notes written by routines are not redacted.
 
