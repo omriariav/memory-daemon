@@ -11,7 +11,7 @@ from workspace_daemon import (
 )
 
 from test_slack_mcp import (
-    CHAN, LATE, ME, NOW, ROOT, SEARCH, BOB, BridgeTestCase, Connector,
+    CHAN, LATE, ME, NOW, ROOT, BOB, BridgeTestCase, Connector,
     hit_block, routine, search_text, source, thread_text, ts_at,
 )
 
