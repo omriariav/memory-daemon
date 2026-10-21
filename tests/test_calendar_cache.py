@@ -1472,6 +1472,8 @@ class LockGroupTest(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(daemon_cli, "set_log_file"), \
                 mock.patch.object(daemon_cli, "log"), \
+                mock.patch.object(daemon_cli.state.ScheduleStore, "due",
+                                  return_value=True), \
                 mock.patch.object(daemon_cli.runner, "run", side_effect=fake_run):
             self.assertEqual(daemon_cli.cmd_tick(args), 0)
         return set().union(*ran) if ran else set()
