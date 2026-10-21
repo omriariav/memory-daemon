@@ -1335,30 +1335,33 @@ Chat small talk ("hi hi", "sounds good", a lone reaction) should never reach a
 model. Three config-driven guards, all safe by default:
 
 - **`analyze.skip_trivial`** (default `false`; recommended `true` for `slack`,
-  `slack_mcp` and `gchat` routines). Before any model call, a deterministic
-  check removes emoji codes, mentions and `Reactions:` lines; a thread is
-  trivial when what remains is at most `analyze.trivial_max_chars` (default
-  120) characters. It is never trivial when it has a URL, a file or attachment,
-  a `?` in more than 40 characters, two or more authors with more than 80
-  characters, or a decision/commitment/date signal (for example "we go with
-  option B", a time, an amount, an acronym). Trivial threads are ledgered as
+  `slack_mcp` and `gchat` routines). Allowlist based, evaluated before any model
+  call: after removing emoji codes, pictographs, mentions, `Reactions:` lines
+  and punctuation, a thread is trivial only when every remaining word is a
+  known acknowledgement or greeting (English and Hebrew, e.g. thanks, ok, sure,
+  no problem, hi, תודה, סבבה, אין בעיה) and the text is at most
+  `analyze.trivial_max_chars` (default 120). Add your own words with
+  `analyze.trivial_extra_words: [...]`. It is never trivial with a word outside
+  the list, a request form (can you, please, תעביר, בבקשה), a URL, a file or
+  attachment, or a mention of the owner. Trivial threads are ledgered as
   `memory: skipped_trivial` (reason in `trivial_reason`), counted in the run
-  totals as `trivial`, and included in the status `skipped_not_worthy` column.
-  Routines with an `output:` note sink, and operator-confirmed sources, are
-  never skipped.
+  totals as `trivial` (not `processed`), and included in the status
+  `skipped_not_worthy` column. Routines with an `output:` note sink, and
+  operator-confirmed sources, are never skipped.
 - **`memory.extract_model`** (optional, e.g. `sonnet`). Model for the
   structured extraction pass, same provider as `analyze`. Unset keeps
   `analyze.model`. The summary pass is unchanged, so a cheap model can triage
   while a stronger one fills the JSON.
 - **Extraction retry and fallback.** A schema or JSON failure is retried once
   with `Your previous JSON failed: <error>. Return corrected JSON only.`
-  appended. If the retry also fails: when the summary is at most 200
-  characters, or the item is borderline (chat text within `trivial_max_chars`),
-  nothing is stored; the item is ledgered as `memory: skipped_extract_failed`,
-  counted as `extract_failed` in the run totals, and shown as a WARN in the
-  status `issues` column. Otherwise the plain note is still stored, titled
-  with the summary's first sentence (never the raw message text) and tagged
-  `extract-degraded`.
+  appended. If both answers are invalid and the item is a borderline chat item
+  (chat text within `trivial_max_chars`), nothing is stored; it is ledgered as
+  `memory: skipped_extract_failed`, counted as `extract_failed` in the run
+  totals, and listed as an informational line under the status table (it does
+  not mark the routine unhealthy). Any other failure (timeout, transport) and
+  every non-chat source keep the previous behaviour: the plain note is stored,
+  titled with the summary's first sentence (never the raw message text) and
+  tagged `extract-degraded`.
 
 ### Slack via a connector
 

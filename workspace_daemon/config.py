@@ -82,6 +82,7 @@ ANALYZE_KEYS = {
     "provider", "model", "instruction", "instruction_from_connector",
     "instruction_extra", "connector_sweep", "max_output_tokens",
     "focus_domains", "pick_label", "skip_trivial", "trivial_max_chars",
+    "trivial_extra_words",
 }
 OUTPUT_KEYS = {"vault_dir", "slug_prefix", "filename_template", "kind", "tags"}
 SOURCE_KEYS = {
@@ -870,6 +871,14 @@ def validate(routine):
     ):
         problems.append(
             f"{rid}: analyze.trivial_max_chars must be a positive integer"
+        )
+    extra_words = analyze.get("trivial_extra_words")
+    if extra_words is not None and (
+        not isinstance(extra_words, list)
+        or any(not isinstance(w, str) or not w.strip() for w in extra_words)
+    ):
+        problems.append(
+            f"{rid}: analyze.trivial_extra_words must be a list of strings"
         )
     domains = analyze.get("focus_domains")
     if domains is not None and not isinstance(domains, list):

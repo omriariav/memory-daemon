@@ -1,13 +1,29 @@
-"""Deterministic triviality check for chat threads (no model call)."""
+"""Deterministic triviality check for chat threads (no model call).
+
+Allowlist based: a thread is small talk only when every remaining word is a
+known acknowledgement/greeting. Anything else is kept for the model.
+"""
 import re
+import unicodedata
 
 CHAT_KINDS = ("slack", "slack_mcp", "gchat")
 DEFAULT_MAX_CHARS = 120
-# A question this short is conversational ("on the 3rd floor, right?").
-SHORT_QUESTION_CHARS = 40
-# Several people exchanging this much text is a discussion, not an ack.
-MULTI_AUTHOR_CHARS = 80
 
+_WORDS = """
+thanks thank thx ty you ok okay sure cool great nice np lol haha hi hey hello
+morning good sounds yes yep yup no nope problem welcome got it all right
+alright fine perfect awesome appreciate appreciated will do done noted
+bye cheers
+תודה רבה סבבה אחלה מעולה יופי בסדר היי הי בוקר טוב כן לא אוקי אין בעיה
+בכיף שלום ערב לילה אשמח תודה! הבנתי קיבלתי
+"""
+ALLOWLIST = frozenset(_WORDS.split())
+
+# Any request/question form keeps the thread.
+_REQUEST_RE = re.compile(
+    r"(?i)\b(?:can|could|would|will)\s+(?:you|u)\b|\bplease\b|\bpls\b|\bplz\b"
+    r"|תוכל|תוכלי|תעביר|תעבירי|תשלח|תשלחי|בבקשה"
+)
 _MESSAGE_RE = re.compile(r"^\[[^\]\n]*\] ([^:\n]{1,80}): ?(.*)$")
 _REACTIONS_RE = re.compile(r"(?i)\breactions:.*$")
 _EMOJI_RE = re.compile(r":[A-Za-z0-9_+'-]+:")
@@ -16,21 +32,6 @@ _URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 _FILE_RE = re.compile(
     r"(?im)^\s*(?:files?|attachments?|\[(?:file|attachment|image)[^\]]*\])\b"
 )
-# Conservative substance signals: any hit keeps a short message.
-_SUBSTANCE_RE = re.compile(
-    r"(?i)\b(?:decid\w*|decision|agree\w*|approv\w*|reject\w*|option\s+\w+|"
-    r"go(?:ing)?\s+with|we(?:'ll|\s+will|\s+should|\s+need|\s+chose|\s+pick\w*)|"
-    r"let'?s|deadline|launch\w*|ship\w*|deploy\w*|rollout|migrat\w*|budget|"
-    r"priorit\w*|blocker|blocked|assign\w*|owner|todo|action\s+item|"
-    r"commit\w*|promise\w*|cancel\w*|renew\w*|contract|invoice|incident|"
-    r"outage|bug|hire|hiring|offer|salary|raise|promotion|feedback|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|"
-    r"january|february|march|april|june|july|august|september|october|"
-    r"november|december)\b"
-    r"|\b\d{1,2}[:/.-]\d{1,2}\b|\b\d+\s?(?:%|k|m|usd|eur|ils|\$)"
-    r"|[$€£]\s?\d"
-)
-_ACRONYM_RE = re.compile(r"\b(?!OK\b)[A-Z]{2,}\b")
 
 
 def is_chat_kind(kind):
@@ -40,12 +41,10 @@ def is_chat_kind(kind):
 def _clean(text):
     text = _REACTIONS_RE.sub("", text)
     text = _EMOJI_RE.sub("", text)
-    text = _MENTION_RE.sub("", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return _MENTION_RE.sub("", text)
 
 
 def _messages(body):
-    """Split a rendered chat body into (author, raw text) messages."""
     out = []
     for line in (body or "").splitlines():
         match = _MESSAGE_RE.match(line)
@@ -59,42 +58,55 @@ def _messages(body):
 
 
 def human_text(body):
-    """(total cleaned text, {author: cleaned chars}) for a rendered body."""
-    per_author = {}
+    """Cleaned human text of a rendered chat body (emoji/mentions/reactions out)."""
     parts = []
-    for author, raw in _messages(body):
+    for _author, raw in _messages(body):
         cleaned = " ".join(_clean(line) for line in raw.splitlines()).strip()
-        if not cleaned:
-            continue
-        parts.append(cleaned)
-        per_author[author] = per_author.get(author, 0) + len(cleaned)
-    return " ".join(parts), per_author
+        if cleaned:
+            parts.append(cleaned)
+    return " ".join(parts)
+
+
+def _tokens(text):
+    """Lowercased word tokens; punctuation, symbols and pictographs dropped."""
+    kept = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat[0] in "LNM" or ch.isspace() or ch in "'’":
+            kept.append(ch)
+        else:
+            kept.append(" ")
+    return [t.strip("'’") for t in "".join(kept).lower().split() if t.strip("'’")]
 
 
 def is_borderline(item, max_chars=DEFAULT_MAX_CHARS):
     """Short chat text, whatever the substance guards say."""
     if not is_chat_kind(item.get("source_kind")):
         return False
-    text, _ = human_text(item.get("body", ""))
-    return len(text) <= max_chars
+    return len(human_text(item.get("body", ""))) <= max_chars
 
 
-def assess(item, max_chars=DEFAULT_MAX_CHARS):
+def assess(item, max_chars=DEFAULT_MAX_CHARS, extra_words=()):
     """Return (is_trivial, reason) for a chat item; conservative by design."""
     if not is_chat_kind(item.get("source_kind")):
         return False, "not a chat source"
     body = item.get("body", "")
-    text, per_author = human_text(body)
-    if len(text) > max_chars:
-        return False, "long text"
+    evidence = (item.get("frontmatter") or {}).get("slack_owner_evidence") or []
+    if "mentioned" in evidence:
+        return False, "mentions the owner"
     if _URL_RE.search(body):
         return False, "contains a link"
     if _FILE_RE.search(body):
         return False, "contains a file or attachment"
-    if "?" in text and len(text) > SHORT_QUESTION_CHARS:
-        return False, "substantive question"
-    if len(per_author) >= 2 and len(text) > MULTI_AUTHOR_CHARS:
-        return False, "multi-author discussion"
-    if _SUBSTANCE_RE.search(text) or _ACRONYM_RE.search(text):
-        return False, "decision/date/commitment signal"
-    return True, f"{len(text)} chars of small talk"
+    text = human_text(body)
+    if len(text) > max_chars:
+        return False, "long text"
+    if _REQUEST_RE.search(text):
+        return False, "request form"
+    allowed = ALLOWLIST | {
+        w.strip().lower() for w in extra_words or () if isinstance(w, str)
+    }
+    outside = [t for t in _tokens(text) if t not in allowed]
+    if outside:
+        return False, f"non-small-talk word {outside[0]!r}"
+    return True, "small talk only"

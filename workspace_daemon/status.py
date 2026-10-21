@@ -379,8 +379,6 @@ def routine_rows(
         issues = []
         if memory_errors:
             issues.append(f"{memory_errors} memory sink")
-        if extract_failed:
-            issues.append(f"{extract_failed} extract failed (WARN)")
         if expansion_fallbacks:
             issues.append(f"{expansion_fallbacks} source expansion")
         if pending_actions:
@@ -465,6 +463,7 @@ def routine_rows(
                 else str(skipped_not_worthy)
             ),
             "issues": ", ".join(issues) or "-",
+            "extract_failed": extract_failed,
         })
     return rows
 
@@ -620,6 +619,12 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
         for row in rows
     ]
     lines.extend(_table(headers, values))
+    for row in rows:
+        if row.get("extract_failed"):
+            lines.append(
+                f"Info: {row['routine']}: {row['extract_failed']} item(s) "
+                "not stored after extraction failed twice (last 24h)"
+            )
     bridge_text, bridge_problems = bridge_lines(base_dir, now)
     lines.extend(bridge_text)
     lines.extend([

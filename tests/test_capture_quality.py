@@ -13,47 +13,61 @@ def chat(*messages, kind="slack_mcp"):
 
 
 class TrivialityTest(unittest.TestCase):
-    def assertTrivial(self, item):
-        self.assertTrue(triviality.assess(item)[0], item["body"])
+    def assertTrivial(self, item, extra=()):
+        self.assertTrue(triviality.assess(item, extra_words=extra)[0], item["body"])
 
-    def assertSubstantive(self, item):
-        self.assertFalse(triviality.assess(item)[0], item["body"])
+    def assertSubstantive(self, item, extra=()):
+        self.assertFalse(triviality.assess(item, extra_words=extra)[0], item["body"])
 
-    def test_observed_small_talk_is_trivial(self):
+    def test_small_talk_is_trivial(self):
         for text in (
             "hi hi",
-            "you're on the 3rd floor, right?",
             "Sure, no problem :slightly_smiling_face: Reactions: thankyouwave (1)",
-            "Hey! Sounds good I accepted the invite",
-            "ack_button",
-            ":ack_button:",
+            "Hey! Sounds good",
             "<@U123|jane> thanks :wave:",
+            "תודה!",
+            "תודה רבה",
+            "סבבה \U0001F44D",
+            "אין בעיה, בכיף",
+            "Reactions: ack_button (1)",
         ):
             self.assertTrivial(chat(("Jane Doe", text)))
 
-    def test_lone_reaction_line_is_trivial(self):
+    def test_lone_reaction_is_trivial(self):
         self.assertTrivial(chat(("Jane Doe", "Reactions: ack_button (1)")))
+        self.assertTrivial(chat(("Jane Doe", ":ack_button:")))
 
-    def test_substantive_short_messages_are_kept(self):
-        self.assertSubstantive(chat(("Jane Doe", "we go with option B for EU dunning")))
-        self.assertSubstantive(chat(
-            ("Jane Doe", "Can you confirm the renewal pricing for the DACH team before we send it?")))
-        self.assertSubstantive(chat(("Jane Doe", "see https://example.com/doc")))
-        self.assertSubstantive(chat(("Jane Doe", "here you go\nFiles: plan.pdf")))
-        self.assertSubstantive(chat(("Jane Doe", "call moved to 14:30")))
+    def test_anything_outside_allowlist_is_kept(self):
+        for text in (
+            "סגרנו, הולכים על אופציה ב",
+            "תעביר לי את המצגת עד מחר",
+            "can you send me the deck?",
+            "we go with option B for EU dunning",
+            "you're on the 3rd floor, right?",
+            "Hey! Sounds good I accepted the invite",
+            "thanks, please send it",
+            "see https://example.com/doc",
+            "ok\nFiles: plan.pdf",
+            "call moved to 14:30",
+            "Can you confirm the renewal pricing?",
+        ):
+            self.assertSubstantive(chat(("Jane Doe", text)))
 
-    def test_long_or_multi_author_text_is_kept(self):
-        self.assertSubstantive(chat(("Jane Doe", "x " * 80)))
-        self.assertSubstantive(chat(
-            ("Jane Doe", "okay that works for me then, thanks a lot"),
-            ("John Roe", "great, glad we could sort that out today")))
+    def test_owner_mention_is_kept(self):
+        item = chat(("Jane Doe", "<@U999|me> thanks"))
+        item["frontmatter"]["slack_owner_evidence"] = ["mentioned"]
+        self.assertSubstantive(item)
+
+    def test_extra_words(self):
+        item = chat(("Jane Doe", "ack roger"))
+        self.assertSubstantive(item)
+        self.assertTrivial(item, extra=["ack", "Roger"])
+
+    def test_long_text_is_kept(self):
+        self.assertSubstantive(chat(("Jane Doe", "thanks " * 40)))
 
     def test_non_chat_source_never_trivial(self):
         self.assertFalse(triviality.assess(chat(("A", "hi hi"), kind="gmail"))[0])
-
-    def test_max_chars_is_configurable(self):
-        item = chat(("Jane Doe", "Hey! Sounds good I accepted the invite"))
-        self.assertFalse(triviality.assess(item, 10)[0])
 
 
 class TrivialVerdictTest(unittest.TestCase):
@@ -69,6 +83,8 @@ class TrivialVerdictTest(unittest.TestCase):
     def test_on_skips_and_respects_output_sink(self):
         r = self.routine(skip_trivial=True)
         self.assertTrue(runner._trivial_verdict(r, chat(("A", "hi hi"))))
+        r["analyze"]["trivial_extra_words"] = ["zzz"]
+        self.assertTrue(runner._trivial_verdict(r, chat(("A", "hi zzz"))))
         r["output"] = {"vault_dir": "/v"}
         self.assertIsNone(runner._trivial_verdict(r, chat(("A", "hi hi"))))
 
@@ -178,7 +194,7 @@ class DegradedFallbackTest(unittest.TestCase):
         self.routine = {"id": "r", "analyze": {"provider": "claude", "model": "haiku"},
                         "memory": {"store": "/store", "type": "note"}}
 
-    def capture(self, item, summary):
+    def capture(self, item, summary, exc=None):
         added = {}
 
         def fake_cli(store, args, stdin_text=None, timeout=120):
@@ -187,7 +203,8 @@ class DegradedFallbackTest(unittest.TestCase):
 
         identity = {"email": None, "person": None, "safe": False}
         with mock.patch.object(memory_sink, "_extract",
-                               side_effect=ValueError("body must be a non-empty string")), \
+                               side_effect=exc or memory_sink.ExtractionInvalid(
+                                   "body must be a non-empty string")), \
                 mock.patch.object(memory_sink, "_authenticated_identity",
                                   return_value=identity), \
                 mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
@@ -201,17 +218,33 @@ class DegradedFallbackTest(unittest.TestCase):
                 "frontmatter": {},
                 "body": "[t] A: " + "We agreed the EU dunning rollout plan details. " * 6}
 
-    def test_short_summary_is_not_stored(self):
+    def test_short_summary_chat_item_with_long_text_is_stored(self):
         out, added = self.capture(self.long_item(), "Short summary.")
-        self.assertEqual(out["memory"], "skipped_extract_failed")
-        self.assertEqual(out["memory_warn"], 1)
-        self.assertEqual(added, {})
+        self.assertEqual(out["memory"], "created")
 
-    def test_borderline_chat_item_is_not_stored(self):
+    def test_borderline_chat_item_invalid_twice_is_not_stored(self):
         item = self.long_item()
         item["body"] = "[t] A: hi there"
         out, added = self.capture(item, "x" * 400)
         self.assertEqual(out["memory"], "skipped_extract_failed")
+        self.assertEqual(out["memory_warn"], 1)
+        self.assertEqual(added, {})
+
+    def test_transport_failure_on_borderline_chat_is_not_dropped(self):
+        item = self.long_item()
+        item["body"] = "[t] A: hi there"
+        out, added = self.capture(item, "short", exc=RuntimeError("timeout"))
+        self.assertEqual(out["memory"], "created")
+        self.assertIn("extract-degraded",
+                      added["args"][added["args"].index("--tags") + 1])
+
+    def test_gmail_and_mila_short_summary_still_stored(self):
+        for kind in ("gmail", "mila"):
+            for exc in (None, RuntimeError("yoetz timed out")):
+                item = self.long_item()
+                item.update(source_kind=kind, body="short")
+                out, added = self.capture(item, "Short summary.", exc=exc)
+                self.assertEqual(out["memory"], "created", (kind, exc))
 
     def test_long_summary_stored_degraded_with_summary_title(self):
         summary = "Team chose option B for EU dunning. " + "Detail. " * 40

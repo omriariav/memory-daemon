@@ -630,9 +630,6 @@ def _verified_source_people(item, rid, identity, provider=None):
     return verified, unresolved
 
 
-DEGRADED_MIN_SUMMARY_CHARS = 200
-
-
 def _trivial_max_chars(routine):
     value = (routine.get("analyze") or {}).get("trivial_max_chars")
     return value if isinstance(value, int) and value > 0 else (
@@ -692,8 +689,9 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
     extract_model = memory_cfg(routine).get("extract_model")
     if isinstance(extract_model, str) and extract_model.strip():
         kwargs["model"] = extract_model.strip()
+    answer = llm.analyze(routine, prompt, **kwargs)
     try:
-        return _parse_extraction(llm.analyze(routine, prompt, **kwargs))
+        return _parse_extraction(answer)
     except ValueError as exc:  # includes json.JSONDecodeError
         error = str(exc)
     # One retry that shows the model exactly what was wrong.
@@ -701,7 +699,15 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         f"{prompt}\n\nYour previous JSON failed: {error}. "
         "Return corrected JSON only."
     )
-    return _parse_extraction(llm.analyze(routine, retry_prompt, **kwargs))
+    answer = llm.analyze(routine, retry_prompt, **kwargs)
+    try:
+        return _parse_extraction(answer)
+    except ValueError as exc:
+        raise ExtractionInvalid(str(exc)) from exc
+
+
+class ExtractionInvalid(ValueError):
+    """Both extraction attempts answered, but with invalid output."""
 
 
 def _parse_extraction(raw):
@@ -923,15 +929,18 @@ def capture(routine, item, summary, dry_run=False):
             degraded = f"extraction failed, stored as plain note: {exc}"
             log(f"routine={rid} memory WARN {degraded}")
             keep = operator_confirmed or active_chat_followup
-            if not keep and (
-                len(summary.strip()) <= DEGRADED_MIN_SUMMARY_CHARS
-                or triviality.is_borderline(
+            # Only a model that answered badly twice on a short chat item is
+            # dropped; transport/timeout failures keep the old behaviour.
+            if (
+                not keep
+                and isinstance(exc, ExtractionInvalid)
+                and triviality.is_borderline(
                     item, _trivial_max_chars(routine)
                 )
             ):
                 log(
                     f"routine={rid} memory WARN source_id={source_id}: "
-                    "extraction failed twice on a short/borderline item, "
+                    "extraction answered invalidly twice on a short chat item, "
                     "not storing"
                 )
                 return {"memory": "skipped_extract_failed", "memory_warn": 1}

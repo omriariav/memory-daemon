@@ -2320,6 +2320,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             if isinstance(outcome_record, dict) and outcome_record.get("memory_held"):
                 hold_claim(claim)
                 totals["skipped"] += 1
+            elif (
+                isinstance(outcome_record, dict)
+                and outcome_record.get("memory") == "skipped_trivial"
+            ):
+                pass  # counted as totals["trivial"], not as processed
             else:
                 totals["processed"] += 1
         except state.AlreadyRunning:
@@ -2413,7 +2418,10 @@ def _trivial_verdict(routine, item):
     max_chars = cfg.get("trivial_max_chars")
     if type(max_chars) is not int or max_chars < 1:
         max_chars = triviality.DEFAULT_MAX_CHARS
-    trivial, reason = triviality.assess(item, max_chars)
+    extra = cfg.get("trivial_extra_words")
+    trivial, reason = triviality.assess(
+        item, max_chars, extra if isinstance(extra, list) else ()
+    )
     return reason if trivial else None
 
 
