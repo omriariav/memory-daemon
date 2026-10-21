@@ -11,6 +11,8 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py new                        interactive scaffold for a new routine
   daemon.py tui                        live terminal UI: status, pause, run, tick
   daemon.py ctl pause|resume|state     non-interactive kill switch and summary
+  daemon.py backfill-owner-todos --routine ID --entry ENTRY [-n]
+                                       file a stored meeting's owner actions as todos
 """
 import argparse
 import os
@@ -24,7 +26,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, runner, state, status, tui
+from workspace_daemon import config, identity, llm, memory_sink, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -118,6 +120,38 @@ def cmd_ctl(args):
         return 1
     snap = tui.Collector(BASE_DIR, args.label_prefix).snapshot()
     print(tui.summary_line(snap))
+    return 0
+
+
+# --- backfill-owner-todos ---------------------------------------------------
+
+def cmd_backfill_owner_todos(args):
+    set_log_file(LOG_FILE)
+    routines = {r["id"]: r for r in config.discover(BASE_DIR)}
+    routine = routines.get(args.routine)
+    if routine is None:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
+    problems = config.validate(routine)
+    if problems:
+        for p in problems:
+            log(f"invalid routine: {p}")
+        return 1
+    llm.configure(BASE_DIR)
+    identity.configure(BASE_DIR)
+    try:
+        result = memory_sink.backfill_owner_todos(
+            routine, args.entry, dry_run=args.dry_run
+        )
+    except RuntimeError as exc:
+        log(f"error: {exc}")
+        return 1
+    verb = "would file" if args.dry_run else "filed"
+    count = result.get("memory_owner_todos", 0)
+    print(f"{verb} {count} owner todo(s) from {args.entry}")
+    problems = result.get("memory_owner_todos_error", 0)
+    if problems:
+        print(f"{problems} todo(s) failed; see the log", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -595,6 +629,17 @@ def main(argv=None):
     p_ctl.add_argument("--label-prefix", default=default_prefix,
                        help="launchd label prefix for `state` (default: %(default)s)")
     p_ctl.set_defaults(func=cmd_ctl)
+    p_bf = sub.add_parser(
+        "backfill-owner-todos",
+        help="file the owner's action items of an already-captured meeting "
+             "entry as todos (from its stored body)",
+    )
+    p_bf.add_argument("--routine", required=True,
+                      help="capture routine whose memory block to use")
+    p_bf.add_argument("--entry", required=True, help="meeting memory entry id")
+    p_bf.add_argument("-n", "--dry-run", action="store_true",
+                      help="extract and count, but write nothing to the store")
+    p_bf.set_defaults(func=cmd_backfill_owner_todos)
     sub.add_parser("validate", help="check all routine YAML").set_defaults(func=cmd_validate)
     sub.add_parser("new", help="interactive scaffold for a new routine").set_defaults(func=cmd_new)
 

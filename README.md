@@ -1282,6 +1282,73 @@ source:
   `transcript only`); `--count-only` and every listing log
   `mila: app hints: N with hints, M transcript-only, K waiting for hints`.
 
+#### Owner action items as todos (`memory.owner_todos`)
+
+A meeting yields one `meeting` entry, so the owner's action items are only body
+text and never reach the Fibery export, which selects `todo` entries. Opt in on
+a capture routine (Mila, Whisper, transcripts, meeting notes):
+
+```yaml
+memory:
+  owner_todos:
+    enabled: true          # default false
+    max_per_item: 5        # 1-20
+    tag: from-meeting
+    owner_slug: me-example # optional; default is the verified owner slug
+    owner_name: Me Example # required unless the identity provider verifies a name
+    owner_names: [M. Example]   # optional aliases, e.g. a native-script spelling
+```
+
+- Fails closed: without an owner slug and at least one owner name (configured
+  or verified through the identity provider) nothing is asked or filed. Todos
+  are also skipped when the sink denies owner attention (including the
+  no-owner-action marker).
+- The extraction prompt gains one key, `owner_actions: [{text, due?,
+  evidence_ts}]`: only what the owner explicitly committed to, or was
+  explicitly asked to do and accepted. Other people's actions stay in the
+  meeting body; app hints are candidates only. Titles of todos already filed
+  for the meeting are offered so a repeat run reuses them verbatim.
+- Deterministic grounding (live capture): `evidence_ts` is required and must
+  head a `[hh:mm:ss] Speaker: text` line of the transcript; when that line has
+  a real speaker name it must match an owner name. When the owner is mapped to a
+  speaker in the recording (Mila `speakerNames`, or an owner-named line), only
+  the owner's own lines ground an action: any other key, named or a raw
+  `SPEAKER_NN`, fails. If the owner is not mapped at all, a named non-owner
+  fails and an unnamed label passes. Other actions are dropped; logs carry
+  counts only.
+- Each action becomes its own `todo`: title = the action text, people = the
+  owner slug, tags = `tag` + the routine's tags minus source-type noise,
+  body = one line naming the meeting entry id, timestamp and
+  `meeting-owner-action` evidence. Invalid elements are dropped one by one;
+  a non-list value files nothing; the meeting entry is always saved.
+- Id scheme: `<meeting source id>#action-<k>`, `k` = short hash of the
+  redacted, normalized action text (case, punctuation, whitespace ignored), so
+  re-processing updates the same todos. An action a later run no longer
+  returns is never deleted.
+- Todo writes never fail the capture: store trouble is counted
+  (`memory_owner_todos_error`), and the store's near-duplicate guard is
+  respected (`memory_owner_todos_duplicates`, never `--force-new`), so a
+  recurring action can be skipped as a duplicate instead of retrying the meeting.
+- A personal-flagged meeting makes personal-tagged todos; redaction applies.
+- Outbound: add the meeting source's prefix to `from_sources` of the
+  `fibery_tasks_outbound` routine (`mila:` is a default; Whisper ids need
+  `whisper:`). The maintenance run already excludes every configured
+  `memory.personal_tag`, so a non-default personal tag is honored.
+  Do not combine owner todos with `write_mode: apply`: model-extracted actions
+  would reach the inbox with no human check. The default `suggest` mode is the
+  human gate.
+- Backfill an already-captured meeting from its stored body (no transcript or
+  source access):
+
+  ```bash
+  ./daemon.py backfill-owner-todos --routine meeting-transcriptions \
+      --entry <meeting-entry-id> [--dry-run]
+  ```
+
+  The guarantee is weaker than live capture: the stored body is a model
+  summary, so an action is kept only when an owner name shares its sentence or
+  bullet. `--dry-run` calls the model and reports the count but writes nothing.
+
 ### Whisper pipeline transcriptions
 
 `source.kind: whisper` ingests finished transcripts from the local

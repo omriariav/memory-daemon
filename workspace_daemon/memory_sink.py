@@ -36,6 +36,7 @@ import yaml
 
 from . import claude_bridge
 from . import identity as identity_providers
+from . import owner_todos
 from . import personal
 from . import triviality
 from .shell import log, npx_bin
@@ -84,7 +85,7 @@ other text, with exactly these keys:
             below (leave out anyone not listed, and include only people
             materially involved in the memory)
   "tags": array of 1-4 short kebab-case topic tags
-{personal_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
+{personal_schema}{owner_todos_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
           below that this note directly resolves, confirms, or updates —
           usually empty; never invent an id. When the note records the
           resolution or completion of a related entry, list it here and
@@ -187,7 +188,7 @@ def validate(routine):
     unknown = set(cfg) - {
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
         "identity", "personal_tag", "redact_ids", "personal_keywords",
-        "extract_model",
+        "extract_model", "owner_todos",
     }
     if unknown:
         problems.append(
@@ -212,6 +213,7 @@ def validate(routine):
         problems.append(f"{rid}: memory.extract_model must be a non-empty string")
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
+    problems.extend(owner_todos.validate(cfg, rid))
     confirmed = cfg.get("operator_confirmed_source_ids")
     if confirmed is not None and (
         not isinstance(confirmed, list)
@@ -652,7 +654,8 @@ def _summary_title(summary):
     return "untitled"
 
 
-def _extract(routine, item, summary, store, verified_people=(), identity=None):
+def _extract(routine, item, summary, store, verified_people=(), identity=None,
+             owner_names=(), existing_titles=()):
     """Structured second pass over the already-distilled summary."""
     from . import llm  # late import to avoid cycles
 
@@ -682,6 +685,12 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None):
         personal_schema=(
             PERSONAL_SCHEMA
             if personal.personal_tag(personal.memory_cfg(routine)) else ""
+        ),
+        owner_todos_schema=(
+            owner_todos.prompt_section(routine, owner_names, existing_titles)
+            if owner_names and owner_todos.enabled(routine)
+            and owner_todos.is_meeting_item(item)
+            else ""
         ),
         related_entries=related_catalog or "(none)",
         title=item.get("title", ""), date=item.get("date", ""), body=summary,
@@ -724,7 +733,9 @@ def _parse_extraction(raw):
     }
     # `personal` / `personal_reason` are validated (leniently) by capture();
     # a missing or malformed value must never discard the whole extraction.
-    optional = {"personal", "personal_reason"}
+    # `owner_actions` is validated by owner_todos.validate_actions(); a bad
+    # value voids only the todos, never the meeting entry.
+    optional = {"personal", "personal_reason", "owner_actions"}
     if set(data) - optional != expected:
         missing = sorted(expected - set(data))
         unknown = sorted(set(data) - expected - optional)
@@ -959,10 +970,18 @@ def capture(routine, item, summary, dry_run=False):
     )
     if extract:
         try:
+            todo_names, todo_titles = (), ()
+            if owner_todos.enabled(routine) and owner_todos.is_meeting_item(item):
+                todo_names = owner_todos.owner_names(
+                    routine, _verified_owner_name(identity)
+                )
+                if todo_names and source_id:
+                    todo_titles = existing_action_titles(store, source_id)
             entry.update(_extract(
                 routine, item, summary, store,
                 verified_people=verified_source,
                 identity=identity,
+                owner_names=todo_names, existing_titles=todo_titles,
             ))
             extraction_succeeded = True
         except claude_bridge.GUARD_STOPS:
@@ -1225,12 +1244,257 @@ def capture(routine, item, summary, dry_run=False):
         f"source_id={source_id}"
     )
 
-    return {
+    outcome = {
         "memory": verdict,
         "memory_entry_id": entry_id,
         "memory_people": people,
         "memory_source_id": source_id,
     }
+    if (
+        etype == "meeting" and extraction_succeeded and source_id
+        and not owner_attention_denied
+        and owner_todos.enabled(routine) and owner_todos.is_meeting_item(item)
+    ):
+        outcome.update(_file_live_owner_todos(
+            routine, item, entry, source_id, entry_id, identity,
+            bool(ptag) and ptag in tags,
+        ))
+    return outcome
+
+
+def _verified_owner_name(identity):
+    if (identity or {}).get("safe"):
+        return (identity.get("person") or {}).get("name")
+    return None
+
+
+def _owner_slug(routine, identity):
+    slug = owner_todos.cfg(routine).get("owner_slug")
+    if isinstance(slug, str) and slug:
+        return slug
+    person = (identity or {}).get("person") or {}
+    return person.get("slug") if (identity or {}).get("safe") else None
+
+
+def existing_action_titles(store, meeting_source_id):
+    """Titles of todos already filed for this meeting (best effort)."""
+    from .google_tasks_sync import _load_memory_entries
+
+    prefix = f"{meeting_source_id}{owner_todos.ACTION_ID_PREFIX}"
+    try:
+        entries = _load_memory_entries(store)
+    except Exception:
+        return []
+    return [
+        e["title"] for e in entries.values()
+        if any(s.startswith(prefix) for s in e["source_ids"])
+    ]
+
+
+def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
+                           identity, is_personal):
+    """Validate, ground and file owner actions from a live capture.
+
+    Never raises for ordinary failures: the meeting entry is already durable
+    and a raise would make the runner retry the whole paid capture.
+    """
+    rid = routine.get("id")
+    actions, dropped = owner_todos.validate_actions(
+        entry.get("owner_actions"), require_ts=True
+    )
+    if actions is None:
+        log(f"routine={rid} owner-todos: invalid owner_actions, "
+            "no todos filed")
+        return {}
+    names = owner_todos.owner_names(routine, _verified_owner_name(identity))
+    if not actions:
+        log(f"routine={rid} owner-todos: 0 actions valid "
+            f"(dropped {dropped}); earlier todos for this meeting are kept")
+        return {}
+    owner_slug = _owner_slug(routine, identity)
+    if not owner_slug or not names:
+        log(f"routine={rid} owner-todos: owner slug or name unknown (set "
+            "memory.owner_todos.owner_slug and owner_name), "
+            f"{len(actions)} action(s) not filed")
+        return {}
+    grounded = [
+        a for a in actions if owner_todos.grounded_in_transcript(
+            item.get("body", ""), a.get("evidence_ts"), names,
+            (item.get("frontmatter") or {}).get("mila_speaker_names") or ())
+    ]
+    ungrounded = len(actions) - len(grounded)
+    if dropped or ungrounded:
+        log(f"routine={rid} owner-todos: dropped {dropped} invalid and "
+            f"{ungrounded} ungrounded action(s)")
+    if not grounded:
+        return {}
+    return create_owner_todos(
+        routine, meeting_source_id=source_id, meeting_entry_id=entry_id,
+        date=item.get("date", ""), actions=grounded, owner_slug=owner_slug,
+        is_personal=is_personal,
+    )
+
+
+def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
+                       actions, owner_slug, is_personal=False, dry_run=False):
+    """File validated owner actions as todo entries; never raises for store
+    trouble. Returns outcome keys: `memory_owner_todos` (filed count) and, on
+    trouble, `memory_owner_todos_error` / `memory_owner_todos_duplicates`.
+
+    Ids are `<meeting source id>#action-<hash of redacted normalized text>`:
+    stable across re-processing, so the store updates in place. Entries from
+    earlier runs that the model no longer returns are never deleted, and
+    --force-new is never used: the store's near-duplicate guard wins.
+    """
+    cfg = memory_cfg(routine)
+    rid = routine.get("id")
+    store = cfg["store"]
+    ptag = personal.personal_tag(cfg)
+    limit = owner_todos.max_per_item(routine)
+    if len(actions) > limit:
+        log(f"routine={rid} owner-todos: {len(actions)} actions, "
+            f"keeping the first {limit}")
+        actions = actions[:limit]
+    tags = list(dict.fromkeys(owner_todos.todo_tags(
+        routine, cfg.get("tags") or [], ptag, is_personal
+    ) + [AUTO_TAG]))
+    counts = {}
+    for action in actions:
+        text = action["text"]
+        if personal.redact_enabled(cfg):
+            text, _ = personal.redact(text)
+        title = owner_todos.todo_title(text)
+        body = owner_todos.todo_body(meeting_entry_id or "unknown", action)
+        sid = owner_todos.action_source_id(meeting_source_id, text)
+        if dry_run:
+            counts["dry_run"] = counts.get("dry_run", 0) + 1
+            log(f"routine={rid} [dry-run] would file owner todo "
+                f"source_id={sid}")
+            continue
+        args = [
+            "add", "--type", "todo", "--title", title, "--date", date,
+            "--people", owner_slug, "--tags", ",".join(tags),
+            "--source-ids", sid,
+        ]
+        try:
+            r = _cli(store, args, stdin_text=body, timeout=300)
+            out = (r.stdout or "") + (r.stderr or "")
+            _commit_store(store, f"memory: {rid} owner todo")
+        except claude_bridge.GUARD_STOPS:
+            raise
+        except Exception as exc:
+            counts["error"] = counts.get("error", 0) + 1
+            log(f"routine={rid} owner-todos WARN add failed: "
+                f"{type(exc).__name__}")
+            continue
+        m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
+        if r.returncode == 0 and m:
+            verdict = m.group(1)
+        elif _verify_written_entry(store, sid, "todo", title, [owner_slug],
+                                   tags, body):
+            verdict = "verified"
+        elif r.returncode == 2 or "near-duplicate" in out.lower() \
+                or "near duplicate" in out.lower():
+            verdict = "duplicate_skipped"
+        else:
+            verdict = "error"
+            log(f"routine={rid} owner-todos WARN add failed "
+                f"(exit {r.returncode})")
+        counts[verdict] = counts.get(verdict, 0) + 1
+    log(f"routine={rid} owner-todos: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    filed = sum(v for k, v in counts.items()
+                if k not in ("error", "duplicate_skipped"))
+    result = {"memory_owner_todos": filed}
+    if counts.get("error"):
+        result["memory_owner_todos_error"] = counts["error"]
+    if counts.get("duplicate_skipped"):
+        result["memory_owner_todos_duplicates"] = counts["duplicate_skipped"]
+    return result
+
+
+def backfill_owner_todos(routine, entry_id, dry_run=False):
+    """Re-run owner-action extraction over a stored meeting entry body.
+
+    Works from the entry body (which already lists the meeting's action
+    items), so no recording transcript or source access is needed. The
+    grounding is weaker than a live capture: an owner name must share a
+    sentence or bullet with the action in the stored (summarized) body.
+    Creates the same stable-id todos a live capture would. Returns the outcome
+    dict of create_owner_todos (with `dry_run`, `memory_owner_todos` counts
+    the actions found).
+    """
+    from . import llm  # late import to avoid cycles
+    from .google_tasks_sync import _load_memory_entries
+
+    cfg = memory_cfg(routine)
+    if not cfg:
+        raise RuntimeError("routine has no memory block")
+    if not owner_todos.cfg(routine):
+        raise RuntimeError("routine has no memory.owner_todos block")
+    rid = routine.get("id")
+    entry = _load_memory_entries(cfg["store"]).get(entry_id)
+    if entry is None:
+        raise RuntimeError(f"memory entry {entry_id!r} not found")
+    if entry["type"] != "meeting":
+        raise RuntimeError(f"memory entry {entry_id!r} is not a meeting")
+    meeting_sids = [
+        value for value in entry["source_ids"]
+        if owner_todos.ACTION_ID_PREFIX not in value
+    ]
+    if not meeting_sids:
+        raise RuntimeError(f"memory entry {entry_id!r} has no source id")
+    block = owner_todos.cfg(routine)
+    identity = (
+        {"safe": False}
+        if block.get("owner_slug") and owner_todos.owner_names(routine)
+        else _authenticated_identity(
+            rid, identity_providers.provider_for(routine)
+        )
+    )
+    owner_slug = _owner_slug(routine, identity)
+    names = owner_todos.owner_names(routine, _verified_owner_name(identity))
+    if not owner_slug or not names:
+        raise RuntimeError(
+            "owner unknown: set memory.owner_todos.owner_slug and owner_name"
+        )
+    prompt = owner_todos.BACKFILL_PROMPT.format(
+        section=owner_todos.prompt_section(
+            routine, names,
+            existing_action_titles(cfg["store"], meeting_sids[0]),
+            require_ts=False,
+        ),
+        title=entry["title"], date=entry["date"], body=entry["body"],
+    )
+    kwargs = {}
+    model = cfg.get("extract_model")
+    if isinstance(model, str) and model.strip():
+        kwargs["model"] = model.strip()
+    answer = llm.analyze(routine, prompt, **kwargs)
+    try:
+        raw = re.sub(r"^```(json)?|```$", "", answer.strip(), flags=re.M)
+        data = json.loads(raw.strip())
+        actions, dropped = owner_todos.validate_actions(
+            data.get("owner_actions") if isinstance(data, dict) else None
+        )
+    except ValueError:
+        actions = None
+    if actions is None:
+        raise RuntimeError("model returned invalid owner_actions; nothing filed")
+    grounded = [
+        a for a in actions
+        if owner_todos.grounded_in_body(entry["body"], a["text"], names)
+    ]
+    log(f"routine={rid} owner-todos backfill: {len(actions)} valid, "
+        f"{len(actions) - len(grounded)} ungrounded in the entry body, "
+        f"{dropped} invalid dropped")
+    ptag = personal.personal_tag(cfg)
+    return create_owner_todos(
+        routine, meeting_source_id=meeting_sids[0],
+        meeting_entry_id=entry_id, date=entry["date"], actions=grounded,
+        owner_slug=owner_slug, dry_run=dry_run,
+        is_personal=bool(ptag) and ptag in entry["tags"],
+    )
 
 
 def resolve_followup(routine, memory_entry_id, thread_id, title,
