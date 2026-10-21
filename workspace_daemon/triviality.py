@@ -11,10 +11,10 @@ DEFAULT_MAX_CHARS = 120
 
 _WORDS = """
 thanks thank thx ty you ok okay sure cool great nice np lol haha hi hey hello
-morning good sounds yes yep yup no nope problem welcome got it all right
-alright fine perfect awesome appreciate appreciated will do done noted
-bye cheers
-תודה רבה סבבה אחלה מעולה יופי בסדר היי הי בוקר טוב כן לא אוקי אין בעיה
+morning good sounds yes yep yup problem welcome got it all right
+alright fine perfect awesome appreciate appreciated
+bye cheers worries
+תודה רבה סבבה אחלה מעולה יופי בסדר היי הי בוקר טוב כן אוקי בעיה
 בכיף שלום ערב לילה אשמח תודה! הבנתי קיבלתי
 """
 ALLOWLIST = frozenset(_WORDS.split())
@@ -76,7 +76,20 @@ def _tokens(text):
             kept.append(ch)
         else:
             kept.append(" ")
-    return [t.strip("'’") for t in "".join(kept).lower().split() if t.strip("'’")]
+    words = [t.strip("'’") for t in "".join(kept).lower().split() if t.strip("'’")]
+    # "no"/"לא" alone can answer a question or decline; only the set phrases
+    # "no problem/worries" and "אין בעיה" count as small talk. A commitment
+    # such as "will do" or "done" is never small talk.
+    out = []
+    for i, word in enumerate(words):
+        nxt = words[i + 1] if i + 1 < len(words) else ""
+        if word == "no" and nxt in ("problem", "worries"):
+            out.append("np")
+        elif word == "אין" and nxt == "בעיה":
+            out.append("np")
+        else:
+            out.append(word)
+    return out
 
 
 def is_borderline(item, max_chars=DEFAULT_MAX_CHARS):

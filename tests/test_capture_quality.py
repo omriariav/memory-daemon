@@ -13,6 +13,16 @@ def chat(*messages, kind="slack_mcp"):
 
 
 class TrivialityTest(unittest.TestCase):
+    def test_commitments_and_bare_answers_are_kept(self):
+        for text in ("will do", "done", "no", "לא", "noted"):
+            with self.subTest(text=text):
+                self.assertFalse(triviality.assess(chat(("Bob", text)))[0])
+
+    def test_set_phrases_stay_small_talk(self):
+        for text in ("no problem", "no worries!", "אין בעיה"):
+            with self.subTest(text=text):
+                self.assertTrue(triviality.assess(chat(("Bob", text)))[0])
+
     def assertTrivial(self, item, extra=()):
         self.assertTrue(triviality.assess(item, extra_words=extra)[0], item["body"])
 
