@@ -11,6 +11,11 @@ Candidate identity has two layers:
   transcript or changed matching metadata is reconsidered;
 * memory source id: ``mila:<recording-uuid>`` — corrections update the same
   memory instead of creating duplicates.
+
+Optional ``app_summary`` (mode ``hints``): the recording app's own action items
+and summary are appended to the transcript as clearly delimited, unverified
+hints.  The transcript stays the analysis input; hints never change the
+candidate id, so a summary that shows up after capture does not reprocess.
 """
 import datetime
 import difflib
@@ -209,12 +214,203 @@ def _transcript(record, directory, manual=None):
     )
 
 
-def _candidate(record, directory, manual=None, zone=None):
+APP_SUMMARY_MODES = ("off", "hints")
+APP_SUMMARY_KEYS = {
+    "mode", "wait_minutes", "min_chars", "min_overlap", "item_min_overlap",
+}
+APP_SUMMARY_DEFAULTS = {
+    "mode": "off", "wait_minutes": 45, "min_chars": 200,
+    "min_overlap": 0.3, "item_min_overlap": 0.25,
+}
+ACTION_WINDOW_SECONDS = 180
+_HEBREW_PREFIXES = "שהובכלמ"
+HINT_SUMMARY_CHARS = 1500
+MAX_ACTION_ITEMS = 50
+MAX_ACTION_ITEM_CHARS = 400
+HINTS_HEADING = "Unverified hints from the recording app (may be wrong)"
+
+
+def app_summary_settings(source):
+    """Effective ``source.app_summary`` settings with defaults applied."""
+    cfg = source.get("app_summary") or {}
+    merged = dict(APP_SUMMARY_DEFAULTS)
+    merged.update({k: v for k, v in cfg.items() if k in APP_SUMMARY_KEYS})
+    return merged
+
+
+def _action_items(record):
+    items = []
+    raw = record.get("actionItems")
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        text = " ".join(str(entry.get("text") or "").split())
+        if not text:
+            continue
+        try:
+            seconds = float(entry.get("timestampSeconds"))
+            seconds = seconds if seconds >= 0 else None
+        except (TypeError, ValueError):
+            seconds = None
+        items.append({"text": text, "seconds": seconds})
+    return items[:MAX_ACTION_ITEMS]
+
+
+def _hints_present(record, app):
+    """Whether the app has produced anything yet (decides waiting only)."""
+    summary = str(record.get("summary") or "").strip()
+    return len(summary) >= int(app["min_chars"]) or bool(_action_items(record))
+
+
+_LETTER_RUN = re.compile(r"[^\W\d_]{3,}")
+
+
+def _tokens(text):
+    """Lowercase letter runs of 3+ chars (any script)."""
+    return set(_LETTER_RUN.findall(str(text).casefold()))
+
+
+def _forms(tokens):
+    """Tokens plus the variant without one leading Hebrew prefix letter."""
+    forms = set(tokens)
+    for token in tokens:
+        if len(token) > 3 and token[0] in _HEBREW_PREFIXES:
+            forms.add(token[1:])
+    return forms
+
+
+def _overlap(hint_tokens, vocabulary):
+    """Share of the hint's tokens that occur in the (prefix-aware) vocabulary."""
+    if not hint_tokens:
+        return 0.0
+    hit = sum(
+        1 for token in hint_tokens
+        if token in vocabulary
+        or (len(token) > 3 and token[0] in _HEBREW_PREFIXES
+            and token[1:] in vocabulary)
+    )
+    return hit / len(hint_tokens)
+
+
+def _gate_hints(record, app, transcript):
+    """Deterministic local sanity gate (no model call); hints or None.
+
+    The app's summarizer can emit unrelated text (an assistant's meta-reply),
+    so a summary is kept only if at least ``min_overlap`` of its words occur in
+    the transcript.  An action item is kept only if at least
+    ``item_min_overlap`` of its words occur in the transcript window within
+    ``ACTION_WINDOW_SECONDS`` of its timestamp (the whole transcript when it
+    has no timestamp or the window is empty).  Logs counts and ratios only.
+    A rejection never restarts the wait window.
+    """
+    whole = _forms(_tokens(transcript))
+    summary = str(record.get("summary") or "").strip()
+    if len(summary) < int(app["min_chars"]):
+        summary = ""
+    if summary:
+        ratio = _overlap(_tokens(summary), whole)
+        if ratio < float(app["min_overlap"]):
+            log(f"mila hints: summary rejected (overlap {ratio:.2f})")
+            summary = ""
+    segments = [
+        (float(seg.get("start") or 0), _forms(_tokens(seg.get("text") or "")))
+        for seg in record.get("segments") or [] if isinstance(seg, dict)
+    ]
+    actions, dropped = [], 0
+    for action in _action_items(record):
+        vocabulary = whole
+        if action["seconds"] is not None:
+            window = set()
+            for start, forms in segments:
+                if abs(start - action["seconds"]) <= ACTION_WINDOW_SECONDS:
+                    window |= forms
+            vocabulary = window or whole
+        if _overlap(_tokens(action["text"]), vocabulary) >= float(
+            app["item_min_overlap"]
+        ):
+            actions.append(action)
+        else:
+            dropped += 1
+    if dropped:
+        log(f"mila hints: {dropped} action item(s) dropped "
+            "(no transcript support)")
+    if not summary and not actions:
+        return None
+    return {"summary": summary, "actions": actions}
+
+
+def completion_time(record, end):
+    """Best available moment the recording finished (start of the wait window).
+
+    ``completedAt`` when the app records one; otherwise the computed recording
+    end, or the filename capture stamp when that is later (an imported file's
+    stamp is the import instant, when the app began summarizing it).
+    """
+    explicit = record.get("completedAt")
+    if explicit:
+        try:
+            return _parse_instant(explicit)
+        except RuntimeError:
+            pass
+    best = end
+    stamp = _CAPTURE_STAMP.search(str(record.get("audioFileName") or ""))
+    if stamp and str(record.get("source") or "") != "voiceMemo":
+        captured = datetime.datetime.strptime(
+            stamp.group("stamp"), "%Y-%m-%dT%H-%M-%SZ"
+        ).replace(tzinfo=datetime.timezone.utc)
+        best = max(best, captured)
+    return best
+
+
+def _waiting_for_hints(record, end, app):
+    deadline = completion_time(record, end) + datetime.timedelta(
+        minutes=float(app["wait_minutes"])
+    )
+    return _now() < deadline
+
+
+def _mmss(seconds):
+    total = max(0, int(seconds))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _hints_section(hints):
+    lines = [f"--- {HINTS_HEADING} ---"]
+    if hints["actions"]:
+        lines.append("Action items:")
+        for action in hints["actions"]:
+            stamp = (
+                f"[{_mmss(action['seconds'])}] "
+                if action["seconds"] is not None else ""
+            )
+            lines.append(f"- {stamp}{action['text'][:MAX_ACTION_ITEM_CHARS]}")
+    if hints["summary"]:
+        lines.append("Summary:")
+        lines.append(hints["summary"][:HINT_SUMMARY_CHARS])
+    lines.append("--- end of unverified hints ---")
+    return "\n".join(lines)
+
+
+def _candidate(record, directory, manual=None, zone=None, app=None,
+               wait=False):
+    """Build a candidate, or None while holding for app hints to appear."""
+    app = app or APP_SUMMARY_DEFAULTS
+    hints = None
+    if (
+        app["mode"] == "hints" and wait
+        and not _hints_present(record, app)
+        and _waiting_for_hints(
+            record, _recording_interval(record, zone)[1], app
+        )
+    ):
+        return None
     body, transcript_path = _transcript(record, directory, manual)
     if not body.strip():
         raise RuntimeError(
             f"completed Mila recording {record.get('id')} has an empty transcript"
         )
+    if app["mode"] == "hints":
+        hints = _gate_hints(record, app, body)
     recording_id = str(record["id"])
     source_id = f"mila:{recording_id}"
     start, end = _recording_interval(record, zone)
@@ -245,6 +441,7 @@ def _candidate(record, directory, manual=None, zone=None):
         "raw": {
             "source_id": source_id,
             "recording": record,
+            "hints": hints,
             "transcript": body,
             "transcript_path": transcript_path,
             "content_hash": digest,
@@ -263,6 +460,8 @@ def candidates(source):
     """List manual recordings first, then completed indexed Mila recordings."""
     found = {}
     zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
+    app = app_summary_settings(source)
+    waiting = 0
     for manual in source.get("manual_recordings") or []:
         metadata_file = manual.get("recordings_file") or source["recordings_file"]
         record = _record_by_id(metadata_file, manual["recording_id"])
@@ -270,8 +469,9 @@ def candidates(source):
             raise RuntimeError(
                 f"manual Mila recording {manual['recording_id']} is not completed"
             )
+        # An explicit backfill never waits for hints.
         candidate = _candidate(
-            record, Path(metadata_file).parent, manual, zone=zone
+            record, Path(metadata_file).parent, manual, zone=zone, app=app
         )
         found[candidate["raw"]["source_id"]] = candidate
 
@@ -289,9 +489,13 @@ def candidates(source):
         if source_id in found:
             continue
         try:
-            found[source_id] = _candidate(
-                record, metadata_file.parent, zone=zone
+            built = _candidate(
+                record, metadata_file.parent, zone=zone, app=app, wait=True
             )
+            if built is None:
+                waiting += 1  # not a candidate: nothing ledgered, retried
+                continue
+            found[source_id] = built
         except Exception as exc:
             # Keep one item-level failure visible without making a single
             # malformed sidecar prevent every other recording from running.
@@ -328,7 +532,15 @@ def candidates(source):
         reverse=True,
     ), zone)
     limit = int(source.get("max_results", 0))
-    return ordered[:limit] if limit else ordered
+    ordered = ordered[:limit] if limit else ordered
+    if app["mode"] == "hints":
+        with_hints = sum(1 for c in ordered if c["raw"].get("hints"))
+        log(
+            f"mila: app hints: {with_hints} with hints, "
+            f"{len(ordered) - with_hints} transcript-only, "
+            f"{waiting} waiting for hints"
+        )
+    return ordered
 
 
 # --- per-run state -----------------------------------------------------------
@@ -833,6 +1045,15 @@ def fetch(_routine, source, candidate):
     events = _calendar_candidates(source, record, start, end)
     timezone = source.get("calendar_timezone", "UTC")
     local_date = start.astimezone(ZoneInfo(timezone)).date().isoformat()
+    body = _bounded(
+        redact_secrets(raw["transcript"]),
+        source.get("max_transcript_chars", DEFAULT_MAX_TRANSCRIPT_CHARS),
+    )
+    hints = raw.get("hints")
+    if hints:
+        # Untrusted like the transcript: redacted here, never logged, and read
+        # only by sessions without write tools.
+        body += "\n\n" + redact_secrets(_hints_section(hints))
     return {
         "id": candidate["id"],
         "source_id": raw["source_id"],
@@ -842,10 +1063,7 @@ def fetch(_routine, source, candidate):
         # Transcripts can contain dictated credentials or pasted tokens. Keep
         # Mila's source files untouched, but redact before either the Calendar
         # matcher or the summarizer receives the text.
-        "body": _bounded(
-            redact_secrets(raw["transcript"]),
-            source.get("max_transcript_chars", DEFAULT_MAX_TRANSCRIPT_CHARS),
-        ),
+        "body": body,
         "_mila_calendar_candidates": events,
         "frontmatter": {
             "mila_recording_id": str(record["id"]),
@@ -854,6 +1072,7 @@ def fetch(_routine, source, candidate):
             "mila_recording_end": raw["recording_end"],
             "mila_duration_seconds": float(record.get("duration") or 0),
             "mila_content_hash": raw["content_hash"],
+            "mila_app_hints": bool(hints),
             "calendar_candidate_count": len(events),
         },
     }
@@ -1172,7 +1391,9 @@ def match_calendar(routine, source, item):
 
 
 def dry_run_description(item):
+    hinted = (item.get("frontmatter") or {}).get("mila_app_hints")
     return (
+        f"input: transcript{' + app hints' if hinted else ' only'}; "
         f"would match against "
         f"{len(item.get('_mila_calendar_candidates') or [])} Calendar candidate(s); "
         "only a high-confidence match would be sent for memory analysis"

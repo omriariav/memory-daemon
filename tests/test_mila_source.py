@@ -1906,3 +1906,281 @@ class FollowUpTest(unittest.TestCase):
                                     now, [])
             self.assertFalse(stale.exists())
             self.assertTrue(fresh.exists())
+
+
+SEGMENTS = [
+    {"start": 0, "end": 5,
+     "text": "We agreed the plan to send the draft and book a room."},
+    {"start": 120, "end": 130, "text": "Send the draft tomorrow."},
+    {"start": 3725, "end": 3730, "text": "Book a room for the offsite."},
+]
+LONG_SUMMARY = "**Overview**\n- " + ("Agreed plan send draft book room. " * 12)
+META_REPLY = (
+    "I need your permission to use a tool before I can summarize this. "
+    "Please approve the request so that I can continue with the work. " * 2
+)
+HEBREW_SEGMENTS = [
+    {"start": 0, "end": 5, "text": "בפגישה סיכמנו להעביר את התקציב לצוות"},
+]
+
+
+def at(minutes_after):
+    base = datetime.datetime(2026, 7, 27, 19, 35, 32,
+                             tzinfo=datetime.timezone.utc)
+    return base + datetime.timedelta(minutes=minutes_after)
+
+
+class AppHintsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "recordings.json"
+        self.source = {
+            "kind": "mila", "recordings_file": str(self.path),
+            "max_results": 0, "app_summary": {"mode": "hints"},
+        }
+
+    def write(self, **extra):
+        rec = record("R1", segments=SEGMENTS)
+        rec.update(extra)
+        self.path.write_text(json.dumps([rec]))
+
+    def candidates(self, now_minutes=0, source=None):
+        with mock.patch.object(mila_source, "_now",
+                               return_value=at(now_minutes)):
+            return mila_source.candidates(source or self.source)
+
+    def fetch(self, candidate):
+        with mock.patch.object(mila_source, "_calendar_candidates",
+                               return_value=[]):
+            return mila_source.fetch({}, self.source, candidate)
+
+    ACTIONS = [
+        {"addedAt": "x", "id": "a", "source": "ai", "text": "Send the draft",
+         "timestampSeconds": 125},
+        {"addedAt": "x", "id": "b", "source": "ai", "text": "Book a room",
+         "timestampSeconds": 3725.4},
+    ]
+
+    def test_hints_are_delimited_and_transcript_stays_primary(self):
+        self.write(summary=LONG_SUMMARY, actionItems=self.ACTIONS)
+        (cand,) = self.candidates()
+        fetched = self.fetch(cand)
+        body = fetched["body"]
+        head, _, hints = body.partition(f"--- {mila_source.HINTS_HEADING} ---")
+        self.assertIn("We agreed the plan to send", head)
+        self.assertIn("- [02:05] Send the draft", hints)
+        self.assertIn("- [62:05] Book a room", hints)
+        self.assertIn("**Overview**", hints)
+        self.assertTrue(body.rstrip().endswith("--- end of unverified hints ---"))
+        self.assertTrue(fetched["frontmatter"]["mila_app_hints"])
+
+    def test_summary_is_truncated_and_short_summary_dropped(self):
+        self.write(summary="agreed plan " * 500)
+        body = self.fetch(self.candidates()[0])["body"]
+        hints = body.partition(f"--- {mila_source.HINTS_HEADING} ---")[2]
+        self.assertLess(len(hints), mila_source.HINT_SUMMARY_CHARS + 200)
+        self.write(summary="too short", actionItems=[])
+        (cand,) = self.candidates(now_minutes=46)
+        self.assertNotIn(mila_source.HINTS_HEADING, self.fetch(cand)["body"])
+
+    def test_mode_off_by_default_and_never_waits(self):
+        self.write(summary=LONG_SUMMARY)
+        source = dict(self.source)
+        del source["app_summary"]
+        (cand,) = self.candidates(source=source)
+        self.assertNotIn(mila_source.HINTS_HEADING, self.fetch(cand)["body"])
+        self.write()
+        self.assertEqual(len(self.candidates(source=source)), 1)
+
+    def test_waits_then_falls_back_to_transcript_only(self):
+        self.write()
+        self.assertEqual(self.candidates(now_minutes=44.9), [])
+        (cand,) = self.candidates(now_minutes=45)
+        fetched = self.fetch(cand)
+        self.assertNotIn(mila_source.HINTS_HEADING, fetched["body"])
+        self.assertIn("We agreed the plan to send", fetched["body"])
+        self.assertFalse(fetched["frontmatter"]["mila_app_hints"])
+
+    def test_summary_appearing_inside_window_is_used(self):
+        self.write()
+        self.assertEqual(self.candidates(now_minutes=10), [])
+        self.write(actionItems=self.ACTIONS)
+        (cand,) = self.candidates(now_minutes=20)
+        self.assertIn("Send the draft", self.fetch(cand)["body"])
+
+    def test_wait_minutes_zero_never_waits(self):
+        self.write()
+        source = dict(self.source, app_summary={"mode": "hints",
+                                                "wait_minutes": 0})
+        self.assertEqual(len(self.candidates(source=source)), 1)
+
+    def test_completed_at_is_the_best_timestamp(self):
+        self.write(completedAt="2026-07-27T21:00:00Z")
+        self.assertEqual(self.candidates(now_minutes=60), [])
+        self.assertEqual(len(self.candidates(now_minutes=150)), 1)
+
+    def test_candidate_id_is_unchanged_when_hints_appear_later(self):
+        self.write()
+        (before,) = self.candidates(now_minutes=60)
+        self.write(summary=LONG_SUMMARY, actionItems=self.ACTIONS)
+        (after,) = self.candidates(now_minutes=120)
+        self.assertEqual(before["id"], after["id"])
+        off = dict(self.source)
+        del off["app_summary"]
+        self.assertEqual(before["id"], self.candidates(source=off)[0]["id"])
+
+    def test_waiting_item_is_not_a_candidate_and_counts_are_logged(self):
+        self.write()
+        logs = []
+        with mock.patch.object(mila_source, "log", side_effect=logs.append):
+            self.candidates(now_minutes=5)
+        self.assertTrue(any("0 with hints, 0 transcript-only, 1 waiting" in m
+                            for m in logs))
+
+    def test_hint_secrets_are_redacted(self):
+        token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        self.write(actionItems=[{"text": f"Send {token}",
+                                 "timestampSeconds": 1}])
+        body = self.fetch(self.candidates()[0])["body"]
+        self.assertIn("- [00:01] Send", body)
+        self.assertNotIn(token, body)
+
+    def test_personal_redaction_applies_to_hint_text_at_capture(self):
+        from tests.test_personal import FakeResult, make_il_id
+        valid = make_il_id()
+        self.write(summary=LONG_SUMMARY + f" ת.ז. {valid}")
+        item = self.fetch(self.candidates()[0])
+        self.assertIn(valid, item["body"])
+        memory_sink._slug_cache.clear()
+        memory_sink._slug_cache["/store"] = set()
+        calls = {}
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls["stdin"] = stdin_text
+            return FakeResult("✓ created e1\n")
+
+        r = {"id": "r", "memory": {"store": "/store", "extract": False}}
+        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+             mock.patch.object(memory_sink, "_authenticated_identity",
+                               return_value={"email": None, "person": None,
+                                             "safe": False}), \
+             mock.patch.object(memory_sink, "_commit_store"):
+            memory_sink.capture(r, item, f"Summary ת.ז. {valid}")
+        self.assertNotIn(valid, calls["stdin"])
+
+    def test_prompt_carries_hint_instructions_only_with_hints(self):
+        routine_cfg = {"analyze": {"instruction": "x", "provider": "p",
+                                   "model": "m"}}
+        self.write(summary=LONG_SUMMARY)
+        item = self.fetch(self.candidates()[0])
+        item["source_kind"] = "mila"
+        prompt = llm.build_prompt(routine_cfg, item, [])
+        self.assertIn("ONLY if the transcript supports it", prompt)
+        self.assertIn("never from the hint's wording", prompt)
+        self.write()
+        item = self.fetch(self.candidates(now_minutes=60)[0])
+        item["source_kind"] = "mila"
+        self.assertNotIn(
+            "Recording-app hints", llm.build_prompt(routine_cfg, item, []))
+
+    def test_dry_run_description_and_count_only_split(self):
+        from workspace_daemon import count_only
+        self.write(summary=LONG_SUMMARY)
+        item = self.fetch(self.candidates()[0])
+        item["_mila_calendar_candidates"] = []
+        self.assertIn("transcript + app hints",
+                      mila_source.dry_run_description(item))
+        logs = []
+        claims = {"r": [{"source": self.source, "candidate": c}
+                        for c in self.candidates()]}
+        ledger = state.Store(Path(self.tmp.name), dry_run=True)
+        with mock.patch.object(count_only, "log", side_effect=logs.append):
+            count_only.report(
+                claims, ledger, self.tmp.name,
+                {"matched": 0, "processed": 0, "skipped": 0})
+        self.assertTrue(any("1 with hints, 0 transcript-only" in m
+                            for m in logs))
+
+    def test_config_validation(self):
+        def problems(app):
+            return config.validate(routine("/tmp/store", {
+                "kind": "mila", "recordings_file": "/tmp/r.json",
+                "app_summary": app}))
+        self.assertEqual(problems({"mode": "hints", "wait_minutes": 45,
+                                   "min_chars": 200}), [])
+        self.assertTrue(problems({"mode": "replace"}))
+        self.assertTrue(problems({"mode": "hints", "wait_minutes": -1}))
+        self.assertTrue(problems({"mode": "hints", "x": 1}))
+
+    def hints_body(self, now_minutes=60):
+        cands = self.candidates(now_minutes=now_minutes)
+        self.assertEqual(len(cands), 1)
+        return self.fetch(cands[0])["body"]
+
+    def test_meta_reply_summary_is_rejected_without_waiting_again(self):
+        self.write(summary=META_REPLY)
+        logs = []
+        with mock.patch.object(mila_source, "log", side_effect=logs.append):
+            # Present (long enough), so no wait; rejected, so transcript-only.
+            body = self.hints_body(now_minutes=0)
+        self.assertNotIn(mila_source.HINTS_HEADING, body)
+        self.assertTrue(any("summary rejected (overlap" in m for m in logs))
+        self.assertFalse(any("permission" in m for m in logs))
+
+    def test_genuine_summary_is_accepted(self):
+        self.write(summary=LONG_SUMMARY)
+        self.assertIn("Summary:", self.hints_body(now_minutes=0))
+
+    def test_overlap_threshold_is_configurable(self):
+        self.write(summary=LONG_SUMMARY)
+        self.source["app_summary"] = {"mode": "hints",
+                                      "min_overlap": 1.0}
+        self.assertNotIn("Summary:", self.hints_body(now_minutes=60))
+
+    def test_hebrew_prefixes_count_as_support(self):
+        rec = record("R1", segments=HEBREW_SEGMENTS)
+        rec["summary"] = "סיכום הפגישה: התקציב הועבר לצוות " * 10
+        self.path.write_text(json.dumps([rec]))
+        self.assertIn("Summary:", self.hints_body(now_minutes=0))
+
+    def test_unsupported_action_item_is_dropped(self):
+        self.write(actionItems=[
+            {"text": "Send the draft", "timestampSeconds": 125},
+            {"text": "Send the draft", "timestampSeconds": 3000},
+            {"text": "Refactor billing pipeline soon", "timestampSeconds": 125},
+            {"text": "Offsite", "timestampSeconds": 125},
+            {"text": "Book a room"},
+            {"text": "Unrelated gardening errand"},
+        ])
+        logs = []
+        with mock.patch.object(mila_source, "log", side_effect=logs.append):
+            body = self.hints_body(now_minutes=0)
+        hints = body.partition(f"--- {mila_source.HINTS_HEADING} ---")[2]
+        self.assertIn("- [02:05] Send the draft", hints)
+        self.assertIn("[50:00]", hints)   # empty window: whole transcript
+        self.assertNotIn("Offsite", hints)  # window non-empty, no support
+        self.assertNotIn("billing", hints)
+        self.assertIn("- Book a room", hints)
+        self.assertNotIn("gardening", hints)
+        self.assertTrue(any("3 action item(s) dropped" in m for m in logs))
+
+    def test_all_hints_rejected_yields_transcript_only(self):
+        self.write(summary=META_REPLY,
+                   actionItems=[{"text": "Unrelated gardening errand"}])
+        body = self.hints_body(now_minutes=0)
+        self.assertNotIn(mila_source.HINTS_HEADING, body)
+
+    def test_item_threshold_boundary_and_config_keys(self):
+        self.write(actionItems=[{"text": "send zzzzz qqqqq wwwww",
+                                 "timestampSeconds": 125}])
+        # 1 of 4 tokens supported = 0.25, exactly at the default threshold.
+        self.assertIn("zzzzz", self.hints_body(now_minutes=0))
+        self.source["app_summary"] = {"mode": "hints",
+                                      "item_min_overlap": 0.26}
+        self.assertNotIn(mila_source.HINTS_HEADING,
+                         self.hints_body(now_minutes=60))
+        bad = config.validate(routine("/tmp/store", {
+            "kind": "mila", "recordings_file": "/tmp/r.json",
+            "app_summary": {"mode": "hints", "min_overlap": 2}}))
+        self.assertTrue(bad)

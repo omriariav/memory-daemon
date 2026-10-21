@@ -37,7 +37,10 @@ timestamps. Calendar matching is mandatory at runtime and only a
 high-confidence match may proceed to memory. Outcome receipts belong under the
 daemon's `state/transcriptions/`, never inside Mila's directory. Inconclusive
 matches retry on the routine cadence and a later success resolves older failed
-versions by stable recording source id.
+versions by stable recording source id. Optional
+`app_summary: {mode: off|hints, wait_minutes, min_chars, min_overlap, item_min_overlap}`
+appends the recording app's action items and summary to the transcript as
+unverified, locally sanity-checked hints; the transcript stays the input.
 
 For `source.kind: whisper`, point `transcriptions_dir` at the
 speech-to-text-tools output directory (read-only). Enumeration is

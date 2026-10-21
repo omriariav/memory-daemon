@@ -46,6 +46,17 @@ source:
     calendar_id: primary
     owner_email: me@example.com
 
+  # Recording-app hints: the app's action items and summary are appended to the
+  # transcript as an unverified hints block (the transcript stays the input).
+  # Hints failing a local transcript-overlap check are dropped. A recording with
+  # no hints yet is held up to wait_minutes, then processed transcript-only.
+  app_summary:
+    mode: hints            # off (default) | hints
+    wait_minutes: 45
+    min_chars: 200
+    min_overlap: 0.3
+    item_min_overlap: 0.25
+
   # On-device matching: deterministic title + time rules first, then a local
   # Ollama model only for ambiguous recordings, so raw transcripts never reach
   # a cloud model for matching. Ollama down means "unmatched, retry next run".
