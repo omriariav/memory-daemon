@@ -1,5 +1,6 @@
 """Routine discovery, loading, and validation."""
 import datetime
+import os
 import re
 from pathlib import Path
 from string import Formatter
@@ -56,7 +57,6 @@ MAINTENANCE_ALLOWED_KEYS = {
         "kind", "document_secret", "read_tool", "write_tool", "write_mode",
         "model", "owner_slug", "checkpoint", "store", "outbound_since",
         "from_sources", "inbox_heading", "max_per_run", "exclude_tags",
-        "retry_unconfirmed",
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
@@ -593,6 +593,38 @@ def _budget_problems(rid, routine):
     ):
         problems.append(f"{rid}: budget.daily_usd must be a positive number")
     return problems
+
+
+def _norm_path(value):
+    return os.path.normpath(os.path.expanduser(str(value).strip()))
+
+
+def cross_problems(routines):
+    """Problems that need several routines: {routine id: [problem, ...]}.
+
+    The inbound Fibery routine links `mem:` markers using the outbound
+    routine's checkpoint, so its `outbound_checkpoint` must be that file.
+    """
+    outbound = {
+        _norm_path(r["maintenance"].get("checkpoint", "state/fibery-outbound.json"))
+        for r in routines
+        if isinstance(r.get("maintenance"), dict)
+        and r["maintenance"].get("kind") == "fibery_tasks_outbound"
+    }
+    found = {}
+    if not outbound:
+        return found
+    for r in routines:
+        m = r.get("maintenance")
+        if not (isinstance(m, dict) and m.get("kind") == "fibery_tasks_inbound"):
+            continue
+        path = _norm_path(m.get("outbound_checkpoint", "state/fibery-outbound.json"))
+        if path not in outbound:
+            found.setdefault(r.get("id", "<missing id>"), []).append(
+                f"{r.get('id', '<missing id>')}: maintenance.outbound_checkpoint "
+                "must equal the fibery_tasks_outbound routine's checkpoint"
+            )
+    return found
 
 
 def validate(routine):
@@ -1388,9 +1420,9 @@ def _validate_fibery_tasks_outbound(rid, cfg):
         problems.append(
             f"{rid}: maintenance.inbox_heading must be a short single-line string"
         )
-    for key in ("exclude_tags", "retry_unconfirmed"):
-        if key in cfg and not _str_list(cfg[key]):
-            problems.append(f"{rid}: maintenance.{key} must be a list of strings")
+    if "exclude_tags" in cfg and not _str_list(cfg["exclude_tags"]):
+        problems.append(
+            f"{rid}: maintenance.exclude_tags must be a list of strings")
     cap = cfg.get("max_per_run", 5)
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 50:
         problems.append(

@@ -266,6 +266,33 @@ def _now():
         "%Y-%m-%dT%H:%M:%SZ")
 
 
+class UnconfirmedHeld(RuntimeError):
+    """Earlier writes are unconfirmed; the routine stays unhealthy."""
+
+
+def clear_unconfirmed(checkpoint_path, ids):
+    """One-shot operator action: forget attempted rows; returns what cleared.
+
+    Only ``attempted`` rows (and the heading when attempted) are removed, so
+    an exported entry can never be written again by this path.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    items, cleared = checkpoint["items"], []
+    for entry_id in ids:
+        if entry_id == "heading":
+            if (checkpoint.get("heading") or {}).get("state") == "attempted":
+                del checkpoint["heading"]
+                cleared.append("heading")
+        elif not ENTRY_ID_RE.fullmatch(entry_id):
+            raise RuntimeError(f"not an entry id: {entry_id!r}")
+        elif (items.get(entry_id) or {}).get("state") == "attempted":
+            del items[entry_id]
+            cleared.append(entry_id)
+    if cleared:
+        _save_checkpoint(checkpoint_path, checkpoint)
+    return cleared
+
+
 def _entries(store):
     if not (Path(store) / "memory" / "entries").is_dir():
         return {}
@@ -279,7 +306,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
     ``exported`` only when a read shows its marker. An attempted entry whose
     marker never shows up is reported as ``unconfirmed`` and is never written
     again automatically (the same holds for creating the heading); the operator
-    clears it with ``retry_unconfirmed: [<entry-id>, ... | heading]``.
+    clears it with the one-shot CLI flag ``run --routine X --retry-unconfirmed``
+    (see ``clear_unconfirmed``).
     """
     if not valid_read_tool(cfg.get("read_tool")):
         raise RuntimeError(
@@ -309,21 +337,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
     items = checkpoint["items"]
     heading_row = checkpoint.get("heading") or {}
 
-    cleared = [i for i in (cfg.get("retry_unconfirmed") or [])]
     changed = False
-    for entry_id in cleared:
-        if entry_id == "heading":
-            if heading_row.get("state") == "attempted":
-                checkpoint.pop("heading", None)
-                heading_row = {}
-                changed = True
-        elif (items.get(entry_id) or {}).get("state") == "attempted":
-            del items[entry_id]
-            changed = True
-    if changed and not dry_run:
-        _save_checkpoint(checkpoint_path, checkpoint)
-        log("fibery_tasks_outbound: cleared unconfirmed: "
-            + ", ".join(cleared))
 
     def attempted_ids():
         return sorted(i for i, r in items.items()

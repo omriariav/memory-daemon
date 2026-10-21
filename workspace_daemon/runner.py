@@ -274,6 +274,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
 
     valid = []
     routing_failures = []
+    cross = config.cross_problems(routines)
     for routine in routines:
         if not routine.get("enabled", True):
             parked = sum(
@@ -284,7 +285,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
             log(f"routine={routine['id']} disabled, skipping{note}")
             continue
         try:
-            problems = config.validate(routine)
+            problems = config.validate(routine) + cross.get(routine["id"], [])
             if problems:
                 raise config.RoutineError("; ".join(problems))
             if routine["id"] not in active_ids:

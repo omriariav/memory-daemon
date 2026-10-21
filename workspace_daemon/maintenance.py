@@ -107,9 +107,17 @@ def run(base_dir, routine, dry_run=False):
                 "checkpoint", fibery_tasks_outbound.DEFAULT_CHECKPOINT)),
             dry_run=dry_run, extra_exclude=_personal_tags(base_dir),
         )
+        held = report.get("unconfirmed", [])
+        if held:
+            message = f"unconfirmed export held ({len(held)} ids)"
+            log(f"routine={routine_id} maintenance={kind} ERROR: {message}: "
+                + ", ".join(held))
+            raise fibery_tasks_outbound.UnconfirmedHeld(
+                f"{message}; check the document, then run with "
+                "--retry-unconfirmed to clear")
         log(
             f"routine={routine_id} maintenance={kind} "
-            f"unconfirmed={len(report.get('unconfirmed', []))} "
+            f"unconfirmed={len(held)} "
             f"candidates={report['candidates']} exported={report['exported']} "
             f"already_present={report['already_present']} "
             f"mode={report['mode']} dry_run={report['dry_run']}"

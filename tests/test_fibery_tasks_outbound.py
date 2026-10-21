@@ -251,27 +251,53 @@ class ExportTest(OutboundBase):
         self.run_once()
         self.assertEqual(len(self.writes()), 1)
 
-    def test_retry_unconfirmed_clears_attempted(self):
+    def test_clear_unconfirmed_is_one_shot(self):
         write_entry(self.store, "a1")
         self.land = False
         with self.assertRaises(RuntimeError):
             self.run_once()
         self.land = True
-        self.heading = True  # a heading exists now
-        self.run_once(retry_unconfirmed=["a1", "heading"])
+        self.heading = True
+        cleared = fto.clear_unconfirmed(self.checkpoint, ["a1", "heading", "a1"])
+        self.assertEqual(cleared, ["a1", "heading"])
+        self.run_once()
         self.assertEqual(len(self.writes()), 2)
         self.assertEqual(self.items()["a1"]["state"], "exported")
+        # Clearing again (id already exported) does nothing and never rewrites.
+        self.assertEqual(fto.clear_unconfirmed(self.checkpoint, ["a1"]), [])
+        self.run_once()
+        self.run_once()
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_failed_retry_is_held_again(self):
+        write_entry(self.store, "a1")
+        self.land = False
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        fto.clear_unconfirmed(self.checkpoint, ["a1", "heading"])
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.assertEqual(len(self.writes()), 2)
+        self.run_once()
+        self.run_once()
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_clear_rejects_odd_ids(self):
+        write_entry(self.store, "a1")
+        self.run_once()
+        with self.assertRaises(RuntimeError):
+            fto.clear_unconfirmed(self.checkpoint, ["../x"])
 
     def test_attempted_heading_never_created_twice(self):
         write_entry(self.store, "a1")
         self.land = False
         with self.assertRaises(RuntimeError):
             self.run_once()
-        self.items()["a1"]
         data = json.loads(self.checkpoint.read_text())
         self.assertEqual(data["heading"]["state"], "attempted")
         # Operator clears only the entry, not the heading.
-        report = self.run_once(retry_unconfirmed=["a1"])
+        fto.clear_unconfirmed(self.checkpoint, ["a1"])
+        report = self.run_once()
         self.assertTrue(report["held_unconfirmed"])
         self.assertIn("heading", report["unconfirmed"])
         self.assertEqual(len(self.writes()), 1)
@@ -563,6 +589,47 @@ class PersonalTagTest(unittest.TestCase):
                 {"private", "secret"} <= run.call_args[1]["extra_exclude"])
 
 
+class HeldVisibilityTest(OutboundBase):
+    def test_every_held_run_logs_error_and_raises(self):
+        from workspace_daemon import maintenance, status
+        write_entry(self.store, "a1")
+        self.land = False
+        routine = ConfigTest().routine()
+        routine["maintenance"]["store"] = str(self.store)
+        routine["maintenance"]["checkpoint"] = str(self.checkpoint)
+        with self.assertRaises(RuntimeError):
+            maintenance.run(self.dir, routine)
+        for _ in range(2):
+            with mock.patch.object(maintenance, "log") as log:
+                with self.assertRaises(fto.UnconfirmedHeld):
+                    maintenance.run(self.dir, routine)
+            lines = [c.args[0] for c in log.call_args_list]
+            error = [l for l in lines if "ERROR: unconfirmed export held (" in l]
+            self.assertEqual(len(error), 1)
+            self.assertTrue(error[0].startswith(
+                "routine=fib-out maintenance=fibery_tasks_outbound ERROR:"))
+            self.assertTrue(status._ROUTINE_ERROR.match(error[0]))
+        self.assertEqual(len(self.writes()), 1)
+
+
+class CrossValidationTest(unittest.TestCase):
+    def test_inbound_must_point_at_the_outbound_checkpoint(self):
+        outbound = {"id": "out", "role": "maintenance", "maintenance": {
+            "kind": "fibery_tasks_outbound", "checkpoint": "state/custom.json"}}
+        inbound = {"id": "inb", "role": "maintenance", "maintenance": {
+            "kind": "fibery_tasks_inbound"}}
+        self.assertTrue(config.cross_problems([outbound, inbound])["inb"])
+        inbound["maintenance"]["outbound_checkpoint"] = "state/./custom.json"
+        self.assertEqual(config.cross_problems([outbound, inbound]), {})
+        # No outbound routine: nothing to match.
+        inbound["maintenance"]["outbound_checkpoint"] = "state/other.json"
+        self.assertEqual(config.cross_problems([inbound]), {})
+        # Default on both sides matches.
+        outbound["maintenance"].pop("checkpoint")
+        inbound["maintenance"].pop("outbound_checkpoint")
+        self.assertEqual(config.cross_problems([outbound, inbound]), {})
+
+
 class ConfigTest(unittest.TestCase):
     def routine(self, **over):
         maintenance = {
@@ -592,7 +659,7 @@ class ConfigTest(unittest.TestCase):
             {"inbox_heading": "a\nb"},
             {"max_per_run": 0},
             {"exclude_tags": "personal"},
-            {"retry_unconfirmed": [1]},
+            {"retry_unconfirmed": ["a1"]},
             {"bogus": 1},
         ):
             self.assertTrue(config.validate(self.routine(**over)), over)

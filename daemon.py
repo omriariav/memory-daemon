@@ -94,8 +94,9 @@ def cmd_validate(args):
         print("no routines to validate")
         return 0
     all_problems = []
+    cross = config.cross_problems(routines)
     for r in routines:
-        problems = config.validate(r)
+        problems = config.validate(r) + cross.get(r["id"], [])
         source = Path(r["_source_file"]).name
         if problems:
             all_problems.extend(problems)
@@ -215,6 +216,30 @@ def _pause_reason(args, prefix=""):
     return None
 
 
+def _retry_unconfirmed(args, routines):
+    """One-shot: forget unconfirmed Fibery export attempts, then run on."""
+    if not args.routine or args.dry_run:
+        raise config.RoutineError(
+            "--retry-unconfirmed needs --routine and cannot be a dry run"
+        )
+    routine = next(r for r in routines if r["id"] == args.routine)
+    maintenance_cfg = routine.get("maintenance")
+    if not (isinstance(maintenance_cfg, dict)
+            and maintenance_cfg.get("kind") == "fibery_tasks_outbound"):
+        raise config.RoutineError(
+            "--retry-unconfirmed only applies to a fibery_tasks_outbound routine"
+        )
+    from workspace_daemon import fibery_tasks_outbound
+    ids = [i.strip() for i in args.retry_unconfirmed.split(",") if i.strip()]
+    path = Path(maintenance_cfg.get(
+        "checkpoint", fibery_tasks_outbound.DEFAULT_CHECKPOINT)).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    cleared = fibery_tasks_outbound.clear_unconfirmed(path, ids)
+    log(f"routine={args.routine} fibery_tasks_outbound: cleared unconfirmed "
+        f"for retry: {', '.join(cleared) or 'none'}")
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
     count_only = getattr(args, "count_only", False)
@@ -241,12 +266,16 @@ def cmd_run(args):
             if routine["id"] == args.routine else routine
             for routine in routines
         ]
-    problems = [p for r in routines for p in config.validate(r)]
+    cross = config.cross_problems(routines)
+    problems = [p for r in routines
+                for p in config.validate(r) + cross.get(r["id"], [])]
     if problems:
         for p in problems:
             log(f"invalid routine: {p}")
         return 1
 
+    if getattr(args, "retry_unconfirmed", None):
+        _retry_unconfirmed(args, routines)
     mode = (
         " (dry-run — no LLM call, source mutation, or data/state write; "
         "operational log only)"
@@ -327,7 +356,9 @@ def cmd_tick(args):
     if not args.dry_run:
         config.secure_routine_files(BASE_DIR)
     routines = config.discover(BASE_DIR)
-    problems = [p for r in routines for p in config.validate(r)]
+    cross = config.cross_problems(routines)
+    problems = [p for r in routines
+                for p in config.validate(r) + cross.get(r["id"], [])]
     if problems:
         for p in problems:
             log(f"invalid routine: {p}")
@@ -519,6 +550,10 @@ def main(argv=None):
     p_run.add_argument("--count-only", action="store_true",
                        help="list only: report new/changed items and a cost "
                             "estimate; no ledger, cursor or store write")
+    p_run.add_argument("--retry-unconfirmed", metavar="ID[,ID...]|heading",
+                       help="one-shot, with --routine on a fibery_tasks_outbound "
+                            "routine: forget those unconfirmed export attempts "
+                            "(entry ids and/or the word heading) before the run")
     p_run.add_argument("--ignore-pause", action="store_true",
                        help="run even though state/PAUSED exists (manual override)")
     p_run.set_defaults(func=cmd_run)

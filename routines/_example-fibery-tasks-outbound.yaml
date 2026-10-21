@@ -49,7 +49,7 @@ maintenance:
   # Tags that block export (default shown). Every memory.personal_tag found
   # on any routine is excluded as well.
   exclude_tags: [personal, no-fibery, no-owner-action]
-  # A write whose marker never showed up is reported as unconfirmed and is not
-  # retried. After checking the document, list the entry ids (and/or the word
-  # heading) here for one run to clear them, then remove the line.
-  # retry_unconfirmed: []
+  # A write whose marker never showed up is reported as unconfirmed, fails every
+  # run (status shows the routine unhealthy) and is never retried on its own.
+  # After checking the document, clear it once with:
+  #   ./daemon.py run --routine fibery-tasks-outbound --retry-unconfirmed ID[,ID...|heading]
