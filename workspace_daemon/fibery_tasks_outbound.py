@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import claude_bridge, personal, state
 from .fibery_tasks_inbound import (
-    MEM_RE, OUTBOUND_CHECKPOINT, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document,
+    MEM_RE, OUTBOUND_CHECKPOINT, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document, pending_ids,
     valid_read_tool, _document_text, _text_of,
 )
 from .google_tasks_sync import _load_memory_entries
@@ -136,6 +136,7 @@ def inspect(text, heading):
     for root in roots:
         if root not in blocks:
             raise FiberyParseError("rootBlockIds references a missing block")
+    pending = pending_ids(blocks, suggestions)
     want = " ".join(heading.split()).casefold()
     heading_id = None
     pending_heading = False
@@ -145,22 +146,27 @@ def inspect(text, heading):
         if block["type"] != "heading":
             continue
         raw = _text_of(block)
+        if root in pending:
+            if " ".join(TAG_RE.sub("", raw).split()).casefold() == want:
+                pending_heading = True
+            continue
         if " ".join(accepted_text(raw).split()).casefold() == want:
             heading_id, position = root, index
             break
         if " ".join(TAG_RE.sub("", raw).split()).casefold() == want:
             pending_heading = True
-    if heading_id is None and want in " ".join(suggestions.split()).casefold():
-        pending_heading = True
     anchor = None
     if heading_id is not None:
         for root in roots[position + 1:]:
             block = blocks[root]
+            if root in pending:
+                continue
             if block["type"] == "heading":
                 break
-            if block["type"] == "bullet_list":
+            if block["type"] == "bullet_list" and root not in pending:
                 items = [c for c in block["childIds"]
-                         if blocks[c]["type"] == "list_item"]
+                         if blocks[c]["type"] == "list_item"
+                         and c not in pending]
                 if items:
                     anchor = items[-1]
     return {

@@ -29,6 +29,8 @@ class Doc:
         self.blocks = []
         self.roots = []
         self.n = 1000
+        self.version = 0
+        self.suggestions = []
 
     def _id(self):
         self.n += 1
@@ -64,13 +66,32 @@ class Doc:
                     else f"content: {text}",
                 ])
 
+    def suggest(self, block_ids, kind="inserted", inline=False):
+        """Record a pending tracked-change suggestion over these blocks."""
+        self.suggestions.append((list(block_ids), kind, inline))
+
+    def _suggestion_lines(self):
+        lines = [f"suggestions[{len(self.suggestions)}]:"]
+        for i, (ids, kind, inline) in enumerate(self.suggestions):
+            lines.extend([
+                f"  - id: sg-{i}", f"    kind: {kind}", "    authorId: user-1",
+                "    createdAt: 1700000000000", "    baggage:",
+                "      fibery.via.type: mcp", "      fibery.via.name: Connector",
+                f"    blockIds[{len(ids)}]: " + ",".join(ids),
+                f"    inline: {'true' if inline else 'false'}",
+                "    commentIds: []",
+            ])
+        return lines
+
     def text(self, wrap=True):
-        lines = ["version: 0",
+        lines = [f"version: {self.version}",
                  f"rootBlockIds[{len(self.roots)}]: " + ",".join(self.roots),
                  f"blocks[{len(self.blocks)}]:"]
         for block in self.blocks:
             lines.append("  - " + block[0])
             lines.extend("    " + ln for ln in block[1:])
+        if self.suggestions:
+            lines.extend(self._suggestion_lines())
         toon = "\n".join(lines)
         return json.dumps({"success": True, "document": toon}) if wrap else toon
 
@@ -204,7 +225,10 @@ class ParserTest(unittest.TestCase):
         good = json.loads(simple_doc((1, "TODO", "x", "S")))["document"]
         bad = [
             "nonsense",
-            good.replace("version: 0", "version: 7"),
+            good.replace("version: 0\n", ""),
+            good.replace("version: 0", "version: abc"),
+            good.replace("version: 0", "version: -1"),
+            good.replace("version: 0", 'version: "3"x'),
             good.replace("blocks[4]", "blocks[9]"),
             good.replace("state: TODO", "state: MAYBE"),
             good.replace("type: list_item", "type: list_item\n    bogus line"),
@@ -223,6 +247,95 @@ class ParserTest(unittest.TestCase):
                               "childIds[1]: " + bid(9999))
         with self.assertRaises(fti.FiberyParseError):
             fti.parse_tasks(broken)
+
+
+class LiveFormatTest(RunBase):
+    def pending_doc(self, kind="inserted", inline=False, with_accepted=True):
+        doc = Doc()
+        if with_accepted:
+            doc.heading("Accepted")
+            doc.bullets([(bid(1), "TODO", [q("Kept task")])])
+        doc.heading("Inbox")
+        heading = doc.roots[-1]
+        doc.bullets([(bid(2), "TODO", [q("Suggested task (mem:abc)")])])
+        doc.suggest([heading, doc.roots[-1]], kind=kind, inline=inline)
+        return doc
+
+    def test_revision_version_accepted(self):
+        doc = Doc()
+        doc.version = 3
+        doc.bullets([(bid(1), "TODO", [q("x")])])
+        self.assertEqual(len(fti.parse_tasks(doc.text())), 1)
+
+    def test_bad_version_rejected(self):
+        for good_to_bad in ("version: x", "version: 1.5", "version: -2",
+                            "version:"):
+            text = simple_doc().replace("version: 0", good_to_bad)
+            with self.assertRaises(fti.FiberyParseError, msg=good_to_bad):
+                fti.parse_tasks(text)
+        missing = json.loads(simple_doc())["document"].replace(
+            "version: 0\n", "")
+        with self.assertRaises(fti.FiberyParseError):
+            fti.parse_tasks(missing)
+
+    def test_pending_inserted_blocks_import_nothing(self):
+        doc = self.pending_doc()
+        tasks = fti.parse_tasks(doc.text())
+        self.assertEqual([t["block_id"] for t in tasks], [bid(1)])
+        self.assertEqual(tasks[0]["section"], "Accepted")
+        report = self.run_once(doc.text())
+        self.assertEqual(report["created"], 1)
+        self.assertNotIn(bid(2), self.items())
+
+    def test_pending_only_document_has_no_tasks(self):
+        doc = self.pending_doc(with_accepted=False)
+        self.assertEqual(fti.parse_tasks(doc.text()), [])
+
+    def test_unrelated_suggestions_section_keeps_accepted_tasks(self):
+        doc = Doc()
+        doc.heading("Work")
+        doc.bullets([(bid(1), "TODO", [q("A")]), (bid(2), "DONE", [q("B")])])
+        doc.suggest([doc.roots[0]], kind="inserted", inline=False)
+        tasks = fti.parse_tasks(doc.text())
+        self.assertEqual([t["block_id"] for t in tasks], [bid(1), bid(2)])
+
+    def test_accepted_doc_with_inline_suggestion_unchanged(self):
+        doc = Doc()
+        doc.bullets([(bid(1), "TODO", [q("A")])])
+        doc.suggest([bid(1002)], kind="inserted", inline=True)
+        self.assertEqual(len(fti.parse_tasks(doc.text())), 1)
+
+    def test_deleted_suggestion_keeps_the_task(self):
+        doc = Doc()
+        doc.bullets([(bid(1), "TODO", [q("Keep me")])])
+        doc.suggest([doc.roots[0]], kind="deleted", inline=False)
+        tasks = fti.parse_tasks(doc.text())
+        self.assertEqual([t["text"] for t in tasks], ["Keep me"])
+
+    def test_unknown_block_in_suggestion_fails(self):
+        doc = Doc()
+        doc.bullets([(bid(1), "TODO", [q("x")])])
+        doc.suggest([bid(9999)])
+        with self.assertRaises(fti.FiberyParseError):
+            fti.parse_tasks(doc.text())
+
+    def test_malformed_suggestions_fail(self):
+        doc = Doc()
+        doc.bullets([(bid(1), "TODO", [q("x")])])
+        doc.suggest([doc.roots[0]])
+        good = doc.text(wrap=False)
+        for bad in (good.replace("suggestions[1]", "suggestions[2]"),
+                    good.replace("inline: false", "inline: maybe"),
+                    good.replace("blockIds[1]", "blockIds[2]"),
+                    good.replace("    kind: inserted\n", "")):
+            with self.assertRaises(fti.FiberyParseError, msg=bad):
+                fti.parse_tasks(bad)
+
+    def test_empty_suggestions_header_is_fine(self):
+        doc = Doc()
+        doc.bullets([(bid(1), "TODO", [q("x")])])
+        text = doc.text(wrap=False) + "\nsuggestions[0]:"
+        self.assertEqual(len(fti.parse_tasks(text)), 1)
 
 
 class DiffTest(RunBase):
