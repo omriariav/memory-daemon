@@ -204,9 +204,13 @@ def build_prompt(routine, item, label_catalog):
     return "\n".join(parts) + "\n"
 
 
-def analyze(routine, prompt):
-    """Call the configured provider (yoetz, or headless Claude) and return the text."""
+def analyze(routine, prompt, model=None):
+    """Call the configured provider (yoetz, or headless Claude) and return the text.
+
+    `model` overrides analyze.model for this call (same provider).
+    """
     cfg = routine["analyze"]
+    model = model or cfg["model"]
     mem = personal.memory_cfg(routine)
     if mem and personal.redact_enabled(mem):
         # Every model call for a memory-capturing routine sees redacted text.
@@ -218,13 +222,13 @@ def analyze(routine, prompt):
         if _base_dir is None:
             raise RuntimeError("analyze.provider claude needs llm.configure(base_dir)")
         return claude_bridge.complete(
-            prompt, model=cfg["model"], base_dir=_base_dir
+            prompt, model=model, base_dir=_base_dir
         )
     cmd = [
         yoetz_bin(), "ask",
         "-p", prompt,
         "--provider", cfg["provider"],
-        "--model", cfg["model"],
+        "--model", model,
         "--max-output-tokens", str(cfg.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)),
         "--format", "json",
     ]
