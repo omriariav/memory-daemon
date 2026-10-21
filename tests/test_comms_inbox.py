@@ -187,13 +187,18 @@ class ReactionTest(InboxTestCase):
         )
         self.assertEqual([r["ts"] for r in self.messages()], [ts_at(10)])
 
-    def test_save_emoji_reaction_is_recorded_and_still_captured(self):
+    def test_save_emoji_is_not_handled_unless_listed(self):
         self.connector.search = by_filter({f"hasmy::{SAVE}:": [
             {"ts": ts_at(10)},
         ]})
         listing = slack_mcp.candidates(inbox_source(save_reactions=[SAVE]))
         self.assertEqual(len(listing), 1)
         self.assertTrue(listing[0]["raw"]["saved"])
+        self.assertEqual(self.reactions(), [])
+        self.assertEqual([r["ts"] for r in self.messages()], [ts_at(10)])
+        slack_mcp.candidates(inbox_source(
+            {"channels": [CHAN], "reactions": [SAVE]}, save_reactions=[SAVE],
+        ))
         self.assertEqual(
             [(r["ts"], r["emoji"]) for r in self.reactions()],
             [(ts_at(10), SAVE)],
@@ -259,7 +264,7 @@ class DueChecksTest(unittest.TestCase):
         comms_inbox.record(self.tmp.name, rows, 14, now=now)
         return [
             d["ts"] for d in comms_inbox.due_checks(
-                self.tmp.name, ME, limit, hours, now=now,
+                self.tmp.name, limit, hours, now=now,
             )
         ]
 
@@ -314,9 +319,9 @@ class ReactionReadTest(InboxTestCase):
             {"ts": ts_at(10)},
         ]})
 
-    def run_once(self, **over):
+    def run_once(self, inbox=None, **over):
         return slack_mcp.candidates(inbox_source(
-            reactions_tool=REACTIONS_TOOL, **over
+            inbox, reactions_tool=REACTIONS_TOOL, **over
         ))
 
     def test_owner_reaction_is_recorded_and_closes_the_message(self):
@@ -332,6 +337,16 @@ class ReactionReadTest(InboxTestCase):
         self.run_once()
         self.assertEqual(len(self.reads), 1)
         self.assertEqual(len(self.connector.calls), calls + 1)  # search only
+
+    def test_track_and_save_emoji_are_not_handled(self):
+        self.answer = reactions_text(
+            ("omribot-track", [ME]), (SAVE, [ME]), ("pray", [ME]),
+        )
+        self.run_once({"channels": [CHAN], "track_reactions": ["omribot-track"]},
+                      save_reactions=[SAVE])
+        self.assertEqual(
+            [r["emoji"] for r in self.reactions()], ["pray"]
+        )
 
     def test_message_without_owner_reaction_stays_open(self):
         self.answer = reactions_text(("pray", [BOB]))
@@ -656,6 +671,95 @@ class FollowTest(InboxTestCase):
         )
 
 
+class ReviewFixTest(InboxTestCase):
+    def test_failed_inbox_search_does_not_mark_the_listing_partial(self):
+        def search(args):
+            if args["filters"] == f"hasmy::{ACK}:":
+                return "not json"
+            return search_text([{"ts": ts_at(10)}])
+
+        self.connector.search = search
+        runtime = {}
+        listing = slack_mcp.candidates(inbox_source(
+            {"channels": [CHAN], "reactions": [ACK]},
+            _slack_mcp_runtime=runtime,
+        ))
+        self.assertFalse(listing.partial)
+        self.assertEqual(runtime["failed_keys"], [])
+
+    def test_capture_outage_still_fails_when_an_inbox_search_works(self):
+        def search(args):
+            if args["filters"] == f"hasmy::{ACK}:":
+                return search_text([])
+            return "not json"
+
+        self.connector.search = search
+        with self.assertRaisesRegex(slack_mcp.SlackMcpError, "every search"):
+            slack_mcp.candidates(inbox_source(
+                {"channels": [CHAN], "reactions": [ACK]},
+            ))
+
+    def test_shared_files_keep_the_longest_live_retention(self):
+        old = f"{int(NOW) - 5 * 86400}.000100"
+        comms_inbox.record(self.tmp.name, [message(old)], 14, now=NOW)
+        follow = comms_inbox.load_follow(self.tmp.name)
+        follow["covered"]["wide:x"] = {
+            "at": NOW - 60, "channels": [], "retention_days": 14,
+        }
+        comms_inbox.save_follow(self.tmp.name, follow, 14, now=NOW)
+        slack_mcp.candidates(inbox_source(
+            {"channels": [CHAN], "retention_days": 2}
+        ))
+        self.assertIn(old, [r["ts"] for r in self.rows()])
+
+    def test_save_emoji_is_searched_again_when_its_look_back_is_short(self):
+        seen = []
+        self.connector.search = lambda a: seen.append(a) or search_text([])
+        slack_mcp.candidates(inbox_source(
+            {"channels": [CHAN], "reactions": [SAVE]},
+            save_reactions=[SAVE], save_reaction_lookback_days=2,
+        ))
+        afters = sorted(
+            a["after"] for a in seen if a["filters"] == f"hasmy::{SAVE}:"
+        )
+        self.assertEqual(
+            afters, [int(NOW) - 14 * 86400, int(NOW) - 2 * 86400]
+        )
+
+    def test_uncovered_inbox_channel_is_reported(self):
+        slack_mcp._WARNED_UNCOVERED.clear()
+        with mock.patch.object(slack_mcp, "log") as log:
+            slack_mcp.candidates(inbox_source({"channels": [CHAN2]}))
+        self.assertTrue(any(
+            "searched by no query" in c.args[0] for c in log.call_args_list
+        ))
+
+    def test_malformed_state_files_count_as_empty(self):
+        state = Path(self.tmp.name, "state")
+        state.mkdir(parents=True, exist_ok=True)
+        for body in ("[]", "null", '{"covered": [], "threads": 3}',
+                     '{"conversations": {}, "scanned": []}'):
+            with self.subTest(body=body):
+                (state / comms_inbox.FOLLOW_FILE).write_text(body)
+                (state / comms_inbox.TRACKED_FILE).write_text(body)
+                self.assertEqual(
+                    comms_inbox.load_follow(self.tmp.name)["threads"], {}
+                )
+                self.assertEqual(
+                    comms_inbox.load_tracked(self.tmp.name)["conversations"],
+                    [],
+                )
+
+    def test_error_results_back_off(self):
+        self.connector.errors = lambda tool, args: tool == REACTIONS_TOOL
+        comms_inbox.record(self.tmp.name, [message(ts_at(10))], 14, now=NOW)
+        slack_mcp.candidates(inbox_source(reactions_tool=REACTIONS_TOOL))
+        checks = json.loads(
+            Path(self.tmp.name, "state", comms_inbox.CHECKS_FILE).read_text()
+        )
+        self.assertIn(f"{CHAN}:{ts_at(10)}", checks)
+
+
 class ConfigTest(unittest.TestCase):
     def problems(self, **over):
         with tempfile.TemporaryDirectory() as tmp:
@@ -671,7 +775,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_bad_blocks(self):
         for block in (
-            [], {"channels": []}, {"channels": ["general"]},
+            [], {"channels": ["general"]},
             {"channels": [CHAN], "extra": 1},
             {"channels": [CHAN], "reactions": [":eyes:"]},
             {"channels": [CHAN], "reactions": ["a", "b", "c", "d", "e", "f"]},
@@ -699,6 +803,9 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(tool=tool):
                 text = "\n".join(self.problems(reactions_tool=tool))
                 self.assertIn("reactions_tool", text)
+
+    def test_empty_block_is_valid(self):
+        self.assertEqual(self.problems(comms_inbox={}), [])
 
     def test_track_reactions_alone_are_enough(self):
         self.assertEqual(self.problems(
@@ -749,7 +856,7 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(merged["comms_inbox"]["reactions"], [ACK])
             merged, _ = slack_watch.expand({"kind": "slack", "watch": str(path)})
             self.assertNotIn("comms_inbox", merged)
-            path.write_text("comms_inbox: {retention_days: 3}\n")
+            path.write_text("comms_inbox: {retention_days: 0}\n")
             with self.assertRaises(slack_watch.WatchError):
                 slack_watch.load(str(path))
 

@@ -2,7 +2,12 @@
 
 The `slack_mcp` source can keep `state/comms-inbox.jsonl` for a configured set
 of conversations, so a reply tracker reads new messages (and the owner's own
-replies and reactions) from disk instead of fetching Slack again. It reuses
+replies and reactions) from disk instead of fetching Slack again.
+
+Every routine with a `comms_inbox` block shares the files below, and each run
+prunes them by the longest `retention_days` of the lanes active in the last
+day. Runs that write them must not overlap: capture routines all run under
+the daemon's `run` lock, which serializes them. It reuses
 the hits every run's searches already return: no extra read, no model call,
 and no settle delay (a message is recorded in the run that first lists it).
 
@@ -38,6 +43,10 @@ recorded like those of `channels`, until the track request is older than
 no other query lists is searched by an extra `tracked` query (channels in
 chunks, at most MAX_TRACKED_QUERIES), from a per-channel scan mark kept with
 the tracked set in `state/comms-inbox-tracked.json`.
+
+An empty block (`comms_inbox: {}`) is valid: that routine records only the
+tracked and followed conversations its own searches list, and publishes its
+searched channels so the routine that polls followed threads skips them.
 
 Owner reactions come from two places. Search (`hasmy::<emoji>:`) finds the
 listed emoji only. With `reactions_tool` (the connector's read-only
@@ -141,15 +150,6 @@ def problem(value):
             )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
-    if (
-        not channels and value.get("all_dms") is not True
-        and not value.get("track_reactions")
-        and value.get("follow_threads") is not True
-    ):
-        return (
-            "needs `channels`, `all_dms: true`, `track_reactions` and/or "
-            "`follow_threads: true`"
-        )
 
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),
@@ -283,7 +283,7 @@ def _load_checks(base_dir):
     }
 
 
-def due_checks(base_dir, self_user_id, limit, hours, now=None):
+def due_checks(base_dir, limit, hours, now=None):
     """Open messages whose reactions are due a read, newest first.
 
     Each is {"channel_id", "ts", "thread_ts"}. Open: the newest message of
@@ -404,7 +404,10 @@ def load_tracked(base_dir):
         log("comms inbox: tracked state is unreadable; starting empty")
         return empty
     out = {"conversations": [], "scanned": {}}
-    for entry in (data.get("conversations") if isinstance(data, dict) else 0) or []:
+    if not isinstance(data, dict):
+        return out
+    conversations = data.get("conversations")
+    for entry in conversations if isinstance(conversations, list) else []:
         try:
             item = {
                 "channel_id": str(entry["channel_id"]),
@@ -416,7 +419,8 @@ def load_tracked(base_dir):
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
         out["conversations"].append(item)
-    for channel, when in ((data.get("scanned") or {}).items()):
+    scanned = data.get("scanned")
+    for channel, when in (scanned.items() if isinstance(scanned, dict) else ()):
         if isinstance(when, (int, float)) and not isinstance(when, bool):
             out["scanned"][str(channel)] = when
     return out
@@ -503,18 +507,22 @@ def load_follow(base_dir):
     if not isinstance(data, dict):
         return empty
     out = {"threads": {}, "scanned": None, "covered": {}}
-    for routine, entry in (data.get("covered") or {}).items():
+    covered = data.get("covered")
+    for lane, entry in (covered.items() if isinstance(covered, dict) else ()):
         try:
-            out["covered"][str(routine)] = {
+            days = entry.get("retention_days", DEFAULTS["retention_days"])
+            out["covered"][str(lane)] = {
                 "at": float(entry["at"]),
                 "channels": [str(c) for c in entry["channels"]],
+                "retention_days": int(days),
             }
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError):
             continue
     scanned = data.get("scanned")
     if isinstance(scanned, (int, float)) and not isinstance(scanned, bool):
         out["scanned"] = scanned
-    for key, entry in (data.get("threads") or {}).items():
+    threads = data.get("threads")
+    for key, entry in (threads.items() if isinstance(threads, dict) else ()):
         try:
             channel, root = str(key).split(":", 1)
             float(root), float(entry["last"])
@@ -574,6 +582,17 @@ def follow_thread(follow, channel, root, ts):
 
 def is_followed(follow, hit):
     return f"{hit['channel']}:{hit['root']}" in follow["threads"]
+
+
+def keep_days(follow, now=None):
+    """Days the shared inbox files keep: the longest retention any lane
+    with a live coverage entry asks for."""
+    floor = (time.time() if now is None else now) - COVERED_TTL
+    days = [
+        entry.get("retention_days", DEFAULTS["retention_days"])
+        for entry in follow["covered"].values() if entry["at"] >= floor
+    ]
+    return max(days or [DEFAULTS["retention_days"]])
 
 
 def covered_channels(follow, now=None):

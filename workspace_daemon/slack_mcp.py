@@ -192,6 +192,7 @@ MAX_SESSION_SEEN = 300
 
 _base_dir = None
 _last_search = [0.0]
+_WARNED_UNCOVERED = set()
 
 
 def configure(base_dir):
@@ -990,11 +991,16 @@ def search_queries(cfg, since=None):
 
 def inbox_reactions(cfg):
     """Inbox emoji that need a search of their own (a save emoji's search
-    already runs)."""
+    already runs, and is reused when it looks back far enough)."""
     inbox = cfg.get("comms_inbox")
     if not inbox:
         return []
-    return [n for n in inbox["reactions"] if n not in cfg["save_reactions"]]
+    reused = (
+        set(cfg["save_reactions"])
+        if cfg["save_reaction_lookback_days"] >= inbox["retention_days"]
+        else set()
+    )
+    return [n for n in inbox["reactions"] if n not in reused]
 
 
 def _pace(cfg):
@@ -1527,9 +1533,19 @@ def candidates(source):
     )
     follow = comms_inbox.load_follow(_base_dir) if cfg["comms_inbox"] else None
     if follow is not None:
-        follow["covered"][source.get("_routine_id") or "default"] = {
+        # One entry per source (a routine may have several); a changed
+        # channel list leaves the old entry to expire.
+        lane = "{}:{}".format(
+            source.get("_routine_id") or "default",
+            _digest(sorted(cfg["channels"]), cfg["all_dms"]),
+        )
+        follow["covered"][lane] = {
             "at": now, "channels": sorted(cfg["channels"]),
+            "retention_days": cfg["comms_inbox"]["retention_days"],
         }
+        # The inbox files are shared: prune by the longest live retention.
+        cfg["comms_inbox"]["keep_days"] = comms_inbox.keep_days(follow, now)
+        _warn_uncovered(cfg)
     fresh = int(slack_source._rfc3339_epoch(since_for(source, None, now)))
     saved_after = int(now) - cfg["save_reaction_lookback_days"] * 86400
     reacted_after = int(now) - (
@@ -1571,7 +1587,17 @@ def candidates(source):
             "DM session state cannot be written; nothing was searched"
         )
     found, capped, failed = _search_all(cfg, queries, afters, now)
-    if failed and failed >= {k for q in queries for k in q["keys"]}:
+    # A failed inbox search costs only the inbox; it never marks the capture
+    # listing partial or counts toward "every search failed".
+    inbox_keys = {
+        k for q in queries if q["kind"] in RECORD_ONLY for k in q["keys"]
+    }
+    if failed & inbox_keys:
+        log(f"slack_mcp: {len(failed & inbox_keys)} comms-inbox search "
+            "key(s) failed")
+    inbox_failed, failed = failed, failed - inbox_keys
+    capture_keys = {k for q in queries for k in q["keys"]} - inbox_keys
+    if failed and failed >= capture_keys:
         raise SlackMcpError("every search query failed")
     for key in sorted(capped):
         if key.startswith(SAVED_PREFIX):
@@ -1584,14 +1610,16 @@ def candidates(source):
                 "retention_days or raise max_search_pages)")
     if cfg["comms_inbox"] and not source.get("_count_only"):
         # Before DM sessions re-point `root`: the inbox keeps the real thread.
-        _record_inbox(cfg, found, now, tracked, follow)
-        _mark_scanned(cfg, queries, tracked, follow, capped, failed, now)
-        if follow is not None:
-            if cfg["comms_inbox"]["follow_threads"]:
-                _poll_threads(cfg, follow, now)
-            comms_inbox.save_follow(
-                _base_dir, follow, cfg["comms_inbox"]["retention_days"], now
-            )
+        inbox = cfg["comms_inbox"]
+        rows, started = _inbox_rows(cfg, found, tracked, follow)
+        _mark_scanned(cfg, queries, tracked, follow, capped, inbox_failed, now)
+        if inbox["follow_threads"]:
+            rows += _poll_threads(cfg, follow, now)
+        added = comms_inbox.record(_base_dir, rows, inbox["keep_days"], now)
+        comms_inbox.save_follow(_base_dir, follow, inbox["keep_days"], now)
+        if added or started:
+            log(f"slack_mcp: comms inbox recorded {added} new line(s), "
+                f"{started} conversation(s) newly tracked or followed")
         _check_reactions(cfg, now)
     # Inbox-only hits never become candidates.
     found = [
@@ -1674,7 +1702,7 @@ def candidates(source):
         "runtime": source.get("_slack_mcp_runtime"),
     }
     out = Listing()
-    out.partial = bool(failed)
+    out.partial = bool(failed)  # capture queries only
     for _ts, candidate_id, anchor_id, channel, root, group in saved_take:
         batch["order"].append((channel, root))
         out.append(_candidate(
@@ -1797,15 +1825,17 @@ def _mark_scanned(cfg, queries, tracked, follow, capped, failed, now):
                 int(capped[key]) + overlap if key in capped else int(now)
             )
     comms_inbox.save_tracked(
-        _base_dir, tracked, cfg["comms_inbox"]["retention_days"], now
+        _base_dir, tracked, cfg["comms_inbox"]["keep_days"], now
     )
 
 
 def _poll_threads(cfg, follow, now):
-    """Read due followed threads outside the searched channels; record them.
+    """Read due followed threads outside the searched channels; their rows.
 
     One bridge session, at most `thread_polls` reads. A failed session is
-    logged and leaves the threads due; a budget or pause stop propagates.
+    logged and leaves the threads due; a read with no usable result (an error
+    such as a deleted thread) still counts as a read, so it backs off like
+    any other. A budget or pause stop propagates.
     """
     inbox = cfg["comms_inbox"]
     due = comms_inbox.due_polls(
@@ -1814,7 +1844,7 @@ def _poll_threads(cfg, follow, now):
         inbox["thread_polls"], now,
     )
     if not due:
-        return
+        return []
     calls = [
         {THREAD_CHANNEL_ARG: channel, THREAD_TS_ARG: root,
          THREAD_LIMIT_ARG: cfg["max_thread_replies"]}
@@ -1827,12 +1857,13 @@ def _poll_threads(cfg, follow, now):
         raise
     except claude_bridge.BridgeError as exc:
         log(f"slack_mcp: comms inbox thread reads failed: {exc}")
-        return
+        return []
     rows, read, bad, truncated = [], 0, 0, 0
     for (channel, root), text in zip(due, texts):
-        if text is None:
-            continue
         follow["threads"][f"{channel}:{root}"]["checked"] = now
+        if text is None:
+            bad += 1
+            continue
         try:
             parent, replies, more = parse_thread(text)
         except SlackMcpParseError:
@@ -1847,16 +1878,15 @@ def _poll_threads(cfg, follow, now):
             hit = dict(message, channel=channel, root=root)
             rows.append(comms_inbox.message_row(hit, cfg["self_user_id"]))
             comms_inbox.follow_thread(follow, channel, root, message["ts"])
-    added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
-    log(f"slack_mcp: comms inbox read {read}/{len(due)} followed thread(s), "
-        f"{added} new line(s)"
-        + (f", {bad} unparseable" if bad else "")
+    log(f"slack_mcp: comms inbox read {read}/{len(due)} followed thread(s)"
+        + (f", {bad} without a usable result" if bad else "")
         + (f", {truncated} with older replies not returned" if truncated
            else ""))
+    return rows
 
 
-def _record_inbox(cfg, found, now, tracked, follow=None):
-    """Append this run's hits in the inbox conversations to the comms inbox.
+def _inbox_rows(cfg, found, tracked, follow):
+    """Inbox rows for this run's hits; (rows, conversations newly tracked).
 
     Messages from every query (both sides of a conversation, bots included)
     in inbox channels, DMs (`all_dms`) and tracked conversations; owner
@@ -1901,12 +1931,27 @@ def _record_inbox(cfg, found, now, tracked, follow=None):
         rows.append(comms_inbox.message_row(hit, cfg["self_user_id"]))
         if query["kind"] in ("saved", "reacted"):
             emoji = query["key"].split(":", 1)[1]
-            if emoji in reactions or query["kind"] == "saved":
+            # A save emoji means "remember this", not "handled", unless it
+            # is also listed as an inbox reaction.
+            if emoji in reactions:
                 rows.append(comms_inbox.reaction_row(hit, emoji))
-    added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
-    if added or started:
-        log(f"slack_mcp: comms inbox recorded {added} new line(s), "
-            f"{started} conversation(s) newly tracked or followed")
+    return rows, started
+
+
+def _warn_uncovered(cfg):
+    """Log once when an inbox channel is listed by no query."""
+    inbox = cfg["comms_inbox"]
+    missing = [
+        c for c in inbox["channels"]
+        if c not in cfg["channels"]
+        and not (cfg["all_dms"] and c[:1] in "DG")
+        and c not in _WARNED_UNCOVERED
+    ]
+    if missing:
+        _WARNED_UNCOVERED.update(missing)
+        log(f"slack_mcp: {len(missing)} comms_inbox channel(s) are searched "
+            "by no query (add them to `channels`); only mentions, people or "
+            "tracked threads there are recorded")
 
 
 def _check_reactions(cfg, now):
@@ -1921,8 +1966,7 @@ def _check_reactions(cfg, now):
     if not tool or not inbox["reaction_checks"]:
         return
     due = comms_inbox.due_checks(
-        _base_dir, cfg["self_user_id"], inbox["reaction_checks"],
-        inbox["reaction_check_hours"], now,
+        _base_dir, inbox["reaction_checks"], inbox["reaction_check_hours"], now,
     )
     if not due:
         return
@@ -1937,26 +1981,35 @@ def _check_reactions(cfg, now):
     except claude_bridge.BridgeError as exc:
         log(f"slack_mcp: comms inbox reaction reads failed: {exc}")
         return
+    # Track and save emoji are requests, not "handled" (a save emoji counts
+    # only when it is also listed as an inbox reaction).
+    not_handled = (
+        set(inbox["track_reactions"]) | set(cfg["save_reactions"])
+    ) - set(inbox["reactions"])
     rows, checked, bad = [], [], 0
     for message, text in zip(due, texts):
-        if text is None:
-            continue
+        # A read with no usable result (e.g. a deleted message) backs off too.
+        checked.append(f"{message['channel_id']}:{message['ts']}")
         try:
+            if text is None:
+                raise ValueError("no result")
             emoji = comms_inbox.parse_reactions(text, cfg["self_user_id"])
         except ValueError:
             bad += 1
             emoji = []
-        checked.append(f"{message['channel_id']}:{message['ts']}")
         hit = {"channel": message["channel_id"], "ts": message["ts"],
                "root": message["thread_ts"]}
-        rows.extend(comms_inbox.reaction_row(hit, name) for name in emoji)
-    added = comms_inbox.record(_base_dir, rows, inbox["retention_days"], now)
+        rows.extend(
+            comms_inbox.reaction_row(hit, name) for name in emoji
+            if name not in not_handled
+        )
+    added = comms_inbox.record(_base_dir, rows, inbox["keep_days"], now)
     comms_inbox.mark_checked(
         _base_dir, checked, inbox["reaction_check_hours"], now
     )
     log(f"slack_mcp: comms inbox read reactions of {len(checked)}/{len(due)} "
         f"open message(s), {added} owner reaction(s) new"
-        + (f", {bad} unparseable" if bad else ""))
+        + (f", {bad} without a usable result" if bad else ""))
 
 
 def _inherited_tag(cfg, processed, anchor_id):

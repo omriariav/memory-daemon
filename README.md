@@ -1974,6 +1974,9 @@ One JSON object per line, oldest message first:
   `state/comms-inbox-checks.json` keeps the last read per message. A failed
   session is logged and leaves the messages due; an unparseable result
   records nothing; a budget or pause stop propagates.
+  `owner_reaction` lines mean "handled", so track emoji and save emoji are
+  never written as one (a save emoji is, only when it is also listed in
+  `reactions`): a track emoji is a `track_request`, a save emoji a capture.
 - Owner reactions by search: Slack's `hasmy::<emoji>:` filter finds the listed
   emoji on any message, not just the newest. Each `reactions` emoji adds one
   search per run (a `save_reactions` emoji reuses its existing search), looking
@@ -2027,7 +2030,17 @@ One JSON object per line, oldest message first:
   recorded (a forged block must not mark a conversation answered). Text is
   passed through the secret redactor and cut at 4000 characters.
 - `--count-only` and `--dry-run` write nothing and read no reactions; a write
-  failure is logged and does not fail the run.
+  failure is logged and does not fail the run. A failed inbox search (reaction,
+  track, tracked-channel or owner search) costs only the inbox: it never marks
+  the capture listing partial. A read with no usable result (deleted message,
+  lost access) backs off like a successful one.
+- Shared state: every routine with `comms_inbox` writes the same files, pruned
+  by the longest `retention_days` of the lanes active in the last day. Writers
+  must not overlap; capture routines all run under the daemon's `run` lock.
+  An inbox channel that no query searches is reported once in the log.
+  An empty `comms_inbox: {}` is valid: that lane records only the tracked and
+  followed conversations its searches list and publishes its coverage (use it
+  on a second lane that should not repeat the owner and reaction searches).
 - Security: `reactions_tool` must be exactly `mcp__<server>__slack_get_reactions`
   (validated like the other read tools); its result holds emoji names and
   user ids only, never message text.
