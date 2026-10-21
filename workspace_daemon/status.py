@@ -112,7 +112,7 @@ def probe_launchd(label=DEFAULT_LAUNCHD_LABEL, uid=None):
     }
 
 
-def read_tick_history(path):
+def read_tick_history(path, max_bytes=32 * 1024 * 1024):
     """Summarize coordinator ticks and the last result for every routine."""
     path = Path(path)
     if not path.exists():
@@ -121,7 +121,6 @@ def read_tick_history(path):
         # Status is interactive and must stay bounded even after years of
         # unattended operation. Rotation normally keeps this small; tailing is
         # a second line of defence for legacy/unrotated logs.
-        max_bytes = 32 * 1024 * 1024
         with path.open("rb") as handle:
             size = path.stat().st_size
             if size > max_bytes:

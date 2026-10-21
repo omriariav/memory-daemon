@@ -279,6 +279,8 @@ writes no ledger, cursor, store, or vault file (the bridge still logs its own
 session metadata to `state/claude-usage.jsonl`); maintenance routines are not
 run.
 
+`daemon.py run` exits 75 (not 0) when every lock group was busy and nothing ran, so callers can tell a skipped run from a finished one.
+
 ### Terminal UI
 
 `./memory-daemon-status.sh` opens a live terminal UI when run in a terminal
@@ -302,10 +304,20 @@ tiny terminals and works without colors, logs, or `launchctl`.
 | `v` | validate routines |
 | `?` / `q` | help / quit |
 
+Which checkout it controls: the UI reads the program of each loaded launchd
+job (`launchctl print`, falling back to the plist) and, when they agree,
+controls that checkout with that interpreter, so `p` always writes the
+`state/PAUSED` the scheduler honors. The header shows `Target: <dir>`. If the
+jobs disagree, or `--base-dir` / `MEMORY_DAEMON_DIR` names a different
+checkout, a warning replaces it and `p`, `r`/`d`/`c`, `t` and `L` are refused.
+`L` is also refused while a tick is running, waits for the job to unload,
+retries the bootstrap, and prints the exact `launchctl bootstrap` restore
+command if a job fails to come back.
+
 Actions start `daemon.py` as detached processes with output appended to
 `logs/tui.log`. The UI never starts a second run of a routine it is already
 running. Without a terminal use the subcommands: `./memory-daemon-status.sh
-pause|resume|state|run <id>|logs [-f]|status` (or `daemon.py ctl
+pause|resume|state|run <id>|logs [-f] [-n N]|status` (or `daemon.py ctl
 pause|resume|state`). Set `MEMORY_DAEMON_PYTHON` to pick the interpreter; the
 script otherwise prefers `.venv/bin/python` in the repo, then `python3`.
 

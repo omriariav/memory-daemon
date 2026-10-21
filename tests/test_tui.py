@@ -95,22 +95,98 @@ class LabelDiscoveryTest(unittest.TestCase):
             self.assertEqual(tui.discover_labels("com.memory-daemon"), [])
             self.assertFalse(tui.launchctl_available())
 
-    def test_reload_skips_labels_without_plist(self):
-        calls = []
+    def test_reload_waits_for_bootout_then_bootstraps(self):
+        calls, loaded = [], [True]
 
         def run(args):
             calls.append(args)
+            if args[0] == "bootout":
+                return 0, ""
+            if args[0] == "print":
+                loaded[0] = False  # gone after the first poll
+                return (0 if loaded[0] else 113), ""
             return 0, ""
 
         with tempfile.TemporaryDirectory() as tmp:
+            plist = Path(tmp) / "a.label.plist"
+            plist.write_text("x")
+            lines, ok = tui.reload_jobs(
+                ["a.label", "b.label"], run, uid=501, plist_dir=tmp,
+                sleep=lambda s: None)
+        self.assertTrue(ok)
+        self.assertEqual([c[0] for c in calls], ["bootout", "print", "bootstrap"])
+        self.assertEqual(calls[-1], ["bootstrap", "gui/501", str(plist)])
+        self.assertEqual(lines[0], "a.label: reloaded")
+        self.assertIn("left loaded", lines[1])
+
+    def test_reload_retries_then_reports_restore_command(self):
+        attempts = []
+
+        def run(args):
+            if args[0] == "bootstrap":
+                attempts.append(args)
+                return 5, ""
+            return 113, ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = Path(tmp) / "a.label.plist"
+            plist.write_text("x")
+            lines, ok = tui.reload_jobs(
+                ["a.label"], run, uid=501, plist_dir=tmp, sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertEqual(len(attempts), 4)
+        self.assertIn(f"launchctl bootstrap gui/501 {plist}", lines[0])
+
+    def test_reload_succeeds_after_a_transient_bootstrap_failure(self):
+        rcs = iter([5, 0])
+
+        def run(args):
+            return (next(rcs), "") if args[0] == "bootstrap" else (113, "")
+
+        with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "a.label.plist").write_text("x")
-            out = tui.reload_jobs(["a.label", "b.label"], run, uid=501, plist_dir=tmp)
-        self.assertEqual(calls, [
-            ["bootout", "gui/501/a.label"],
-            ["bootstrap", "gui/501", str(Path(tmp) / "a.label.plist")],
-        ])
-        self.assertEqual(out[0], "a.label: reloaded")
-        self.assertIn("left loaded", out[1])
+            lines, ok = tui.reload_jobs(
+                ["a.label"], run, uid=1, plist_dir=tmp, sleep=lambda s: None)
+        self.assertTrue(ok)
+
+
+class TargetTest(unittest.TestCase):
+    def test_program_from_launchctl_print(self):
+        out = ("gui/1/x = {\n\targuments = {\n\t\t/opt/venv/bin/python\n"
+               "\t\t/srv/live/daemon.py\n\t\ttick\n\t}\n}\n")
+        self.assertEqual(
+            tui.job_program("x", lambda a: (0, out), uid=1),
+            ("/opt/venv/bin/python", "/srv/live/daemon.py"))
+
+    def test_program_falls_back_to_plist(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(Path(tmp) / "x.plist", "wb") as fh:
+                plistlib.dump({"ProgramArguments": ["/p/python", "/d/daemon.py", "tick"]}, fh)
+            self.assertEqual(
+                tui.job_program("x", lambda a: (1, ""), uid=1, plist_dir=tmp),
+                ("/p/python", "/d/daemon.py"))
+            self.assertIsNone(
+                tui.job_program("missing", lambda a: (1, ""), uid=1, plist_dir=tmp))
+
+    def test_resolve_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, dev = Path(tmp) / "live", Path(tmp) / "dev"
+            live.mkdir()
+            dev.mkdir()
+            progs = [("/py", str(live / "daemon.py")), ("/py2", str(live / "daemon.py"))]
+            t = tui.resolve_target(progs, dev, explicit=False)
+            self.assertEqual((t["dir"], t["python"], t["conflict"]),
+                             (str(live.resolve()), "/py", None))
+            t = tui.resolve_target(progs, dev, explicit=True)
+            self.assertIsNone(t["dir"])
+            self.assertIn("launchd runs", t["conflict"])
+            self.assertIsNone(
+                tui.resolve_target(progs, live, explicit=True)["conflict"])
+            t = tui.resolve_target(
+                progs + [("/py", str(dev / "daemon.py"))], live)
+            self.assertIn("different checkouts", t["conflict"])
+            self.assertEqual(tui.resolve_target([], dev)["dir"], None)
 
 
 class CollectorTest(unittest.TestCase):
@@ -181,7 +257,7 @@ class ActionTest(unittest.TestCase):
     def test_command_construction(self):
         self.assertEqual(
             tui.build_run_command("py", "d.py", "alpha", "run"),
-            ["py", "d.py", "run", "--routine", "alpha"])
+            ["py", "d.py", "run", "--routine=alpha"])
         self.assertEqual(
             tui.build_run_command("py", "d.py", "alpha", "dry")[-1], "--dry-run")
         self.assertEqual(
@@ -252,6 +328,10 @@ class FakeRunner:
     def reap(self):
         return []
 
+    def retarget(self, base_dir, python=None):
+        self.python = python or self.python
+        self.target_dir = base_dir
+
 
 class AppKeysTest(unittest.TestCase):
     def setUp(self):
@@ -285,7 +365,7 @@ class AppKeysTest(unittest.TestCase):
         self.assertEqual(self.runner.started, [])
         self.press("r", "y")
         self.assertEqual(self.runner.started, [
-            ("alpha", ["py", "d.py", "run", "--routine", "alpha"])])
+            ("alpha", ["py", "d.py", "run", "--routine=alpha"])])
 
     def test_dry_and_count_modes(self):
         self.press("d", "y", "c", "y")
@@ -335,6 +415,128 @@ class AppKeysTest(unittest.TestCase):
         self.assertEqual(self.app.ui.mode, "main")
 
 
+class AppSafetyTest(unittest.TestCase):
+    """Retargeting, wrong-target refusal, reload guards, other fixes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.dev, self.live = root / "dev", root / "live"
+        self.dev.mkdir()
+        self.live.mkdir()
+        _make_base_at(self.dev)
+        _make_base_at(self.live)
+        (self.live / "daemon.py").write_text("# live\n")
+        p = mock.patch.dict(os.environ, {"PATH": "/nonexistent"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _app(self, programs, explicit=False, **kw):
+        probe = {"have_launchctl": True, "programs": programs, "jobs": [{
+            "label": "com.x", "loaded": True, "state": "not running",
+            "interval_seconds": 900, "last_exit": 0}]}
+        patcher = mock.patch.object(tui.Collector, "probe", return_value=probe)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return tui.App(self.dev, runner=FakeRunner(), explicit=explicit, **kw), probe
+
+    def test_retargets_to_the_checkout_launchd_runs(self):
+        app, _ = self._app([(sys.executable, str(self.live / "daemon.py"))])
+        self.assertEqual(app.base_dir.resolve(), self.live.resolve())
+        self.assertEqual(app.collector.base_dir.resolve(), self.live.resolve())
+        self.assertEqual(app.runner.python, sys.executable)
+        app.handle_key(ord("p"))
+        app.handle_key(ord("y"))
+        self.assertTrue((self.live / "state" / "PAUSED").exists())
+        self.assertFalse((self.dev / "state" / "PAUSED").exists())
+        header = [t for t, _ in tui.render_lines(
+            app.snap, app.ui, 100, 30)]
+        self.assertTrue(any(t.startswith("Target:") for t in header))
+
+    def test_explicit_mismatch_disables_controls(self):
+        app, _ = self._app(
+            [(sys.executable, str(self.live / "daemon.py"))], explicit=True)
+        self.assertEqual(app.base_dir.resolve(), self.dev.resolve())
+        for key in "prtL":
+            app.handle_key(ord(key))
+            self.assertIsNone(app.ui.prompt, key)
+            self.assertIn("controls disabled", app.ui.message)
+            app.ui.message = ""
+        self.assertFalse((self.dev / "state" / "PAUSED").exists())
+        self.assertEqual(app.runner.started, [])
+        lines = [t for t, _ in tui.render_lines(app.snap, app.ui, 100, 30)]
+        self.assertTrue(any(t.startswith("WARNING:") for t in lines))
+
+    def test_disagreeing_jobs_disable_controls(self):
+        app, _ = self._app([(sys.executable, str(self.live / "daemon.py")),
+                            (sys.executable, str(self.dev / "daemon.py"))])
+        app.handle_key(ord("p"))
+        self.assertIn("different checkouts", app.ui.message)
+
+    def test_reload_refused_while_a_tick_runs(self):
+        app, probe = self._app([])
+        probe["jobs"][0]["state"] = "running"
+        app.collector._probe_result = probe
+        app.refresh()
+        with mock.patch.object(tui.sys, "platform", "darwin"):
+            app.handle_key(ord("L"))
+        self.assertIsNone(app.ui.prompt)
+        self.assertIn("reload refused", app.ui.message)
+
+    def test_reload_runs_off_thread_and_reports_failure(self):
+        spawned = []
+        app, _ = self._app([], spawn=spawned.append)
+        results = [(["com.x: NOT LOADED. Restore: launchctl bootstrap gui/1 /p"], False)]
+        with mock.patch.object(tui.sys, "platform", "darwin"), \
+                mock.patch.object(tui, "reload_jobs", side_effect=results):
+            app.handle_key(ord("L"))
+            app.handle_key(ord("y"))
+            self.assertTrue(app.reloading)
+            app.handle_key(ord("p"))  # blocked while reloading
+            self.assertIn("in progress", app.ui.message)
+            spawned[0]()  # what the worker thread would do
+        app.refresh()
+        self.assertFalse(app.reloading)
+        self.assertEqual(app.ui.mode, "text")
+        self.assertIn("launchctl bootstrap gui/1 /p", app.ui.text_lines[0])
+
+    def test_count_only_refused_for_non_capture_routine(self):
+        app, _ = self._app([])
+        app.snap["rows"][0]["group"] = "maintenance"
+        app.handle_key(ord("c"))
+        self.assertIsNone(app.ui.prompt)
+        self.assertIn("capture routines", app.ui.message)
+
+    def test_probe_is_cached(self):
+        collector = tui.Collector(self.dev)
+        with mock.patch.object(
+                tui.Collector, "probe",
+                return_value={"have_launchctl": False, "jobs": [], "programs": []}
+        ) as probe:
+            collector.snapshot()
+            collector.snapshot()
+        self.assertEqual(probe.call_count, 1)
+
+    def test_reap_reports_lock_skip(self):
+        class Proc:
+            def poll(self):
+                return state.EXIT_LOCKED
+        runner = tui.ActionRunner(self.dev)
+        runner.procs["a"] = (Proc(), "run a")
+        self.assertEqual(runner.reap(), ["run a: skipped, another run holds the lock"])
+
+    def test_integer_routine_ids_render(self):
+        snap = RenderTest()._snap(2)
+        snap["rows"][0]["id"] = 7
+        ui = tui.UIState()
+        ui.filter = True
+        ui.log_lines = ["x routine=7 ok"]
+        lines = tui.render_lines(snap, ui, 100, 30)
+        self.assertTrue(any(" 7 " in t for t, _ in lines))
+        self.assertEqual(tui.filter_log(["a routine=7"], 7), ["a routine=7"])
+
+
 class RenderTest(unittest.TestCase):
     def _snap(self, n=3):
         rows = [{
@@ -360,6 +562,40 @@ class RenderTest(unittest.TestCase):
             lines = tui.render_lines(self._snap(30), ui, w, h)
             self.assertEqual(len(lines), h, (w, h))
             self.assertTrue(all(len(t) <= w for t, _ in lines), (w, h))
+
+    def test_control_characters_are_neutralized(self):
+        self.assertEqual(tui._clip("a\x00b\x1b[31m\x85c\td", 40), "a?b?[31m?c d")
+        ui = tui.UIState()
+        ui.mode = "log"
+        ui.log_lines = ["before\x00after", "tab\there"]
+        for t, _ in tui.render_lines(self._snap(), ui, 80, 12):
+            self.assertNotIn("\x00", t)
+            self.assertNotIn("\t", t)
+
+    def test_wide_characters_are_measured_in_cells(self):
+        text = tui._clip("\u65e5\u672c\u8a9e" * 10, 21)
+        self.assertLessEqual(tui._dwidth(text), 21)
+        self.assertTrue(text.endswith("..."))
+        self.assertEqual(tui._dwidth(tui._pad("\u65e5", 6)), 6)
+
+    def test_paint_survives_nul_and_value_error(self):
+        class Screen:
+            def getmaxyx(self):
+                return 30, 100
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def addnstr(self, *a):
+                raise ValueError("embedded null character")
+
+        app = mock.Mock()
+        app.snap, app.ui = self._snap(), tui.UIState()
+        app.runner.running_keys.return_value = set()
+        tui._paint(Screen(), app, {})
 
     def test_tiny_terminal_message(self):
         lines = tui.render_lines(self._snap(), tui.UIState(), 20, 5)
@@ -420,7 +656,64 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(len(tail), 5)
 
 
+def _make_base_at(base):
+    (base / "routines").mkdir(exist_ok=True)
+    data = dict(ROUTINE, id="alpha")
+    (base / "routines" / "alpha.yaml").write_text(yaml.safe_dump(data))
+
+
 class CliTest(unittest.TestCase):
+    def test_resume_on_a_directory_is_a_clean_error(self):
+        import daemon as daemon_cli
+        with tempfile.TemporaryDirectory() as tmp:
+            state.pause_file(tmp).parent.mkdir()
+            state.pause_file(tmp).mkdir()
+            args = mock.Mock(action="resume")
+            with mock.patch.object(daemon_cli, "BASE_DIR", Path(tmp)), \
+                    mock.patch("sys.stderr") as err:
+                self.assertEqual(daemon_cli.cmd_ctl(args), 1)
+            self.assertTrue(err.write.called)
+
+    def test_script_derives_dir_and_python_from_the_plist(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "live"
+            live.mkdir()
+            (live / "daemon.py").write_text(
+                "import sys\nprint('LIVE', __file__.split('/')[-2], sys.argv[1:])\n")
+            agents = root / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            with open(agents / "com.t.x.plist", "wb") as fh:
+                plistlib.dump({"ProgramArguments": [
+                    sys.executable, str(live / "daemon.py"), "tick"]}, fh)
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(root),
+                   "MEMORY_DAEMON_LAUNCHD_LABEL": "com.t.x"}
+            result = subprocess.run(
+                ["bash", str(REPO / "memory-daemon-status.sh"), "state"],
+                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LIVE live ['ctl', 'state']", result.stdout)
+
+    def test_script_logs_n_and_missing_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "daemon.py").write_text("")
+            env = {"PATH": "/usr/bin:/bin", "HOME": tmp,
+                   "MEMORY_DAEMON_DIR": tmp}
+            script = str(REPO / "memory-daemon-status.sh")
+            missing = subprocess.run(["bash", script, "logs"],
+                                     capture_output=True, text=True, env=env)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("no log yet", missing.stderr)
+            (repo / "logs").mkdir()
+            (repo / "logs" / "run.log").write_text(
+                "".join(f"l{i}\n" for i in range(100)))
+            out = subprocess.run(["bash", script, "logs", "-n", "3"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(out.stdout.split(), ["l97", "l98", "l99"], out.stderr)
+
+
     def _run(self, base_args, env_extra=None):
         env = dict(os.environ, PATH="/usr/bin:/bin")
         env.update(env_extra or {})

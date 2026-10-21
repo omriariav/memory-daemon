@@ -29,6 +29,11 @@ class Paused(StateError):
     pass
 
 
+# `daemon.py run` exit code when every group was skipped on a busy lock
+# (sysexits EX_TEMPFAIL), so callers can tell "skipped" from "done".
+EXIT_LOCKED = 75
+
+
 def pause_file(base_dir):
     return Path(base_dir) / "state" / "PAUSED"
 

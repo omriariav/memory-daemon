@@ -95,19 +95,27 @@ def cmd_tui(args):
         print("tui needs a terminal; use `daemon.py status` or `ctl state`",
               file=sys.stderr)
         return 2
-    return tui.run_curses(BASE_DIR, interval=args.interval,
-                          label_prefix=args.label_prefix)
+    explicit = bool(args.base_dir or os.environ.get("MEMORY_DAEMON_DIR"))
+    return tui.run_curses(
+        Path(args.base_dir).expanduser() if args.base_dir else BASE_DIR,
+        interval=args.interval, label_prefix=args.label_prefix,
+        explicit=explicit)
 
 
 def cmd_ctl(args):
-    if args.action == "pause":
-        created = state.pause(BASE_DIR, args.reason)
-        print("paused" if created else "already paused")
-        return 0
-    if args.action == "resume":
-        removed = state.resume(BASE_DIR)
-        print("resumed" if removed else "was not paused")
-        return 0
+    try:
+        if args.action == "pause":
+            created = state.pause(BASE_DIR, args.reason)
+            print("paused" if created else "already paused")
+            return 0
+        if args.action == "resume":
+            removed = state.resume(BASE_DIR)
+            print("resumed" if removed else "was not paused")
+            return 0
+    except OSError as exc:
+        print(f"error: cannot change state/PAUSED: {exc.strerror or exc}",
+              file=sys.stderr)
+        return 1
     snap = tui.Collector(BASE_DIR, args.label_prefix).snapshot()
     print(tui.summary_line(snap))
     return 0
@@ -323,11 +331,13 @@ def cmd_run(args):
         )
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
+    attempted = locked = 0
     for group_ids, lock_name in _manual_execution_groups(
         routines, active_ids
     ):
         if not group_ids:
             continue
+        attempted += 1
         try:
             group_totals = runner.run(
                 BASE_DIR, routines, dry_run=args.dry_run,
@@ -344,6 +354,7 @@ def cmd_run(args):
                 f"run group={lock_name} skipped routines={skipped_ids} — "
                 f"{exc}"
             )
+            locked += 1
             continue
         except state.Paused as exc:
             log(f"run stopped: {exc}")
@@ -368,6 +379,9 @@ def cmd_run(args):
             f"(retried automatically next run)"
         )
     log(f"run done: {summary}")
+    if attempted and locked == attempted:
+        # Nothing ran: every group was busy. Distinct from a clean run.
+        return state.EXIT_LOCKED
     return 1 if totals["errors"] else 0
 
 
@@ -570,6 +584,9 @@ def main(argv=None):
     p_tui.add_argument("--label-prefix", default=default_prefix,
                        help="show every loaded launchd job whose label starts "
                             "with this (default: %(default)s)")
+    p_tui.add_argument("--base-dir", help="control this checkout instead of "
+                       "the one launchd runs (the UI then refuses to act "
+                       "if they differ)")
     p_tui.set_defaults(func=cmd_tui)
     p_ctl = sub.add_parser("ctl", help="pause, resume, or summarize state")
     p_ctl.add_argument("action", choices=("pause", "resume", "state"))

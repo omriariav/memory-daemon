@@ -11,11 +11,14 @@ Layers, thinnest last:
   given width and height. ``run_curses`` only paints those rows.
 """
 import os
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from workspace_daemon import claude_bridge, config, state, status
@@ -76,28 +79,113 @@ def discover_labels(prefix, run=launchctl_run):
     return sorted(labels)
 
 
-def reload_jobs(labels, run=launchctl_run, uid=None, plist_dir=None):
-    """bootout + bootstrap each label from its LaunchAgents plist.
+def _agents_dir(plist_dir=None):
+    return Path(plist_dir or Path.home() / "Library" / "LaunchAgents")
 
-    A label with no plist on disk is left loaded (it could not be restored).
-    Returns human-readable result lines.
+
+def _find_program(args):
+    """(interpreter, daemon.py) from a job's argument vector, or None."""
+    for i, arg in enumerate(args):
+        if os.path.basename(str(arg)) == "daemon.py" and i >= 1:
+            return str(args[i - 1]), str(arg)
+    return None
+
+
+def job_program(label, run=launchctl_run, uid=None, plist_dir=None):
+    """The (interpreter, daemon.py) a launchd job really runs, or None.
+
+    Reads `launchctl print`, then falls back to the plist's ProgramArguments.
     """
     uid = os.getuid() if uid is None else uid
-    plist_dir = Path(plist_dir or Path.home() / "Library" / "LaunchAgents")
+    rc, out = run(["print", f"gui/{uid}/{label}"])
+    if rc == 0:
+        match = re.search(
+            r"^\s*arguments = \{\n(.*?)^\s*\}", out, re.MULTILINE | re.DOTALL)
+        if match:
+            found = _find_program(
+                [ln.strip() for ln in match.group(1).splitlines() if ln.strip()])
+            if found:
+                return found
+    try:
+        with open(_agents_dir(plist_dir) / f"{label}.plist", "rb") as handle:
+            args = plistlib.load(handle).get("ProgramArguments") or []
+    except Exception:  # missing, unreadable or malformed plist
+        return None
+    return _find_program(list(args))
+
+
+def resolve_target(programs, current_dir, explicit=False):
+    """Decide which checkout the UI controls from what launchd actually runs.
+
+    ``programs`` are (interpreter, daemon.py) pairs of the loaded jobs. Returns
+    {"dir", "python", "conflict"}; ``dir`` is None when no job reveals one.
+    """
+    dirs = {}
+    for python, script in programs:
+        dirs.setdefault(Path(script).resolve().parent, python)
+    if not dirs:
+        return {"dir": None, "python": None, "conflict": None}
+    if len(dirs) > 1:
+        names = ", ".join(sorted(_short(d) for d in dirs))
+        return {"dir": None, "python": None,
+                "conflict": f"launchd jobs run different checkouts: {names}"}
+    (target, python), = dirs.items()
+    if explicit and target != Path(current_dir).resolve():
+        return {"dir": None, "python": None, "conflict": (
+            f"requested {_short(current_dir)} but launchd runs {_short(target)}")}
+    return {"dir": str(target), "python": python, "conflict": None}
+
+
+def _short(path):
+    text = str(path)
+    home = str(Path.home())
+    return "~" + text[len(home):] if text == home or text.startswith(home + os.sep) else text
+
+
+def reload_jobs(labels, run=launchctl_run, uid=None, plist_dir=None,
+                sleep=time.sleep, progress=None):
+    """bootout, wait until gone, bootstrap (with retries) from each plist.
+
+    A label with no plist is left loaded (it could not be restored). Returns
+    ``(lines, ok)``; on a failed bootstrap the lines include the exact command
+    that restores the job.
+    """
+    uid = os.getuid() if uid is None else uid
+    agents = _agents_dir(plist_dir)
     domain = f"gui/{uid}"
-    out = []
+    out, ok = [], True
+
+    def note(text):
+        if progress:
+            progress(text)
+
     for label in labels:
-        plist = plist_dir / f"{label}.plist"
+        plist = agents / f"{label}.plist"
         if not plist.is_file():
-            out.append(f"{label}: no plist at LaunchAgents, left loaded")
+            out.append(f"{label}: no plist in LaunchAgents, left loaded")
             continue
-        rc_out, _ = run(["bootout", f"{domain}/{label}"])
-        rc_in, _ = run(["bootstrap", domain, str(plist)])
+        target = f"{domain}/{label}"
+        note(f"reload {label}: unloading...")
+        run(["bootout", target])
+        for _ in range(20):
+            if run(["print", target])[0] != 0:
+                break
+            sleep(0.5)
+        note(f"reload {label}: loading...")
+        rc_in = 1
+        for delay in (0, 0.5, 1, 2):
+            if delay:
+                sleep(delay)
+            rc_in, _ = run(["bootstrap", domain, str(plist)])
+            if rc_in == 0:
+                break
         if rc_in == 0:
             out.append(f"{label}: reloaded")
         else:
-            out.append(f"{label}: bootstrap failed (rc={rc_in}, bootout rc={rc_out})")
-    return out
+            ok = False
+            out.append(
+                f"{label}: NOT LOADED. Restore: launchctl bootstrap {domain} {plist}")
+    return out, ok
 
 
 def _groups_for_label(label):
@@ -120,16 +208,81 @@ def routine_group(routine):
 
 # --- data model -------------------------------------------------------------
 
+PROBE_INTERVAL = 10.0
+HISTORY_INTERVAL = 5.0
+HISTORY_MAX_BYTES = 4 * 1024 * 1024
+
+
 class Collector:
-    """Builds snapshots; caches the YAML load and the (large) tick history."""
+    """Builds snapshots; caches the YAML load, launchd probe and tick history.
+
+    The launchd probe runs at most every ``PROBE_INTERVAL`` seconds. With
+    ``start_background()`` it runs on a thread, so a hung launchctl never
+    freezes the UI. Tick history is parsed from the last ``HISTORY_MAX_BYTES``
+    of run.log, at most every ``HISTORY_INTERVAL`` seconds and only when the
+    file changed.
+    """
 
     def __init__(self, base_dir, label_prefix=status.DEFAULT_LAUNCHD_LABEL,
-                 run=launchctl_run):
+                 run=launchctl_run, explicit=False, plist_dir=None):
         self.base_dir = Path(base_dir)
         self.label_prefix = label_prefix
         self.run = run
+        self.explicit = explicit
+        self.plist_dir = plist_dir
+        self._probe_result = None
+        self._probe_at = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+        self.retarget(self.base_dir)
+
+    def retarget(self, base_dir):
+        self.base_dir = Path(base_dir)
         self._routines = (None, [], None)
-        self._history = (None, None)
+        self._history = (None, None, 0.0)
+
+    # launchd probe
+    def probe(self):
+        """Query launchd now: jobs, and the programs they run."""
+        have = launchctl_available()
+        labels = discover_labels(self.label_prefix, self.run) if have else []
+        jobs = [status.probe_launchd(label) for label in labels or [self.label_prefix]]
+        programs = []
+        for job in jobs:
+            if job.get("loaded"):
+                found = job_program(job["label"], self.run, plist_dir=self.plist_dir)
+                if found:
+                    programs.append(found)
+        return {"have_launchctl": have, "jobs": jobs, "programs": programs}
+
+    def _probe_cached(self):
+        stale = self._probe_result is None or (
+            self._thread is None
+            and time.monotonic() - self._probe_at >= PROBE_INTERVAL)
+        if stale:
+            self._probe_result = self.probe()
+            self._probe_at = time.monotonic()
+        return self._probe_result
+
+    def start_background(self):
+        """Re-probe every PROBE_INTERVAL on a daemon thread."""
+        self._probe_cached()  # first result synchronously, before the UI starts
+        if self._thread is not None:
+            return
+
+        def loop():
+            while not self._stop.wait(PROBE_INTERVAL):
+                try:
+                    result = self.probe()
+                except Exception:
+                    continue
+                self._probe_result, self._probe_at = result, time.monotonic()
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
 
     def _load_routines(self):
         directory = config.routines_dir(self.base_dir)
@@ -157,10 +310,13 @@ class Collector:
             sig = (st.st_mtime_ns, st.st_size)
         except OSError:
             sig = None
-        if sig is not None and sig == self._history[0]:
-            return self._history[1]
-        history = status.read_tick_history(path)
-        self._history = (sig, history)
+        cached_sig, cached, at = self._history
+        if cached is not None and (
+                sig == cached_sig
+                or time.monotonic() - at < HISTORY_INTERVAL):
+            return cached
+        history = status.read_tick_history(path, max_bytes=HISTORY_MAX_BYTES)
+        self._history = (sig, history, time.monotonic())
         return history
 
     def snapshot(self, now=None):
@@ -169,10 +325,9 @@ class Collector:
         routines, routine_error = self._load_routines()
         if routine_error:
             problems.append(f"routines: {routine_error}")
-        have_launchctl = launchctl_available()
-        labels = discover_labels(self.label_prefix, self.run) if have_launchctl else []
-        probe_labels = labels or [self.label_prefix]
-        jobs = [status.probe_launchd(label) for label in probe_labels]
+        probe = self._probe_cached()
+        have_launchctl, jobs = probe["have_launchctl"], probe["jobs"]
+        target = resolve_target(probe["programs"], self.base_dir, self.explicit)
         running_groups = set()
         for job in jobs:
             if job.get("loaded") and job.get("state") == "running":
@@ -237,7 +392,8 @@ class Collector:
             f"{status._iso_age(latest['at'], now)} ({latest['state']})"
             if latest else "never recorded"
         )
-        attention = bool(problems) or any(r["flags"] for r in out_rows)
+        attention = (bool(problems) or bool(target["conflict"])
+                     or any(r["flags"] for r in out_rows))
         for job in jobs:
             if job.get("loaded") and job.get("last_exit") not in (None, 0):
                 attention = True
@@ -248,6 +404,7 @@ class Collector:
             "paused": pause,
             "jobs": jobs,
             "have_launchctl": have_launchctl,
+            "target": dict(target, current=str(self.base_dir)),
             "last_tick": last_tick,
             "spend_total": sum(spent.values()),
             "spend_cap": cap,
@@ -314,7 +471,7 @@ RUN_MODES = {"run": [], "dry": ["--dry-run"], "count": ["--count-only"]}
 
 
 def build_run_command(python, script, routine_id, mode="run"):
-    return [str(python), str(script), "run", "--routine", routine_id] + RUN_MODES[mode]
+    return [str(python), str(script), "run", f"--routine={routine_id}"] + RUN_MODES[mode]
 
 
 def build_tick_command(python, script, group):
@@ -330,6 +487,13 @@ class ActionRunner:
         self.script = script or self.base_dir / "daemon.py"
         self.popen = popen
         self.procs = {}  # key -> (proc, label)
+
+    def retarget(self, base_dir, python=None):
+        """Point at another checkout (and the interpreter launchd uses)."""
+        self.base_dir = Path(base_dir)
+        self.script = self.base_dir / "daemon.py"
+        if python and os.access(python, os.X_OK):
+            self.python = python
 
     @property
     def log_path(self):
@@ -387,7 +551,11 @@ class ActionRunner:
             rc = proc.poll()
             if rc is not None:
                 del self.procs[key]
-                done.append(f"{label}: finished" + ("" if rc == 0 else f" (exit {rc})"))
+                if rc == state.EXIT_LOCKED:
+                    done.append(f"{label}: skipped, another run holds the lock")
+                else:
+                    done.append(
+                        f"{label}: finished" + ("" if rc == 0 else f" (exit {rc})"))
         return done
 
 
@@ -407,7 +575,7 @@ def read_log_tail(path, max_lines=LOG_TAIL_LINES):
 
 
 def filter_log(lines, routine_id):
-    pattern = re.compile(r"(?<![\w-])" + re.escape(routine_id) + r"(?![\w-])")
+    pattern = re.compile(r"(?<![\w-])" + re.escape(str(routine_id)) + r"(?![\w-])")
     return [line for line in lines if pattern.search(line)]
 
 
@@ -452,18 +620,60 @@ HELP_LINES = [
 
 class App:
     def __init__(self, base_dir, collector=None, runner=None,
-                 label_prefix=status.DEFAULT_LAUNCHD_LABEL, run=launchctl_run):
+                 label_prefix=status.DEFAULT_LAUNCHD_LABEL, run=launchctl_run,
+                 explicit=False, spawn=None):
         self.base_dir = Path(base_dir)
         self.run = run
-        self.collector = collector or Collector(base_dir, label_prefix, run)
+        self.collector = collector or Collector(
+            base_dir, label_prefix, run, explicit=explicit)
         self.runner = runner or ActionRunner(base_dir)
+        self.spawn = spawn or self._spawn_thread
+        self.reloading = False
+        self.reload_result = None
         self.ui = UIState()
         self.snap = None
         self.refresh()
 
+    @staticmethod
+    def _spawn_thread(fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _retarget(self):
+        """Follow launchd: control the checkout and interpreter it runs."""
+        target = self.snap["target"]
+        new = Path(target["dir"]) if target["dir"] else None
+        if target["conflict"] or new is None or not (new / "daemon.py").is_file():
+            return False
+        changed = new.resolve() != self.base_dir.resolve()
+        if changed:
+            self.base_dir = new
+            self.collector.retarget(new)
+        self.runner.retarget(self.base_dir, target["python"])
+        return changed
+
+    def _blocked(self):
+        """Why p/r/t/L must not act right now (and say so), or None."""
+        conflict = self.snap["target"]["conflict"]
+        if conflict:
+            self.ui.message = f"controls disabled: {conflict}"
+            return True
+        if self.reloading:
+            self.ui.message = "a launchd reload is in progress"
+            return True
+        return False
+
     # data
     def refresh(self):
         self.snap = self.collector.snapshot()
+        if self._retarget():
+            self.snap = self.collector.snapshot()
+        if self.reload_result is not None:
+            lines, ok = self.reload_result
+            self.reload_result, self.reloading = None, False
+            if ok:
+                self.ui.message = "; ".join(lines)
+            else:
+                self._show_text("launchd reload FAILED: restore manually", lines)
         self.ui.log_lines = read_log_tail(self.base_dir / "logs" / "run.log")
         for msg in self.runner.reap():
             self.ui.message = msg
@@ -574,10 +784,15 @@ class App:
         ui.mode, ui.text_title, ui.text_lines, ui.text_scroll = "text", title, lines, 0
 
     def confirm(self, text, fn):
-        self.ui.prompt = Prompt(
-            text + " [y/N]", "yn", lambda k: fn() if k == "y" else None)
+        def answer(key):
+            if key == "y" and not self._blocked():
+                fn()
+
+        self.ui.prompt = Prompt(text + " [y/N]", "yn", answer)
 
     def _toggle_pause(self):
+        if self._blocked():
+            return
         if self.snap["paused"]:
             self.confirm("Resume the daemon (remove state/PAUSED)?", self._resume)
         else:
@@ -604,7 +819,12 @@ class App:
         if row is None:
             self.ui.message = "no routine selected"
             return
+        if self._blocked():
+            return
         rid = row["id"]
+        if mode == "count" and row["group"] != "capture":
+            self.ui.message = "count-only applies to capture routines"
+            return
         if not row["enabled"]:
             self.ui.message = f"{rid} is disabled; enable it in its YAML first"
             return
@@ -626,6 +846,8 @@ class App:
         self.confirm(f"{verb} {rid}?{extra}", go)
 
     def _ask_tick(self):
+        if self._blocked():
+            return
         legend = " ".join(f"{k}={g}" for k, g in TICK_GROUPS)
         groups = dict(TICK_GROUPS)
 
@@ -648,14 +870,35 @@ class App:
         if sys.platform != "darwin" or not self.snap["have_launchctl"]:
             self.ui.message = "reload: needs macOS launchctl; skipped"
             return
-        labels = [j["label"] for j in self.snap["jobs"] if j.get("loaded")]
+        if self._blocked():
+            return
+        loaded = [j for j in self.snap["jobs"] if j.get("loaded")]
+        labels = [j["label"] for j in loaded]
         if not labels:
             self.ui.message = "reload: no loaded launchd jobs match the prefix"
             return
+        busy = [j["label"] for j in loaded if j.get("state") == "running"]
+        if busy:
+            self.ui.message = (
+                "reload refused: a tick is running (" + ", ".join(busy)
+                + "); unloading would kill it. Retry when idle")
+            return
+
+        def work():
+            try:
+                result = reload_jobs(
+                    labels, self.run, plist_dir=self.collector.plist_dir,
+                    progress=lambda text: setattr(self.ui, "message", text))
+            except Exception as exc:
+                result = ([f"reload crashed: {exc}"]
+                          + [f"Check: launchctl print gui/{os.getuid()}/{x}"
+                             for x in labels], False)
+            self.reload_result = result
 
         def go():
-            self.ui.message = "; ".join(reload_jobs(labels, self.run))
-            self.refresh()
+            self.reloading = True
+            self.ui.message = "reloading launchd jobs..."
+            self.spawn(work)
 
         self.confirm(f"Reload {len(labels)} launchd job(s) (bootout+bootstrap)?", go)
 
@@ -674,11 +917,44 @@ class App:
 
 # --- rendering --------------------------------------------------------------
 
+def _sanitize(text):
+    """Control characters (NUL, C1, escapes) would crash or garble curses."""
+    return "".join(
+        " " if ch == "\t" else
+        "?" if ord(ch) < 32 or 127 <= ord(ch) < 160 else ch
+        for ch in str(text))
+
+
+def _cw(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _dwidth(text):
+    return sum(_cw(ch) for ch in text)
+
+
+def _cut(text, cols):
+    out, used = [], 0
+    for ch in text:
+        w = _cw(ch)
+        if used + w > cols:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
 def _clip(text, width):
-    text = text.replace("\t", " ")
-    if len(text) <= width:
+    text = _sanitize(text)
+    if _dwidth(text) <= width:
         return text
-    return text[:max(0, width - 3)] + "..." if width > 3 else text[:width]
+    return _cut(text, width - 3) + "..." if width > 3 else _cut(text, width)
+
+
+def _pad(text, width):
+    return text + " " * max(0, width - _dwidth(text))
 
 
 def _money(value):
@@ -712,7 +988,7 @@ def _row_cells(row, running):
     if running:
         flags.insert(0, "running...")
     return {
-        "id": row["id"],
+        "id": str(row["id"]),
         "status": row["status"],
         "last": last,
         "next": row["next"],
@@ -757,7 +1033,7 @@ def _table_lines(snap, ui, running, width, height):
 
     def fmt(values):
         return "  " + "  ".join(
-            _clip(values[key], w[key]).ljust(w[key]) for key, _, _ in cols
+            _pad(_clip(values[key], w[key]), w[key]) for key, _, _ in cols
         )
 
     lines = [(_clip(fmt({k: h for k, h, _ in COLUMNS}), width), "title")]
@@ -797,7 +1073,7 @@ def _log_lines(snap, ui, width, height, title_extra=""):
         if raw is not None:
             raw = filter_log(raw, row["id"])
     title += title_extra
-    lines = [(_clip(title, width).ljust(width), "title")]
+    lines = [(_pad(_clip(title, width), width), "title")]
     avail = max(0, height - 1)
     if raw is None:
         body = ["(no logs/run.log yet)"]
@@ -834,6 +1110,12 @@ def _header_lines(snap, width):
         (_clip(f"Last tick: {snap['last_tick']}   Spend today: {spend}", width),
          "normal"),
     ]
+    target = snap.get("target") or {}
+    if target.get("conflict"):
+        lines.append((_clip(
+            f"WARNING: {target['conflict']}. p/r/t/L are disabled.", width), "bad"))
+    elif target.get("current"):
+        lines.append((_clip(f"Target: {_short(target['current'])}", width), "dim"))
     for problem in snap["problems"][:2]:
         lines.append((_clip(f"ATTENTION: {problem}", width), "bad"))
     return lines
@@ -927,16 +1209,18 @@ def _paint(stdscr, app, attrs):
     for y, (text, style) in enumerate(lines[:height]):
         try:
             stdscr.addnstr(y, 0, text, max(0, width - 1), attrs.get(style, 0))
-        except curses.error:
-            pass  # writing the bottom-right cell raises; harmless
+        except (curses.error, ValueError):
+            pass  # bottom-right cell raises curses.error; NUL raises ValueError
     stdscr.refresh()
 
 
-def run_curses(base_dir, interval=2.0, label_prefix=status.DEFAULT_LAUNCHD_LABEL):
+def run_curses(base_dir, interval=2.0, label_prefix=status.DEFAULT_LAUNCHD_LABEL,
+               explicit=False):
     if curses is None:
         print("curses is not available on this platform", file=sys.stderr)
         return 2
-    app = App(base_dir, label_prefix=label_prefix)
+    app = App(base_dir, label_prefix=label_prefix, explicit=explicit)
+    app.collector.start_background()
 
     def loop(stdscr):
         try:
@@ -959,3 +1243,5 @@ def run_curses(base_dir, interval=2.0, label_prefix=status.DEFAULT_LAUNCHD_LABEL
         return curses.wrapper(loop)
     except KeyboardInterrupt:
         return 130
+    finally:
+        app.collector.stop()
