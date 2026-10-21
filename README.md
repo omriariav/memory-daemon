@@ -1218,15 +1218,17 @@ connector, so people are identified by Slack user id only.
 
 How a run works:
 
-1. Search is the lister, oldest first. One bridge session runs the planned
-   searches: the watched channels (`in:<#id>` terms, 15 per query), one
+1. Search is the lister, oldest first. One bridge session runs the first page
+   of every planned search (each session carries a fixed cost, so a run never
+   splits them): the watched channels (`in:<#id>` terms, 15 per query), one
    `from:<@id>` query per person, and one mention query by keyword
    (`mention_keywords`, default `<@{self_user_id}>`). Each uses
    `after=<cursor minus overlap>`, `sort=timestamp`, `sort_dir=asc`,
    `include_context=false`, `content_types=messages`,
    `response_format=detailed` and `limit=20`; pages that
-   report a cursor are followed in later sessions, up to `max_search_pages`.
-   Searches are spaced `min_seconds_between_searches` apart and a run plans at
+   report a cursor are followed in later sessions, one session per page round
+   for all queries still paging, up to `max_search_pages`.
+   Sessions are spaced `min_seconds_between_searches` apart and a run plans at
    most `max_queries_per_run`. Every new root and reply comes back with its
    channel, author, timestamp and thread root, so late replies to old threads
    surface without reading channels. Mention and DM hits parse like any other.

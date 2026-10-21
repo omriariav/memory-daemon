@@ -82,7 +82,6 @@ SOURCE_KEYS = set(DEFAULTS) | {
 CURSOR_SCHEMA = 1
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
-CALLS_PER_SESSION = 10
 THREADS_PER_SESSION = 8
 MAX_READ_ATTEMPTS = 3
 # A thread read alone in its session that yields nothing, run after run.
@@ -607,7 +606,7 @@ def _one_session(cfg, tool, pins, calls, what, required):
         base_dir=_base_dir,
         max_turns=len(calls) + 4,
         max_budget_usd=round(0.1 + 0.03 * len(calls), 2),
-        timeout=BRIDGE_TIMEOUT,
+        timeout=max(BRIDGE_TIMEOUT, 60 + 8 * len(calls)),
         attempts=BRIDGE_ATTEMPTS,
         required=required,
         accept_partial=True,
@@ -726,59 +725,59 @@ def _search_all(cfg, queries, afters, now):
     for page in range(cfg["max_search_pages"]):
         order = sorted(pending)
         following = {}
-        for start in range(0, len(order), CALLS_PER_SESSION):
-            part = order[start:start + CALLS_PER_SESSION]
-            _pace(cfg)
-            texts = _session(
-                cfg, cfg["search_tool"], _search_pins(cfg),
-                [pending[i] for i in part], "search", [cfg["search_tool"]],
-                pace=True,
-            )
-            for index, text in zip(part, texts):
-                if text is None:
-                    raise claude_bridge.BridgeError(
-                        "a planned search call returned no result"
-                    )
-                query = queries[index]
-                key = query["key"]
-                after = afters[key]
-                try:
-                    hits, cursor = parse_search(text)
-                    trusted = getattr(hits, "trusted", None)
-                    stamps = [
-                        float(h["ts"])
-                        for h in (hits if trusted is None else trusted)
-                    ]
-                    last = newest.get(index)
-                    if cursor and stamps and (
-                        stamps != sorted(stamps)
-                        or (last is not None and stamps[0] < last)
-                    ):
-                        raise SlackMcpError(
-                            "search results are not in ascending order"
-                        )
-                except SlackMcpError as exc:
-                    failed.add(key)
-                    log(f"slack_mcp: {query['kind']} search failed: {exc}")
-                    continue
-                accepted = [
-                    h for h in hits if _valid_hit(query, h, after, now, cfg)
+        # Every call of this page round shares one session: a session has a
+        # fixed cost, and the round's calls do not depend on each other.
+        calls = [pending[i] for i in order]
+        _pace(cfg)
+        texts = _session(
+            cfg, cfg["search_tool"], _search_pins(cfg), calls,
+            "search", [cfg["search_tool"]], pace=True,
+        )
+        for index, text in zip(order, texts):
+            if text is None:
+                raise claude_bridge.BridgeError(
+                    "a planned search call returned no result"
+                )
+            query = queries[index]
+            key = query["key"]
+            after = afters[key]
+            try:
+                hits, cursor = parse_search(text)
+                trusted = getattr(hits, "trusted", None)
+                stamps = [
+                    float(h["ts"])
+                    for h in (hits if trusted is None else trusted)
                 ]
-                if stamps:
-                    # Parsed hits, in validated ascending order, bound the
-                    # prefix read even when none passed the cross-checks.
-                    newest[index] = max(stamps)
-                found.extend((query, hit) for hit in accepted)
-                if cursor and not hits:
-                    log(f"slack_mcp: {query['kind']} search returned an "
-                        "empty page with a cursor; treating it as the end")
-                elif cursor and page + 1 >= cfg["max_search_pages"]:
-                    mark = newest.get(index, float(after))
-                    capped[key] = min(capped.get(key, mark), mark)
-                elif cursor:
-                    following[index] = _search_args(
-                        cfg, query, after, cursor
+                last = newest.get(index)
+                if cursor and stamps and (
+                    stamps != sorted(stamps)
+                    or (last is not None and stamps[0] < last)
+                ):
+                    raise SlackMcpError(
+                        "search results are not in ascending order"
                     )
+            except SlackMcpError as exc:
+                failed.add(key)
+                log(f"slack_mcp: {query['kind']} search failed: {exc}")
+                continue
+            accepted = [
+                h for h in hits if _valid_hit(query, h, after, now, cfg)
+            ]
+            if stamps:
+                # Parsed hits, in validated ascending order, bound the
+                # prefix read even when none passed the cross-checks.
+                newest[index] = max(stamps)
+            found.extend((query, hit) for hit in accepted)
+            if cursor and not hits:
+                log(f"slack_mcp: {query['kind']} search returned an "
+                    "empty page with a cursor; treating it as the end")
+            elif cursor and page + 1 >= cfg["max_search_pages"]:
+                mark = newest.get(index, float(after))
+                capped[key] = min(capped.get(key, mark), mark)
+            elif cursor:
+                following[index] = _search_args(
+                    cfg, query, after, cursor
+                )
         pending = following
         if not pending:
             break

@@ -383,6 +383,42 @@ class ListingTest(BridgeTestCase):
         ])
         self.assertEqual(len(self.connector.calls), 1)  # one session
 
+    def test_all_first_pages_share_one_session(self):
+        people = ["U0EXAMPLEC", "U0EXAMPLED", "U0EXAMPLEE"]
+        slack_mcp.candidates(source(people=people, include_mentions=True))
+        self.assertEqual(len(self.connector.calls), 1)
+        planned = re.findall(r"^\d+\. ", self.connector.prompts[0], re.M)
+        self.assertEqual(len(planned), 5)  # channels + 3 people + mentions
+        self.assertEqual(self.slept, [])
+
+    def test_follow_up_pages_share_one_later_session_per_round(self):
+        pages = {}
+
+        def search(args):
+            key = args.get("filters") or "me"
+            pages[key] = pages.get(key, 0) + 1
+            more = pages[key] < 3
+            return search_text(
+                [{"ts": ts_at(10 * pages[key])}],
+                cursor="MORE" if more else None,
+            )
+
+        self.connector.search = search
+        slack_mcp.candidates(source(
+            people=["U0EXAMPLEC"], include_mentions=True,
+            max_search_pages=5, min_seconds_between_searches=3,
+        ))
+        self.assertEqual(len(self.connector.calls), 3)  # one per page round
+        self.assertEqual(len(self.slept), 2)  # only between sessions
+        self.assertEqual(self.slept[0], 3.0)
+
+    def test_many_queries_still_fit_one_session(self):
+        slack_mcp.candidates(source(
+            people=[f"U0EXAMPLE{n:02d}" for n in range(14)],
+            include_mentions=True,
+        ))
+        self.assertEqual(len(self.connector.calls), 1)
+
     def test_each_query_lists_from_its_own_cursor(self):
         afters = {}
 
