@@ -340,9 +340,9 @@ class ReactionReadTest(InboxTestCase):
 
     def test_track_and_save_emoji_are_not_handled(self):
         self.answer = reactions_text(
-            ("omribot-track", [ME]), (SAVE, [ME]), ("pray", [ME]),
+            (TRACK, [ME]), (SAVE, [ME]), ("pray", [ME]),
         )
-        self.run_once({"channels": [CHAN], "track_reactions": ["omribot-track"]},
+        self.run_once({"channels": [CHAN], "track_reactions": [TRACK]},
                       save_reactions=[SAVE])
         self.assertEqual(
             [r["emoji"] for r in self.reactions()], ["pray"]
