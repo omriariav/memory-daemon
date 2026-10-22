@@ -410,6 +410,9 @@ same source item, ownership is resolved before the processed ledger is checked:
 2. Within either class, lower `routing.priority` wins (default `100`).
 3. Equal-ranked distinct routines are ambiguous. The item is skipped with an
    error instead of letting YAML filename order choose its prompt.
+   This also happens when two capture routines list the same Slack thread,
+   for example a people search that overlaps another routine's channels or
+   DMs; set `routing.priority` on one of them to pick the owner.
 
 This makes a low-frequency, broad inbox sweep safe as a fallback:
 
