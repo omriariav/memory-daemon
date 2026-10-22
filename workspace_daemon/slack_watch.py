@@ -373,10 +373,14 @@ def expand(source):
             # Only the connector-backed source can search by reaction.
             if value and source.get("kind") == "slack_mcp":
                 merged[key] = list(value)
-        elif key in ("dm_sessions", "comms_inbox"):
-            # Only the connector-backed source can read a DM conversation or
-            # keep the comms inbox.
+        elif key == "dm_sessions":
+            # Only the connector-backed source can read a DM conversation.
             if value and source.get("kind") == "slack_mcp":
+                merged[key] = dict(value)
+        elif key == "comms_inbox":
+            # Only the connector-backed source keeps the comms inbox; an
+            # empty block is meaningful (record followed threads only).
+            if value is not None and source.get("kind") == "slack_mcp":
                 merged[key] = dict(value)
         elif value not in ([], False):
             merged[key] = value

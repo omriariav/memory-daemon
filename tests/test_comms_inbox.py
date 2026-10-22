@@ -856,6 +856,17 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(merged["comms_inbox"]["reactions"], [ACK])
             merged, _ = slack_watch.expand({"kind": "slack", "watch": str(path)})
             self.assertNotIn("comms_inbox", merged)
+            path.write_text(f"channels: [{CHAN}]\ncomms_inbox: {{}}\n")
+            merged, err = slack_watch.expand(
+                {"kind": "slack_mcp", "watch": str(path)}
+            )
+            self.assertIsNone(err)
+            self.assertEqual(merged["comms_inbox"], {})
+            path.write_text(f"channels: [{CHAN}]\n")
+            merged, _ = slack_watch.expand(
+                {"kind": "slack_mcp", "watch": str(path)}
+            )
+            self.assertNotIn("comms_inbox", merged)
             path.write_text("comms_inbox: {retention_days: 0}\n")
             with self.assertRaises(slack_watch.WatchError):
                 slack_watch.load(str(path))
