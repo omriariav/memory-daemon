@@ -11,7 +11,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
-from . import slack_watch
+from . import comms_inbox, slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
@@ -1678,6 +1678,27 @@ def _validate_slack_mcp(prefix, source):
             f"{prefix}.read_channel_tool must be the exact read-only MCP tool "
             "mcp__<server>__slack_read_channel"
         )
+    inbox = source.get("comms_inbox")
+    inbox_problem = None if inbox is None else comms_inbox.problem(inbox)
+    if inbox_problem:
+        problems.append(f"{prefix}.comms_inbox {inbox_problem}")
+    elif (
+        inbox is not None and inbox.get("all_dms") is True
+        and source.get("all_dms") is not True
+    ):
+        problems.append(
+            f"{prefix}.comms_inbox.all_dms needs all_dms: true (no other "
+            "query lists every DM)"
+        )
+    reactions_tool = source.get("reactions_tool")
+    if reactions_tool is not None and not (
+        _read_only_tool(reactions_tool, "slack_get_reactions")
+        and _MCP_TOOL.match(reactions_tool).group(1) == "slack_get_reactions"
+    ):
+        problems.append(
+            f"{prefix}.reactions_tool must be the exact read-only MCP tool "
+            "mcp__<server>__slack_get_reactions"
+        )
     owner = source.get("self_user_id")
     if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
         problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")
@@ -1809,6 +1830,13 @@ def _validate_slack_mcp(prefix, source):
         + (1 if source.get("include_mentions") is True else 0)
         + (1 if source.get("all_dms") is True else 0)
         + (len(reactions) if reactions_ok and reactions else 0)
+        + (
+            len(set(inbox.get("reactions") or [])
+                - set(reactions if reactions_ok and reactions else []))
+            + len(inbox.get("track_reactions") or [])
+            + (1 if inbox.get("follow_threads") is True else 0)
+            if inbox is not None and not inbox_problem else 0
+        )
     )
     cap = source.get("max_queries_per_run", 20)
     if _bounded_int(cap, 1, 100) and planned > cap:

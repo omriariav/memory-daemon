@@ -22,6 +22,10 @@ candidate ids.
       channel_types: [im, mpim]
     owner_action_channels:
       - C0EXAMPLE01
+    comms_inbox:              # slack_mcp only: local record for a reply tracker
+      channels: [C0EXAMPLE01] # (see comms_inbox.py for the file format)
+      all_dms: true
+      reactions: [eyes]
     bootstrap: 3d             # first-run look-back when no cursor exists
     discover_from: ~/path/slack-discovered.yaml   # channels found by discovery
     ignore_channels: [C0EXAMPLE09]                # never added by discovery
@@ -45,13 +49,13 @@ from pathlib import Path
 
 import yaml
 
-from . import state
+from . import comms_inbox, state
 from .shell import log
 
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap", "all_dms", "discover_from", "ignore_channels",
-    "save_reactions", "dm_sessions",
+    "save_reactions", "dm_sessions", "comms_inbox",
 }
 DM_SESSION_KEYS = {"enabled", "gap_minutes", "max_span_hours", "channel_types"}
 DM_SESSION_TYPES = ("im", "mpim")
@@ -239,6 +243,12 @@ def _parse(path):
         if problem:
             raise WatchError(f"`dm_sessions` {problem}")
         dm_sessions = dict(dm_sessions)
+    inbox = data.get("comms_inbox")
+    if inbox is not None:
+        problem = comms_inbox.problem(inbox)
+        if problem:
+            raise WatchError(f"`comms_inbox` {problem}")
+        inbox = dict(inbox)
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
@@ -258,6 +268,7 @@ def _parse(path):
         "all_dms": all_dms,
         "save_reactions": reactions,
         "dm_sessions": dm_sessions,
+        "comms_inbox": inbox,
         "owner_action_channels": _ids(
             data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
@@ -365,6 +376,11 @@ def expand(source):
         elif key == "dm_sessions":
             # Only the connector-backed source can read a DM conversation.
             if value and source.get("kind") == "slack_mcp":
+                merged[key] = dict(value)
+        elif key == "comms_inbox":
+            # Only the connector-backed source keeps the comms inbox; an
+            # empty block is meaningful (record followed threads only).
+            if value is not None and source.get("kind") == "slack_mcp":
                 merged[key] = dict(value)
         elif value not in ([], False):
             merged[key] = value

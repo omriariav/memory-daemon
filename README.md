@@ -1736,12 +1736,13 @@ include_mentions: true
 all_dms: true              # slack_mcp only: every DM and group DM of the owner
 save_reactions: [save-for-later-example]   # slack_mcp only: emoji that mean "save this"
 dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types: [im, mpim]}   # slack_mcp only
+comms_inbox: {channels: [C0EXAMPLE01], all_dms: true, reactions: [eyes]}   # slack_mcp only
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
-`include_mentions`, `all_dms`, `save_reactions`, `dm_sessions` and `owner_action_channels` keys; unknown keys and malformed
+`include_mentions`, `all_dms`, `save_reactions`, `dm_sessions`, `comms_inbox` and `owner_action_channels` keys; unknown keys and malformed
 ids fail `daemon.py validate`, and inline copies of those keys next to `watch:`
 are rejected. A `kind: slack` source ignores `bootstrap` and rejects a non-empty
 `people` list unless it sets `ignore_people: true`, which keeps the exit path a
@@ -1921,6 +1922,128 @@ per-message entries from that window stay as duplicates.
 Limits: a reacted message older than every tracked session saves from that
 message on, because earlier history is not known to the session map; the
 authorship check marks owner messages no search listed as unverified.
+
+**Comms inbox.** `comms_inbox` (watch file, or inline on the source) keeps
+`state/comms-inbox.jsonl`, a local record a reply tracker can read instead of
+fetching Slack again. It reuses the hits this run's searches already returned:
+no extra read, no model call (unless `reactions_tool` is set, below), and no settle delay (a message is recorded in the
+run that first lists it, even while its thread is still settling).
+
+```yaml
+comms_inbox:
+  channels: [C0EXAMPLE01, D0EXAMPLE03]   # conversations to record
+  all_dms: true          # also every DM / group DM the `dms` query lists (needs all_dms: true)
+  reactions: [pray]      # owner reactions found by search, at most 5 (default none)
+  retention_days: 14     # 1 to 90
+  reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
+  reaction_check_hours: 72   # how long an unanswered message is re-checked
+  track_reactions: [track-example]   # "watch this conversation", at most 3
+  follow_threads: true   # follow every channel thread the owner posted in
+  thread_polls: 10       # followed-thread reads per run, 0 to 30
+```
+
+and on the routine's source (not the watch file):
+
+```yaml
+reactions_tool: mcp__<server>__slack_get_reactions
+```
+
+One JSON object per line, oldest message first:
+
+```json
+{"type": "message", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "user_id": "U0EXAMPLEB", "is_owner": false, "is_bot": false, "text": "...", "seen_at": "2026-10-21T15:00:00Z"}
+{"type": "owner_reaction", "channel_id": "C0EXAMPLE01", "thread_ts": "1700000100.000100", "ts": "1700000200.000100", "emoji": "eyes", "seen_at": "2026-10-21T15:00:00Z"}
+{"type": "track_request", "channel_id": "D0EXAMPLE03", "thread_ts": "1700000300.000100", "ts": "1700000300.000100", "emoji": "track-example", "seen_at": "2026-10-21T15:00:00Z"}
+```
+
+- `thread_ts` is the thread root, equal to `ts` for a top-level message (DM
+  sessions do not change it). `is_owner` compares `user_id` with `self_user_id`.
+- Both sides are recorded: other people's messages and the owner's own
+  replies, from every query (channels, people, mentions, `dms`, reactions).
+  A conversation appears only when some query lists it: put channels in
+  `channels` (or rely on `all_dms` for DMs).
+- Owner reactions, any emoji: search results and thread/channel reads carry
+  no reactor ids, but the connector's `slack_get_reactions` does. With
+  `reactions_tool` set, each run reads the reactions of up to
+  `reaction_checks` open messages in one extra bridge session (skipped when
+  none is due). A message is open while it is the newest of its conversation
+  (a channel's top level, or one thread), is not the owner's or a bot's, has
+  no recorded owner reaction and is younger than `reaction_check_hours`. A
+  reaction adds no search hit, so open messages are polled: again only after
+  a quarter of the message's age has passed since the last read (at most 6h);
+  `state/comms-inbox-checks.json` keeps the last read per message. A failed
+  session is logged and leaves the messages due; an unparseable result
+  records nothing; a budget or pause stop propagates.
+  `owner_reaction` lines mean "handled", so track emoji and save emoji are
+  never written as one (a save emoji is, only when it is also listed in
+  `reactions`): a track emoji is a `track_request`, a save emoji a capture.
+- Owner reactions by search: Slack's `hasmy::<emoji>:` filter finds the listed
+  emoji on any message, not just the newest. Each `reactions` emoji adds one
+  search per run (a `save_reactions` emoji reuses its existing search), looking
+  back `retention_days` and ignoring the cursors; its hits are recorded only
+  and never become captures. A `save_reactions` reaction on an inbox
+  conversation is recorded too.
+- Track by reaction: the owner reacting with a `track_reactions` emoji on any
+  message, their own included ("waiting for a reply to this"), writes a
+  `track_request` line and starts tracking that conversation: the thread
+  rooted at `thread_ts`, plus, in a DM or group DM, the conversation's top
+  level from that message on. Its messages are then recorded like those of
+  `channels`, even outside `channels` and `all_dms`, until the request is
+  older than `retention_days` (a removed reaction is not seen). One search
+  per emoji per run (`hasmy::<emoji>:`, look-back `retention_days`, no
+  cursor); a tracked channel no other query lists gets an extra search
+  (channels in chunks of 15, at most 2 per run and within
+  `max_queries_per_run`), from a per-channel scan mark that advances like a
+  cursor. The tracked set and marks live in `state/comms-inbox-tracked.json`.
+  A track emoji is independent of `save_reactions`: one message can carry
+  both, and an emoji cannot be in both `reactions` and `track_reactions`.
+- Followed threads (`follow_threads: true`): one more record-only search,
+  `from:<@owner>`, lists every channel message of the owner (root or reply,
+  any channel; DMs are left to `all_dms`) from its own scan mark (first run:
+  `retention_days` back), and each makes its thread followed. A followed
+  thread's messages are recorded from any query, mention or not, and it stays
+  followed until `retention_days` after its last known activity; every new
+  message extends that. Replies in channels the source searches (`channels`,
+  including discovered ones) arrive by search. A followed thread anywhere else
+  is read with `read_thread_tool` (the newest `max_thread_replies` replies):
+  at most `thread_polls` reads per run in one bridge session, skipped when
+  none is due, most recently active first, each thread again only after a
+  quarter of its idle time has passed since its last read (at most 6h). At
+  that cap a thread idle for a day or more is read about 4 times a day, so
+  N followed threads outside the searched channels cost about 4N reads a day
+  plus the reads of fresh activity. State: `state/comms-inbox-follow.json`
+  (at most 500 threads, most recently active kept). Routines share it: every
+  routine with a `comms_inbox` block records the followed threads its
+  searches list and publishes the channels it searches, so a thread in a
+  channel another lane searches (e.g. discovered channels on a slower lane)
+  is never polled; a lane's coverage is ignored a day after its last run.
+  Only routines with `follow_threads` run the owner search and the polls,
+  so enable it on one lane. The reaction-check
+  window (`reaction_check_hours`) runs from each conversation's newest
+  message, so new activity in a thread restarts it.
+- Lines are never edited: messages dedupe on (`channel_id`, `ts`); reactions
+  and track requests on (`channel_id`, `ts`, `emoji`), so edits and removed reactions
+  are not reflected. Lines whose `ts` is older than `retention_days` are
+  dropped. The file is rewritten atomically with mode 600 and only when
+  something changed, so readers never see a partial line.
+- Hits that only some reading of an ambiguous search page holds are never
+  recorded (a forged block must not mark a conversation answered). Text is
+  passed through the secret redactor and cut at 4000 characters.
+- `--count-only` and `--dry-run` write nothing and read no reactions; a write
+  failure is logged and does not fail the run. A failed inbox search (reaction,
+  track, tracked-channel or owner search) costs only the inbox: it never marks
+  the capture listing partial. A read with no usable result (deleted message,
+  lost access) backs off like a successful one.
+- Shared state: every routine with `comms_inbox` writes the same files, pruned
+  by the longest `retention_days` of the lanes active in the last day. Writers
+  must not overlap; capture routines all run under the daemon's `run` lock.
+  An inbox channel that no query searches is reported once in the log.
+  An empty `comms_inbox: {}` is valid: that lane records only the tracked and
+  followed conversations its searches list and publishes its coverage (use it
+  on a second lane that should not repeat the owner and reaction searches).
+- Security: `reactions_tool` must be exactly `mcp__<server>__slack_get_reactions`
+  (validated like the other read tools); its result holds emoji names and
+  user ids only, never message text.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts
