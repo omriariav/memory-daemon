@@ -2185,7 +2185,8 @@ def _route_claims(claims, totals, failures=(), held_source_keys=None):
             totals["ambiguous"] += 1
             log(
                 f"ownership ERROR source={kind} id={item_id}: equal-ranked "
-                f"routines {ids}; skipped"
+                f"routines {ids}; skipped; set routing.priority on one of them "
+                f"(lower wins)"
             )
             continue
         claim = winners[0]

@@ -520,12 +520,18 @@ class OwnershipRoutingTest(unittest.TestCase):
     def test_equal_rank_is_ambiguous_not_file_order(self):
         one, two = {"id": "one"}, {"id": "two"}
         totals = {"errors": 0, "ambiguous": 0}
-        owned = runner._route_claims(
-            {("gmail", "same"): [self.claim(one), self.claim(two)]},
-            totals,
-        )
+        with mock.patch.object(runner, "log") as log:
+            owned = runner._route_claims(
+                {("gmail", "same"): [self.claim(one), self.claim(two)]},
+                totals,
+            )
         self.assertEqual(owned, {})
         self.assertEqual(totals, {"errors": 1, "ambiguous": 1})
+        # The prefix is stable for greps; the hint names the fix.
+        message = log.call_args.args[0]
+        self.assertIn("ownership ERROR source=gmail id=same: equal-ranked", message)
+        self.assertIn("routines one, two; skipped", message)
+        self.assertIn("set routing.priority on one of them (lower wins)", message)
 
     def test_managed_followup_claim_beats_ordinary_same_routine_claim(self):
         routine = {"id": "gmail-sweep"}
