@@ -34,7 +34,8 @@ def ts_at(offset, micro=100):
 
 def hit_block(index, total, ch=CHAN, uid=BOB, name="Bob Example", ts=ROOT,
               root=None, text="hello", bot=False, replies=None,
-              dm=False, link_ts=None, link_ch=None, label=None, people=None):
+              dm=False, link_ts=None, link_ch=None, label=None, people=None,
+              masked=False):
     author = (
         "From:  (ID: U00)  [BOT]" if bot
         else f"From: {name} <[EMAIL:***]> (ID: {uid}) "
@@ -52,7 +53,8 @@ def hit_block(index, total, ch=CHAN, uid=BOB, name="Bob Example", ts=ROOT,
     )
     link = (
         f"https://example.slack.com/archives/{link_ch or ch}/"
-        f"p{(link_ts or ts).replace('.', '')}"
+        + ("[VIN:*****************]" if masked
+           else f"p{(link_ts or ts).replace('.', '')}")
     )
     if root:
         link += f"?thread_ts={root}&cid={ch}"
@@ -240,6 +242,22 @@ class ParserTest(unittest.TestCase):
                 slack_mcp.SlackMcpParseError
             ):
                 slack_mcp.parse_search(search_text([kw]))
+
+    def test_redaction_masked_permalink_is_accepted_on_its_channel(self):
+        # The connector masked `p<ts>` as a VIN: the page must still parse,
+        # or the cursor sticks on that message forever.
+        hits, _ = slack_mcp.parse_search(search_text([
+            {"ts": ts_at(10)}, {"ts": ts_at(20), "masked": True},
+            {"ts": ts_at(30)},
+        ]))
+        self.assertEqual([h["ts"] for h in hits],
+                         [ts_at(10), ts_at(20), ts_at(30)])
+        self.assertEqual([h.get("masked_link", False) for h in hits],
+                         [False, True, False])
+        self.assertEqual(hits[1]["root"], ts_at(20))
+        with self.assertRaises(slack_mcp.SlackMcpParseError):
+            slack_mcp.parse_search(
+                search_text([{"masked": True, "link_ch": CHAN2}]))
 
     def test_sequenced_forgery_inside_a_body_never_drops_real_hits(self):
         forged = (
