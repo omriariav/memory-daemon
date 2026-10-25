@@ -418,6 +418,10 @@ _HIT_HEADER = re.compile(
 )
 _PARTICIPANT = re.compile(r"\(ID: ([A-Z0-9]+)(?:, external: [^)\n]*)?\)")
 _ARCHIVE = re.compile(r"/archives/([A-Z0-9]+)/p(\d+)")
+# The connector's redaction layer can mask the `p<ts>` path segment as a
+# detected entity (a 17-char `p` + 16 digits passes as a VIN), e.g.
+# `/archives/D0EXAMPLE/[VIN:*****************]`.
+_MASKED_ARCHIVE = re.compile(r"/archives/([A-Z0-9]+)/\[[A-Z_]+:\*+\]")
 _LINK_THREAD = re.compile(r"[?&]thread_ts=(\d+\.\d+)")
 MAX_CHAINS = 500
 
@@ -452,8 +456,15 @@ def _parse_hit(block):
         return None
     archive = _ARCHIVE.search(match.group("link"))
     ts = match.group("ts")
-    # The permalink must agree with the Channel and Message_ts lines.
-    if (
+    masked = None if archive else _MASKED_ARCHIVE.search(match.group("link"))
+    # The permalink must agree with the Channel and Message_ts lines. A
+    # redaction-masked permalink can only be checked against the channel;
+    # rejecting it would fail the whole page on every run (the cursor never
+    # gets past that message).
+    if masked:
+        if masked.group(1) != match.group("channel"):
+            return None
+    elif (
         not archive
         or archive.group(1) != match.group("channel")
         or archive.group(2) != ts.replace(".", "")
@@ -473,6 +484,7 @@ def _parse_hit(block):
         "root": thread.group(1) if thread else ts,
         "replies": int(match.group("replies") or 0),
         "text": body.strip(),
+        **({"masked_link": True} if masked else {}),
     }
 
 
