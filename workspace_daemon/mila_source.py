@@ -426,6 +426,32 @@ def _hints_section(hints):
     return "\n".join(lines)
 
 
+def _capture_digest(record, body, transcript_path, start, end):
+    """Return (title, transcript_hash, digest) identifying one capture version."""
+    title = str(record.get("title") or Path(transcript_path).stem)
+    transcript_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    # Calendar matching and the eventual entry date/title depend on more than
+    # transcript text. Version every piece of recording provenance that can
+    # affect that decision so corrected Mila metadata is not hidden by an old
+    # successful ledger row.
+    capture = {
+        "transcript_hash": transcript_hash,
+        "title": title,
+        "recording_start": start.isoformat(),
+        "recording_end": end.isoformat(),
+        "duration": float(record.get("duration") or 0),
+        "source": str(record.get("source") or ""),
+        "transcript_name": Path(transcript_path).name,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            capture, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return title, transcript_hash, digest
+
+
 def _candidate(record, directory, manual=None, zone=None, app=None,
                wait=False):
     """Build a candidate, or None while holding for app hints to appear."""
@@ -448,27 +474,9 @@ def _candidate(record, directory, manual=None, zone=None, app=None,
     recording_id = str(record["id"])
     source_id = f"mila:{recording_id}"
     start, end = _recording_interval(record, zone)
-    title = str(record.get("title") or Path(transcript_path).stem)
-    transcript_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-    # Calendar matching and the eventual entry date/title depend on more than
-    # transcript text. Version every piece of recording provenance that can
-    # affect that decision so corrected Mila metadata is not hidden by an old
-    # successful ledger row.
-    capture = {
-        "transcript_hash": transcript_hash,
-        "title": title,
-        "recording_start": start.isoformat(),
-        "recording_end": end.isoformat(),
-        "duration": float(record.get("duration") or 0),
-        "source": str(record.get("source") or ""),
-        "transcript_name": Path(transcript_path).name,
-    }
-    digest = hashlib.sha256(
-        json.dumps(
-            capture, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()[:16]
+    title, transcript_hash, digest = _capture_digest(
+        record, body, transcript_path, start, end
+    )
     return {
         "id": f"{source_id}@{digest}",
         "title": title,
@@ -489,6 +497,59 @@ def _candidate(record, directory, manual=None, zone=None, app=None,
 
 def _completed(record):
     return record.get("status") == "completed" and not record.get("deletedAt")
+
+
+def _settled(entry):
+    """True when a ledger row means the runner would skip the candidate.
+
+    Mirrors the retry conditions in ``runner._run_owned``: a memory error or
+    hold, an incomplete expansion, or a non-final calendar rejection all get
+    reprocessed, so they still count as pending work.
+    """
+    if entry is None:
+        return False
+    return not (
+        "memory_error" in entry
+        or entry.get("memory_held")
+        or "expand_fallback" in entry
+        or (entry.get("calendar_match_rejected") is True
+            and not entry.get("calendar_match_final"))
+    )
+
+
+def has_pending(source, ledger):
+    """Cheap pre-check: is any completed recording not yet processed?
+
+    ``ledger`` is the processed-ledger dict (``state.load``). Reads only
+    ``recordings.json`` and local transcripts: no hints gate, calendar or model
+    call. A recording held for the app summary counts as pending (the real run
+    decides whether to keep holding), as does one whose transcript cannot be
+    read unless its error row is already ledgered. Manual backfills are
+    ignored: they are explicit, never triggered by Mila writes.
+    """
+    zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
+    excluded = {str(v) for v in source.get("exclude_recording_ids") or []}
+    metadata_file = Path(source["recordings_file"])
+    for record in _read_json(metadata_file):
+        recording_id = str(record.get("id") or "")
+        if not recording_id or recording_id in excluded or not _completed(record):
+            continue
+        source_id = f"mila:{recording_id}"
+        try:
+            body, transcript_path = _transcript(record, metadata_file.parent)
+            if not body.strip():
+                raise RuntimeError("empty transcript")
+            start, end = _recording_interval(record, zone)
+            digest = _capture_digest(record, body, transcript_path, start, end)[2]
+            candidate_id = f"{source_id}@{digest}"
+        except Exception as exc:
+            digest = hashlib.sha256(
+                f"{recording_id}:{exc}".encode("utf-8")
+            ).hexdigest()[:16]
+            candidate_id = f"{source_id}@error-{digest}"
+        if not _settled(ledger.get(candidate_id)):
+            return True
+    return False
 
 
 def candidates(source):

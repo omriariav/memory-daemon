@@ -2384,6 +2384,41 @@ maintenance coordinator tick immediately. Each tick runs every **enabled**
 routine in its group that is due; the helper never changes a routine's
 `enabled` setting. It is safe to call again when the schedulers are loaded.
 
+### Mila trigger (optional)
+
+`launchd/com.memory-daemon-mila.plist.template` runs the Mila routine shortly
+after Mila writes `recordings.json` (launchd `WatchPaths`) instead of waiting for
+a tick. It runs `daemon.py run --routine mila-meetings --if-pending --wait-lock 600`:
+
+- `--if-pending` is a lock-free pre-check: it exits 0 when no completed,
+  not-yet-processed recording exists (Mila rewrites the file while recording;
+  recordings still in progress, deleted, or already in the ledger do nothing). A
+  recording held for the app summary counts as pending, so the run starts and
+  the hold logic decides.
+- `--wait-lock SECONDS` (also usable on any `run`) polls `run.lock` every 2s for
+  up to SECONDS when a tick holds it, then falls back to the usual skip
+  (exit 75). Default is off.
+- `ThrottleInterval 60` limits launches to one a minute. `state/PAUSED` and
+  budget caps apply as for any `run`; the lid/network preflight does not unless
+  you add `--preflight`.
+
+The hourly tick remains the safety net, including for recordings whose
+`app_summary` hold expires with no further write to `recordings.json`.
+
+```sh
+sed "s|__REPO_DIR__|$PWD|g; s|__PYTHON__|$HOME/.venvs/memory-daemon/bin/python|g; s|__HOME__|$HOME|g; s|__MILA_RECORDINGS__|$HOME/Library/Application Support/Mila/recordings.json|g" \
+  launchd/com.memory-daemon-mila.plist.template \
+  > ~/Library/LaunchAgents/com.memory-daemon-mila.plist
+chmod 600 ~/Library/LaunchAgents/com.memory-daemon-mila.plist
+
+# Install (explicit; run.sh does not manage this job):
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.memory-daemon-mila.plist
+
+# Uninstall:
+launchctl bootout gui/$(id -u)/com.memory-daemon-mila
+rm ~/Library/LaunchAgents/com.memory-daemon-mila.plist
+```
+
 Check on it:
 
 ```sh

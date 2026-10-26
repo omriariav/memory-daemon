@@ -157,7 +157,7 @@ def _needs_label_catalog(routines):
 
 
 def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None,
-        lock_name="run", count_only=False, ignore_pause=False):
+        lock_name="run", count_only=False, ignore_pause=False, wait_lock=0):
     """Process every enabled routine. Returns a summary dict.
 
     In dry-run no source or data state is mutated: no yoetz call, Gmail write,
@@ -182,7 +182,7 @@ def run(base_dir, routines, dry_run=False, refresh_labels=False, active_ids=None
     with ExitStack() as stack:
         stack.enter_context(claude_bridge.pause_override(ignore_pause))
         lock = (
-            stack.enter_context(state.RunLock(base_dir, name=lock_name))
+            stack.enter_context(state.RunLock(base_dir, name=lock_name, wait=wait_lock))
             if not dry_run else None
         )
         return _run_locked(

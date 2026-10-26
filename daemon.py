@@ -26,7 +26,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, identity, llm, memory_sink, preflight, runner, state, status, tui
+from workspace_daemon import config, identity, llm, memory_sink, mila_source, preflight, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -322,6 +322,29 @@ def _retry_unconfirmed(args, routines):
         f"for retry: {', '.join(cleared) or 'none'}")
 
 
+def _has_pending_work(routines, active_ids):
+    """Lock-free pre-check for trigger-driven runs (`run --if-pending`).
+
+    Only Mila sources can answer cheaply; anything else is assumed pending so
+    the flag never hides work. A source that cannot be read also counts as
+    pending, so the real run surfaces the error.
+    """
+    ledger = state.load(BASE_DIR)
+    for routine in routines:
+        if routine["id"] not in active_ids:
+            continue
+        for source in config.sources(routine):
+            if source.get("kind") != "mila":
+                return True
+            try:
+                if mila_source.has_pending(source, ledger):
+                    return True
+            except Exception as exc:
+                log(f"routine={routine['id']} pending pre-check failed: {exc}")
+                return True
+    return False
+
+
 def cmd_run(args):
     set_log_file(LOG_FILE)
     count_only = getattr(args, "count_only", False)
@@ -380,6 +403,10 @@ def cmd_run(args):
         return _count_only(
             routines, active_ids, getattr(args, "ignore_pause", False)
         )
+    if getattr(args, "if_pending", False) and not args.dry_run:
+        if not _has_pending_work(routines, active_ids):
+            log("run skipped: no new completed recording to process")
+            return 0
     log(f"run start: {len(active_ids)} routine(s){mode}")
     totals = _empty_totals()
     attempted = locked = 0
@@ -395,6 +422,7 @@ def cmd_run(args):
                 refresh_labels=args.refresh_labels, active_ids=group_ids,
                 lock_name=lock_name,
                 ignore_pause=getattr(args, "ignore_pause", False),
+                wait_lock=getattr(args, "wait_lock", 0) or 0,
             )
         except state.AlreadyRunning as exc:
             # Manual and scheduled census runs share slack-census.lock; other
@@ -697,6 +725,12 @@ def main(argv=None):
                             "(entry ids and/or the word heading) before the run")
     p_run.add_argument("--ignore-pause", action="store_true",
                        help="run even though state/PAUSED exists (manual override)")
+    p_run.add_argument("--wait-lock", type=float, default=0, metavar="SECONDS",
+                       help="if another run holds the lock, retry for up to "
+                            "SECONDS before skipping (default: skip at once)")
+    p_run.add_argument("--if-pending", action="store_true",
+                       help="exit 0 without taking the lock when a Mila routine "
+                            "has no completed, unprocessed recording")
     p_run.add_argument("--preflight", action="store_true",
                        help="apply the tick's lid-closed and offline checks "
                             "to this explicit run (off by default)")
