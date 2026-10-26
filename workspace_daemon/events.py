@@ -1,15 +1,20 @@
-"""Capture event stream: one JSON line per memory a capture created or updated.
+"""Event stream: one JSON line per memory a capture created or updated, and
+per calendar invite, change or cancellation.
 
 `state/events.jsonl` lets a reader (a notifier, a dashboard) follow captures
-without polling the memory store. Only `memory_sink.capture` writes it; every
-other reader must treat it as read-only.
+without polling the memory store. `memory_sink.capture` (source from the
+`source_id` prefix, e.g. slack) and the `calendar_cache` routine (source gcal)
+write it; every other reader must treat it as read-only.
 
 One JSON object per line, oldest first:
 
     {"v": 1, "id", "ts", "source", "kind", "routine", "memory_id",
      "source_id", "title", "people"}
 
-`kind` is "new" (entry created) or "update" (existing entry refreshed).
+`kind` is "new" (entry created) or "update" (existing entry refreshed). Calendar
+events add "cancel" and carry `memory_id` null, `source_id` `gcal:<event id>`
+and a trailing optional "details" object (omitted when empty):
+`{"start", "end"}` ISO times, plus `{"changed": {field: [old, new]}}` on update.
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
 `state/events.lock`. The file is rotated to `events.jsonl.1` (one
@@ -41,9 +46,10 @@ def event_id(source_id, memory_id, kind, ts):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def build(routine_id, kind, memory_id, source_id, title, people, ts=None):
+def build(routine_id, kind, memory_id, source_id, title, people, ts=None,
+          details=None):
     ts = ts or utc_now_iso()
-    return {
+    event = {
         "v": SCHEMA_VERSION,
         "id": event_id(source_id, memory_id, kind, ts),
         "ts": ts,
@@ -55,6 +61,9 @@ def build(routine_id, kind, memory_id, source_id, title, people, ts=None):
         "title": title,
         "people": list(people or []),
     }
+    if details:
+        event["details"] = details
+    return event
 
 
 def emit(base_dir, event):

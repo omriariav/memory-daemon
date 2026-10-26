@@ -18,6 +18,7 @@ string is stripped of control characters.
 import datetime
 import html
 import json
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from . import claude_bridge, config, state
+from . import events as event_stream
 from .shell import log
 
 ROOM_DOMAIN = "resource.calendar.google.com"
@@ -45,6 +47,13 @@ EXTERNAL_NAME_CHARS = 30
 MAX_LINKS = 3
 DEFAULT_MAX_DETAILS = 20
 DEFAULT_STALE_AFTER = "2h"
+DEFAULT_EVENTS_WINDOW_DAYS = 7
+# my_rsvp values (see _rsvp_for_owner) whose update/cancel events are noise:
+# my own events, and ones I declined.
+QUIET_RSVPS = frozenset({"organizer", "declined"})
+SNAPSHOT_FILE = "calendar-snapshot.json"
+SNAPSHOT_VERSION = 1
+SOURCE = "gcal"
 DEFAULT_CONFERENCE_HOSTS = ("zoom.us", "meet.google.com", "teams.microsoft.com")
 BRIDGE_TIMEOUT = 180
 BRIDGE_ATTEMPTS = 2
@@ -417,6 +426,7 @@ def parse_list(text, tz):
             "end": end,
             "all_day": all_day,
             "location": fields.get("location", ""),
+            "status": clean(fields.get("status")).lower() or "confirmed",
             "organizer": _first_email(fields.get("organizer")),
             "organizer_text": fields.get("organizer", ""),
             "attendees": parse_attendees(fields.get("attendees", "")),
@@ -777,9 +787,19 @@ def render_json(events, cfg, now):
 
 # --- fetch + run -----------------------------------------------------------
 
+def diff_hours(cfg):
+    """Window of the event diff in hours; 0 turns the diff off."""
+    return float(cfg.get("events_window_days", DEFAULT_EVENTS_WINDOW_DAYS)) * 24
+
+
+def fetch_hours(cfg):
+    """One listing covers both the output window and the (wider) diff window."""
+    return max(float(cfg.get("window_hours", 48)), diff_hours(cfg))
+
+
 def list_args(cfg, now):
     """The exact list arguments; every one is pinned in the bridge allowlist."""
-    window = float(cfg.get("window_hours", 48))
+    window = fetch_hours(cfg)
     time_min = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
     time_max = time_min + datetime.timedelta(hours=window)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -845,7 +865,11 @@ def in_window(listed, now, window_hours, tz):
 
 
 def fetch(cfg, base_dir, now, tz):
-    """One bridge session; returns (listed events, {event_id: detail})."""
+    """One bridge session; returns (listed events, {event_id: detail}, wide).
+
+    `wide` is the complete listing over the diff window, or None when the diff
+    must not run (diff off, or the result hit max_events and may be cut).
+    """
     args = list_args(cfg, now)
     max_details = int(cfg.get("max_details", DEFAULT_MAX_DETAILS))
     list_tool, get_tool = cfg["list_tool"], cfg["get_tool"]
@@ -874,8 +898,15 @@ def fetch(cfg, base_dir, now, tz):
         raise claude_bridge.BridgeError(
             "list_events produced no result with the pinned arguments"
         )
-    listed = in_window(parse_list(listing["text"], tz), now,
-                       cfg.get("window_hours", 48), tz)
+    parsed = parse_list(listing["text"], tz)
+    listed = in_window(parsed, now, cfg.get("window_hours", 48), tz)
+    wide = None
+    if diff_hours(cfg) > 0:
+        if len(parsed) >= int(cfg.get("max_events", 50)):
+            log("calendar_cache: listing hit max_events; event diff skipped "
+                "(raise max_events or lower events_window_days)")
+        else:
+            wide = in_window(parsed, now, fetch_hours(cfg), tz)
     timed = sorted((e for e in listed if not e["all_day"]),
                    key=lambda e: e["start"])
     known = {event["event_id"] for event in timed[:max_details]}
@@ -897,7 +928,7 @@ def fetch(cfg, base_dir, now, tz):
     if skipped:
         log(f"calendar_cache: {skipped} event detail lookup(s) failed; "
             "those events render from the listing only")
-    return listed, details
+    return listed, details, wide
 
 
 def _output_paths(cfg):
@@ -954,7 +985,141 @@ def mark_stale(cfg, text_path, json_path, now):
     return True
 
 
-def run(cfg, base_dir, dry_run=False, now=None):
+# --- event diff ------------------------------------------------------------
+
+def _iso(value, all_day):
+    if all_day:
+        return value.isoformat()
+    return value.astimezone(datetime.timezone.utc).isoformat()
+
+
+def snapshot_rows(wide, details, cfg, tz):
+    """{event_id: {start, end, location, conference, status, my_rsvp, title}}."""
+    status = {raw["event_id"]: raw.get("status") or "confirmed" for raw in wide}
+    return {
+        event["event_id"]: {
+            "start": _iso(event["start"], event["all_day"]),
+            "end": _iso(event["end"], event["all_day"]),
+            "location": event["location"],
+            "conference": event["conference_url"] or "",
+            "status": status.get(event["event_id"], "confirmed"),
+            "my_rsvp": event["my_rsvp"],
+            "title": event["title"],
+        }
+        for event in normalize(wide, details, cfg, tz)
+    }
+
+
+def _row_when(value, tz):
+    if _DATE_ONLY.match(value):
+        day = datetime.date.fromisoformat(value)
+        return datetime.datetime.combine(day, datetime.time.min, tzinfo=tz)
+    return datetime.datetime.fromisoformat(value)
+
+
+def snapshot_path(base_dir):
+    return Path(os.path.join(base_dir, "state", SNAPSHOT_FILE))
+
+
+def load_snapshot(base_dir):
+    """The previous snapshot, or None when absent or unreadable (a first run)."""
+    try:
+        data = json.loads(snapshot_path(base_dir).read_text())
+        if data["v"] != SNAPSHOT_VERSION:
+            return None
+        datetime.datetime.fromisoformat(data["fetched_at"])
+        float(data["window_hours"])
+        if not isinstance(data["events"], dict):
+            return None
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_snapshot(base_dir, rows, now, hours):
+    path = snapshot_path(base_dir)
+    state.ensure_private_dir(path.parent)
+    state.write_atomic(path, json.dumps({
+        "v": SNAPSHOT_VERSION,
+        "fetched_at": now.astimezone(datetime.timezone.utc).isoformat(),
+        "window_hours": hours,
+        "events": rows,
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", mode=0o600)
+
+
+def diff_snapshots(prev, rows, now, hours, tz):
+    """[(kind, event_id, row, changed)] between two successive snapshots.
+
+    Only events that have not ended and start inside [now, now + hours) count.
+    An event is `new` only when it was already inside the previous window (an
+    old invite that merely scrolled into range is not new). A disappearance is
+    a cancel only while its previous start is still ahead and in the window.
+    Neither update nor cancel fires when my RSVP is "organizer" or "declined"
+    in the old or the new row.
+    """
+    limit = now + datetime.timedelta(hours=hours)
+    prev_limit = datetime.datetime.fromisoformat(prev["fetched_at"]) \
+        + datetime.timedelta(hours=float(prev["window_hours"]))
+    before = prev["events"]
+    found = []
+    for event_id, row in rows.items():
+        start, end = _row_when(row["start"], tz), _row_when(row["end"], tz)
+        if end <= now or start >= limit:
+            continue
+        old = before.get(event_id)
+        if row["status"] == "cancelled":
+            if old and old["status"] != "cancelled" \
+                    and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
+                found.append(("cancel", event_id, row, None))
+        elif old is None:
+            if row["my_rsvp"] == "needsAction" and start < prev_limit:
+                found.append(("new", event_id, row, None))
+        elif old["status"] != "cancelled" \
+                and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
+            changed = {
+                field: [old[field], row[field]]
+                for field in ("start", "end", "location", "conference")
+                if old[field] != row[field]
+                # A link read from get_event is only there for the soonest
+                # events, so appearing or vanishing is not a change.
+                and (field != "conference" or (old[field] and row[field]))
+            }
+            if changed:
+                found.append(("update", event_id, row, changed))
+    for event_id, old in before.items():
+        if event_id in rows or old["status"] == "cancelled" \
+                or old["my_rsvp"] in QUIET_RSVPS:
+            continue
+        if now < _row_when(old["start"], tz) < limit:
+            found.append(("cancel", event_id, old, None))
+    return found
+
+
+def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
+    """Diff this snapshot against the last one, store it, emit the changes.
+
+    The snapshot is written first, so a crash loses an event rather than
+    repeating it on every later run.
+    """
+    hours = diff_hours(cfg)
+    rows = snapshot_rows(wide, details, cfg, tz)
+    prev = load_snapshot(base_dir)
+    save_snapshot(base_dir, rows, now, hours)
+    if prev is None:
+        return 0
+    found = diff_snapshots(prev, rows, now, hours, tz)
+    for kind, event_id, row, changed in found:
+        info = {"start": row["start"], "end": row["end"]}
+        if changed:
+            info["changed"] = changed
+        event_stream.emit(base_dir, event_stream.build(
+            routine_id, kind, None, f"{SOURCE}:{event_id}", row["title"],
+            people=[], details=info,
+        ))
+    return len(found)
+
+
+def run(cfg, base_dir, dry_run=False, now=None, routine_id="calendar-cache"):
     """Refresh the calendar cache; a failure raises and leaves the JSON as-is.
 
     A failed refresh keeps the previous files until they are `stale_after` old,
@@ -972,7 +1137,7 @@ def run(cfg, base_dir, dry_run=False, now=None):
         return {"ok": True, "dry_run": True, "events": 0,
                 "output": str(text_path), "json": str(json_path)}
     try:
-        listed, details = fetch(cfg, base_dir, now, tz)
+        listed, details, wide = fetch(cfg, base_dir, now, tz)
         events = normalize(listed, details, cfg, tz)
         text = render_text(events, cfg, now)
         twin = render_json(events, cfg, now)
@@ -987,8 +1152,19 @@ def run(cfg, base_dir, dry_run=False, now=None):
     _ensure_parent(text_path)
     state.write_atomic(json_path, twin, mode=0o600)
     state.write_atomic(text_path, text, mode=0o600)
+    emitted = 0
+    if wide is not None:
+        # A complete listing only; a failed or cut-off fetch never reaches here
+        # with `wide`, so it cannot make events look cancelled.
+        try:
+            emitted = track_events(
+                cfg, base_dir, routine_id, wide, details, now, tz
+            )
+        except Exception as exc:
+            log(f"calendar_cache WARN event diff failed: "
+                f"{type(exc).__name__}: {exc}")
     if len(listed) >= int(cfg.get("max_events", 50)):
         log("calendar_cache: result reached max_events; later events may be cut")
     return {"ok": True, "dry_run": False, "events": len(events),
-            "details": len(details), "output": str(text_path),
+            "details": len(details), "emitted": emitted, "output": str(text_path),
             "json": str(json_path)}

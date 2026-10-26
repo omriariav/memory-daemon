@@ -730,6 +730,7 @@ maintenance:
   kind: calendar_cache
   calendar_id: primary                 # pinned in the bridge allowlist
   window_hours: 48
+  events_window_days: 7                # diff window for state/events.jsonl; 0 = off
   timezone: UTC                        # rendering timezone (IANA)
   owner_email: me@example.com          # "my RSVP"; organizer => "organizer"
   internal_domains: [example.com]      # agendas/links only for these organizers
@@ -747,6 +748,28 @@ maintenance:
 
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
 are exact MCP names from your connector and are never defaulted.
+
+Calendar events: the same single list call asks for `events_window_days`
+(default 7, `0` turns this off) instead of `window_hours`; `output` and the JSON
+twin still hold only the next `window_hours`. Each successful run diffs that
+listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
+`{event_id: {start, end, location, conference, status, my_rsvp, title}}` under
+`events`, with `fetched_at` and `window_hours`) and appends events to
+`state/events.jsonl` (see "Capture events"). The first run, a failed or
+unparseable fetch, a listing that hit `max_events`, or an unreadable snapshot
+emit nothing, and a failed fetch never rewrites the snapshot. Only events that
+have not ended and start inside the window count.
+
+- `new`: an unseen event I have not answered (`needsAction`) that was already
+  inside the previous window. Events I organize or answered, and invites that
+  merely scrolled into range, are not new.
+- `update`: start, end, location or conference link changed. Attendee RSVPs,
+  description and the attendee list are ignored; a link that appears or
+  vanishes (detail lookups cover only the soonest events) is not a change.
+  Events I organize or declined never emit `update` or `cancel`.
+- `cancel`: `Status: cancelled`, or the event vanished while its previous start
+  was still ahead and inside the window. The
+  list call does not pass `showDeleted`, so vanishing is the usual signal.
 
 Output, one block per event sorted by start (declined events are kept; rooms
 are shown only under `where`, not counted as attendees):
@@ -2251,7 +2274,7 @@ unvalidated name is never sent to Gmail.
 ### Capture events
 
 `state/events.jsonl` (mode 0600) gets one JSON line each time a capture creates
-or updates a memory, so a notifier or dashboard can follow captures without
+or updates a memory (and for calendar changes, below), so a notifier or dashboard can follow captures without
 polling the store:
 
 ```json
@@ -2263,7 +2286,13 @@ polling the store:
   nothing. `source` is the `source_id` prefix before the first `:` (`unknown`
   without one). `id` is the first 16 hex of sha256 of
   `source_id|memory_id|kind|ts`.
-- Writer: `memory_sink.capture` only. The other `add` paths (owner todos,
+- Calendar events (writer: the `calendar_cache` routine): `source` is `gcal`,
+  `kind` is `new` (pending invite), `update` or `cancel`, `memory_id` is `null`,
+  `source_id` is `gcal:<event id>`, `people` is `[]`, and a trailing `details`
+  object has `start` and `end` (ISO, UTC for timed events), plus
+  `changed: {field: [old, new]}` on `update` (fields start, end, location,
+  conference). `details` is omitted when empty and never present on captures.
+- Writer for captures: `memory_sink.capture`. The other `add` paths (owner todos,
   person briefs, Fibery, Google Tasks, the Gmail follow-up note) emit nothing.
   Appends are one `write` on an `O_APPEND` descriptor under `flock` on
   `state/events.lock`; a failed append is logged and never fails the capture.

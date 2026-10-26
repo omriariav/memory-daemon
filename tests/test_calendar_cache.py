@@ -87,6 +87,7 @@ def cfg(**over):
         "list_tool": LIST_TOOL,
         "get_tool": GET_TOOL,
         "max_events": 50,
+        "events_window_days": 0,  # legacy single window
     }
     base.update(over)
     return base
@@ -1195,7 +1196,7 @@ class RunTest(unittest.TestCase):
 
     def test_maintenance_dispatch(self):
         routine = {"id": "calendar-cache", "maintenance": self.cfg}
-        fetched = (calendar_cache.parse_list(LIST_TEXT, TZ), {})
+        fetched = (calendar_cache.parse_list(LIST_TEXT, TZ), {}, None)
         with mock.patch.object(calendar_cache, "fetch", return_value=fetched):
             report = maintenance.run(self.base, routine)
         self.assertEqual(report["events"], 2)

@@ -76,7 +76,9 @@ def run(base_dir, routine, dry_run=False):
     if kind == "calendar_cache":
         mode = "previewing" if dry_run else "refreshing"
         log(f"routine={routine_id} maintenance={kind} {mode}")
-        report = calendar_cache.run(cfg, base_dir, dry_run=dry_run)
+        report = calendar_cache.run(
+            cfg, base_dir, dry_run=dry_run, routine_id=routine_id
+        )
         log(
             f"routine={routine_id} maintenance={kind} "
             f"events={report['events']} dry_run={report['dry_run']}"
