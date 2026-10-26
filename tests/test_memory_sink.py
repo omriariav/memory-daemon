@@ -1,10 +1,11 @@
 """memory_sink: slug-catalog parsing, model-output validation, source-id derivation."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import contacts, drive, memory_sink
+from workspace_daemon import contacts, drive, llm, memory_sink
 
 # Verbatim `slugs list --kind person` output from personal-memory (2026-07).
 # The count column broke the original parser: it returned an empty set, and the
@@ -1428,6 +1429,73 @@ class FollowupResolutionTest(unittest.TestCase):
                 )
 
         commit.assert_not_called()
+
+
+class CaptureEventsTest(unittest.TestCase):
+    """capture() appends one event per created/updated memory, else none."""
+
+    def setUp(self):
+        memory_sink._slug_cache.clear()
+        contacts.clear_cache()
+        memory_sink._slug_cache["/store"] = {"jane-doe"}
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.routine = {"id": "r", "memory": {"store": "/store", "type": "note",
+                                              "extract": True}}
+        self.item = {"id": "slack:C1:1.0", "title": "t", "date": "2026-07-27",
+                     "frontmatter": {}}
+
+    def _capture(self, cli_out="✓ created 2026-07-27-t\n", worthy=True,
+                 dry_run=False):
+        extraction = {"worthy": worthy, "type": "note", "title": "Title",
+                      "people": ["jane-doe"], "tags": [], "body": "b"}
+        identity = {
+            "email": "me@example.com",
+            "person": {"email": "me@example.com", "name": "Memory Owner",
+                       "slug": "memory-owner",
+                       "resource_name": "people/memory-owner"},
+            "safe": True,
+        }
+        with mock.patch.object(memory_sink, "log"), \
+                mock.patch.object(memory_sink, "_cli",
+                                  return_value=FakeResult(cli_out)), \
+                mock.patch.object(memory_sink, "_authenticated_identity",
+                                  return_value=identity), \
+                mock.patch.object(memory_sink, "_extract",
+                                  return_value=extraction), \
+                mock.patch.object(memory_sink.subprocess, "run",
+                                  return_value=FakeResult()), \
+                mock.patch.object(llm, "_base_dir", self.tmp.name):
+            memory_sink.capture(self.routine, self.item, "summary",
+                                dry_run=dry_run)
+        file = Path(self.tmp.name) / "state" / "events.jsonl"
+        if not file.exists():
+            return []
+        return [json.loads(line) for line in file.read_text().splitlines()]
+
+    def test_created_emits_one_new_event(self):
+        rows = self._capture()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "new")
+        self.assertEqual(rows[0]["source"], "slack")
+        self.assertEqual(rows[0]["routine"], "r")
+        self.assertEqual(rows[0]["memory_id"], "2026-07-27-t")
+        self.assertEqual(rows[0]["source_id"], "slack:C1:1.0")
+        self.assertEqual(rows[0]["title"], "Title")
+        self.assertEqual(rows[0]["people"], ["jane-doe"])
+
+    def test_updated_emits_update_event(self):
+        rows = self._capture("↻ updated 2026-07-27-t\n")
+        self.assertEqual([r["kind"] for r in rows], ["update"])
+
+    def test_unchanged_emits_nothing(self):
+        self.assertEqual(self._capture("↻ unchanged 2026-07-27-t\n"), [])
+
+    def test_skipped_not_worthy_emits_nothing(self):
+        self.assertEqual(self._capture(worthy=False), [])
+
+    def test_dry_run_emits_nothing(self):
+        self.assertEqual(self._capture(dry_run=True), [])
 
 
 if __name__ == "__main__":

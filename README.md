@@ -2248,6 +2248,33 @@ resolved case-insensitively **against the real catalog** before Gmail sees it. A
 hallucinated label resolves to nothing and `apply_label` is skipped — an
 unvalidated name is never sent to Gmail.
 
+### Capture events
+
+`state/events.jsonl` (mode 0600) gets one JSON line each time a capture creates
+or updates a memory, so a notifier or dashboard can follow captures without
+polling the store:
+
+```json
+{"v": 1, "id": "3f2a9c1d7b4e8a60", "ts": "2026-10-26T10:00:00Z", "source": "slack", "kind": "new", "routine": "slack-to-memory", "memory_id": "2026-10-26-title", "source_id": "slack:C0EXAMPLE01:1761472800.000100", "title": "Title", "people": ["jane-doe"]}
+```
+
+- `kind` is `new` (entry created) or `update` (updated, or an ambiguous CLI
+  result verified on disk). `unchanged`, skipped and dry-run captures write
+  nothing. `source` is the `source_id` prefix before the first `:` (`unknown`
+  without one). `id` is the first 16 hex of sha256 of
+  `source_id|memory_id|kind|ts`.
+- Writer: `memory_sink.capture` only. The other `add` paths (owner todos,
+  person briefs, Fibery, Google Tasks, the Gmail follow-up note) emit nothing.
+  Appends are one `write` on an `O_APPEND` descriptor under `flock` on
+  `state/events.lock`; a failed append is logged and never fails the capture.
+- Rotation: at 5 MB the file is renamed to `events.jsonl.1` (one generation,
+  an older `.1` is overwritten).
+- Guarantee: one event per created or updated capture. A duplicate is
+  possible only when an item is captured again, so readers dedupe on `id`. An
+  event is lost if the process dies between the store write and the append
+  (the retry sees `unchanged`).
+- Readers must treat the files as read-only.
+
 ## Output
 
 `<vault_dir>/<slug_prefix>-<email date YYYY-MM-DD>.md`, suffixed with a short
@@ -2470,6 +2497,7 @@ workspace_daemon/
   claude_bridge.py         least-privilege headless `claude -p` runner (+ PreToolUse hook)
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions
+  events.py                capture event stream (state/events.jsonl)
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
