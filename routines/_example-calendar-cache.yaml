@@ -33,6 +33,9 @@ maintenance:
   # the window and max_events computed by the routine).
   calendar_id: primary
   window_hours: 48
+  # Diff window for state/events.jsonl (new/update/cancel calendar events).
+  # The one list call covers this many days; output stays window_hours. 0 = off.
+  events_window_days: 7
   # Rendering timezone (IANA).
   timezone: UTC
   # Whose RSVP is "my RSVP"; also makes events you organize show "organizer".

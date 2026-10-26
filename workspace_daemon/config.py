@@ -46,7 +46,7 @@ MAINTENANCE_ALLOWED_KEYS = {
         "kind", "calendar_id", "window_hours", "timezone", "owner_email",
         "internal_domains", "output", "skip_titles", "max_attendee_names",
         "model", "list_tool", "get_tool", "max_events", "max_details",
-        "stale_after", "conference_hosts",
+        "stale_after", "conference_hosts", "events_window_days",
     },
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
@@ -1544,6 +1544,15 @@ def _validate_calendar_cache(rid, cfg):
         problems.append(
             f"{rid}: maintenance.window_hours must be a positive number "
             "of at most 744"
+        )
+    days = cfg.get("events_window_days", 7)
+    if (
+        not isinstance(days, (int, float)) or isinstance(days, bool)
+        or not 0 <= days <= 31
+    ):
+        problems.append(
+            f"{rid}: maintenance.events_window_days must be a number "
+            "from 0 (no event diff) to 31"
         )
     if "timezone" in cfg:
         try:

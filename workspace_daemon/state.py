@@ -663,13 +663,41 @@ class RunLock:
     whole-snapshot ledger writes clobber each other.
     """
 
-    def __init__(self, base_dir, name="run"):
+    def __init__(self, base_dir, name="run", wait=0, poll=2.0):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(name)):
             raise ValueError(f"invalid run-lock name {name!r}")
         self.path = Path(base_dir) / "state" / f"{name}.lock"
         self._fh = None
+        # wait > 0: poll for up to that many seconds before giving up, so a
+        # triggered run is deferred behind a busy tick instead of dropped.
+        self.wait = max(0, wait)
+        self.poll = poll
 
     def __enter__(self):
+        if not self.wait:
+            return self._acquire()
+        started = time.monotonic()
+        deadline = started + self.wait
+        waiting = False
+        while True:
+            try:
+                self._acquire()
+            except AlreadyRunning as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                if not waiting:
+                    log(f"{self.path.name} busy ({exc}); waiting up to "
+                        f"{self.wait:g}s")
+                    waiting = True
+                time.sleep(min(self.poll, remaining))
+                continue
+            if waiting:
+                log(f"{self.path.name} acquired after "
+                    f"{time.monotonic() - started:.0f}s")
+            return self
+
+    def _acquire(self):
         ensure_private_dir(self.path.parent)
         for _ in range(5):
             # O_RDWR|O_CREAT, never "w": open(path, "w") truncates before the

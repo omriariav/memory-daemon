@@ -1245,6 +1245,11 @@ def capture(routine, item, summary, dry_run=False):
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"
     )
+    if verdict in ("created", "updated", "verified"):
+        _emit_capture_event(
+            rid, "new" if verdict == "created" else "update",
+            entry_id, source_id, title, people,
+        )
 
     outcome = {
         "memory": verdict,
@@ -1263,6 +1268,19 @@ def capture(routine, item, summary, dry_run=False):
             bool(ptag) and ptag in tags,
         ))
     return outcome
+
+
+def _emit_capture_event(rid, kind, entry_id, source_id, title, people):
+    """Append a capture event to state/events.jsonl (best effort)."""
+    from . import events  # late import to avoid cycles
+    from . import llm
+
+    base_dir = llm.base_dir()
+    if base_dir is None:
+        return
+    events.emit(base_dir, events.build(
+        rid, kind, entry_id, source_id, title, people,
+    ))
 
 
 def _verified_owner_name(identity):
