@@ -212,6 +212,7 @@ class ReactionTest(InboxTestCase):
             ))
 
 
+CAROL = "U0EXAMPLEC"
 REACTIONS_TOOL = "mcp__example_slack__slack_get_reactions"
 
 
@@ -268,12 +269,12 @@ class DueChecksTest(unittest.TestCase):
             )
         ]
 
-    def test_only_the_newest_non_owner_message_per_conversation(self):
+    def test_only_the_newest_message_per_conversation(self):
         t1, t2, t3 = (f"{int(NOW) - n}.000100" for n in (300, 200, 100))
         self.assertEqual(self.due([
             message(t1), message(t2),                      # top level: t2
             message(t3, user=ME, thread=t1),               # thread: owner last
-        ]), [t2])
+        ]), [t3, t2])
 
     def test_reacted_old_and_bot_messages_are_closed(self):
         old = f"{int(NOW) - 80 * 3600}.000100"
@@ -295,6 +296,37 @@ class DueChecksTest(unittest.TestCase):
         comms_inbox.mark_checked(self.tmp.name, [f"{CHAN}:{ts}"], 72, now=NOW)
         self.assertEqual(self.due([], now=NOW + 4799), [])
         self.assertEqual(self.due([], now=NOW + 4800), [ts])
+
+    def test_owner_newest_message_is_due_until_a_peer_reacts(self):
+        t1, t2 = (f"{int(NOW) - n}.000100" for n in (300, 100))
+        self.assertEqual(self.due([message(t1), message(t2, user=ME)]), [t2])
+        peer = comms_inbox.peer_row(
+            {"channel": CHAN, "ts": t2, "root": t2}, "pray", BOB
+        )
+        self.assertEqual(self.due([peer]), [])
+
+    def test_owner_bot_and_old_owner_messages_are_not_due(self):
+        old = f"{int(NOW) - 80 * 3600}.000100"
+        bot = dict(
+            message(f"{int(NOW) - 50}.000100", user=ME, ch=CHAN2), is_bot=True
+        )
+        self.assertEqual(self.due([message(old, user=ME, ch=DM), bot]), [])
+
+    def test_owner_messages_share_the_limit_without_starving_others(self):
+        others = [f"{int(NOW) - n}.000100" for n in (400, 300, 200, 100)]
+        mine = [f"{int(NOW) - n}.000200" for n in (50, 40)]
+        rows = [message(t, ch=f"C0EXAMPLE{i}0") for i, t in enumerate(others)]
+        rows += [message(t, user=ME, ch=f"C0OWNER{i}000")
+                 for i, t in enumerate(mine)]
+        # limit 4: owner messages get 2, the rest 2, newest first overall.
+        self.assertEqual(
+            self.due(rows, limit=4),
+            [mine[1], mine[0], others[3], others[2]],
+        )
+        # Spare slots go to the other side.
+        self.assertEqual(self.due([], limit=6), [mine[1], mine[0]] + others[::-1])
+        self.assertEqual(len(self.due([], limit=1)), 1)
+        self.assertEqual(self.due([], limit=1), [others[3]])
 
     def test_newest_first_up_to_the_limit(self):
         stamps = [f"{int(NOW) - n}.000100" for n in (30, 20, 10)]
@@ -337,6 +369,94 @@ class ReactionReadTest(InboxTestCase):
         self.run_once()
         self.assertEqual(len(self.reads), 1)
         self.assertEqual(len(self.connector.calls), calls + 1)  # search only
+
+    def test_peer_reaction_on_an_owner_message_is_recorded(self):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text(
+            ("pray", [BOB, ME]), ("eyes", [ME]), ("+1", [BOB]),
+        )
+        self.run_once()
+        self.run_once()
+        peers = [r for r in self.rows() if r["type"] == "peer_reaction"]
+        self.assertEqual(
+            sorted((r["emoji"], r["user_id"]) for r in peers),
+            [("+1", BOB), ("pray", BOB)],
+        )
+        row = peers[0]
+        self.assertEqual(
+            (row["channel_id"], row["thread_ts"], row["ts"]),
+            (CHAN, ts_at(10), ts_at(10)),
+        )
+        self.assertIn("seen_at", row)
+        self.assertEqual(self.reactions(), [])   # owner's own: not recorded
+        self.assertEqual(len(self.reads), 1)     # closed after the first read
+
+    def test_track_and_save_emoji_from_peers_are_not_recorded(self):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text((TRACK, [BOB]), (SAVE, [BOB]), ("pray", [BOB]))
+        self.run_once({"channels": [CHAN], "track_reactions": [TRACK]},
+                      save_reactions=[SAVE])
+        self.assertEqual(
+            [r["emoji"] for r in self.rows() if r["type"] == "peer_reaction"],
+            ["pray"],
+        )
+
+    def peer_users(self, **inbox):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text(("pray", [BOB, CAROL]))
+        self.run_once({"channels": [CHAN], **inbox})
+        return sorted(
+            r["user_id"] for r in self.rows() if r["type"] == "peer_reaction"
+        )
+
+    def test_every_other_reactor_is_recorded_by_default(self):
+        self.assertEqual(self.peer_users(), sorted([BOB, CAROL]))
+
+    def test_ignore_reactors_setting_skips_listed_ids(self):
+        self.assertEqual(self.peer_users(ignore_reactors=[CAROL]), [BOB])
+
+    def test_ignore_reactors_validation(self):
+        ok = {"ignore_reactors": [CAROL]}
+        self.assertIsNone(comms_inbox.problem(ok))
+        for bad in ("U1", [CAROL, CAROL], ["nope"], [f"U0EXAMPLE{i:02d}" for i in range(21)]):
+            with self.subTest(bad=bad):
+                self.assertIsNotNone(
+                    comms_inbox.problem({"ignore_reactors": bad})
+                )
+
+    def test_owner_reaction_alone_on_own_message_stays_open(self):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text(("eyes", [ME]))
+        self.run_once()
+        self.assertEqual(
+            [r for r in self.rows() if r["type"] != "message"], []
+        )
+
+    def test_peer_reaction_is_deduped_on_user_and_emoji(self):
+        hit = {"channel": CHAN, "ts": ts_at(10), "root": ts_at(10)}
+        rows = [comms_inbox.peer_row(hit, "pray", BOB)] * 2 + [
+            comms_inbox.peer_row(hit, "pray", ME),
+            comms_inbox.peer_row(hit, "eyes", BOB),
+        ]
+        self.assertEqual(comms_inbox.record(self.tmp.name, rows, 14, NOW), 3)
+        self.assertEqual(comms_inbox.record(self.tmp.name, rows, 14, NOW), 0)
+
+    def test_owner_and_peer_checks_share_the_read_budget(self):
+        self.connector.search = by_filter({
+            f"in:<#{CHAN}>": [{"ts": ts_at(10)}],
+            f"in:<#{CHAN2}>": [{"ts": ts_at(20), "uid": ME, "name": "Me",
+                                "ch": CHAN2}],
+        })
+        self.run_once({"channels": [CHAN, CHAN2], "reaction_checks": 1})
+        self.assertEqual(len(self.reads), 1)
 
     def test_track_and_save_emoji_are_not_handled(self):
         self.answer = reactions_text(

@@ -2009,6 +2009,7 @@ comms_inbox:
   reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
   reaction_check_hours: 72   # how long an unanswered message is re-checked
   track_reactions: [track-example]   # "watch this conversation", at most 3
+  ignore_reactors: [U0EXAMPLE09]   # user ids never recorded as peer reactions, at most 20
   follow_threads: true   # follow every channel thread the owner posted in
   thread_polls: 10       # followed-thread reads per run, 0 to 30
 ```

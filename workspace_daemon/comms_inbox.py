@@ -20,6 +20,7 @@ Watch file (or source) block:
       retention_days: 14       # default 14
       reaction_checks: 10      # reaction reads per run (needs reactions_tool)
       reaction_check_hours: 72 # how long an unanswered message is re-checked
+      ignore_reactors: [U0EXAMPLE09]   # never recorded as peer reactions (at most 20)
       track_reactions: [track-example]   # "watch this conversation" (at most 3)
       follow_threads: true     # every channel thread the owner posted in
       thread_polls: 10         # thread reads per run for followed threads
@@ -30,6 +31,8 @@ One JSON object per line, oldest message first:
      "is_owner", "is_bot", "text", "seen_at"}
     {"type": "owner_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
+    {"type": "peer_reaction", "channel_id", "thread_ts", "ts", "emoji",
+     "user_id", "seen_at"}
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
 
@@ -48,15 +51,22 @@ An empty block (`comms_inbox: {}`) is valid: that routine records only the
 tracked and followed conversations its own searches list, and publishes its
 searched channels so the routine that polls followed threads skips them.
 
-Owner reactions come from two places. Search (`hasmy::<emoji>:`) finds the
+Owner reactions (and peer reactions, below) come from two places. Search (`hasmy::<emoji>:`) finds the
 listed emoji only. With `reactions_tool` (the connector's read-only
 `slack_get_reactions`) on the source, each run also reads the reactions of
 up to `reaction_checks` open messages: the newest message of a conversation
-(a channel's top level, or one thread) when it is from someone else, carries
-no recorded owner reaction, and is younger than `reaction_check_hours`. A
-reaction adds no search hit, so open messages are polled, with a back-off of
-a quarter of the message's age (at most 6h) between checks of the same one;
-`state/comms-inbox-checks.json` keeps the last check per message.
+(a channel's top level, or one thread) younger than `reaction_check_hours`,
+when it is from someone else with no recorded owner reaction, or the owner's
+(not a bot's) with no recorded peer reaction. A reaction adds no search hit,
+so open messages are polled, with a back-off of a quarter of the message's
+age (at most 6h) between checks of the same one;
+`state/comms-inbox-checks.json` keeps the last check per message. The owner's
+own messages get at most half of `reaction_checks` (unused slots go to the
+others), polled newest first. A reaction by someone other than the owner on
+an owner message is recorded as a `peer_reaction` (one line per emoji and
+user), so a reply tracker can see an emoji-only acknowledgement. Reactors in
+`ignore_reactors` are skipped. The bot marker is not used: a person's agent
+posts under that person's own id, so it cannot tell a bot from a person.
 
 `follow_threads` adds a record-only `from:<@owner>` search (its own scan
 mark, look-back `retention_days` on the first run): every channel message of
@@ -75,9 +85,9 @@ another routine's search already lists. Only routines with `follow_threads`
 run the owner search and the polls.
 
 `thread_ts` is the thread root (equal to `ts` for a top-level message); an
-`owner_reaction` names the message it was put on. Lines are never changed:
-messages are deduped on (channel_id, ts) and reactions on (channel_id, ts,
-emoji), so an edit or a removed reaction is not reflected. Lines whose `ts` is
+`owner_reaction` or `peer_reaction` names the message it was put on. Lines
+are never changed: messages are deduped on (channel_id, ts), reactions on
+(channel_id, ts, emoji) and peer reactions also on user_id, so an edit or a removed reaction is not reflected. Lines whose `ts` is
 older than the retention window are dropped. The file is rewritten atomically
 (mode 600), so a reader never sees a partial line.
 """
@@ -94,12 +104,13 @@ FILE_NAME = "comms-inbox.jsonl"
 KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
-    "thread_polls",
+    "thread_polls", "ignore_reactors",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
-            "follow_threads": False, "thread_polls": 10}
+            "follow_threads": False, "thread_polls": 10,
+            "ignore_reactors": []}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -109,6 +120,7 @@ MAX_TRACKED_QUERIES = 2
 CHECKS_FILE = "comms-inbox-checks.json"
 MAX_CHECK_GAP = 6 * 3600
 MAX_REACTIONS = 5
+MAX_IGNORE_REACTORS = 20
 MAX_RETENTION_DAYS = 90
 MAX_TEXT = 4000
 _REACTION_LINE = re.compile(
@@ -117,6 +129,7 @@ _REACTION_LINE = re.compile(
 )
 _REACTOR = re.compile(r"\(([UW][A-Z0-9]+)\)")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
+USER_ID = re.compile(r"^[UW][A-Z0-9]{6,}$")
 EMOJI = re.compile(r"^[a-z0-9][a-z0-9_+'-]{0,99}$")
 
 
@@ -148,6 +161,16 @@ def problem(value):
                 f"`{key}` must be a list of at most {most} distinct emoji "
                 "names (no colons)"
             )
+    ignore = value.get("ignore_reactors", [])
+    if (
+        not isinstance(ignore, list) or len(ignore) > MAX_IGNORE_REACTORS
+        or not all(isinstance(u, str) and USER_ID.match(u) for u in ignore)
+        or len(set(ignore)) != len(ignore)
+    ):
+        return (
+            f"`ignore_reactors` must be a list of at most {MAX_IGNORE_REACTORS}"
+            " distinct Slack user ids"
+        )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
 
@@ -174,6 +197,7 @@ def settings(value):
     cfg["channels"] = list(cfg["channels"])
     cfg["reactions"] = list(cfg["reactions"])
     cfg["track_reactions"] = list(cfg["track_reactions"])
+    cfg["ignore_reactors"] = list(cfg["ignore_reactors"])
     return cfg
 
 
@@ -184,6 +208,9 @@ def path(base_dir):
 def _key(row):
     if row.get("type") in ("owner_reaction", "track_request"):
         return (row["type"], row["channel_id"], row["ts"], row["emoji"])
+    if row.get("type") == "peer_reaction":
+        return (row["type"], row["channel_id"], row["ts"], row["emoji"],
+                row["user_id"])
     return ("message", row["channel_id"], row["ts"])
 
 
@@ -228,6 +255,10 @@ def reaction_row(hit, emoji):
         "ts": hit["ts"],
         "emoji": emoji,
     }
+
+
+def peer_row(hit, emoji, user_id):
+    return dict(reaction_row(hit, emoji), type="peer_reaction", user_id=user_id)
 
 
 def track_row(hit, emoji):
@@ -286,10 +317,13 @@ def _load_checks(base_dir):
 def due_checks(base_dir, limit, hours, now=None):
     """Open messages whose reactions are due a read, newest first.
 
-    Each is {"channel_id", "ts", "thread_ts"}. Open: the newest message of
-    its conversation, not the owner's and not a bot's, with no recorded owner
-    reaction, younger than `hours`. Due: never checked, or last checked at
-    least a quarter of its age ago (capped at MAX_CHECK_GAP).
+    Each is {"channel_id", "ts", "thread_ts", "own"}. Open: the newest
+    message of its conversation, not a bot's, younger than `hours`, and either
+    someone else's with no recorded owner reaction, or the owner's ("own")
+    with no recorded peer reaction. Due: never checked, or last checked at
+    least a quarter of its age ago (capped at MAX_CHECK_GAP). The owner's
+    messages take at most limit // 2 slots; slots either side leaves unused go
+    to the other.
     """
     if base_dir is None or not limit:
         return []
@@ -298,6 +332,10 @@ def due_checks(base_dir, limit, hours, now=None):
     reacted = {
         (r["channel_id"], r["ts"]) for r in rows
         if r.get("type") == "owner_reaction"
+    }
+    peer_reacted = {
+        (r["channel_id"], r["ts"]) for r in rows
+        if r.get("type") == "peer_reaction"
     }
     newest = {}
     for row in rows:
@@ -313,24 +351,30 @@ def due_checks(base_dir, limit, hours, now=None):
         ):
             newest[conversation] = row
     checks = _load_checks(base_dir)
-    due = []
+    others, own = [], []
     for row in newest.values():
         age = now - float(row["ts"])
+        mine = bool(row.get("is_owner"))
         if (
-            row.get("is_owner") or row.get("is_bot")
-            or (row["channel_id"], row["ts"]) in reacted
-            or age > hours * 3600
+            row.get("is_bot") or age > hours * 3600
+            or (row["channel_id"], row["ts"]) in (
+                peer_reacted if mine else reacted
+            )
         ):
             continue
         last = checks.get(f"{row['channel_id']}:{row['ts']}")
         if last is not None and now - last < min(age / 4, MAX_CHECK_GAP):
             continue
-        due.append({
+        (own if mine else others).append({
             "channel_id": row["channel_id"], "ts": row["ts"],
-            "thread_ts": row.get("thread_ts") or row["ts"],
+            "thread_ts": row.get("thread_ts") or row["ts"], "own": mine,
         })
+    for group in (others, own):
+        group.sort(key=lambda d: float(d["ts"]), reverse=True)
+    take_own = min(len(own), max(limit // 2, limit - len(others)))
+    due = others[:limit - take_own] + own[:take_own]
     due.sort(key=lambda d: float(d["ts"]), reverse=True)
-    return due[:limit]
+    return due
 
 
 def mark_checked(base_dir, keys, hours, now=None):
@@ -353,8 +397,8 @@ def mark_checked(base_dir, keys, hours, now=None):
         log("comms inbox: reaction check state could not be written")
 
 
-def parse_reactions(text, owner):
-    """Emoji names `owner` reacted with, from one slack_get_reactions result.
+def parse_reactors(text):
+    """[(emoji, [user ids])] from one slack_get_reactions result.
 
     Raises ValueError when the result has an unknown shape.
     """
@@ -379,9 +423,16 @@ def parse_reactions(text, owner):
         match = _REACTION_LINE.match(line)
         if not match:
             raise ValueError("reaction result has an unknown line")
-        if owner in _REACTOR.findall(match.group("who")):
-            found.append(match.group("emoji"))
+        found.append((match.group("emoji"), _REACTOR.findall(match.group("who"))))
     return found
+
+
+def parse_reactions(text, owner):
+    """Emoji names `owner` reacted with, from one slack_get_reactions result.
+
+    Raises ValueError when the result has an unknown shape.
+    """
+    return [e for e, users in parse_reactors(text) if owner in users]
 
 
 # --- tracked conversations ---------------------------------------------------
