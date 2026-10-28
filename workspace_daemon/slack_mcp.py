@@ -2005,22 +2005,29 @@ def _check_reactions(cfg, now):
         try:
             if text is None:
                 raise ValueError("no result")
-            emoji = comms_inbox.parse_reactions(text, cfg["self_user_id"])
+            reactors = comms_inbox.parse_reactors(text)
         except ValueError:
             bad += 1
-            emoji = []
+            reactors = []
         hit = {"channel": message["channel_id"], "ts": message["ts"],
                "root": message["thread_ts"]}
-        rows.extend(
-            comms_inbox.reaction_row(hit, name) for name in emoji
-            if name not in not_handled
-        )
+        owner = cfg["self_user_id"]
+        if message.get("own"):
+            rows.extend(
+                comms_inbox.peer_row(hit, name, uid)
+                for name, users in reactors for uid in users if uid != owner
+            )
+        else:
+            rows.extend(
+                comms_inbox.reaction_row(hit, name) for name, users in reactors
+                if owner in users and name not in not_handled
+            )
     added = comms_inbox.record(_base_dir, rows, inbox["keep_days"], now)
     comms_inbox.mark_checked(
         _base_dir, checked, inbox["reaction_check_hours"], now
     )
     log(f"slack_mcp: comms inbox read reactions of {len(checked)}/{len(due)} "
-        f"open message(s), {added} owner reaction(s) new"
+        f"open message(s), {added} reaction(s) new"
         + (f", {bad} without a usable result" if bad else ""))
 
 
