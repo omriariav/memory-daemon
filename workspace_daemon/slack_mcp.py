@@ -2015,7 +2015,8 @@ def _check_reactions(cfg, now):
         if message.get("own"):
             rows.extend(
                 comms_inbox.peer_row(hit, name, uid)
-                for name, users in reactors for uid in users if uid != owner
+                for name, users in reactors for uid in users
+                if uid != owner and name not in not_handled
             )
         else:
             rows.extend(

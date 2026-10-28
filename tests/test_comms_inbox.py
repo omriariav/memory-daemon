@@ -392,6 +392,18 @@ class ReactionReadTest(InboxTestCase):
         self.assertEqual(self.reactions(), [])   # owner's own: not recorded
         self.assertEqual(len(self.reads), 1)     # closed after the first read
 
+    def test_track_and_save_emoji_from_peers_are_not_recorded(self):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text((TRACK, [BOB]), (SAVE, [BOB]), ("pray", [BOB]))
+        self.run_once({"channels": [CHAN], "track_reactions": [TRACK]},
+                      save_reactions=[SAVE])
+        self.assertEqual(
+            [r["emoji"] for r in self.rows() if r["type"] == "peer_reaction"],
+            ["pray"],
+        )
+
     def test_owner_reaction_alone_on_own_message_stays_open(self):
         self.connector.search = by_filter({f"in:<#{CHAN}>": [
             {"ts": ts_at(10), "uid": ME, "name": "Me"},
