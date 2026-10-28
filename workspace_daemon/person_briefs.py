@@ -40,7 +40,8 @@ from pathlib import Path
 
 import yaml
 
-from . import claude_bridge, contacts, llm, memory_sink, personal, state
+from . import claude_bridge, contacts, llm, memory_sink, person_resolver
+from . import personal, state
 from . import identity as identity_providers
 from .shell import log
 
@@ -584,11 +585,12 @@ def _redact(routine, text):
     return text
 
 
-def _fact_dict(row, name, profile, store_facts):
+def _fact_dict(row, name, profile, store_facts, extra=None):
     first = store_facts["first"]
     facts = {
         "person": name,
         "slack_profile": profile or None,
+        "extra_facts": extra or None,
         "email_domain": row.get("email_domain"),
         "first_entry": (
             {"id": first["id"], "date": first["date"],
@@ -613,6 +615,10 @@ def _deterministic_lines(name, facts):
     )
     if role:
         lines.append(f"{name}: {role}.")
+    extra = facts.get("extra_facts") or {}
+    if extra:
+        pairs = "; ".join(f"{k}: {v}" for k, v in extra.items())
+        lines.append(f"{name}: {pairs}.")
     if profile.get("timezone") or profile.get("manager"):
         lines.append(
             "; ".join(
@@ -660,7 +666,7 @@ def _valid_model_lines(text, facts):
 
 def _compose(routine, row, name, facts):
     """(lines, used_model). A model is called only when facts are rich enough."""
-    needs_model = bool(facts.get("slack_profile")) or (
+    needs_model = bool(facts.get("slack_profile") or facts.get("extra_facts")) or (
         facts.get("entries_seen", 0) > 1
     )
     if not needs_model:
@@ -805,7 +811,9 @@ def process(routine, base_dir, dry_run=False):
                 if row.get("slack_user_id") and row.get("source_kind") == "slack_mcp":
                     profile, row["profile_verified"] = _slack_profile(
                         routine, row["slack_user_id"], slug, base_dir)
-                facts = _fact_dict(row, name, profile, store_facts)
+                facts = _fact_dict(
+                    row, name, profile, store_facts,
+                    person_resolver.facts_for(routine, slug, [name]))
                 lines, _used_model = _compose(routine, row, name, facts)
                 _write_brief(routine, store, row, name, lines)
             except claude_bridge.GUARD_STOPS as exc:
