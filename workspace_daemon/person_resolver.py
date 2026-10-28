@@ -124,19 +124,23 @@ def _run(argv, timeout, payload):
     proc = subprocess.Popen(
         list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, env=_env(),
-        cwd=os.path.dirname(os.path.abspath(argv[0])), start_new_session=True)
+        cwd=os.path.dirname(os.path.realpath(argv[0])), start_new_session=True)
     try:
         out, err = proc.communicate(payload, timeout=timeout)
-    except BaseException:
+    finally:
+        # Always kill the session: on timeout or a decode error the resolver
+        # may still run; after success this reaps background children it left.
+        # The group id is the leader's pid and stays reserved while any member
+        # lives, so this cannot hit an unrelated process; once the group is
+        # empty killpg fails with ESRCH, which is ignored.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
         try:
-            proc.communicate(timeout=2)  # reap
+            proc.wait(timeout=2)  # reap (instant if already reaped)
         except Exception:
             pass
-        raise
     if proc.returncode != 0:
         raise ValueError(f"exit {proc.returncode}: {(err or '').strip()[:200]}")
     return out
@@ -187,6 +191,12 @@ def _query(routine, names):
         got = _call(argv, _timeout(routine), todo)
         if got:
             resolved, facts = got
+            # Single-threaded daemon: no locking. Drop expired entries on
+            # insert so the memos cannot grow without bound.
+            for memo in (_memo, _fact_memo):
+                for key in [k for k, v in memo.items()
+                            if now - v[0] >= MEMO_TTL]:
+                    del memo[key]
             for name in todo:
                 _memo[(argv, name)] = (now, resolved[name])
             for slug, row in facts.items():

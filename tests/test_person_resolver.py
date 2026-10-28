@@ -17,7 +17,8 @@ open({log!r}, "a").write(json.dumps(names) + "\\n")
 if mode == "grandchild":
     import subprocess
     p = subprocess.Popen(["sleep", "30"])
-    open({log!r} + ".pid", "w").write(str(p.pid))
+    open({log!r} + ".pid.tmp", "w").write(str(p.pid))
+    import os; os.rename({log!r} + ".pid.tmp", {log!r} + ".pid")
     time.sleep(30)
 if mode == "otherfacts":
     print(json.dumps({{"resolved": {{}},
@@ -98,9 +99,15 @@ class CanonicalizeTest(ResolverTestBase):
         self.assertLess(len(msg), 300)
 
     def test_timeout_kills_process_group(self):
-        routine = self.routine("grandchild", person_resolver_timeout=0.5)
+        routine = self.routine("grandchild", person_resolver_timeout=2)
         self.assertEqual(person_resolver.canonicalize(routine, ["Ada"]), ["Ada"])
-        pid = int(Path(str(self.calls) + ".pid").read_text())
+        pidfile = Path(str(self.calls) + ".pid")
+        for _ in range(60):  # the resolver was killed; its pid file may lag
+            if pidfile.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(pidfile.exists(), "resolver never started")
+        pid = int(pidfile.read_text())
         for _ in range(20):
             try:
                 os.kill(pid, 0)

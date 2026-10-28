@@ -1176,7 +1176,7 @@ returns (accepted for any well-formed slug). See
 
 Names are sent to the resolver in plaintext on stdin. It runs with a minimal
 environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`) and the executable's
-directory as its working directory.
+directory (symlinks resolved) as its working directory.
 
 - **Capture.** Each resolved slug replaces the model's string before the
   existing known-slug check, so the hook can never mint an identity: a slug
