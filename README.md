@@ -1148,6 +1148,51 @@ queue to retry on the next run.
 Gmail actions, so reach for the `expand` form unless you genuinely want every
 matching document in your Drive history.
 
+### Person resolver hook
+
+Optional. Point a routine at a local executable that maps the names the model
+writes onto your own slugs and supplies extra facts for person briefs. Unset,
+nothing changes.
+
+```yaml
+memory:
+  person_resolver: [/abs/path/to/resolver, --optional-arg]
+  person_resolver_timeout: 5   # seconds, default 5
+```
+
+The executable receives `{"names": ["Ada", "kuba"]}` on stdin (the people
+strings the model returned, deduped) and prints:
+
+```json
+{"resolved": {"Ada": "ada-lovelace", "kuba": null},
+ "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}}}
+```
+
+Both keys are optional; `null` means "no match". Names are stripped and
+empty or duplicate ones dropped before sending; the keys of `resolved` must
+equal the sent strings exactly. `facts` is keyed by the slug the resolver
+returns (accepted for any well-formed slug). See
+`examples/person_resolver_example.py`.
+
+Names are sent to the resolver in plaintext on stdin. It runs with a minimal
+environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`) and the executable's
+directory (symlinks resolved) as its working directory.
+
+- **Capture.** Each resolved slug replaces the model's string before the
+  existing known-slug check, so the hook can never mint an identity: a slug
+  the store has not seen is still dropped and tagged `people-unmapped`.
+- **Person briefs.** `facts[slug]` is added to the brief facts as generic
+  `key: value` lines (strings only, trimmed).
+- **Failure.** A timeout, non-zero exit, invalid JSON or a non-slug value is
+  logged as a warning (with the first 200 characters of stderr on a non-zero
+  exit) and treated as no answer; capture proceeds as if the hook were unset.
+  On timeout the resolver's whole process group is killed.
+- **Config.** `person_resolver[0]` must be an absolute path to an existing,
+  executable file; `person_resolver_timeout` must be a positive number.
+- **Caching.** Successful answers (including `null`) are memoized in the
+  daemon process for 10 minutes, so a batch of items spawns the resolver once
+  per new name. Failures are never cached; the next capture retries.
+
 ### Person briefs
 
 When a capture introduces a person the store has no brief for, the daemon can

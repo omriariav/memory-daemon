@@ -1,0 +1,233 @@
+"""Optional person resolver hook: map names to slugs and attach facts.
+
+Opt in under a routine's `memory:` block:
+
+    memory:
+      person_resolver: [/abs/path/to/executable, optional, args]
+      person_resolver_timeout: 5      # seconds, optional
+
+The executable gets `{"names": [...]}` on stdin and prints
+
+    {"resolved": {"<input name>": "<slug>" | null},
+     "facts": {"<slug>": {"<key>": "<value>"}}}
+
+Names are stripped, and empty or duplicate ones dropped, before they are sent;
+the keys of `resolved` must equal the sent strings exactly. `facts` is keyed by
+the slug the resolver returns and is accepted for any well-formed slug, even one
+no sent name resolved to. Both keys are optional. Any failure (timeout, non-zero
+exit, bad JSON, a value of the wrong shape) is logged and treated as "no
+answer": the daemon behaves as if the hook were unset. Failures are never
+cached, so the next capture retries. The hook never raises into the capture
+path and never mints identities: a resolved slug is still checked against the
+store.
+
+The resolver runs in its own process group with a minimal environment (PATH,
+HOME, LANG, LC_ALL, TMPDIR) and the executable's directory as cwd; on timeout
+the whole group is killed. Names go to it in plaintext on stdin.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import time
+
+from .shell import log
+
+SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+DEFAULT_TIMEOUT = 5.0
+MEMO_TTL = 600  # seconds; the daemon is long-lived, so results age out
+ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
+MAX_FACT_KEYS = 12
+_memo = {}  # (argv, name) -> (stamp, slug | None)
+_fact_memo = {}  # (argv, slug) -> (stamp, {key: value})
+
+
+def reset():
+    _memo.clear()
+    _fact_memo.clear()
+
+
+def configured(routine):
+    mem = routine.get("memory")
+    argv = mem.get("person_resolver") if isinstance(mem, dict) else None
+    if isinstance(argv, list) and argv and all(
+        isinstance(a, str) and a for a in argv
+    ):
+        return tuple(argv)
+    return None
+
+
+def _timeout(routine):
+    value = (routine.get("memory") or {}).get("person_resolver_timeout")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and value > 0:
+        return float(value)
+    return DEFAULT_TIMEOUT
+
+
+def validate(memory_cfg, rid):
+    """Config problems for the resolver keys; empty list means valid."""
+    problems = []
+    if "person_resolver_timeout" in memory_cfg:
+        t = memory_cfg["person_resolver_timeout"]
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
+            problems.append(
+                f"{rid}: memory.person_resolver_timeout must be a positive number")
+    if "person_resolver" not in memory_cfg:
+        return problems
+    argv = memory_cfg["person_resolver"]
+    if not isinstance(argv, list) or not argv or any(
+        not isinstance(a, str) or not a for a in argv
+    ):
+        problems.append(
+            f"{rid}: memory.person_resolver must be a list "
+            "[absolute_path_to_executable, ...args]")
+        return problems
+    exe = argv[0]
+    if not exe.startswith("/"):
+        problems.append(f"{rid}: memory.person_resolver[0] must be an absolute path")
+    elif not os.path.isfile(exe):
+        problems.append(f"{rid}: memory.person_resolver[0] {exe} does not exist")
+    elif not os.access(exe, os.X_OK):
+        problems.append(f"{rid}: memory.person_resolver[0] {exe} is not executable")
+    return problems
+
+
+def _clean_facts(raw):
+    """{slug: {key: value}} with only well-formed strings, else raises ValueError."""
+    if not isinstance(raw, dict):
+        raise ValueError("facts must be an object")
+    out = {}
+    for slug, row in raw.items():
+        if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+            raise ValueError("facts key is not a slug")
+        if not isinstance(row, dict):
+            raise ValueError("facts value must be an object")
+        clean = {}
+        for key, value in row.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("fact keys and values must be strings")
+            key, value = key.strip()[:40], value.strip()[:200]
+            if key and value and len(clean) < MAX_FACT_KEYS:
+                clean[key] = value
+        out[slug] = clean
+    return out
+
+
+def _env():
+    return {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
+
+
+def _run(argv, timeout, payload):
+    """stdout of one resolver run; kills the whole process group on timeout."""
+    proc = subprocess.Popen(
+        list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=_env(),
+        cwd=os.path.dirname(os.path.realpath(argv[0])), start_new_session=True)
+    try:
+        out, err = proc.communicate(payload, timeout=timeout)
+    finally:
+        # Always kill the session: on timeout or a decode error the resolver
+        # may still run; after success this reaps background children it left.
+        # The group id is the leader's pid and stays reserved while any member
+        # lives, so this cannot hit an unrelated process; once the group is
+        # empty killpg fails with ESRCH, which is ignored.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)  # reap (instant if already reaped)
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        raise ValueError(f"exit {proc.returncode}: {(err or '').strip()[:200]}")
+    return out
+
+
+def _call(argv, timeout, names):
+    """(resolved, facts) from one subprocess call, or None on any failure."""
+    try:
+        data = json.loads(_run(argv, timeout, json.dumps({"names": names})))
+        if not isinstance(data, dict):
+            raise ValueError("output must be an object")
+        resolved = data.get("resolved", {})
+        if not isinstance(resolved, dict):
+            raise ValueError("resolved must be an object")
+        clean = {}
+        for name in names:
+            slug = resolved.get(name)
+            if slug is None:
+                clean[name] = None
+            elif isinstance(slug, str) and SLUG_RE.fullmatch(slug):
+                clean[name] = slug
+            else:
+                raise ValueError("resolved value is not a slug")
+        return clean, _clean_facts(data.get("facts", {}))
+    except subprocess.TimeoutExpired:
+        log(f"person-resolver WARN timed out after {timeout:g}s: {argv[0]}")
+    except Exception as exc:  # never raise into the capture path
+        log(f"person-resolver WARN {type(exc).__name__}: {exc}")
+    return None
+
+
+def _norm(names):
+    """Stripped, non-empty, unique strings, in order."""
+    return list(dict.fromkeys(
+        n.strip() for n in names if isinstance(n, str) and n.strip()))
+
+
+def _query(routine, names):
+    """Fill the memo for `names` (already normalized); argv or None if unset.
+    A failed call memoizes nothing."""
+    argv = configured(routine)
+    if argv is None:
+        return None
+    now = time.monotonic()
+    todo = [n for n in names
+            if not ((argv, n) in _memo and now - _memo[(argv, n)][0] < MEMO_TTL)]
+    if todo:
+        got = _call(argv, _timeout(routine), todo)
+        if got:
+            resolved, facts = got
+            # Single-threaded daemon: no locking. Drop expired entries on
+            # insert so the memos cannot grow without bound.
+            for memo in (_memo, _fact_memo):
+                for key in [k for k, v in memo.items()
+                            if now - v[0] >= MEMO_TTL]:
+                    del memo[key]
+            for name in todo:
+                _memo[(argv, name)] = (now, resolved[name])
+            for slug, row in facts.items():
+                _fact_memo[(argv, slug)] = (now, row)
+    return argv
+
+
+def canonicalize(routine, people):
+    """Map model-supplied people to resolver slugs; unresolved pass through.
+    Order and uniqueness are kept. Unset or failing hook: input unchanged."""
+    people = list(people)
+    argv = _query(routine, _norm(people))
+    if argv is None:
+        return people
+    return list(dict.fromkeys(
+        ((_memo.get((argv, p.strip())) or (0, None))[1] if isinstance(p, str)
+         else None) or p for p in people))
+
+
+def facts_for(routine, slug, names=()):
+    """{key: value} the resolver knows about `slug` ({} when none).
+
+    `names` are display names to ask about (never the slug itself); facts
+    learned for `slug` earlier, e.g. during capture, are reused without a call.
+    """
+    argv = configured(routine)
+    if argv is None:
+        return {}
+    now = time.monotonic()
+    cached = _fact_memo.get((argv, slug))
+    if not (cached and now - cached[0] < MEMO_TTL):
+        _query(routine, _norm(names))
+    row = _fact_memo.get((argv, slug))
+    return dict(row[1]) if row else {}

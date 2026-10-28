@@ -37,6 +37,7 @@ import yaml
 from . import claude_bridge
 from . import identity as identity_providers
 from . import owner_todos
+from . import person_resolver
 from . import personal
 from . import triviality
 from .shell import log, npx_bin
@@ -189,6 +190,7 @@ def validate(routine):
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
         "identity", "personal_tag", "redact_ids", "personal_keywords",
         "extract_model", "owner_todos", "person_briefs",
+        "person_resolver", "person_resolver_timeout",
     }
     if unknown:
         problems.append(
@@ -214,6 +216,7 @@ def validate(routine):
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
     problems.extend(owner_todos.validate(cfg, rid))
+    problems.extend(person_resolver.validate(cfg, rid))
     from . import person_briefs  # late import: person_briefs imports this module
     problems.extend(person_briefs.validate(cfg, rid, MEMORY_TYPES))
     confirmed = cfg.get("operator_confirmed_source_ids")
@@ -1085,7 +1088,10 @@ def capture(routine, item, summary, dry_run=False):
     known = _known_slugs_for_identity(store, identity)
     source_slugs = {person["slug"] for person in verified_source}
     allowed = known | source_slugs | set(verified_owners)
-    model_people = entry.get("people") or []
+    # An optional resolver hook maps names the model wrote to slugs first; the
+    # allowed check below still applies. No-op when the hook is unset.
+    model_people = person_resolver.canonicalize(
+        routine, entry.get("people") or [])
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))
