@@ -65,8 +65,8 @@ own messages get at most half of `reaction_checks` (unused slots go to the
 others), polled newest first. A reaction by someone other than the owner on
 an owner message is recorded as a `peer_reaction` (one line per emoji and
 user), so a reply tracker can see an emoji-only acknowledgement. Reactors in
-`ignore_reactors`, and users whose messages the inbox recorded as bot
-messages, are skipped (the reaction text itself does not mark bots).
+`ignore_reactors` are skipped. The bot marker is not used: a person's agent
+posts under that person's own id, so it cannot tell a bot from a person.
 
 `follow_threads` adds a record-only `from:<@owner>` search (its own scan
 mark, look-back `retention_days` on the first run): every channel message of
@@ -254,16 +254,6 @@ def reaction_row(hit, emoji):
         "thread_ts": hit["root"],
         "ts": hit["ts"],
         "emoji": emoji,
-    }
-
-
-def bot_users(base_dir):
-    """User ids the inbox recorded as bot authors."""
-    if base_dir is None:
-        return set()
-    return {
-        r["user_id"] for r in _load(path(base_dir))
-        if r.get("type") == "message" and r.get("is_bot") and r.get("user_id")
     }
 
 

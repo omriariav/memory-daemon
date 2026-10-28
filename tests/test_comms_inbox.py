@@ -421,12 +421,6 @@ class ReactionReadTest(InboxTestCase):
     def test_ignore_reactors_setting_skips_listed_ids(self):
         self.assertEqual(self.peer_users(ignore_reactors=[CAROL]), [BOB])
 
-    def test_users_recorded_as_bots_are_skipped(self):
-        comms_inbox.record(self.tmp.name, [
-            dict(message(ts_at(5), user=CAROL), is_bot=True),
-        ], 14, now=NOW)
-        self.assertEqual(self.peer_users(), [BOB])
-
     def test_ignore_reactors_validation(self):
         ok = {"ignore_reactors": [CAROL]}
         self.assertIsNone(comms_inbox.problem(ok))
