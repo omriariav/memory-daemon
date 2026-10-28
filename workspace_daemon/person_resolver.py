@@ -11,14 +11,24 @@ The executable gets `{"names": [...]}` on stdin and prints
     {"resolved": {"<input name>": "<slug>" | null},
      "facts": {"<slug>": {"<key>": "<value>"}}}
 
-Both keys are optional. Any failure (timeout, non-zero exit, bad JSON, a value
-of the wrong shape) is logged and treated as "no answer": the daemon behaves as
-if the hook were unset. The hook never raises into the capture path and never
-mints identities: a resolved slug is still checked against the store.
+Names are stripped, and empty or duplicate ones dropped, before they are sent;
+the keys of `resolved` must equal the sent strings exactly. `facts` is keyed by
+the slug the resolver returns and is accepted for any well-formed slug, even one
+no sent name resolved to. Both keys are optional. Any failure (timeout, non-zero
+exit, bad JSON, a value of the wrong shape) is logged and treated as "no
+answer": the daemon behaves as if the hook were unset. Failures are never
+cached, so the next capture retries. The hook never raises into the capture
+path and never mints identities: a resolved slug is still checked against the
+store.
+
+The resolver runs in its own process group with a minimal environment (PATH,
+HOME, LANG, LC_ALL, TMPDIR) and the executable's directory as cwd; on timeout
+the whole group is killed. Names go to it in plaintext on stdin.
 """
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -27,7 +37,7 @@ from .shell import log
 SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 DEFAULT_TIMEOUT = 5.0
 MEMO_TTL = 600  # seconds; the daemon is long-lived, so results age out
-MAX_OUTPUT = 1_000_000
+ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 MAX_FACT_KEYS = 12
 _memo = {}  # (argv, name) -> (stamp, slug | None)
 _fact_memo = {}  # (argv, slug) -> (stamp, {key: value})
@@ -105,17 +115,37 @@ def _clean_facts(raw):
     return out
 
 
+def _env():
+    return {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
+
+
+def _run(argv, timeout, payload):
+    """stdout of one resolver run; kills the whole process group on timeout."""
+    proc = subprocess.Popen(
+        list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=_env(),
+        cwd=os.path.dirname(os.path.abspath(argv[0])), start_new_session=True)
+    try:
+        out, err = proc.communicate(payload, timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=2)  # reap
+        except Exception:
+            pass
+        raise
+    if proc.returncode != 0:
+        raise ValueError(f"exit {proc.returncode}: {(err or '').strip()[:200]}")
+    return out
+
+
 def _call(argv, timeout, names):
     """(resolved, facts) from one subprocess call, or None on any failure."""
     try:
-        proc = subprocess.run(
-            list(argv), input=json.dumps({"names": names}),
-            capture_output=True, text=True, timeout=timeout, check=False)
-        if proc.returncode != 0:
-            raise ValueError(f"exit {proc.returncode}")
-        if len(proc.stdout) > MAX_OUTPUT:
-            raise ValueError("output too large")
-        data = json.loads(proc.stdout)
+        data = json.loads(_run(argv, timeout, json.dumps({"names": names})))
         if not isinstance(data, dict):
             raise ValueError("output must be an object")
         resolved = data.get("resolved", {})
@@ -138,23 +168,29 @@ def _call(argv, timeout, names):
     return None
 
 
+def _norm(names):
+    """Stripped, non-empty, unique strings, in order."""
+    return list(dict.fromkeys(
+        n.strip() for n in names if isinstance(n, str) and n.strip()))
+
+
 def _query(routine, names):
-    """Fill the memo for `names`; returns the argv or None when unset."""
+    """Fill the memo for `names` (already normalized); argv or None if unset.
+    A failed call memoizes nothing."""
     argv = configured(routine)
     if argv is None:
         return None
     now = time.monotonic()
-    fresh = lambda stamp: now - stamp < MEMO_TTL  # noqa: E731
-    todo = [n for n in dict.fromkeys(names)
-            if isinstance(n, str) and n.strip()
-            and not ((argv, n) in _memo and fresh(_memo[(argv, n)][0]))]
+    todo = [n for n in names
+            if not ((argv, n) in _memo and now - _memo[(argv, n)][0] < MEMO_TTL)]
     if todo:
         got = _call(argv, _timeout(routine), todo)
-        resolved, facts = got if got else ({n: None for n in todo}, {})
-        for name in todo:
-            _memo[(argv, name)] = (now, resolved[name])
-        for slug, row in facts.items():
-            _fact_memo[(argv, slug)] = (now, row)
+        if got:
+            resolved, facts = got
+            for name in todo:
+                _memo[(argv, name)] = (now, resolved[name])
+            for slug, row in facts.items():
+                _fact_memo[(argv, slug)] = (now, row)
     return argv
 
 
@@ -162,20 +198,26 @@ def canonicalize(routine, people):
     """Map model-supplied people to resolver slugs; unresolved pass through.
     Order and uniqueness are kept. Unset or failing hook: input unchanged."""
     people = list(people)
-    argv = _query(routine, people)
+    argv = _query(routine, _norm(people))
     if argv is None:
         return people
     return list(dict.fromkeys(
-        (_memo.get((argv, p)) or (0, None))[1] or p for p in people))
+        ((_memo.get((argv, p.strip())) or (0, None))[1] if isinstance(p, str)
+         else None) or p for p in people))
 
 
 def facts_for(routine, slug, names=()):
     """{key: value} the resolver knows about `slug` ({} when none).
 
-    `names` are extra strings (e.g. the display name) to ask about, so the
-    resolver can attach facts for a slug it was not asked about earlier.
+    `names` are display names to ask about (never the slug itself); facts
+    learned for `slug` earlier, e.g. during capture, are reused without a call.
     """
-    argv = _query(routine, [slug, *names])
+    argv = configured(routine)
     if argv is None:
         return {}
-    return dict((_fact_memo.get((argv, slug)) or (0, {}))[1])
+    now = time.monotonic()
+    cached = _fact_memo.get((argv, slug))
+    if not (cached and now - cached[0] < MEMO_TTL):
+        _query(routine, _norm(names))
+    row = _fact_memo.get((argv, slug))
+    return dict(row[1]) if row else {}

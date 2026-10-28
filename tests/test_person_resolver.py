@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,17 @@ import json, sys, time
 mode = {mode!r}
 names = json.load(sys.stdin)["names"]
 open({log!r}, "a").write(json.dumps(names) + "\\n")
+if mode == "grandchild":
+    import subprocess
+    p = subprocess.Popen(["sleep", "30"])
+    open({log!r} + ".pid", "w").write(str(p.pid))
+    time.sleep(30)
+if mode == "otherfacts":
+    print(json.dumps({{"resolved": {{}},
+                      "facts": {{"grace-hopper": {{"title": "Admiral"}}}}}}))
+    sys.exit(0)
+if mode == "fail":
+    sys.stderr.write("boom " + "x" * 300)
 if mode == "slow":
     time.sleep(5)
 if mode == "fail":
@@ -79,6 +91,43 @@ class CanonicalizeTest(ResolverTestBase):
             self.assertEqual(out, ["Ada"], mode)
             self.log.assert_called_once()
 
+    def test_nonzero_exit_logs_stderr_prefix(self):
+        person_resolver.canonicalize(self.routine("fail"), ["Ada"])
+        msg = self.log.call_args.args[0]
+        self.assertIn("exit 3: boom", msg)
+        self.assertLess(len(msg), 300)
+
+    def test_timeout_kills_process_group(self):
+        routine = self.routine("grandchild", person_resolver_timeout=0.5)
+        self.assertEqual(person_resolver.canonicalize(routine, ["Ada"]), ["Ada"])
+        pid = int(Path(str(self.calls) + ".pid").read_text())
+        for _ in range(20):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, 9)
+            self.fail("grandchild survived the timeout")
+
+    def test_failures_are_not_cached(self):
+        routine = self.routine("fail")
+        person_resolver.canonicalize(routine, ["Ada"])
+        person_resolver.canonicalize(routine, ["Ada"])
+        self.assertEqual(self.call_count(), 2)
+
+    def test_names_are_normalized(self):
+        out = person_resolver.canonicalize(
+            self.routine(), ["  Ada ", "Ada", "", "   ", "zed"])
+        self.assertEqual(out, ["ada-lovelace", "", "   ", "zed"])
+        self.assertEqual(json.loads(self.calls.read_text().splitlines()[0]),
+                         ["Ada", "zed"])
+
+    def test_only_blank_names_never_call(self):
+        person_resolver.canonicalize(self.routine(), ["", "  "])
+        self.assertEqual(self.call_count(), 0)
+
     def test_missing_executable_never_raises(self):
         routine = {"id": "r", "memory": {"person_resolver": ["/nonexistent/x"]}}
         self.assertEqual(person_resolver.canonicalize(routine, ["Ada"]), ["Ada"])
@@ -99,6 +148,27 @@ class FactsTest(ResolverTestBase):
         facts = person_resolver.facts_for(self.routine(), "ada-lovelace",
                                           ["Ada Lovelace"])
         self.assertEqual(facts, {"title": "Staff Engineer", "team": "Engines"})
+
+    def test_slug_is_never_sent_as_a_name(self):
+        person_resolver.facts_for(self.routine(), "ada-lovelace", ["Ada"])
+        self.assertEqual(json.loads(self.calls.read_text().splitlines()[0]),
+                         ["Ada"])
+
+    def test_facts_learned_during_capture_are_reused(self):
+        routine = self.routine()
+        person_resolver.canonicalize(routine, ["Ada"])
+        facts = person_resolver.facts_for(routine, "ada-lovelace", ["Ada"])
+        self.assertEqual(facts["title"], "Staff Engineer")
+        self.assertEqual(self.call_count(), 1)
+
+    def test_facts_for_unrequested_slug_are_accepted(self):
+        facts = person_resolver.facts_for(
+            self.routine("otherfacts"), "grace-hopper", ["Someone"])
+        self.assertEqual(facts, {"title": "Admiral"})
+
+    def test_no_names_no_call(self):
+        self.assertEqual(person_resolver.facts_for(self.routine(), "x-y"), {})
+        self.assertEqual(self.call_count(), 0)
 
     def test_facts_empty_when_unset_or_failing(self):
         self.assertEqual(person_resolver.facts_for({"memory": {}}, "ada-lovelace"), {})
@@ -138,7 +208,11 @@ class ValidateTest(ResolverTestBase):
                     {"person_resolver": [str(self.tmp / "missing")]},
                     {"person_resolver": [str(plain)]},
                     {"person_resolver": [self.script()],
-                     "person_resolver_timeout": 0}):
+                     "person_resolver_timeout": 0},
+                    {"person_resolver": [self.script()],
+                     "person_resolver_timeout": True},
+                    {"person_resolver": [self.script()],
+                     "person_resolver_timeout": "5"}):
             self.assertTrue(self.problems(cfg), cfg)
 
 

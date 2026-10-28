@@ -1168,8 +1168,15 @@ strings the model returned, deduped) and prints:
  "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}}}
 ```
 
-Both keys are optional; `null` means "no match". See
+Both keys are optional; `null` means "no match". Names are stripped and
+empty or duplicate ones dropped before sending; the keys of `resolved` must
+equal the sent strings exactly. `facts` is keyed by the slug the resolver
+returns (accepted for any well-formed slug). See
 `examples/person_resolver_example.py`.
+
+Names are sent to the resolver in plaintext on stdin. It runs with a minimal
+environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`) and the executable's
+directory as its working directory.
 
 - **Capture.** Each resolved slug replaces the model's string before the
   existing known-slug check, so the hook can never mint an identity: a slug
@@ -1177,12 +1184,14 @@ Both keys are optional; `null` means "no match". See
 - **Person briefs.** `facts[slug]` is added to the brief facts as generic
   `key: value` lines (strings only, trimmed).
 - **Failure.** A timeout, non-zero exit, invalid JSON or a non-slug value is
-  logged as a warning and treated as no answer; capture proceeds as if the
-  hook were unset.
+  logged as a warning (with the first 200 characters of stderr on a non-zero
+  exit) and treated as no answer; capture proceeds as if the hook were unset.
+  On timeout the resolver's whole process group is killed.
 - **Config.** `person_resolver[0]` must be an absolute path to an existing,
   executable file; `person_resolver_timeout` must be a positive number.
-- **Caching.** Answers (including `null`) are memoized in the daemon process
-  for 10 minutes, so a batch of items spawns the resolver once per new name.
+- **Caching.** Successful answers (including `null`) are memoized in the
+  daemon process for 10 minutes, so a batch of items spawns the resolver once
+  per new name. Failures are never cached; the next capture retries.
 
 ### Person briefs
 
