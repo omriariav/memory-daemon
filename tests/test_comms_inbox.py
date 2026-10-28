@@ -212,6 +212,7 @@ class ReactionTest(InboxTestCase):
             ))
 
 
+CAROL = "U0EXAMPLEC"
 REACTIONS_TOOL = "mcp__example_slack__slack_get_reactions"
 
 
@@ -403,6 +404,37 @@ class ReactionReadTest(InboxTestCase):
             [r["emoji"] for r in self.rows() if r["type"] == "peer_reaction"],
             ["pray"],
         )
+
+    def peer_users(self, **inbox):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "uid": ME, "name": "Me"},
+        ]})
+        self.answer = reactions_text(("pray", [BOB, CAROL]))
+        self.run_once({"channels": [CHAN], **inbox})
+        return sorted(
+            r["user_id"] for r in self.rows() if r["type"] == "peer_reaction"
+        )
+
+    def test_every_other_reactor_is_recorded_by_default(self):
+        self.assertEqual(self.peer_users(), sorted([BOB, CAROL]))
+
+    def test_ignore_reactors_setting_skips_listed_ids(self):
+        self.assertEqual(self.peer_users(ignore_reactors=[CAROL]), [BOB])
+
+    def test_users_recorded_as_bots_are_skipped(self):
+        comms_inbox.record(self.tmp.name, [
+            dict(message(ts_at(5), user=CAROL), is_bot=True),
+        ], 14, now=NOW)
+        self.assertEqual(self.peer_users(), [BOB])
+
+    def test_ignore_reactors_validation(self):
+        ok = {"ignore_reactors": [CAROL]}
+        self.assertIsNone(comms_inbox.problem(ok))
+        for bad in ("U1", [CAROL, CAROL], ["nope"], [f"U0EXAMPLE{i:02d}" for i in range(21)]):
+            with self.subTest(bad=bad):
+                self.assertIsNotNone(
+                    comms_inbox.problem({"ignore_reactors": bad})
+                )
 
     def test_owner_reaction_alone_on_own_message_stays_open(self):
         self.connector.search = by_filter({f"in:<#{CHAN}>": [

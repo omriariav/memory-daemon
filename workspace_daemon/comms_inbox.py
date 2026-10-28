@@ -20,6 +20,7 @@ Watch file (or source) block:
       retention_days: 14       # default 14
       reaction_checks: 10      # reaction reads per run (needs reactions_tool)
       reaction_check_hours: 72 # how long an unanswered message is re-checked
+      ignore_reactors: [U0EXAMPLE09]   # never recorded as peer reactions (at most 20)
       track_reactions: [track-example]   # "watch this conversation" (at most 3)
       follow_threads: true     # every channel thread the owner posted in
       thread_polls: 10         # thread reads per run for followed threads
@@ -63,7 +64,9 @@ age (at most 6h) between checks of the same one;
 own messages get at most half of `reaction_checks` (unused slots go to the
 others), polled newest first. A reaction by someone other than the owner on
 an owner message is recorded as a `peer_reaction` (one line per emoji and
-user), so a reply tracker can see an emoji-only acknowledgement.
+user), so a reply tracker can see an emoji-only acknowledgement. Reactors in
+`ignore_reactors`, and users whose messages the inbox recorded as bot
+messages, are skipped (the reaction text itself does not mark bots).
 
 `follow_threads` adds a record-only `from:<@owner>` search (its own scan
 mark, look-back `retention_days` on the first run): every channel message of
@@ -101,12 +104,13 @@ FILE_NAME = "comms-inbox.jsonl"
 KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
-    "thread_polls",
+    "thread_polls", "ignore_reactors",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
-            "follow_threads": False, "thread_polls": 10}
+            "follow_threads": False, "thread_polls": 10,
+            "ignore_reactors": []}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -116,6 +120,7 @@ MAX_TRACKED_QUERIES = 2
 CHECKS_FILE = "comms-inbox-checks.json"
 MAX_CHECK_GAP = 6 * 3600
 MAX_REACTIONS = 5
+MAX_IGNORE_REACTORS = 20
 MAX_RETENTION_DAYS = 90
 MAX_TEXT = 4000
 _REACTION_LINE = re.compile(
@@ -124,6 +129,7 @@ _REACTION_LINE = re.compile(
 )
 _REACTOR = re.compile(r"\(([UW][A-Z0-9]+)\)")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
+USER_ID = re.compile(r"^[UW][A-Z0-9]{6,}$")
 EMOJI = re.compile(r"^[a-z0-9][a-z0-9_+'-]{0,99}$")
 
 
@@ -155,6 +161,16 @@ def problem(value):
                 f"`{key}` must be a list of at most {most} distinct emoji "
                 "names (no colons)"
             )
+    ignore = value.get("ignore_reactors", [])
+    if (
+        not isinstance(ignore, list) or len(ignore) > MAX_IGNORE_REACTORS
+        or not all(isinstance(u, str) and USER_ID.match(u) for u in ignore)
+        or len(set(ignore)) != len(ignore)
+    ):
+        return (
+            f"`ignore_reactors` must be a list of at most {MAX_IGNORE_REACTORS}"
+            " distinct Slack user ids"
+        )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
 
@@ -181,6 +197,7 @@ def settings(value):
     cfg["channels"] = list(cfg["channels"])
     cfg["reactions"] = list(cfg["reactions"])
     cfg["track_reactions"] = list(cfg["track_reactions"])
+    cfg["ignore_reactors"] = list(cfg["ignore_reactors"])
     return cfg
 
 
@@ -237,6 +254,16 @@ def reaction_row(hit, emoji):
         "thread_ts": hit["root"],
         "ts": hit["ts"],
         "emoji": emoji,
+    }
+
+
+def bot_users(base_dir):
+    """User ids the inbox recorded as bot authors."""
+    if base_dir is None:
+        return set()
+    return {
+        r["user_id"] for r in _load(path(base_dir))
+        if r.get("type") == "message" and r.get("is_bot") and r.get("user_id")
     }
 
 

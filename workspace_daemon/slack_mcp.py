@@ -1998,6 +1998,7 @@ def _check_reactions(cfg, now):
     not_handled = (
         set(inbox["track_reactions"]) | set(cfg["save_reactions"])
     ) - set(inbox["reactions"])
+    skip_users = set(inbox["ignore_reactors"]) | comms_inbox.bot_users(_base_dir)
     rows, checked, bad = [], [], 0
     for message, text in zip(due, texts):
         # A read with no usable result (e.g. a deleted message) backs off too.
@@ -2016,7 +2017,8 @@ def _check_reactions(cfg, now):
             rows.extend(
                 comms_inbox.peer_row(hit, name, uid)
                 for name, users in reactors for uid in users
-                if uid != owner and name not in not_handled
+                if uid != owner and uid not in skip_users
+                and name not in not_handled
             )
         else:
             rows.extend(
