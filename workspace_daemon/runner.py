@@ -2457,13 +2457,12 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 totals["processed"] += 1
         except state.AlreadyRunning:
             raise
+        except gmail_mcp.SenderUnverified as exc:
+            # Recorded as done: external mail is skipped, not an error, and
+            # must not hold the cursor, so no hold_claim here.
+            totals["skipped"] += 1
+            log(f"routine={rid} skipped id={candidate['id']}: {exc}")
         except Exception as exc:  # per-item failures are isolated
-            if isinstance(exc, gmail_mcp.SenderUnverified):
-                # Recorded as done; external mail is skipped, not an error,
-                # and must not hold the cursor.
-                totals["skipped"] += 1
-                log(f"routine={rid} skipped id={candidate['id']}: {exc}")
-                continue
             hold_claim(claim)
             if (
                 isinstance(exc, claude_bridge.GUARD_STOPS)

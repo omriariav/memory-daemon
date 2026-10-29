@@ -1566,7 +1566,8 @@ class VerifiedSenderConfigTest(unittest.TestCase):
         self.assertEqual(self.problems(verified_sender_domains=["example.com"]), [])
         self.assertEqual(self.problems(verified_sender_domains=["example.com"],
                                        auth_servers=["mx.example.net"]), [])
-        for bad in ([], "example.com", ["Example.com"], ["@example.com"],
+        self.assertEqual(self.problems(verified_sender_domains=["Example.COM"]), [])
+        for bad in ([], "example.com", ["@example.com"],
                     ["example"], [""], [None]):
             self.assertTrue(self.problems(verified_sender_domains=bad), bad)
         self.assertTrue(self.problems(auth_servers=["mx.google.com"]))
@@ -1616,3 +1617,31 @@ class OwnerAndWithheldTest(VerifiedSenderFlowTest):
             {1: authed_text(1), 2: authed_text(2, auth=())})
         thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
         self.assertEqual((thread["omitted"], thread["withheld"]), (0, 1))
+
+
+class VerifiedSenderRoundThreeTest(VerifiedSenderFlowTest):
+    def test_gmail_dkim_identity_without_a_local_part(self):
+        auth = ["mx.google.com; dkim=pass header.i=@example.com header.s=g1 "
+                "header.b=abc; spf=pass (google.com: domain of a@example.com "
+                "designates 192.0.2.1 as permitted sender) "
+                "smtp.mailfrom=a@example.com"]
+        self.assertTrue(gmail_mcp.sender_authenticated(
+            auth, "example.com", ["mx.google.com"]))
+
+    def test_a_second_trusted_gateway_is_allowed_but_a_repeat_is_not(self):
+        servers = ["mx.google.com", "gw.example.net"]
+        good = "mx.google.com; dmarc=pass header.from=example.com"
+        self.assertTrue(gmail_mcp.sender_authenticated(
+            [good, "gw.example.net; spf=pass smtp.mailfrom=a@example.com"],
+            "example.com", servers))
+        self.assertFalse(gmail_mcp.sender_authenticated(
+            [good, good], "example.com", servers))
+
+    def test_messages_dropped_at_listing_are_noted_as_withheld(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1, "sender": "x@vendor.test"},
+             {"mid": 2, "thread": 1, "epoch": T2}],
+            {2: authed_text(2)})
+        thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
+        self.assertEqual(thread["withheld"], 1)

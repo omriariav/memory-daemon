@@ -700,12 +700,14 @@ def sender_domain(value):
     return _domain_of(address)
 
 
-def _domain_of(address):
+def _domain_of(address, bare_ok=False):
+    """Domain of local@domain; `bare_ok` also takes `@domain` (a DKIM
+    `header.i` with no local part, as Gmail writes it)."""
     address = str(address or "").strip()
     if address.count("@") != 1 or any(c.isspace() for c in address):
         return None
     local, domain = address.split("@")
-    if not local or not domain:
+    if not domain or not (local or bare_ok):
         return None
     return domain.casefold()
 
@@ -758,22 +760,25 @@ def _auth_server(clauses):
 
 
 def sender_authenticated(results, domain, servers):
-    """True when the one Authentication-Results stamped by a trusted server
-    is the topmost header and shows dmarc=pass for `domain`, or dkim=pass
+    """True when the topmost Authentication-Results is a trusted server's and
+    shows dmarc=pass for `domain`, or dkim=pass
     signed by `domain` plus spf=pass for it. Anything missing, unreadable or
     ambiguous is False, and any other DMARC verdict vetoes a pass.
 
     The receiving server adds its header above any a sender wrote into the
-    message; a second header naming a trusted server is treated as forged.
+    message; a second header naming the same server is treated as forged.
     """
     if not results or not domain or None in results:
         return False
     parsed = [_auth_clauses(value) for value in results]
     if any(clauses is None for clauses in parsed):
         return False
-    trusted = [i for i, clauses in enumerate(parsed)
-               if _auth_server(clauses) in servers]
-    if trusted != [0]:
+    # The topmost header must be a trusted server's; another header naming
+    # that same server below it can only be one a sender wrote.
+    top = _auth_server(parsed[0])
+    if top not in servers or any(
+        _auth_server(clauses) == top for clauses in parsed[1:]
+    ):
         return False
     verdicts = {"dmarc": False, "dkim": False, "spf": False}
     for clause in parsed[0][1:]:
@@ -794,7 +799,7 @@ def sender_authenticated(results, domain, servers):
         elif method == "dkim":
             verdicts["dkim"] |= (
                 props.get("header.d") == domain
-                or _domain_of(props.get("header.i")) == domain
+                or _domain_of(props.get("header.i"), bare_ok=True) == domain
             )
         else:
             verdicts["spf"] |= _domain_of(props.get("smtp.mailfrom")) == domain
@@ -982,15 +987,21 @@ def _group(cfg, hits):
     """Group accepted hits by thread."""
     owner = (cfg.get("owner_email") or "").strip().casefold()
     domains = cfg.get("verified_sender_domains")
+    withheld = {}  # thread -> ids dropped at listing
     if domains:
         # The owner's own mail never carries the receiving server's verdict,
         # so it would only cost a read and fail at fetch.
+        all_hits = hits
         hits, external = _partition(hits, lambda h: (
             sender_domain(h["from"]) in domains and _address(h["from"]) != owner
         ))
         if external:
             _log_skipped("from senders outside verified_sender_domains",
                          sorted(set(external)))
+        dropped = set(external)
+        for hit in all_hits:
+            if hit["id"] in dropped:
+                withheld.setdefault(hit["thread"], set()).add(hit["id"])
     groups = {}
     for hit in hits:
         group = groups.setdefault(hit["thread"], {"messages": {}})
@@ -1010,6 +1021,7 @@ def _group(cfg, hits):
             "messages": [(mid, epoch) for epoch, mid, _ in messages],
             "newest_epoch": newest_epoch,
             "newest_id": newest_id,
+            "withheld": len(withheld.get(thread, ())),
         }
     return out
 
@@ -1031,6 +1043,7 @@ def _candidate(candidate_id, source_id, thread, group, plan, batch,
         "newest_ts": group["newest_epoch"],
         "message_ids": [mid for mid, _ in group["messages"]],
         "fetch_ids": plan,
+        "listing_withheld": group.get("withheld", 0),
         "keys": [CURSOR_KEY],
         "mode": "mcp_thread",
         "_batch": batch,
@@ -1349,7 +1362,7 @@ def fetch(routine, candidate, source=None):
         "thread_id": thread,
         "messages": out,
         "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
-        "withheld": len(unverified),
+        "withheld": len(unverified) + raw.get("listing_withheld", 0),
     }
 
 

@@ -2247,20 +2247,26 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 - Listing drops every message whose `From` is not one plain address in a listed
   domain. The match is exact: a subdomain or lookalike does not match, and the
   display name is ignored.
-- `fetch()` then requires exactly one `Authentication-Results` header stamped
-  by one of `auth_servers`, and it must be the topmost header. It must show
+- `fetch()` then requires the topmost `Authentication-Results` header to be
+  stamped by one of `auth_servers`. A lower header naming the same server
+  counts as forged. It must show
   `dmarc=pass` with `header.from` equal to the domain, or `dkim=pass` signed by
   the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
   Comments and quoted strings are removed before parsing, so text a sender
   controls cannot form a clause.
 - An `Authentication-Results` line printed after the message's own headers
   is treated as forged, because a decoded header value can contain a newline.
-- A message that is missing the header or fails the check is dropped. In a
-  kept thread, a note says how many messages were withheld. The owner's own
-  mail never passes the receiving server, so it is dropped at listing.
-- Limits: a verified colleague's mail can still quote or forward outside
-  text. A thread recorded as `unverified` is not re-read after the domains or
-  the connector change.
+- A message that is missing the header or fails the check is dropped, at
+  listing or at fetch. In a kept thread, a note says how many messages were
+  withheld.
+- The owner's own mail never passes the receiving server, so it is dropped at
+  listing. The owner's replies in a thread are therefore not captured.
+- Limits:
+  - A verified colleague's mail can still quote or forward outside text.
+  - A thread recorded as `unverified` is not re-read after the domains or the
+    connector change.
+  - Mail delivered without the receiving server's stamp is never captured.
+    This includes all mail when the connector does not return the header.
 - A thread with no verified message is recorded as `unverified` and never
   captured. Logs carry counts and message ids only.
 - This fails closed. A connector whose `fetch_message` does not return

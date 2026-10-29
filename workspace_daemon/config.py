@@ -1934,12 +1934,12 @@ def _validate_gmail_mcp(prefix, source):
         if key in source and not (
             isinstance(value, list) and value and all(
                 isinstance(d, str)
-                and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", d)
+                and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", d, re.I)
                 for d in value
             )
         ):
             problems.append(
-                f"{prefix}.{key} must be a non-empty list of lowercase domains"
+                f"{prefix}.{key} must be a non-empty list of domains"
             )
     if "auth_servers" in source and "verified_sender_domains" not in source:
         problems.append(f"{prefix}.auth_servers requires verified_sender_domains")
