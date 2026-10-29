@@ -1093,6 +1093,27 @@ def capture(routine, item, summary, dry_run=False):
     # allowed check below still applies. No-op when the hook is unset.
     model_people = person_resolver.canonicalize(
         routine, entry.get("people") or [])
+    # A bare first name in a meeting ("Daniel") maps to the one calendar
+    # attendee who goes by it. Such a slug is attested by the invitation, so
+    # it is allowed like a verified source participant.
+    attendees = [
+        row for row in meta.get("source_people") or []
+        if isinstance(row, dict)
+        and str(row.get("role") or "").startswith("calendar-")
+    ]
+    pending = [p for p in model_people if p not in allowed]
+    if attendees and pending:
+        owner = (identity.get("person") or {}).get("slug") \
+            if identity.get("safe") else None
+        matched = person_resolver.first_name_matches(
+            routine, pending, attendees, verified_source,
+            exclude={owner} if owner else set())
+        if matched:
+            log(f"routine={rid} memory: matched {len(matched)} first name(s) "
+                "to meeting attendees")
+            allowed = allowed | set(matched.values())
+            model_people = list(dict.fromkeys(
+                matched.get(p, p) for p in model_people))
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))

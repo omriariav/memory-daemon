@@ -1165,10 +1165,12 @@ strings the model returned, deduped) and prints:
 
 ```json
 {"resolved": {"Ada": "ada-lovelace", "kuba": null},
- "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}}}
+ "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}},
+ "first_names": {"ada-lovelace": ["Ada", "Augusta"]},
+ "stale": true}
 ```
 
-Both keys are optional; `null` means "no match". Names are stripped and
+Only `resolved` is required; `null` means "no match". Names are stripped and
 empty or duplicate ones dropped before sending; the keys of `resolved` must
 equal the sent strings exactly. `facts` is keyed by the slug the resolver
 returns (accepted for any well-formed slug). See
@@ -1181,6 +1183,18 @@ directory (symlinks resolved) as its working directory.
 - **Capture.** Each resolved slug replaces the model's string before the
   existing known-slug check, so the hook can never mint an identity: a slug
   the store has not seen is still dropped and tagged `people-unmapped`.
+- **Meeting first names.** A capture with calendar attendees (`mila`,
+  `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one
+  attendee who goes by it, never to anyone else in the directory. Each
+  attendee is resolved by the local part of their email (e.g. `first.last`),
+  then their display name, then the verified participant list. Their first
+  names are the resolver's `first_names` (preferred names, nicknames) plus the
+  first word of the display name and of the email's local part. A name shared
+  by several attendees, or by none, stays unresolved as before. A match on the
+  memory owner is left out. The matched slug is attested by the invitation, so
+  it is kept like a verified participant.
+- **Stale data.** `"stale": true` (the resolver's data is past its refresh
+  date) still resolves; one warning is logged per run.
 - **Person briefs.** `facts[slug]` is added to the brief facts as generic
   `key: value` lines (strings only, trimmed).
 - **Failure.** A timeout, non-zero exit, invalid JSON or a non-slug value is
