@@ -2960,7 +2960,9 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         and not record.get("expand_fallback")
     ):
         processed.record_resolving(
-            item["id"], record, record.get("memory_source_id") or item.get("source_id")
+            item["id"], record,
+            record.get("memory_thread_source_id")
+            or record.get("memory_source_id") or item.get("source_id"),
         )
     else:
         processed.record(item["id"], record)

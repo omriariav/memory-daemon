@@ -1,6 +1,7 @@
 """Operational alerts: budget pressure, budget holds and unhealthy routines.
 
-Every scheduler tick calls `check`. It evaluates a fixed set of conditions,
+Every scheduler tick that passes the pause and preflight checks calls
+`check` (dry runs do not). It evaluates a fixed set of conditions,
 and each condition that becomes true is announced once: a line in the run log
 and an event in `state/events.jsonl` with source "daemon" and kind "alert",
 which the notifier (capture-events.py + notify.json) delivers. A condition
@@ -12,14 +13,17 @@ Conditions (`key` in the event's details):
 - `budget-hit:<day>`: the global cap is reached, so every Claude routine is
   held. It replaces the 80% condition, so a jump past the cap alerts once.
 - `budget-invalid`: state/budget.yaml cannot be read, which also holds them.
+- `usage-unreadable`: the usage log cannot be read, so spend is unknown and
+  Claude routines and routines with their own cap are held.
 - `hold:<routine>:<day>`: a routine reached its own budget.daily_usd. Holds
   caused by the global cap are listed on `budget-hit` instead, so a cap hit
   sends one alert, not one per routine.
 - `attention:<routine>`: `status` would show the routine as "attention".
   Tick states that a running tick produces on its own (incomplete, overlap)
   are ignored.
-- `connector:<server>`: an MCP connector's errors have outlasted its last
-  success by more than CONNECTOR_GRACE_SECONDS.
+- `connector:<server>`: an MCP connector's last error has been newer than
+  its last success for more than CONNECTOR_GRACE_SECONDS (counted from the
+  first error since that success).
 
 Budget conditions carry spend by routine. Deduplication state lives in
 `state/alerts.json`; `state/alerts.lock` keeps concurrent ticks (capture,
@@ -50,37 +54,50 @@ def _spend_text(spent):
     ) or "no spend"
 
 
-def budget_conditions(base_dir, routines, now):
-    """Active budget conditions as {key: (message, details)}."""
+def budget_conditions(routines, entries, budget, now):
+    """Active budget conditions as {key: (message, details)}.
+
+    `entries` is the usage log (or a BridgeError reading it) and `budget` is
+    load_budget's (cap, tz) (or a BridgeError).
+    """
     found = {}
-    bridged = [
-        routine for routine in routines
+    bridged = sorted(
+        routine["id"] for routine in routines
         if routine.get("enabled", True) and config.uses_claude_bridge(routine)
-    ]
-    try:
-        cap, tz = claude_bridge.load_budget(base_dir)
-        entries = claude_bridge.recent_usage(base_dir, now=now)
-    except claude_bridge.BridgeError as exc:
+    )
+    capped = sorted(
+        routine["id"] for routine in routines
+        if routine.get("enabled", True) and config.budget_cap(routine)
+    )
+    if isinstance(budget, claude_bridge.BridgeError):
         if bridged:
-            held = sorted(routine["id"] for routine in bridged)
             found["budget-invalid"] = (
-                f"Budget unreadable ({exc}); holding {', '.join(held)}",
+                f"Budget unreadable ({budget}); holding {', '.join(bridged)}",
+                {"held": bridged},
+            )
+        return found
+    if isinstance(entries, claude_bridge.BridgeError):
+        held = sorted(set(bridged) | set(capped))
+        if held:
+            found["usage-unreadable"] = (
+                f"Spend unknown ({entries}); holding {', '.join(held)}",
                 {"held": held},
             )
         return found
+    cap, tz = budget
     day_start = claude_bridge.day_start_epoch(now, tz)
     day = datetime.datetime.fromtimestamp(day_start, tz).date().isoformat()
     spent = status.spend_by_routine(entries, day_start)
     total = sum(spent.values())
     spend = {tag: round(value, 2) for tag, value in spent.items()}
-    if cap is not None and total >= cap:
-        held = sorted(routine["id"] for routine in bridged)
+    hit = cap is not None and total >= cap
+    if hit:
         found[f"budget-hit:{day}"] = (
             f"Global Claude cap reached: ${total:.2f} of ${cap:g}; "
-            f"holding {', '.join(held) or 'nothing'}. "
+            f"holding {', '.join(bridged) or 'nothing'}. "
             f"Spend: {_spend_text(spent)}",
             {"spent_usd": round(total, 2), "cap_usd": cap,
-             "held": held, "by_routine": spend},
+             "held": bridged, "by_routine": spend},
         )
     elif cap is not None and total >= WARN_FRACTION * cap:
         found[f"budget-80:{day}"] = (
@@ -94,6 +111,8 @@ def budget_conditions(base_dir, routines, now):
         if not routine.get("enabled", True) or own is None:
             continue
         rid = routine["id"]
+        if hit and rid in bridged:
+            continue  # already listed as held on the cap hit
         used = spent.get(rid, 0.0)
         if used >= own:
             found[f"hold:{rid}:{day}"] = (
@@ -103,7 +122,7 @@ def budget_conditions(base_dir, routines, now):
     return found
 
 
-def health_conditions(base_dir, routines, now):
+def health_conditions(base_dir, routines, entries, now):
     """Routines `status` flags for attention, and connectors failing too long."""
     found = {}
     history = status.read_tick_history(Path(base_dir) / "logs" / "run.log")
@@ -119,21 +138,16 @@ def health_conditions(base_dir, routines, now):
                 f"{row['routine']} needs attention: {', '.join(issues)}",
                 {"routine": row["routine"], "issues": issues},
             )
-    try:
-        entries = claude_bridge.recent_usage(base_dir, now=now)
-    except claude_bridge.BridgeError:
-        return found  # the budget condition already reports an unreadable log
-    times = status.connector_times(entries)
-    for server, first in times["first_error"].items():
-        if now - first < CONNECTOR_GRACE_SECONDS:
-            continue
-        if times["error"].get(server, 0) <= times["ok"].get(server, 0):
-            continue
-        found[f"connector:{server}"] = (
-            f"Connector {server} failing for {status._duration(now - first)} "
-            "with no successful call",
-            {"connector": server},
-        )
+    if isinstance(entries, claude_bridge.BridgeError):
+        return found  # reported as usage-unreadable
+    # connector_times keeps first_error only while no ok has followed it.
+    for server, first in status.connector_times(entries)["first_error"].items():
+        if now - first >= CONNECTOR_GRACE_SECONDS:
+            found[f"connector:{server}"] = (
+                f"Connector {server} failing for "
+                f"{status._duration(now - first)} with no successful call",
+                {"connector": server},
+            )
     return found
 
 
@@ -151,15 +165,12 @@ def check(base_dir, routines, now=None):
     Never raises: alerting must not break the tick that runs it.
     """
     now = time.time() if now is None else now
-    state_dir = state.ensure_private_dir(Path(base_dir) / "state")
+    lock_fd = None
     try:
+        state_dir = state.ensure_private_dir(Path(base_dir) / "state")
         lock_fd = os.open(
             str(state_dir / LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600
         )
-    except OSError as exc:
-        log(f"alerts WARN lock failed: {type(exc).__name__}: {exc}")
-        return []
-    try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -169,12 +180,22 @@ def check(base_dir, routines, now=None):
         log(f"alerts WARN check failed: {type(exc).__name__}: {exc}")
         return []
     finally:
-        os.close(lock_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _read(loader):
+    try:
+        return loader()
+    except claude_bridge.BridgeError as exc:
+        return exc
 
 
 def _check_locked(base_dir, routines, now, path):
-    active = budget_conditions(base_dir, routines, now)
-    active.update(health_conditions(base_dir, routines, now))
+    entries = _read(lambda: claude_bridge.recent_usage(base_dir, now=now))
+    budget = _read(lambda: claude_bridge.load_budget(base_dir))
+    active = budget_conditions(routines, entries, budget, now)
+    active.update(health_conditions(base_dir, routines, entries, now))
     seen = _load(path)
     new = [key for key in active if key not in seen]
     stamp = datetime.datetime.fromtimestamp(
@@ -183,13 +204,23 @@ def _check_locked(base_dir, routines, now, path):
     if remembered != seen:
         # Saved before delivery: a failed save sends nothing and retries next
         # tick, rather than repeating the alert on every tick.
-        state.write_atomic(path, json.dumps(remembered, sort_keys=True),
-                           mode=0o600)
+        _save(path, remembered)
+    undelivered = []
     for key in sorted(new):
         message, details = active[key]
         log(f"alert {key}: {message}")
-        events.emit(base_dir, events.build(
+        if not events.emit(base_dir, events.build(
             "daemon", "alert", None, f"daemon:{key}", message, [],
             ts=stamp, details={"key": key, **details},
-        ))
-    return new
+        )):
+            undelivered.append(key)
+    if undelivered:
+        # Forget them so the next tick tries again.
+        for key in undelivered:
+            remembered.pop(key)
+        _save(path, remembered)
+    return [key for key in sorted(new) if key not in undelivered]
+
+
+def _save(path, remembered):
+    state.write_atomic(path, json.dumps(remembered, sort_keys=True), mode=0o600)

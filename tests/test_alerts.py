@@ -217,6 +217,44 @@ class AlertsTest(unittest.TestCase):
         self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 1)
 
+    def test_unreadable_usage_log_alerts_with_held_routines(self):
+        self.cap(10)
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.assertEqual(self.check([BRIDGED, capped_plain]),
+                         ["usage-unreadable"])
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["held"], ["alpha", "plain"])
+        self.assertNotIn("budget.yaml", event["title"])
+
+    def test_unreadable_usage_log_alerts_without_bridged_routines(self):
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.assertEqual(self.check([capped_plain]), ["usage-unreadable"])
+
+    def test_global_hit_suppresses_own_cap_holds_of_bridged_routines(self):
+        self.cap(5)
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(6)
+        self.assertEqual(self.check([capped, OTHER]), ["budget-hit:2026-03-10"])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_failed_append_is_retried_on_the_next_tick(self):
+        self.cap(5)
+        self.spend(6)
+        with mock.patch.object(alerts.events, "emit", return_value=False):
+            self.assertEqual(self.check(), [])
+        self.assertEqual(
+            json.loads((self.base / "state" / "alerts.json").read_text()), {})
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(len(self.emitted()), 1)
+        self.assertEqual(self.check(), [])
+
+    def test_state_dir_failure_never_raises(self):
+        with mock.patch.object(alerts.state, "ensure_private_dir",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.check(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

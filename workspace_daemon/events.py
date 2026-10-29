@@ -67,7 +67,7 @@ def build(routine_id, kind, memory_id, source_id, title, people, ts=None,
 
 
 def emit(base_dir, event):
-    """Append one event line. Never raises: a failed append is only logged."""
+    """Append one event line; True on success. Never raises: a failure is logged."""
     try:
         state_dir = ensure_private_dir(os.path.join(base_dir, "state"))
         line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
@@ -93,3 +93,5 @@ def emit(base_dir, event):
             os.close(lock_fd)  # closing also drops the flock
     except (OSError, TypeError, ValueError) as exc:
         log(f"events WARN append failed: {type(exc).__name__}: {exc}")
+        return False
+    return True

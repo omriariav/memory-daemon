@@ -1712,7 +1712,8 @@ file or a failed usage-log write makes it report unhealthy.
 
 ### Alerts
 
-Every scheduler tick (except a dry run) checks a few conditions and announces
+Every scheduler tick that passes the pause and preflight checks (except a
+dry run) checks a few conditions and announces
 each one once when it starts: an `alert <key>: ...` line in the run log and an
 event in `state/events.jsonl` with source `daemon` and kind `alert` (see
 "Capture events"). A condition stays quiet while it holds and can alert again
@@ -1721,11 +1722,12 @@ only after it clears.
 | key | when |
 |---|---|
 | `budget-80:<day>` | today's spend reached 80% of the global `daily_usd` |
-| `budget-hit:<day>` | the global cap is reached; lists the held routines. It replaces the 80% alert, so a jump past the cap alerts once, and routines held by it get no alert of their own |
+| `budget-hit:<day>` | the global cap is reached; lists the held routines. It replaces the 80% alert, so a jump past the cap alerts once, and Claude routines held by it get no `hold:` alert of their own |
 | `budget-invalid` | `state/budget.yaml` is malformed (Claude routines are held) |
+| `usage-unreadable` | `state/claude-usage.jsonl` cannot be read, so spend is unknown (Claude routines and routines with their own cap are held) |
 | `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
 | `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap`, which a tick running in another group produces |
-| `connector:<server>` | a connector's errors have outlasted its last success by over an hour |
+| `connector:<server>` | a connector's last error has been newer than its last success for over an hour, counted from the first error since that success |
 
 Budget alerts carry spend by routine. Dedupe state is `state/alerts.json`, and
 `state/alerts.lock` stops two schedulers from alerting at once. A failed check
