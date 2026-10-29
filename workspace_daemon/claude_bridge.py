@@ -321,7 +321,8 @@ def hold_reason(budget, entries, routine=None, routine_cap=None, now=None,
     The pure core of budget_exhausted. `budget` is load_budget's (cap, tz) or
     the BridgeError it raised; `entries` is recent_usage's list, its
     BridgeError, or a callable taking the day's start epoch and returning
-    the list from then on (read only when a cap needs it). kind is "global", "routine" or "unreadable". Fails closed like
+    the list from then on (read only when a cap needs it). kind is "global",
+    "routine", "budget-invalid" or "usage-unreadable". Fails closed like
     budget_exhausted.
     """
     if not include_global and routine_cap is None:
@@ -329,7 +330,7 @@ def hold_reason(budget, entries, routine=None, routine_cap=None, now=None,
     now = time.time() if now is None else now
     if isinstance(budget, BridgeError):
         if include_global:
-            return "unreadable", str(budget)
+            return "budget-invalid", str(budget)
         cap, tz = None, None
     else:
         cap, tz = budget
@@ -344,7 +345,7 @@ def hold_reason(budget, entries, routine=None, routine_cap=None, now=None,
         except BridgeError as exc:
             entries = exc
     if isinstance(entries, BridgeError):
-        return "unreadable", str(entries)
+        return "usage-unreadable", str(entries)
     today = [entry for epoch, entry in entries if epoch >= day_start]
     if need_global and sum(entry_cost(entry) for entry in today) >= cap:
         return "global", f"global cap ${cap:g} reached"
@@ -355,6 +356,21 @@ def hold_reason(budget, entries, routine=None, routine_cap=None, now=None,
     return None
 
 
+def budget_hold(base_dir, routine=None, routine_cap=None, now=None,
+                include_global=True):
+    """hold_reason for the live budget file and usage log: (kind, text) or None."""
+    if not include_global and routine_cap is None:
+        return None
+    try:
+        budget = load_budget(base_dir)
+    except BridgeError as exc:
+        budget = exc
+    return hold_reason(
+        budget, lambda since: recent_usage(base_dir, since, now), routine,
+        routine_cap, now=now, include_global=include_global,
+    )
+
+
 def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
                      include_global=True):
     """Why new work should not start now, or None.
@@ -363,17 +379,7 @@ def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
     exhausted, since spend can no longer be known. include_global=False is for
     routines that never use the bridge: only their own cap applies to them.
     """
-    if not include_global and routine_cap is None:
-        return None
-    try:
-        budget = load_budget(base_dir)
-    except BridgeError as exc:
-        budget = exc
-    reason = hold_reason(
-        budget, lambda since: recent_usage(base_dir, since, now), routine,
-        routine_cap,
-        now=now, include_global=include_global,
-    )
+    reason = budget_hold(base_dir, routine, routine_cap, now, include_global)
     return reason[1] if reason else None
 
 
@@ -385,14 +391,13 @@ def _check_guards(base_dir):
     if pause:
         stop = PausedError(f"paused: {pause}")
     else:
-        reason = budget_exhausted(
+        reason = budget_hold(
             base_dir, scope.tag if scope else None,
             scope.cap if scope else None,
         )
         if reason:
-            stop = BudgetExhausted(
-                BUDGET_EXHAUSTED if reason.startswith("global") else reason
-            )
+            kind, text = reason
+            stop = BudgetExhausted(BUDGET_EXHAUSTED if kind == "global" else text)
     if stop:
         if scope and scope.stop is None:
             scope.stop = stop

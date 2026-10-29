@@ -1722,9 +1722,9 @@ only after it clears.
 | key | when |
 |---|---|
 | `budget-80:<day>` | today's spend reached 80% of the global `daily_usd` |
-| `budget-hit:<day>` | the global cap is reached; lists the held routines. It replaces the 80% alert, so a jump past the cap alerts once, and Claude routines held by it get no `hold:` alert of their own |
+| `budget-hit:<day>` | the global cap is reached; lists the held routines. It replaces the 80% alert, so a jump past the cap alerts once. A Claude routine at its own cap that it lists gets no `hold:` alert while the cap hit lasts, and gets one if it is still held after the cap hit clears |
 | `budget-invalid` | `state/budget.yaml` is malformed and routines are held because of it |
-| `usage-unreadable` | `state/claude-usage.jsonl` cannot be read and routines are held because spend is unknown |
+| `usage-unreadable` | `state/claude-usage.jsonl` cannot be read; lists routines held because spend is unknown, and alerts even when none are, since spend and connector health are then unknown |
 | `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
 | `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap`, which a tick running in another group produces |
 | `connector:<server>` | a connector's last error has been newer than its last success for over an hour, counted from the first error since that success |

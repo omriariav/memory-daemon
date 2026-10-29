@@ -238,14 +238,16 @@ class AlertsTest(unittest.TestCase):
         self.assertEqual(self.check(), [])
         self.assertEqual(len(self.emitted()), 2)
 
-    def test_own_cap_hold_covered_by_cap_hit_stays_quiet_after_raise(self):
+    def test_own_cap_hold_hidden_by_cap_hit_alerts_once_it_clears(self):
         capped = dict(BRIDGED, budget={"daily_usd": 1})
         self.cap(5)
         self.spend(6)
         self.assertEqual(self.check([capped]), ["budget-hit:2026-03-10"])
-        self.cap(20)
         self.assertEqual(self.check([capped]), [])
-        self.assertEqual(len(self.emitted()), 1)
+        self.cap(20)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
+        self.assertEqual(self.check([capped]), [])
+        self.assertEqual(len(self.emitted()), 2)
 
     def test_own_cap_hold_before_cap_hit_is_not_repeated(self):
         capped = dict(BRIDGED, budget={"daily_usd": 1})

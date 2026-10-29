@@ -12,8 +12,10 @@ Conditions (`key` in the event's details):
 - `budget-80:<day>`: today's spend reached 80% of state/budget.yaml daily_usd.
 - `budget-hit:<day>`: the global cap is reached, so every Claude routine is
   held. It replaces the 80% condition, so a jump past the cap alerts once.
-- `budget-invalid` / `usage-unreadable`: state/budget.yaml or the usage log
-  cannot be read, and routines are held because of it.
+- `budget-invalid`: state/budget.yaml cannot be read and routines are held
+  because of it.
+- `usage-unreadable`: the usage log cannot be read. It alerts even when
+  nothing is held, since spend and connector health are then unknown.
 - `hold:<routine>:<day>`: a routine reached its own budget.daily_usd. Holds
   caused by the global cap are listed on `budget-hit` instead, so a cap hit
   sends one alert, not one per routine.
@@ -60,8 +62,9 @@ def budget_conditions(routines, entries, budget, now):
     applies, evaluated on the same snapshot of the budget file and usage log
     as the spend figures. `entries` is the usage log (or a BridgeError
     reading it) and `budget` is load_budget's (cap, tz) (or a BridgeError).
-    Quiet keys are active but already covered by the cap-hit alert: they
-    are recorded without being sent.
+    Quiet keys are active but covered by the cap-hit alert: they are neither
+    sent nor recorded, so one still active after the cap hit clears alerts
+    then.
     """
     found, quiet = {}, set()
     held = {}
@@ -79,8 +82,7 @@ def budget_conditions(routines, entries, budget, now):
                          ("usage-unreadable", entries)):
         if not isinstance(problem, Exception):
             continue
-        blocked = sorted(rid for rid, (kind, text) in held.items()
-                         if kind == "unreadable" and text == str(problem))
+        blocked = sorted(rid for rid, (kind, _) in held.items() if kind == key)
         if key == "budget-invalid" and not blocked:
             continue
         found[key] = (
@@ -89,11 +91,10 @@ def budget_conditions(routines, entries, budget, now):
         )
     if isinstance(entries, Exception):
         return found, quiet
-    tz = None if isinstance(budget, Exception) else budget[1]
+    cap, tz = (None, None) if isinstance(budget, Exception) else budget
     day_start = claude_bridge.day_start_epoch(now, tz)
     day = datetime.datetime.fromtimestamp(day_start, tz).date().isoformat()
     spent = status.spend_by_routine(entries, day_start)
-    cap = None if isinstance(budget, Exception) else budget[0]
     total = sum(spent.values())
     hit = cap is not None and total >= cap
     for routine in routines:
@@ -104,6 +105,7 @@ def budget_conditions(routines, entries, budget, now):
             continue
         # Keyed on the routine's own cap, not on which cap the gate reports
         # first, so a later global hit (or its lifting) cannot re-alert it.
+        # Hidden behind a cap hit that already lists it.
         key = f"hold:{rid}:{day}"
         found[key] = (
             f"{rid} held: its own cap ${own:g} reached (${used:.2f} today)",
@@ -233,8 +235,8 @@ def _check_locked(base_dir, routines, now, path):
         if key not in quiet and (key not in seen or isinstance(seen[key], dict))
     )
     remembered = {
-        key: seen.get(key) or (stamp if key in quiet else {"pending": stamp})
-        for key in active
+        key: seen.get(key) or {"pending": stamp}
+        for key in active if key in seen or key not in quiet
     }
     if due or remembered != seen:
         # Saved on every tick with something to send: if saving fails, nothing
@@ -250,7 +252,7 @@ def _check_locked(base_dir, routines, now, path):
             "daemon", "alert", None, f"daemon:{key}", message, [],
             ts=stamp, details={"key": key, **details},
         )):
-            remembered[key] = remembered[key]["pending"]
+            remembered[key] = stamp
             sent.append(key)
     if sent:
         _save(path, remembered)
