@@ -4,10 +4,10 @@ import json
 import sys
 
 PEOPLE = {
-    "ada-lovelace": {"names": {"ada lovelace", "ada", "ada.lovelace"},
+    "ada-lovelace": {"names": {"ada lovelace", "ada.lovelace"},
                      "first_names": ["Ada", "Augusta"],
                      "facts": {"title": "Staff Engineer", "team": "Engines"}},
-    "sam-lead": {"names": {"sam lead", "sam"}, "first_names": ["Sam"],
+    "sam-lead": {"names": {"sam lead"}, "first_names": ["Sam"],
                  "facts": {}},
 }
 

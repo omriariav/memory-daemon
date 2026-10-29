@@ -31,7 +31,7 @@ The resolver runs in its own process group with a minimal environment (PATH,
 HOME, LANG, LC_ALL, TMPDIR) and the executable's directory as cwd; on timeout
 the whole group is killed. Names go to it in plaintext on stdin.
 
-Bare first names in a meeting capture ("Daniel said...") are matched only
+Bare first names in a meeting capture ("Ada said...") are matched only
 against that meeting's calendar attendees, never the whole directory: a name
 maps to an attendee only when exactly one attendee goes by it.
 """
@@ -55,6 +55,11 @@ _fact_memo = {}  # (argv, slug) -> (stamp, {key: value})
 _first_memo = {}  # (argv, slug) -> (stamp, [first name, ...])
 MAX_FIRST_NAMES = 8
 _stale_warned = [False]
+
+
+def new_run():
+    """Start of a routine run: the stale-data warning may fire again."""
+    _stale_warned[0] = False
 
 
 def reset():
@@ -90,6 +95,15 @@ def validate(memory_cfg, rid):
         if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
             problems.append(
                 f"{rid}: memory.person_resolver_timeout must be a positive number")
+    domains = memory_cfg.get("internal_domains")
+    if domains is not None and (
+        not isinstance(domains, list)
+        or any(not isinstance(d, str) or not d.strip() or "@" in d
+               or d != d.strip().casefold() for d in domains)
+    ):
+        problems.append(
+            f"{rid}: memory.internal_domains must be a list of lowercase "
+            "domains (no @)")
     if "person_resolver" not in memory_cfg:
         return problems
     argv = memory_cfg["person_resolver"]
@@ -243,16 +257,25 @@ def _query(routine, names):
     return argv
 
 
-def canonicalize(routine, people):
+def canonicalize(routine, people, keep_single=False, keep=()):
     """Map model-supplied people to resolver slugs; unresolved pass through.
-    Order and uniqueness are kept. Unset or failing hook: input unchanged."""
+    Order and uniqueness are kept. Unset or failing hook: input unchanged.
+
+    `keep_single` leaves bare single-word names alone (they may only resolve
+    through a meeting's attendees); `keep` names are never sent or mapped.
+    """
     people = list(people)
-    argv = _query(routine, _norm(people))
+
+    def skip(p):
+        return not isinstance(p, str) or p in keep or (
+            keep_single and " " not in fold(p))
+
+    argv = _query(routine, _norm([p for p in people if not skip(p)]))
     if argv is None:
         return people
     return list(dict.fromkeys(
-        ((_memo.get((argv, p.strip())) or (0, None))[1] if isinstance(p, str)
-         else None) or p for p in people))
+        (None if skip(p) else (_memo.get((argv, p.strip())) or (0, None))[1])
+        or p for p in people))
 
 
 def facts_for(routine, slug, names=()):
@@ -272,10 +295,16 @@ def facts_for(routine, slug, names=()):
     return dict(row[1]) if row else {}
 
 
+_FOLD_EXTRA = {"ł": "l", "ø": "o", "đ": "d", "ß": "ss", "æ": "ae", "œ": "oe"}
+
+
 def fold(value):
     """Case- and accent-folded words of a name, joined by single spaces."""
     text = unicodedata.normalize("NFKD", str(value or ""))
-    text = text.encode("ascii", "ignore").decode("ascii").casefold()
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.casefold()
+    for src, dst in _FOLD_EXTRA.items():
+        text = text.replace(src, dst)
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
@@ -283,17 +312,25 @@ def _local_part(email):
     return email.split("@", 1)[0] if "@" in email else ""
 
 
-def first_name_map(routine, attendees, verified=()):
+def _domain(email):
+    return email.rsplit("@", 1)[1] if "@" in email else ""
+
+
+def first_name_map(routine, attendees, verified=(), internal=()):
     """{folded first name: {slug, ...}} for a meeting's attendees.
 
     `attendees` are {"email", "name"} rows; `verified` are directory-verified
-    people ({"email", "slug"}). An attendee's slug comes from the resolver
-    (the email's local part, e.g. first.last, then the display name), else
-    from `verified`. Its first names are the resolver's `first_names` plus
-    the first word of the display name and of the local part. An attendee
-    with no slug still counts, under a `?<email>` placeholder, so a first
-    name shared with an unknown guest stays ambiguous.
+    people ({"email", "slug"}); `internal` are the owner's email domains. An
+    attendee's slug is an exact-email `verified` slug, else (only when the
+    email's domain is in `internal`) the resolver's answer for the email's
+    local part, then the display name. External attendees never get a
+    resolver slug: a guest named like an employee is not that employee.
+    Its first names are the resolver's `first_names` plus the first word of
+    the display name and of the local part. An attendee with no slug still
+    counts, under a `?<email>` placeholder, so a first name it shares stays
+    ambiguous. Several emails of one slug count once.
     """
+    internal = {str(d).strip().casefold() for d in internal}
     by_email = {
         str(p.get("email") or "").strip().casefold(): p.get("slug")
         for p in verified if isinstance(p, dict) and p.get("slug")
@@ -305,18 +342,23 @@ def first_name_map(routine, attendees, verified=()):
         email = str(row.get("email") or "").strip().casefold()
         name = str(row.get("name") or "").strip()
         rows.append((email, _local_part(email), name))
+
+    def lookup(email):
+        return (not by_email.get(email)) and _domain(email) in internal
+
     argv = _query(routine, _norm(
-        [key for _, local, name in rows for key in (local, name)]))
+        [key for email, local, name in rows if lookup(email)
+         for key in (local, name)]))
     found = {}
     for email, local, name in rows:
-        slug = None
-        if argv is not None:
+        slug = by_email.get(email)
+        if not slug and argv is not None and lookup(email):
             for key in (local, name):
                 hit = _memo.get((argv, key.strip())) if key.strip() else None
                 if hit and hit[1]:
                     slug = hit[1]
                     break
-        slug = slug or by_email.get(email) or f"?{email or name}"
+        slug = slug or f"?{email or name}"
         given = [name.split()[0] if name.split() else "",
                  re.split(r"[._+-]", local)[0] if local else ""]
         known = _first_memo.get((argv, slug)) if argv is not None else None
@@ -328,12 +370,14 @@ def first_name_map(routine, attendees, verified=()):
     return found
 
 
-def first_name_matches(routine, names, attendees, verified=(), exclude=()):
+def first_name_matches(routine, names, attendees, verified=(), exclude=(),
+                       internal=()):
     """{name: slug} for the bare first names in `names` that exactly one
     attendee goes by.
 
     A name shared by several attendees, or by none, is left out. So is a
-    match on a slug in `exclude` (the memory owner).
+    match on a slug in `exclude` (the memory owner). `internal` are the
+    owner's email domains (see `first_name_map`).
     """
     bare = [
         n for n in names
@@ -341,7 +385,7 @@ def first_name_matches(routine, names, attendees, verified=(), exclude=()):
     ]
     if not attendees or not bare:
         return {}
-    first = first_name_map(routine, attendees, verified)
+    first = first_name_map(routine, attendees, verified, internal)
     matches, ambiguous = {}, 0
     for name in bare:
         slugs = first.get(fold(name)) or set()

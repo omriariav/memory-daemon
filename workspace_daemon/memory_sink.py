@@ -191,7 +191,7 @@ def validate(routine):
         "store", "type", "tags", "extract", "operator_confirmed_source_ids",
         "identity", "personal_tag", "redact_ids", "personal_keywords",
         "extract_model", "owner_todos", "person_briefs",
-        "person_resolver", "person_resolver_timeout",
+        "person_resolver", "person_resolver_timeout", "internal_domains",
     }
     if unknown:
         problems.append(
@@ -1089,31 +1089,43 @@ def capture(routine, item, summary, dry_run=False):
     known = _known_slugs_for_identity(store, identity)
     source_slugs = {person["slug"] for person in verified_source}
     allowed = known | source_slugs | set(verified_owners)
-    # An optional resolver hook maps names the model wrote to slugs first; the
-    # allowed check below still applies. No-op when the hook is unset.
-    model_people = person_resolver.canonicalize(
-        routine, entry.get("people") or [])
-    # A bare first name in a meeting ("Daniel") maps to the one calendar
+    # A bare first name in a meeting ("Ada") maps to the one calendar
     # attendee who goes by it. Such a slug is attested by the invitation, so
-    # it is allowed like a verified source participant.
+    # it is allowed like a verified source participant. This runs on the raw
+    # model names, before the directory-wide resolver, and only with a safe
+    # owner identity.
+    raw_people = list(entry.get("people") or [])
     attendees = [
         row for row in meta.get("source_people") or []
         if isinstance(row, dict)
         and str(row.get("role") or "").startswith("calendar-")
     ]
-    pending = [p for p in model_people if p not in allowed]
-    if attendees and pending:
-        owner = (identity.get("person") or {}).get("slug") \
-            if identity.get("safe") else None
+    matched = {}
+    pending = [p for p in raw_people if p not in allowed]
+    if attendees and pending and identity.get("safe"):
+        own_email = str(identity.get("email") or "").strip().casefold()
+        attendees = [
+            row for row in attendees
+            if str(row.get("email") or "").strip().casefold() != own_email
+        ]
+        domains = {own_email.rsplit("@", 1)[-1]} if "@" in own_email else set()
+        domains |= {str(d).strip().casefold()
+                    for d in cfg.get("internal_domains") or []}
+        owner_slug = (identity.get("person") or {}).get("slug")
         matched = person_resolver.first_name_matches(
             routine, pending, attendees, verified_source,
-            exclude={owner} if owner else set())
+            exclude={owner_slug} if owner_slug else set(),
+            internal=domains)
         if matched:
             log(f"routine={rid} memory: matched {len(matched)} first name(s) "
                 "to meeting attendees")
             allowed = allowed | set(matched.values())
-            model_people = list(dict.fromkeys(
-                matched.get(p, p) for p in model_people))
+    # An optional resolver hook maps names the model wrote to slugs first; the
+    # allowed check below still applies. No-op when the hook is unset. For
+    # calendar captures a single-word name resolves only via the attendees.
+    model_people = person_resolver.canonicalize(
+        routine, raw_people, keep_single=bool(attendees), keep=set(matched))
+    model_people = list(dict.fromkeys(matched.get(p, p) for p in model_people))
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))

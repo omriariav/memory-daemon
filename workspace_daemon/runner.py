@@ -14,7 +14,7 @@ from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
-from . import gmail_mcp, slack_mcp, zoom_source
+from . import gmail_mcp, person_resolver, slack_mcp, zoom_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -2264,6 +2264,7 @@ def _route_claims(claims, totals, failures=(), held_source_keys=None):
 def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                lock=None, catalog=None, base_dir=None, shared_circuit=None):
     rid = routine["id"]
+    person_resolver.new_run()
     shared_circuit = {} if shared_circuit is None else shared_circuit
     failed_source_keys = set()
     circuit_reported = False

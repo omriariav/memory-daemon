@@ -12,7 +12,8 @@ from workspace_daemon import identity, memory_sink, person_resolver
 # names deliberately do not resolve on their own.
 DIRECTORY = {
     "ada.lovelace": "ada-lovelace", "Ada Lovelace": "ada-lovelace",
-    "ada.byron": "ada-byron", "Ada Byron": "ada-byron",
+    "a.lovelace": "ada-lovelace", "ada.byron": "ada-byron",
+    "lukasz.nowak": "lukasz-nowak", "soren.berg": "soren-berg", "Ada Byron": "ada-byron",
     "augusta.king": "augusta-king",
     "jose.nunez": "jose-nunez",
     "me.owner": "memory-owner",
@@ -20,7 +21,8 @@ DIRECTORY = {
 FIRST = {
     "ada-lovelace": ["Ada"], "ada-byron": ["Ada"],
     "augusta-king": ["Augusta", "Gus"], "jose-nunez": ["José"],
-    "memory-owner": ["Me"],
+    "memory-owner": ["Me"], "lukasz-nowak": ["Łukasz"],
+    "soren-berg": ["Søren"],
 }
 SCRIPT = """#!/usr/bin/env python3
 import json, sys
@@ -62,6 +64,7 @@ class Base(unittest.TestCase):
 
 class FirstNameTest(Base):
     def matches(self, names, attendees, routine=None, **kw):
+        kw.setdefault("internal", ["example.com"])
         return person_resolver.first_name_matches(
             routine or self.routine(), names, attendees, **kw)
 
@@ -105,6 +108,56 @@ class FirstNameTest(Base):
             self.matches(["Ada"], [attendee("guest@other.example", "Ada Guest")]),
             {})
 
+    def test_external_guest_is_not_mapped_to_an_employee(self):
+        # ada.lovelace@partner.example must not resolve to the internal slug,
+        # and still makes "Ada" ambiguous with the real employee.
+        guest = attendee("ada.lovelace@partner.example", "Ada Lovelace")
+        self.assertEqual(self.matches(["Ada"], [guest]), {})
+        self.assertEqual(
+            self.matches(["Ada"], [guest, attendee("ada.lovelace@example.com")]),
+            {})
+        self.assertEqual(
+            self.matches(["Gus"], [guest, attendee("augusta.king@example.com")]),
+            {"Gus": "augusta-king"})
+
+    def test_external_attendees_are_never_sent_to_the_resolver(self):
+        self.matches(["Ada"], [attendee("ada.lovelace@partner.example",
+                                        "Ada Lovelace")])
+        self.assertFalse((self.tmp / "calls.log").exists())
+
+    def test_verified_exact_email_wins_for_an_external_attendee(self):
+        out = self.matches(
+            ["Ada"], [attendee("ada.lovelace@partner.example", "Ada Lovelace")],
+            verified=[{"email": "Ada.Lovelace@partner.example",
+                       "slug": "ada-partner"}])
+        self.assertEqual(out, {"Ada": "ada-partner"})
+
+    def test_two_aliases_of_one_person_are_not_ambiguous(self):
+        out = self.matches(
+            ["Ada"], [attendee("ada.lovelace@example.com"),
+                      attendee("a.lovelace@example.com")])
+        self.assertEqual(out, {"Ada": "ada-lovelace"})
+
+    def test_non_ascii_names_fold_to_their_plain_form(self):
+        self.assertEqual(person_resolver.fold("Łukasz Ørsted Đ ß Æ œ"),
+                         "lukasz orsted d ss ae oe")
+        out = self.matches(
+            ["Lukasz", "Łukasz", "Soren", "Søren"],
+            [attendee("lukasz.nowak@example.com"),
+             attendee("soren.berg@example.com")])
+        self.assertEqual(out, {"Lukasz": "lukasz-nowak",
+                               "Łukasz": "lukasz-nowak",
+                               "Soren": "soren-berg", "Søren": "soren-berg"})
+
+    def test_stale_warning_fires_again_after_a_new_run(self):
+        routine = self.routine(stale=True)
+        self.matches(["Ada"], [attendee("ada.lovelace@example.com")], routine)
+        person_resolver._memo.clear()
+        person_resolver.new_run()
+        self.matches(["Ada"], [attendee("augusta.king@example.com")], routine)
+        warnings = [c for c in self.log.call_args_list if "stale" in str(c)]
+        self.assertEqual(len(warnings), 2)
+
     def test_absent_first_name_is_never_guessed(self):
         self.assertEqual(
             self.matches(["Grace"], [attendee("ada.lovelace@example.com")]),
@@ -123,7 +176,8 @@ class FirstNameTest(Base):
             {"id": "r", "memory": {}}, ["Grace", "Ada"],
             [attendee("g.hopper@example.com", "Grace Hopper"),
              attendee("unknown@example.com", "Ada Unknown")],
-            verified=[{"email": "g.hopper@example.com", "slug": "grace-hopper"}])
+            verified=[{"email": "g.hopper@example.com", "slug": "grace-hopper"}],
+            internal=["example.com"])
         self.assertEqual(out, {"Grace": "grace-hopper"})
 
     def test_stale_directory_still_resolves_and_warns_once(self):
@@ -154,7 +208,7 @@ class CaptureTest(Base):
         super().setUp()
         self.addCleanup(identity._providers.clear)
 
-    def capture(self, people, source_people):
+    def capture(self, people, source_people, safe=True):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True})
@@ -171,7 +225,7 @@ class CaptureTest(Base):
             seen["args"] = args
             return mock.Mock(returncode=0, stdout="✓ created e\n", stderr="")
 
-        ident = {"email": "me.owner@example.com", "safe": True,
+        ident = {"email": "me.owner@example.com", "safe": safe,
                  "person": {"email": "me.owner@example.com", "name": "Me Owner",
                             "slug": "memory-owner"}}
         with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
@@ -197,6 +251,40 @@ class CaptureTest(Base):
              attendee("ada.byron@example.com", role="gmail-sender"),
              attendee("me.owner@example.com")])
         self.assertEqual(people, "ada-lovelace,augusta-king,jane-doe")
+
+    def test_unsafe_identity_adds_nothing(self):
+        people = self.capture(
+            ["Ada", "jane-doe"], [attendee("ada.lovelace@example.com")],
+            safe=False)
+        self.assertNotIn("ada-lovelace", people or "")
+
+    def test_owner_is_excluded_by_email_when_resolver_gives_another_slug(self):
+        # The owner's invitation row maps to a different slug in the
+        # directory (here an alias of Ada); it must still be dropped.
+        people = self.capture(
+            ["Ada", "jane-doe"],
+            [attendee("ME.OWNER@example.com", "Ada Owner"),
+             attendee("ada.lovelace@example.com")])
+        self.assertEqual(people, "ada-lovelace,jane-doe")
+
+    def test_external_guest_sharing_a_first_name_blocks_the_match(self):
+        people = self.capture(
+            ["Ada", "jane-doe"],
+            [attendee("ada.lovelace@example.com"),
+             attendee("ada.lovelace@partner.example", "Ada Lovelace")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_canonicalize_does_not_preempt_a_bare_name(self):
+        # The directory resolves the bare "Gus" outright; for a meeting it
+        # must only resolve through the attendees.
+        DIRECTORY["Gus"] = "augusta-king"
+        self.addCleanup(DIRECTORY.pop, "Gus")
+        people = self.capture(
+            ["Gus", "jane-doe"], [attendee("ada.lovelace@example.com")])
+        self.assertEqual(people, "jane-doe")
+        people = self.capture(
+            ["Gus", "jane-doe"], [attendee("augusta.king@example.com")])
+        self.assertEqual(people, "augusta-king,jane-doe")
 
     def test_ambiguous_first_name_is_dropped_as_before(self):
         people = self.capture(
