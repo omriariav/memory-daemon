@@ -133,6 +133,18 @@ def source_people(event):
     organizer = event.get("organizer")
     if isinstance(organizer, str):
         organizer = {"email": organizer}
+    if isinstance(organizer, dict) and not organizer.get("response_status"):
+        # Take the organizer's reply from their attendee row, so a declined
+        # organizer is not counted as present.
+        org_email = str(organizer.get("email") or "").strip().casefold()
+        for attendee in event.get("attendees") or []:
+            if (isinstance(attendee, dict) and org_email
+                    and attendee.get("response_status")
+                    and str(attendee.get("email") or "").strip().casefold()
+                    == org_email):
+                organizer = {**organizer,
+                             "response_status": attendee["response_status"]}
+                break
     for role, person in [
         ("calendar-organizer", organizer),
         *[("calendar-attendee", attendee) for attendee in event.get("attendees") or []],

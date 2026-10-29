@@ -314,6 +314,22 @@ class CaptureTest(Base):
             [attendee("ada.lovelace@example.com", rsvp="declined")])
         self.assertEqual(people, "jane-doe")
 
+    def test_declined_owner_still_makes_a_name_ambiguous(self):
+        people = self.capture(
+            ["Ada", "jane-doe"],
+            [attendee("ME.OWNER@example.com", "Ada Owner", rsvp="declined"),
+             attendee("ada.lovelace@example.com", "Ada Lovelace",
+                      rsvp="accepted")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_declined_external_guest_is_ignored(self):
+        people = self.capture(
+            ["Ada", "jane-doe"],
+            [attendee("guest@other.example", "Ada Guest", rsvp="declined"),
+             attendee("ada.lovelace@example.com", "Ada Lovelace",
+                      rsvp="accepted")])
+        self.assertEqual(people, "ada-lovelace,jane-doe")
+
     def test_unsafe_identity_adds_nothing(self):
         people = self.capture(
             ["Ada", "jane-doe"], [attendee("ada.lovelace@example.com")],
@@ -402,10 +418,6 @@ class CaptureTest(Base):
         self.assertIsNone(people)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SourcePeopleRsvpTest(unittest.TestCase):
     def test_builders_keep_a_declined_rsvp(self):
         from workspace_daemon import transcripts, zoom_source
@@ -419,3 +431,22 @@ class SourcePeopleRsvpTest(unittest.TestCase):
             "attendees": [{"email": "ada.byron@example.com",
                            "response_status": "declined"}]})
         self.assertEqual([r.get("rsvp") for r in mila], [None, "declined"])
+
+    def test_declined_organizer_keeps_the_attendee_rsvp(self):
+        from workspace_daemon import transcripts, zoom_source
+        zoom = zoom_source._source_people({
+            "organizer": {"email": "ada.lovelace@example.com"},
+            "attendees": [{"email": "Ada.Lovelace@example.com",
+                           "rsvp": "declined"}]})
+        self.assertEqual([(r["role"], r.get("rsvp")) for r in zoom],
+                         [("calendar-organizer", "declined")])
+        mila = transcripts.source_people({
+            "organizer": "ada.lovelace@example.com",
+            "attendees": [{"email": "Ada.Lovelace@example.com",
+                           "response_status": "declined"}]})
+        self.assertEqual([(r["role"], r.get("rsvp")) for r in mila],
+                         [("calendar-organizer", "declined")])
+
+
+if __name__ == "__main__":
+    unittest.main()
