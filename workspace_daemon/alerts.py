@@ -74,16 +74,18 @@ def budget_conditions(routines, entries, budget, now):
         )
         if reason:
             held[routine["id"]] = reason
-    unknown = sorted(rid for rid, (kind, _) in held.items()
-                     if kind == "unreadable")
-    if unknown:
-        problems = sorted({held[rid][1] for rid in unknown})
-        key = ("budget-invalid" if isinstance(budget, Exception)
-               and str(budget) in problems else "usage-unreadable")
+    # One key per broken file, so fixing one cannot re-announce the other.
+    for key, problem in (("budget-invalid", budget),
+                         ("usage-unreadable", entries)):
+        if not isinstance(problem, Exception):
+            continue
+        blocked = sorted(rid for rid, (kind, text) in held.items()
+                         if kind == "unreadable" and text == str(problem))
+        if key == "budget-invalid" and not blocked:
+            continue
         found[key] = (
-            f"Spend cannot be checked ({'; '.join(problems)}); "
-            f"holding {', '.join(unknown)}",
-            {"held": unknown},
+            f"{problem}; holding {', '.join(blocked) or 'nothing'}",
+            {"held": blocked},
         )
     if isinstance(entries, Exception):
         return found, quiet
@@ -149,7 +151,7 @@ def health_conditions(base_dir, routines, entries, now):
                 {"routine": row["routine"], "issues": issues},
             )
     if isinstance(entries, claude_bridge.BridgeError):
-        return found  # reported as usage-unreadable
+        return found  # reported by budget_conditions as usage-unreadable
     # connector_times keeps first_error only while no ok has followed it.
     for server, first in status.connector_times(entries)["first_error"].items():
         if now - first >= CONNECTOR_GRACE_SECONDS:
@@ -162,15 +164,28 @@ def health_conditions(base_dir, routines, entries, now):
 
 
 def _load(path):
+    """Saved alert state: key -> sent time, or {"pending": time}.
+
+    Anything else in the file is dropped, so its key counts as new.
+    """
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value for key, value in data.items()
+        if (isinstance(value, str) and value)
+        or (isinstance(value, dict) and isinstance(value.get("pending"), str)
+            and value["pending"])
+    }
 
 
 def check(base_dir, routines, now=None):
-    """Alert on newly active conditions; forget cleared ones. Returns new keys.
+    """Alert on newly active conditions; forget cleared ones.
+
+    Returns the keys sent this tick (new ones and retried pending ones).
 
     Never raises: alerting must not break the tick that runs it.
     """
@@ -221,7 +236,9 @@ def _check_locked(base_dir, routines, now, path):
         key: seen.get(key) or (stamp if key in quiet else {"pending": stamp})
         for key in active
     }
-    if remembered != seen:
+    if due or remembered != seen:
+        # Saved on every tick with something to send: if saving fails, nothing
+        # is sent, so a broken alerts.json cannot cause a resend per tick.
         _save(path, remembered)
     sent = []
     for key in due:

@@ -278,7 +278,37 @@ class AlertsTest(unittest.TestCase):
 
     def test_unreadable_usage_log_without_any_cap_holds_nothing(self):
         (self.base / "state" / "claude-usage.jsonl").mkdir()
-        self.assertEqual(self.check([BRIDGED, OTHER]), [])
+        self.assertEqual(self.check([BRIDGED, OTHER]), ["usage-unreadable"])
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["held"], [])
+        self.assertIn("holding nothing", event["title"])
+
+    def test_fixing_one_of_two_broken_files_does_not_re_alert(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        self.assertEqual(sorted(self.check()),
+                         ["budget-invalid", "usage-unreadable"])
+        self.cap(10)
+        self.assertEqual(self.check(), [])
+
+    def test_malformed_saved_values_count_as_new(self):
+        self.cap(5)
+        self.spend(6)
+        (self.base / "state" / "alerts.json").write_text(json.dumps(
+            {"budget-hit:2026-03-10": {}, "other": None}))
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_pending_retry_needs_a_working_save(self):
+        self.cap(5)
+        self.spend(6)
+        with mock.patch.object(alerts.events, "emit", return_value=False):
+            self.assertEqual(self.check(), [])
+        with mock.patch.object(alerts.state, "write_atomic",
+                               side_effect=OSError("disk full")):
+            self.assertEqual(self.check(), [])
+        self.assertEqual(self.emitted(), [])
 
     def test_invalid_budget_still_reports_own_cap_holds_of_plain_routines(self):
         (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
