@@ -122,6 +122,15 @@ def _source_people(event):
     """Organizer and attendees as `source_people` rows for slug resolution."""
     people, seen = [], set()
     organizer = event.get("organizer") or {}
+    if isinstance(organizer, dict) and not organizer.get("rsvp"):
+        # The organizer has no reply of their own; take it from their
+        # attendee row so a declined organizer is not counted as present.
+        org_email = str(organizer.get("email") or "").strip().casefold()
+        for a in event.get("attendees") or []:
+            if (isinstance(a, dict) and org_email and a.get("rsvp")
+                    and str(a.get("email") or "").strip().casefold() == org_email):
+                organizer = {**organizer, "rsvp": a["rsvp"]}
+                break
     rows = [("calendar-organizer", organizer)] + [
         ("calendar-attendee", a) for a in event.get("attendees") or []
     ]
@@ -132,10 +141,11 @@ def _source_people(event):
         if not email or email in seen:
             continue
         seen.add(email)
-        people.append({
-            "email": email, "name": str(person.get("name") or ""),
-            "role": role,
-        })
+        row = {"email": email, "name": str(person.get("name") or ""),
+               "role": role}
+        if person.get("rsvp"):
+            row["rsvp"] = str(person["rsvp"])
+        people.append(row)
     return people
 
 

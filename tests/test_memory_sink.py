@@ -1019,6 +1019,29 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(people, [verified])
         self.assertEqual(unresolved, [])
 
+    def test_declined_invitee_is_not_a_source_person_candidate(self):
+        self.item["frontmatter"]["source_people"] = [
+            {"email": "gone@example.com", "name": "Gone", "rsvp": "declined"},
+            {"email": "maybe@example.com", "name": "Maybe",
+             "rsvp": "tentative"},
+            {"email": "quiet@example.com", "name": "Quiet",
+             "rsvp": "needsAction"},
+        ]
+        with mock.patch.object(
+            contacts, "resolve_email", return_value=None
+        ) as resolve:
+            people, unresolved = memory_sink._verified_source_people(
+                self.item, "r",
+                {"email": "me@example.com", "safe": True,
+                 "person": {"email": "me@example.com", "name": "Me",
+                            "slug": "me", "resource_name": "people/me"}},
+            )
+
+        self.assertEqual([c.args[0] for c in resolve.call_args_list],
+                         ["maybe@example.com", "quiet@example.com"])
+        self.assertEqual(people, [])
+        self.assertEqual(unresolved, ["maybe@example.com", "quiet@example.com"])
+
     def test_existing_authenticated_slug_is_removed_from_final_people(self):
         memory_sink._slug_cache["/store"].add("memory-owner")
         out, calls = self._run_capture({

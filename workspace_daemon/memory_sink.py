@@ -579,9 +579,14 @@ def _verified_source_people(item, rid, identity, provider=None):
     """Resolve exact Gmail/Chat participant emails for safe model attribution."""
     provider = provider or identity_providers.provider_for({})
     candidates = item.get("frontmatter", {}).get("source_people") or []
+    # A declined invitee did not attend, so they are not a participant. The
+    # owner is exempt: recordings can match meetings the owner declined.
+    own_email = str(identity.get("email") or "").strip().casefold()
     candidates = [
         candidate for candidate in candidates
         if isinstance(candidate, dict) and candidate.get("email")
+        and (candidate.get("rsvp") != "declined"
+             or str(candidate["email"]).strip().casefold() == own_email)
     ]
     if not candidates:
         return [], []
@@ -1111,17 +1116,21 @@ def capture(routine, item, summary, dry_run=False):
     # attendee who goes by it. Such a slug is attested by the invitation, so
     # it is allowed like a verified source participant. This runs on the raw
     # model names, before the directory-wide resolver, and only with a safe
-    # owner identity.
+    # owner identity. An invitee who declined was not in the room, so they
+    # neither match nor make a shared first name ambiguous. The owner's own
+    # row is always kept: a recording can match a meeting the owner declined.
     raw_people = list(entry.get("people") or [])
+    own_email = str(identity.get("email") or "").strip().casefold()
     attendees = [
         row for row in meta.get("source_people") or []
         if isinstance(row, dict)
         and str(row.get("role") or "").startswith("calendar-")
+        and (row.get("rsvp") != "declined"
+             or str(row.get("email") or "").strip().casefold() == own_email)
     ]
     matched = {}
     pending = [p for p in raw_people if p not in allowed]
     if attendees and pending and identity.get("safe"):
-        own_email = str(identity.get("email") or "").strip().casefold()
         domains = _owner_domains(cfg, own_email)
         owner_slug = (identity.get("person") or {}).get("slug")
         matched = person_resolver.first_name_matches(
