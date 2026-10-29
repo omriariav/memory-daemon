@@ -1,0 +1,50 @@
+# Example: capture Zoom AI Companion meeting summaries into personal memory.
+#
+# Discovery reads the calendar_cache routine's JSON output (its `output` path
+# with a .json extension), so that routine must run too. Every Zoom meeting in
+# the file is remembered in state/zoom-meetings.json; after it ends, the
+# read-only meeting-assets tool is asked for it through the headless Claude
+# bridge, with a doubling back-off, for retry_hours. A summary is captured only
+# when the host shared it with you. The recording is never read.
+#
+# Memory source id: zoom:<meeting uuid>, so a changed summary updates in place.
+# When a transcript routine (mila, whisper) captured the same calendar event,
+# the Zoom entry is kept separate and linked to follow it.
+id: example-zoom-to-memory
+enabled: false
+description: Capture shared Zoom meeting summaries.
+role: specialized
+
+schedule:
+  every: 30m
+
+source:
+  kind: zoom
+  # Exact MCP tool name as your connector exposes it (`claude mcp list`).
+  assets_tool: mcp__claude_ai_Example_Zoom__get_meeting_assets
+  calendar_file: ~/.cache/claude-calendar/next48h.json
+  model: haiku                 # bridge model; it only transports tool results
+  conference_hosts: [zoom.us]  # join links on these hosts carry the meeting number
+  first_check_minutes: 10      # first check this long after the meeting ends
+  max_interval_minutes: 240    # back-off cap between checks
+  retry_hours: 24              # then the meeting is dropped
+  max_checks_per_run: 10       # meetings checked per bridge session
+  match_tolerance_minutes: 120 # a recurring number must answer for this occurrence
+  max_summary_chars: 30000
+  skip_declined: true
+  link_transcripts: true
+
+analyze:
+  provider: claude
+  model: sonnet
+  max_output_tokens: 4096
+  instruction: >-
+    The source is a machine-written meeting summary. Preserve only durable
+    decisions, commitments, action items, deadlines, blockers and
+    people/project facts. Attribute an owner or deadline only when stated.
+    Return exactly NOT MEMORY-WORTHY when nothing durable was discussed.
+
+memory:
+  store: /absolute/path/to/your/personal-memory
+  type: meeting
+  tags: [meeting, zoom]

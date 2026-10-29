@@ -385,6 +385,18 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertNotIn("--follows", calls["args"])
         self.assertEqual(out["memory"], "created")
 
+    def test_source_supplied_follows_are_linked(self):
+        self.item["frontmatter"]["follows_entry_ids"] = [
+            "2026-10-01-transcript-entry", "Bad Id!", 7,
+        ]
+        out, calls = self._run_capture(
+            {"worthy": True, "type": "meeting", "title": "T",
+             "people": [], "tags": ["x"], "follows": ["invented-entry"],
+             "body": "b"})
+        idx = calls["args"].index("--follows")
+        self.assertEqual(calls["args"][idx + 1], "2026-10-01-transcript-entry")
+        self.assertEqual(out["memory"], "created")
+
     def test_invalid_type_falls_back_to_config(self):
         out, calls = self._run_capture(
             {"worthy": True, "type": "diary", "title": "T", "people": [],

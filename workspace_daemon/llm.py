@@ -178,6 +178,14 @@ def source_header_lines(item):
                 "and take the owner from the transcript, never from the hint's "
                 "wording. Hints never override the transcript."
             )
+    if item.get("source_kind") == "zoom" or meta.get("zoom_meeting_uuid"):
+        lines.append("Source: Zoom AI Companion meeting summary (machine-written)")
+        if meta.get("calendar_event_title"):
+            lines.append(f"Calendar event: {meta['calendar_event_title']}")
+        if meta.get("calendar_event_start"):
+            lines.append(f"Calendar event start: {meta['calendar_event_start']}")
+        if meta.get("zoom_start"):
+            lines.append(f"Meeting started: {meta['zoom_start']}")
     return lines
 
 

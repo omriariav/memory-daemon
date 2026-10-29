@@ -21,7 +21,7 @@ stays the only writer.
 import hashlib
 import re
 
-MEETING_KINDS = {"mila", "whisper", "transcripts", "meeting-notes"}
+MEETING_KINDS = {"mila", "whisper", "transcripts", "meeting-notes", "zoom"}
 DEFAULT_MAX_PER_ITEM = 5
 MAX_ALLOWED = 20
 DEFAULT_TAG = "from-meeting"
