@@ -55,6 +55,12 @@ def _spend_text(spent):
     ) or "no spend"
 
 
+# Keys that cannot be evaluated while the usage log or budget file is
+# unreadable: their saved state is kept rather than treated as cleared.
+USAGE_KEYS = ("budget-hit:", "budget-80:", "hold:", "connector:")
+BUDGET_KEYS = ("budget-hit:", "budget-80:", "hold:")
+
+
 def budget_conditions(routines, entries, budget, now):
     """Active budget conditions as ({key: (message, details)}, quiet keys).
 
@@ -95,7 +101,10 @@ def budget_conditions(routines, entries, budget, now):
     day_start = claude_bridge.day_start_epoch(now, tz)
     day = datetime.datetime.fromtimestamp(day_start, tz).date().isoformat()
     spent = status.spend_by_routine(entries, day_start)
-    total = sum(spent.values())
+    # Summed per entry in log order, exactly as hold_reason does, so float
+    # rounding at the cap cannot split the alert from the gate.
+    total = sum(claude_bridge.entry_cost(entry)
+                for epoch, entry in entries if epoch >= day_start)
     hit = cap is not None and total >= cap
     for routine in routines:
         own = config.budget_cap(routine)
@@ -234,10 +243,16 @@ def _check_locked(base_dir, routines, now, path):
         key for key in active
         if key not in quiet and (key not in seen or isinstance(seen[key], dict))
     )
+    unknown = (USAGE_KEYS if isinstance(entries, Exception) else ()) + (
+        BUDGET_KEYS if isinstance(budget, Exception) else ())
     remembered = {
+        key: value for key, value in seen.items()
+        if unknown and key.startswith(unknown)
+    }
+    remembered.update({
         key: seen.get(key) or {"pending": stamp}
         for key in active if key in seen or key not in quiet
-    }
+    })
     if due or remembered != seen:
         # Saved on every tick with something to send: if saving fails, nothing
         # is sent, so a broken alerts.json cannot cause a resend per tick.
@@ -254,8 +269,8 @@ def _check_locked(base_dir, routines, now, path):
         )):
             remembered[key] = stamp
             sent.append(key)
-    if sent:
-        _save(path, remembered)
+            # Saved per send, so a later failure cannot resend this one.
+            _save(path, remembered)
     return sent
 
 

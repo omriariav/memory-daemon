@@ -86,9 +86,11 @@ def emit(base_dir, event):
                 target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
             )
             try:
-                os.write(fd, line)
+                written = os.write(fd, line)
             finally:
                 os.close(fd)
+            if written != len(line):
+                raise OSError(f"short write ({written} of {len(line)} bytes)")
         finally:
             os.close(lock_fd)  # closing also drops the flock
     except (OSError, TypeError, ValueError) as exc:

@@ -352,6 +352,56 @@ class AlertsTest(unittest.TestCase):
                                side_effect=PermissionError("denied")):
             self.assertEqual(self.check(), [])
 
+    def test_unreadable_tick_does_not_clear_sent_alerts(self):
+        self.cap(5)
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T17:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.spend(6)
+        self.assertEqual(sorted(self.check()),
+                         ["budget-hit:2026-03-10", "connector:srv_a"])
+        log = self.base / "state" / "claude-usage.jsonl"
+        log.rename(log.with_suffix(".bak"))
+        log.mkdir()
+        self.assertEqual(self.check(), ["usage-unreadable"])
+        log.rmdir()
+        log.with_suffix(".bak").rename(log)
+        self.assertEqual(self.check(), [])
+
+    def test_broken_budget_file_does_not_clear_cap_hit(self):
+        self.cap(5)
+        self.spend(6)
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        self.assertEqual(self.check(), ["budget-invalid"])
+        self.cap(5)
+        self.assertEqual(self.check(), [])
+
+    def test_failure_after_a_send_does_not_resend_it(self):
+        self.cap(5)
+        self.spend(6)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 5\nday_timezone: UTC\n")
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(0.01, routine="plain")
+        real = alerts.events.build
+        calls = []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real(*args, **kwargs)
+
+        rows = [{"routine": "beta", "armed": "yes", "issues": "1 memory sink"}]
+        with mock.patch.object(alerts.events, "build", side_effect=second_fails), \
+                mock.patch.object(alerts.status, "routine_rows", return_value=rows):
+            self.assertEqual(self.check([capped, OTHER]), [])
+        self.assertEqual(len(self.emitted()), 1)
+        with mock.patch.object(alerts.status, "routine_rows", return_value=rows):
+            self.assertEqual(self.check([capped, OTHER]), ["budget-hit:2026-03-10"])
+        self.assertEqual(len(self.emitted()), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
