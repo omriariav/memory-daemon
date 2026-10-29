@@ -26,7 +26,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import config, identity, llm, memory_sink, mila_source, preflight, runner, state, status, tui
+from workspace_daemon import alerts, config, identity, llm, memory_sink, mila_source, preflight, runner, state, status, tui
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -491,6 +491,11 @@ def cmd_tick(args):
         for p in problems:
             log(f"invalid routine: {p}")
         return 1
+
+    if not args.dry_run:
+        # Before the due check: a cap hit leaves routines held, and the tick
+        # that would notice must not depend on anything being due.
+        alerts.check(BASE_DIR, routines)
 
     schedule = state.ScheduleStore(BASE_DIR, dry_run=args.dry_run)
     selected = [

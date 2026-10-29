@@ -692,6 +692,49 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
     )
 
 
+def spend_by_routine(entries, day_start):
+    """USD per usage_scope tag since day_start; untagged calls are "(unattributed)"."""
+    spent = {}
+    for epoch, entry in entries:
+        if epoch >= day_start:
+            tag = entry.get("routine") or "(unattributed)"
+            spent[tag] = spent.get(tag, 0.0) + claude_bridge.entry_cost(entry)
+    return spent
+
+
+def connector_times(entries):
+    """Per-connector last ok / last error / last failed call, from usage entries.
+
+    "first_error" is the first error after the connector's last ok, so a
+    reader can tell how long it has been failing. "latest_error" is
+    (epoch, outcome) of the newest failed call, or None.
+    """
+    last_ok, last_error, last_in_failed, first_error = {}, {}, {}, {}
+    latest_error = None
+    for epoch, entry in entries:
+        outcome = str(entry.get("outcome", ""))
+        failed = outcome == "missing_results" or outcome.startswith("error")
+        servers = {
+            name.split("__")[1] for name in entry.get("tools") or []
+            if isinstance(name, str) and name.startswith("mcp__")
+            and len(name.split("__")) > 2
+        }
+        for server in servers:
+            if not failed:
+                target = last_ok
+                first_error.pop(server, None)
+            elif f"mcp__{server}__" in outcome:
+                target = last_error  # the failure names this connector
+                first_error.setdefault(server, epoch)
+            else:
+                target = last_in_failed  # it was merely part of a failed call
+            target[server] = max(target.get(server, 0), epoch)
+        if failed and (latest_error is None or epoch >= latest_error[0]):
+            latest_error = (epoch, outcome)
+    return {"ok": last_ok, "error": last_error, "in_failed": last_in_failed,
+            "first_error": first_error, "latest_error": latest_error}
+
+
 def bridge_lines(base_dir, now):
     """Claude bridge block, plus problems that make the daemon unhealthy.
 
@@ -717,31 +760,12 @@ def bridge_lines(base_dir, now):
         )
     if not entries and cap is None and not problems:
         return [], []
-    day_start = claude_bridge.day_start_epoch(now, tz)
-    spent = {}
-    last_ok, last_error, last_in_failed = {}, {}, {}
-    latest_error = None
-    for epoch, entry in entries:
-        if epoch >= day_start:
-            tag = entry.get("routine") or "(unattributed)"
-            spent[tag] = spent.get(tag, 0.0) + claude_bridge.entry_cost(entry)
-        outcome = str(entry.get("outcome", ""))
-        failed = outcome == "missing_results" or outcome.startswith("error")
-        servers = {
-            name.split("__")[1] for name in entry.get("tools") or []
-            if isinstance(name, str) and name.startswith("mcp__")
-            and len(name.split("__")) > 2
-        }
-        for server in servers:
-            if not failed:
-                target = last_ok
-            elif f"mcp__{server}__" in outcome:
-                target = last_error  # the failure names this connector
-            else:
-                target = last_in_failed  # it was merely part of a failed call
-            target[server] = max(target.get(server, 0), epoch)
-        if failed and (latest_error is None or epoch >= latest_error[0]):
-            latest_error = (epoch, outcome)
+    spent = spend_by_routine(entries, claude_bridge.day_start_epoch(now, tz))
+    connectors = connector_times(entries)
+    last_ok, last_error, last_in_failed = (
+        connectors["ok"], connectors["error"], connectors["in_failed"]
+    )
+    latest_error = connectors["latest_error"]
     total = sum(spent.values())
     cap_text = f" of ${cap:g} cap" if cap is not None else ""
     lines = ["", "Claude bridge", f"Spend today: ${total:.2f}{cap_text}"]

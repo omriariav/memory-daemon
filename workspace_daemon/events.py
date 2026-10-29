@@ -1,10 +1,10 @@
-"""Event stream: one JSON line per memory a capture created or updated, and
-per calendar invite, change or cancellation.
+"""Event stream: one JSON line per memory a capture created or updated, per
+calendar invite, change or cancellation, and per operational alert.
 
 `state/events.jsonl` lets a reader (a notifier, a dashboard) follow captures
 without polling the memory store. `memory_sink.capture` (source from the
-`source_id` prefix, e.g. slack) and the `calendar_cache` routine (source gcal)
-write it; every other reader must treat it as read-only.
+`source_id` prefix, e.g. slack), the `calendar_cache` routine (source gcal)
+and `alerts.check` (source daemon, kind "alert") write it; every other reader must treat it as read-only.
 
 One JSON object per line, oldest first:
 

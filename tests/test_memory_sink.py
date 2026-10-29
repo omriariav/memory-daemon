@@ -21,9 +21,9 @@ SLUGS_OUTPUT = """\
 
 
 class FakeResult:
-    def __init__(self, stdout="", returncode=0):
+    def __init__(self, stdout="", returncode=0, stderr=""):
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
         self.returncode = returncode
 
 
@@ -396,6 +396,70 @@ class CaptureValidationTest(unittest.TestCase):
         idx = calls["args"].index("--follows")
         self.assertEqual(calls["args"][idx + 1], "2026-10-01-transcript-entry")
         self.assertEqual(out["memory"], "created")
+
+    def _run_refused_capture(self, item_id, refusal_source="slack:C1:1.0",
+                             follows=None):
+        self.item["id"] = item_id
+        calls = []
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls.append(list(args))
+            if len(calls) == 1:
+                return FakeResult(
+                    f"↻ matches existing 2026-07-20-open-todo via {refusal_source}\n",
+                    returncode=1,
+                    stderr=(f"✗ {refusal_source} already anchors the open todo "
+                            "2026-07-20-open-todo — log the outcome as a new "
+                            "entry with --follows 2026-07-20-open-todo\n"),
+                )
+            return FakeResult("✓ created 2026-07-27-outcome\n")
+
+        if follows:
+            self.item["frontmatter"]["follows_entry_ids"] = follows
+        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+                mock.patch.object(memory_sink, "_authenticated_identity",
+                                  return_value={"email": None, "person": None,
+                                                "safe": False}), \
+                mock.patch.object(memory_sink.subprocess, "run",
+                                  return_value=FakeResult()), \
+                mock.patch.object(memory_sink, "log"):
+            try:
+                out = memory_sink.capture(self.routine, self.item, "s")
+            except RuntimeError as exc:
+                out = exc
+        return out, calls
+
+    def test_reply_on_open_todo_thread_is_added_as_a_follow_up(self):
+        out, calls = self._run_refused_capture("slack:C1:1.0@2.5")
+        self.assertEqual(len(calls), 2)
+        retry = calls[1]
+        self.assertEqual(retry[retry.index("--source-ids") + 1],
+                         "slack:C1:1.0:2.5")
+        self.assertEqual(retry[retry.index("--follows") + 1],
+                         "2026-07-20-open-todo")
+        self.assertEqual(out["memory"], "created")
+        self.assertEqual(out["memory_source_id"], "slack:C1:1.0:2.5")
+
+    def test_reply_retry_keeps_existing_follows(self):
+        out, calls = self._run_refused_capture(
+            "slack:C1:1.0@2.5:20260727", follows=["2026-07-01-earlier"])
+        retry = calls[1]
+        self.assertEqual(retry[retry.index("--follows") + 1],
+                         "2026-07-01-earlier,2026-07-20-open-todo")
+        self.assertEqual(retry[retry.index("--source-ids") + 1],
+                         "slack:C1:1.0:2.5")
+
+    def test_refusal_without_a_distinct_reply_is_not_retried(self):
+        for item_id in ("slack:C1:1.0@1.0", "slack:C1:1.0"):
+            out, calls = self._run_refused_capture(item_id)
+            self.assertEqual(len(calls), 1, item_id)
+            self.assertIsInstance(out, RuntimeError)
+
+    def test_refusal_for_another_anchor_is_not_retried(self):
+        out, calls = self._run_refused_capture(
+            "slack:C1:1.0@2.5", refusal_source="slack:C9:9.0")
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(out, RuntimeError)
 
     def test_invalid_type_falls_back_to_config(self):
         out, calls = self._run_capture(

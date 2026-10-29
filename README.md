@@ -1710,6 +1710,28 @@ time, last error that names it, and last time it was part of a failed call
 (from the `mcp__<server>__` prefix of logged tool names); a malformed budget
 file or a failed usage-log write makes it report unhealthy.
 
+### Alerts
+
+Every scheduler tick (except a dry run) checks a few conditions and announces
+each one once when it starts: an `alert <key>: ...` line in the run log and an
+event in `state/events.jsonl` with source `daemon` and kind `alert` (see
+"Capture events"). A condition stays quiet while it holds and can alert again
+only after it clears.
+
+| key | when |
+|---|---|
+| `budget-80:<day>` | today's spend reached 80% of the global `daily_usd` |
+| `budget-hit:<day>` | the global cap is reached; lists the held routines. It replaces the 80% alert, so a jump past the cap alerts once, and routines held by it get no alert of their own |
+| `budget-invalid` | `state/budget.yaml` is malformed (Claude routines are held) |
+| `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
+| `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap`, which a tick running in another group produces |
+| `connector:<server>` | a connector's errors have outlasted its last success by over an hour |
+
+Budget alerts carry spend by routine. Dedupe state is `state/alerts.json`, and
+`state/alerts.lock` stops two schedulers from alerting at once. A failed check
+is logged and never fails the tick. To have a notifier show them, enable
+source `daemon` in its filter.
+
 ### Personal content
 
 Captures from any source (Gmail, Chat, Slack, Mila, calendar-derived items)
@@ -2394,6 +2416,10 @@ polling the store:
   object has `start` and `end` (ISO, UTC for timed events), plus
   `changed: {field: [old, new]}` on `update` (fields start, end, location,
   conference). `details` is omitted when empty and never present on captures.
+- Alerts (writer: `alerts.check`, see "Alerts"): `source` is `daemon`, `kind`
+  is `alert`, `routine` is `daemon`, `memory_id` is `null`, `source_id` is
+  `daemon:<key>`, `title` is the message, and `details` holds `key` plus the
+  condition's data.
 - Writer for captures: `memory_sink.capture`. The other `add` paths (owner todos,
   person briefs, Fibery, Google Tasks, the Gmail follow-up note) emit nothing.
   Appends are one `write` on an `O_APPEND` descriptor under `flock` on
@@ -2664,6 +2690,7 @@ workspace_daemon/
   notes.py                 frontmatter + note writing
   actions.py               declarative Gmail triage actions
   events.py                capture event stream (state/events.jsonl)
+  alerts.py                once-per-condition operational alerts (budget, holds, health)
   state.py                 processed.json
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)

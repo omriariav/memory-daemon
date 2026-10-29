@@ -1282,6 +1282,14 @@ def capture(routine, item, summary, dry_run=False):
         return {"memory": "dry_run"}
 
     r = _cli(store, args, stdin_text=body, timeout=300)
+    retry = _open_todo_outcome_retry(args, r, item, source_id)
+    if retry:
+        args, source_id, todo_id = retry
+        log(
+            f"routine={rid} memory: {todo_id} is an open todo anchored on "
+            f"this thread; logging the reply as a new entry {source_id}"
+        )
+        r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
     # Some store failures happen after the entry file was written. Preserve
     # any such write before deciding whether the result is an error.
@@ -1337,6 +1345,42 @@ def capture(routine, item, summary, dry_run=False):
             bool(ptag) and ptag in tags,
         ))
     return outcome
+
+
+_OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open \S+ (\S+) —")
+_REPLY_TS_RE = re.compile(r"@(\d+\.\d+)")
+
+
+def _open_todo_outcome_retry(args, result, item, source_id):
+    """Re-add args for a Slack reply the store refused to merge into an open todo.
+
+    A thread root that anchors an open todo cannot be retyped in place: the
+    store asks for the outcome as a new entry that follows the todo, under
+    the reply's own id (slack:<root>:<reply_ts>). Returns (args, source_id,
+    todo_id), or None when the refusal is anything else or the candidate has
+    no reply distinct from the root.
+    """
+    if result.returncode == 0 or not str(source_id or "").startswith("slack:"):
+        return None
+    refusal = _OPEN_ANCHOR_RE.search((result.stdout or "") + (result.stderr or ""))
+    if not refusal or refusal.group(1) != source_id:
+        return None
+    todo_id = refusal.group(2)
+    reply = _REPLY_TS_RE.search(str(item.get("id", "")))
+    if not SOURCE_FOLLOWS_RE.fullmatch(todo_id) or not reply \
+            or reply.group(1) == source_id.rsplit(":", 1)[-1]:
+        return None
+    reply_source_id = f"{source_id}:{reply.group(1)}"
+    retry = list(args)
+    retry[retry.index("--source-ids") + 1] = reply_source_id
+    if "--follows" in retry:
+        at = retry.index("--follows") + 1
+        follows = retry[at].split(",")
+        if todo_id not in follows:
+            retry[at] = ",".join(follows + [todo_id])
+    else:
+        retry += ["--follows", todo_id]
+    return retry, reply_source_id, todo_id
 
 
 def _emit_capture_event(rid, kind, entry_id, source_id, title, people):
