@@ -207,15 +207,16 @@ class AlertsTest(unittest.TestCase):
                                side_effect=RuntimeError("boom")):
             self.assertEqual(self.check(), [])
 
-    def test_failed_delivery_is_retried_on_the_next_tick(self):
+    def test_failed_save_repeats_rather_than_loses_the_alert(self):
         self.cap(5)
         self.spend(6)
         with mock.patch.object(alerts.state, "write_atomic",
                                side_effect=OSError("disk full")):
             self.assertEqual(self.check(), [])
-        self.assertEqual(self.emitted(), [])
-        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 1)
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
+        self.assertEqual(len(self.emitted()), 2)
 
     def test_unreadable_usage_log_alerts_with_held_routines(self):
         self.cap(10)
@@ -225,7 +226,24 @@ class AlertsTest(unittest.TestCase):
                          ["usage-unreadable"])
         [event] = self.emitted()
         self.assertEqual(event["details"]["held"], ["alpha", "plain"])
-        self.assertNotIn("budget.yaml", event["title"])
+        self.assertIn("usage log", event["title"])
+
+    def test_unreadable_usage_log_without_any_cap_holds_nothing(self):
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        self.assertEqual(self.check([BRIDGED, OTHER]), [])
+
+    def test_invalid_budget_still_reports_own_cap_holds_of_plain_routines(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.spend(1.5, routine="plain")
+        self.assertEqual(self.check([capped_plain]), ["hold:plain:2026-03-10"])
+
+    def test_connector_order_follows_time_not_file_order(self):
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T18:00:05Z", tools=tool)
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.assertEqual(self.check(), [])
 
     def test_unreadable_usage_log_alerts_without_bridged_routines(self):
         (self.base / "state" / "claude-usage.jsonl").mkdir()
@@ -244,8 +262,7 @@ class AlertsTest(unittest.TestCase):
         self.spend(6)
         with mock.patch.object(alerts.events, "emit", return_value=False):
             self.assertEqual(self.check(), [])
-        self.assertEqual(
-            json.loads((self.base / "state" / "alerts.json").read_text()), {})
+        self.assertFalse((self.base / "state" / "alerts.json").exists())
         self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 1)
         self.assertEqual(self.check(), [])

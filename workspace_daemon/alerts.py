@@ -1,7 +1,7 @@
 """Operational alerts: budget pressure, budget holds and unhealthy routines.
 
-Every scheduler tick that passes the pause and preflight checks calls
-`check` (dry runs do not). It evaluates a fixed set of conditions,
+Every scheduler tick that passes the pause and preflight checks and finds
+every routine valid calls `check` (dry runs do not). It evaluates a fixed set of conditions,
 and each condition that becomes true is announced once: a line in the run log
 and an event in `state/events.jsonl` with source "daemon" and kind "alert",
 which the notifier (capture-events.py + notify.json) delivers. A condition
@@ -12,9 +12,8 @@ Conditions (`key` in the event's details):
 - `budget-80:<day>`: today's spend reached 80% of state/budget.yaml daily_usd.
 - `budget-hit:<day>`: the global cap is reached, so every Claude routine is
   held. It replaces the 80% condition, so a jump past the cap alerts once.
-- `budget-invalid`: state/budget.yaml cannot be read, which also holds them.
-- `usage-unreadable`: the usage log cannot be read, so spend is unknown and
-  Claude routines and routines with their own cap are held.
+- `budget-invalid` / `usage-unreadable`: state/budget.yaml or the usage log
+  cannot be read, and routines are held because of it.
 - `hold:<routine>:<day>`: a routine reached its own budget.daily_usd. Holds
   caused by the global cap are listed on `budget-hit` instead, so a cap hit
   sends one alert, not one per routine.
@@ -54,71 +53,70 @@ def _spend_text(spent):
     ) or "no spend"
 
 
-def budget_conditions(routines, entries, budget, now):
+def budget_conditions(base_dir, routines, entries, budget, now):
     """Active budget conditions as {key: (message, details)}.
 
+    Who is held comes from claude_bridge.budget_exhausted, the same gate the
+    runner applies, so the alert cannot drift from what actually stops.
     `entries` is the usage log (or a BridgeError reading it) and `budget` is
     load_budget's (cap, tz) (or a BridgeError).
     """
     found = {}
-    bridged = sorted(
-        routine["id"] for routine in routines
-        if routine.get("enabled", True) and config.uses_claude_bridge(routine)
-    )
-    capped = sorted(
-        routine["id"] for routine in routines
-        if routine.get("enabled", True) and config.budget_cap(routine)
-    )
-    if isinstance(budget, claude_bridge.BridgeError):
-        if bridged:
-            found["budget-invalid"] = (
-                f"Budget unreadable ({budget}); holding {', '.join(bridged)}",
-                {"held": bridged},
-            )
-        return found
-    if isinstance(entries, claude_bridge.BridgeError):
-        held = sorted(set(bridged) | set(capped))
-        if held:
-            found["usage-unreadable"] = (
-                f"Spend unknown ({entries}); holding {', '.join(held)}",
-                {"held": held},
-            )
-        return found
-    cap, tz = budget
+    held = {}
+    for routine in routines:
+        if not routine.get("enabled", True):
+            continue
+        reason = claude_bridge.budget_exhausted(
+            base_dir, routine["id"], routine_cap=config.budget_cap(routine),
+            now=now, include_global=config.uses_claude_bridge(routine),
+        )
+        if reason:
+            held[routine["id"]] = reason
+    by_global = sorted(rid for rid, why in held.items()
+                       if why.startswith("global cap"))
+    unknown = sorted(rid for rid, why in held.items()
+                     if not why.startswith(("global cap", "routine cap")))
+    if unknown:
+        problems = sorted({held[rid] for rid in unknown})
+        key = ("budget-invalid" if any("budget.yaml" in p for p in problems)
+               else "usage-unreadable")
+        found[key] = (
+            f"Spend cannot be checked ({'; '.join(problems)}); "
+            f"holding {', '.join(unknown)}",
+            {"held": unknown},
+        )
+    tz = None if isinstance(budget, Exception) else budget[1]
     day_start = claude_bridge.day_start_epoch(now, tz)
     day = datetime.datetime.fromtimestamp(day_start, tz).date().isoformat()
+    if isinstance(entries, Exception):
+        return found
     spent = status.spend_by_routine(entries, day_start)
+    for rid, why in sorted(held.items()):
+        if why.startswith("routine cap"):
+            found[f"hold:{rid}:{day}"] = (
+                f"{rid} held: {why} (${spent.get(rid, 0.0):.2f} today)",
+                {"routine": rid, "spent_usd": round(spent.get(rid, 0.0), 2)},
+            )
+    if isinstance(budget, Exception) or budget[0] is None:
+        return found
+    cap = budget[0]
     total = sum(spent.values())
     spend = {tag: round(value, 2) for tag, value in spent.items()}
-    hit = cap is not None and total >= cap
-    if hit:
+    if total >= cap:
         found[f"budget-hit:{day}"] = (
             f"Global Claude cap reached: ${total:.2f} of ${cap:g}; "
-            f"holding {', '.join(bridged) or 'nothing'}. "
+            f"holding {', '.join(by_global) or 'nothing'}. "
             f"Spend: {_spend_text(spent)}",
             {"spent_usd": round(total, 2), "cap_usd": cap,
-             "held": bridged, "by_routine": spend},
+             "held": by_global, "by_routine": spend},
         )
-    elif cap is not None and total >= WARN_FRACTION * cap:
+    elif total >= WARN_FRACTION * cap:
         found[f"budget-80:{day}"] = (
             f"Claude spend at {total / cap:.0%} of the ${cap:g} daily cap "
             f"(${total:.2f}). Spend: {_spend_text(spent)}",
             {"spent_usd": round(total, 2), "cap_usd": cap,
              "by_routine": spend},
         )
-    for routine in routines:
-        own = config.budget_cap(routine)
-        if not routine.get("enabled", True) or own is None:
-            continue
-        rid = routine["id"]
-        if hit and rid in bridged:
-            continue  # already listed as held on the cap hit
-        used = spent.get(rid, 0.0)
-        if used >= own:
-            found[f"hold:{rid}:{day}"] = (
-                f"{rid} held: its own cap ${own:g} reached (${used:.2f} today)",
-                {"routine": rid, "spent_usd": round(used, 2), "cap_usd": own},
-            )
     return found
 
 
@@ -194,32 +192,31 @@ def _read(loader):
 def _check_locked(base_dir, routines, now, path):
     entries = _read(lambda: claude_bridge.recent_usage(base_dir, now=now))
     budget = _read(lambda: claude_bridge.load_budget(base_dir))
-    active = budget_conditions(routines, entries, budget, now)
+    active = budget_conditions(base_dir, routines, entries, budget, now)
     active.update(health_conditions(base_dir, routines, entries, now))
     seen = _load(path)
-    new = [key for key in active if key not in seen]
     stamp = datetime.datetime.fromtimestamp(
         now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    remembered = {key: seen.get(key) or stamp for key in active}
-    if remembered != seen:
-        # Saved before delivery: a failed save sends nothing and retries next
-        # tick, rather than repeating the alert on every tick.
-        _save(path, remembered)
-    undelivered = []
-    for key in sorted(new):
+    sent = []
+    for key in sorted(key for key in active if key not in seen):
         message, details = active[key]
-        log(f"alert {key}: {message}")
-        if not events.emit(base_dir, events.build(
+        # emit logs its own failure; an unsent key stays out of alerts.json
+        # so the next tick retries it.
+        if events.emit(base_dir, events.build(
             "daemon", "alert", None, f"daemon:{key}", message, [],
             ts=stamp, details={"key": key, **details},
         )):
-            undelivered.append(key)
-    if undelivered:
-        # Forget them so the next tick tries again.
-        for key in undelivered:
-            remembered.pop(key)
+            log(f"alert {key}: {message}")
+            sent.append(key)
+    remembered = {
+        key: seen.get(key) or stamp for key in active
+        if key in seen or key in sent
+    }
+    if remembered != seen:
+        # Saved after delivery: a failed save can repeat an alert next tick,
+        # but never loses one.
         _save(path, remembered)
-    return [key for key in sorted(new) if key not in undelivered]
+    return sent
 
 
 def _save(path, remembered):
