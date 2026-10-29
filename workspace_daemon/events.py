@@ -86,11 +86,15 @@ def emit(base_dir, event):
                 target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
             )
             try:
+                start = os.fstat(fd).st_size
                 written = os.write(fd, line)
+                if written != len(line):
+                    # Drop the fragment so a retry starts on a clean line.
+                    os.ftruncate(fd, start)
+                    raise OSError(
+                        f"short write ({written} of {len(line)} bytes)")
             finally:
                 os.close(fd)
-            if written != len(line):
-                raise OSError(f"short write ({written} of {len(line)} bytes)")
         finally:
             os.close(lock_fd)  # closing also drops the flock
     except (OSError, TypeError, ValueError) as exc:

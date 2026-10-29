@@ -402,6 +402,14 @@ class AlertsTest(unittest.TestCase):
             self.assertEqual(self.check([capped, OTHER]), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 2)
 
+    def test_hold_listed_on_budget_invalid_is_not_announced_twice(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(1.5)
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        self.assertEqual(self.check([capped]), ["budget-invalid"])
+        self.cap(10)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
+
 
 if __name__ == "__main__":
     unittest.main()

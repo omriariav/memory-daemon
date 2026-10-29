@@ -68,9 +68,9 @@ def budget_conditions(routines, entries, budget, now):
     applies, evaluated on the same snapshot of the budget file and usage log
     as the spend figures. `entries` is the usage log (or a BridgeError
     reading it) and `budget` is load_budget's (cap, tz) (or a BridgeError).
-    Quiet keys are active but covered by the cap-hit alert: they are neither
-    sent nor recorded, so one still active after the cap hit clears alerts
-    then.
+    Quiet keys are active but covered by the cap-hit or budget-invalid
+    alert: they are neither sent nor recorded, so one still active after that
+    alert clears alerts then.
     """
     found, quiet = {}, set()
     held = {}
@@ -120,8 +120,8 @@ def budget_conditions(routines, entries, budget, now):
             f"{rid} held: its own cap ${own:g} reached (${used:.2f} today)",
             {"routine": rid, "spent_usd": round(used, 2), "cap_usd": own},
         )
-        if hit and held.get(rid, ("",))[0] == "global":
-            quiet.add(key)
+        if held.get(rid, ("",))[0] in ("global", "budget-invalid"):
+            quiet.add(key)  # listed on budget-hit or budget-invalid
     if cap is None:
         return found, quiet
     spend = {tag: round(value, 2) for tag, value in spent.items()}
