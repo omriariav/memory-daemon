@@ -1,6 +1,5 @@
 """Bare first names in meeting captures, matched against that meeting's
 attendees only. All people, emails and slugs are placeholders."""
-import json
 import stat
 import tempfile
 import unittest
