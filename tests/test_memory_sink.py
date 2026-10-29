@@ -439,6 +439,7 @@ class CaptureValidationTest(unittest.TestCase):
                          "2026-07-20-open-todo")
         self.assertEqual(out["memory"], "created")
         self.assertEqual(out["memory_source_id"], "slack:C1:1.0:2.5")
+        self.assertEqual(out["memory_thread_source_id"], "slack:C1:1.0")
 
     def test_reply_retry_keeps_existing_follows(self):
         out, calls = self._run_refused_capture(

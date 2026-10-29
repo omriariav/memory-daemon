@@ -711,9 +711,17 @@ def connector_times(entries):
     """
     last_ok, last_error, last_in_failed, first_error = {}, {}, {}, {}
     latest_error = None
-    for epoch, entry in entries:
+    # Concurrent writers can append out of time order; first_error needs it.
+    # Within one second an ok counts as the later event.
+    def failed_call(entry):
         outcome = str(entry.get("outcome", ""))
-        failed = outcome == "missing_results" or outcome.startswith("error")
+        return outcome == "missing_results" or outcome.startswith("error")
+
+    for epoch, entry in sorted(
+        entries, key=lambda pair: (pair[0], not failed_call(pair[1]))
+    ):
+        outcome = str(entry.get("outcome", ""))
+        failed = failed_call(entry)
         servers = {
             name.split("__")[1] for name in entry.get("tools") or []
             if isinstance(name, str) and name.startswith("mcp__")

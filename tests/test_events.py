@@ -1,5 +1,6 @@
 """Capture event stream: schema, ids, rotation, append safety."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,20 @@ class EmitTest(unittest.TestCase):
 
     def lines(self, file=None):
         return (file or self.file).read_text().splitlines()
+
+    def test_emit_reports_success_and_short_writes(self):
+        self.assertTrue(events.emit(self.base, make()))
+        real_write = os.write
+
+        def short(fd, data):
+            return real_write(fd, data[:3])
+
+        with mock.patch.object(events.os, "write", side_effect=short), \
+                mock.patch.object(events, "log"):
+            self.assertFalse(events.emit(self.base, make(kind="update")))
+        self.assertTrue(events.emit(self.base, make(kind="update")))
+        rows = [json.loads(line) for line in self.lines()]
+        self.assertEqual([r["kind"] for r in rows], ["new", "update"])
 
     def test_two_emits_make_two_valid_lines(self):
         events.emit(self.base, make())

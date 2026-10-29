@@ -1282,8 +1282,10 @@ def capture(routine, item, summary, dry_run=False):
         return {"memory": "dry_run"}
 
     r = _cli(store, args, stdin_text=body, timeout=300)
+    thread_source_id = None
     retry = _open_todo_outcome_retry(args, r, item, source_id)
     if retry:
+        thread_source_id = source_id
         args, source_id, todo_id = retry
         log(
             f"routine={rid} memory: {todo_id} is an open todo anchored on "
@@ -1335,6 +1337,10 @@ def capture(routine, item, summary, dry_run=False):
         "memory_source_id": source_id,
         "memory_personal": bool(ptag) and ptag in tags,
     }
+    if thread_source_id:
+        # The reply has its own id, but earlier failures of this thread are
+        # recorded under the root id; the runner clears them by this one.
+        outcome["memory_thread_source_id"] = thread_source_id
     if (
         etype == "meeting" and extraction_succeeded and source_id
         and not owner_attention_denied

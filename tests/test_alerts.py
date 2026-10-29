@@ -207,15 +207,208 @@ class AlertsTest(unittest.TestCase):
                                side_effect=RuntimeError("boom")):
             self.assertEqual(self.check(), [])
 
-    def test_failed_delivery_is_retried_on_the_next_tick(self):
+    def test_failing_save_sends_nothing_until_it_works(self):
         self.cap(5)
         self.spend(6)
         with mock.patch.object(alerts.state, "write_atomic",
                                side_effect=OSError("disk full")):
             self.assertEqual(self.check(), [])
+            self.assertEqual(self.check(), [])
+        self.assertEqual(self.emitted(), [])
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_unconfirmed_send_is_retried(self):
+        self.cap(5)
+        self.spend(6)
+        real = alerts.state.write_atomic
+        calls = []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(alerts.state, "write_atomic",
+                               side_effect=second_fails):
+            self.assertEqual(self.check(), [])
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
+        self.assertEqual(len(self.emitted()), 2)
+
+    def test_own_cap_hold_hidden_by_cap_hit_alerts_once_it_clears(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.cap(5)
+        self.spend(6)
+        self.assertEqual(self.check([capped]), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check([capped]), [])
+        self.cap(20)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
+        self.assertEqual(self.check([capped]), [])
+        self.assertEqual(len(self.emitted()), 2)
+
+    def test_own_cap_hold_before_cap_hit_is_not_repeated(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.cap(5)
+        self.spend(1.5)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
+        self.spend(4, routine="beta")
+        self.assertEqual(self.check([capped]), ["budget-hit:2026-03-10"])
+        self.cap(20)
+        self.assertEqual(self.check([capped]), [])
+        hold = self.emitted()[0]
+        self.assertEqual(hold["details"]["cap_usd"], 1)
+
+    def test_same_second_ok_beats_error(self):
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool)
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.assertEqual(self.check(), [])
+
+    def test_unreadable_usage_log_alerts_with_held_routines(self):
+        self.cap(10)
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.assertEqual(self.check([BRIDGED, capped_plain]),
+                         ["usage-unreadable"])
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["held"], ["alpha", "plain"])
+        self.assertIn("usage log", event["title"])
+
+    def test_unreadable_usage_log_without_any_cap_holds_nothing(self):
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        self.assertEqual(self.check([BRIDGED, OTHER]), ["usage-unreadable"])
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["held"], [])
+        self.assertIn("holding nothing", event["title"])
+
+    def test_fixing_one_of_two_broken_files_does_not_re_alert(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        self.assertEqual(sorted(self.check()),
+                         ["budget-invalid", "usage-unreadable"])
+        self.cap(10)
+        self.assertEqual(self.check(), [])
+
+    def test_malformed_saved_values_count_as_new(self):
+        self.cap(5)
+        self.spend(6)
+        (self.base / "state" / "alerts.json").write_text(json.dumps(
+            {"budget-hit:2026-03-10": {}, "other": None}))
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_pending_retry_needs_a_working_save(self):
+        self.cap(5)
+        self.spend(6)
+        with mock.patch.object(alerts.events, "emit", return_value=False):
+            self.assertEqual(self.check(), [])
+        with mock.patch.object(alerts.state, "write_atomic",
+                               side_effect=OSError("disk full")):
+            self.assertEqual(self.check(), [])
+        self.assertEqual(self.emitted(), [])
+
+    def test_invalid_budget_still_reports_own_cap_holds_of_plain_routines(self):
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.spend(1.5, routine="plain")
+        self.assertEqual(self.check([capped_plain]), ["hold:plain:2026-03-10"])
+
+    def test_connector_order_follows_time_not_file_order(self):
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T18:00:05Z", tools=tool)
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.assertEqual(self.check(), [])
+
+    def test_unreadable_usage_log_alerts_without_bridged_routines(self):
+        (self.base / "state" / "claude-usage.jsonl").mkdir()
+        capped_plain = dict(PLAIN, budget={"daily_usd": 1})
+        self.assertEqual(self.check([capped_plain]), ["usage-unreadable"])
+
+    def test_global_hit_suppresses_own_cap_holds_of_bridged_routines(self):
+        self.cap(5)
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(6)
+        self.assertEqual(self.check([capped, OTHER]), ["budget-hit:2026-03-10"])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_failed_append_is_retried_on_the_next_tick(self):
+        self.cap(5)
+        self.spend(6)
+        with mock.patch.object(alerts.events, "emit", return_value=False):
+            self.assertEqual(self.check(), [])
         self.assertEqual(self.emitted(), [])
         self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 1)
+        self.assertEqual(self.check(), [])
+
+    def test_state_dir_failure_never_raises(self):
+        with mock.patch.object(alerts.state, "ensure_private_dir",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.check(), [])
+
+    def test_unreadable_tick_does_not_clear_sent_alerts(self):
+        self.cap(5)
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T17:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.spend(6)
+        self.assertEqual(sorted(self.check()),
+                         ["budget-hit:2026-03-10", "connector:srv_a"])
+        log = self.base / "state" / "claude-usage.jsonl"
+        log.rename(log.with_suffix(".bak"))
+        log.mkdir()
+        self.assertEqual(self.check(), ["usage-unreadable"])
+        log.rmdir()
+        log.with_suffix(".bak").rename(log)
+        self.assertEqual(self.check(), [])
+
+    def test_broken_budget_file_does_not_clear_cap_hit(self):
+        self.cap(5)
+        self.spend(6)
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        self.assertEqual(self.check(), ["budget-invalid"])
+        self.cap(5)
+        self.assertEqual(self.check(), [])
+
+    def test_failure_after_a_send_does_not_resend_it(self):
+        self.cap(5)
+        self.spend(6)
+        (self.base / "state" / "budget.yaml").write_text(
+            "daily_usd: 5\nday_timezone: UTC\n")
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(0.01, routine="plain")
+        real = alerts.events.build
+        calls = []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real(*args, **kwargs)
+
+        rows = [{"routine": "beta", "armed": "yes", "issues": "1 memory sink"}]
+        with mock.patch.object(alerts.events, "build", side_effect=second_fails), \
+                mock.patch.object(alerts.status, "routine_rows", return_value=rows):
+            self.assertEqual(self.check([capped, OTHER]), [])
+        self.assertEqual(len(self.emitted()), 1)
+        with mock.patch.object(alerts.status, "routine_rows", return_value=rows):
+            self.assertEqual(self.check([capped, OTHER]), ["budget-hit:2026-03-10"])
+        self.assertEqual(len(self.emitted()), 2)
+
+    def test_hold_listed_on_budget_invalid_is_not_announced_twice(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.spend(1.5)
+        (self.base / "state" / "budget.yaml").write_text("daily_usd: -1\n")
+        self.assertEqual(self.check([capped]), ["budget-invalid"])
+        self.cap(10)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
 
 
 if __name__ == "__main__":
