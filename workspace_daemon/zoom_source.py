@@ -197,10 +197,12 @@ def _sync_calendar(cfg, meetings, events, refreshed, now):
         start, end = _epoch(event.get("start")), _epoch(event.get("end"))
         if not isinstance(event_id, str) or not event_id or start is None or end is None:
             continue
+        # Listed is enough to be kept: a refresh whose detail lookups ran out
+        # can list a known meeting without its join link.
+        seen.add(event_id)
         number = meeting_number(event.get("conference_url"), hosts)
         if not number or event.get("all_day"):
             continue
-        seen.add(event_id)
         record = meetings.get(event_id)
         if record is not None and (
             record.get("status") != "tracking" or record.get("checks")
@@ -237,16 +239,17 @@ def _sync_calendar(cfg, meetings, events, refreshed, now):
 
 # --- transcript links ------------------------------------------------------------
 
-def transcript_entries(event_id):
-    """Memory entry ids of transcript captures (Mila, Whisper) of this event."""
-    if _base_dir is None or not event_id:
-        return []
+def transcript_index():
+    """{calendar event id: [memory entry ids]} of transcript captures (Mila,
+    Whisper), read from their processed receipts."""
+    if _base_dir is None:
+        return {}
     directory = Path(_base_dir) / "state" / "transcriptions" / "processed"
-    found = []
+    index = {}
     try:
         paths = sorted(directory.glob("*.json"))
     except OSError:
-        return []
+        return {}
     for path in paths:
         try:
             receipt = json.loads(path.read_text())
@@ -256,25 +259,35 @@ def transcript_entries(event_id):
             continue
         match = receipt.get("calendar_match") or {}
         entry_id = receipt.get("memory_entry_id")
+        event_id = match.get("event_id") if isinstance(match, dict) else None
         if (
-            isinstance(match, dict) and match.get("event_id") == event_id
+            isinstance(event_id, str) and event_id
             and receipt.get("memory") in CAPTURED_VERDICTS
             and isinstance(entry_id, str) and _ENTRY_ID.match(entry_id)
-            and entry_id not in found
         ):
-            found.append(entry_id)
-    return found
+            found = index.setdefault(event_id, [])
+            if entry_id not in found:
+                found.append(entry_id)
+    return index
+
+
+def transcript_entries(event_id):
+    """Memory entry ids of transcript captures of this calendar event."""
+    return transcript_index().get(event_id, []) if event_id else []
 
 
 def _link_transcripts(meetings, store, dry_run):
     """Link captured Zoom entries to transcript entries captured after them."""
     from . import memory_sink  # late import to avoid cycles
-    for event_id, record in meetings.items():
-        zoom_id = record.get("memory_entry_id")
-        if record.get("status") != "captured" or not zoom_id:
-            continue
+    pending = {
+        event_id: record for event_id, record in meetings.items()
+        if record.get("status") == "captured" and record.get("memory_entry_id")
+    }
+    index = transcript_index() if pending else {}
+    for event_id, record in pending.items():
+        zoom_id = record["memory_entry_id"]
         linked = record.setdefault("linked", [])
-        for entry_id in transcript_entries(event_id):
+        for entry_id in index.get(event_id, []):
             if entry_id in linked or entry_id == zoom_id:
                 continue
             if dry_run or not store:

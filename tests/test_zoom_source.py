@@ -267,6 +267,13 @@ class ZoomSourceTest(unittest.TestCase):
         self.assertEqual(self.connector.calls, [])
         self.assertFalse((self.base / "state" / "zoom-meetings.json").exists())
 
+    def test_meeting_listed_without_its_link_is_kept(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.write_calendar([dict(event(), conference_url="")])
+        self.listing()
+        self.assertEqual(list(self.meetings()), ["ev1"])
+
     def test_cancelled_upcoming_meeting_is_dropped(self):
         self.write_calendar([event()])
         self.listing()
