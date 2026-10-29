@@ -1645,3 +1645,29 @@ class VerifiedSenderRoundThreeTest(VerifiedSenderFlowTest):
         thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
         self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
         self.assertEqual(thread["withheld"], 1)
+
+
+class VerifiedSenderRoundFourTest(VerifiedSenderFlowTest):
+    def test_missing_dmarc_policy_leaves_it_to_dkim_and_spf(self):
+        for verdict in ("none", "bestguesspass"):
+            auth = [f"mx.google.com; dkim=pass header.i=@example.com; "
+                    f"spf=pass smtp.mailfrom=a@example.com; dmarc={verdict}"]
+            self.assertTrue(gmail_mcp.sender_authenticated(
+                auth, "example.com", ["mx.google.com"]), verdict)
+
+    def test_folded_untracked_headers_parse(self):
+        text = ("Authentication-Results: mx.google.com;\n"
+                " dmarc=pass header.from=example.com\n"
+                "ARC-Seal: i=1; a=rsa-sha256;\n"
+                "        b=abc\n" + message_text())
+        parsed = gmail_mcp.parse_message(text)
+        self.assertEqual(parsed["auth_results"],
+                         ["mx.google.com; dmarc=pass header.from=example.com"])
+
+    def test_owner_mail_is_not_reported_as_withheld(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1, "sender": f"Me <{ME}>"},
+             {"mid": 2, "thread": 1, "epoch": T2}],
+            {2: authed_text(2)})
+        thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertEqual(thread["withheld"], 0)

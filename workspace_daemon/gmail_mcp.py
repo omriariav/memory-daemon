@@ -375,7 +375,10 @@ _HEADER_KEYS = {
     "subject", "from", "to", "cc", "date", "thread id",
 }
 _AUTH_KEY = "authentication-results"
+_SKIP = object()
 _AUTH_RESULT = re.compile(r"\A(dkim|spf|dmarc)\s*=\s*([a-z]+)\b(.*)\Z", re.I | re.S)
+# DMARC verdicts that veto; none/bestguesspass leave it to dkim plus spf.
+_DMARC_FAILURES = {"fail", "quarantine", "reject", "temperror", "permerror"}
 _NAME_THEN_ADDRESS = re.compile(r'[^<>@"]*<([^<>\s]+)>')
 _AUTH_PROP = re.compile(r"([a-z]+\.[a-z-]+)\s*=\s*(\S+)", re.I)
 _DOC_START = re.compile(
@@ -617,6 +620,8 @@ def parse_message(text):
     key = None
     for line in head.split("\n"):
         if line[:1] in (" ", "\t") and key is not None:
+            if key == _SKIP:
+                continue
             if key == _AUTH_KEY:
                 if auth[-1] is not None:
                     auth[-1] += " " + line.strip()
@@ -637,7 +642,7 @@ def parse_message(text):
                 raise GmailMcpParseError("message header repeated")
             fields[key] = match.group(2).strip()
         else:
-            key = None
+            key = _SKIP  # an untracked header: its folded lines are skipped
     for needed in ("from", "date", "thread id"):
         if needed not in fields:
             raise GmailMcpParseError("message result lacks a header")
@@ -763,7 +768,7 @@ def sender_authenticated(results, domain, servers):
     """True when the topmost Authentication-Results is a trusted server's and
     shows dmarc=pass for `domain`, or dkim=pass
     signed by `domain` plus spf=pass for it. Anything missing, unreadable or
-    ambiguous is False, and any other DMARC verdict vetoes a pass.
+    ambiguous is False, and a failing DMARC verdict vetoes a pass.
 
     The receiving server adds its header above any a sender wrote into the
     message; a second header naming the same server is treated as forged.
@@ -790,7 +795,7 @@ def sender_authenticated(results, domain, servers):
             k.casefold(): v.casefold()
             for k, v in _AUTH_PROP.findall(match.group(3))
         }
-        if method == "dmarc" and result != "pass":
+        if method == "dmarc" and result in _DMARC_FAILURES:
             return False
         if result != "pass":
             continue
@@ -991,17 +996,19 @@ def _group(cfg, hits):
     if domains:
         # The owner's own mail never carries the receiving server's verdict,
         # so it would only cost a read and fail at fetch.
-        all_hits = hits
-        hits, external = _partition(hits, lambda h: (
-            sender_domain(h["from"]) in domains and _address(h["from"]) != owner
-        ))
+        kept, external = [], set()
+        for hit in hits:
+            if owner and _address(hit["from"]) == owner:
+                continue  # the owner's own mail is not withheld, just unread
+            if sender_domain(hit["from"]) in domains:
+                kept.append(hit)
+            else:
+                external.add(hit["id"])
+                withheld.setdefault(hit["thread"], set()).add(hit["id"])
+        hits = kept
         if external:
             _log_skipped("from senders outside verified_sender_domains",
-                         sorted(set(external)))
-        dropped = set(external)
-        for hit in all_hits:
-            if hit["id"] in dropped:
-                withheld.setdefault(hit["thread"], set()).add(hit["id"])
+                         sorted(external))
     groups = {}
     for hit in hits:
         group = groups.setdefault(hit["thread"], {"messages": {}})
