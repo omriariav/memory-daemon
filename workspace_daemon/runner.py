@@ -1298,6 +1298,11 @@ def _gmail_mcp_fetch(routine, source, candidate):
                 f"were not read.]\n\n{body}"
             )
             thread_truncated = True
+        if thread.get("withheld"):
+            body = (
+                f"[{thread['withheld']} message(s) of this thread were "
+                "withheld: the sender could not be verified.]\n\n" + body
+            )
         people_headers = [m["headers"] for m in reversed(thread_messages)]
     else:
         body = newest["body"]
@@ -2452,6 +2457,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 totals["processed"] += 1
         except state.AlreadyRunning:
             raise
+        except gmail_mcp.SenderUnverified as exc:
+            # Recorded as done: external mail is skipped, not an error, and
+            # must not hold the cursor, so no hold_claim here.
+            totals["skipped"] += 1
+            log(f"routine={rid} skipped id={candidate['id']}: {exc}")
         except Exception as exc:  # per-item failures are isolated
             hold_claim(claim)
             if (

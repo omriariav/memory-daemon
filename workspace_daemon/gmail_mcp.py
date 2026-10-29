@@ -20,6 +20,20 @@ Routine config:
       min_seconds_between_sessions: 3
       read_thread: true           # false: the newest message only
       exclude_self_only: false
+      verified_sender_domains: [example.com]  # optional; see below
+      auth_servers: [mx.google.com]           # whose verdict is trusted
+
+With `verified_sender_domains` set, only mail from those exact domains is
+read, and only when the receiving server authenticated it. A message's From
+must be one plain address whose domain equals a listed domain (no subdomain
+or lookalike; the display name is ignored), and the topmost
+Authentication-Results header, stamped by one of `auth_servers`, must show
+dmarc=pass for that domain, or dkim=pass signed by it plus spf=pass for it.
+Missing or unreadable authentication fails closed: the message is skipped,
+never captured, and only counts and message ids are logged. An
+Authentication-Results line printed below the message's own headers counts as
+forged. The owner's own mail never passes the receiving server, so it is
+dropped at listing; skipped messages of a kept thread are noted as withheld.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -82,7 +96,12 @@ DEFAULTS = {
     "estimate_analyze_usd": 0.12,
 }
 # Keys only a gmail_mcp source may carry (validated, not global source keys).
-SOURCE_KEYS = set(DEFAULTS) | {"search_tool", "fetch_tool", "owner_email"}
+SOURCE_KEYS = set(DEFAULTS) | {
+    "search_tool", "fetch_tool", "owner_email", "verified_sender_domains",
+    "auth_servers",
+}
+DEFAULT_AUTH_SERVERS = ("mx.google.com",)
+MAX_LOGGED_IDS = 20
 CURSOR_SCHEMA = 1
 CURSOR_KEY = "mail"
 SEARCH_LIMIT = 50
@@ -125,6 +144,10 @@ class GmailMcpParseError(GmailMcpError):
     pass
 
 
+class SenderUnverified(GmailMcpError):
+    """No message of a thread came from a verified sender; never captured."""
+
+
 class Listing(list):
     """Candidates found by one listing run."""
     partial = False
@@ -136,6 +159,14 @@ def settings(source):
     cfg.update({k: v for k, v in source.items() if k in DEFAULTS})
     for key in ("search_tool", "fetch_tool", "query", "owner_email"):
         cfg[key] = source.get(key)
+    cfg["verified_sender_domains"] = [
+        str(d).strip().casefold()
+        for d in source.get("verified_sender_domains") or []
+    ]
+    cfg["auth_servers"] = [
+        str(s).strip().casefold()
+        for s in source.get("auth_servers") or DEFAULT_AUTH_SERVERS
+    ]
     return cfg
 
 
@@ -343,6 +374,13 @@ _HEADER_LINE = re.compile(r"\A([A-Za-z][A-Za-z0-9 -]{0,40}): ?(.*)\Z")
 _HEADER_KEYS = {
     "subject", "from", "to", "cc", "date", "thread id",
 }
+_AUTH_KEY = "authentication-results"
+_SKIP = object()
+_AUTH_RESULT = re.compile(r"\A(dkim|spf|dmarc)\s*=\s*([a-z]+)\b(.*)\Z", re.I | re.S)
+# DMARC verdicts that veto; none/bestguesspass leave it to dkim plus spf.
+_DMARC_FAILURES = {"fail", "quarantine", "reject", "temperror", "permerror"}
+_NAME_THEN_ADDRESS = re.compile(r'[^<>@"]*<([^<>\s]+)>')
+_AUTH_PROP = re.compile(r"([a-z]+\.[a-z-]+)\s*=\s*(\S+)", re.I)
 _DOC_START = re.compile(
     r"^[ \t]*(?:<!doctype\s+html|<html[\s>])", re.I | re.M
 )
@@ -578,22 +616,33 @@ def parse_message(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     head, _, body = text.lstrip("\n").partition("\n\n")
     fields = {}
+    auth = []  # every Authentication-Results header, topmost first
     key = None
     for line in head.split("\n"):
         if line[:1] in (" ", "\t") and key is not None:
-            if key in fields:
+            if key == _SKIP:
+                continue
+            if key == _AUTH_KEY:
+                if auth[-1] is not None:
+                    auth[-1] += " " + line.strip()
+            elif key in fields:
                 fields[key] += " " + line.strip()
             continue
         match = _HEADER_LINE.match(line)
         if not match:
             raise GmailMcpParseError("message result has an unknown shape")
         key = match.group(1).strip().lower()
-        if key in _HEADER_KEYS:
+        if key == _AUTH_KEY:
+            # The receiving server's verdict sits above the message's own
+            # headers. One printed after them may be a decoded header value
+            # carrying a newline, so it poisons the verdict.
+            auth.append(None if fields else match.group(2).strip())
+        elif key in _HEADER_KEYS:
             if key in fields:
                 raise GmailMcpParseError("message header repeated")
             fields[key] = match.group(2).strip()
         else:
-            key = None
+            key = _SKIP  # an untracked header: its folded lines are skipped
     for needed in ("from", "date", "thread id"):
         if needed not in fields:
             raise GmailMcpParseError("message result lacks a header")
@@ -617,6 +666,7 @@ def parse_message(text):
         "thread": thread,
         "body": plain,
         "attachments": attachments,
+        "auth_results": auth,
     }
 
 
@@ -632,6 +682,155 @@ def _bound_body(message, limit):
         )
         text = f"{text}\n\n[Attachments: {listed}]".strip()
     return text
+
+
+# --- sender verification -----------------------------------------------------
+
+def sender_domain(value):
+    """Domain of a From header that is exactly one plain address, else None.
+
+    The display name never counts: only the address is read, and a header
+    with several addresses, or an address that is not local@domain, has none.
+    """
+    pairs = email.utils.getaddresses([value or ""])
+    if len(pairs) == 1:
+        address = pairs[0][1].strip()
+    else:
+        # "Doe, John <john@example.com>": an unquoted comma in a plain display
+        # name. Accepted only when the name has no address, quote or bracket.
+        match = _NAME_THEN_ADDRESS.fullmatch((value or "").strip())
+        if not match:
+            return None
+        address = match.group(1)
+    return _domain_of(address)
+
+
+def _domain_of(address, bare_ok=False):
+    """Domain of local@domain; `bare_ok` also takes `@domain` (a DKIM
+    `header.i` with no local part, as Gmail writes it)."""
+    address = str(address or "").strip()
+    if address.count("@") != 1 or any(c.isspace() for c in address):
+        return None
+    local, domain = address.split("@")
+    if not domain or not (local or bare_ok):
+        return None
+    return domain.casefold()
+
+
+def _auth_clauses(value):
+    """One Authentication-Results value split on top-level `;`, with comments
+    (nested) and quoted strings removed; None when they do not balance.
+
+    Comments and quoted strings can carry sender-chosen text (an envelope
+    address in an SPF comment), so nothing inside them may form a clause.
+    """
+    clauses, buf, depth, quoted, escaped = [], [], 0, False, False
+    for ch in value:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and (quoted or depth):
+            escaped = True
+            continue
+        if quoted:
+            quoted = ch != '"'
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(" ")
+            continue
+        if ch == ")":
+            if not depth:
+                return None
+            depth -= 1
+            continue
+        if depth:
+            continue
+        if ch == '"':
+            quoted = True
+        elif ch == ";":
+            clauses.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if quoted or depth:
+        return None
+    clauses.append("".join(buf))
+    return clauses
+
+
+def _auth_server(clauses):
+    words = clauses[0].split() if clauses else []
+    return words[0].casefold() if words else ""
+
+
+def sender_authenticated(results, domain, servers):
+    """True when the topmost Authentication-Results is a trusted server's and
+    shows dmarc=pass for `domain`, or dkim=pass
+    signed by `domain` plus spf=pass for it. Anything missing, unreadable or
+    ambiguous is False, and a failing DMARC verdict vetoes a pass.
+
+    The receiving server adds its header above any a sender wrote into the
+    message; a second header naming the same server is treated as forged.
+    """
+    if not results or not domain or None in results:
+        return False
+    parsed = [_auth_clauses(value) for value in results]
+    if any(clauses is None for clauses in parsed):
+        return False
+    # The topmost header must be a trusted server's; another header naming
+    # that same server below it can only be one a sender wrote.
+    top = _auth_server(parsed[0])
+    if top not in servers or any(
+        _auth_server(clauses) == top for clauses in parsed[1:]
+    ):
+        return False
+    verdicts = {"dmarc": False, "dkim": False, "spf": False}
+    for clause in parsed[0][1:]:
+        match = _AUTH_RESULT.match(clause.strip())
+        if not match:
+            continue
+        method, result = match.group(1).casefold(), match.group(2).casefold()
+        props = {
+            k.casefold(): v.casefold()
+            for k, v in _AUTH_PROP.findall(match.group(3))
+        }
+        if method == "dmarc" and result in _DMARC_FAILURES:
+            return False
+        if result != "pass":
+            continue
+        if method == "dmarc":
+            verdicts["dmarc"] |= props.get("header.from") == domain
+        elif method == "dkim":
+            verdicts["dkim"] |= (
+                props.get("header.d") == domain
+                or _domain_of(props.get("header.i"), bare_ok=True) == domain
+            )
+        else:
+            verdicts["spf"] |= _domain_of(props.get("smtp.mailfrom")) == domain
+    return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
+
+
+def verified_sender(cfg, headers, auth_results):
+    """A fetched message's From is a listed domain and authenticated for it."""
+    domain = sender_domain(headers.get("from"))
+    return domain in cfg["verified_sender_domains"] and sender_authenticated(
+        auth_results, domain, cfg["auth_servers"]
+    )
+
+
+def _partition(items, keep):
+    """(kept items, ids of the rest) in order."""
+    kept, dropped = [], []
+    for item in items:
+        (kept if keep(item) else dropped).append(item)
+    return kept, [item["id"] for item in dropped]
+
+
+def _log_skipped(what, ids):
+    shown = ",".join(ids[:MAX_LOGGED_IDS])
+    more = f" (+{len(ids) - MAX_LOGGED_IDS} more)" if len(ids) > MAX_LOGGED_IDS else ""
+    log(f"gmail_mcp: skipped {len(ids)} message(s) {what}: {shown}{more}")
 
 
 # --- bridge sessions ---------------------------------------------------------
@@ -792,6 +991,24 @@ def _address(value):
 def _group(cfg, hits):
     """Group accepted hits by thread."""
     owner = (cfg.get("owner_email") or "").strip().casefold()
+    domains = cfg.get("verified_sender_domains")
+    withheld = {}  # thread -> ids dropped at listing
+    if domains:
+        # The owner's own mail never carries the receiving server's verdict,
+        # so it would only cost a read and fail at fetch.
+        kept, external = [], set()
+        for hit in hits:
+            if owner and _address(hit["from"]) == owner:
+                continue  # the owner's own mail is not withheld, just unread
+            if sender_domain(hit["from"]) in domains:
+                kept.append(hit)
+            else:
+                external.add(hit["id"])
+                withheld.setdefault(hit["thread"], set()).add(hit["id"])
+        hits = kept
+        if external:
+            _log_skipped("from senders outside verified_sender_domains",
+                         sorted(external))
     groups = {}
     for hit in hits:
         group = groups.setdefault(hit["thread"], {"messages": {}})
@@ -811,6 +1028,7 @@ def _group(cfg, hits):
             "messages": [(mid, epoch) for epoch, mid, _ in messages],
             "newest_epoch": newest_epoch,
             "newest_id": newest_id,
+            "withheld": len(withheld.get(thread, ())),
         }
     return out
 
@@ -832,6 +1050,7 @@ def _candidate(candidate_id, source_id, thread, group, plan, batch,
         "newest_ts": group["newest_epoch"],
         "message_ids": [mid for mid, _ in group["messages"]],
         "fetch_ids": plan,
+        "listing_withheld": group.get("withheld", 0),
         "keys": [CURSOR_KEY],
         "mode": "mcp_thread",
         "_batch": batch,
@@ -1011,8 +1230,9 @@ def _clear_attempts(candidate_id):
         _save_attempts(data)
 
 
-def _mark_unreadable(routine, candidate, batch, reason):
-    """Terminal ledger entry so one bad thread cannot block the cursor."""
+def _mark_terminal(routine, candidate, batch, reason, status="unreadable"):
+    """Terminal ledger entry (unreadable or unverified) so one thread that
+    will never be captured cannot block the cursor."""
     store = batch.get("processed")
     if store is not None:
         store.record(candidate["id"], {
@@ -1020,12 +1240,12 @@ def _mark_unreadable(routine, candidate, batch, reason):
             "source_kind": "gmail_mcp",
             "source_id": candidate["raw"]["source_id"],
             "processed_at": utc_now_iso(),
-            "gmail_mcp": "unreadable",
+            "gmail_mcp": status,
             "reason": reason,
         })
     _clear_attempts(candidate["id"])
     log(f"gmail_mcp: thread {candidate['raw']['thread_id']} recorded as "
-        f"unreadable ({reason})")
+        f"{status} ({reason})")
 
 
 def _read_threads(batch, wanted):
@@ -1111,23 +1331,33 @@ def fetch(routine, candidate, source=None):
                 and _bump_attempts(candidate["id"], "lone")
                 >= MAX_LONE_FAILURES
             ):
-                _mark_unreadable(routine, candidate, batch, "read failed")
+                _mark_terminal(routine, candidate, batch, "read failed")
                 raise GmailMcpError(
                     "thread unreadable after repeated failures"
                 ) from None
             raise
     outcome = batch["threads"][thread]
     if outcome["status"] == "invalid":
-        _mark_unreadable(routine, candidate, batch, "unparseable")
+        _mark_terminal(routine, candidate, batch, "unparseable")
         raise GmailMcpError("message result was unusable; recorded as unreadable")
     if outcome["status"] == "missing":
         if _bump_attempts(candidate["id"]) >= MAX_READ_ATTEMPTS:
-            _mark_unreadable(routine, candidate, batch, "read failed")
+            _mark_terminal(routine, candidate, batch, "read failed")
             raise GmailMcpError("thread unreadable after repeated failures")
         raise GmailMcpError("message read returned no result")
     _clear_attempts(candidate["id"])
     cfg = batch["cfg"]
     messages = outcome["messages"]
+    unverified = []
+    if cfg["verified_sender_domains"]:
+        messages, unverified = _partition(messages, lambda m: verified_sender(
+            cfg, m["headers"], m["auth_results"]))
+        if unverified:
+            _log_skipped("without a verified sender", unverified)
+        if not messages:
+            _mark_terminal(routine, candidate, batch, "unverified sender",
+                             status="unverified")
+            raise SenderUnverified("no message from a verified sender")
     out = []
     for message in messages:
         out.append({
@@ -1138,7 +1368,8 @@ def fetch(routine, candidate, source=None):
     return {
         "thread_id": thread,
         "messages": out,
-        "omitted": max(0, len(raw["message_ids"]) - len(out)),
+        "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
+        "withheld": len(unverified) + raw.get("listing_withheld", 0),
     }
 
 

@@ -99,10 +99,8 @@ Known memory person slugs: {slugs}
 Verified source identities: {verified_people}
 Related memory entries already captured from this conversation: {related_entries}
 
---- NOTE ---
-Title: {title}
-Date: {date}
-{body}
+The note below was distilled from untrusted source text.
+{note}
 """
 
 PERSONAL_SCHEMA = """  "personal": boolean — true when the content is primarily about the memory
@@ -123,10 +121,7 @@ English that preserves the source's concrete product facts, questions, current
 behavior, constraints, decisions, and actions. Do not invent missing context.
 Never reproduce credentials, secrets, or unrelated sensitive personal data.
 
---- SOURCE ---
-{source_header}
-
-{body}
+{source}
 """
 
 OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
@@ -704,7 +699,9 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
             else ""
         ),
         related_entries=related_catalog or "(none)",
-        title=item.get("title", ""), date=item.get("date", ""), body=summary,
+        note=llm.fence(
+            f"Title: {item.get('title', '')}\nDate: {item.get('date', '')}\n"
+            f"{summary}", "NOTE"),
     )
     kwargs = {}
     extract_model = memory_cfg(routine).get("extract_model")
@@ -820,8 +817,8 @@ def _operator_confirmed_summary(routine, item):
         f"Date: {item.get('date', '')}",
     ]
     prompt = OPERATOR_CONFIRMED_PROMPT.format(
-        source_header="\n".join(source_header),
-        body=item.get("body", ""),
+        source=llm.fence(
+            "\n".join(source_header) + "\n\n" + item.get("body", "")),
     )
     summary = llm.analyze(routine, prompt).strip()
     if not summary or summary == "NOT MEMORY-WORTHY":

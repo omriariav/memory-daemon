@@ -878,8 +878,9 @@ Fibery document the inbound routine reads. Selection (all required): type
 `todo` and unresolved; `owner_slug` (required) among the entry's `people` and no
 `no-owner-action` tag (the sink only keeps a `todo` when the owner is
 affirmed); date on or after `outbound_since` (required, quoted `YYYY-MM-DD`); a
-source id starting with one of `from_sources` (default `slack:`, `mila:`,
-`gmail:`). Never selected: entries with any `fibery:` source id, tags
+source id starting with one of `from_sources` (default `slack:`, `mila:`;
+email is left out because anyone can send it, list `gmail:` to opt in). Never
+selected: entries with any `fibery:` source id, tags
 `exclude_tags` (default `personal`, `no-fibery`, `no-owner-action`; every
 `memory.personal_tag` configured on any routine is excluded too), or entries
 already in the checkpoint.
@@ -2265,7 +2266,39 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 (3), `overlap` (1h), `bootstrap` (2d), `settle_minutes` (10),
 `calls_per_session` (15, max 20), `min_seconds_between_sessions` (3),
 `read_thread` (true), `exclude_self_only` (false; needs `owner_email`),
-`estimate_analyze_usd` (0.12).
+`estimate_analyze_usd` (0.12), `verified_sender_domains` (unset),
+`auth_servers` (`[mx.google.com]`; needs `verified_sender_domains`).
+
+**Verified senders only.** Mail text is untrusted, and anyone can write it. With
+`verified_sender_domains` set, only mail from those exact domains is read:
+
+- Listing drops every message whose `From` is not one plain address in a listed
+  domain. The match is exact: a subdomain or lookalike does not match, and the
+  display name is ignored.
+- `fetch()` then requires the topmost `Authentication-Results` header to be
+  stamped by one of `auth_servers`. A lower header naming the same server
+  counts as forged. It must show
+  `dmarc=pass` with `header.from` equal to the domain, or `dkim=pass` signed by
+  the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
+  Comments and quoted strings are removed before parsing, so text a sender
+  controls cannot form a clause.
+- An `Authentication-Results` line printed after the message's own headers
+  is treated as forged, because a decoded header value can contain a newline.
+- A message that is missing the header or fails the check is dropped, at
+  listing or at fetch. In a kept thread, a note says how many messages were
+  withheld.
+- The owner's own mail never passes the receiving server, so it is dropped at
+  listing. The owner's replies in a thread are therefore not captured.
+- Limits:
+  - A verified colleague's mail can still quote or forward outside text.
+  - A thread recorded as `unverified` is not re-read after the domains or the
+    connector change.
+  - Mail delivered without the receiving server's stamp is never captured.
+    This includes all mail when the connector does not return the header.
+- A thread with no verified message is recorded as `unverified` and never
+  captured. Logs carry counts and message ids only.
+- This fails closed. A connector whose `fetch_message` does not return
+  `Authentication-Results` therefore yields no captures at all.
 
 How a run works:
 
