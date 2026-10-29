@@ -27,7 +27,9 @@ from .shell import log
 
 CHECKPOINT_VERSION = 1
 DEFAULT_CHECKPOINT = OUTBOUND_CHECKPOINT
-DEFAULT_FROM_SOURCES = ["slack:", "mila:", "gmail:"]
+# Email is left out: anyone can send mail, so its text must not become a
+# suggested task in an external tool. List "gmail:" explicitly to opt in.
+DEFAULT_FROM_SOURCES = ["slack:", "mila:"]
 DEFAULT_HEADING = "Inbox"
 DEFAULT_MAX_PER_RUN = 5
 DEFAULT_WRITE_MODE = "suggest"

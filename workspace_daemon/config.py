@@ -1929,6 +1929,20 @@ def _validate_gmail_mcp(prefix, source):
         problems.append(f"{prefix}.owner_email must be an email address")
     if source.get("exclude_self_only") is True and owner is None:
         problems.append(f"{prefix}.exclude_self_only requires owner_email")
+    for key in ("verified_sender_domains", "auth_servers"):
+        value = source.get(key)
+        if value is not None and not (
+            isinstance(value, list) and value and all(
+                isinstance(d, str)
+                and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", d)
+                for d in value
+            )
+        ):
+            problems.append(
+                f"{prefix}.{key} must be a non-empty list of lowercase domains"
+            )
+    if "auth_servers" in source and "verified_sender_domains" not in source:
+        problems.append(f"{prefix}.auth_servers requires verified_sender_domains")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
     for key in ("queue_query", "exclude_query", "max_results"):

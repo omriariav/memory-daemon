@@ -1383,3 +1383,172 @@ class UsageMeansTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GOOD_AUTH = ("mx.google.com; dkim=pass header.i=@example.com header.s=g1 "
+             "header.b=abc; spf=pass (google.com: domain of ann@example.com "
+             "designates 192.0.2.1 as permitted sender) "
+             "smtp.mailfrom=ann@example.com; dmarc=pass (p=REJECT sp=REJECT "
+             "dis=NONE) header.from=example.com")
+
+
+def authed_text(mid, thread=1, sender="Ann Example <ann@example.com>",
+                auth=(GOOD_AUTH,), body=None):
+    text = message_text(thread=thread, epoch=T1 + mid, sender=sender,
+                        body=body or f"body {mid}")
+    head, _, rest = text.partition("\n\n")
+    extra = "".join(f"Authentication-Results: {a}\n" for a in auth)
+    return f"{head}\n{extra.rstrip()}\n\n{rest}" if extra else text
+
+
+class VerifiedSenderTest(unittest.TestCase):
+    SERVERS = ["mx.google.com"]
+
+    def ok(self, results, domain="example.com"):
+        return gmail_mcp.sender_authenticated(results, domain, self.SERVERS)
+
+    def test_sender_domain_reads_the_address_not_the_display_name(self):
+        cases = {
+            "Ann <ann@example.com>": "example.com",
+            "ANN@EXAMPLE.COM": "example.com",
+            '"ann@example.com" <eve@evil.test>': "evil.test",
+            "example.com <eve@evil.test>": "evil.test",
+            "eve@evil.test": "evil.test",
+            "ann@example.com@evil.test": None,
+            "ann@example.com, eve@evil.test": None,
+            "": None,
+            "Ann": None,
+        }
+        for value, domain in cases.items():
+            self.assertEqual(gmail_mcp.sender_domain(value), domain, value)
+
+    def test_dmarc_pass_for_the_domain(self):
+        self.assertTrue(self.ok([GOOD_AUTH]))
+        self.assertTrue(self.ok(
+            ["mx.google.com; dmarc=pass header.from=example.com"]))
+
+    def test_dkim_and_spf_both_needed_without_dmarc(self):
+        dkim = "dkim=pass header.d=example.com"
+        spf = "spf=pass smtp.mailfrom=bounce@example.com"
+        self.assertTrue(self.ok([f"mx.google.com; {dkim}; {spf}"]))
+        self.assertFalse(self.ok([f"mx.google.com; {dkim}"]))
+        self.assertFalse(self.ok([f"mx.google.com; {spf}"]))
+        self.assertFalse(self.ok(
+            [f"mx.google.com; dkim=pass header.d=evil.test; {spf}"]))
+
+    def test_failures_and_other_domains_do_not_pass(self):
+        for results in (
+            [], [""], ["garbage"],
+            ["mx.google.com; dmarc=fail header.from=example.com"],
+            ["mx.google.com; dmarc=pass header.from=evil.test"],
+            ["mx.google.com; dmarc=pass header.from=mail.example.com"],
+            ["mx.google.com; dmarc=none header.from=example.com"],
+            # an untrusted server's verdict
+            ["mx.evil.test; dmarc=pass header.from=example.com"],
+            # a sender-written pass below the receiver's real verdict
+            ["mx.google.com; dmarc=fail header.from=example.com",
+             "mx.google.com; dmarc=pass header.from=example.com"],
+            # a pass hidden in a comment
+            ["mx.google.com; dmarc=fail (dmarc=pass header.from=example.com)"
+             " header.from=example.com"],
+        ):
+            self.assertFalse(self.ok(results), results)
+
+    def test_parser_keeps_every_auth_header_in_order(self):
+        text = authed_text(1, auth=("first; dmarc=pass", "second"))
+        self.assertEqual(gmail_mcp.parse_message(text)["auth_results"],
+                         ["first; dmarc=pass", "second"])
+        self.assertEqual(gmail_mcp.parse_message(message_text())["auth_results"],
+                         [])
+
+    def test_auth_header_text_in_the_body_is_not_a_header(self):
+        text = message_text(body="Authentication-Results: mx.google.com; "
+                                 "dmarc=pass header.from=example.com")
+        self.assertEqual(gmail_mcp.parse_message(text)["auth_results"], [])
+
+
+class VerifiedSenderFlowTest(BridgeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ledger = {}
+        self.store = mock.Mock()
+        self.store.record.side_effect = lambda k, v: self.ledger.__setitem__(k, v)
+
+    def run_flow(self, hits, fetched):
+        self.connector.search = lambda a: search_text(hits)
+        self.connector.fetch = lambda mid: fetched[int(mid, 16)]
+        src = source(settle_minutes=0, verified_sender_domains=["example.com"],
+                     _processed=self.store)
+        with mock.patch.object(slack_mcp, "_already_done", return_value=False):
+            listing = gmail_mcp.candidates(src)
+        return listing, src
+
+    def test_valid_internal_sender_is_read(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1)})
+        thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertEqual([m["body"] for m in thread["messages"]], ["body 1"])
+
+    def test_spoofed_lookalike_and_subdomain_senders_are_never_fetched(self):
+        senders = {
+            1: '"Ann <ann@example.com>" <eve@evil.test>',
+            2: "Ann <ann@example.co>",
+            3: "Ann <ann@example-com.net>",
+            4: "Ann <ann@mail.example.com>",
+        }
+        hits = [{"mid": n, "thread": n, "epoch": T1 + n, "sender": s}
+                for n, s in senders.items()]
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            listing, _ = self.run_flow(hits, {})
+        self.assertEqual(list(listing), [])
+        self.assertEqual(self.connector.fetched(), [])
+        line = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertIn("skipped 4 message(s)", line)
+        self.assertNotIn("evil", line)
+
+    def test_missing_auth_headers_fail_closed(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        record = self.ledger[listing[0]["id"]]
+        self.assertEqual(record["gmail_mcp"], "unverified")
+
+    def test_spoofed_from_with_a_failing_verdict_fails_closed(self):
+        bad = "mx.google.com; spf=fail smtp.mailfrom=eve@evil.test; dmarc=fail header.from=example.com"
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, auth=(bad,))})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_only_verified_messages_of_a_thread_are_kept(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1},
+             {"mid": 2, "thread": 1, "epoch": T2}],
+            {1: authed_text(1, auth=()), 2: authed_text(2)})
+        thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
+
+    def test_unset_domains_keep_todays_behaviour(self):
+        self.connector.search = lambda a: search_text(
+            [{"mid": 1, "thread": 1, "epoch": T1, "sender": "eve@evil.test"}])
+        self.connector.fetch = lambda mid: message_text(epoch=T1 + 1)
+        src = source(settle_minutes=0)
+        listing = gmail_mcp.candidates(src)
+        self.assertEqual(len(gmail_mcp.fetch({"id": "r"}, listing[0], src)["messages"]), 1)
+
+
+class VerifiedSenderConfigTest(unittest.TestCase):
+    def problems(self, **over):
+        with tempfile.TemporaryDirectory() as tmp:
+            return config.validate(routine(tmp, **over))
+
+    def test_domain_lists(self):
+        self.assertEqual(self.problems(verified_sender_domains=["example.com"]), [])
+        self.assertEqual(self.problems(verified_sender_domains=["example.com"],
+                                       auth_servers=["mx.example.net"]), [])
+        for bad in ([], "example.com", ["Example.com"], ["@example.com"],
+                    ["example"], [""], [None]):
+            self.assertTrue(self.problems(verified_sender_domains=bad), bad)
+        self.assertTrue(self.problems(auth_servers=["mx.google.com"]))

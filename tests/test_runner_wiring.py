@@ -92,6 +92,20 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertIn("label:EMEA", self.applied)
         self.assertEqual(self.ledger()["m1"]["gmail_label_applied"], "EMEA")
 
+    def test_unverified_sender_is_skipped_not_an_error(self):
+        from workspace_daemon import gmail_mcp
+
+        def unverified(routine, source, candidate):
+            raise gmail_mcp.SenderUnverified("no message from a verified sender")
+
+        listing = runner.SOURCES["gmail"][0]
+        with mock.patch.dict(runner.SOURCES, {"gmail": (listing, unverified)}):
+            totals = runner.run(self.base, [routine(self.vault, label="EMEA")])
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["skipped"], 1)
+        self.assertEqual(totals["processed"], 0)
+        self.assertEqual(self.applied, [])
+
     def test_streams_label_routine_runs_clean(self):
         streams = {"Weekly Report DACH": {"title": "Weekly - DACH", "label": "EMEA"}}
         r = routine(self.vault, streams=streams)

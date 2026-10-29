@@ -2461,6 +2461,11 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 totals["skipped"] += 1
                 log(f"routine={rid} held id={candidate['id']}: {exc}")
                 continue
+            if isinstance(exc, gmail_mcp.SenderUnverified):
+                # Recorded as done; external mail is skipped, not an error.
+                totals["skipped"] += 1
+                log(f"routine={rid} skipped id={candidate['id']}: {exc}")
+                continue
             totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):

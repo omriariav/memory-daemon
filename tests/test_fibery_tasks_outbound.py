@@ -134,6 +134,14 @@ class SelectionTest(OutboundBase):
                fto.select_candidates(entries, self.cfg, exported={"good"})]
         self.assertEqual(ids, ["mila-ok"])
 
+    def test_email_todos_need_an_explicit_opt_in(self):
+        write_entry(self.store, "mail", sources=["gmail:abc"])
+        entries = fto._load_memory_entries(self.store)
+        self.assertEqual(fto.select_candidates(entries, self.cfg), [])
+        cfg = dict(self.cfg, from_sources=["gmail:"])
+        self.assertEqual(
+            [e["id"] for e in fto.select_candidates(entries, cfg)], ["mail"])
+
     def test_cap_and_checkpoint(self):
         for n in range(7):
             write_entry(self.store, f"e{n}", date=f"2026-08-0{n + 1}")

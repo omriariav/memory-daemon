@@ -40,8 +40,9 @@ maintenance:
   owner_slug: example-owner
   # Only todos dated on or after this day (quoted so YAML keeps a string).
   outbound_since: "2026-01-01"
-  # Source id prefixes eligible for export.
-  from_sources: ["slack:", "mila:", "gmail:"]
+  # Source id prefixes eligible for export. "gmail:" is left out on purpose:
+  # email text can come from anyone.
+  from_sources: ["slack:", "mila:"]
   # Section the items are appended to (created once at the end if missing).
   inbox_heading: Inbox
   max_per_run: 5

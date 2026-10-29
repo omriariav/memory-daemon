@@ -878,8 +878,9 @@ Fibery document the inbound routine reads. Selection (all required): type
 `todo` and unresolved; `owner_slug` (required) among the entry's `people` and no
 `no-owner-action` tag (the sink only keeps a `todo` when the owner is
 affirmed); date on or after `outbound_since` (required, quoted `YYYY-MM-DD`); a
-source id starting with one of `from_sources` (default `slack:`, `mila:`,
-`gmail:`). Never selected: entries with any `fibery:` source id, tags
+source id starting with one of `from_sources` (default `slack:`, `mila:`;
+email is left out because anyone can send it, list `gmail:` to opt in). Never
+selected: entries with any `fibery:` source id, tags
 `exclude_tags` (default `personal`, `no-fibery`, `no-owner-action`; every
 `memory.personal_tag` configured on any routine is excluded too), or entries
 already in the checkpoint.
@@ -2237,7 +2238,25 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 (3), `overlap` (1h), `bootstrap` (2d), `settle_minutes` (10),
 `calls_per_session` (15, max 20), `min_seconds_between_sessions` (3),
 `read_thread` (true), `exclude_self_only` (false; needs `owner_email`),
-`estimate_analyze_usd` (0.12).
+`estimate_analyze_usd` (0.12), `verified_sender_domains` (unset),
+`auth_servers` (`[mx.google.com]`; needs `verified_sender_domains`).
+
+**Verified senders only.** Mail text is untrusted, and anyone can write it. With
+`verified_sender_domains` set, only mail from those exact domains is read:
+
+- Listing drops every message whose `From` is not one plain address in a listed
+  domain. The match is exact: a subdomain or lookalike does not match, and the
+  display name is ignored.
+- `fetch()` then requires the topmost `Authentication-Results` header, stamped
+  by one of `auth_servers`. It must show `dmarc=pass` with `header.from` equal
+  to the domain, or `dkim=pass` signed by the domain plus `spf=pass` for it.
+  The receiving server writes its header above any header a sender added, so
+  lower headers never count.
+- A message that is missing the header or fails the check is dropped.
+- A thread with no verified message is recorded as `unverified` and never
+  captured. Logs carry counts and message ids only.
+- This fails closed. A connector whose `fetch_message` does not return
+  `Authentication-Results` therefore yields no captures at all.
 
 How a run works:
 
