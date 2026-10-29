@@ -143,11 +143,14 @@ def source_people(event):
         if not email or email in seen:
             continue
         seen.add(email)
-        people.append({
+        row = {
             "email": email,
             "name": str(person.get("display_name") or ""),
             "role": role,
-        })
+        }
+        if person.get("response_status"):
+            row["rsvp"] = str(person["response_status"])
+        people.append(row)
     return people
 
 

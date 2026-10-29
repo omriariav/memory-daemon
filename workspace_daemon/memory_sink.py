@@ -1111,12 +1111,14 @@ def capture(routine, item, summary, dry_run=False):
     # attendee who goes by it. Such a slug is attested by the invitation, so
     # it is allowed like a verified source participant. This runs on the raw
     # model names, before the directory-wide resolver, and only with a safe
-    # owner identity.
+    # owner identity. An invitee who declined was not in the room, so they
+    # neither match nor make a shared first name ambiguous.
     raw_people = list(entry.get("people") or [])
     attendees = [
         row for row in meta.get("source_people") or []
         if isinstance(row, dict)
         and str(row.get("role") or "").startswith("calendar-")
+        and row.get("rsvp") != "declined"
     ]
     matched = {}
     pending = [p for p in raw_people if p not in allowed]
