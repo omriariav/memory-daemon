@@ -14,7 +14,7 @@ from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
-from . import gmail_mcp, slack_mcp
+from . import gmail_mcp, slack_mcp, zoom_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -248,6 +248,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     llm.configure(base_dir)
     slack_mcp.configure(base_dir)
     gmail_mcp.configure(base_dir)
+    zoom_source.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)
@@ -1396,6 +1397,7 @@ SOURCES = {
                   _gmail_mcp_fetch(routine, source, candidate)),
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
+    "zoom": (zoom_source.candidates, zoom_source.fetch),
 }
 
 # Transcript connectors share one protocol beyond enumeration: a Calendar
@@ -1421,6 +1423,8 @@ def _scope(source):
         return "recently active Slack conversations"
     if source.get("kind") == "mila":
         return source.get("recordings_file") or "Mila recordings"
+    if source.get("kind") == "zoom":
+        return "Zoom meeting summaries"
     if source.get("kind") == "whisper":
         return source.get("transcriptions_dir") or "Whisper transcripts"
     slack_channels = [
@@ -1463,6 +1467,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "gchat": 50,
     "mila": 0,
     "whisper": 0,
+    "zoom": 0,
 }
 
 
@@ -1616,7 +1621,7 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
-    if source.get("kind") in ("slack_mcp", "gmail_mcp"):
+    if source.get("kind") in ("slack_mcp", "gmail_mcp", "zoom"):
         return None  # the source reports watermarks, not a hold
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
@@ -1758,6 +1763,12 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             # Listing skips threads the ledger already holds, so the cap and
             # settle window apply to new work only.
             listing_source = dict(listing_source, _processed=processed)
+        if kind == "zoom":
+            # The ledger settles a meeting; the store links transcripts.
+            listing_source = dict(
+                listing_source, _processed=processed,
+                _memory_store=memory_sink.memory_cfg(routine).get("store"),
+            )
         if kind == "slack" and source.get("include_mentions"):
             # Mentions are workspace-wide. Exclude every explicitly owned
             # channel, including channels owned by another routine whose digest

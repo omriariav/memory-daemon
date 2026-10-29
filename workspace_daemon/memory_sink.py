@@ -52,6 +52,7 @@ AUTO_TAG = "auto-captured"
 # flows must treat entries carrying it as FYI, never as "waiting on me".
 NO_OWNER_ACTION_TAG = "no-owner-action"
 SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+SOURCE_FOLLOWS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,200}")
 MAX_SOURCE_PEOPLE = 20
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -1191,6 +1192,14 @@ def capture(routine, item, summary, dry_run=False):
         follows = [value for value in model_follows if value in related_ids]
         dropped_follows = [
             value for value in model_follows if value not in related_ids
+        ]
+        # A source can name entries it knows this one follows (a Zoom summary
+        # of a meeting that also has a transcript entry). Those come from the
+        # daemon's own receipts, never from a model.
+        follows += [
+            value for value in meta.get("follows_entry_ids") or []
+            if isinstance(value, str) and SOURCE_FOLLOWS_RE.fullmatch(value)
+            and value not in follows
         ]
         if dropped_follows:
             log(

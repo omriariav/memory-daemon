@@ -1489,6 +1489,36 @@ memory:
   summary, so an action is kept only when an owner name shares its sentence or
   bullet. `--dry-run` calls the model and reports the count but writes nothing.
 
+### Zoom meeting summaries
+
+`source.kind: zoom` captures Zoom AI Companion meeting summaries that the host
+shared with you. Zoom search misses meetings created from a calendar, so
+discovery reads the `calendar_cache` routine's JSON twin instead
+(`calendar_file`). Every event whose join link is on a `conference_hosts` host
+and carries a meeting number is remembered in `state/zoom-meetings.json`
+(declined events are skipped; personal `/my/` links carry no number).
+
+After a meeting ends, one bridge session per run calls the read-only
+`assets_tool` (`mcp__<server>__get_meeting_assets`) for each due meeting. A
+summary appears some unknown time later, so each meeting is checked
+`first_check_minutes` after its end, then with a doubling back-off capped at
+`max_interval_minutes`, and dropped after `retry_hours`. A meeting is captured
+only when its assets carry a summary with `has_permission` and `has_summary`,
+and their start time is within `match_tolerance_minutes` of the calendar event
+(a recurring meeting number can answer for another occurrence). The recording
+is never read.
+
+The memory source id is `zoom:<meeting uuid>`; the candidate id adds a hash of
+the summary, so a changed summary updates the same entry. Calendar organizer and
+attendees become `source_people`, resolved to existing person slugs like a
+transcript's. Captures go to `state/events.jsonl` with source `zoom`.
+
+When a transcript routine (`mila`, `whisper`) captured the same calendar event,
+both entries are kept. The Zoom entry follows the transcript entry: through
+`--follows` when the transcript was captured first, or `memory link` on a later
+run when it arrives afterwards (`link_transcripts: false` turns this off). See
+`routines/_example-zoom-to-memory.yaml`.
+
 ### Whisper pipeline transcriptions
 
 `source.kind: whisper` ingests finished transcripts from the local

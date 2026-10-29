@@ -17,7 +17,7 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {
     "gmail", "gmail_mcp", "drive_docs", "slack", "slack_mcp", "gchat", "mila",
-    "whisper",
+    "whisper", "zoom",
 }
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
@@ -1939,6 +1939,46 @@ def _validate_gmail_mcp(prefix, source):
     return problems
 
 
+def _validate_zoom(prefix, source):
+    """Zoom summaries: one read-only assets tool, a calendar file, bounds."""
+    from . import zoom_source
+    problems = []
+    if not _exact_tool(source.get("assets_tool"), zoom_source.ASSETS_TOOL_NAME):
+        problems.append(
+            f"{prefix}.assets_tool must be the exact read-only MCP tool "
+            f"mcp__<server>__{zoom_source.ASSETS_TOOL_NAME}"
+        )
+    if not _non_empty_str(source.get("calendar_file")):
+        problems.append(
+            f"{prefix}.calendar_file is required (the calendar_cache JSON)"
+        )
+    for key, lower, upper in (
+        ("first_check_minutes", 1, 720), ("max_interval_minutes", 5, 1440),
+        ("retry_hours", 1, 168), ("max_checks_per_run", 1, 20),
+        ("max_summary_chars", 1000, 200000),
+        ("match_tolerance_minutes", 0, 720), ("stale_calendar_hours", 1, 168),
+    ):
+        if key in source and not _bounded_int(source[key], lower, upper):
+            problems.append(
+                f"{prefix}.{key} must be an integer from {lower} to {upper}"
+            )
+    hosts = source.get("conference_hosts")
+    if hosts is not None and (
+        not isinstance(hosts, list) or not hosts
+        or not all(_non_empty_str(h) for h in hosts)
+    ):
+        problems.append(f"{prefix}.conference_hosts must be a list of hosts")
+    for key in ("skip_declined", "link_transcripts"):
+        if key in source and not isinstance(source[key], bool):
+            problems.append(f"{prefix}.{key} must be true or false")
+    if "model" in source and not _non_empty_str(source["model"]):
+        problems.append(f"{prefix}.model must be a non-empty string")
+    for key in ("query", "max_results"):
+        if key in source:
+            problems.append(f"{prefix}.{key} is not supported by zoom")
+    return problems
+
+
 def _validate_schedule(routine):
     """Validate the cadence shared by capture and maintenance routines."""
     problems = []
@@ -2104,8 +2144,10 @@ def _validate_mila_match(source, prefix):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    from . import gmail_mcp, slack_mcp
+    from . import gmail_mcp, slack_mcp, zoom_source
     allowed = SOURCE_KEYS | (
+        zoom_source.SOURCE_KEYS if source.get("kind") == "zoom" else set()
+    ) | (
         slack_mcp.SOURCE_KEYS if source.get("kind") == "slack_mcp" else set()
     ) | (
         gmail_mcp.SOURCE_KEYS if source.get("kind") == "gmail_mcp" else set()
@@ -2416,6 +2458,8 @@ def _validate_source(routine, source, prefix):
         problems.extend(_validate_slack_mcp(prefix, source))
     if kind == "gmail_mcp":
         problems.extend(_validate_gmail_mcp(prefix, source))
+    if kind == "zoom":
+        problems.extend(_validate_zoom(prefix, source))
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)
