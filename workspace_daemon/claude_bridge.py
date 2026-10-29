@@ -314,6 +314,47 @@ def spent_today(base_dir, routine=None, tz=None, now=None):
     return total
 
 
+def hold_reason(budget, entries, routine=None, routine_cap=None, now=None,
+                include_global=True):
+    """Why new work should not start, as (kind, text), or None.
+
+    The pure core of budget_exhausted. `budget` is load_budget's (cap, tz) or
+    the BridgeError it raised; `entries` is recent_usage's list, its
+    BridgeError, or a callable returning the list (read only when a cap needs
+    it). kind is "global", "routine" or "unreadable". Fails closed like
+    budget_exhausted.
+    """
+    if not include_global and routine_cap is None:
+        return None
+    now = time.time() if now is None else now
+    if isinstance(budget, BridgeError):
+        if include_global:
+            return "unreadable", str(budget)
+        cap, tz = None, None
+    else:
+        cap, tz = budget
+    need_global = include_global and cap is not None
+    need_routine = routine_cap is not None and routine is not None
+    if not (need_global or need_routine):
+        return None
+    if callable(entries):
+        try:
+            entries = entries()
+        except BridgeError as exc:
+            entries = exc
+    if isinstance(entries, BridgeError):
+        return "unreadable", str(entries)
+    day_start = day_start_epoch(now, tz)
+    today = [entry for epoch, entry in entries if epoch >= day_start]
+    if need_global and sum(entry_cost(entry) for entry in today) >= cap:
+        return "global", f"global cap ${cap:g} reached"
+    if need_routine and sum(
+        entry_cost(entry) for entry in today if entry.get("routine") == routine
+    ) >= routine_cap:
+        return "routine", f"routine cap ${routine_cap:g} reached"
+    return None
+
+
 def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
                      include_global=True):
     """Why new work should not start now, or None.
@@ -325,21 +366,14 @@ def budget_exhausted(base_dir, routine=None, routine_cap=None, now=None,
     if not include_global and routine_cap is None:
         return None
     try:
-        try:
-            cap, tz = load_budget(base_dir)
-        except BridgeError:
-            if include_global:
-                raise
-            cap, tz = None, None
-        if include_global and cap is not None \
-                and spent_today(base_dir, None, tz, now) >= cap:
-            return f"global cap ${cap:g} reached"
-        if routine_cap is not None and routine is not None \
-                and spent_today(base_dir, routine, tz, now) >= routine_cap:
-            return f"routine cap ${routine_cap:g} reached"
+        budget = load_budget(base_dir)
     except BridgeError as exc:
-        return str(exc)
-    return None
+        budget = exc
+    reason = hold_reason(
+        budget, lambda: recent_usage(base_dir, now=now), routine, routine_cap,
+        now=now, include_global=include_global,
+    )
+    return reason[1] if reason else None
 
 
 def _check_guards(base_dir):

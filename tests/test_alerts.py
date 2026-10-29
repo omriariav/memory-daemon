@@ -207,16 +207,64 @@ class AlertsTest(unittest.TestCase):
                                side_effect=RuntimeError("boom")):
             self.assertEqual(self.check(), [])
 
-    def test_failed_save_repeats_rather_than_loses_the_alert(self):
+    def test_failing_save_sends_nothing_until_it_works(self):
         self.cap(5)
         self.spend(6)
         with mock.patch.object(alerts.state, "write_atomic",
                                side_effect=OSError("disk full")):
             self.assertEqual(self.check(), [])
+            self.assertEqual(self.check(), [])
+        self.assertEqual(self.emitted(), [])
+        self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
+        self.assertEqual(self.check(), [])
         self.assertEqual(len(self.emitted()), 1)
+
+    def test_unconfirmed_send_is_retried(self):
+        self.cap(5)
+        self.spend(6)
+        real = alerts.state.write_atomic
+        calls = []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(alerts.state, "write_atomic",
+                               side_effect=second_fails):
+            self.assertEqual(self.check(), [])
         self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(self.check(), [])
         self.assertEqual(len(self.emitted()), 2)
+
+    def test_own_cap_hold_covered_by_cap_hit_stays_quiet_after_raise(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.cap(5)
+        self.spend(6)
+        self.assertEqual(self.check([capped]), ["budget-hit:2026-03-10"])
+        self.cap(20)
+        self.assertEqual(self.check([capped]), [])
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_own_cap_hold_before_cap_hit_is_not_repeated(self):
+        capped = dict(BRIDGED, budget={"daily_usd": 1})
+        self.cap(5)
+        self.spend(1.5)
+        self.assertEqual(self.check([capped]), ["hold:alpha:2026-03-10"])
+        self.spend(4, routine="beta")
+        self.assertEqual(self.check([capped]), ["budget-hit:2026-03-10"])
+        self.cap(20)
+        self.assertEqual(self.check([capped]), [])
+        hold = self.emitted()[0]
+        self.assertEqual(hold["details"]["cap_usd"], 1)
+
+    def test_same_second_ok_beats_error(self):
+        tool = ["mcp__srv_a__list"]
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool)
+        self.spend(0.01, ts="2026-03-10T18:00:00Z", tools=tool,
+                   outcome="error: mcp__srv_a__list failed")
+        self.assertEqual(self.check(), [])
 
     def test_unreadable_usage_log_alerts_with_held_routines(self):
         self.cap(10)
@@ -262,7 +310,7 @@ class AlertsTest(unittest.TestCase):
         self.spend(6)
         with mock.patch.object(alerts.events, "emit", return_value=False):
             self.assertEqual(self.check(), [])
-        self.assertFalse((self.base / "state" / "alerts.json").exists())
+        self.assertEqual(self.emitted(), [])
         self.assertEqual(self.check(), ["budget-hit:2026-03-10"])
         self.assertEqual(len(self.emitted()), 1)
         self.assertEqual(self.check(), [])

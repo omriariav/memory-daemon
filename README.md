@@ -1731,9 +1731,10 @@ only after it clears.
 
 Who is held comes from the same check the runner uses, and budget alerts
 carry spend by routine. Dedupe state is `state/alerts.json`, and
-`state/alerts.lock` stops two schedulers from alerting at once. An alert is
-recorded only after its event is written, so a failed append is retried on
-the next tick (a failed save can repeat one). A failed check is logged and
+`state/alerts.lock` stops two schedulers from alerting at once. A new alert is
+saved as pending before its event is written and marked sent after, so a
+failed append is retried on the next tick, a save that keeps failing sends
+nothing, and only a failure between the two saves can repeat one. A failed check is logged and
 never fails the tick. To have a notifier show them, enable
 source `daemon` in its filter.
 

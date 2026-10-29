@@ -53,56 +53,68 @@ def _spend_text(spent):
     ) or "no spend"
 
 
-def budget_conditions(base_dir, routines, entries, budget, now):
-    """Active budget conditions as {key: (message, details)}.
+def budget_conditions(routines, entries, budget, now):
+    """Active budget conditions as ({key: (message, details)}, quiet keys).
 
-    Who is held comes from claude_bridge.budget_exhausted, the same gate the
-    runner applies, so the alert cannot drift from what actually stops.
-    `entries` is the usage log (or a BridgeError reading it) and `budget` is
-    load_budget's (cap, tz) (or a BridgeError).
+    Who is held comes from claude_bridge.hold_reason, the gate the runner
+    applies, evaluated on the same snapshot of the budget file and usage log
+    as the spend figures. `entries` is the usage log (or a BridgeError
+    reading it) and `budget` is load_budget's (cap, tz) (or a BridgeError).
+    Quiet keys are active but already covered by the cap-hit alert: they
+    are recorded without being sent.
     """
-    found = {}
+    found, quiet = {}, set()
     held = {}
     for routine in routines:
         if not routine.get("enabled", True):
             continue
-        reason = claude_bridge.budget_exhausted(
-            base_dir, routine["id"], routine_cap=config.budget_cap(routine),
+        reason = claude_bridge.hold_reason(
+            budget, entries, routine["id"], config.budget_cap(routine),
             now=now, include_global=config.uses_claude_bridge(routine),
         )
         if reason:
             held[routine["id"]] = reason
-    by_global = sorted(rid for rid, why in held.items()
-                       if why.startswith("global cap"))
-    unknown = sorted(rid for rid, why in held.items()
-                     if not why.startswith(("global cap", "routine cap")))
+    unknown = sorted(rid for rid, (kind, _) in held.items()
+                     if kind == "unreadable")
     if unknown:
-        problems = sorted({held[rid] for rid in unknown})
-        key = ("budget-invalid" if any("budget.yaml" in p for p in problems)
-               else "usage-unreadable")
+        problems = sorted({held[rid][1] for rid in unknown})
+        key = ("budget-invalid" if isinstance(budget, Exception)
+               and str(budget) in problems else "usage-unreadable")
         found[key] = (
             f"Spend cannot be checked ({'; '.join(problems)}); "
             f"holding {', '.join(unknown)}",
             {"held": unknown},
         )
+    if isinstance(entries, Exception):
+        return found, quiet
     tz = None if isinstance(budget, Exception) else budget[1]
     day_start = claude_bridge.day_start_epoch(now, tz)
     day = datetime.datetime.fromtimestamp(day_start, tz).date().isoformat()
-    if isinstance(entries, Exception):
-        return found
     spent = status.spend_by_routine(entries, day_start)
-    for rid, why in sorted(held.items()):
-        if why.startswith("routine cap"):
-            found[f"hold:{rid}:{day}"] = (
-                f"{rid} held: {why} (${spent.get(rid, 0.0):.2f} today)",
-                {"routine": rid, "spent_usd": round(spent.get(rid, 0.0), 2)},
-            )
-    if isinstance(budget, Exception) or budget[0] is None:
-        return found
-    cap = budget[0]
+    cap = None if isinstance(budget, Exception) else budget[0]
     total = sum(spent.values())
+    hit = cap is not None and total >= cap
+    for routine in routines:
+        own = config.budget_cap(routine)
+        rid = routine["id"]
+        used = spent.get(rid, 0.0)
+        if not routine.get("enabled", True) or own is None or used < own:
+            continue
+        # Keyed on the routine's own cap, not on which cap the gate reports
+        # first, so a later global hit (or its lifting) cannot re-alert it.
+        key = f"hold:{rid}:{day}"
+        found[key] = (
+            f"{rid} held: its own cap ${own:g} reached (${used:.2f} today)",
+            {"routine": rid, "spent_usd": round(used, 2), "cap_usd": own},
+        )
+        if hit and held.get(rid, ("",))[0] == "global":
+            quiet.add(key)
+    if cap is None:
+        return found, quiet
     spend = {tag: round(value, 2) for tag, value in spent.items()}
-    if total >= cap:
+    if hit:
+        by_global = sorted(rid for rid, (kind, _) in held.items()
+                           if kind == "global")
         found[f"budget-hit:{day}"] = (
             f"Global Claude cap reached: ${total:.2f} of ${cap:g}; "
             f"holding {', '.join(by_global) or 'nothing'}. "
@@ -117,7 +129,7 @@ def budget_conditions(base_dir, routines, entries, budget, now):
             {"spent_usd": round(total, 2), "cap_usd": cap,
              "by_routine": spend},
         )
-    return found
+    return found, quiet
 
 
 def health_conditions(base_dir, routines, entries, now):
@@ -192,29 +204,38 @@ def _read(loader):
 def _check_locked(base_dir, routines, now, path):
     entries = _read(lambda: claude_bridge.recent_usage(base_dir, now=now))
     budget = _read(lambda: claude_bridge.load_budget(base_dir))
-    active = budget_conditions(base_dir, routines, entries, budget, now)
+    active, quiet = budget_conditions(routines, entries, budget, now)
     active.update(health_conditions(base_dir, routines, entries, now))
     seen = _load(path)
     stamp = datetime.datetime.fromtimestamp(
         now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # alerts.json maps key -> time first sent, or {"pending": time} while a
+    # send is unconfirmed. Pending keys are saved before sending, so a save
+    # that keeps failing sends nothing (no flood), and an unconfirmed send is
+    # retried rather than lost.
+    due = sorted(
+        key for key in active
+        if key not in quiet and (key not in seen or isinstance(seen[key], dict))
+    )
+    remembered = {
+        key: seen.get(key) or (stamp if key in quiet else {"pending": stamp})
+        for key in active
+    }
+    if remembered != seen:
+        _save(path, remembered)
     sent = []
-    for key in sorted(key for key in active if key not in seen):
+    for key in due:
         message, details = active[key]
-        # emit logs its own failure; an unsent key stays out of alerts.json
-        # so the next tick retries it.
+        if key not in seen:
+            log(f"alert {key}: {message}")
+        # emit logs its own failure; the key stays pending and is retried.
         if events.emit(base_dir, events.build(
             "daemon", "alert", None, f"daemon:{key}", message, [],
             ts=stamp, details={"key": key, **details},
         )):
-            log(f"alert {key}: {message}")
+            remembered[key] = remembered[key]["pending"]
             sent.append(key)
-    remembered = {
-        key: seen.get(key) or stamp for key in active
-        if key in seen or key in sent
-    }
-    if remembered != seen:
-        # Saved after delivery: a failed save can repeat an alert next tick,
-        # but never loses one.
+    if sent:
         _save(path, remembered)
     return sent
 
