@@ -1158,6 +1158,8 @@ nothing changes.
 memory:
   person_resolver: [/abs/path/to/resolver, --optional-arg]
   person_resolver_timeout: 5   # seconds, default 5
+  internal_domains: [example.com]  # optional: more owner domains for the
+                                   # meeting first-name match
 ```
 
 The executable receives `{"names": ["Ada", "kuba"]}` on stdin (the people
@@ -1165,10 +1167,12 @@ strings the model returned, deduped) and prints:
 
 ```json
 {"resolved": {"Ada": "ada-lovelace", "kuba": null},
- "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}}}
+ "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}},
+ "first_names": {"ada-lovelace": ["Ada", "Augusta"]},
+ "stale": true}
 ```
 
-Both keys are optional; `null` means "no match". Names are stripped and
+Only `resolved` is required; `null` means "no match". Names are stripped and
 empty or duplicate ones dropped before sending; the keys of `resolved` must
 equal the sent strings exactly. `facts` is keyed by the slug the resolver
 returns (accepted for any well-formed slug). See
@@ -1179,8 +1183,30 @@ environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`) and the executable's
 directory (symlinks resolved) as its working directory.
 
 - **Capture.** Each resolved slug replaces the model's string before the
-  existing known-slug check, so the hook can never mint an identity: a slug
-  the store has not seen is still dropped and tagged `people-unmapped`.
+  existing known-slug check: a slug the store has not seen is still dropped
+  and tagged `people-unmapped`. The one exception is the meeting first-name
+  path below, whose slugs are attested by the calendar invitation instead.
+- **Meeting first names.** A capture with calendar attendees (`mila`,
+  `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one
+  attendee who goes by it, never to anyone else in the directory. This runs on
+  the model's raw names, before the directory-wide lookup, which never
+  resolves a single-word name for these captures. It needs a safe owner
+  identity; without one nothing is added. An attendee's slug is, in order: an
+  exact-email directory-verified participant, else (only for emails in the
+  owner's domains) the resolver's answer for the email's local part (e.g.
+  `first.last`), then the display name. The owner's domains are
+  `memory.internal_domains` when set (only those), else the identity email's
+  domain, unless that is a public mail provider (then none). External
+  attendees are never sent to the resolver and get no slug, but still count
+  toward ambiguity. Several emails of one slug count once. Their first names
+  are the resolver's `first_names` (preferred names, nicknames) plus the first
+  word of the display name and of the email's local part, compared
+  case-insensitively with accents folded. A name shared by several attendees,
+  or by none, stays unresolved as before. The owner (by invitation email or resolved
+  slug) is never a match target, but still counts toward ambiguity. The matched slug is attested by the invitation (not by
+  the store), so it is kept like a verified participant.
+- **Stale data.** `"stale": true` (the resolver's data is past its refresh
+  date) still resolves; one warning is logged per run.
 - **Person briefs.** `facts[slug]` is added to the brief facts as generic
   `key: value` lines (strings only, trimmed).
 - **Failure.** A timeout, non-zero exit, invalid JSON or a non-slug value is
