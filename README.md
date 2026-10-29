@@ -2247,12 +2247,15 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 - Listing drops every message whose `From` is not one plain address in a listed
   domain. The match is exact: a subdomain or lookalike does not match, and the
   display name is ignored.
-- `fetch()` then requires the topmost `Authentication-Results` header, stamped
-  by one of `auth_servers`. It must show `dmarc=pass` with `header.from` equal
-  to the domain, or `dkim=pass` signed by the domain plus `spf=pass` for it.
-  The receiving server writes its header above any header a sender added, so
-  lower headers never count.
-- A message that is missing the header or fails the check is dropped.
+- `fetch()` then requires exactly one `Authentication-Results` header stamped
+  by one of `auth_servers`, and it must be the topmost header. It must show
+  `dmarc=pass` with `header.from` equal to the domain, or `dkim=pass` signed by
+  the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
+  Comments and quoted strings are removed before parsing, so text a sender
+  controls cannot form a clause.
+- A message that is missing the header or fails the check is dropped. In a
+  kept thread it counts as not read. Mail the owner sent never passes the
+  receiving server, so it has no such header and is dropped too.
 - A thread with no verified message is recorded as `unverified` and never
   captured. Logs carry counts and message ids only.
 - This fails closed. A connector whose `fetch_message` does not return

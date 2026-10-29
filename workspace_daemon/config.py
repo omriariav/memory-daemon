@@ -1931,7 +1931,7 @@ def _validate_gmail_mcp(prefix, source):
         problems.append(f"{prefix}.exclude_self_only requires owner_email")
     for key in ("verified_sender_domains", "auth_servers"):
         value = source.get(key)
-        if value is not None and not (
+        if key in source and not (
             isinstance(value, list) and value and all(
                 isinstance(d, str)
                 and re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", d)

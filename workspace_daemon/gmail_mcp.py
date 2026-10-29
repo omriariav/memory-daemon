@@ -30,7 +30,9 @@ or lookalike; the display name is ignored), and the topmost
 Authentication-Results header, stamped by one of `auth_servers`, must show
 dmarc=pass for that domain, or dkim=pass signed by it plus spf=pass for it.
 Missing or unreadable authentication fails closed: the message is skipped,
-never captured, and only counts and message ids are logged.
+never captured, and only counts and message ids are logged. Mail the owner
+sent never passes the receiving server, so it carries no such header and is
+skipped too. Skipped messages of a kept thread count as not read.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -372,7 +374,6 @@ _HEADER_KEYS = {
     "subject", "from", "to", "cc", "date", "thread id",
 }
 _AUTH_KEY = "authentication-results"
-_AUTH_COMMENT = re.compile(r"\([^()]*\)")
 _AUTH_RESULT = re.compile(r"\A(dkim|spf|dmarc)\s*=\s*([a-z]+)\b(.*)\Z", re.I | re.S)
 _AUTH_PROP = re.compile(r"([a-z]+\.[a-z-]+)\s*=\s*(\S+)", re.I)
 _DOC_START = re.compile(
@@ -697,43 +698,95 @@ def _address_domain(value):
     return value.rsplit("@", 1)[-1] if value else ""
 
 
-def sender_authenticated(results, domain, servers):
-    """True when the topmost Authentication-Results, stamped by a trusted
-    server, shows dmarc=pass for `domain`, or dkim=pass signed by `domain`
-    plus spf=pass for it. Anything missing or unreadable is False.
+def _auth_clauses(value):
+    """One Authentication-Results value split on top-level `;`, with comments
+    (nested) and quoted strings removed; None when they do not balance.
 
-    Only the topmost header counts: the receiving server adds its own above
-    any a sender wrote into the message.
+    Comments and quoted strings can carry sender-chosen text (an envelope
+    address in an SPF comment), so nothing inside them may form a clause.
+    """
+    clauses, buf, depth, quoted, escaped = [], [], 0, False, False
+    for ch in value:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and (quoted or depth):
+            escaped = True
+            continue
+        if quoted:
+            quoted = ch != '"'
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(" ")
+            continue
+        if ch == ")":
+            if not depth:
+                return None
+            depth -= 1
+            continue
+        if depth:
+            continue
+        if ch == '"':
+            quoted = True
+        elif ch == ";":
+            clauses.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if quoted or depth:
+        return None
+    clauses.append("".join(buf))
+    return clauses
+
+
+def _auth_server(clauses):
+    words = clauses[0].split() if clauses else []
+    return words[0].casefold() if words else ""
+
+
+def sender_authenticated(results, domain, servers):
+    """True when the one Authentication-Results stamped by a trusted server
+    is the topmost header and shows dmarc=pass for `domain`, or dkim=pass
+    signed by `domain` plus spf=pass for it. Anything missing, unreadable or
+    ambiguous is False, and any other DMARC verdict vetoes a pass.
+
+    The receiving server adds its header above any a sender wrote into the
+    message; a second header naming a trusted server is treated as forged.
     """
     if not results or not domain:
         return False
-    text = _AUTH_COMMENT.sub(" ", results[0])
-    server, _, rest = text.partition(";")
-    words = server.split()
-    if not words or words[0].casefold() not in servers:
+    parsed = [_auth_clauses(value) for value in results]
+    if any(clauses is None for clauses in parsed):
         return False
-    passed = {"dkim": False, "spf": False}
-    for clause in rest.split(";"):
+    trusted = [i for i, clauses in enumerate(parsed)
+               if _auth_server(clauses) in servers]
+    if trusted != [0]:
+        return False
+    verdicts = {"dmarc": False, "dkim": False, "spf": False}
+    for clause in parsed[0][1:]:
         match = _AUTH_RESULT.match(clause.strip())
-        if not match or match.group(2).casefold() != "pass":
+        if not match:
             continue
-        method = match.group(1).casefold()
+        method, result = match.group(1).casefold(), match.group(2).casefold()
         props = {
             k.casefold(): v.casefold()
             for k, v in _AUTH_PROP.findall(match.group(3))
         }
-        if method == "dmarc" and props.get("header.from") == domain:
-            return True
-        if method == "dkim" and (
-            props.get("header.d") == domain
-            or _address_domain(props.get("header.i")) == domain
-        ):
-            passed["dkim"] = True
-        if method == "spf" and _address_domain(
-            props.get("smtp.mailfrom")
-        ) == domain:
-            passed["spf"] = True
-    return passed["dkim"] and passed["spf"]
+        if method == "dmarc" and result != "pass":
+            return False
+        if result != "pass":
+            continue
+        if method == "dmarc":
+            verdicts["dmarc"] |= props.get("header.from") == domain
+        elif method == "dkim":
+            verdicts["dkim"] |= (
+                props.get("header.d") == domain
+                or _address_domain(props.get("header.i")) == domain
+            )
+        else:
+            verdicts["spf"] |= _address_domain(props.get("smtp.mailfrom")) == domain
+    return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
 
 
 def verified_sender(cfg, headers, auth_results):
@@ -910,12 +963,16 @@ def _group(cfg, hits):
     owner = (cfg.get("owner_email") or "").strip().casefold()
     domains = cfg.get("verified_sender_domains")
     if domains:
-        external = [h["id"] for h in hits
-                    if sender_domain(h["from"]) not in domains]
+        kept, external = [], set()
+        for hit in hits:
+            if sender_domain(hit["from"]) in domains:
+                kept.append(hit)
+            else:
+                external.add(hit["id"])
         if external:
             _log_skipped("from senders outside verified_sender_domains",
-                         sorted(set(external)))
-        hits = [h for h in hits if sender_domain(h["from"]) in domains]
+                         sorted(external))
+        hits = kept
     groups = {}
     for hit in hits:
         group = groups.setdefault(hit["thread"], {"messages": {}})
@@ -1253,11 +1310,15 @@ def fetch(routine, candidate, source=None):
     cfg = batch["cfg"]
     messages = outcome["messages"]
     if cfg["verified_sender_domains"]:
-        unverified = [m["id"] for m in messages if not verified_sender(
-            cfg, m["headers"], m.get("auth_results"))]
+        kept, unverified = [], []
+        for message in messages:
+            if verified_sender(cfg, message["headers"], message["auth_results"]):
+                kept.append(message)
+            else:
+                unverified.append(message["id"])
         if unverified:
             _log_skipped("without a verified sender", unverified)
-        messages = [m for m in messages if m["id"] not in unverified]
+        messages = kept
         if not messages:
             _mark_unreadable(routine, candidate, batch, "unverified sender",
                              status="unverified")
@@ -1272,7 +1333,7 @@ def fetch(routine, candidate, source=None):
     return {
         "thread_id": thread,
         "messages": out,
-        "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
+        "omitted": max(0, len(raw["message_ids"]) - len(out)),
     }
 
 

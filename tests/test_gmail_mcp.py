@@ -1451,6 +1451,24 @@ class VerifiedSenderTest(unittest.TestCase):
             # a pass hidden in a comment
             ["mx.google.com; dmarc=fail (dmarc=pass header.from=example.com)"
              " header.from=example.com"],
+            # a forged clause smuggled through a nested comment and quotes
+            ['mx.google.com; spf=neutral (google.com: domain of "x) ; '
+             'dmarc=pass header.from=example.com ; ("@evil.test is neutral) '
+             'smtp.mailfrom="x) ; dmarc=pass header.from=example.com ; ("'
+             '@evil.test; dmarc=fail header.from=example.com'],
+            ["mx.google.com; spf=pass (a (b) c; dmarc=pass "
+             "header.from=example.com) smtp.mailfrom=x@evil.test"],
+            # unbalanced comment or quote
+            ["mx.google.com; dmarc=pass header.from=example.com (open"],
+            ['mx.google.com; dmarc=pass header.from=example.com "open'],
+            # a pass then a fail: any other DMARC verdict vetoes
+            ["mx.google.com; dmarc=pass header.from=example.com; "
+             "dmarc=fail header.from=example.com"],
+            # a second header naming a trusted server is treated as forged
+            ["mx.google.com; dmarc=pass header.from=example.com",
+             "mx.google.com; dmarc=pass header.from=example.com"],
+            ["other.test; none",
+             "mx.google.com; dmarc=pass header.from=example.com"],
         ):
             self.assertFalse(self.ok(results), results)
 
@@ -1529,6 +1547,7 @@ class VerifiedSenderFlowTest(BridgeTestCase):
             {1: authed_text(1, auth=()), 2: authed_text(2)})
         thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
         self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
+        self.assertEqual(thread["omitted"], 1)  # the gap stays visible
 
     def test_unset_domains_keep_todays_behaviour(self):
         self.connector.search = lambda a: search_text(
@@ -1552,3 +1571,5 @@ class VerifiedSenderConfigTest(unittest.TestCase):
                     ["example"], [""], [None]):
             self.assertTrue(self.problems(verified_sender_domains=bad), bad)
         self.assertTrue(self.problems(auth_servers=["mx.google.com"]))
+        # an empty YAML key must not silently switch verification off
+        self.assertTrue(self.problems(verified_sender_domains=None))
