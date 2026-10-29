@@ -579,9 +579,11 @@ def _verified_source_people(item, rid, identity, provider=None):
     """Resolve exact Gmail/Chat participant emails for safe model attribution."""
     provider = provider or identity_providers.provider_for({})
     candidates = item.get("frontmatter", {}).get("source_people") or []
+    # A declined invitee did not attend, so they are not a participant.
     candidates = [
         candidate for candidate in candidates
         if isinstance(candidate, dict) and candidate.get("email")
+        and candidate.get("rsvp") != "declined"
     ]
     if not candidates:
         return [], []
