@@ -93,6 +93,19 @@ class FirstNameTest(Base):
             verified=[{"email": "gus.other@example.com", "slug": "gus-other"}])
         self.assertEqual(out, {})
 
+    def test_unknown_guest_with_the_same_first_name_makes_it_ambiguous(self):
+        out = self.matches(
+            ["Ada", "Gus"],
+            [attendee("ada.lovelace@example.com"),
+             attendee("guest@other.example", "Ada Guest"),
+             attendee("augusta.king@example.com")])
+        self.assertEqual(out, {"Gus": "augusta-king"})
+
+    def test_unknown_guest_alone_is_not_matched(self):
+        self.assertEqual(
+            self.matches(["Ada"], [attendee("guest@other.example", "Ada Guest")]),
+            {})
+
     def test_absent_first_name_is_never_guessed(self):
         self.assertEqual(
             self.matches(["Grace"], [attendee("ada.lovelace@example.com")]),

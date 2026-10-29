@@ -290,7 +290,9 @@ def first_name_map(routine, attendees, verified=()):
     people ({"email", "slug"}). An attendee's slug comes from the resolver
     (the email's local part, e.g. first.last, then the display name), else
     from `verified`. Its first names are the resolver's `first_names` plus
-    the first word of the display name and of the local part.
+    the first word of the display name and of the local part. An attendee
+    with no slug still counts, under a `?<email>` placeholder, so a first
+    name shared with an unknown guest stays ambiguous.
     """
     by_email = {
         str(p.get("email") or "").strip().casefold(): p.get("slug")
@@ -314,9 +316,7 @@ def first_name_map(routine, attendees, verified=()):
                 if hit and hit[1]:
                     slug = hit[1]
                     break
-        slug = slug or by_email.get(email)
-        if not slug:
-            continue
+        slug = slug or by_email.get(email) or f"?{email or name}"
         given = [name.split()[0] if name.split() else "",
                  re.split(r"[._+-]", local)[0] if local else ""]
         known = _first_memo.get((argv, slug)) if argv is not None else None
@@ -347,8 +347,10 @@ def first_name_matches(routine, names, attendees, verified=(), exclude=()):
         slugs = first.get(fold(name)) or set()
         if len(slugs) > 1:
             ambiguous += 1
-        elif len(slugs) == 1 and next(iter(slugs)) not in exclude:
-            matches[name] = next(iter(slugs))
+        elif len(slugs) == 1:
+            slug = next(iter(slugs))
+            if slug not in exclude and not slug.startswith("?"):
+                matches[name] = slug
     if ambiguous:
         log(f"person-resolver: {ambiguous} first name(s) shared by several "
             "attendees left unresolved")
