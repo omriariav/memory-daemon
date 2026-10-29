@@ -1298,6 +1298,11 @@ def _gmail_mcp_fetch(routine, source, candidate):
                 f"were not read.]\n\n{body}"
             )
             thread_truncated = True
+        if thread.get("withheld"):
+            body = (
+                f"[{thread['withheld']} message(s) of this thread were "
+                "withheld: the sender could not be verified.]\n\n" + body
+            )
         people_headers = [m["headers"] for m in reversed(thread_messages)]
     else:
         body = newest["body"]

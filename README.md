@@ -2253,9 +2253,14 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
   the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
   Comments and quoted strings are removed before parsing, so text a sender
   controls cannot form a clause.
+- An `Authentication-Results` line printed after the message's own headers
+  is treated as forged, because a decoded header value can contain a newline.
 - A message that is missing the header or fails the check is dropped. In a
-  kept thread it counts as not read. Mail the owner sent never passes the
-  receiving server, so it has no such header and is dropped too.
+  kept thread, a note says how many messages were withheld. The owner's own
+  mail never passes the receiving server, so it is dropped at listing.
+- Limits: a verified colleague's mail can still quote or forward outside
+  text. A thread recorded as `unverified` is not re-read after the domains or
+  the connector change.
 - A thread with no verified message is recorded as `unverified` and never
   captured. Logs carry counts and message ids only.
 - This fails closed. A connector whose `fetch_message` does not return

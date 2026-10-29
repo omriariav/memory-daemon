@@ -30,9 +30,10 @@ or lookalike; the display name is ignored), and the topmost
 Authentication-Results header, stamped by one of `auth_servers`, must show
 dmarc=pass for that domain, or dkim=pass signed by it plus spf=pass for it.
 Missing or unreadable authentication fails closed: the message is skipped,
-never captured, and only counts and message ids are logged. Mail the owner
-sent never passes the receiving server, so it carries no such header and is
-skipped too. Skipped messages of a kept thread count as not read.
+never captured, and only counts and message ids are logged. An
+Authentication-Results line printed below the message's own headers counts as
+forged. The owner's own mail never passes the receiving server, so it is
+dropped at listing; skipped messages of a kept thread are noted as withheld.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -375,6 +376,7 @@ _HEADER_KEYS = {
 }
 _AUTH_KEY = "authentication-results"
 _AUTH_RESULT = re.compile(r"\A(dkim|spf|dmarc)\s*=\s*([a-z]+)\b(.*)\Z", re.I | re.S)
+_NAME_THEN_ADDRESS = re.compile(r'[^<>@"]*<([^<>\s]+)>')
 _AUTH_PROP = re.compile(r"([a-z]+\.[a-z-]+)\s*=\s*(\S+)", re.I)
 _DOC_START = re.compile(
     r"^[ \t]*(?:<!doctype\s+html|<html[\s>])", re.I | re.M
@@ -616,7 +618,8 @@ def parse_message(text):
     for line in head.split("\n"):
         if line[:1] in (" ", "\t") and key is not None:
             if key == _AUTH_KEY:
-                auth[-1] += " " + line.strip()
+                if auth[-1] is not None:
+                    auth[-1] += " " + line.strip()
             elif key in fields:
                 fields[key] += " " + line.strip()
             continue
@@ -625,7 +628,10 @@ def parse_message(text):
             raise GmailMcpParseError("message result has an unknown shape")
         key = match.group(1).strip().lower()
         if key == _AUTH_KEY:
-            auth.append(match.group(2).strip())
+            # The receiving server's verdict sits above the message's own
+            # headers. One printed after them may be a decoded header value
+            # carrying a newline, so it poisons the verdict.
+            auth.append(None if fields else match.group(2).strip())
         elif key in _HEADER_KEYS:
             if key in fields:
                 raise GmailMcpParseError("message header repeated")
@@ -682,20 +688,26 @@ def sender_domain(value):
     with several addresses, or an address that is not local@domain, has none.
     """
     pairs = email.utils.getaddresses([value or ""])
-    if len(pairs) != 1:
-        return None
-    address = pairs[0][1].strip()
+    if len(pairs) == 1:
+        address = pairs[0][1].strip()
+    else:
+        # "Doe, John <john@example.com>": an unquoted comma in a plain display
+        # name. Accepted only when the name has no address, quote or bracket.
+        match = _NAME_THEN_ADDRESS.fullmatch((value or "").strip())
+        if not match:
+            return None
+        address = match.group(1)
+    return _domain_of(address)
+
+
+def _domain_of(address):
+    address = str(address or "").strip()
     if address.count("@") != 1 or any(c.isspace() for c in address):
         return None
     local, domain = address.split("@")
     if not local or not domain:
         return None
     return domain.casefold()
-
-
-def _address_domain(value):
-    value = str(value or "").strip().strip("<>").casefold()
-    return value.rsplit("@", 1)[-1] if value else ""
 
 
 def _auth_clauses(value):
@@ -754,7 +766,7 @@ def sender_authenticated(results, domain, servers):
     The receiving server adds its header above any a sender wrote into the
     message; a second header naming a trusted server is treated as forged.
     """
-    if not results or not domain:
+    if not results or not domain or None in results:
         return False
     parsed = [_auth_clauses(value) for value in results]
     if any(clauses is None for clauses in parsed):
@@ -782,10 +794,10 @@ def sender_authenticated(results, domain, servers):
         elif method == "dkim":
             verdicts["dkim"] |= (
                 props.get("header.d") == domain
-                or _address_domain(props.get("header.i")) == domain
+                or _domain_of(props.get("header.i")) == domain
             )
         else:
-            verdicts["spf"] |= _address_domain(props.get("smtp.mailfrom")) == domain
+            verdicts["spf"] |= _domain_of(props.get("smtp.mailfrom")) == domain
     return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
 
 
@@ -795,6 +807,14 @@ def verified_sender(cfg, headers, auth_results):
     return domain in cfg["verified_sender_domains"] and sender_authenticated(
         auth_results, domain, cfg["auth_servers"]
     )
+
+
+def _partition(items, keep):
+    """(kept items, ids of the rest) in order."""
+    kept, dropped = [], []
+    for item in items:
+        (kept if keep(item) else dropped).append(item)
+    return kept, [item["id"] for item in dropped]
 
 
 def _log_skipped(what, ids):
@@ -963,16 +983,14 @@ def _group(cfg, hits):
     owner = (cfg.get("owner_email") or "").strip().casefold()
     domains = cfg.get("verified_sender_domains")
     if domains:
-        kept, external = [], set()
-        for hit in hits:
-            if sender_domain(hit["from"]) in domains:
-                kept.append(hit)
-            else:
-                external.add(hit["id"])
+        # The owner's own mail never carries the receiving server's verdict,
+        # so it would only cost a read and fail at fetch.
+        hits, external = _partition(hits, lambda h: (
+            sender_domain(h["from"]) in domains and _address(h["from"]) != owner
+        ))
         if external:
             _log_skipped("from senders outside verified_sender_domains",
-                         sorted(external))
-        hits = kept
+                         sorted(set(external)))
     groups = {}
     for hit in hits:
         group = groups.setdefault(hit["thread"], {"messages": {}})
@@ -1192,8 +1210,9 @@ def _clear_attempts(candidate_id):
         _save_attempts(data)
 
 
-def _mark_unreadable(routine, candidate, batch, reason, status="unreadable"):
-    """Terminal ledger entry so one bad thread cannot block the cursor."""
+def _mark_terminal(routine, candidate, batch, reason, status="unreadable"):
+    """Terminal ledger entry (unreadable or unverified) so one thread that
+    will never be captured cannot block the cursor."""
     store = batch.get("processed")
     if store is not None:
         store.record(candidate["id"], {
@@ -1292,35 +1311,31 @@ def fetch(routine, candidate, source=None):
                 and _bump_attempts(candidate["id"], "lone")
                 >= MAX_LONE_FAILURES
             ):
-                _mark_unreadable(routine, candidate, batch, "read failed")
+                _mark_terminal(routine, candidate, batch, "read failed")
                 raise GmailMcpError(
                     "thread unreadable after repeated failures"
                 ) from None
             raise
     outcome = batch["threads"][thread]
     if outcome["status"] == "invalid":
-        _mark_unreadable(routine, candidate, batch, "unparseable")
+        _mark_terminal(routine, candidate, batch, "unparseable")
         raise GmailMcpError("message result was unusable; recorded as unreadable")
     if outcome["status"] == "missing":
         if _bump_attempts(candidate["id"]) >= MAX_READ_ATTEMPTS:
-            _mark_unreadable(routine, candidate, batch, "read failed")
+            _mark_terminal(routine, candidate, batch, "read failed")
             raise GmailMcpError("thread unreadable after repeated failures")
         raise GmailMcpError("message read returned no result")
     _clear_attempts(candidate["id"])
     cfg = batch["cfg"]
     messages = outcome["messages"]
+    unverified = []
     if cfg["verified_sender_domains"]:
-        kept, unverified = [], []
-        for message in messages:
-            if verified_sender(cfg, message["headers"], message["auth_results"]):
-                kept.append(message)
-            else:
-                unverified.append(message["id"])
+        messages, unverified = _partition(messages, lambda m: verified_sender(
+            cfg, m["headers"], m["auth_results"]))
         if unverified:
             _log_skipped("without a verified sender", unverified)
-        messages = kept
         if not messages:
-            _mark_unreadable(routine, candidate, batch, "unverified sender",
+            _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")
             raise SenderUnverified("no message from a verified sender")
     out = []
@@ -1333,7 +1348,8 @@ def fetch(routine, candidate, source=None):
     return {
         "thread_id": thread,
         "messages": out,
-        "omitted": max(0, len(raw["message_ids"]) - len(out)),
+        "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
+        "withheld": len(unverified),
     }
 
 
