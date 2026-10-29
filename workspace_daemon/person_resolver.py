@@ -99,10 +99,10 @@ def validate(memory_cfg, rid):
     if domains is not None and (
         not isinstance(domains, list)
         or any(not isinstance(d, str) or not d.strip() or "@" in d
-               or d != d.strip().casefold() for d in domains)
+               for d in domains)
     ):
         problems.append(
-            f"{rid}: memory.internal_domains must be a list of lowercase "
+            f"{rid}: memory.internal_domains must be a list of "
             "domains (no @)")
     if "person_resolver" not in memory_cfg:
         return problems
@@ -268,7 +268,7 @@ def canonicalize(routine, people, keep_single=False, keep=()):
 
     def skip(p):
         return not isinstance(p, str) or p in keep or (
-            keep_single and " " not in fold(p))
+            keep_single and len(p.split()) == 1 and " " not in fold(p))
 
     argv = _query(routine, _norm([p for p in people if not skip(p)]))
     if argv is None:
@@ -316,7 +316,8 @@ def _domain(email):
     return email.rsplit("@", 1)[1] if "@" in email else ""
 
 
-def first_name_map(routine, attendees, verified=(), internal=()):
+def first_name_map(routine, attendees, verified=(), internal=(),
+                   owner_email=""):
     """{folded first name: {slug, ...}} for a meeting's attendees.
 
     `attendees` are {"email", "name"} rows; `verified` are directory-verified
@@ -328,8 +329,10 @@ def first_name_map(routine, attendees, verified=(), internal=()):
     Its first names are the resolver's `first_names` plus the first word of
     the display name and of the local part. An attendee with no slug still
     counts, under a `?<email>` placeholder, so a first name it shares stays
-    ambiguous. Several emails of one slug count once.
+    ambiguous. Several emails of one slug count once. The `owner_email` row
+    is kept as a `?owner` placeholder: it counts toward ambiguity.
     """
+    owner_email = str(owner_email or "").strip().casefold()
     internal = {str(d).strip().casefold() for d in internal}
     by_email = {
         str(p.get("email") or "").strip().casefold(): p.get("slug")
@@ -344,14 +347,15 @@ def first_name_map(routine, attendees, verified=(), internal=()):
         rows.append((email, _local_part(email), name))
 
     def lookup(email):
-        return (not by_email.get(email)) and _domain(email) in internal
+        return email != owner_email and (not by_email.get(email)) and _domain(email) in internal
 
     argv = _query(routine, _norm(
         [key for email, local, name in rows if lookup(email)
          for key in (local, name)]))
     found = {}
     for email, local, name in rows:
-        slug = by_email.get(email)
+        slug = "?owner" if owner_email and email == owner_email \
+            else by_email.get(email)
         if not slug and argv is not None and lookup(email):
             for key in (local, name):
                 hit = _memo.get((argv, key.strip())) if key.strip() else None
@@ -371,7 +375,7 @@ def first_name_map(routine, attendees, verified=(), internal=()):
 
 
 def first_name_matches(routine, names, attendees, verified=(), exclude=(),
-                       internal=()):
+                       internal=(), owner_email=""):
     """{name: slug} for the bare first names in `names` that exactly one
     attendee goes by.
 
@@ -385,7 +389,8 @@ def first_name_matches(routine, names, attendees, verified=(), exclude=(),
     ]
     if not attendees or not bare:
         return {}
-    first = first_name_map(routine, attendees, verified, internal)
+    first = first_name_map(routine, attendees, verified, internal,
+                           owner_email)
     matches, ambiguous = {}, 0
     for name in bare:
         slugs = first.get(fold(name)) or set()

@@ -836,6 +836,24 @@ def _saved_fallback_summary(item):
     )
 
 
+PUBLIC_MAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "icloud.com", "me.com", "proton.me", "protonmail.com",
+})
+
+
+def _owner_domains(cfg, own_email):
+    """Email domains counted as the owner's: memory.internal_domains when set
+    (only those), else the identity email's domain unless it is a public
+    mail provider."""
+    configured = {str(d).strip().casefold()
+                  for d in cfg.get("internal_domains") or [] if str(d).strip()}
+    if configured:
+        return configured
+    domain = own_email.rsplit("@", 1)[-1] if "@" in own_email else ""
+    return set() if domain in PUBLIC_MAIL_DOMAINS or not domain else {domain}
+
+
 def capture(routine, item, summary, dry_run=False):
     """Distill `summary` into one memory entry and store it via the CLI.
 
@@ -1104,18 +1122,12 @@ def capture(routine, item, summary, dry_run=False):
     pending = [p for p in raw_people if p not in allowed]
     if attendees and pending and identity.get("safe"):
         own_email = str(identity.get("email") or "").strip().casefold()
-        attendees = [
-            row for row in attendees
-            if str(row.get("email") or "").strip().casefold() != own_email
-        ]
-        domains = {own_email.rsplit("@", 1)[-1]} if "@" in own_email else set()
-        domains |= {str(d).strip().casefold()
-                    for d in cfg.get("internal_domains") or []}
+        domains = _owner_domains(cfg, own_email)
         owner_slug = (identity.get("person") or {}).get("slug")
         matched = person_resolver.first_name_matches(
             routine, pending, attendees, verified_source,
             exclude={owner_slug} if owner_slug else set(),
-            internal=domains)
+            internal=domains, owner_email=own_email)
         if matched:
             log(f"routine={rid} memory: matched {len(matched)} first name(s) "
                 "to meeting attendees")

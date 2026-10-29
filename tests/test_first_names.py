@@ -203,15 +203,60 @@ class FirstNameTest(Base):
                          ["Ada"])
 
 
+class KeepSingleTest(Base):
+    def sent(self):
+        path = self.tmp / "calls.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_two_word_hebrew_name_reaches_the_resolver(self):
+        person_resolver.canonicalize(
+            self.routine(), ["דנה לוי"], keep_single=True)
+        self.assertTrue(self.sent())
+
+    def test_one_word_hebrew_name_does_not(self):
+        person_resolver.canonicalize(
+            self.routine(), ["דנה"], keep_single=True)
+        self.assertEqual(self.sent(), "")
+
+    def test_slug_style_name_still_reaches_the_resolver(self):
+        person_resolver.canonicalize(
+            self.routine(), ["ada-lovelace"], keep_single=True)
+        self.assertTrue(self.sent())
+
+
+class InternalDomainsValidationTest(unittest.TestCase):
+    def problems(self, value):
+        routine = {"id": "r", "memory": {"store": "/s",
+                                         "internal_domains": value}}
+        return [p for p in memory_sink.validate(routine)
+                if "internal_domains" in p]
+
+    def test_bad_shapes_are_rejected(self):
+        for bad in ("example.com", [1], ["a@example.com"], [""], {"a": 1}):
+            self.assertTrue(self.problems(bad), bad)
+
+    def test_uppercase_is_accepted_and_normalised_at_use(self):
+        self.assertEqual(self.problems(["Example.COM"]), [])
+        self.assertEqual(
+            memory_sink._owner_domains({"internal_domains": ["Example.COM"]},
+                                       "me@other.example"), {"example.com"})
+
+    def test_owner_domains_defaults(self):
+        self.assertEqual(memory_sink._owner_domains({}, "me@example.com"),
+                         {"example.com"})
+        self.assertEqual(memory_sink._owner_domains({}, "me@gmail.com"), set())
+
+
 class CaptureTest(Base):
     def setUp(self):
         super().setUp()
         self.addCleanup(identity._providers.clear)
 
-    def capture(self, people, source_people, safe=True):
+    def capture(self, people, source_people, safe=True, extra=None,
+                owner_email="me.owner@example.com"):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
-                                  "extract": True})
+                                  "extract": True, **(extra or {})})
         memory_sink._slug_cache.clear()
         memory_sink._slug_cache["/store"] = {"jane-doe"}
         item = {"id": "zoom:U@1", "source_id": "zoom:U", "title": "t",
@@ -225,8 +270,8 @@ class CaptureTest(Base):
             seen["args"] = args
             return mock.Mock(returncode=0, stdout="✓ created e\n", stderr="")
 
-        ident = {"email": "me.owner@example.com", "safe": safe,
-                 "person": {"email": "me.owner@example.com", "name": "Me Owner",
+        ident = {"email": owner_email, "safe": safe,
+                 "person": {"email": owner_email, "name": "Me Owner",
                             "slug": "memory-owner"}}
         with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
                 mock.patch.object(memory_sink, "_extract",
@@ -258,14 +303,55 @@ class CaptureTest(Base):
             safe=False)
         self.assertNotIn("ada-lovelace", people or "")
 
-    def test_owner_is_excluded_by_email_when_resolver_gives_another_slug(self):
-        # The owner's invitation row maps to a different slug in the
-        # directory (here an alias of Ada); it must still be dropped.
+    def test_owner_sharing_a_first_name_makes_it_ambiguous(self):
+        # The owner's row maps to a different slug in the directory; it still
+        # counts, so "Ada" is not handed to the other Ada.
         people = self.capture(
             ["Ada", "jane-doe"],
             [attendee("ME.OWNER@example.com", "Ada Owner"),
              attendee("ada.lovelace@example.com")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_owner_with_a_unique_first_name_is_never_matched(self):
+        people = self.capture(
+            ["Me", "Ada", "jane-doe"],
+            [attendee("me.owner@example.com", "Me Owner"),
+             attendee("ada.lovelace@example.com")])
         self.assertEqual(people, "ada-lovelace,jane-doe")
+
+    def test_owner_alias_email_resolving_to_the_owner_slug(self):
+        DIRECTORY["me.alias"] = "memory-owner"
+        self.addCleanup(DIRECTORY.pop, "me.alias")
+        people = self.capture(
+            ["Me", "jane-doe"], [attendee("me.alias@example.com")])
+        self.assertEqual(people, "jane-doe")
+        people = self.capture(
+            ["Ada", "jane-doe"],
+            [attendee("me.alias@example.com", "Ada Owner"),
+             attendee("ada.lovelace@example.com")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_public_mail_owner_domain_is_not_internal(self):
+        people = self.capture(
+            ["Ada", "jane-doe"], [attendee("ada.lovelace@gmail.com")],
+            owner_email="owner@gmail.com")
+        self.assertEqual(people, "jane-doe")
+
+    def test_configured_internal_domains_reach_capture(self):
+        extra = {"internal_domains": ["Partner.Example"]}
+        rows = [attendee("ada.lovelace@partner.example"),
+                attendee("augusta.king@example.com")]
+        # Only the configured domain counts; the identity domain does not.
+        self.assertEqual(
+            self.capture(["Ada", "Gus", "jane-doe"], rows, extra=extra),
+            "ada-lovelace,jane-doe")
+
+    def test_public_mail_owner_with_configured_domains(self):
+        people = self.capture(
+            ["Ada"], [attendee("ada.lovelace@example.com")],
+            owner_email="owner@gmail.com",
+            extra={"internal_domains": ["example.com"]})
+        self.assertEqual(people, "ada-lovelace")
 
     def test_external_guest_sharing_a_first_name_blocks_the_match(self):
         people = self.capture(

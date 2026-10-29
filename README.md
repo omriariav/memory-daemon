@@ -1194,15 +1194,16 @@ directory (symlinks resolved) as its working directory.
   identity; without one nothing is added. An attendee's slug is, in order: an
   exact-email directory-verified participant, else (only for emails in the
   owner's domains) the resolver's answer for the email's local part (e.g.
-  `first.last`), then the display name. The owner's domains are the identity
-  email's domain plus the optional `memory.internal_domains` list. External
+  `first.last`), then the display name. The owner's domains are
+  `memory.internal_domains` when set (only those), else the identity email's
+  domain, unless that is a public mail provider (then none). External
   attendees are never sent to the resolver and get no slug, but still count
   toward ambiguity. Several emails of one slug count once. Their first names
   are the resolver's `first_names` (preferred names, nicknames) plus the first
   word of the display name and of the email's local part, compared
   case-insensitively with accents folded. A name shared by several attendees,
-  or by none, stays unresolved as before. The owner is left out, by slug and
-  by invitation email. The matched slug is attested by the invitation (not by
+  or by none, stays unresolved as before. The owner (by invitation email or resolved
+  slug) is never a match target, but still counts toward ambiguity. The matched slug is attested by the invitation (not by
   the store), so it is kept like a verified participant.
 - **Stale data.** `"stale": true` (the resolver's data is past its refresh
   date) still resolves; one warning is logged per run.
