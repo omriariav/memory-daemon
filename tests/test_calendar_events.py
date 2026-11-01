@@ -279,7 +279,7 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(block("other", soon(), rsvp="accepted")))
         (event,) = self.emitted()
         self.assertEqual(event["kind"], "cancel")
-        self.assertEqual(event["details"]["changed"]["instances"],
+        self.assertEqual(event["details"]["instances"],
                          ["ser_20261023T083000Z", "ser_20261024T083000Z"])
 
     def test_series_invite_is_one_new(self):
@@ -295,6 +295,14 @@ class EventsTest(unittest.TestCase):
         ext = dict(organizer="eve@evil.test", rsvp="accepted")
         self.seed(block("a", soon(), title=long + "A", **ext))
         self.run_at(listing(block("a", soon(), title=long + "B", **ext)))
+        self.assertEqual(self.emitted(), [])
+
+    def test_unhashable_old_answer_is_skipped(self):
+        self.seed(self.mine("needsAction"))
+        data = json.loads(self.snapshot.read_text())
+        data["events"]["m"]["rsvps"]["bob.jones@example.com"] = ["Bob", ["x"]]
+        self.snapshot.write_text(json.dumps(data))
+        self.run_at(listing(self.mine("accepted")))
         self.assertEqual(self.emitted(), [])
 
     def test_snapshot_without_rsvps_compares_nothing(self):

@@ -622,11 +622,10 @@ def normalize(listed, details, cfg, tz):
             "end": end,
             "all_day": raw["all_day"],
             "title": title,
-            # The title as listed, cut like the shown one: detail lookups
-            # (which come and go) never change it.
-            "list_title": clean(
-                raw["title"], TITLE_MAX if is_internal else EXTERNAL_TITLE_MAX
-            ),
+            # The title as listed, cut to the shorter (external) length for
+            # every event: it never depends on detail lookups, which come
+            # and go, and no event carries more than that of it.
+            "list_title": clean(raw["title"], EXTERNAL_TITLE_MAX),
             "my_rsvp": _rsvp_for_owner(owner, organizer, entries),
             "organizer": {
                 "email": organizer, "name": organizer_name,
@@ -1045,18 +1044,22 @@ def snapshot_rows(wide, details, cfg, tz):
 
 
 def _rsvp_changes(before, after):
-    """{label: [old, new]} for attendees in both maps whose answer changed.
+    """{email: (label, old, new)} for attendees in both maps whose answer
+    changed.
 
     The label is the attendee's name, or their email when the name is empty
     or shared with another attendee. Malformed old entries are skipped.
     """
     shared = collections.Counter(name for name, _ in after.values())
-    return {
-        (name if name and shared[name] == 1 else email): [before[email][1], rsvp]
-        for email, (name, rsvp) in sorted(after.items())
-        if isinstance(before.get(email), list) and len(before[email]) == 2
-        and before[email][1] != rsvp
-    }
+    changes = {}
+    for email, (name, rsvp) in sorted(after.items()):
+        old = before.get(email)
+        if not (isinstance(old, list) and len(old) == 2
+                and isinstance(old[1], str)) or old[1] == rsvp:
+            continue
+        label = name if name and shared[name] == 1 else email
+        changes[email] = (label, old[1], rsvp)
+    return changes
 
 
 def _series(event_id):
@@ -1150,19 +1153,20 @@ def diff_snapshots(prev, rows, now, hours, tz):
                 found.append(("new", event_id, row, None))
         elif old["status"] != "cancelled" \
                 and old["my_rsvp"] == row["my_rsvp"] == "organizer":
-            answers = (
+            changes = (
                 _rsvp_changes(old["rsvps"], row.get("rsvps") or {})
                 if isinstance(old.get("rsvps"), dict) else {}
             )
-            # Per attendee: a series-wide answer is not repeated because
-            # another attendee answered one instance only.
-            answers = {
-                who: change for who, change in answers.items()
-                if ("rsvp", _series(event_id), who, tuple(change))
-                not in reported
-                and not reported.add(("rsvp", _series(event_id), who,
-                                      tuple(change)))
-            }
+            # Per attendee (by email, whatever their label on this
+            # instance): an answer to a whole series is reported once.
+            answers = {}
+            for email, (label, before_rsvp, after_rsvp) in changes.items():
+                key = ("rsvp", _series(event_id), email, before_rsvp,
+                       after_rsvp)
+                if key in reported:
+                    continue
+                reported.add(key)
+                answers[label] = [before_rsvp, after_rsvp]
             if answers:
                 found.append(("rsvp", event_id, row, answers))
         elif old["status"] != "cancelled" \
@@ -1194,8 +1198,9 @@ def _collapse_series(found, shape):
     """One event per (kind, series, change) instead of one per instance.
 
     The first instance stands for the series; when several collapse, its
-    changes gain `instances`, every instance id it stands for. An rsvp is
-    already deduped per attendee.
+    changes gain `instances` (moved to the event's details on emit), every
+    instance id it stands for. An rsvp is already deduped per attendee and
+    names only its first instance.
     """
     groups = {}
     out = []
@@ -1232,8 +1237,12 @@ def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
     found = diff_snapshots(prev, rows, now, hours, tz)
     for kind, event_id, row, changed in found:
         info = {"start": row["start"], "end": row["end"]}
+        changed = dict(changed or {})
+        instances = changed.pop("instances", None)
         if changed:
             info["changed"] = changed
+        if instances:
+            info["instances"] = instances
         # Titles and attendee names are written by others.
         info["untrusted"] = True
         event_stream.emit(base_dir, event_stream.build(
