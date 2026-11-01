@@ -2310,14 +2310,14 @@ all:
 - A message that has the header still gets the full check, so a failing or
   unreadable verdict is still dropped, and a header printed below the
   message's own headers still counts as forged.
-- The first time any fetched message carries the header, From-only trust
-  turns itself off for good (marker `state/gmail-mcp-auth-seen`, plus a WARN
-  in the log): the connector evidently returns it, so a message without it
-  was not stamped by the receiving server. Remove the flag then; delete the
-  marker only if you turn the flag back on for a different connector.
-- A thread with messages accepted this way tells the prompt so ("accepted on
-  the From address alone"), and each fetch logs `accepted N message(s) on
-  From only` with the newest message id.
+- The first time any message read through a `fetch_tool` carries the header
+  (whether the flag is on or not), From-only trust turns itself off for that
+  tool for good (`state/gmail-mcp-auth-seen.json`, plus a WARN in the log):
+  the connector evidently returns it, so a message without it was not stamped
+  by the receiving server. Remove the flag then.
+- Each message accepted this way starts with a "Sender not authenticated"
+  note in the prompt, the thread notes how many there were, and each fetch
+  logs `accepted N message(s) on From only` with the newest message id.
 - The owner's own sent mail has no verdict either, so `owner_email` is
   required; mail sent from an alias that is not `owner_email` is read as a
   colleague's.

@@ -164,6 +164,8 @@ class BridgeTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         gmail_mcp.configure(self.tmp.name)
         gmail_mcp._last_session[0] = 0.0
+        gmail_mcp._auth_seen_memory.clear()
+        self.addCleanup(gmail_mcp._auth_seen_memory.clear)
 
 
 T1 = 1700000100
@@ -1578,8 +1580,6 @@ class VerifiedSenderConfigTest(unittest.TestCase):
 class TrustFromWithoutAuthTest(BridgeTestCase):
     def setUp(self):
         super().setUp()
-        gmail_mcp._auth_seen_memory = False
-        self.addCleanup(setattr, gmail_mcp, "_auth_seen_memory", False)
         self.ledger = {}
         self.store = mock.Mock()
         self.store.record.side_effect = lambda k, v: self.ledger.__setitem__(k, v)
@@ -1599,7 +1599,8 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
             [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())})
         with mock.patch.object(gmail_mcp, "log") as logged:
             thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
-        self.assertEqual([m["body"] for m in thread["messages"]], ["body 1"])
+        self.assertEqual([m["body"] for m in thread["messages"]],
+                         [f"{gmail_mcp.FROM_ONLY_NOTE}\nbody 1"])
         self.assertEqual(thread["withheld"], 0)
         self.assertEqual(thread["from_only"], 1)
         line = " ".join(str(c.args[0]) for c in logged.call_args_list)
@@ -1676,27 +1677,59 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
              {"mid": 3, "thread": 3, "epoch": T2 + 5}],
             {1: authed_text(1, auth=()), 2: authed_text(2),
              3: authed_text(3, thread=3, auth=())})
-        by_thread = {c["id"].split("@")[0]: c for c in listing}
+        first = next(c for c in listing if c["raw"]["thread_id"] == hexid(1))
+        later = next(c for c in listing if c["raw"]["thread_id"] == hexid(3))
         with mock.patch.object(gmail_mcp, "log") as logged:
-            thread = gmail_mcp.fetch({"id": "r"}, by_thread[listing[0]["id"].split("@")[0]], src)
+            thread = gmail_mcp.fetch({"id": "r"}, first, src)
         self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
         self.assertEqual(thread["from_only"], 0)
-        self.assertTrue(gmail_mcp.auth_seen())
+        self.assertTrue(gmail_mcp.auth_seen(FETCH))
         self.assertIn("From-only trust is now off",
                       " ".join(str(c.args[0]) for c in logged.call_args_list))
-        # A later thread without the header is no longer trusted.
         with self.assertRaises(gmail_mcp.SenderUnverified):
-            gmail_mcp.fetch({"id": "r"}, listing[1], src)
+            gmail_mcp.fetch({"id": "r"}, later, src)
 
-    def test_seen_marker_persists_in_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            gmail_mcp.configure(tmp)
-            self.addCleanup(gmail_mcp.configure, None)
-            self.assertFalse(gmail_mcp.auth_seen())
-            with mock.patch.object(gmail_mcp, "log"):
-                gmail_mcp._mark_auth_seen()
-            gmail_mcp._auth_seen_memory = False
-            self.assertTrue(gmail_mcp.auth_seen())
+    def test_header_elsewhere_in_the_batch_disarms_before_judging(self):
+        # The header-less thread is fetched first, but its batch-mate already
+        # shows the connector returns the header.
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1},
+             {"mid": 2, "thread": 2, "epoch": T2}],
+            {1: authed_text(1, auth=()), 2: authed_text(2, thread=2)})
+        first = next(c for c in listing if c["raw"]["thread_id"] == hexid(1))
+        with mock.patch.object(gmail_mcp, "log"), \
+                self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, first, src)
+
+    def test_header_seen_with_the_flag_off_disarms_it_later(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1)},
+            trust=False)
+        with mock.patch.object(gmail_mcp, "log"):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertTrue(gmail_mcp.auth_seen(FETCH))
+
+    def test_marker_is_per_connector_and_persists(self):
+        with mock.patch.object(gmail_mcp, "log"):
+            gmail_mcp._mark_auth_seen("other_fetch_tool")
+        gmail_mcp._auth_seen_memory.clear()
+        self.assertTrue(gmail_mcp.auth_seen("other_fetch_tool"))
+        self.assertFalse(gmail_mcp.auth_seen(FETCH))
+
+    def test_failed_marker_save_still_disarms_this_process(self):
+        with mock.patch.object(gmail_mcp.state, "write_atomic",
+                               side_effect=OSError("read-only")), \
+                mock.patch.object(gmail_mcp, "log"):
+            gmail_mcp._mark_auth_seen(FETCH)
+        self.assertTrue(gmail_mcp.auth_seen(FETCH))
+
+    def test_each_from_only_message_is_marked_in_its_body(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())})
+        with mock.patch.object(gmail_mcp, "log"):
+            thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertTrue(thread["messages"][0]["body"].startswith(
+            gmail_mcp.FROM_ONLY_NOTE))
 
     def test_runner_tells_the_prompt_about_from_only_messages(self):
         from workspace_daemon import runner
@@ -1735,6 +1768,9 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
                 trust_from_without_auth=True)
             del no_owner_routine["source"]["owner_email"]
             no_owner = config.validate(no_owner_routine)
+            null_owner = config.validate(routine(
+                tmp, verified_sender_domains=["example.com"],
+                trust_from_without_auth=True, owner_email=None))
             off_alone = config.validate(routine(tmp, trust_from_without_auth=False))
             bad = config.validate(routine(
                 tmp, verified_sender_domains=["example.com"],
@@ -1742,6 +1778,7 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         self.assertEqual(ok, [])
         self.assertTrue(any("requires verified_sender_domains" in p for p in alone))
         self.assertTrue(any("requires owner_email" in p for p in no_owner))
+        self.assertTrue(any("requires owner_email" in p for p in null_owner))
         self.assertEqual(off_alone, [])
         self.assertTrue(any("must be true or false" in p for p in bad))
 

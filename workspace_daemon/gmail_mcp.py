@@ -43,12 +43,13 @@ make every message fail closed. `trust_from_without_auth: true` (only with
 passes the same strict domain check when it carries no Authentication-Results
 header at all. A message that has one still gets the full check, so a failing
 verdict is still a hard fail, and a header printed below the message's own
-headers still counts as forged. The first time any fetched message carries
-the header, From-only trust switches itself off for good
-(state/gmail-mcp-auth-seen), since the connector evidently returns it and a
-message without it was not stamped by the receiving server. Accepted
-messages are counted on the thread ("from_only") so the prompt says so, and
-logged with counts and message ids. The From header can be spoofed: this
+headers still counts as forged. The first time any message read through a
+`fetch_tool` carries the header (flag on or off), From-only trust switches
+itself off for that tool for good (state/gmail-mcp-auth-seen.json), since the
+connector evidently returns it and a message without it was not stamped by
+the receiving server. Each accepted message's body starts with a
+"Sender not authenticated" note, the thread counts them ("from_only"), and
+the log carries counts and message ids. The From header can be spoofed: this
 relies on the domain's DMARC policy making the receiving server reject
 forged mail.
 
@@ -832,6 +833,10 @@ def sender_authenticated(results, domain, servers):
     return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
 
 
+FROM_ONLY_NOTE = ("[Sender not authenticated: this message was accepted on "
+                  "its From address alone.]")
+
+
 def sender_verdict(cfg, headers, auth_results):
     """"verified", "from_only" or None for a fetched message.
 
@@ -1201,32 +1206,45 @@ def candidates(source):
 
 # --- fetch -------------------------------------------------------------------
 
-_auth_seen_memory = False  # stands in for the marker file when unconfigured
+_auth_seen_memory = set()  # fetch tools seen this process (covers a failed save)
 
 
 def _auth_seen_path():
-    return Path(_base_dir) / "state" / "gmail-mcp-auth-seen"
+    return Path(_base_dir) / "state" / "gmail-mcp-auth-seen.json"
 
 
-def auth_seen():
-    """Whether any fetched message has carried Authentication-Results."""
+def _load_auth_seen():
     if _base_dir is None:
-        return _auth_seen_memory
-    return _auth_seen_path().exists()
+        return []
+    try:
+        data = json.loads(_auth_seen_path().read_text())
+    except (OSError, ValueError):
+        return []
+    return [tool for tool in data if isinstance(tool, str)] \
+        if isinstance(data, list) else []
 
 
-def _mark_auth_seen():
-    global _auth_seen_memory
-    if auth_seen():
+def auth_seen(fetch_tool):
+    """Whether a message read through `fetch_tool` carried Authentication-Results."""
+    return fetch_tool in _auth_seen_memory or fetch_tool in _load_auth_seen()
+
+
+def _mark_auth_seen(fetch_tool):
+    if auth_seen(fetch_tool):
         return
-    _auth_seen_memory = True
+    _auth_seen_memory.add(fetch_tool)
     if _base_dir is not None:
         try:
-            state.write_atomic(_auth_seen_path(), "1\n", mode=0o600)
+            state.write_atomic(
+                _auth_seen_path(),
+                json.dumps(sorted(set(_load_auth_seen()) | {fetch_tool})),
+                mode=0o600,
+            )
         except OSError:
-            pass  # the in-memory flag still disarms this process
+            pass  # the in-memory set still disarms this process
     log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
-        "From-only trust is now off. Remove trust_from_without_auth.")
+        "From-only trust is now off for this connector. Remove "
+        "trust_from_without_auth.")
 
 
 def _attempts_path():
@@ -1413,38 +1431,44 @@ def fetch(routine, candidate, source=None):
     cfg = batch["cfg"]
     messages = outcome["messages"]
     unverified, from_only = [], []
+    # A connector that shows the header for one message shows it for all, so
+    # once any message of the batch carries it, a message without it was
+    # never stamped by the receiving server: From-only trust stops for good.
+    # Recorded whether or not the flag is on, so turning it on later cannot
+    # trust a connector already known to return the header.
+    if any(m["auth_results"] != []
+           for read in batch["threads"].values()
+           for m in read.get("messages") or []):
+        _mark_auth_seen(cfg["fetch_tool"])
     if cfg["verified_sender_domains"]:
-        if cfg["trust_from_without_auth"]:
-            # A connector that shows the header for one message shows it for
-            # all, so a message without it was never stamped by the receiving
-            # server: From-only trust stops for good.
-            if any(m["auth_results"] != [] for m in messages):
-                _mark_auth_seen()
-            if auth_seen():
-                cfg = dict(cfg, trust_from_without_auth=False)
-        verdicts = {
+        if cfg["trust_from_without_auth"] and auth_seen(cfg["fetch_tool"]):
+            cfg = dict(cfg, trust_from_without_auth=False)
+        verdict = {
             m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
             for m in messages
         }
         messages, unverified = _partition(
-            messages, lambda m: verdicts[m["id"]] is not None)
+            messages, lambda m: verdict[m["id"]] is not None)
         if unverified:
             _log_skipped("without a verified sender", unverified)
-        from_only = [m["id"] for m in messages
-                     if verdicts[m["id"]] == "from_only"]
+        from_only = {m["id"] for m in messages if verdict[m["id"]] == "from_only"}
         if from_only:
+            newest = [m["id"] for m in messages if m["id"] in from_only][-1:]
             _log_ids(f"accepted {len(from_only)} message(s) on From only "
-                     "(no Authentication-Results), newest", from_only[-1:])
+                     "(no Authentication-Results), newest", newest)
         if not messages:
             _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")
             raise SenderUnverified("no message from a verified sender")
     out = []
     for message in messages:
+        body = _bound_body(message, cfg["max_message_chars"])
+        if message["id"] in from_only:
+            body = f"{FROM_ONLY_NOTE}\n{body}"
         out.append({
             "id": message["id"],
             "headers": message["headers"],
-            "body": _bound_body(message, cfg["max_message_chars"]),
+            "body": body,
         })
     return {
         "thread_id": thread,
