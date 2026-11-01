@@ -2118,12 +2118,15 @@ One JSON object per line, oldest message first:
 - `channel_type` (every line type): `"im"` for a direct message, `"mpim"` for a
   group DM, `"channel"` for a public or private channel. It comes from the
   search hit's own label (`DM` on a `D...` id, `Group DM`), so a group DM is
-  recognised although its id starts with `C`. It is cached per channel in
-  `state/comms-inbox-channels.json`, so lines from thread reads and reaction
-  reads get it too; a channel never seen in a search has none.
-- `peer_is_bot` (lines of an `"im"` only, once the other member has posted):
-  `true` when every message they posted carries the bot marker (an app), else
-  `false`. A person whose own agent sometimes posts for them stays `false`.
+  recognised although its id starts with `C`. A line without a label (thread
+  or reaction reads) takes the type another line of that channel in the
+  inbox carries; with none, it has no field.
+- `peer_is_bot` (lines of an `"im"` only, once a message from someone other
+  than the owner is in the inbox): `true` when every such message carries the
+  bot marker (an app), else `false`. A person whose own agent sometimes posts
+  for them stays `false`. It is fixed when the line is written, so read the
+  newest line. An app of the owner's that posts in a person's DM before they
+  reply counts as the peer until then.
 - Lines written before these fields existed lack them; treat a missing
   field as unknown. Existing lines are never rewritten.
 - Both sides are recorded: other people's messages and the owner's own

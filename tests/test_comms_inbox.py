@@ -1077,12 +1077,18 @@ class ChannelTypeTest(unittest.TestCase):
                   comms_inbox.path(self.base).read_text().splitlines()]
         self.assertEqual(row["channel_type"], "mpim")
 
-    def test_unreadable_cache_is_ignored(self):
-        cache = Path(self.base) / "state" / comms_inbox.CHANNELS_FILE
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text("{not json")
-        rows = self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM"))
-        self.assertEqual(rows[("D0EXAMPLE01", self.ts(1))]["channel_type"], "im")
+    def test_peer_is_bot_reflects_the_whole_inbox(self):
+        self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM"))
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(2), "DM",
+                                    bot=True))
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
+    def test_unlabelled_human_before_a_labelled_bot_counts(self):
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(1)),
+            self.hit("D0EXAMPLE01", self.ts(2), "DM", bot=True),
+        )
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
 
 
 if __name__ == "__main__":
