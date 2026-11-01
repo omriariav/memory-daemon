@@ -1718,6 +1718,22 @@ def _validate_slack_mcp(prefix, source):
             f"{prefix}.reactions_tool must be the exact read-only MCP tool "
             "mcp__<server>__slack_get_reactions"
         )
+    for key, family in (("channels_tool", "slack_list_user_channels"),
+                        ("channel_info_tool", "slack_search_channels")):
+        value = source.get(key)
+        if value is not None and not _exact_tool(value, family):
+            problems.append(
+                f"{prefix}.{key} must be the exact read-only MCP tool "
+                f"mcp__<server>__{family}"
+            )
+    if (
+        inbox is not None and not inbox_problem
+        and inbox.get("joined_channels") is True
+        and source.get("channels_tool") is None
+    ):
+        problems.append(
+            f"{prefix}.comms_inbox.joined_channels needs channels_tool"
+        )
     owner = source.get("self_user_id")
     if not isinstance(owner, str) or not slack_watch.USER_ID.match(owner):
         problems.append(f"{prefix}.self_user_id must be the owner's Slack user id")

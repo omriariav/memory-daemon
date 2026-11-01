@@ -2138,12 +2138,16 @@ comms_inbox:
   ignore_reactors: [U0EXAMPLE09]   # user ids never recorded as peer reactions, at most 20
   follow_threads: true   # follow every channel thread the owner posted in
   thread_polls: 10       # followed-thread reads per run, 0 to 30
+  joined_channels: true  # a line per newly joined channel (needs channels_tool)
+  joined_check_minutes: 60   # how often channels are listed, 15 to 1440
 ```
 
 and on the routine's source (not the watch file):
 
 ```yaml
 reactions_tool: mcp__<server>__slack_get_reactions
+channels_tool: mcp__<server>__slack_list_user_channels    # joined_channels
+channel_info_tool: mcp__<server>__slack_search_channels   # optional: creator
 ```
 
 One JSON object per line, oldest message first:
@@ -2258,6 +2262,30 @@ One JSON object per line, oldest message first:
 - Security: `reactions_tool` must be exactly `mcp__<server>__slack_get_reactions`
   (validated like the other read tools); its result holds emoji names and
   user ids only, never message text.
+- Joined channels: with `joined_channels` a run lists the owner's public and
+  private channels (DMs and archived channels excluded) at most every
+  `joined_check_minutes`, in one extra bridge session (channel ids only), and
+  records a `channel_joined` line per channel not in the previous listing:
+  `{"type": "channel_joined", "channel_id", "name", "private",
+  "channel_type": "channel", "ts", "thread_ts", "seen_at"}`, plus
+  `creator_id`, `creator_name` and `created` when `channel_info_tool` finds
+  the channel. Only when something is new, a full listing (names) and the
+  channel search (at most 5) follow in their own sessions. `ts` is when the
+  join was detected; the listing has no join time. The first listing is a
+  silent baseline. The known set only grows: leaving is not tracked, so a
+  rejoin, an unarchived channel or one back after a brief scope loss is not
+  announced. Names come from the full
+  listing only for the new ids, and creator details only from a search
+  result matching both name and id, so a channel purpose cannot forge an
+  entry. A listing that is empty, lacks an "of N total" header, spans more
+  than one page (200 channels) or whose count does not match changes
+  nothing. A new channel without a usable name waits up to 3 checks, then is
+  recorded with `name: null`. More than 20 new channels at once (a changed
+  scope or workspace) re-baselines silently. State, one per connector tool
+  and owner (shared by routines, so a join is recorded once):
+  `state/comms-inbox-joined-<tool>-<hash>.json`. An owner in more than 200
+  channels never gets a complete listing, so nothing is recorded (each check
+  logs it).
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

@@ -24,6 +24,9 @@ Watch file (or source) block:
       track_reactions: [track-example]   # "watch this conversation" (at most 3)
       follow_threads: true     # every channel thread the owner posted in
       thread_polls: 10         # thread reads per run for followed threads
+      joined_channels: true    # a line per newly joined channel (needs
+                               # channels_tool; see comms_joined.py)
+      joined_check_minutes: 60 # how often channels are listed (15 to 1440)
 
 One JSON object per line, oldest message first:
 
@@ -38,6 +41,8 @@ described below.
      "user_id", "seen_at"}
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
+    {"type": "channel_joined", "channel_id", "name", "private", "ts",
+     "thread_ts", "seen_at"} (+ creator details; see comms_joined.py)
 
 Every line (any type) written since channel types were added also carries
 `channel_type`: "im" (a direct message), "mpim" (a group DM) or "channel"
@@ -125,13 +130,15 @@ FILE_NAME = "comms-inbox.jsonl"
 KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
-    "thread_polls", "ignore_reactors",
+    "thread_polls", "ignore_reactors", "joined_channels",
+    "joined_check_minutes",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
             "follow_threads": False, "thread_polls": 10,
-            "ignore_reactors": []}
+            "ignore_reactors": [], "joined_channels": False,
+            "joined_check_minutes": 60}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -167,7 +174,7 @@ def problem(value):
         isinstance(c, str) and CHANNEL_ID.match(c) for c in channels
     ):
         return "`channels` must be a list of Slack channel ids"
-    for key in ("all_dms", "follow_threads"):
+    for key in ("all_dms", "follow_threads", "joined_channels"):
         if not isinstance(value.get(key, False), bool):
             return f"`{key}` must be true or false"
     for key, most in (
@@ -199,7 +206,7 @@ def problem(value):
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),
         ("reaction_checks", 0, 30), ("reaction_check_hours", 1, 336),
-        ("thread_polls", 0, 30),
+        ("thread_polls", 0, 30), ("joined_check_minutes", 15, 1440),
     ):
         number = value.get(key, DEFAULTS[key])
         if not (
@@ -230,6 +237,8 @@ def path(base_dir):
 def _key(row):
     if row.get("type") in ("owner_reaction", "track_request"):
         return (row["type"], row["channel_id"], row["ts"], row["emoji"])
+    if row.get("type") == "channel_joined":
+        return (row["type"], row["channel_id"], row["ts"])
     if row.get("type") == "peer_reaction":
         return (row["type"], row["channel_id"], row["ts"], row["emoji"],
                 row["user_id"])
