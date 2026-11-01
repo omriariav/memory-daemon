@@ -2275,8 +2275,9 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 - Listing drops every message whose `From` is not one plain address in a listed
   domain. The match is exact: a subdomain or lookalike does not match, and the
   display name is ignored.
-- `fetch()` then requires the topmost `Authentication-Results` header to be
-  stamped by one of `auth_servers`. A lower header naming the same server
+- `fetch()` then requires (unless From-only trust, below, applies) the
+  topmost `Authentication-Results` header to be stamped by one of
+  `auth_servers`. A lower header naming the same server
   counts as forged. It must show
   `dmarc=pass` with `header.from` equal to the domain, or `dkim=pass` signed by
   the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
@@ -2301,7 +2302,7 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
   `Authentication-Results` therefore yields no captures at all.
 
 **From-only trust** (`trust_from_without_auth: true`, valid only with
-`verified_sender_domains`). For a connector that never returns
+`verified_sender_domains` and `owner_email`). For a connector that never returns
 `Authentication-Results`, this accepts a message whose `From` passes the exact
 domain check above when the message has no `Authentication-Results` header at
 all:
@@ -2309,9 +2310,19 @@ all:
 - A message that has the header still gets the full check, so a failing or
   unreadable verdict is still dropped, and a header printed below the
   message's own headers still counts as forged.
-- Each acceptance is logged as `accepted N message(s) on From only`, with
-  message ids only, so you can see when the connector starts returning the
-  header and the flag can go.
+- The first time any fetched message carries the header, From-only trust
+  turns itself off for good (marker `state/gmail-mcp-auth-seen`, plus a WARN
+  in the log): the connector evidently returns it, so a message without it
+  was not stamped by the receiving server. Remove the flag then; delete the
+  marker only if you turn the flag back on for a different connector.
+- A thread with messages accepted this way tells the prompt so ("accepted on
+  the From address alone"), and each fetch logs `accepted N message(s) on
+  From only` with the newest message id.
+- The owner's own sent mail has no verdict either, so `owner_email` is
+  required; mail sent from an alias that is not `owner_email` is read as a
+  colleague's.
+- Threads recorded as `unverified` before the flag was turned on are not
+  re-read until they get a new message.
 - Known gaps:
   - The `From` header can be spoofed. This relies on the domain publishing a
     DMARC `p=reject` (or `quarantine`) policy, so the receiving server rejects

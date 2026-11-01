@@ -25,7 +25,8 @@ Routine config:
       trust_from_without_auth: false          # see "From-only trust" below
 
 With `verified_sender_domains` set, only mail from those exact domains is
-read, and only when the receiving server authenticated it. A message's From
+read, and (unless From-only trust is on, below) only when the receiving
+server authenticated it. A message's From
 must be one plain address whose domain equals a listed domain (no subdomain
 or lookalike; the display name is ignored), and the topmost
 Authentication-Results header, stamped by one of `auth_servers`, must show
@@ -38,13 +39,18 @@ dropped at listing; skipped messages of a kept thread are noted as withheld.
 
 From-only trust: a connector that never shows Authentication-Results would
 make every message fail closed. `trust_from_without_auth: true` (only with
-`verified_sender_domains`) accepts a message whose From passes the same strict
-domain check when it carries no Authentication-Results header at all. A
-message that has one still gets the full check, so a failing verdict is still
-a hard fail, and a header printed below the message's own headers still
-counts as forged. Each such acceptance is logged ("accepted on From only")
-with counts and message ids. The From header can be spoofed: this relies on
-the domain's DMARC policy making the receiving server reject forged mail.
+`verified_sender_domains` and `owner_email`) accepts a message whose From
+passes the same strict domain check when it carries no Authentication-Results
+header at all. A message that has one still gets the full check, so a failing
+verdict is still a hard fail, and a header printed below the message's own
+headers still counts as forged. The first time any fetched message carries
+the header, From-only trust switches itself off for good
+(state/gmail-mcp-auth-seen), since the connector evidently returns it and a
+message without it was not stamped by the receiving server. Accepted
+messages are counted on the thread ("from_only") so the prompt says so, and
+logged with counts and message ids. The From header can be spoofed: this
+relies on the domain's DMARC policy making the receiving server reject
+forged mail.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -844,11 +850,6 @@ def sender_verdict(cfg, headers, auth_results):
     return None
 
 
-def verified_sender(cfg, headers, auth_results):
-    """A fetched message's From is a listed domain and accepted for it."""
-    return sender_verdict(cfg, headers, auth_results) is not None
-
-
 def _partition(items, keep):
     """(kept items, ids of the rest) in order."""
     kept, dropped = [], []
@@ -1029,7 +1030,8 @@ def _group(cfg, hits):
     withheld = {}  # thread -> ids dropped at listing
     if domains:
         # The owner's own mail never carries the receiving server's verdict,
-        # so it would only cost a read and fail at fetch.
+        # so it would only cost a read and fail at fetch (or, with From-only
+        # trust, be read as a colleague's mail).
         kept, external = [], set()
         for hit in hits:
             if owner and _address(hit["from"]) == owner:
@@ -1198,6 +1200,34 @@ def candidates(source):
 
 
 # --- fetch -------------------------------------------------------------------
+
+_auth_seen_memory = False  # stands in for the marker file when unconfigured
+
+
+def _auth_seen_path():
+    return Path(_base_dir) / "state" / "gmail-mcp-auth-seen"
+
+
+def auth_seen():
+    """Whether any fetched message has carried Authentication-Results."""
+    if _base_dir is None:
+        return _auth_seen_memory
+    return _auth_seen_path().exists()
+
+
+def _mark_auth_seen():
+    global _auth_seen_memory
+    if auth_seen():
+        return
+    _auth_seen_memory = True
+    if _base_dir is not None:
+        try:
+            state.write_atomic(_auth_seen_path(), "1\n", mode=0o600)
+        except OSError:
+            pass  # the in-memory flag still disarms this process
+    log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+        "From-only trust is now off. Remove trust_from_without_auth.")
+
 
 def _attempts_path():
     return Path(_base_dir) / "state" / "gmail-mcp-attempts.json"
@@ -1382,8 +1412,16 @@ def fetch(routine, candidate, source=None):
     _clear_attempts(candidate["id"])
     cfg = batch["cfg"]
     messages = outcome["messages"]
-    unverified = []
+    unverified, from_only = [], []
     if cfg["verified_sender_domains"]:
+        if cfg["trust_from_without_auth"]:
+            # A connector that shows the header for one message shows it for
+            # all, so a message without it was never stamped by the receiving
+            # server: From-only trust stops for good.
+            if any(m["auth_results"] != [] for m in messages):
+                _mark_auth_seen()
+            if auth_seen():
+                cfg = dict(cfg, trust_from_without_auth=False)
         verdicts = {
             m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
             for m in messages
@@ -1396,7 +1434,7 @@ def fetch(routine, candidate, source=None):
                      if verdicts[m["id"]] == "from_only"]
         if from_only:
             _log_ids(f"accepted {len(from_only)} message(s) on From only "
-                     "(no Authentication-Results)", from_only)
+                     "(no Authentication-Results), newest", from_only[-1:])
         if not messages:
             _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")
@@ -1413,6 +1451,7 @@ def fetch(routine, candidate, source=None):
         "messages": out,
         "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
         "withheld": len(unverified) + raw.get("listing_withheld", 0),
+        "from_only": len(from_only),
     }
 
 

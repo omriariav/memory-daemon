@@ -1578,6 +1578,8 @@ class VerifiedSenderConfigTest(unittest.TestCase):
 class TrustFromWithoutAuthTest(BridgeTestCase):
     def setUp(self):
         super().setUp()
+        gmail_mcp._auth_seen_memory = False
+        self.addCleanup(setattr, gmail_mcp, "_auth_seen_memory", False)
         self.ledger = {}
         self.store = mock.Mock()
         self.store.record.side_effect = lambda k, v: self.ledger.__setitem__(k, v)
@@ -1586,7 +1588,8 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         self.connector.search = lambda a: search_text(hits)
         self.connector.fetch = lambda mid: fetched[int(mid, 16)]
         src = source(settle_minutes=0, verified_sender_domains=["example.com"],
-                     trust_from_without_auth=trust, _processed=self.store)
+                     trust_from_without_auth=trust,
+                     owner_email="owner@example.com", _processed=self.store)
         with mock.patch.object(slack_mcp, "_already_done", return_value=False):
             listing = gmail_mcp.candidates(src)
         return listing, src
@@ -1598,6 +1601,7 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
             thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
         self.assertEqual([m["body"] for m in thread["messages"]], ["body 1"])
         self.assertEqual(thread["withheld"], 0)
+        self.assertEqual(thread["from_only"], 1)
         line = " ".join(str(c.args[0]) for c in logged.call_args_list)
         self.assertIn("accepted 1 message(s) on From only", line)
         self.assertIn(hexid(1), line)
@@ -1665,6 +1669,47 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         line = " ".join(str(c.args[0]) for c in logged.call_args_list)
         self.assertNotIn("From only", line)
 
+    def test_a_seen_header_turns_from_only_trust_off_for_good(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1},
+             {"mid": 2, "thread": 1, "epoch": T2},
+             {"mid": 3, "thread": 3, "epoch": T2 + 5}],
+            {1: authed_text(1, auth=()), 2: authed_text(2),
+             3: authed_text(3, thread=3, auth=())})
+        by_thread = {c["id"].split("@")[0]: c for c in listing}
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            thread = gmail_mcp.fetch({"id": "r"}, by_thread[listing[0]["id"].split("@")[0]], src)
+        self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
+        self.assertEqual(thread["from_only"], 0)
+        self.assertTrue(gmail_mcp.auth_seen())
+        self.assertIn("From-only trust is now off",
+                      " ".join(str(c.args[0]) for c in logged.call_args_list))
+        # A later thread without the header is no longer trusted.
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[1], src)
+
+    def test_seen_marker_persists_in_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gmail_mcp.configure(tmp)
+            self.addCleanup(gmail_mcp.configure, None)
+            self.assertFalse(gmail_mcp.auth_seen())
+            with mock.patch.object(gmail_mcp, "log"):
+                gmail_mcp._mark_auth_seen()
+            gmail_mcp._auth_seen_memory = False
+            self.assertTrue(gmail_mcp.auth_seen())
+
+    def test_runner_tells_the_prompt_about_from_only_messages(self):
+        from workspace_daemon import runner
+        thread = {
+            "thread_id": "t1", "omitted": 0, "withheld": 0, "from_only": 1,
+            "messages": [{"id": hexid(1), "body": "body 1", "headers": {
+                "from": "Ann <ann@example.com>", "subject": "s",
+                "date": "Mon, 1 Jan 2024 00:00:00 +0000", "to": ME}}],
+        }
+        with mock.patch.object(runner.gmail_mcp, "fetch", return_value=thread):
+            item = runner._gmail_mcp_fetch({"id": "r"}, source(), {"id": "c"})
+        self.assertIn("accepted on the From address alone", item["body"])
+
     def test_verdicts(self):
         cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
                                   "trust_from_without_auth": True})
@@ -1682,14 +1727,21 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ok = config.validate(routine(
                 tmp, verified_sender_domains=["example.com"],
+                owner_email="owner@example.com",
                 trust_from_without_auth=True))
             alone = config.validate(routine(tmp, trust_from_without_auth=True))
+            no_owner_routine = routine(
+                tmp, verified_sender_domains=["example.com"],
+                trust_from_without_auth=True)
+            del no_owner_routine["source"]["owner_email"]
+            no_owner = config.validate(no_owner_routine)
             off_alone = config.validate(routine(tmp, trust_from_without_auth=False))
             bad = config.validate(routine(
                 tmp, verified_sender_domains=["example.com"],
                 trust_from_without_auth="yes"))
         self.assertEqual(ok, [])
         self.assertTrue(any("requires verified_sender_domains" in p for p in alone))
+        self.assertTrue(any("requires owner_email" in p for p in no_owner))
         self.assertEqual(off_alone, [])
         self.assertTrue(any("must be true or false" in p for p in bad))
 

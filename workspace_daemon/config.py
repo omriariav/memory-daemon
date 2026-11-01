@@ -1947,12 +1947,13 @@ def _validate_gmail_mcp(prefix, source):
         if not isinstance(source["trust_from_without_auth"], bool):
             problems.append(
                 f"{prefix}.trust_from_without_auth must be true or false")
-        elif source["trust_from_without_auth"] and (
-            "verified_sender_domains" not in source
-        ):
-            problems.append(
-                f"{prefix}.trust_from_without_auth requires "
-                "verified_sender_domains")
+        elif source["trust_from_without_auth"]:
+            # The owner's own sent mail carries no verdict either; without
+            # owner_email it would be read as a colleague's.
+            for needed in ("verified_sender_domains", "owner_email"):
+                if needed not in source:
+                    problems.append(
+                        f"{prefix}.trust_from_without_auth requires {needed}")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
     for key in ("queue_query", "exclude_query", "max_results"):
