@@ -2037,7 +2037,12 @@ def _check_joined(cfg, now, lane):
     """
     inbox = cfg["comms_inbox"]
     tool = cfg["channels_tool"]
-    if not tool or not inbox["joined_channels"]:
+    if not inbox["joined_channels"]:
+        return
+    if not tool:
+        # A watch-file block is merged after validation, so say it here.
+        log("slack_mcp: comms_inbox.joined_channels needs channels_tool on "
+            "the source; joined channels not checked")
         return
 
     def run(session_tool, pins, what):

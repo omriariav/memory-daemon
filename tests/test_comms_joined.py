@@ -30,7 +30,9 @@ def full_text(entries, purpose=""):
             + (f"- **Purpose:** {purpose}\n" if purpose else "")
             + "- **Archived:** No\n"
         )
-    return json.dumps({"result": "## My Channels\n\n" + "\n".join(blocks)})
+    return json.dumps({"result": (
+        f"## My Channels (showing {len(blocks)} of {len(blocks)} total)\n\n"
+        + "\n".join(blocks))})
 
 
 def info_text(name, channel, creator="Example Person", uid="U0EXAMPLEB",
@@ -87,6 +89,20 @@ class ParseTest(unittest.TestCase):
         self.assertIn("Purpose", json.loads(text)["results"])
         info = comms_joined.parse_info(text, A, "new-room")
         self.assertEqual(info["creator_id"], "U0EXAMPLEB")
+
+    def test_info_with_multiline_purpose(self):
+        text = info_text("new-room", A).replace(
+            "IST\\nPermalink",
+            "IST\\nPurpose: 1. Plans\\n2. Notes\\n3. More\\nPermalink")
+        info = comms_joined.parse_info(text, A, "new-room")
+        self.assertEqual(info["creator_id"], "U0EXAMPLEB")
+
+    def test_names_need_a_complete_full_listing(self):
+        cut = json.dumps({"result": json.loads(
+            full_text(ROOM))["result"].replace(
+                "## My Channels", "## My Channels (showing 1, more results "
+                "available)")})
+        self.assertEqual(comms_joined.parse_names(cut, {A}), {})
 
     def test_created_with_offset(self):
         info = comms_joined.parse_info(

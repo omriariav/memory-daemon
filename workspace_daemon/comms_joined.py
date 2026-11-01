@@ -81,8 +81,8 @@ _INFO_BLOCK = re.compile(
     r"Creator: ([^\n]{1,120}?) \(<@([UW][A-Z0-9]{8,})>?\)\s*\n"
     r"Created: ([0-9: -]{10,25}[A-Z]{0,5}(?:[+-][0-9]{1,2}(?::?[0-9]{2})?)?)"
     r"\s*\n"
-    # Purpose and Topic sit here when the channel has them.
-    r"(?:(?:Purpose|Topic): [^\n]*\n){0,2}"
+    # Purpose and Topic sit here when the channel has them, maybe multi-line.
+    r"(?:(?!Permalink: |### Result )[^\n]*\n){0,40}?"
     r"Permalink: \[link\]\([^)\s]*?/archives/([CG][A-Z0-9]{8,})\)",
     re.MULTILINE,
 )
@@ -140,9 +140,18 @@ def parse_ids(text):
 
 
 def parse_names(text, ids):
-    """{id: (name, private)} for `ids` whose full entries all agree."""
+    """{id: (name, private)} for `ids` whose full entries all agree.
+
+    Only from a complete listing: in a cut one, a block forged in another
+    channel's purpose could be the only entry for an id.
+    """
+    text = _body(text, "result")
+    match = _HEADER.search(text)
+    if not match or match.group(1) != match.group(2) \
+            or "more results available" in text.lower():
+        return {}
     found = {}
-    for name, channel, kind in _BLOCK.findall(_body(text, "result")):
+    for name, channel, kind in _BLOCK.findall(text):
         if channel in ids:
             found.setdefault(channel, set()).add((name, kind == "Private"))
     return {c: next(iter(v)) for c, v in found.items() if len(v) == 1}
@@ -243,6 +252,8 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
     is retried after `joined_check_minutes`; joins that could not be written
     (or named) are retried at the next check.
     """
+    if base_dir is None:
+        return 0
     now = time.time() if now is None else now
     saved = load(base_dir, lane)
     members, checked = saved["members"], saved["checked"]
