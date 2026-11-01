@@ -85,7 +85,7 @@ class EventsTest(unittest.TestCase):
             "end": "2026-10-23T09:30:00+00:00",
             "location": "", "conference": "", "status": "confirmed",
             "my_rsvp": "needsAction", "title": "Pending",
-            "rsvps": {"alice.smith@example.com": ["Alice Smith", "accepted"]},
+            "list_title": "Pending",
         })
         self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
 
@@ -138,7 +138,8 @@ class EventsTest(unittest.TestCase):
     def test_snapshot_without_title_is_not_a_title_change(self):
         self.seed(block("a", soon(), rsvp="accepted"))
         data = json.loads(self.snapshot.read_text())
-        del data["events"]["a"]["title"]
+        del data["events"]["a"]["list_title"]
+        data["events"]["a"]["title"] = "Something else"
         self.snapshot.write_text(json.dumps(data))
         self.run_at(listing(block("a", soon(), rsvp="accepted")))
         self.assertEqual(self.emitted(), [])
@@ -171,6 +172,46 @@ class EventsTest(unittest.TestCase):
                         rsvp="accepted"))
         self.run_at(listing(self.mine("accepted")))
         self.assertEqual(self.emitted(), [])
+
+    def test_only_my_events_store_rsvps_without_me_or_organizer(self):
+        self.seed(self.mine("accepted"), block("o", soon(), rsvp="accepted"))
+        data = json.loads(self.snapshot.read_text())
+        self.assertEqual(data["events"]["m"]["rsvps"], {
+            "alice.smith@example.com": ["Alice Smith", "accepted"],
+            "bob.jones@example.com": ["Bob Jones", "accepted"],
+        })
+        self.assertNotIn("rsvps", data["events"]["o"])
+
+    def test_same_names_are_labelled_by_email(self):
+        two = lambda a, b: block(
+            "m", soon(), title="Mine", organizer="me@example.com",
+            rsvp="accepted",
+            extra=f", bob.jones@example.com ({a}), bob.jones@other.test ({b})")
+        self.seed(two("needsAction", "needsAction"))
+        self.run_at(listing(two("accepted", "declined")))
+        (event,) = self.emitted()
+        self.assertEqual(event["details"]["changed"], {
+            "bob.jones@example.com": ["needsAction", "accepted"],
+            "bob.jones@other.test": ["needsAction", "declined"],
+        })
+
+    def test_malformed_old_entry_is_skipped_not_fatal(self):
+        self.seed(self.mine("needsAction"))
+        data = json.loads(self.snapshot.read_text())
+        data["events"]["m"]["rsvps"]["bob.jones@example.com"] = ["Bob"]
+        self.snapshot.write_text(json.dumps(data))
+        self.run_at(listing(self.mine("accepted")))
+        self.assertEqual(self.emitted(), [])
+
+    def test_series_answer_is_reported_once(self):
+        def inst(day, rsvp):
+            return block(f"ser_2026102{day}T083000Z", soon(day - 2),
+                         title="Daily", organizer="me@example.com",
+                         rsvp="accepted",
+                         extra=f", bob.jones@example.com ({rsvp})")
+        self.seed(inst(3, "needsAction"), inst(4, "needsAction"))
+        self.run_at(listing(inst(3, "accepted"), inst(4, "accepted")))
+        self.assertEqual([e["kind"] for e in self.emitted()], ["rsvp"])
 
     def test_snapshot_without_rsvps_compares_nothing(self):
         self.seed(self.mine("needsAction"))

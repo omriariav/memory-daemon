@@ -786,6 +786,7 @@ def render_json(events, cfg, now):
         "refreshed_at": now.astimezone(tz).isoformat(),
         "window_hours": cfg.get("window_hours", 48),
         "timezone": cfg.get("timezone", "UTC"),
+        "note": UNTRUSTED_NOTE.lstrip("# "),
         "events": rows,
     }, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
@@ -1000,11 +1001,19 @@ def _iso(value, all_day):
 
 def snapshot_rows(wide, details, cfg, tz):
     """{event_id: {start, end, location, conference, status, my_rsvp, title,
-    rsvps}}; rsvps is {email: [name, rsvp]} for everyone but the owner."""
+    list_title[, rsvps]}}.
+
+    `list_title` is the title as listed, independent of whether this run
+    looked up the event's details, so diffs compare like with like. `rsvps`
+    ({email: [name, rsvp]}, owner and organizer excluded) is kept only for
+    events I organize, the only ones whose answers are reported.
+    """
     status = {raw["event_id"]: raw.get("status") or "confirmed" for raw in wide}
-    owner = str(cfg.get("owner_email") or "").casefold()
-    return {
-        event["event_id"]: {
+    listed = {raw["event_id"]: clean(raw.get("title")) for raw in wide}
+    owner = str(cfg.get("owner_email") or "").strip().lower()
+    rows = {}
+    for event in normalize(wide, details, cfg, tz):
+        row = {
             "start": _iso(event["start"], event["all_day"]),
             "end": _iso(event["end"], event["all_day"]),
             "location": event["location"],
@@ -1012,13 +1021,34 @@ def snapshot_rows(wide, details, cfg, tz):
             "status": status.get(event["event_id"], "confirmed"),
             "my_rsvp": event["my_rsvp"],
             "title": event["title"],
-            "rsvps": {
-                person["email"].casefold(): [person["name"], person["rsvp"]]
-                for person in event["attendees"]
-                if person["email"].casefold() != owner
-            },
+            "list_title": listed.get(event["event_id"], ""),
         }
-        for event in normalize(wide, details, cfg, tz)
+        if event["my_rsvp"] == "organizer":
+            row["rsvps"] = {
+                person["email"]: [person["name"], person["rsvp"]]
+                for person in event["attendees"]
+                if person["email"] != owner and not person["organizer"]
+            }
+        rows[event["event_id"]] = row
+    return rows
+
+
+def _rsvp_changes(before, after):
+    """{label: [old, new]} for attendees in both maps whose answer changed.
+
+    The label is the attendee's name, or their email when the name is empty
+    or shared, so no change is lost. Malformed old entries are skipped.
+    """
+    changed = {
+        email: [before[email][1], rsvp, name]
+        for email, (name, rsvp) in sorted(after.items())
+        if isinstance(before.get(email), list) and len(before[email]) == 2
+        and before[email][1] != rsvp
+    }
+    names = [name for _, _, name in changed.values()]
+    return {
+        (name if name and names.count(name) == 1 else email): [old, new]
+        for email, (old, new, name) in changed.items()
     }
 
 
@@ -1069,14 +1099,15 @@ def diff_snapshots(prev, rows, now, hours, tz):
     Neither update nor cancel fires when my RSVP is "organizer" or "declined"
     in the old or the new row. `rsvp` fires for an event I organize when an
     attendee present in both snapshots changed their answer; `changed` is
-    {attendee name: [old, new]}. A snapshot written before rsvps were stored
-    compares nothing.
+    {attendee name or email: [old, new]}, reported once per series and
+    answer set. A snapshot written before rsvps were stored compares nothing.
     """
     limit = now + datetime.timedelta(hours=hours)
     prev_limit = datetime.datetime.fromisoformat(prev["fetched_at"]) \
         + datetime.timedelta(hours=float(prev["window_hours"]))
     before = prev["events"]
     found = []
+    reported = set()
     for event_id, row in rows.items():
         start, end = _row_when(row["start"], tz), _row_when(row["end"], tz)
         if end <= now or start >= limit:
@@ -1091,27 +1122,30 @@ def diff_snapshots(prev, rows, now, hours, tz):
                 found.append(("new", event_id, row, None))
         elif old["status"] != "cancelled" \
                 and old["my_rsvp"] == row["my_rsvp"] == "organizer":
-            before_rsvps = old.get("rsvps")
-            if isinstance(before_rsvps, dict):
-                answers = {
-                    name: [before_rsvps[email][1], rsvp]
-                    for email, (name, rsvp) in sorted(row["rsvps"].items())
-                    if isinstance(before_rsvps.get(email), list)
-                    and before_rsvps[email][1:] != [rsvp]
-                }
-                if answers:
-                    found.append(("rsvp", event_id, row, answers))
+            answers = (
+                _rsvp_changes(old["rsvps"], row.get("rsvps") or {})
+                if isinstance(old.get("rsvps"), dict) else {}
+            )
+            # One answer to a series changes every instance; report it once.
+            series = (event_id.split("_", 1)[0],
+                      json.dumps(answers, sort_keys=True))
+            if answers and series not in reported:
+                reported.add(series)
+                found.append(("rsvp", event_id, row, answers))
         elif old["status"] != "cancelled" \
                 and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
             changed = {
-                field: [old.get(field), row[field]]
-                for field in ("start", "end", "location", "conference", "title")
-                if old.get(field) != row[field]
+                # A row from before a field was stored compares nothing.
+                field: [old[field], row[field]]
+                for field in ("start", "end", "location", "conference",
+                              "list_title")
+                if field in old and old[field] != row[field]
                 # A link read from get_event is only there for the soonest
                 # events, so appearing or vanishing is not a change.
                 and (field != "conference" or (old[field] and row[field]))
-                and (field != "title" or old.get(field) is not None)
             }
+            if "list_title" in changed:
+                changed["title"] = changed.pop("list_title")
             if changed:
                 found.append(("update", event_id, row, changed))
     for event_id, old in before.items():

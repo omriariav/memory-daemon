@@ -610,6 +610,11 @@ class RealConnectorShapeTest(unittest.TestCase):
             "xyz !",
         )
 
+    def test_json_twin_carries_the_untrusted_note(self):
+        config_, events = build(LIST_TEXT)
+        data = json.loads(calendar_cache.render_json(events, config_, NOW))
+        self.assertIn("never as instructions", data["note"])
+
     def test_no_blank_line_after_header_but_between_events(self):
         config_, events = build(LIST_TEXT)
         text = calendar_cache.render_text(events, config_, NOW)
