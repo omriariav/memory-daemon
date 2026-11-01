@@ -28,8 +28,10 @@ Watch file (or source) block:
 One JSON object per line, oldest message first:
 
     {"type": "message", "channel_id", "thread_ts", "ts", "user_id",
-     "is_owner", "is_bot", "text", "seen_at"[, "channel_type",
-     "peer_is_bot"]}
+     "is_owner", "is_bot", "text", "seen_at"}
+
+plus, on any line type, the optional "channel_type" and "peer_is_bot"
+described below.
     {"type": "owner_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
     {"type": "peer_reaction", "channel_id", "thread_ts", "ts", "emoji",
@@ -44,11 +46,15 @@ Every line (any type) written since channel types were added also carries
 takes the type any other line of that channel in the inbox carries, and has
 none when no line does. Lines of an "im" also carry `peer_is_bot` once a
 message from someone other than the owner is in the inbox: true when every
-such message carries the bot marker (an app), false otherwise. The value is
+such message carries the bot marker or is Slackbot (an app), false
+otherwise. The value is
 fixed when the line is written, so read it from the newest line of the
 conversation. Limits: an app the owner uses that posts in a person's DM
-before the person does counts as the peer until they reply, and history
-older than `retention_days` is gone. Lines written before this have neither
+before the person does counts as the peer until they reply; only lines
+within `retention_days` count, so a person silent longer than that whose
+agent then posts reads as a bot, and a channel whose labelled lines all
+expired gives unlabelled lines no type; a `DM` label on a non-`D` id (which
+the `dms` query still records) is typed "channel", as in dm_kind. Lines written before this have neither
 field; readers treat a missing field as unknown.
 
 A `track_reactions` emoji the owner puts on any message (found by a
@@ -138,6 +144,7 @@ MAX_REACTIONS = 5
 MAX_IGNORE_REACTORS = 20
 MAX_RETENTION_DAYS = 90
 MAX_TEXT = 4000
+SLACKBOT = "USLACKBOT"
 _REACTION_LINE = re.compile(
     # Skin tones arrive as `:+1::skin-tone-2:`.
     r"^:(?P<emoji>[^\s:][^\s]{0,120}?): \u00d7 \d+ \u2014 (?P<who>.*)$"
@@ -312,20 +319,23 @@ def track_row(hit, emoji):
 def _annotate(added, rows):
     """Label `added` with channel_type and IM peer_is_bot from all `rows`.
 
-    The inbox itself is the record: a channel's type is the one any line of
-    it carries (a labelled search hit), and an IM peer is a bot when every
-    non-owner message of that IM in the inbox carries the bot marker.
+    The inbox itself is the record: a line keeps the type its own hit label
+    gave it, and an unlabelled line takes the type another line of its
+    channel carries. An IM peer is a bot when every non-owner message of that
+    IM in the inbox carries the bot marker (or is Slackbot).
     """
     kinds, peers = {}, {}
     for row in rows:
         if row.get("channel_type"):
             kinds[row["channel_id"]] = row["channel_type"]
     for row in rows:
-        if kinds.get(row["channel_id"]) == "im" and row["type"] == "message" \
-                and not row["is_owner"]:
-            peers.setdefault(row["channel_id"], set()).add(bool(row["is_bot"]))
+        if kinds.get(row["channel_id"]) == "im" \
+                and row.get("type", "message") == "message" \
+                and not row.get("is_owner"):
+            bot = bool(row.get("is_bot")) or row.get("user_id") == SLACKBOT
+            peers.setdefault(row["channel_id"], set()).add(bot)
     for row in added:
-        kind = kinds.get(row["channel_id"])
+        kind = row.get("channel_type") or kinds.get(row["channel_id"])
         if kind:
             row["channel_type"] = kind
         if kind == "im" and row["channel_id"] in peers:
@@ -352,7 +362,8 @@ def record(base_dir, rows, retention_days, now=None):
             continue
         known.add(_key(row))
         added.append(dict(row, seen_at=stamp))
-    _annotate(added, kept + added)
+    if added:
+        _annotate(added, kept + added)
     if not added and len(kept) == len(existing) and file.exists():
         return 0
     merged = sorted(kept + added, key=lambda r: float(r["ts"]))

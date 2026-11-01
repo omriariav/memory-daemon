@@ -1083,6 +1083,20 @@ class ChannelTypeTest(unittest.TestCase):
                                     bot=True))
         self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
 
+    def test_slackbot_dm_is_a_bot(self):
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM",
+                                    user="USLACKBOT"))
+        self.assertTrue(rows[("D0EXAMPLE01", self.ts(1))]["peer_is_bot"])
+
+    def test_partial_old_line_does_not_break_recording(self):
+        file = comms_inbox.path(self.base)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps({"channel_id": "D0EXAMPLE01",
+                                    "ts": self.ts(1), "channel_type": "im"})
+                        + "\n")
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(2), "DM"))
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
     def test_unlabelled_human_before_a_labelled_bot_counts(self):
         rows = self.record(
             self.hit("D0EXAMPLE01", self.ts(1)),

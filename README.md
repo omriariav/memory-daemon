@@ -2124,9 +2124,11 @@ One JSON object per line, oldest message first:
 - `peer_is_bot` (lines of an `"im"` only, once a message from someone other
   than the owner is in the inbox): `true` when every such message carries the
   bot marker (an app), else `false`. A person whose own agent sometimes posts
-  for them stays `false`. It is fixed when the line is written, so read the
-  newest line. An app of the owner's that posts in a person's DM before they
-  reply counts as the peer until then.
+  for them stays `false`; Slackbot counts as a bot. It is fixed when the line
+  is written, so read the newest line. Only lines within `retention_days`
+  count: a person silent for longer whose agent then posts reads as a bot,
+  and an app of the owner's that posts in a person's DM before they reply
+  counts as the peer until then.
 - Lines written before these fields existed lack them; treat a missing
   field as unknown. Existing lines are never rewritten.
 - Both sides are recorded: other people's messages and the owner's own

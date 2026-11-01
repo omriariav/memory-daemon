@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import (
+    comms_inbox,
     config, count_only, runner, slack_mcp, slack_watch,
 )
 
@@ -150,11 +151,11 @@ class ClusteringTest(SessionCase):
     def test_legacy_private_channel_is_not_a_dm(self):
         hit = {"channel": MPIM, "label": "Private", "replies": 0,
                "ts": ts_at(1), "root": ts_at(1), "is_bot": False}
-        self.assertIsNone(slack_mcp.dm_kind(hit))
-        self.assertEqual(slack_mcp.dm_kind(dict(hit, label="DM")), None)
-        self.assertEqual(slack_mcp.dm_kind(dict(hit, label="Group DM")), "mpim")
+        self.assertIsNone(comms_inbox.dm_kind(hit))
+        self.assertEqual(comms_inbox.dm_kind(dict(hit, label="DM")), None)
+        self.assertEqual(comms_inbox.dm_kind(dict(hit, label="Group DM")), "mpim")
         self.assertEqual(
-            slack_mcp.dm_kind(dict(hit, channel=DM, label="DM")), "im"
+            comms_inbox.dm_kind(dict(hit, channel=DM, label="DM")), "im"
         )
 
     def test_group_dm_sessions_and_channel_types(self):

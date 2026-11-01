@@ -1224,9 +1224,6 @@ def _save_dm_state(routine_id, channels, keep_after):
     return True
 
 
-dm_kind = comms_inbox.dm_kind
-
-
 def _place(sessions, ts, gap, span):
     """The session a message belongs to (created or extended as needed).
 
@@ -1295,7 +1292,7 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
     by_channel = {}
     threaded = []
     for query, hit in found:
-        if dm_kind(hit) not in dm["channel_types"]:
+        if comms_inbox.dm_kind(hit) not in dm["channel_types"]:
             continue
         if hit["root"] != hit["ts"] or hit["replies"]:
             # A reply or a parent with replies: tagged below when it belongs
