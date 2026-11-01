@@ -55,6 +55,7 @@ INVITE_CHUNK_DAYS = 7
 INVITES_EVERY = 3600
 INVITES_SLACK = 120
 INVITES_FILE = "calendar-invites.json"
+SEEN_DAYS = 60
 # my_rsvp values (see _rsvp_for_owner) whose update/cancel events are noise:
 # my own events, and ones I declined.
 QUIET_RSVPS = frozenset({"organizer", "declined"})
@@ -858,8 +859,10 @@ def invite_windows(cfg, now):
 
     Empty when invite_lookahead_days does not reach past the diff window.
     """
+    # Past the diff window, or past the output window when the diff is off.
+    offset = diff_hours(cfg) or float(cfg.get("window_hours", 48))
     start = now.astimezone(datetime.timezone.utc).replace(microsecond=0) \
-        + datetime.timedelta(hours=diff_hours(cfg))
+        + datetime.timedelta(hours=offset)
     end = now.astimezone(datetime.timezone.utc).replace(microsecond=0) \
         + datetime.timedelta(days=float(cfg.get("invite_lookahead_days", 0)))
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -918,8 +921,16 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
     if stamp - tried < INVITES_EVERY - INVITES_SLACK:
         return 0
     seen = saved.get("seen")
-    first_scan = not isinstance(seen, dict)
-    seen = {} if first_scan else dict(seen)
+    # A changed range re-baselines: invites that were simply outside the old
+    # range are not new.
+    scope = [diff_hours(cfg), float(cfg.get("window_hours", 48)),
+             float(cfg.get("invite_lookahead_days", 0))]
+    first_scan = not isinstance(seen, dict) or saved.get("scope") != scope
+    seen = dict(seen) if isinstance(seen, dict) else {}
+    # Series the diff already tracks (announced there, or there before).
+    snapshot = load_snapshot(base_dir) or {}
+    tracked = {_series(event_id) for event_id in snapshot.get("events", {})}
+    skip = {t.strip().casefold() for t in cfg.get("skip_titles", [])}
     owner = str(cfg.get("owner_email") or "").strip().lower()
     list_tool = cfg["list_tool"]
     pending, complete = {}, True
@@ -958,23 +969,26 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
             # even when it runs into this one.
             if _bounds(raw, tz)[0] < floor:
                 continue
+            if raw["all_day"] and clean(raw.get("title")).casefold() in skip:
+                continue
             if _rsvp_for_owner(owner, raw.get("organizer"),
                                raw["attendees"]) == "needsAction":
-                # One announcement per recurring series, not per instance.
+                # One announcement per recurring series, not per instance,
+                # naming its next instance.
                 key = _series(raw["event_id"])
                 start = _iso(raw["start"], raw["all_day"])
-                if key not in pending or start > _iso(
+                if key not in pending or start < _iso(
                         pending[key]["start"], pending[key]["all_day"]):
                     pending[key] = raw
-    fresh = [key for key in pending if key not in seen]
-    for key, raw in pending.items():
-        # The latest start keeps a moved invite or a series remembered.
-        start = _iso(raw["start"], raw["all_day"])
-        seen[key] = max(str(seen.get(key, "")), start)
-    # Forget invites that have started; the record stays small.
-    today = now.astimezone(tz).date().isoformat()
-    seen = {k: v for k, v in seen.items() if str(v)[:10] >= today}
-    record = {"tried": stamp}
+    fresh = [key for key in pending if key not in seen and key not in tracked]
+    # Remembered by when it was last listed, so a sparse (monthly) series or
+    # a moved invite is not announced again; dropped after SEEN_DAYS unlisted.
+    today = now.astimezone(tz).date()
+    for key in pending:
+        seen[key] = today.isoformat()
+    floor_day = (today - datetime.timedelta(days=SEEN_DAYS)).isoformat()
+    seen = {k: v for k, v in seen.items() if str(v)[:10] >= floor_day}
+    record = {"tried": stamp, "scope": scope}
     if not first_scan or complete:
         # A first scan only starts the record when it saw every window
         # whole; otherwise what it missed would be announced next time.

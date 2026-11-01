@@ -69,7 +69,7 @@ class EventsTest(unittest.TestCase):
 
     def run_far(self, main_text, far_texts, now=NOW, **over):
         """Main listing answers the main session; far_texts[i] window i."""
-        config_ = dict(self.cfg, invite_lookahead_days=21, **over)
+        config_ = dict(self.cfg, **dict({"invite_lookahead_days": 21}, **over))
         windows = calendar_cache.invite_windows(config_, now)
         main_args = calendar_cache.list_args(config_, now)
         far_calls = []
@@ -163,6 +163,34 @@ class EventsTest(unittest.TestCase):
                      max_events=1)
         path = self.base / "state" / "calendar-invites.json"
         self.assertNotIn("seen", json.loads(path.read_text()))
+
+    def test_a_series_the_diff_already_tracks_is_not_announced(self):
+        def inst(day):
+            return block(f"wk_202610{day:02d}T090000Z", soon(day - 20),
+                         title="Weekly")
+        # The diff sees (and announces) the first instance near-term.
+        self.run_far(listing(inst(23)), [listing(), listing()])
+        self.run_far(listing(inst(23)), [listing(inst(30)), listing()],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_changed_range_rebaselines_silently(self):
+        far = block("far", soon(25), title="Far")
+        self.run_far(listing(), [listing(), listing()])
+        self.run_far(listing(), [listing(), listing(), listing(far)],
+                     now=NOW + datetime.timedelta(hours=1),
+                     invite_lookahead_days=28)
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_monthly_series_is_not_announced_again(self):
+        self.run_far(listing(), [listing(), listing()])
+        nov = block("mo_20261102T090000Z", soon(16), title="Monthly")
+        dec = block("mo_20261202T090000Z", soon(46), title="Monthly")
+        self.run_far(listing(), [listing(), listing(nov)],
+                     now=NOW + datetime.timedelta(hours=1))
+        later = NOW + datetime.timedelta(days=30)
+        self.run_far(listing(), [listing(), listing(dec)], now=later)
+        self.assertEqual(len(self.emitted()), 1)
 
     def test_a_far_scan_failure_never_fails_the_refresh(self):
         with mock.patch.object(calendar_cache, "scan_far_invites",

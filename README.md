@@ -792,13 +792,18 @@ have not ended and start inside the window count.
 Far invites: with `invite_lookahead_days` past the diff window (e.g. 21),
 an unanswered invite further out is announced too. Once an hour (a failed
 attempt backs off an hour), after the outputs are written, the range from
-the end of the diff window to `invite_lookahead_days` is listed in pinned
+the end of the diff window (the output window when the diff is off) to
+`invite_lookahead_days` is listed in pinned
 7-day windows, each its own small bridge session, and every invite I have
 not answered that was not listed before (and that starts in that range)
-emits one gcal `new` event (with `untrusted: true`); a recurring series is
-announced once. The first scan only records what is already there, and
-only when every window listed in full. An invite created to start within
-about an hour past the diff window's edge can be missed by both checks. The record of seen invites is `state/calendar-invites.json`. It
+emits one gcal `new` event (with `untrusted: true`, naming its next
+instance); a recurring series is announced once, and one the diff already
+tracks is not announced. Invites are remembered for 60 days after they were
+last listed. The first scan, and the first after the range changes, only
+record what is there (and only when every window listed in full); `skip_titles`
+applies. Limits: an invite created to start within about an hour past the
+diff window's edge can be missed by both checks, and one the scan announced
+that is later moved into the diff window is announced again there. The record of seen invites is `state/calendar-invites.json`. It
 never emits update or cancel events and does not touch the diff snapshot;
 an invite it announced is not announced again when it reaches the diff
 window, because the diff never treats an invite that scrolled in as new.
