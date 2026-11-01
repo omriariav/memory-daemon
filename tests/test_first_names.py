@@ -256,7 +256,7 @@ class CaptureTest(Base):
         self.addCleanup(identity._providers.clear)
 
     def capture(self, people, source_people, safe=True, extra=None,
-                owner_email="me.owner@example.com"):
+                owner_email="me.owner@example.com", verified=()):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True, **(extra or {})})
@@ -282,7 +282,7 @@ class CaptureTest(Base):
                 mock.patch.object(memory_sink, "_authenticated_identity",
                                   return_value=ident), \
                 mock.patch.object(memory_sink, "_verified_source_people",
-                                  return_value=([], [])), \
+                                  return_value=(list(verified), [])), \
                 mock.patch.object(memory_sink, "_prefetch_identities"), \
                 mock.patch.object(memory_sink, "_commit_store"), \
                 mock.patch.object(memory_sink, "_emit_capture_event"), \
@@ -298,7 +298,7 @@ class CaptureTest(Base):
              attendee("augusta.king@example.com"),
              attendee("ada.byron@example.com", role="gmail-sender"),
              attendee("me.owner@example.com")])
-        self.assertEqual(people, "ada-lovelace,augusta-king,jane-doe")
+        self.assertEqual(people, "ada-lovelace,augusta-king")
 
     def test_declined_invitee_does_not_make_a_name_ambiguous(self):
         people = self.capture(
@@ -306,13 +306,13 @@ class CaptureTest(Base):
             [attendee("ada.lovelace@example.com", rsvp="accepted"),
              attendee("ada.byron@example.com", "Ada Byron",
                       rsvp="declined")])
-        self.assertEqual(people, "ada-lovelace,jane-doe")
+        self.assertEqual(people, "ada-lovelace")
 
     def test_declined_invitee_is_never_matched(self):
         people = self.capture(
             ["Ada", "jane-doe"],
             [attendee("ada.lovelace@example.com", rsvp="declined")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_declined_owner_still_makes_a_name_ambiguous(self):
         people = self.capture(
@@ -320,7 +320,7 @@ class CaptureTest(Base):
             [attendee("ME.OWNER@example.com", "Ada Owner", rsvp="declined"),
              attendee("ada.lovelace@example.com", "Ada Lovelace",
                       rsvp="accepted")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_declined_external_guest_is_ignored(self):
         people = self.capture(
@@ -328,7 +328,7 @@ class CaptureTest(Base):
             [attendee("guest@other.example", "Ada Guest", rsvp="declined"),
              attendee("ada.lovelace@example.com", "Ada Lovelace",
                       rsvp="accepted")])
-        self.assertEqual(people, "ada-lovelace,jane-doe")
+        self.assertEqual(people, "ada-lovelace")
 
     def test_unsafe_identity_adds_nothing(self):
         people = self.capture(
@@ -343,32 +343,32 @@ class CaptureTest(Base):
             ["Ada", "jane-doe"],
             [attendee("ME.OWNER@example.com", "Ada Owner"),
              attendee("ada.lovelace@example.com")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_owner_with_a_unique_first_name_is_never_matched(self):
         people = self.capture(
             ["Me", "Ada", "jane-doe"],
             [attendee("me.owner@example.com", "Me Owner"),
              attendee("ada.lovelace@example.com")])
-        self.assertEqual(people, "ada-lovelace,jane-doe")
+        self.assertEqual(people, "ada-lovelace")
 
     def test_owner_alias_email_resolving_to_the_owner_slug(self):
         DIRECTORY["me.alias"] = "memory-owner"
         self.addCleanup(DIRECTORY.pop, "me.alias")
         people = self.capture(
             ["Me", "jane-doe"], [attendee("me.alias@example.com")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
         people = self.capture(
             ["Ada", "jane-doe"],
             [attendee("me.alias@example.com", "Ada Owner"),
              attendee("ada.lovelace@example.com")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_public_mail_owner_domain_is_not_internal(self):
         people = self.capture(
             ["Ada", "jane-doe"], [attendee("ada.lovelace@gmail.com")],
             owner_email="owner@gmail.com")
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_configured_internal_domains_reach_capture(self):
         extra = {"internal_domains": ["Partner.Example"]}
@@ -377,7 +377,7 @@ class CaptureTest(Base):
         # Only the configured domain counts; the identity domain does not.
         self.assertEqual(
             self.capture(["Ada", "Gus", "jane-doe"], rows, extra=extra),
-            "ada-lovelace,jane-doe")
+            "ada-lovelace")
 
     def test_public_mail_owner_with_configured_domains(self):
         people = self.capture(
@@ -391,7 +391,7 @@ class CaptureTest(Base):
             ["Ada", "jane-doe"],
             [attendee("ada.lovelace@example.com"),
              attendee("ada.lovelace@partner.example", "Ada Lovelace")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
 
     def test_canonicalize_does_not_preempt_a_bare_name(self):
         # The directory resolves the bare "Gus" outright; for a meeting it
@@ -400,17 +400,46 @@ class CaptureTest(Base):
         self.addCleanup(DIRECTORY.pop, "Gus")
         people = self.capture(
             ["Gus", "jane-doe"], [attendee("ada.lovelace@example.com")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
         people = self.capture(
             ["Gus", "jane-doe"], [attendee("augusta.king@example.com")])
-        self.assertEqual(people, "augusta-king,jane-doe")
+        self.assertEqual(people, "augusta-king")
 
     def test_ambiguous_first_name_is_dropped_as_before(self):
         people = self.capture(
             ["Ada", "jane-doe"],
             [attendee("ada.lovelace@example.com"),
              attendee("ada.byron@example.com")])
-        self.assertEqual(people, "jane-doe")
+        self.assertIsNone(people)
+
+    def test_known_slug_that_was_not_invited_is_dropped(self):
+        # Named in the meeting, known to the store, but not invited.
+        people = self.capture(
+            ["jane-doe", "Ada"], [attendee("ada.lovelace@example.com")])
+        self.assertEqual(people, "ada-lovelace")
+
+    def test_small_meeting_lists_every_verified_invitee(self):
+        ada = {"email": "ada.lovelace@example.com", "slug": "ada-lovelace"}
+        people = self.capture(
+            ["jane-doe"],
+            [attendee("me.owner@example.com"),
+             attendee("ada.lovelace@example.com")], verified=[ada])
+        self.assertEqual(people, "ada-lovelace")
+
+    def test_large_meeting_keeps_only_named_invitees(self):
+        rows = [attendee(f"p{n}@example.com") for n in range(5)]
+        verified = [{"email": f"p{n}@example.com", "slug": f"person-{n}"}
+                    for n in range(5)]
+        people = self.capture(["person-2", "jane-doe"], rows,
+                              verified=verified)
+        self.assertEqual(people, "person-2")
+
+    def test_declined_invitee_is_not_listed_in_a_small_meeting(self):
+        # _verified_source_people already drops declined rows; the count
+        # of invitees ignores them too.
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com", rsvp="declined")])
+        self.assertIsNone(people)
 
     def test_non_calendar_sources_are_untouched(self):
         people = self.capture(

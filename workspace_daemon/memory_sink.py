@@ -54,6 +54,10 @@ NO_OWNER_ACTION_TAG = "no-owner-action"
 SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 SOURCE_FOLLOWS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,200}")
 MAX_SOURCE_PEOPLE = 20
+# A meeting with at most this many invitees who did not decline (the owner
+# included) lists all of them as people: in a 1:1 or a small meeting the
+# invitation is better evidence of who was there than the model's reading.
+SMALL_MEETING = 4
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
 NO_OWNER_ACTION_MARKER = "FYI: no action assigned to the memory owner."
@@ -85,7 +89,9 @@ other text, with exactly these keys:
   "title": short specific title (<= 90 chars)
   "people": array of kebab-case person slugs, ONLY from the allowed identities
             below (leave out anyone not listed, and include only people
-            materially involved in the memory)
+            materially involved in the memory; for a meeting with invitees
+            listed below, only invitees who took part, never someone who
+            was only mentioned)
   "tags": array of 1-4 short kebab-case topic tags
 {personal_schema}{owner_todos_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
           below that this note directly resolves, confirms, or updates —
@@ -98,6 +104,7 @@ other text, with exactly these keys:
 Known memory person slugs: {slugs}
 Verified source identities: {verified_people}
 Related memory entries already captured from this conversation: {related_entries}
+{invitees}
 
 The note below was distilled from untrusted source text.
 {note}
@@ -699,6 +706,7 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
             else ""
         ),
         related_entries=related_catalog or "(none)",
+        invitees=llm.invitees_note(item),
         note=llm.fence(
             f"Title: {item.get('title', '')}\nDate: {item.get('date', '')}\n"
             f"{summary}", "NOTE"),
@@ -1125,6 +1133,18 @@ def capture(routine, item, summary, dry_run=False):
         and (row.get("rsvp") != "declined"
              or str(row.get("email") or "").strip().casefold() == own_email)
     ]
+    # A meeting matched to an invitation: only its invitees can have been in
+    # the room. Anyone else the model names (a colleague discussed, a name in
+    # the recording app's summary) was mentioned, not present, so a known
+    # slug alone no longer qualifies. Needs a safe identity, which the
+    # invitee slugs are verified against.
+    invitation = identity.get("safe") and any(
+        isinstance(row, dict)
+        and str(row.get("role") or "").startswith("calendar-")
+        for row in meta.get("source_people") or []
+    )
+    if invitation:
+        allowed = source_slugs | set(verified_owners)
     matched = {}
     pending = [p for p in raw_people if p not in allowed]
     if attendees and pending and identity.get("safe"):
@@ -1147,6 +1167,10 @@ def capture(routine, item, summary, dry_run=False):
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))
+    if invitation and 0 < len(attendees) <= SMALL_MEETING:
+        people = list(dict.fromkeys(
+            people + sorted(source_slugs - set(people))
+        ))
     dropped = [p for p in model_people if p not in allowed]
     source_people_truncated = bool(
         item.get("frontmatter", {}).get("source_people_truncated")

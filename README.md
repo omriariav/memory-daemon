@@ -1228,6 +1228,16 @@ directory (symlinks resolved) as its working directory.
   existing known-slug check: a slug the store has not seen is still dropped
   and tagged `people-unmapped`. The one exception is the meeting first-name
   path below, whose slugs are attested by the calendar invitation instead.
+- **Meeting attendance.** A capture matched to a calendar invitation (`mila`,
+  `whisper`, `zoom`) lists as `people` only invitees who did not decline: a
+  name the store knows but the invitation lacks (someone discussed, or named
+  in the recording app's own summary) is dropped, since they were mentioned,
+  not present. With at most 4 such invitees (the owner included) every
+  verified invitee is listed even when the model left them out; above that,
+  only the invitees the model names. The summary and extraction prompts carry
+  the invitee names with the rule that no one else can have attended or be
+  credited with a statement. Without an invitation, or without a safe owner
+  identity, capture works as before.
 - **Meeting first names.** A capture with calendar attendees (`mila`,
   `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one
   attendee who goes by it, never to anyone else in the directory. This runs on
