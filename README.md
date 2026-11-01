@@ -1232,19 +1232,23 @@ directory (symlinks resolved) as its working directory.
   `whisper`, `zoom`) lists as `people` only the invitees who attended: a
   name the store knows but the invitation lacks (someone discussed, or named
   in the recording app's own summary) is dropped, since they were mentioned,
-  not present. Per invitee besides the owner: **declined** when the RSVP
-  says so (listed even when the directory cannot verify them); **attended**
-  when a speaker the recording names (Mila speaker names, generic labels
-  like "Speaker 2" ignored, the owner's names from `owner_todos` excluded)
-  matches them or the model names them as a participant, and, in a meeting
-  of at most 4 (the owner included) whose recording names no speaker besides
-  the owner, when they accepted; otherwise a **no-show** when every voice in
-  the recording is named (`mila_speaker_count`), else **unconfirmed**.
-  Appended to the body: "Invited, not present: Name (declined), Name
-  (no-show)." and "Attendance unconfirmed (reason): Name (no reply)."; a
-  larger meeting counts unconfirmed invitees instead of naming them, and
-  long lists end with "and N more". Limit: the store merges `people` on an
-  update, so a re-capture never removes someone listed by an earlier one.
+  not present. Per invitee besides the owner: **attended** when a speaker
+  the recording names matches them (a full-name label by full name, a
+  one-word label by a first name unique among invitees; generic labels like
+  "Speaker 2" and the owner's names from `owner_todos` are ignored) or the
+  model names them as a participant, and, in a meeting of at most 4 (the
+  owner included) whose recording names no speaker besides the owner, when
+  they accepted (an organizer counts as accepted); otherwise **declined**
+  when the RSVP says so (also unverified invitees; a decliner who spoke is
+  not listed), a **no-show** when every voice in the recording is named
+  (`mila_all_speakers_named`), else **unconfirmed**, with the reason (the
+  source does not say who spoke, the recording names no one besides the
+  owner, or not every voice is named). Appended to the body: "Invited, not
+  present: Name (declined), Name (no-show)." and "Attendance unconfirmed
+  (reason): Name (no reply)."; a larger meeting counts unconfirmed invitees
+  instead of naming them, and long lists end with "and N more". Limit: the
+  store merges `people` on an update, so a re-capture never removes someone
+  listed by an earlier one.
   This applies only when every invitee is verified (safe owner
   identity, every directory lookup found the person, at most 20 rows) and
   someone besides the owner was invited (an owner's own block says nothing

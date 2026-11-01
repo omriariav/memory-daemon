@@ -712,13 +712,14 @@ def _listed(names):
 def _attendance(meta, verified_source, identity, model_people, owner_names):
     """(attended slugs, attendance line or "") for an invitation capture.
 
-    Per invitee besides the owner: declined when the RSVP says so (any
-    calendar row, verified or not). Of the verified others, attended when a
-    named speaker in the recording matches them or the model names them as a
-    participant; in a small meeting whose recording names no speaker besides
-    the owner, also when they accepted. A verified invitee without such
-    evidence is a no-show only when every speaker in the recording is named
-    (``mila_speaker_count``); otherwise their attendance is unconfirmed.
+    Per invitee besides the owner: attended when a named speaker in the
+    recording matches them (a full-name label by full name, a one-word label
+    by a first name unique among invitees) or the model names them as a
+    participant, and, in a small meeting whose recording names no speaker
+    besides the owner, when they accepted (an organizer counts as accepted).
+    Otherwise declined when the RSVP says so (any calendar row), a no-show
+    when every voice in the recording is named, else unconfirmed. Evidence
+    beats a declined RSVP.
     """
     from . import calendar_cache, owner_todos  # late import to avoid cycles
 
@@ -727,19 +728,22 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
         _name_key((identity.get("person") or {}).get("name"))
     }
     owners.discard("")
+    owner_firsts = {name.split(" ")[0] for name in owners}
     by_email = {
         str(person.get("email") or "").strip().casefold(): person
         for person in verified_source
     }
-    named = [
+    mila = "mila_speaker_names" in meta
+    speakers = [
         _name_key(name) for name in meta.get("mila_speaker_names") or []
         if _name_key(name)
         and not owner_todos._GENERIC_SPEAKER_RE.match(str(name).strip())
+        and _name_key(name) not in owners
+        and _name_key(name) not in owner_firsts
     ]
-    speakers = [name for name in named if name not in owners]
-    count = meta.get("mila_speaker_count")
-    all_named = isinstance(count, int) and 0 < count <= len(named)
-    declined, invitees = [], []
+    all_named = bool(meta.get("mila_all_speakers_named"))
+    rank = {"accepted": 3, "tentative": 2, "needsAction": 1, "declined": 0}
+    invitees, declined = {}, []
     for row in meta.get("source_people") or []:
         if not isinstance(row, dict) \
                 or not str(row.get("role") or "").startswith("calendar-"):
@@ -750,31 +754,42 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
         person = by_email.get(email)
         name = str((person or {}).get("name") or row.get("name")
                    or calendar_cache.name_from_email(email) or email)
-        if row.get("rsvp") == "declined":
-            if name not in declined:
+        if _name_key(name) in owners:
+            continue  # an owner alias
+        rsvp = row.get("rsvp") or (
+            "accepted" if row.get("role") == "calendar-organizer"
+            else "needsAction")
+        if not person:
+            if rsvp == "declined" and name not in declined:
                 declined.append(name)
-        elif person and all(i["slug"] != person["slug"] for i in invitees):
-            invitees.append({"slug": person["slug"], "name": name,
-                             "rsvp": row.get("rsvp") or "needsAction"})
+            continue
+        known = invitees.get(person["slug"])
+        if not known or rank.get(rsvp, 1) > rank.get(known["rsvp"], 1):
+            invitees[person["slug"]] = {"slug": person["slug"], "name": name,
+                                        "rsvp": rsvp}
+    invitees = list(invitees.values())
     small = len(invitees) + 1 <= SMALL_MEETING
     firsts = {}
-    for invitee in invitees:
-        first = _name_key(invitee["name"]).split(" ")[0]
+    for name in [i["name"] for i in invitees] + declined:
+        first = _name_key(name).split(" ")[0]
         firsts[first] = firsts.get(first, 0) + 1
 
-    def spoke(invitee):
-        full = _name_key(invitee["name"])
+    def spoke(name):
+        full = _name_key(name)
         first = full.split(" ")[0]
         return any(
             label == full
-            or (firsts.get(first) == 1 and label.split(" ")[0] == first)
+            or (" " not in label and label == first and firsts.get(first) == 1)
             for label in speakers
         )
 
+    declined = [name for name in declined if not spoke(name)]
     attended, no_show, unconfirmed = [], [], []
     for invitee in invitees:
-        if spoke(invitee) or invitee["slug"] in model_people:
+        if spoke(invitee["name"]) or invitee["slug"] in model_people:
             attended.append(invitee["slug"])
+        elif invitee["rsvp"] == "declined":
+            declined.append(invitee["name"])
         elif small and not speakers and invitee["rsvp"] == "accepted":
             attended.append(invitee["slug"])
         elif all_named and speakers:
@@ -789,8 +804,12 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
     if gone:
         parts.append(f"Invited, not present: {_listed(gone)}.")
     if unconfirmed:
-        why = ("not every speaker in the recording is named" if named
-               else "the recording names no speaker besides the owner")
+        if not mila:
+            why = "the source does not say who spoke"
+        elif not speakers:
+            why = "the recording names no speaker besides the owner"
+        else:
+            why = "not every speaker in the recording is named"
         listed = (_listed(unconfirmed) if small
                   else f"{len(unconfirmed)} other invitee(s)")
         parts.append(f"Attendance unconfirmed ({why}): {listed}.")
