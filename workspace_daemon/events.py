@@ -4,7 +4,9 @@ calendar invite, change or cancellation, and per operational alert.
 `state/events.jsonl` lets a reader (a notifier, a dashboard) follow captures
 without polling the memory store. `memory_sink.capture` (source from the
 `source_id` prefix, e.g. slack), the `calendar_cache` routine (source gcal)
-and `alerts.check` (source daemon, kind "alert") write it; every other reader must treat it as read-only.
+`alerts.check` (source daemon, kind "alert") and the Mila source's language
+check (also a daemon alert) write it; every other reader must treat it as
+read-only.
 
 One JSON object per line, oldest first:
 

@@ -233,13 +233,20 @@ HINTS_HEADING = "Unverified hints from the recording app (may be wrong)"
 
 # A recording transcribed in the wrong language loses its speakers and
 # names. With ``language_check`` set, a recording whose language is not the
-# expected one, but whose Mila summary, title or transcript is written in the
-# expected script, is held (not captured) for up to ``hold_minutes`` after it
-# ended, so it can be re-transcribed first; a daemon alert names it once.
-# After the hold it is captured as is. Only Hebrew is supported.
+# expected one, but whose Mila summary or transcript is mostly written in the
+# expected script, is held (not captured) for ``hold_minutes`` after Mila
+# finished it, so it can be re-transcribed first; a daemon alert names it
+# once. The hold never runs past ``calendar_match_hours`` minus
+# LANGUAGE_MATCH_MARGIN after the recording ended, so the calendar match keeps
+# its retries. After the hold it is captured as is. Only Hebrew is supported.
 LANGUAGE_CHECK_KEYS = {"expect", "hold_minutes"}
 LANGUAGE_SCRIPTS = {"he": ("\u0590", "\u05ff")}
 LANGUAGE_MIN_LETTERS = 20
+# Share of a text's letters in the expected script for it to count: a few
+# Hebrew names in an English summary or transcript do not.
+LANGUAGE_SUMMARY_SHARE = 0.3
+LANGUAGE_TRANSCRIPT_SHARE = 0.2
+LANGUAGE_MATCH_MARGIN = 1800
 LANGUAGE_FLAGGED_FILE = "mila-language-flagged.json"
 MAX_LANGUAGE_FLAGGED = 500
 
@@ -253,9 +260,12 @@ def language_check_settings(source):
             "hold_minutes": float(cfg.get("hold_minutes", 120))}
 
 
-def _script_letters(text, expect):
+def _in_script(text, expect, share):
     low, high = LANGUAGE_SCRIPTS[expect]
-    return sum(1 for ch in str(text or "") if low <= ch <= high)
+    text = str(text or "")
+    letters = sum(1 for ch in text if ch.isalpha())
+    hits = sum(1 for ch in text if low <= ch <= high)
+    return hits >= LANGUAGE_MIN_LETTERS and hits >= share * letters
 
 
 def _wrong_language(record, directory, check):
@@ -263,57 +273,100 @@ def _wrong_language(record, directory, check):
     language = str(record.get("language") or "").strip().lower()
     if not language or language == check["expect"]:
         return False
-    texts = [record.get("summary"), record.get("title")]
+    if _in_script(record.get("summary"), check["expect"],
+                  LANGUAGE_SUMMARY_SHARE):
+        return True
     try:
-        texts.append(_transcript(record, directory)[0])
-    except Exception:  # noqa: BLE001 - the summary and title still count
-        pass
-    return any(
-        _script_letters(text, check["expect"]) >= LANGUAGE_MIN_LETTERS
-        for text in texts
+        body = _transcript(record, directory)[0]
+    except Exception:  # noqa: BLE001 - _candidate reports an unreadable one
+        return False
+    return _in_script(body, check["expect"], LANGUAGE_TRANSCRIPT_SHARE)
+
+
+def _language_deadline(record, end, check, source):
+    """When the hold of ``record`` ends."""
+    hold = completion_time(record, end) + datetime.timedelta(
+        minutes=check["hold_minutes"]
     )
+    horizon = end + datetime.timedelta(
+        seconds=float(source.get("calendar_match_hours", 6)) * 3600
+        - LANGUAGE_MATCH_MARGIN
+    )
+    return min(hold, horizon)
 
 
-def _flag_language(record, check):
-    """Alert once per recording that it is held for a language mismatch."""
+def _language_state():
+    """(path, {recording id: "held" | "released"}), or (None, {}) off-run."""
     base = llm.base_dir()
     if base is None:
-        return
+        return None, {}
     path = Path(base) / "state" / LANGUAGE_FLAGGED_FILE
     try:
         flagged = json.loads(path.read_text())
-        if not isinstance(flagged, list):
-            flagged = []
     except (OSError, ValueError):
-        flagged = []
+        flagged = {}
+    if not isinstance(flagged, dict):
+        flagged = {}
+    return path, flagged
+
+
+def _save_language_state(path, flagged):
+    kept = dict(list(flagged.items())[-MAX_LANGUAGE_FLAGGED:])
+    state_mod.write_atomic(path, json.dumps(kept), mode=0o600)
+
+
+def _flag_language(record, check, dry_run):
+    """Alert once per recording that it is held for a language mismatch."""
     recording_id = str(record["id"])
-    if recording_id in flagged:
+    if dry_run:
+        log(f"mila: dry run: would hold recording {recording_id} "
+            f"(transcribed as {record.get('language')!r})")
+        return
+    path, flagged = _language_state()
+    if path is None or recording_id in flagged:
         return
     title = str(record.get("title") or recording_id)[:120]
     message = (
         f"Mila recording '{title}' was transcribed as "
         f"'{record.get('language')}' but looks like '{check['expect']}': "
-        "re-transcribe it in Mila; capture waits up to "
-        f"{check['hold_minutes']:g} min"
+        "re-transcribe it in Mila before it is captured as is"
     )
     key = f"mila-language:{recording_id}"
-    # Saved first: a save that fails sends nothing (no alert per run).
+    # Saved first, so a save that keeps failing sends nothing (no alert per
+    # run); an alert that could not be written is forgotten and retried.
     try:
-        state_mod.write_atomic(
-            path, json.dumps((flagged + [recording_id])[-MAX_LANGUAGE_FLAGGED:]),
-            mode=0o600,
-        )
+        _save_language_state(path, {**flagged, recording_id: "held"})
     except OSError:
         log("mila: language-check state not saved; no alert sent")
         return
     log(f"mila: WARN recording {recording_id} transcribed as "
         f"{record.get('language')!r}, looks {check['expect']!r}; held")
-    events.emit(base, events.build(
+    sent = events.emit(llm.base_dir(), events.build(
         "daemon", "alert", None, f"daemon:{key}", message, [],
         details={"key": key, "recording_id": recording_id,
                  "language": record.get("language"),
                  "expected": check["expect"]},
     ))
+    if not sent:
+        try:
+            _save_language_state(path, flagged)
+        except OSError:
+            pass
+
+
+def _release_language(record, dry_run):
+    """Log once that a held recording is now captured as is."""
+    recording_id = str(record["id"])
+    path, flagged = _language_state()
+    if path is None or flagged.get(recording_id) != "held":
+        return
+    log(f"mila: WARN recording {recording_id} still transcribed as "
+        f"{record.get('language')!r} after the hold; capturing as is")
+    if not dry_run:
+        try:
+            _save_language_state(path, {**flagged, recording_id: "released"})
+        except OSError:
+            pass
 
 
 def app_summary_settings(source):
@@ -673,14 +726,11 @@ def candidates(source):
         try:
             if check and _wrong_language(record, metadata_file.parent, check):
                 end = _recording_interval(record, zone)[1]
-                age = (_now() - end).total_seconds()
-                if age < check["hold_minutes"] * 60:
-                    _flag_language(record, check)
+                if _now() < _language_deadline(record, end, check, source):
+                    _flag_language(record, check, source.get("_dry_run"))
                     held += 1  # not a candidate: retried next run
                     continue
-                log(f"mila: WARN recording {recording_id} still transcribed "
-                    f"as {record.get('language')!r} after the hold; "
-                    "capturing as is")
+                _release_language(record, source.get("_dry_run"))
             built = _candidate(
                 record, metadata_file.parent, zone=zone, app=app, wait=True
             )

@@ -25,12 +25,14 @@ class LanguageCheckTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def run_candidates(self, records, check=None, now=NOW):
+    def run_candidates(self, records, check=None, now=NOW, dry_run=False):
         self.file.write_text(json.dumps(records))
         source = {"recordings_file": str(self.file),
                   "calendar_timezone": "UTC"}
         if check is not False:
             source["language_check"] = check or {"expect": "he"}
+        if dry_run:
+            source["_dry_run"] = True
         with mock.patch.object(mila_source, "_now", return_value=now), \
                 mock.patch.object(mila_source, "log") as log:
             found = mila_source.candidates(source)
@@ -70,12 +72,51 @@ class LanguageCheckTest(unittest.TestCase):
     def test_hebrew_in_the_transcript_alone_counts(self):
         self.assertEqual(self.run_candidates([self.rec("T", "en", text=HEBREW)]), [])
 
-    def test_captured_as_is_after_the_hold(self):
+    def test_captured_as_is_after_the_hold_with_one_warning(self):
+        rec = self.rec("A", "en", summary=HEBREW)
+        self.run_candidates([rec])
         later = NOW + datetime.timedelta(hours=3)
-        found = self.run_candidates([self.rec("A", "en", summary=HEBREW)],
-                                    now=later)
-        self.assertEqual(found, ["mila:A"])
+        self.assertEqual(self.run_candidates([rec], now=later), ["mila:A"])
         self.assertTrue(any("capturing as is" in line for line in self.log))
+        self.run_candidates([rec], now=later)
+        self.assertFalse(any("capturing as is" in line for line in self.log))
+
+    def test_hold_counts_from_when_mila_finished(self):
+        rec = self.rec("A", "en", summary=HEBREW)
+        # Ended about 20:08; Mila finished it 130 minutes later.
+        rec["completedAt"] = "2026-07-27T22:18:00Z"
+        now = datetime.datetime(2026, 7, 27, 22, 30,
+                                tzinfo=datetime.timezone.utc)
+        self.assertEqual(self.run_candidates([rec], now=now), [])
+
+    def test_hold_never_passes_the_calendar_match_horizon(self):
+        rec = self.rec("A", "en", summary=HEBREW)
+        rec["completedAt"] = "2026-07-28T01:00:00Z"
+        now = datetime.datetime(2026, 7, 28, 1, 50,
+                                tzinfo=datetime.timezone.utc)
+        self.assertEqual(self.run_candidates([rec], now=now), ["mila:A"])
+
+    def test_dry_run_neither_alerts_nor_flags(self):
+        rec = self.rec("A", "en", summary=HEBREW)
+        self.assertEqual(self.run_candidates([rec], dry_run=True), [])
+        self.assertEqual(self.events(), [])
+        self.run_candidates([rec])
+        self.assertEqual(len(self.events()), 1)
+
+    def test_an_alert_that_was_not_written_is_retried(self):
+        rec = self.rec("A", "en", summary=HEBREW)
+        with mock.patch.object(mila_source.events, "emit", return_value=False):
+            self.run_candidates([rec])
+        self.run_candidates([rec])
+        self.assertEqual(len(self.events()), 1)
+
+    def test_a_few_hebrew_names_in_english_do_not_count(self):
+        summary = ("A long English summary of the meeting about pricing and "
+                   "launch plans, with many English words. " * 5
+                   + "שלום עליכם חברים יקרים מאוד")
+        self.assertEqual(
+            self.run_candidates([self.rec("E", "en", summary=summary)]),
+            ["mila:E"])
 
     def test_retranscribed_recording_is_released(self):
         self.run_candidates([self.rec("A", "en", summary=HEBREW)])
