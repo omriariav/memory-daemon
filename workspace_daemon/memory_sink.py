@@ -1301,12 +1301,20 @@ def capture(routine, item, summary, dry_run=False):
             store, source_id, etype, title, people,
             list(dict.fromkeys(tags)), body,
         )
+        anchored = None if retry else _open_todo_anchor(r, source_id)
         if entry_id:
             verdict = "verified"
             log(
                 f"routine={rid} memory WARN ambiguous CLI result was "
                 f"verified on disk for source_id={source_id}"
             )
+        elif anchored:
+            # The same message (no reply of its own, e.g. a save reaction on
+            # the thread root) already anchors an open todo: the store keeps
+            # that todo as it is, so this capture changes nothing.
+            verdict, entry_id = "unchanged", anchored
+            log(f"routine={rid} memory: {anchored} is the open todo for this "
+                "message; left as it is")
         elif r.returncode != 0:
             raise RuntimeError(
                 f"memory add failed (exit {r.returncode}): "
@@ -1352,6 +1360,17 @@ def capture(routine, item, summary, dry_run=False):
 
 _OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open \S+ (\S+) —")
 _REPLY_TS_RE = re.compile(r"@(\d+\.\d+)")
+
+
+def _open_todo_anchor(result, source_id):
+    """The open todo `source_id` anchors, when the store refused for that."""
+    if result.returncode == 0 or not source_id:
+        return None
+    refusal = _OPEN_ANCHOR_RE.search((result.stdout or "") + (result.stderr or ""))
+    if not refusal or refusal.group(1) != source_id \
+            or not SOURCE_FOLLOWS_RE.fullmatch(refusal.group(2)):
+        return None
+    return refusal.group(2)
 
 
 def _open_todo_outcome_retry(args, result, item, source_id):
