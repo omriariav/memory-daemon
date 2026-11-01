@@ -1790,6 +1790,41 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
             thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
         self.assertFalse(thread["messages"][0]["body"].strip())
 
+    def test_owner_mail_is_never_from_only(self):
+        cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
+                                  "owner_email": ME,
+                                  "trust_from_without_auth": True})
+        for sender in ("Owner <me@example.com>", "Me, The <me@example.com>",
+                       "ME+notes@Example.com"):
+            self.assertIsNone(
+                gmail_mcp.sender_verdict(cfg, {"from": sender}, []), sender)
+        self.assertEqual(gmail_mcp.sender_verdict(
+            cfg, {"from": "Ann <ann@example.com>"}, []), "from_only")
+
+    def test_disarmed_flag_is_noted_once_per_run(self):
+        with mock.patch.object(gmail_mcp, "log"):
+            gmail_mcp._mark_auth_seen(FETCH, True)
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1},
+             {"mid": 2, "thread": 2, "epoch": T2}],
+            {1: authed_text(1, auth=()), 2: authed_text(2, thread=2, auth=())})
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            for candidate in listing:
+                with self.assertRaises(gmail_mcp.SenderUnverified):
+                    gmail_mcp.fetch({"id": "r"}, candidate, src)
+        notes = [c for c in logged.call_args_list if "disarmed" in str(c.args[0])]
+        self.assertEqual(len(notes), 1)
+
+    def test_memory_is_per_base_dir(self):
+        with mock.patch.object(gmail_mcp, "log"), \
+                mock.patch.object(gmail_mcp.state, "write_atomic",
+                                  side_effect=OSError("read-only")):
+            gmail_mcp._mark_auth_seen(FETCH, True)
+        with tempfile.TemporaryDirectory() as other:
+            gmail_mcp.configure(other)
+            self.addCleanup(gmail_mcp.configure, self.tmp.name)
+            self.assertFalse(gmail_mcp.auth_seen(FETCH))
+
     def test_settings_need_owner_email_too(self):
         cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
                                   "trust_from_without_auth": True})

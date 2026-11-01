@@ -714,12 +714,8 @@ def _bound_body(message, limit):
 
 # --- sender verification -----------------------------------------------------
 
-def sender_domain(value):
-    """Domain of a From header that is exactly one plain address, else None.
-
-    The display name never counts: only the address is read, and a header
-    with several addresses, or an address that is not local@domain, has none.
-    """
+def sender_address(value):
+    """The one plain address of a From header (as read for the domain), or None."""
     pairs = email.utils.getaddresses([value or ""])
     if len(pairs) == 1:
         address = pairs[0][1].strip()
@@ -730,7 +726,24 @@ def sender_domain(value):
         if not match:
             return None
         address = match.group(1)
-    return _domain_of(address)
+    return address if _domain_of(address) else None
+
+
+def sender_domain(value):
+    """Domain of a From header that is exactly one plain address, else None.
+
+    The display name never counts: only the address is read, and a header
+    with several addresses, or an address that is not local@domain, has none.
+    """
+    return _domain_of(sender_address(value))
+
+
+def _same_mailbox(address, owner):
+    """Whether `address` is `owner`, ignoring case and a +tag."""
+    def base(value):
+        local, _, domain = str(value or "").strip().casefold().partition("@")
+        return local.split("+", 1)[0], domain
+    return bool(owner) and base(address) == base(owner)
 
 
 def _domain_of(address, bare_ok=False):
@@ -855,6 +868,11 @@ def sender_verdict(cfg, headers, auth_results):
     if domain not in cfg["verified_sender_domains"]:
         return None
     if cfg.get("trust_from_without_auth") and auth_results == []:
+        # The owner's own sent mail has no verdict either; it must never pass
+        # as a colleague's (a send-as alias other than owner_email still can).
+        if _same_mailbox(sender_address(headers.get("from")),
+                         cfg.get("owner_email")):
+            return None
         return "from_only"
     if sender_authenticated(auth_results, domain, cfg["auth_servers"]):
         return "verified"
@@ -1212,8 +1230,8 @@ def candidates(source):
 
 # --- fetch -------------------------------------------------------------------
 
-_auth_seen_memory = set()  # fetch tools seen this process (covers a failed save)
-_ALL_TOOLS = "*"  # a recorded "*" disarms every tool
+# (base dir, fetch tool) seen this process; covers a failed save.
+_auth_seen_memory = set()
 
 
 def _auth_seen_path():
@@ -1241,17 +1259,17 @@ def auth_seen(fetch_tool):
     A record that exists but cannot be read counts as every tool, so a
     damaged record never re-arms From-only trust.
     """
-    if fetch_tool in _auth_seen_memory:
+    if (_base_dir, fetch_tool) in _auth_seen_memory:
         return True
     recorded = _read_auth_seen()
-    return recorded is None or fetch_tool in recorded or _ALL_TOOLS in recorded
+    return recorded is None or fetch_tool in recorded
 
 
 def _mark_auth_seen(fetch_tool, announce):
     """Record that `fetch_tool` returns the header; WARN only if `announce`."""
     if auth_seen(fetch_tool):
         return
-    _auth_seen_memory.add(fetch_tool)
+    _auth_seen_memory.add((_base_dir, fetch_tool))
     saved = False
     if _base_dir is not None:
         path = _auth_seen_path()
@@ -1473,12 +1491,10 @@ def fetch(routine, candidate, source=None):
     # A connector that shows the header for one message shows it for all, so
     # once any message of the batch carries it, a message without it was
     # never stamped by the receiving server: From-only trust stops for good.
-    # Recorded whether or not the flag is on, so turning it on later cannot
-    # trust a connector already known to return the header.
-    # Only a header above the message's own headers counts: one a sender
-    # printed lower (None) must not let them switch trust off for everyone.
     # Recorded (quietly when the flag is off) whenever verification is on, so
     # turning the flag on later cannot trust a connector known to show it.
+    # Only a header above the message's own headers counts: one a sender
+    # printed lower (None) must not let them switch trust off for everyone.
     if cfg["verified_sender_domains"] and any(
         result is not None
         for read in batch["threads"].values()
@@ -1489,6 +1505,11 @@ def fetch(routine, candidate, source=None):
     if cfg["verified_sender_domains"]:
         if cfg["trust_from_without_auth"] and auth_seen(cfg["fetch_tool"]):
             cfg = dict(cfg, trust_from_without_auth=False)
+            if not batch.get("disarm_noted"):
+                batch["disarm_noted"] = True
+                log("gmail_mcp: trust_from_without_auth is set but disarmed "
+                    "for this connector (it returns Authentication-Results); "
+                    "header-less mail is skipped. Remove the flag.")
         verdict = {
             m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
             for m in messages

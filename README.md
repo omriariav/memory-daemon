@@ -2328,8 +2328,11 @@ all:
   note in the prompt, and each fetch logs `accepted N message(s) on From
   only` with the newest message id.
 - The owner's own sent mail has no verdict either, so `owner_email` is
-  required; mail sent from an alias that is not `owner_email` is read as a
-  colleague's.
+  required, and mail from it (any display name, any `+tag`) is never accepted
+  on From only. Mail sent from a send-as alias that is not `owner_email` is
+  still read as a colleague's.
+- While the flag is set but disarmed, each run logs once that header-less
+  mail is being skipped.
 - Threads recorded as `unverified` before the flag was turned on are not
   re-read until they get a new message.
 - Known gaps:
