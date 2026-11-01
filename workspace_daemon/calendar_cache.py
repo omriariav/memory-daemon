@@ -924,7 +924,9 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
     # A changed range re-baselines: invites that were simply outside the old
     # range are not new.
     scope = [diff_hours(cfg), float(cfg.get("window_hours", 48)),
-             float(cfg.get("invite_lookahead_days", 0))]
+             float(cfg.get("invite_lookahead_days", 0)),
+             str(cfg.get("calendar_id", "primary")),
+             str(cfg.get("owner_email") or "").strip().lower()]
     first_scan = not isinstance(seen, dict) or saved.get("scope") != scope
     seen = dict(seen) if isinstance(seen, dict) else {}
     # Series the diff already tracks (announced there, or there before).
@@ -988,11 +990,11 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
         seen[key] = today.isoformat()
     floor_day = (today - datetime.timedelta(days=SEEN_DAYS)).isoformat()
     seen = {k: v for k, v in seen.items() if str(v)[:10] >= floor_day}
-    record = {"tried": stamp, "scope": scope}
-    if not first_scan or complete:
-        # A first scan only starts the record when it saw every window
-        # whole; otherwise what it missed would be announced next time.
-        record["seen"] = seen
+    record = {"tried": stamp, "scope": scope, "seen": seen}
+    if first_scan and not complete:
+        # A baseline only counts when it saw every window whole; otherwise
+        # keep the previous record and try again next time.
+        record = dict(saved, tried=stamp)
     # Saved before announcing: a crash loses an announcement rather than
     # repeating it.
     state.write_atomic(path, json.dumps(record, sort_keys=True), mode=0o600)
@@ -1005,7 +1007,7 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
             clean(raw.get("title"), EXTERNAL_TITLE_MAX), people=[],
             details={"start": _iso(raw["start"], raw["all_day"]),
                      "end": _iso(raw["end"], raw["all_day"]),
-                     "untrusted": True},
+                     "far": True, "untrusted": True},
         ))
     return len(fresh)
 

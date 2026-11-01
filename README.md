@@ -796,7 +796,8 @@ the end of the diff window (the output window when the diff is off) to
 `invite_lookahead_days` is listed in pinned
 7-day windows, each its own small bridge session, and every invite I have
 not answered that was not listed before (and that starts in that range)
-emits one gcal `new` event (with `untrusted: true`, naming its next
+emits one gcal `new` event (with `far: true` and `untrusted: true`; it may
+be an older invite reaching the lookahead for the first time; naming its next
 instance); a recurring series is announced once, and one the diff already
 tracks is not announced. Invites are remembered for 60 days after they were
 last listed. The first scan, and the first after the range changes, only
