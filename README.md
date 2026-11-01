@@ -2276,10 +2276,12 @@ One JSON object per line, oldest message first:
   without it, and is announced again on rejoining. Names come from the full
   listing only for the new ids, and creator details only from a search
   result matching both name and id, so a channel purpose cannot forge an
-  entry. A listing without an "of N total" header, of more than one page
-  (200 channels), or whose count does not match changes nothing; when the
-  full listing fails, new channels wait for the next check. State, per
-  routine: `state/comms-inbox-joined-<routine>.json`.
+  entry. A listing that is empty, lacks an "of N total" header, spans more
+  than one page (200 channels) or whose count does not match changes
+  nothing. A new channel without a usable name waits up to 3 checks, then is
+  recorded with `name: null`. More than 20 new channels at once (a changed
+  scope or workspace) re-baselines silently. State, per routine and source:
+  `state/comms-inbox-joined-<routine>-<hash>.json`.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

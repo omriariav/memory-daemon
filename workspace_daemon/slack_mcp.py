@@ -1624,7 +1624,11 @@ def candidates(source):
             log(f"slack_mcp: comms inbox recorded {added} new line(s), "
                 f"{started} conversation(s) newly tracked or followed")
         _check_reactions(cfg, now)
-        _check_joined(cfg, now, source.get("_routine_id") or "default")
+        # One state per source: a routine may have several.
+        _check_joined(cfg, now, "{}:{}".format(
+            source.get("_routine_id") or "default",
+            _digest(cfg["channels_tool"], cfg["self_user_id"]),
+        ))
     # Inbox-only hits never become candidates.
     found = [
         (query, hit) for query, hit in found

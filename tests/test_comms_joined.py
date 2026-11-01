@@ -8,6 +8,7 @@ from workspace_daemon import comms_inbox, comms_joined, config, slack_mcp
 
 NOW = 1_800_000_000.0
 A, B, C = "C0EXAMPLE0A", "C0EXAMPLE0B", "G0EXAMPLE0C"
+ROOM = [("new-room", A, False)]
 INBOX = comms_inbox.settings({"joined_channels": True})
 LANE = "lane-example"
 
@@ -32,11 +33,12 @@ def full_text(entries, purpose=""):
     return json.dumps({"result": "## My Channels\n\n" + "\n".join(blocks)})
 
 
-def info_text(name, channel, creator="Example Person", uid="U0EXAMPLEB"):
+def info_text(name, channel, creator="Example Person", uid="U0EXAMPLEB",
+              created="2026-11-01 13:57:21 IST"):
     return json.dumps({"results": (
         "# Search Results for: \n\n## Channels (1 results)\n"
         f"### Result 1 of 1\nName: #{name}\n"
-        f"Creator: {creator} (<@{uid})\nCreated: 2026-11-01 13:57:21 IST\n"
+        f"Creator: {creator} (<@{uid})\nCreated: {created}\n"
         f"Permalink: [link](https://example.slack.com/archives/{channel})\n"
         "Is Archived: false\nChannel Type: public_channel\n"
     )})
@@ -66,6 +68,11 @@ class ParseTest(unittest.TestCase):
             [("one", A, False), ("two", A, False), ("three", C, False)]
         ))["result"]})
         self.assertEqual(comms_joined.parse_names(clash, {A}), {})
+
+    def test_created_with_offset(self):
+        info = comms_joined.parse_info(
+            info_text("r", A, created="2026-11-01 13:57:21 GMT+2"), A, "r")
+        self.assertEqual(info["created"], "2026-11-01 13:57:21 GMT+2")
 
     def test_info_needs_exactly_one_matching_permalink(self):
         info = comms_joined.parse_info(info_text("new-room", A), A, "new-room")
@@ -165,18 +172,22 @@ class CheckTest(unittest.TestCase):
 
     def test_unwritten_joins_are_retried(self):
         self.check(self.lister([B]))
-        self.check(self.lister([A, B]), now=NOW + 3600, record=lambda rows: 0)
+        self.check(self.lister([A, B], ROOM), now=NOW + 3600,
+                   record=lambda rows: 0)
         self.assertEqual(self.members(), {B})
         # Not due again before the interval, then retried.
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 3700), 0)
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 7200), 1)
+        self.assertEqual(
+            self.check(self.lister([A, B], ROOM), now=NOW + 3700), 0)
+        self.assertEqual(
+            self.check(self.lister([A, B], ROOM), now=NOW + 7200), 1)
 
     def test_left_channel_is_announced_again_on_rejoin(self):
         self.check(self.lister([A, B]))
         self.check(self.lister([B]), now=NOW + 3600)
         self.check(self.lister([B]), now=NOW + 7200)
         self.assertEqual(self.members(), {B})
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 10800), 1)
+        self.assertEqual(
+            self.check(self.lister([A, B], ROOM), now=NOW + 10800), 1)
 
     def test_one_missed_listing_is_not_a_leave(self):
         self.check(self.lister([A, B]))
@@ -196,6 +207,42 @@ class CheckTest(unittest.TestCase):
             self.lister([A, B], [("new-room", A, False)]), now=NOW + 7200), 1)
         self.assertEqual(self.rows()[0]["name"], "new-room")
 
+    def test_unnamed_channel_waits_then_is_recorded_without_name(self):
+        self.check(self.lister([B]))
+        for hour in (1, 2):
+            self.assertEqual(
+                self.check(self.lister([A, B]), now=NOW + hour * 3600), 0)
+        self.assertEqual(self.members(), {B})
+        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 3 * 3600), 1)
+        row, = self.rows()
+        self.assertIsNone(row["name"])
+        self.assertEqual(comms_joined.load(self.tmp.name, LANE)["unnamed"], {})
+
+    def test_named_and_unnamed_channels_split(self):
+        self.check(self.lister([C]))
+        self.assertEqual(
+            self.check(self.lister([A, B, C], ROOM), now=NOW + 3600), 1)
+        self.assertEqual([r["channel_id"] for r in self.rows()], [A])
+        self.assertEqual(self.members(), {A, C})
+
+    def test_empty_listing_is_incomplete(self):
+        self.check(self.lister([A]))
+        self.assertIsNone(comms_joined.parse_ids(ids_text([])))
+        self.check(self.lister([]), now=NOW + 3600)
+        self.check(self.lister([]), now=NOW + 7200)
+        self.assertEqual(self.members(), {A})
+
+    def test_many_new_channels_rebaseline(self):
+        self.check(self.lister([A]))
+        many = [f"C0EXAMPLE{n:02d}" for n in range(30)]
+        self.assertEqual(self.check(self.lister([A] + many), now=NOW + 3600), 0)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.members(), {A, *many})
+
+    def test_future_check_time_is_ignored(self):
+        self.check(self.lister([B]), now=NOW + 86400)
+        self.assertEqual(self.check(self.lister([A, B], ROOM)), 1)
+
     def test_lanes_keep_their_own_state(self):
         self.check(self.lister([A]))
         comms_joined.check(self.tmp.name, "other", INBOX, self.lister([B]),
@@ -203,6 +250,8 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(self.members(), {A})
         self.assertEqual(
             comms_joined.load(self.tmp.name, "other")["members"], {B})
+        self.assertNotEqual(comms_joined._path(self.tmp.name, "a.b"),
+                            comms_joined._path(self.tmp.name, "a_b"))
 
     def test_state_write_failure_does_not_raise(self):
         with mock.patch.object(comms_joined.state, "write_atomic",
