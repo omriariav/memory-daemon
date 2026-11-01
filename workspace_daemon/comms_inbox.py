@@ -29,12 +29,33 @@ One JSON object per line, oldest message first:
 
     {"type": "message", "channel_id", "thread_ts", "ts", "user_id",
      "is_owner", "is_bot", "text", "seen_at"}
+
+plus, on any line type, the optional "channel_type" and "peer_is_bot"
+described below.
     {"type": "owner_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
     {"type": "peer_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "user_id", "seen_at"}
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
+
+Every line (any type) written since channel types were added also carries
+`channel_type`: "im" (a direct message), "mpim" (a group DM) or "channel"
+(public or private). It comes from the search hit's own label (`DM` on a
+`D...` id, `Group DM`); a line without a label (a thread or reaction read)
+takes the type any other line of that channel in the inbox carries, and has
+none when no line does. Lines of an "im" also carry `peer_is_bot` once a
+message from someone other than the owner is in the inbox: true when every
+such message carries the bot marker or is Slackbot (an app), false
+otherwise. The value is
+fixed when the line is written, so read it from the newest line of the
+conversation. Limits: an app the owner uses that posts in a person's DM
+before the person does counts as the peer until they reply; only lines
+within `retention_days` count, so a person silent longer than that whose
+agent then posts reads as a bot, and a channel whose labelled lines all
+expired gives unlabelled lines no type; a `DM` label on a non-`D` id (which
+the `dms` query still records) is typed "channel", as in dm_kind. Lines written before this have neither
+field; readers treat a missing field as unknown.
 
 A `track_reactions` emoji the owner puts on any message (found by a
 `hasmy::<emoji>:` search looking back `retention_days`, no cursor) writes a
@@ -123,6 +144,7 @@ MAX_REACTIONS = 5
 MAX_IGNORE_REACTORS = 20
 MAX_RETENTION_DAYS = 90
 MAX_TEXT = 4000
+SLACKBOT = "USLACKBOT"
 _REACTION_LINE = re.compile(
     # Skin tones arrive as `:+1::skin-tone-2:`.
     r"^:(?P<emoji>[^\s:][^\s]{0,120}?): \u00d7 \d+ \u2014 (?P<who>.*)$"
@@ -234,8 +256,29 @@ def _load(file):
     return rows
 
 
+def dm_kind(hit):
+    """'im' or 'mpim' for a hit in a direct conversation, else None.
+
+    Only the hit's own label and id say so: `D...` with label DM is an IM;
+    label Group DM is an mpim. A legacy `G...` private channel carries
+    neither label, so it is never taken for a DM.
+    """
+    if hit.get("label") == "DM" and hit["channel"].startswith("D"):
+        return "im"
+    if hit.get("label") == "Group DM":
+        return "mpim"
+    return None
+
+
+def channel_type(hit):
+    """dm_kind, or "channel" for any other labelled hit; None without a label."""
+    if not (hit.get("label") or "").strip():
+        return None
+    return dm_kind(hit) or "channel"
+
+
 def message_row(hit, self_user_id):
-    return {
+    row = {
         "type": "message",
         "channel_id": hit["channel"],
         "thread_ts": hit["root"],
@@ -245,16 +288,24 @@ def message_row(hit, self_user_id):
         "is_bot": bool(hit["is_bot"]),
         "text": redact_secrets(hit["text"])[:MAX_TEXT],
     }
+    kind = channel_type(hit)
+    if kind:
+        row["channel_type"] = kind
+    return row
 
 
 def reaction_row(hit, emoji):
-    return {
+    row = {
         "type": "owner_reaction",
         "channel_id": hit["channel"],
         "thread_ts": hit["root"],
         "ts": hit["ts"],
         "emoji": emoji,
     }
+    kind = channel_type(hit)
+    if kind:
+        row["channel_type"] = kind
+    return row
 
 
 def peer_row(hit, emoji, user_id):
@@ -263,6 +314,32 @@ def peer_row(hit, emoji, user_id):
 
 def track_row(hit, emoji):
     return dict(reaction_row(hit, emoji), type="track_request")
+
+
+def _annotate(added, rows):
+    """Label `added` with channel_type and IM peer_is_bot from all `rows`.
+
+    The inbox itself is the record: a line keeps the type its own hit label
+    gave it, and an unlabelled line takes the type another line of its
+    channel carries. An IM peer is a bot when every non-owner message of that
+    IM in the inbox carries the bot marker (or is Slackbot).
+    """
+    kinds, peers = {}, {}
+    for row in rows:
+        if row.get("channel_type"):
+            kinds[row["channel_id"]] = row["channel_type"]
+    for row in rows:
+        if kinds.get(row["channel_id"]) == "im" \
+                and row.get("type", "message") == "message" \
+                and not row.get("is_owner"):
+            bot = bool(row.get("is_bot")) or row.get("user_id") == SLACKBOT
+            peers.setdefault(row["channel_id"], set()).add(bot)
+    for row in added:
+        kind = row.get("channel_type") or kinds.get(row["channel_id"])
+        if kind:
+            row["channel_type"] = kind
+        if kind == "im" and row["channel_id"] in peers:
+            row["peer_is_bot"] = peers[row["channel_id"]] == {True}
 
 
 def record(base_dir, rows, retention_days, now=None):
@@ -285,6 +362,8 @@ def record(base_dir, rows, retention_days, now=None):
             continue
         known.add(_key(row))
         added.append(dict(row, seen_at=stamp))
+    if added:
+        _annotate(added, kept + added)
     if not added and len(kept) == len(existing) and file.exists():
         return 0
     merged = sorted(kept + added, key=lambda r: float(r["ts"]))

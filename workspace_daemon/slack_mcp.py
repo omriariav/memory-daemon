@@ -1224,20 +1224,6 @@ def _save_dm_state(routine_id, channels, keep_after):
     return True
 
 
-def dm_kind(hit):
-    """'im' or 'mpim' for a hit in a direct conversation, else None.
-
-    Only the hit's own label and id say so: `D...` with label DM is an IM;
-    label Group DM is an mpim. A legacy `G...` private channel carries
-    neither label, so it is never taken for a DM.
-    """
-    if hit["label"] == "DM" and hit["channel"].startswith("D"):
-        return "im"
-    if hit["label"] == "Group DM":
-        return "mpim"
-    return None
-
-
 def _place(sessions, ts, gap, span):
     """The session a message belongs to (created or extended as needed).
 
@@ -1306,7 +1292,7 @@ def assign_dm_sessions(cfg, found, routine_id="default", persist=True,
     by_channel = {}
     threaded = []
     for query, hit in found:
-        if dm_kind(hit) not in dm["channel_types"]:
+        if comms_inbox.dm_kind(hit) not in dm["channel_types"]:
             continue
         if hit["root"] != hit["ts"] or hit["replies"]:
             # A reply or a parent with replies: tagged below when it belongs

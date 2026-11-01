@@ -2133,6 +2133,22 @@ One JSON object per line, oldest message first:
 
 - `thread_ts` is the thread root, equal to `ts` for a top-level message (DM
   sessions do not change it). `is_owner` compares `user_id` with `self_user_id`.
+- `channel_type` (every line type): `"im"` for a direct message, `"mpim"` for a
+  group DM, `"channel"` for a public or private channel. It comes from the
+  search hit's own label (`DM` on a `D...` id, `Group DM`), so a group DM is
+  recognised although its id starts with `C`. A line without a label (thread
+  or reaction reads) takes the type another line of that channel in the
+  inbox carries; with none, it has no field.
+- `peer_is_bot` (lines of an `"im"` only, once a message from someone other
+  than the owner is in the inbox): `true` when every such message carries the
+  bot marker (an app), else `false`. A person whose own agent sometimes posts
+  for them stays `false`; Slackbot counts as a bot. It is fixed when the line
+  is written, so read the newest line. Only lines within `retention_days`
+  count: a person silent for longer whose agent then posts reads as a bot,
+  and an app of the owner's that posts in a person's DM before they reply
+  counts as the peer until then.
+- Lines written before these fields existed lack them; treat a missing
+  field as unknown. Existing lines are never rewritten.
 - Both sides are recorded: other people's messages and the owner's own
   replies, from every query (channels, people, mentions, `dms`, reactions).
   A conversation appears only when some query lists it: put channels in

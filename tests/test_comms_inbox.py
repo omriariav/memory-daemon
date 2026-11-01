@@ -992,5 +992,118 @@ class ConfigTest(unittest.TestCase):
                 slack_watch.load(str(path))
 
 
+
+class ChannelTypeTest(unittest.TestCase):
+    OWNER = "U0EXAMPLE01"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = tmp.name
+        self.now = 1_800_000_000
+
+    def hit(self, channel, ts, label=None, user="U0EXAMPLE02", bot=False):
+        hit = {"channel": channel, "root": ts, "ts": ts, "user": user,
+               "is_bot": bot, "text": "hi"}
+        if label is not None:
+            hit["label"] = label
+        return hit
+
+    def record(self, *hits):
+        rows = [comms_inbox.message_row(h, self.OWNER) for h in hits]
+        comms_inbox.record(self.base, rows, 14, now=self.now)
+        file = comms_inbox.path(self.base)
+        return {(r["channel_id"], r["ts"]): r for r in
+                (json.loads(l) for l in file.read_text().splitlines())}
+
+    def ts(self, n):
+        return f"{self.now - 1000 + n}.000100"
+
+    def test_types_come_from_the_hit_label(self):
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(1), "DM"),
+            self.hit("C0EXAMPLE02", self.ts(2), "Group DM"),
+            self.hit("C0EXAMPLE03", self.ts(3), "#general"),
+            self.hit("G0EXAMPLE04", self.ts(4), "private-team"),
+        )
+        self.assertEqual(
+            [rows[k]["channel_type"] for k in sorted(rows)],
+            ["mpim", "channel", "im", "channel"])
+
+    def test_a_dm_label_on_a_non_d_id_is_not_an_im(self):
+        rows = self.record(self.hit("G0EXAMPLE04", self.ts(1), "DM"))
+        self.assertEqual(rows[("G0EXAMPLE04", self.ts(1))]["channel_type"],
+                         "channel")
+
+    def test_unlabelled_rows_use_the_cached_type(self):
+        self.record(self.hit("C0EXAMPLE02", self.ts(1), "Group DM"))
+        rows = self.record(self.hit("C0EXAMPLE02", self.ts(2)))
+        self.assertEqual(rows[("C0EXAMPLE02", self.ts(2))]["channel_type"],
+                         "mpim")
+        rows = self.record(self.hit("C0EXAMPLE09", self.ts(3)))
+        self.assertNotIn("channel_type", rows[("C0EXAMPLE09", self.ts(3))])
+
+    def test_bot_peer_is_flagged_on_every_later_im_line(self):
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(1), "DM", user=self.OWNER),
+        )
+        self.assertNotIn("peer_is_bot", rows[("D0EXAMPLE01", self.ts(1))])
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(2), "DM", user="U0EXAMPLEBT",
+                     bot=True),
+            self.hit("D0EXAMPLE01", self.ts(3), "DM", user=self.OWNER),
+        )
+        self.assertTrue(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+        self.assertTrue(rows[("D0EXAMPLE01", self.ts(3))]["peer_is_bot"])
+
+    def test_a_person_who_also_posts_through_an_agent_is_not_a_bot(self):
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(1), "DM", bot=True),
+            self.hit("D0EXAMPLE01", self.ts(2), "DM"),
+        )
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
+    def test_existing_lines_are_never_changed(self):
+        self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM", user=self.OWNER))
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(2), "DM",
+                                    bot=True))
+        self.assertNotIn("peer_is_bot", rows[("D0EXAMPLE01", self.ts(1))])
+
+    def test_reaction_rows_carry_the_type(self):
+        comms_inbox.record(self.base, [comms_inbox.reaction_row(
+            self.hit("C0EXAMPLE02", self.ts(1), "Group DM"), "eyes")],
+            14, now=self.now)
+        (row,) = [json.loads(l) for l in
+                  comms_inbox.path(self.base).read_text().splitlines()]
+        self.assertEqual(row["channel_type"], "mpim")
+
+    def test_peer_is_bot_reflects_the_whole_inbox(self):
+        self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM"))
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(2), "DM",
+                                    bot=True))
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
+    def test_slackbot_dm_is_a_bot(self):
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(1), "DM",
+                                    user="USLACKBOT"))
+        self.assertTrue(rows[("D0EXAMPLE01", self.ts(1))]["peer_is_bot"])
+
+    def test_partial_old_line_does_not_break_recording(self):
+        file = comms_inbox.path(self.base)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps({"channel_id": "D0EXAMPLE01",
+                                    "ts": self.ts(1), "channel_type": "im"})
+                        + "\n")
+        rows = self.record(self.hit("D0EXAMPLE01", self.ts(2), "DM"))
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
+    def test_unlabelled_human_before_a_labelled_bot_counts(self):
+        rows = self.record(
+            self.hit("D0EXAMPLE01", self.ts(1)),
+            self.hit("D0EXAMPLE01", self.ts(2), "DM", bot=True),
+        )
+        self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
+
+
 if __name__ == "__main__":
     unittest.main()
