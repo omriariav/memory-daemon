@@ -523,6 +523,17 @@ class CaptureTest(Base):
             verified=[ADA], speakers=["Augusta King"], all_named=False)
         self.assertNotIn("declined", self.body)
 
+    def test_a_decliner_the_model_names_is_not_listed_as_absent(self):
+        self.capture(
+            ["ada-lovelace"],
+            [attendee("me.owner@example.com"),
+             attendee("augusta.king@example.com", rsvp="accepted"),
+             attendee("ada.lovelace@example.com", "Ada Lovelace",
+                      rsvp="declined")],
+            verified=[{"email": "augusta.king@example.com",
+                       "slug": "augusta-king", "name": "Augusta King"}])
+        self.assertNotIn("declined", self.body)
+
     def test_an_uninvited_namesake_does_not_mark_attendance(self):
         people = self.capture(
             [], [attendee("ada.lovelace@example.com", rsvp="accepted"),

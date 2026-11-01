@@ -783,7 +783,6 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
             for label in speakers
         )
 
-    declined = [name for name in declined if not spoke(name)]
     attended, no_show, unconfirmed = [], [], []
     for invitee in invitees:
         if spoke(invitee["name"]) or invitee["slug"] in model_people:
@@ -798,6 +797,13 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
             reply = {"tentative": "tentative", "accepted": "accepted"}.get(
                 invitee["rsvp"], "no reply")
             unconfirmed.append(f"{invitee['name']} ({reply})")
+    # A decliner (never directory-verified) who spoke, whom the model names,
+    # or who is already credited under another address was there after all.
+    def came(name):
+        slug = re.sub(r"[^a-z0-9]+", "-", _name_key(name)).strip("-")
+        return spoke(name) or slug in model_people or slug in attended
+
+    declined = [name for name in declined if not came(name)]
     parts = []
     gone = [f"{name} (declined)" for name in declined] \
         + [f"{name} (no-show)" for name in no_show]
