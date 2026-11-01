@@ -71,7 +71,9 @@ tracked channels (`tracked:<id>`) and of the owner's own messages (`mine`,
 with `follow_threads`; followed threads outside the searched channels are
 read with `read_thread_tool`) never capture and keep no cursor; with
 `reactions_tool` (mcp__<server>__slack_get_reactions) a run also reads the
-reactions of open inbox messages in one more bridge session.
+reactions of open inbox messages in one more bridge session. With
+`joined_channels` and `channels_tool` (mcp__<server>__slack_list_user_channels)
+it records each channel the owner newly joins; see `comms_joined.py`.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 the two read-only connector tools and hands back their raw text. Everything
@@ -114,7 +116,8 @@ import time
 from pathlib import Path
 
 from . import (
-    claude_bridge, comms_inbox, slack_source, slack_watch, sleepclock, state,
+    claude_bridge, comms_inbox, comms_joined, slack_source, slack_watch,
+    sleepclock, state,
 )
 from .chat_text import redact_secrets
 from .shell import log, utc_now_iso
@@ -142,7 +145,7 @@ DEFAULTS = {
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
     "all_dms", "save_reactions", "dm_sessions", "read_channel_tool",
-    "comms_inbox", "reactions_tool",
+    "comms_inbox", "reactions_tool", "channels_tool", "channel_info_tool",
 }
 CURSOR_SCHEMA = 1
 # Query keys and ledger keys of the reaction-saved path.
@@ -240,6 +243,8 @@ def settings(source):
     cfg["dm_sessions"] = dm_session_cfg(source.get("dm_sessions"))
     cfg["comms_inbox"] = comms_inbox.settings(source.get("comms_inbox"))
     cfg["reactions_tool"] = source.get("reactions_tool")
+    cfg["channels_tool"] = source.get("channels_tool")
+    cfg["channel_info_tool"] = source.get("channel_info_tool")
     return cfg
 
 
@@ -1619,6 +1624,7 @@ def candidates(source):
             log(f"slack_mcp: comms inbox recorded {added} new line(s), "
                 f"{started} conversation(s) newly tracked or followed")
         _check_reactions(cfg, now)
+        _check_joined(cfg, now)
     # Inbox-only hits never become candidates.
     found = [
         (query, hit) for query, hit in found
@@ -2018,6 +2024,38 @@ def _check_reactions(cfg, now):
     log(f"slack_mcp: comms inbox read reactions of {len(checked)}/{len(due)} "
         f"open message(s), {added} reaction(s) new"
         + (f", {bad} without a usable result" if bad else ""))
+
+
+def _check_joined(cfg, now):
+    """Record channels the owner newly joined (see comms_joined.py).
+
+    A failed bridge session is logged and retried later; a budget or pause
+    stop propagates like any other bridge call.
+    """
+    inbox = cfg["comms_inbox"]
+    tool = cfg["channels_tool"]
+    if not tool or not inbox["joined_channels"]:
+        return
+
+    def run(session_tool, pins, what):
+        def call(calls):
+            try:
+                return _session(cfg, session_tool, pins, calls, what, [])
+            except claude_bridge.GUARD_STOPS:
+                raise
+            except claude_bridge.BridgeError as exc:
+                log(f"slack_mcp: comms inbox {what} failed: {exc}")
+                return [None] * len(calls)
+        return call
+
+    info_tool = cfg["channel_info_tool"]
+    comms_joined.check(
+        _base_dir, inbox,
+        run(tool, dict(comms_joined.LIST_PINS), "channel listing"),
+        run(info_tool, {}, "channel lookup") if info_tool else None,
+        lambda rows: comms_inbox.record(_base_dir, rows, inbox["keep_days"], now),
+        now,
+    )
 
 
 def _inherited_tag(cfg, processed, anchor_id):
