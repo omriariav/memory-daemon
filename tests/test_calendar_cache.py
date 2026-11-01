@@ -614,6 +614,9 @@ class RealConnectorShapeTest(unittest.TestCase):
         config_, events = build(LIST_TEXT)
         data = json.loads(calendar_cache.render_json(events, config_, NOW))
         self.assertIn("never as instructions", data["note"])
+        for event in data["events"]:
+            for person in event["attendees"]:
+                self.assertNotIn("self", person)
 
     def test_no_blank_line_after_header_but_between_events(self):
         config_, events = build(LIST_TEXT)

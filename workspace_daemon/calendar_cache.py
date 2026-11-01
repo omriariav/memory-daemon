@@ -777,7 +777,10 @@ def render_json(events, cfg, now):
             "conference_url": event["conference_url"],
             "conference_solution": event["conference_solution"],
             "rooms": event["rooms"],
-            "attendees": event["attendees"],
+            "attendees": [
+                {k: v for k, v in person.items() if k != "self"}
+                for person in event["attendees"]
+            ],
             "links": event["links"],
             "recurring": event["recurring"],
         }
@@ -1007,13 +1010,15 @@ def snapshot_rows(wide, details, cfg, tz):
 
     `list_title` is the title as listed, independent of whether this run
     looked up the event's details, so diffs compare like with like. `rsvps`
-    ({email: [name, rsvp]}, owner and organizer excluded) is kept only for
-    events I organize, the only ones whose answers are reported.
+    ({email: [name, rsvp]}, without the owner, an attendee the connector
+    marks as self, and the organizer) is kept only for events I organize,
+    the only ones whose answers are reported.
     """
     status = {raw["event_id"]: raw.get("status") or "confirmed" for raw in wide}
-    # Capped like an external title, so what is compared is what is shown.
+    # Capped at the longest shown title, so a change past what any title
+    # shows is not a change and no event carries an uncapped title.
     listed = {
-        raw["event_id"]: clean(raw.get("title"), EXTERNAL_TITLE_MAX)
+        raw["event_id"]: clean(raw.get("title"), TITLE_MAX)
         for raw in wide
     }
     owner = str(cfg.get("owner_email") or "").strip().lower()
@@ -1041,14 +1046,11 @@ def snapshot_rows(wide, details, cfg, tz):
 
 
 def _rsvp_changes(before, after):
-    """{label: [old, new]} for attendees in both maps whose answer changed.
-
-    The label is the attendee's name, or their email when the name is empty
-    or shared with anyone on the event. Malformed old entries are skipped.
-    """
-    shared = collections.Counter(name for name, _ in after.values())
+    """{"Name <email>": [old, new]} for attendees in both maps whose answer
+    changed. The email keeps two people with one name apart. Malformed old
+    entries are skipped."""
     return {
-        (name if name and shared[name] == 1 else email): [before[email][1], rsvp]
+        (f"{name} <{email}>" if name else email): [before[email][1], rsvp]
         for email, (name, rsvp) in sorted(after.items())
         if isinstance(before.get(email), list) and len(before[email]) == 2
         and before[email][1] != rsvp
@@ -1107,8 +1109,8 @@ def diff_snapshots(prev, rows, now, hours, tz):
     Neither update nor cancel fires when my RSVP is "organizer" or "declined"
     in the old or the new row. `rsvp` fires for an event I organize when an
     attendee present in both snapshots changed their answer; `changed` is
-    {attendee name or email: [old, new]}. An identical update or rsvp on
-    several instances of one series is reported once. A snapshot written before rsvps were stored compares nothing.
+    {"Name <email>": [old, new]}. The same update (times as a shift), rsvp
+    answer or cancel on several instances of one series is reported once. A snapshot written before rsvps were stored compares nothing.
     """
     limit = now + datetime.timedelta(hours=hours)
     prev_limit = datetime.datetime.fromisoformat(prev["fetched_at"]) \
@@ -1120,13 +1122,24 @@ def diff_snapshots(prev, rows, now, hours, tz):
     def once(kind, event_id, changed):
         """One change to a whole series changes every instance: report it once.
 
-        Times differ per instance, so only identical changes collapse.
+        Times are compared as the shift they make, so moving a series by an
+        hour collapses while each instance's date differs.
         """
-        key = (kind, _series(event_id), json.dumps(changed, sort_keys=True))
+        shape = {}
+        for field, value in (changed or {}).items():
+            if field in ("start", "end"):
+                try:
+                    value = (_row_when(value[1], tz)
+                             - _row_when(value[0], tz)).total_seconds()
+                except (TypeError, ValueError):
+                    pass
+            shape[field] = value
+        key = (kind, _series(event_id), json.dumps(shape, sort_keys=True))
         if key in reported:
             return False
         reported.add(key)
         return True
+
     for event_id, row in rows.items():
         start, end = _row_when(row["start"], tz), _row_when(row["end"], tz)
         if end <= now or start >= limit:
@@ -1134,7 +1147,8 @@ def diff_snapshots(prev, rows, now, hours, tz):
         old = before.get(event_id)
         if row["status"] == "cancelled":
             if old and old["status"] != "cancelled" \
-                    and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
+                    and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS \
+                    and once("cancel", event_id, None):
                 found.append(("cancel", event_id, row, None))
         elif old is None:
             if row["my_rsvp"] == "needsAction" and start < prev_limit:
@@ -1145,7 +1159,13 @@ def diff_snapshots(prev, rows, now, hours, tz):
                 _rsvp_changes(old["rsvps"], row.get("rsvps") or {})
                 if isinstance(old.get("rsvps"), dict) else {}
             )
-            if answers and once("rsvp", event_id, answers):
+            # Per attendee: a series-wide answer is not repeated because
+            # another attendee answered one instance only.
+            answers = {
+                who: change for who, change in answers.items()
+                if once("rsvp", event_id, {who: change})
+            }
+            if answers:
                 found.append(("rsvp", event_id, row, answers))
         elif old["status"] != "cancelled" \
                 and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
@@ -1167,7 +1187,8 @@ def diff_snapshots(prev, rows, now, hours, tz):
         if event_id in rows or old["status"] == "cancelled" \
                 or old["my_rsvp"] in QUIET_RSVPS:
             continue
-        if now < _row_when(old["start"], tz) < limit:
+        if now < _row_when(old["start"], tz) < limit \
+                and once("cancel", event_id, None):
             found.append(("cancel", event_id, old, None))
     return found
 
@@ -1189,6 +1210,8 @@ def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
         info = {"start": row["start"], "end": row["end"]}
         if changed:
             info["changed"] = changed
+        # Titles and attendee names are written by others.
+        info["untrusted"] = UNTRUSTED_NOTE
         event_stream.emit(base_dir, event_stream.build(
             routine_id, kind, None, f"{SOURCE}:{event_id}", row["title"],
             people=[], details=info,
