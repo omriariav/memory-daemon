@@ -68,15 +68,24 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(self.emitted(), [])
 
     def run_chunked(self, texts, now=NOW, **over):
+        """texts[i] answers chunk i (None: that session fails)."""
         config_ = dict(self.cfg, **over)
         chunks = calendar_cache.list_chunks(config_, now)
-        calls = [{"name": LIST_TOOL, "text": text, "is_error": False,
-                  "input": args} for args, text in zip(chunks, texts)]
-        with mock.patch.object(
-            calendar_cache.claude_bridge, "call_tools", return_value=calls
-        ) as bridge:
+        sessions = []
+
+        def bridge(prompt, tools, **kwargs):
+            args = tools[LIST_TOOL]
+            sessions.append(args)
+            index = chunks.index(args)
+            if texts[index] is None:
+                raise claude_bridge.BridgeError("session failed")
+            return [{"name": LIST_TOOL, "text": texts[index],
+                     "is_error": False, "input": args}]
+
+        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
+                               side_effect=bridge):
             report = calendar_cache.run(config_, self.base, now=now)
-        return report, chunks, bridge
+        return report, chunks, sessions
 
     def test_long_window_is_listed_in_pinned_weekly_chunks(self):
         chunks = calendar_cache.list_chunks(
@@ -87,41 +96,41 @@ class EventsTest(unittest.TestCase):
         for left, right in zip(chunks, chunks[1:]):
             self.assertEqual(left["time_max"], right["time_min"])
 
-    def test_chunks_are_merged_deduped_and_all_pinned(self):
+    def test_each_chunk_is_its_own_pinned_session_merged_and_deduped(self):
         self.seed()
         both = block("span", soon(6) + datetime.timedelta(hours=23),
                      hours=3, title="Spans the edge")
-        report, chunks, bridge = self.run_chunked(
+        report, chunks, sessions = self.run_chunked(
             [listing(block("a", soon(), title="Week one"), both),
              listing(both, block("b", soon(10), title="Week two")),
              listing(block("c", soon(17), title="Week three"))],
             events_window_days=21)
-        pins = bridge.call_args.args[1][LIST_TOOL]
-        self.assertEqual(pins, chunks)
+        self.assertEqual(sessions, chunks)
         titles = sorted(e["title"] for e in self.emitted())
         # Only invites already inside the previous (7-day) window are new.
         self.assertEqual(titles, ["Spans the edge", "Week one"])
         data = json.loads(self.snapshot.read_text())
         self.assertEqual(sorted(data["events"]), ["a", "b", "c", "span"])
 
-    def test_a_missing_later_chunk_only_skips_the_diff(self):
+    def test_later_chunks_are_listed_at_most_hourly(self):
+        texts = [listing(block("a", soon())), listing(), listing()]
+        _, _, first = self.run_chunked(texts, events_window_days=21)
+        _, _, again = self.run_chunked(
+            texts, now=NOW + datetime.timedelta(minutes=15),
+            events_window_days=21)
+        _, _, later = self.run_chunked(
+            texts, now=NOW + datetime.timedelta(hours=1),
+            events_window_days=21)
+        self.assertEqual((len(first), len(again), len(later)), (3, 1, 3))
+
+    def test_a_failed_later_chunk_only_skips_the_diff(self):
         self.seed(block("a", soon(), title="A", rsvp="accepted"))
         report, _, _ = self.run_chunked(
             [listing(block("a", soon(), title="A", rsvp="accepted",
-                           location="Moved"))],
+                           location="Moved")), None, listing()],
             events_window_days=21)
         self.assertTrue(report["ok"])
         self.assertEqual(self.emitted(), [])
-
-    def test_a_missing_first_chunk_fails_the_refresh(self):
-        config_ = dict(self.cfg, events_window_days=21)
-        second = calendar_cache.list_chunks(config_, NOW)[1]
-        call = {"name": LIST_TOOL, "text": listing(), "is_error": False,
-                "input": second}
-        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
-                               return_value=[call]), \
-                self.assertRaises(claude_bridge.BridgeError):
-            calendar_cache.run(config_, self.base, now=NOW)
 
     def test_an_unreadable_later_chunk_only_skips_the_diff(self):
         self.seed(block("a", soon(), title="A", rsvp="accepted"))
@@ -132,14 +141,18 @@ class EventsTest(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(self.emitted(), [])
 
-    def test_a_chunk_call_with_an_extra_argument_still_counts(self):
-        config_ = dict(self.cfg, events_window_days=7)
-        args = dict(calendar_cache.list_chunks(config_, NOW)[0], extra="x")
-        call = {"name": LIST_TOOL, "text": listing(block("a", soon())),
-                "is_error": False, "input": args}
-        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
-                               return_value=[call]):
-            self.assertTrue(calendar_cache.run(config_, self.base, now=NOW)["ok"])
+    def test_a_failed_first_chunk_fails_the_refresh(self):
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.run_chunked([None, listing(), listing()],
+                             events_window_days=21)
+
+    def test_a_full_chunk_skips_the_diff(self):
+        self.seed(block("a", soon(), title="A"))
+        self.run_chunked(
+            [listing(block("a", soon(), title="A", location="Moved")),
+             listing(block("b", soon(9)))],
+            events_window_days=14, max_events=1)
+        self.assertEqual(self.emitted(), [])
 
     def test_fractional_chunk_days_leave_no_empty_chunk(self):
         chunks = calendar_cache.list_chunks(

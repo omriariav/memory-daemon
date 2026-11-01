@@ -44,17 +44,12 @@ def decide(payload, tools):
     pins = tools.get(name)
     if pins is None:
         return False, f"tool {name} is not allowlisted"
-    # A dict pins one set of arguments; a non-empty list of dicts allows
-    # any one of them (the call must match every key of that one exactly).
-    options = [pins] if isinstance(pins, dict) else pins
-    if not isinstance(options, list) or not options \
-            or not all(isinstance(option, dict) for option in options):
+    if not isinstance(pins, dict):
         raise ValueError("malformed allowlist")
-    for option in options:
-        if all(key in tool_input and _same(tool_input[key], value)
-               for key, value in option.items()):
-            return True, "allowlisted tool call"
-    return False, f"tool {name} arguments do not match a pin"
+    for key, value in pins.items():
+        if key not in tool_input or not _same(tool_input[key], value):
+            return False, f"tool {name} argument {key} does not match its pin"
+    return True, "allowlisted tool call"
 
 
 def _emit(allowed, reason):

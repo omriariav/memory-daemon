@@ -687,25 +687,6 @@ class HookTest(unittest.TestCase):
                      "Grep", "Bash"):
             self.assertFalse(self.decide(name, {"file_path": "x"}), name)
 
-    def test_a_list_of_pins_allows_any_one_exactly(self):
-        tools = {TOOL_A: [{"a": 1, "b": 2}, {"a": 3, "b": 4}]}
-
-        def ok(**given):
-            return claude_bridge_hook.decide(
-                {"tool_name": TOOL_A, "tool_input": given}, tools)[0]
-
-        self.assertTrue(ok(a=1, b=2))
-        self.assertTrue(ok(a=3, b=4))
-        self.assertFalse(ok(a=1, b=4))
-        self.assertFalse(ok(a=3))
-
-    def test_malformed_pin_lists_deny(self):
-        for pins in ([], [1], "x", [{"a": 1}, None]):
-            with self.assertRaises(ValueError):
-                claude_bridge_hook.decide(
-                    {"tool_name": TOOL_A, "tool_input": {"a": 1}},
-                    {TOOL_A: pins})
-
     def test_pins_need_exact_json_type(self):
         tools = {TOOL_A: {"flag": True, "n": 1, "tags": ["a"]}}
 

@@ -826,7 +826,7 @@ class WindowTest(unittest.TestCase):
         })
 
     def test_prompt_gives_the_exact_values(self):
-        prompt = calendar_cache._fetch_prompt(cfg(), calendar_cache.list_chunks(cfg(), NOW))
+        prompt = calendar_cache._fetch_prompt(cfg(), calendar_cache.list_chunks(cfg(), NOW)[0])
         for value in ('calendar_id "primary"', 'time_min "2026-10-20T08:30:00Z"',
                       'time_max "2026-10-22T08:30:00Z"', "max_results 50"):
             self.assertIn(value, prompt)
@@ -1070,7 +1070,7 @@ class MeetingLinkAgendaTest(unittest.TestCase):
 class PromptTest(unittest.TestCase):
     def test_get_event_requested_for_every_timed_event(self):
         prompt = calendar_cache._fetch_prompt(
-            cfg(max_events=20), calendar_cache.list_chunks(cfg(max_events=20), NOW))
+            cfg(max_events=20), calendar_cache.list_chunks(cfg(max_events=20), NOW)[0])
         self.assertIn("not all-day events", prompt)
         self.assertIn("at most 20 events", prompt)
         self.assertNotIn("other than", prompt)
@@ -1138,12 +1138,12 @@ class RunTest(unittest.TestCase):
         args, kwargs = call.call_args
         prompt, tools = args
         self.assertEqual(tools, {
-            LIST_TOOL: [{
+            LIST_TOOL: {
                 "calendar_id": "primary",
                 "time_min": "2026-10-20T08:30:00Z",
                 "time_max": "2026-10-22T08:30:00Z",
                 "max_results": 50,
-            }],
+            },
             GET_TOOL: {"calendar_id": "primary"},
         })
         self.assertEqual(kwargs["required"], [LIST_TOOL])
@@ -1523,10 +1523,6 @@ class LockGroupTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ChunkConfigTest(unittest.TestCase):
     def problems(self, **maintenance):
         routine = {"id": "cal", "enabled": True, "role": "maintenance",
@@ -1542,3 +1538,7 @@ class ChunkConfigTest(unittest.TestCase):
         self.assertTrue(self.problems(events_window_days=31,
                                       list_chunk_days=2))
         self.assertTrue(self.problems(list_chunk_days=0))
+
+
+if __name__ == "__main__":
+    unittest.main()
