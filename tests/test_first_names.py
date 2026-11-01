@@ -542,7 +542,9 @@ class CaptureTest(Base):
                             "slug": "augusta-king", "name": "Augusta King"}],
             speakers=["Ada Byron"], all_named=True)
         self.assertIsNone(people)
-        self.assertIn("Ada Lovelace (no-show)", self.body)
+        # The unmatched label could be an invitee: absence is not certain.
+        self.assertNotIn("no-show", self.body)
+        self.assertIn("Ada Lovelace (accepted)", self.body)
 
     def test_an_organizer_without_an_rsvp_counts_as_accepted(self):
         people = self.capture(

@@ -754,7 +754,10 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
         person = by_email.get(email)
         name = str((person or {}).get("name") or row.get("name")
                    or calendar_cache.name_from_email(email) or email)
-        if _name_key(name) in owners:
+        # Calendar data written by others: capped like other external names.
+        name = calendar_cache.capped_name(" ".join(name.split()))[:60] \
+            or email
+        if _name_key(name) in owners or _name_key(name) in owner_firsts:
             continue  # an owner alias
         rsvp = row.get("rsvp") or (
             "accepted" if row.get("role") == "calendar-organizer"
@@ -783,6 +786,15 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
             for label in speakers
         )
 
+    # A named voice that matches no invitee could be one of them under another
+    # label, so no absence is certain then.
+    certain = all_named and all(
+        any(label == _name_key(i["name"])
+            or (" " not in label
+                and label == _name_key(i["name"]).split(" ")[0])
+            for i in invitees)
+        for label in speakers
+    )
     attended, no_show, unconfirmed = [], [], []
     for invitee in invitees:
         if spoke(invitee["name"]) or invitee["slug"] in model_people:
@@ -791,7 +803,7 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
             declined.append(invitee["name"])
         elif small and not speakers and invitee["rsvp"] == "accepted":
             attended.append(invitee["slug"])
-        elif all_named and speakers:
+        elif certain and speakers:
             no_show.append(invitee["name"])
         else:
             reply = {"tentative": "tentative", "accepted": "accepted"}.get(
