@@ -67,6 +67,82 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(*blocks) if blocks else "No events found", now=now)
         self.assertEqual(self.emitted(), [])
 
+    def run_far(self, main_text, far_texts, now=NOW, **over):
+        """Main listing answers the main session; far_texts[i] window i."""
+        config_ = dict(self.cfg, invite_lookahead_days=21, **over)
+        windows = calendar_cache.invite_windows(config_, now)
+        main_args = calendar_cache.list_args(config_, now)
+        far_calls = []
+
+        def bridge(prompt, tools, **kwargs):
+            args = tools[LIST_TOOL]
+            if args == main_args:
+                return [{"name": LIST_TOOL, "text": main_text,
+                         "is_error": False, "input": args}]
+            far_calls.append(args)
+            text = far_texts[windows.index(args)]
+            if text is None:
+                raise claude_bridge.BridgeError("session failed")
+            return [{"name": LIST_TOOL, "text": text, "is_error": False,
+                     "input": args}]
+
+        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
+                               side_effect=bridge):
+            calendar_cache.run(config_, self.base, now=now)
+        return windows, far_calls
+
+    def test_far_windows_start_where_the_main_listing_ends(self):
+        windows = calendar_cache.invite_windows(
+            dict(self.cfg, invite_lookahead_days=21), NOW)
+        self.assertEqual([(w["time_min"], w["time_max"]) for w in windows], [
+            (at(NOW + 7 * DAY), at(NOW + 14 * DAY)),
+            (at(NOW + 14 * DAY), at(NOW + 21 * DAY)),
+        ])
+        self.assertEqual(calendar_cache.invite_windows(self.cfg, NOW), [])
+
+    def test_new_far_invites_are_announced_once_after_the_first_scan(self):
+        old = block("old", soon(10), title="Already there")
+        self.run_far(listing(), [listing(old), listing()])
+        self.assertEqual(self.emitted(), [])
+        new = block("new", soon(12), title="Offsite")
+        answered = block("ok", soon(13), title="Answered", rsvp="accepted")
+        hour = datetime.timedelta(hours=1)
+        _, calls = self.run_far(listing(), [listing(old, new, answered),
+                                            listing()], now=NOW + hour)
+        self.assertEqual(len(calls), 2)
+        (event,) = self.emitted()
+        self.assertEqual((event["kind"], event["title"], event["source_id"]),
+                         ("new", "Offsite", "gcal:new"))
+        self.assertTrue(event["details"]["untrusted"])
+        self.run_far(listing(), [listing(old, new), listing()],
+                     now=NOW + 2 * hour)
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_far_scan_runs_at_most_hourly_and_backs_off_on_failure(self):
+        _, first = self.run_far(listing(), [None, listing()])
+        self.assertEqual(len(first), 1)
+        _, soon_after = self.run_far(
+            listing(), [listing(), listing()],
+            now=NOW + datetime.timedelta(minutes=15))
+        self.assertEqual(soon_after, [])
+        _, later = self.run_far(
+            listing(), [listing(), listing()],
+            now=NOW + datetime.timedelta(minutes=59))
+        self.assertEqual(len(later), 2)
+
+    def test_an_incomplete_first_scan_announces_nothing_later(self):
+        there = block("there", soon(16), title="Already there")
+        self.run_far(listing(), [None, listing(there)])
+        self.run_far(listing(), [listing(), listing(there)],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_far_scan_failure_never_fails_the_refresh(self):
+        with mock.patch.object(calendar_cache, "scan_far_invites",
+                               side_effect=RuntimeError("boom")):
+            report = self.run_at(listing(block("a", soon(1), title="Near")))
+        self.assertTrue(report["ok"])
+
     def test_fetch_is_one_wide_call_and_output_stays_48h(self):
         args = calendar_cache.list_args(self.cfg, NOW)
         self.assertEqual(args["time_max"], at(NOW + 7 * DAY))
