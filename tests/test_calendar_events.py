@@ -85,6 +85,7 @@ class EventsTest(unittest.TestCase):
             "end": "2026-10-23T09:30:00+00:00",
             "location": "", "conference": "", "status": "confirmed",
             "my_rsvp": "needsAction", "title": "Pending",
+            "rsvps": {"alice.smith@example.com": ["Alice Smith", "accepted"]},
         })
         self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
 
@@ -124,6 +125,60 @@ class EventsTest(unittest.TestCase):
             "end": ["2026-10-23T09:30:00+00:00", "2026-10-23T11:30:00+00:00"],
         })
         self.assertEqual(event["details"]["start"], "2026-10-23T10:30:00+00:00")
+
+    def test_title_change_is_update(self):
+        self.seed(block("a", soon(), rsvp="accepted", title="Sync"))
+        self.run_at(listing(block("a", soon(), rsvp="accepted",
+                                  title="Sync (moved agenda)")))
+        (event,) = self.emitted()
+        self.assertEqual(event["kind"], "update")
+        self.assertEqual(event["details"]["changed"],
+                         {"title": ["Sync", "Sync (moved agenda)"]})
+
+    def test_snapshot_without_title_is_not_a_title_change(self):
+        self.seed(block("a", soon(), rsvp="accepted"))
+        data = json.loads(self.snapshot.read_text())
+        del data["events"]["a"]["title"]
+        self.snapshot.write_text(json.dumps(data))
+        self.run_at(listing(block("a", soon(), rsvp="accepted")))
+        self.assertEqual(self.emitted(), [])
+
+    def mine(self, guest_rsvp, title="Mine"):
+        return block("m", soon(), title=title, organizer="me@example.com",
+                     rsvp="accepted",
+                     extra=f", bob.jones@example.com ({guest_rsvp})")
+
+    def test_attendee_answer_on_my_event_is_rsvp(self):
+        self.seed(self.mine("needsAction"))
+        self.run_at(listing(self.mine("accepted")))
+        (event,) = self.emitted()
+        self.assertEqual(event["kind"], "rsvp")
+        self.assertEqual(event["details"]["changed"],
+                         {"Bob Jones": ["needsAction", "accepted"]})
+
+    def test_unchanged_answers_and_others_events_emit_no_rsvp(self):
+        self.seed(self.mine("accepted"),
+                  block("o", soon(), rsvp="accepted",
+                        extra=", bob.jones@example.com (needsAction)"))
+        self.run_at(listing(
+            self.mine("accepted"),
+            block("o", soon(), rsvp="accepted",
+                  extra=", bob.jones@example.com (declined)")))
+        self.assertEqual(self.emitted(), [])
+
+    def test_added_attendee_is_not_an_rsvp_change(self):
+        self.seed(block("m", soon(), title="Mine", organizer="me@example.com",
+                        rsvp="accepted"))
+        self.run_at(listing(self.mine("accepted")))
+        self.assertEqual(self.emitted(), [])
+
+    def test_snapshot_without_rsvps_compares_nothing(self):
+        self.seed(self.mine("needsAction"))
+        data = json.loads(self.snapshot.read_text())
+        del data["events"]["m"]["rsvps"]
+        self.snapshot.write_text(json.dumps(data))
+        self.run_at(listing(self.mine("accepted")))
+        self.assertEqual(self.emitted(), [])
 
     def test_location_change_is_update(self):
         self.seed(block("a", soon(), rsvp="accepted", location="Room 1"))
