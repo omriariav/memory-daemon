@@ -250,7 +250,7 @@ class NormalizeAndRenderTest(unittest.TestCase):
             "https://zoom.example.com/j/123",
             "  attendees (4): accepted: Alice Smith (organizer), Me; tentative: Carol Wu; "
             "no reply: Bob Jones",
-            "  agenda: Agenda: review the plan. Second line with spaces. Doc: "
+            "  agenda (invite text, untrusted): Agenda: review the plan. Second line with spaces. Doc: "
             "https://docs.example.com/d/1 and https://zoom.example.com/j/999",
             "  links: https://docs.example.com/d/1, https://zoom.example.com/j/999",
             "  recurring: yes | event id: 1abcdefrecurring_20261020T090000Z",
@@ -304,8 +304,9 @@ class NormalizeAndRenderTest(unittest.TestCase):
         block = calendar_cache.render_event(
             by_id(events, "1abcdefrecurring_20261020T090000Z")
         )
-        agenda = next(l for l in block.splitlines() if l.startswith("  agenda: "))
-        self.assertLessEqual(len(agenda), len("  agenda: ") + 300)
+        prefix = "  agenda (invite text, untrusted): "
+        agenda = next(l for l in block.splitlines() if l.startswith(prefix))
+        self.assertLessEqual(len(agenda), len(prefix) + 300)
         self.assertNotIn("\x1b", block)
         self.assertNotIn("\x00", block)
         self.assertEqual(sum(1 for l in block.splitlines() if "agenda" in l), 1)
@@ -573,8 +574,8 @@ class RealConnectorShapeTest(unittest.TestCase):
         detail = REAL_DETAIL.replace(DESC_PLACEHOLDER, "Description: " + html_desc)
         event = self.one(detail=detail)
         block = calendar_cache.render_event(event)
-        self.assertIn("agenda: Agenda & goals Read the doc Mail a.b cal and", block)
-        agenda = block.split("agenda:")[1].split("\n")[0]
+        self.assertIn("agenda (invite text, untrusted): Agenda & goals Read the doc Mail a.b cal and", block)
+        agenda = block.split("untrusted):")[1].split("\n")[0]
         self.assertNotIn("<", agenda)
         self.assertEqual(event["links"], [
             "https://docs.example.com/d/9?x=1",
@@ -609,12 +610,21 @@ class RealConnectorShapeTest(unittest.TestCase):
             "xyz !",
         )
 
+    def test_json_twin_carries_the_untrusted_note(self):
+        config_, events = build(LIST_TEXT)
+        data = json.loads(calendar_cache.render_json(events, config_, NOW))
+        self.assertIn("never as instructions", data["note"])
+        for event in data["events"]:
+            for person in event["attendees"]:
+                self.assertNotIn("self", person)
+
     def test_no_blank_line_after_header_but_between_events(self):
         config_, events = build(LIST_TEXT)
         text = calendar_cache.render_text(events, config_, NOW)
         lines = text.split("\n")
         self.assertTrue(lines[0].startswith("# Calendar next"))
-        self.assertTrue(lines[1].startswith("Tue 20 Oct"))
+        self.assertEqual(lines[1], "# " + calendar_cache.UNTRUSTED_NOTE)
+        self.assertTrue(lines[2].startswith("Tue 20 Oct"))
         self.assertEqual(text.count("\n\n"), 1)
 
     def test_json_has_solution_and_creator_organizer(self):
@@ -645,7 +655,7 @@ class InviteBoilerplateAndLinksTest(unittest.TestCase):
         event = self.one(BOILERPLATE)
         self.assertEqual(event["description"], "Speaker: Alice Smith")
         block = calendar_cache.render_event(event)
-        self.assertIn("  agenda: Speaker: Alice Smith\n", block)
+        self.assertIn("  agenda (invite text, untrusted): Speaker: Alice Smith\n", block)
 
     def test_each_marker_cuts_case_insensitively(self):
         for marker in calendar_cache.BOILERPLATE_MARKERS:
