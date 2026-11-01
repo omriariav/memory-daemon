@@ -1234,10 +1234,15 @@ directory (symlinks resolved) as its working directory.
   in the recording app's own summary) is dropped, since they were mentioned,
   not present. With at most 4 such invitees (the owner included) every
   verified invitee is listed even when the model left them out; above that,
-  only the invitees the model names. The summary and extraction prompts carry
-  the invitee names with the rule that no one else can have attended or be
-  credited with a statement. Without an invitation, or without a safe owner
-  identity, capture works as before.
+  only the invitees the model names. This applies only when every invitee is
+  verified (safe owner identity, every directory lookup found the person, at
+  most 20 rows); otherwise a real invitee may have only a hand-made store
+  slug, and capture works as before. A known person left out for not being
+  invited is logged, not tagged `people-unmapped`. The summary, extraction
+  and operator-confirmed prompts carry the invitee names in their own
+  untrusted block, with the rule that only they and the owner can have
+  attended or be credited with a statement. Without an invitation capture
+  works as before.
 - **Meeting first names.** A capture with calendar attendees (`mila`,
   `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one
   attendee who goes by it, never to anyone else in the directory. This runs on

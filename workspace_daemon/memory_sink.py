@@ -667,14 +667,38 @@ def _summary_title(summary):
     return "untitled"
 
 
+def _invitees_only(item, identity, unresolved_source):
+    """Whether `people` must come from the matched invitation alone.
+
+    Only when every invitee is accounted for: a safe owner identity, no
+    invitee whose directory lookup failed or found nobody, and no truncated
+    list. Otherwise a real invitee could have only a hand-made store slug,
+    so capture keeps the store-wide allow-list as before.
+    """
+    meta = item.get("frontmatter") or {}
+    rows = meta.get("source_people") or []
+    return bool(
+        identity.get("safe") and not unresolved_source
+        and not meta.get("source_people_truncated")
+        and len(rows) <= MAX_SOURCE_PEOPLE
+        and any(
+            isinstance(row, dict)
+            and str(row.get("role") or "").startswith("calendar-")
+            for row in rows
+        )
+    )
+
+
 def _extract(routine, item, summary, store, verified_people=(), identity=None,
-             owner_names=(), existing_titles=()):
+             owner_names=(), existing_titles=(), invitees_only=False):
     """Structured second pass over the already-distilled summary."""
     from . import llm  # late import to avoid cycles
 
     identity = identity or {"safe": False}
+    # For a fully verified invitation only invitees can be people, so only
+    # their slugs are offered.
     slugs = sorted(
-        _known_slugs_for_identity(store, identity)
+        (set() if invitees_only else _known_slugs_for_identity(store, identity))
         | {person["slug"] for person in verified_people}
     )
     verified_catalog = ", ".join(
@@ -828,6 +852,9 @@ def _operator_confirmed_summary(routine, item):
         source=llm.fence(
             "\n".join(source_header) + "\n\n" + item.get("body", "")),
     )
+    note = llm.invitees_note(item)
+    if note:
+        prompt += "\n" + note
     summary = llm.analyze(routine, prompt).strip()
     if not summary or summary == "NOT MEMORY-WORTHY":
         raise NoUsableSummary(
@@ -999,6 +1026,9 @@ def capture(routine, item, summary, dry_run=False):
         )
     else:
         verified_source, unresolved_source = [], []
+    invitees_only = extract and _invitees_only(
+        item, identity, unresolved_source
+    )
     verified_owners, unresolved_owners = _verified_owner_people(
         item, rid, identity, provider
     )
@@ -1016,6 +1046,7 @@ def capture(routine, item, summary, dry_run=False):
                 verified_people=verified_source,
                 identity=identity,
                 owner_names=todo_names, existing_titles=todo_titles,
+                invitees_only=invitees_only,
             ))
             extraction_succeeded = True
         except claude_bridge.GUARD_STOPS:
@@ -1133,17 +1164,11 @@ def capture(routine, item, summary, dry_run=False):
         and (row.get("rsvp") != "declined"
              or str(row.get("email") or "").strip().casefold() == own_email)
     ]
-    # A meeting matched to an invitation: only its invitees can have been in
-    # the room. Anyone else the model names (a colleague discussed, a name in
-    # the recording app's summary) was mentioned, not present, so a known
-    # slug alone no longer qualifies. Needs a safe identity, which the
-    # invitee slugs are verified against.
-    invitation = identity.get("safe") and any(
-        isinstance(row, dict)
-        and str(row.get("role") or "").startswith("calendar-")
-        for row in meta.get("source_people") or []
-    )
-    if invitation:
+    # A meeting matched to an invitation whose invitees are all verified:
+    # only they can have been in the room. Anyone else the model names (a
+    # colleague discussed, a name in the recording app's summary) was
+    # mentioned, not present, so a known slug alone no longer qualifies.
+    if invitees_only:
         allowed = source_slugs | set(verified_owners)
     matched = {}
     pending = [p for p in raw_people if p not in allowed]
@@ -1167,11 +1192,22 @@ def capture(routine, item, summary, dry_run=False):
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))
-    if invitation and 0 < len(attendees) <= SMALL_MEETING:
+    if invitees_only and 0 < len(attendees) <= SMALL_MEETING:
         people = list(dict.fromkeys(
             people + sorted(source_slugs - set(people))
         ))
-    dropped = [p for p in model_people if p not in allowed]
+    # Known people left out because they were not invited are expected, not
+    # an identity gap: they do not count as dropped.
+    mentioned = [
+        p for p in model_people if invitees_only and p not in allowed
+        and p in known
+    ]
+    if mentioned:
+        log(f"routine={rid} memory: left out {len(mentioned)} known "
+            "person(s) not on the invitation")
+    dropped = [
+        p for p in model_people if p not in allowed and p not in mentioned
+    ]
     source_people_truncated = bool(
         item.get("frontmatter", {}).get("source_people_truncated")
         or len(item.get("frontmatter", {}).get("source_people") or [])

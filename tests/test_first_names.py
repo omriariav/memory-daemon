@@ -256,7 +256,8 @@ class CaptureTest(Base):
         self.addCleanup(identity._providers.clear)
 
     def capture(self, people, source_people, safe=True, extra=None,
-                owner_email="me.owner@example.com", verified=()):
+                owner_email="me.owner@example.com", verified=(),
+                unresolved=(), want_args=False):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True, **(extra or {})})
@@ -282,13 +283,16 @@ class CaptureTest(Base):
                 mock.patch.object(memory_sink, "_authenticated_identity",
                                   return_value=ident), \
                 mock.patch.object(memory_sink, "_verified_source_people",
-                                  return_value=(list(verified), [])), \
+                                  return_value=(list(verified),
+                                                list(unresolved))), \
                 mock.patch.object(memory_sink, "_prefetch_identities"), \
                 mock.patch.object(memory_sink, "_commit_store"), \
                 mock.patch.object(memory_sink, "_emit_capture_event"), \
                 mock.patch.object(memory_sink, "log"):
             memory_sink.capture(routine, item, "summary")
         args = seen["args"]
+        if want_args:
+            return args
         return args[args.index("--people") + 1] if "--people" in args else None
 
     def test_meeting_first_names_become_attendee_slugs(self):
@@ -433,6 +437,20 @@ class CaptureTest(Base):
         people = self.capture(["person-2", "jane-doe"], rows,
                               verified=verified)
         self.assertEqual(people, "person-2")
+
+    def test_unverified_invitee_keeps_the_store_wide_allow_list(self):
+        # A real invitee may only have a hand-made store slug.
+        people = self.capture(
+            ["jane-doe"], [attendee("guest@partner.example")],
+            unresolved=["guest@partner.example"])
+        self.assertEqual(people, "jane-doe")
+
+    def test_a_mentioned_colleague_is_not_an_identity_gap(self):
+        args = self.capture(
+            ["jane-doe", "Ada"], [attendee("ada.lovelace@example.com")],
+            want_args=True)
+        tags = args[args.index("--tags") + 1]
+        self.assertNotIn("people-unmapped", tags)
 
     def test_declined_invitee_is_not_listed_in_a_small_meeting(self):
         # _verified_source_people already drops declined rows; the count
