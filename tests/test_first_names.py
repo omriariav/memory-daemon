@@ -250,13 +250,17 @@ class InternalDomainsValidationTest(unittest.TestCase):
         self.assertEqual(memory_sink._owner_domains({}, "me@gmail.com"), set())
 
 
+ADA = {"email": "ada.lovelace@example.com", "slug": "ada-lovelace"}
+
+
 class CaptureTest(Base):
     def setUp(self):
         super().setUp()
         self.addCleanup(identity._providers.clear)
 
     def capture(self, people, source_people, safe=True, extra=None,
-                owner_email="me.owner@example.com"):
+                owner_email="me.owner@example.com", verified=(),
+                unresolved=(), want_args=False):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True, **(extra or {})})
@@ -282,13 +286,16 @@ class CaptureTest(Base):
                 mock.patch.object(memory_sink, "_authenticated_identity",
                                   return_value=ident), \
                 mock.patch.object(memory_sink, "_verified_source_people",
-                                  return_value=([], [])), \
+                                  return_value=(list(verified),
+                                                list(unresolved))), \
                 mock.patch.object(memory_sink, "_prefetch_identities"), \
                 mock.patch.object(memory_sink, "_commit_store"), \
                 mock.patch.object(memory_sink, "_emit_capture_event"), \
                 mock.patch.object(memory_sink, "log"):
             memory_sink.capture(routine, item, "summary")
         args = seen["args"]
+        if want_args:
+            return args
         return args[args.index("--people") + 1] if "--people" in args else None
 
     def test_meeting_first_names_become_attendee_slugs(self):
@@ -410,6 +417,62 @@ class CaptureTest(Base):
             ["Ada", "jane-doe"],
             [attendee("ada.lovelace@example.com"),
              attendee("ada.byron@example.com")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_known_slug_that_was_not_invited_is_dropped(self):
+        # Named in the meeting, known to the store, but not invited.
+        people = self.capture(
+            ["jane-doe", "Ada"], [attendee("ada.lovelace@example.com")],
+            verified=[ADA])
+        self.assertEqual(people, "ada-lovelace")
+
+    def test_small_meeting_lists_every_verified_invitee(self):
+        ada = ADA
+        people = self.capture(
+            ["jane-doe"],
+            [attendee("me.owner@example.com"),
+             attendee("ada.lovelace@example.com")], verified=[ada])
+        self.assertEqual(people, "ada-lovelace")
+
+    def test_large_meeting_keeps_only_named_invitees(self):
+        rows = [attendee(f"p{n}@example.com") for n in range(5)]
+        verified = [{"email": f"p{n}@example.com", "slug": f"person-{n}"}
+                    for n in range(5)]
+        people = self.capture(["person-2", "jane-doe"], rows,
+                              verified=verified)
+        self.assertEqual(people, "person-2")
+
+    def test_unverified_invitee_keeps_the_store_wide_allow_list(self):
+        # A real invitee may only have a hand-made store slug.
+        people = self.capture(
+            ["jane-doe"], [attendee("guest@partner.example")],
+            unresolved=["guest@partner.example"])
+        self.assertEqual(people, "jane-doe")
+
+    def test_a_mentioned_colleague_is_not_an_identity_gap(self):
+        args = self.capture(
+            ["jane-doe", "Ada"], [attendee("ada.lovelace@example.com")],
+            verified=[ADA], want_args=True)
+        tags = args[args.index("--tags") + 1]
+        self.assertNotIn("people-unmapped", tags)
+
+    def test_owners_own_block_keeps_the_store_wide_allow_list(self):
+        people = self.capture(
+            ["jane-doe"],
+            [attendee("me.owner@example.com", role="calendar-organizer")])
+        self.assertEqual(people, "jane-doe")
+
+    def test_declined_invitee_is_not_listed_in_a_small_meeting(self):
+        # _verified_source_people already drops declined rows; the count
+        # of invitees ignores them too.
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com", rsvp="declined")])
+        self.assertIsNone(people)
+
+    def test_owner_alias_alone_keeps_the_store_wide_allow_list(self):
+        # The alias resolves to the owner, so no one else was verified.
+        people = self.capture(
+            ["jane-doe"], [attendee("me.alias@example.com")])
         self.assertEqual(people, "jane-doe")
 
     def test_non_calendar_sources_are_untouched(self):

@@ -878,7 +878,8 @@ def _event_dict(raw, owner):
         if is_self:
             my_status = person.get("rsvp")
         attendees.append({
-            "email": email, "display_name": "",
+            "email": email,
+            "display_name": calendar_cache.name_from_email(email),
             "response_status": person.get("rsvp"), "self": is_self,
         })
     return {

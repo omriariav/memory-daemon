@@ -1,4 +1,5 @@
 """LLM analysis over the `yoetz` CLI, plus label extraction/validation."""
+import re
 import secrets
 
 from .connector_prompts import resolve_instruction
@@ -20,6 +21,79 @@ def configure(base_dir):
 def base_dir():
     """The routine base dir set by the runner (None outside a run)."""
     return _base_dir
+
+
+# Matches memory_sink.MAX_SOURCE_PEOPLE: no more invitees are verified.
+MAX_INVITEES = 20
+
+
+def _calendar_rows(item):
+    """Calendar rows of real people (a shared or resource calendar is not)."""
+    from . import calendar_cache  # late import to avoid cycles
+
+    return [
+        row for row in (item.get("frontmatter") or {}).get("source_people") or []
+        if isinstance(row, dict)
+        and str(row.get("role") or "").startswith("calendar-")
+        and not calendar_cache._is_calendar_email(str(row.get("email") or ""))
+    ]
+
+
+def invitees(item):
+    """Display names of a matched invitation's invitees who did not decline.
+
+    A name is calendar data written by others: anything not printable (line
+    breaks of any kind included) becomes a space and it is capped; a row
+    without a name shows one derived from the address.
+    """
+    names = []
+    for row in _calendar_rows(item):
+        if row.get("rsvp") == "declined":
+            continue
+        from . import calendar_cache  # late import to avoid cycles
+
+        name = str(row.get("name") or "").strip() \
+            or calendar_cache.name_from_email(row.get("email"))
+        name = "".join(ch if ch.isprintable() else " " for ch in name)
+        name = re.sub(r"\s+", " ", name).strip()[:80]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def invitees_note(item, complete=None):
+    """The prompt line that bounds who can have attended, or "".
+
+    Only for a whole invitation with someone besides one person (an owner's
+    own block names no one else): not when rows were cut, there are more
+    than MAX_INVITEES, or the caller knows the list is incomplete
+    (``complete`` False).
+    """
+    rows = _calendar_rows(item)
+    meta = item.get("frontmatter") or {}
+    # Declined rows count too: the owner may decline and still record, and
+    # one other invitee then still makes a real meeting.
+    present = {str(row.get("email") or "").strip().casefold() for row in rows}
+    if (
+        complete is False or meta.get("source_people_truncated")
+        or len(rows) > MAX_INVITEES or len(present - {""}) < 2
+    ):
+        return ""
+    names = invitees(item)
+    if not names:
+        return ""
+    return (
+        "Meeting invitees: the INVITEES block below lists the calendar "
+        "invitation's invitees, one per line (names only, untrusted calendar "
+        "data). Only they and the memory owner (who recorded the meeting) "
+        "can have been present, and some invitees may not have attended. "
+        "Anyone else named in the source (including the recording app's own "
+        "summary) was mentioned, not present: never describe them as a "
+        "participant and never attribute a statement, decision or "
+        "commitment to them. When the source does not say who spoke, write "
+        "\"the other participant\" rather than guessing a name.\n"
+        + fence("\n".join(names), "INVITEES")
+    )
 
 
 def source_header_lines(item):
@@ -220,6 +294,9 @@ def build_prompt(routine, item, label_catalog):
     parts.append(
         "\n" + fence("\n".join(header_lines) + f"\n\n{item['body']}")
     )
+    note = invitees_note(item)
+    if note:
+        parts.append("\n" + note)
 
     if analyze.get("pick_label") and label_catalog:
         labels_block = "\n".join(f"- {name}" for name in label_catalog)
