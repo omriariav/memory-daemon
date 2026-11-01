@@ -22,9 +22,11 @@ Routine config:
       exclude_self_only: false
       verified_sender_domains: [example.com]  # optional; see below
       auth_servers: [mx.google.com]           # whose verdict is trusted
+      trust_from_without_auth: false          # see "From-only trust" below
 
 With `verified_sender_domains` set, only mail from those exact domains is
-read, and only when the receiving server authenticated it. A message's From
+read, and (unless From-only trust is on, below) only when the receiving
+server authenticated it. A message's From
 must be one plain address whose domain equals a listed domain (no subdomain
 or lookalike; the display name is ignored), and the topmost
 Authentication-Results header, stamped by one of `auth_servers`, must show
@@ -34,6 +36,23 @@ never captured, and only counts and message ids are logged. An
 Authentication-Results line printed below the message's own headers counts as
 forged. The owner's own mail never passes the receiving server, so it is
 dropped at listing; skipped messages of a kept thread are noted as withheld.
+
+From-only trust: a connector that never shows Authentication-Results would
+make every message fail closed. `trust_from_without_auth: true` (only with
+`verified_sender_domains` and `owner_email`) accepts a message whose From
+passes the same strict domain check when it carries no Authentication-Results
+header at all. A message that has one still gets the full check, so a failing
+verdict is still a hard fail, and a header printed below the message's own
+headers still counts as forged. The first time any message read through a
+`fetch_tool` carries the header (flag on or off), From-only trust switches
+itself off for that tool for good (state/gmail-mcp-auth-seen.json), since the
+connector evidently returns it and a message without it was not stamped by
+the receiving server. Each accepted message's body starts with a
+"Sender not authenticated" note, and the log carries counts and message ids. A thread accepted before a later
+bridge session in the same run shows the header stays accepted. The From
+header can be spoofed: this
+relies on the domain's DMARC policy making the receiving server reject
+forged mail.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -67,12 +86,14 @@ first advances it to the newest message read.
 """
 import datetime
 import email.utils
+import fcntl
 import hashlib
 import html
 import html.parser
 import itertools
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -98,7 +119,7 @@ DEFAULTS = {
 # Keys only a gmail_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "fetch_tool", "owner_email", "verified_sender_domains",
-    "auth_servers",
+    "auth_servers", "trust_from_without_auth",
 }
 DEFAULT_AUTH_SERVERS = ("mx.google.com",)
 MAX_LOGGED_IDS = 20
@@ -167,6 +188,13 @@ def settings(source):
         str(s).strip().casefold()
         for s in source.get("auth_servers") or DEFAULT_AUTH_SERVERS
     ]
+    # Also enforced here, not only by config validation: without owner_email
+    # the owner's own sent mail would be read as a colleague's.
+    cfg["trust_from_without_auth"] = (
+        source.get("trust_from_without_auth") is True
+        and bool(cfg["verified_sender_domains"])
+        and bool((cfg.get("owner_email") or "").strip())
+    )
     return cfg
 
 
@@ -686,12 +714,8 @@ def _bound_body(message, limit):
 
 # --- sender verification -----------------------------------------------------
 
-def sender_domain(value):
-    """Domain of a From header that is exactly one plain address, else None.
-
-    The display name never counts: only the address is read, and a header
-    with several addresses, or an address that is not local@domain, has none.
-    """
+def sender_address(value):
+    """The one plain address of a From header (as read for the domain), or None."""
     pairs = email.utils.getaddresses([value or ""])
     if len(pairs) == 1:
         address = pairs[0][1].strip()
@@ -702,7 +726,24 @@ def sender_domain(value):
         if not match:
             return None
         address = match.group(1)
-    return _domain_of(address)
+    return address if _domain_of(address) else None
+
+
+def sender_domain(value):
+    """Domain of a From header that is exactly one plain address, else None.
+
+    The display name never counts: only the address is read, and a header
+    with several addresses, or an address that is not local@domain, has none.
+    """
+    return _domain_of(sender_address(value))
+
+
+def _same_mailbox(address, owner):
+    """Whether `address` is `owner`, ignoring case and a +tag."""
+    def base(value):
+        local, _, domain = str(value or "").strip().casefold().partition("@")
+        return local.split("+", 1)[0], domain
+    return bool(owner) and base(address) == base(owner)
 
 
 def _domain_of(address, bare_ok=False):
@@ -811,12 +852,31 @@ def sender_authenticated(results, domain, servers):
     return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
 
 
-def verified_sender(cfg, headers, auth_results):
-    """A fetched message's From is a listed domain and authenticated for it."""
+FROM_ONLY_NOTE = ("[Sender not authenticated: this message was accepted on "
+                  "its From address alone.]")
+
+
+def sender_verdict(cfg, headers, auth_results):
+    """"verified", "from_only" or None for a fetched message.
+
+    "verified": From is a listed domain and authenticated for it.
+    "from_only": From is a listed domain, the message has no
+    Authentication-Results header at all (an empty list, not one holding a
+    forged or unreadable header), and trust_from_without_auth is on.
+    """
     domain = sender_domain(headers.get("from"))
-    return domain in cfg["verified_sender_domains"] and sender_authenticated(
-        auth_results, domain, cfg["auth_servers"]
-    )
+    if domain not in cfg["verified_sender_domains"]:
+        return None
+    if cfg.get("trust_from_without_auth") and auth_results == []:
+        # The owner's own sent mail has no verdict either; it must never pass
+        # as a colleague's (a send-as alias other than owner_email still can).
+        if _same_mailbox(sender_address(headers.get("from")),
+                         cfg.get("owner_email")):
+            return None
+        return "from_only"
+    if sender_authenticated(auth_results, domain, cfg["auth_servers"]):
+        return "verified"
+    return None
 
 
 def _partition(items, keep):
@@ -827,10 +887,14 @@ def _partition(items, keep):
     return kept, [item["id"] for item in dropped]
 
 
-def _log_skipped(what, ids):
+def _log_ids(summary, ids):
     shown = ",".join(ids[:MAX_LOGGED_IDS])
     more = f" (+{len(ids) - MAX_LOGGED_IDS} more)" if len(ids) > MAX_LOGGED_IDS else ""
-    log(f"gmail_mcp: skipped {len(ids)} message(s) {what}: {shown}{more}")
+    log(f"gmail_mcp: {summary}: {shown}{more}")
+
+
+def _log_skipped(what, ids):
+    _log_ids(f"skipped {len(ids)} message(s) {what}", ids)
 
 
 # --- bridge sessions ---------------------------------------------------------
@@ -995,10 +1059,12 @@ def _group(cfg, hits):
     withheld = {}  # thread -> ids dropped at listing
     if domains:
         # The owner's own mail never carries the receiving server's verdict,
-        # so it would only cost a read and fail at fetch.
+        # so it would only cost a read and fail at fetch (or, with From-only
+        # trust, be read as a colleague's mail).
         kept, external = [], set()
         for hit in hits:
-            if owner and _address(hit["from"]) == owner:
+            if _same_mailbox(sender_address(hit["from"]) or _address(hit["from"]),
+                             owner):
                 continue  # the owner's own mail is not withheld, just unread
             if sender_domain(hit["from"]) in domains:
                 kept.append(hit)
@@ -1020,7 +1086,8 @@ def _group(cfg, hits):
              for mid, (epoch, sender) in group["messages"].items())
         )
         if cfg["exclude_self_only"] and owner and all(
-            _address(sender) == owner for _, _, sender in messages
+            _same_mailbox(sender_address(sender) or _address(sender), owner)
+            for _, _, sender in messages
         ):
             continue
         newest_epoch, newest_id, _ = messages[-1]
@@ -1164,6 +1231,84 @@ def candidates(source):
 
 
 # --- fetch -------------------------------------------------------------------
+
+# (base dir, fetch tool) seen this process; covers a failed save.
+_auth_seen_memory = set()
+
+
+def _auth_seen_path():
+    return Path(_base_dir) / "state" / "gmail-mcp-auth-seen.json"
+
+
+def _read_auth_seen():
+    """The recorded fetch tools, set() when there is no record, None if unreadable."""
+    if _base_dir is None:
+        return set()
+    try:
+        data = json.loads(_auth_seen_path().read_text())
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list) or not all(isinstance(t, str) for t in data):
+        return None
+    return set(data)
+
+
+def auth_seen(fetch_tool):
+    """Whether a message read through `fetch_tool` carried Authentication-Results.
+
+    A record that exists but cannot be read counts as every tool, so a
+    damaged record never re-arms From-only trust.
+    """
+    if (_base_dir, fetch_tool) in _auth_seen_memory:
+        return True
+    recorded = _read_auth_seen()
+    return recorded is None or fetch_tool in recorded
+
+
+def _mark_auth_seen(fetch_tool, announce):
+    """Record that `fetch_tool` returns the header; WARN only if `announce`."""
+    if auth_seen(fetch_tool):
+        return
+    _auth_seen_memory.add((_base_dir, fetch_tool))
+    saved = False
+    if _base_dir is not None:
+        path = _auth_seen_path()
+        try:
+            state.ensure_private_dir(path.parent)
+            # Locked read-modify-write, so routines on different connectors
+            # cannot drop each other's entry. A record unreadable right now is
+            # left alone rather than overwritten with a guess.
+            lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                recorded = _read_auth_seen()
+                if recorded is not None:
+                    state.write_atomic(
+                        path, json.dumps(sorted(recorded | {fetch_tool})),
+                        mode=0o600)
+                    saved = True
+            finally:
+                os.close(lock_fd)
+        except OSError:
+            pass
+    if not announce:
+        return
+    if saved:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "From-only trust is now off for this connector. Remove "
+            "trust_from_without_auth.")
+    elif _base_dir is not None and _read_auth_seen() is None:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "state/gmail-mcp-auth-seen.json is unreadable, so From-only trust "
+            "stays off for every connector. Remove trust_from_without_auth.")
+    else:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "From-only trust is off for this process only: the record in "
+            "state/gmail-mcp-auth-seen.json was not saved, so the next run "
+            "may trust From again. Remove trust_from_without_auth.")
+
 
 def _attempts_path():
     return Path(_base_dir) / "state" / "gmail-mcp-attempts.json"
@@ -1348,22 +1493,73 @@ def fetch(routine, candidate, source=None):
     _clear_attempts(candidate["id"])
     cfg = batch["cfg"]
     messages = outcome["messages"]
-    unverified = []
+    unverified, from_only = [], set()
+    # A connector that shows the header for one message shows it for all, so
+    # once any message of the batch carries it, a message without it was
+    # never stamped by the receiving server: From-only trust stops for good.
+    # Recorded (quietly when the flag is off) whenever verification is on, so
+    # turning the flag on later cannot trust a connector known to show it.
+    # Only a header above the message's own headers counts: one a sender
+    # printed lower (None) must not let them switch trust off for everyone.
+    if cfg["verified_sender_domains"] and any(
+        result is not None
+        for read in batch["threads"].values()
+        for m in read.get("messages") or []
+        for result in m["auth_results"]
+    ):
+        _mark_auth_seen(cfg["fetch_tool"], cfg["trust_from_without_auth"])
     if cfg["verified_sender_domains"]:
-        messages, unverified = _partition(messages, lambda m: verified_sender(
-            cfg, m["headers"], m["auth_results"]))
+        if cfg["trust_from_without_auth"] and auth_seen(cfg["fetch_tool"]):
+            cfg = dict(cfg, trust_from_without_auth=False)
+            if not batch.get("disarm_noted"):
+                batch["disarm_noted"] = True
+                cause = (
+                    "state/gmail-mcp-auth-seen.json is unreadable, which "
+                    "disarms every connector"
+                    if _base_dir is not None and _read_auth_seen() is None
+                    else "this connector returns Authentication-Results"
+                )
+                log(f"gmail_mcp: trust_from_without_auth is set but disarmed "
+                    f"({cause}); header-less mail is skipped.")
+        verdict = {
+            m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
+            for m in messages
+        }
+        messages, unverified = _partition(
+            messages, lambda m: verdict[m["id"]] is not None)
         if unverified:
             _log_skipped("without a verified sender", unverified)
+        # A From-only message with no text has nothing to carry the "not
+        # authenticated" note, while its headers still reach the prompt.
+        for m in messages:
+            if verdict[m["id"]] == "from_only" and not _bound_body(
+                    m, cfg["max_message_chars"]).strip():
+                verdict[m["id"]] = None
+        messages, empty = _partition(
+            messages, lambda m: verdict[m["id"]] is not None)
+        unverified += empty
+        if empty:
+            _log_skipped("accepted on From only but empty", empty)
+        from_only = {m["id"] for m in messages if verdict[m["id"]] == "from_only"}
+        if from_only:
+            _log_ids(f"accepted {len(from_only)} message(s) on From only "
+                     "(no Authentication-Results)",
+                     [m["id"] for m in messages if m["id"] in from_only])
         if not messages:
             _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")
             raise SenderUnverified("no message from a verified sender")
     out = []
     for message in messages:
+        if message["id"] in from_only:
+            body = FROM_ONLY_NOTE + "\n" + _bound_body(
+                message, cfg["max_message_chars"] - len(FROM_ONLY_NOTE) - 1)
+        else:
+            body = _bound_body(message, cfg["max_message_chars"])
         out.append({
             "id": message["id"],
             "headers": message["headers"],
-            "body": _bound_body(message, cfg["max_message_chars"]),
+            "body": body,
         })
     return {
         "thread_id": thread,

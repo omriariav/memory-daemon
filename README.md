@@ -2275,8 +2275,9 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 - Listing drops every message whose `From` is not one plain address in a listed
   domain. The match is exact: a subdomain or lookalike does not match, and the
   display name is ignored.
-- `fetch()` then requires the topmost `Authentication-Results` header to be
-  stamped by one of `auth_servers`. A lower header naming the same server
+- `fetch()` then requires (unless From-only trust, below, applies) the
+  topmost `Authentication-Results` header to be stamped by one of
+  `auth_servers`. A lower header naming the same server
   counts as forged. It must show
   `dmarc=pass` with `header.from` equal to the domain, or `dkim=pass` signed by
   the domain plus `spf=pass` for it. Any other DMARC verdict vetoes the pass.
@@ -2299,6 +2300,62 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
   captured. Logs carry counts and message ids only.
 - This fails closed. A connector whose `fetch_message` does not return
   `Authentication-Results` therefore yields no captures at all.
+
+**From-only trust** (`trust_from_without_auth: true`, valid only with
+`verified_sender_domains` and `owner_email`). For a connector that never returns
+`Authentication-Results`, this accepts a message whose `From` passes the exact
+domain check above when the message has no `Authentication-Results` header at
+all:
+
+- A message that has the header still gets the full check, so a failing or
+  unreadable verdict is still dropped, and a header printed below the
+  message's own headers still counts as forged.
+- The first time any message read through a `fetch_tool` carries the header
+  (recorded whenever `verified_sender_domains` is set, flag on or off),
+  From-only trust turns itself off for that tool for good
+  (`state/gmail-mcp-auth-seen.json`, plus a WARN when the flag is on): the
+  connector evidently returns it, so a message without it was not stamped by
+  the receiving server. Remove the flag then. A connector that returns the
+  header for only some mail therefore stops header-less (often internal)
+  mail entirely; that is the fail-closed direction.
+- Only a header above the message's own headers disarms: one a sender
+  printed lower cannot switch trust off. If the record cannot be read, every
+  connector counts as disarmed (it is never overwritten while unreadable). If
+  it cannot be saved, the log says trust is off for that process only.
+- A thread accepted before a later bridge session of the same run shows the
+  header stays accepted.
+- Each message accepted this way starts with a "Sender not authenticated"
+  note in the prompt, and each fetch logs `accepted N message(s) on From
+  only` with the newest message id.
+- The owner's own sent mail has no verdict either, so `owner_email` is
+  required, and mail from it (any display name, any `+tag`) is never accepted
+  on From only. Mail sent from a send-as alias that is not `owner_email` is
+  still read as a colleague's.
+- While the flag is set but disarmed, each run logs once that header-less
+  mail is being skipped, and why (the connector returned the header, or the
+  record is unreadable).
+- A From-only message with an empty body is skipped, since there is no text
+  to carry the note. Owner matching (listing, `exclude_self_only` and fetch)
+  ignores display names and `+tag`s alike.
+- Threads recorded as `unverified` before the flag was turned on are not
+  re-read until they get a new message.
+- Known gaps:
+  - The `From` header can be spoofed. This relies on the domain publishing a
+    DMARC `p=reject` (or `quarantine`) policy, so the receiving server rejects
+    forged external mail before it reaches the inbox. Check the domain's
+    `_dmarc` record before turning this on.
+  - DMARC passes for mail sent through any service the domain's SPF record
+    includes, or that signs DKIM for it (helpdesk, CRM and marketing
+    platforms). Mail sent that way through a shared platform account can pass.
+  - Legitimate notifications from the domain (for example helpdesk tickets)
+    can carry text written by outsiders; it is treated as internal mail.
+  - Group and mailing-list addresses in the domain that accept outside posts
+    rewrite the poster's `From` to the group address, so an outsider's post
+    passes without any spoofing. Close such groups to outside posters, or
+    keep their mail out of the routine `query`. The
+    prompt still marks all mail text as untrusted data.
+  - Keep `gmail:` out of task export sources (`fibery-tasks-outbound`
+    `from_sources`) so a spoofed or relayed message cannot become a task.
 
 How a run works:
 
