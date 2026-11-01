@@ -67,6 +67,56 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(*blocks) if blocks else "No events found", now=now)
         self.assertEqual(self.emitted(), [])
 
+    def run_chunked(self, texts, now=NOW, **over):
+        config_ = dict(self.cfg, **over)
+        chunks = calendar_cache.list_chunks(config_, now)
+        calls = [{"name": LIST_TOOL, "text": text, "is_error": False,
+                  "input": args} for args, text in zip(chunks, texts)]
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools", return_value=calls
+        ) as bridge:
+            report = calendar_cache.run(config_, self.base, now=now)
+        return report, chunks, bridge
+
+    def test_long_window_is_listed_in_pinned_weekly_chunks(self):
+        chunks = calendar_cache.list_chunks(
+            dict(self.cfg, events_window_days=21), NOW)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0]["time_min"], at(NOW))
+        self.assertEqual(chunks[-1]["time_max"], at(NOW + 21 * DAY))
+        for left, right in zip(chunks, chunks[1:]):
+            self.assertEqual(left["time_max"], right["time_min"])
+
+    def test_chunks_are_merged_deduped_and_all_pinned(self):
+        self.seed()
+        both = block("span", soon(6) + datetime.timedelta(hours=23),
+                     hours=3, title="Spans the edge")
+        report, chunks, bridge = self.run_chunked(
+            [listing(block("a", soon(), title="Week one"), both),
+             listing(both, block("b", soon(10), title="Week two")),
+             listing(block("c", soon(17), title="Week three"))],
+            events_window_days=21)
+        pins = bridge.call_args.args[1][LIST_TOOL]
+        self.assertEqual(pins, chunks)
+        titles = sorted(e["title"] for e in self.emitted())
+        # Only invites already inside the previous (7-day) window are new.
+        self.assertEqual(titles, ["Spans the edge", "Week one"])
+        data = json.loads(self.snapshot.read_text())
+        self.assertEqual(sorted(data["events"]), ["a", "b", "c", "span"])
+
+    def test_a_missing_chunk_fails_the_refresh(self):
+        with self.assertRaises(Exception):
+            self.run_chunked([listing(block("a", soon()))],
+                             events_window_days=21)
+
+    def test_a_full_chunk_skips_the_diff(self):
+        self.seed(block("a", soon(), title="A"))
+        self.run_chunked(
+            [listing(block("a", soon(), title="A", location="Moved")),
+             listing(block("b", soon(9)))],
+            events_window_days=14, max_events=1)
+        self.assertEqual(self.emitted(), [])
+
     def test_fetch_is_one_wide_call_and_output_stays_48h(self):
         args = calendar_cache.list_args(self.cfg, NOW)
         self.assertEqual(args["time_max"], at(NOW + 7 * DAY))

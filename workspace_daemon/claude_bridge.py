@@ -741,7 +741,8 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
-    equality; {} pins nothing). Returns [{"name", "input", "text", "is_error"}]
+    equality; {} pins nothing), or a non-empty list of such dicts, any one of
+    which a call must match. Returns [{"name", "input", "text", "is_error"}]
     for every real tool_result of an allowlisted tool, in order. Results are
     usually human-readable text, not JSON; callers parse.
 

@@ -47,6 +47,7 @@ MAINTENANCE_ALLOWED_KEYS = {
         "internal_domains", "output", "skip_titles", "max_attendee_names",
         "model", "list_tool", "get_tool", "max_events", "max_details",
         "stale_after", "conference_hosts", "events_window_days",
+        "list_chunk_days",
     },
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
@@ -1544,6 +1545,14 @@ def _validate_calendar_cache(rid, cfg):
         problems.append(
             f"{rid}: maintenance.window_hours must be a positive number "
             "of at most 744"
+        )
+    chunk = cfg.get("list_chunk_days", 7)
+    if (
+        not isinstance(chunk, (int, float)) or isinstance(chunk, bool)
+        or not 1 <= chunk <= 31
+    ):
+        problems.append(
+            f"{rid}: maintenance.list_chunk_days must be a number from 1 to 31"
         )
     days = cfg.get("events_window_days", 7)
     if (

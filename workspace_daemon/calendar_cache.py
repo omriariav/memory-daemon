@@ -52,6 +52,9 @@ DEFAULT_EVENTS_WINDOW_DAYS = 7
 # my_rsvp values (see _rsvp_for_owner) whose update/cancel events are noise:
 # my own events, and ones I declined.
 QUIET_RSVPS = frozenset({"organizer", "declined"})
+# One list call covers at most this many days: a week of a busy calendar
+# fits the connector's result cap and the bridge's tool-result size limit.
+DEFAULT_LIST_CHUNK_DAYS = 7
 # Titles, places, agendas and links are written by whoever sends the invite,
 # and this file is printed into prompts.
 UNTRUSTED_NOTE = ("Event titles, places, agendas and links below are calendar "
@@ -812,31 +815,54 @@ def fetch_hours(cfg):
     return max(float(cfg.get("window_hours", 48)), diff_hours(cfg))
 
 
-def list_args(cfg, now):
-    """The exact list arguments; every one is pinned in the bridge allowlist."""
-    window = fetch_hours(cfg)
-    time_min = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
-    time_max = time_min + datetime.timedelta(hours=window)
+def list_chunks(cfg, now):
+    """The exact list calls, consecutive windows of at most `list_chunk_days`.
+
+    Every argument of each is pinned in the bridge allowlist. One call per
+    chunk keeps each result inside the connector's result cap and the
+    tool-result size limit; a window no longer than a chunk is one call.
+    """
+    total = fetch_hours(cfg)
+    step = float(cfg.get("list_chunk_days", DEFAULT_LIST_CHUNK_DAYS)) * 24
+    start = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    end = start + datetime.timedelta(hours=total)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return {
-        "calendar_id": cfg.get("calendar_id", "primary"),
-        "time_min": time_min.strftime(fmt),
-        "time_max": time_max.strftime(fmt),
-        "max_results": int(cfg.get("max_events", 50)),
-    }
+    chunks = []
+    low = start
+    while low < end:
+        high = min(end, low + datetime.timedelta(hours=step))
+        chunks.append({
+            "calendar_id": cfg.get("calendar_id", "primary"),
+            "time_min": low.strftime(fmt),
+            "time_max": high.strftime(fmt),
+            "max_results": int(cfg.get("max_events", 50)),
+        })
+        low = high
+    return chunks
+
+
+def list_args(cfg, now):
+    """The first (with the default settings, the only) list call."""
+    return list_chunks(cfg, now)[0]
 
 
 def _fetch_prompt(cfg, now):
-    args = list_args(cfg, now)
-    calendar_id = args["calendar_id"]
+    chunks = list_chunks(cfg, now)
+    calendar_id = chunks[0]["calendar_id"]
     details = int(cfg.get("max_details", DEFAULT_MAX_DETAILS))
+    calls = "\n".join(
+        f'   - time_min "{a["time_min"]}", time_max "{a["time_max"]}"'
+        for a in chunks
+    )
+    times = ("once with this window" if len(chunks) == 1
+             else f"{len(chunks)} times, once with each of these windows")
     return (
         "This is a read-only calendar fetch. Do exactly these steps and "
         "nothing else.\n"
-        f'1. Call {cfg["list_tool"]} once with calendar_id "{calendar_id}", '
-        f'time_min "{args["time_min"]}", time_max "{args["time_max"]}" '
-        f"and max_results {args['max_results']}. Use these exact values.\n"
-        f'2. For the earliest-starting events in that result that are not '
+        f'1. Call {cfg["list_tool"]} {times}, with calendar_id '
+        f'"{calendar_id}" and max_results {chunks[0]["max_results"]}. Use '
+        f"these exact values.\n{calls}\n"
+        f'2. For the earliest-starting events in the first result that are not '
         f'all-day events (their Time has a clock time, not just dates), call '
         f'{cfg["get_tool"]} with calendar_id "{calendar_id}" and that '
         f"event's ID, to read its description, for at most {details} events. "
@@ -885,15 +911,16 @@ def fetch(cfg, base_dir, now, tz):
     `wide` is the complete listing over the diff window, or None when the diff
     must not run (diff off, or the result hit max_events and may be cut).
     """
-    args = list_args(cfg, now)
+    chunks = list_chunks(cfg, now)
     max_details = int(cfg.get("max_details", DEFAULT_MAX_DETAILS))
     list_tool, get_tool = cfg["list_tool"], cfg["get_tool"]
     results = claude_bridge.call_tools(
         _fetch_prompt(cfg, now),
-        {list_tool: args, get_tool: {"calendar_id": args["calendar_id"]}},
+        {list_tool: chunks[0] if len(chunks) == 1 else chunks,
+         get_tool: {"calendar_id": chunks[0]["calendar_id"]}},
         model=cfg.get("model", "haiku"),
         base_dir=base_dir,
-        max_turns=max_details + 6,
+        max_turns=max_details + 5 + len(chunks),
         max_budget_usd=round(0.1 + 0.02 * max_details, 2),
         timeout=BRIDGE_TIMEOUT,
         attempts=BRIDGE_ATTEMPTS,
@@ -904,22 +931,30 @@ def fetch(cfg, base_dir, now, tz):
     )
     if getattr(results, "partial", False):
         log("calendar_cache: bridge stopped early; rendering what was fetched")
-    listing = next(
-        (r for r in results if r["name"] == list_tool and not r.get("is_error")
-         and r.get("input") == args),
-        None,
-    )
-    if listing is None:
-        raise claude_bridge.BridgeError(
-            "list_events produced no result with the pinned arguments"
+    parsed, seen, full = [], set(), False
+    for args in chunks:
+        listing = next(
+            (r for r in results if r["name"] == list_tool
+             and not r.get("is_error") and r.get("input") == args),
+            None,
         )
-    parsed = parse_list(listing["text"], tz)
+        if listing is None:
+            raise claude_bridge.BridgeError(
+                "list_events produced no result with the pinned arguments"
+            )
+        part = parse_list(listing["text"], tz)
+        full = full or len(part) >= args["max_results"]
+        # An event spanning a chunk boundary is listed by both chunks.
+        for event in part:
+            if event["event_id"] not in seen:
+                seen.add(event["event_id"])
+                parsed.append(event)
     listed = in_window(parsed, now, cfg.get("window_hours", 48), tz)
     wide = None
     if diff_hours(cfg) > 0:
-        if len(parsed) >= int(cfg.get("max_events", 50)):
-            log("calendar_cache: listing hit max_events; event diff skipped "
-                "(raise max_events or lower events_window_days)")
+        if full:
+            log("calendar_cache: a listing hit max_events; event diff skipped "
+                "(raise max_events or lower list_chunk_days)")
         else:
             wide = in_window(parsed, now, fetch_hours(cfg), tz)
     timed = sorted((e for e in listed if not e["all_day"]),

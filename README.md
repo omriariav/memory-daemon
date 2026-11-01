@@ -731,6 +731,7 @@ maintenance:
   calendar_id: primary                 # pinned in the bridge allowlist
   window_hours: 48
   events_window_days: 7                # diff window for state/events.jsonl; 0 = off
+  list_chunk_days: 7                   # one list call per this many days of the window
   timezone: UTC                        # rendering timezone (IANA)
   owner_email: me@example.com          # "my RSVP"; organizer => "organizer"
   internal_domains: [example.com]      # agendas/links only for these organizers
@@ -749,8 +750,12 @@ maintenance:
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
 are exact MCP names from your connector and are never defaulted.
 
-Calendar events: the same single list call asks for `events_window_days`
-(default 7, `0` turns this off) instead of `window_hours`; `output` and the JSON
+Calendar events: the listing asks for `events_window_days` (default 7, `0`
+turns this off) instead of `window_hours`, in consecutive calls of at most
+`list_chunk_days` (default 7) each, every one pinned in the bridge allowlist,
+so a long window stays inside the connector's result cap (many cap
+`max_results` at 100) and the tool-result size limit. Events listed by two
+chunks are merged; `output` and the JSON
 twin still hold only the next `window_hours`. Each successful run diffs that
 listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
 `{event_id: {start, end, location, conference, status, my_rsvp, title,
