@@ -48,8 +48,7 @@ headers still counts as forged. The first time any message read through a
 itself off for that tool for good (state/gmail-mcp-auth-seen.json), since the
 connector evidently returns it and a message without it was not stamped by
 the receiving server. Each accepted message's body starts with a
-"Sender not authenticated" note, the thread counts them ("from_only"), and
-the log carries counts and message ids. A thread accepted before a later
+"Sender not authenticated" note, and the log carries counts and message ids. A thread accepted before a later
 bridge session in the same run shows the header stays accepted. The From
 header can be spoofed: this
 relies on the domain's DMARC policy making the receiving server reject
@@ -1214,19 +1213,15 @@ def candidates(source):
 # --- fetch -------------------------------------------------------------------
 
 _auth_seen_memory = set()  # fetch tools seen this process (covers a failed save)
-_ALL_TOOLS = "*"  # an unreadable record disarms every tool (fail closed)
+_ALL_TOOLS = "*"  # a recorded "*" disarms every tool
 
 
 def _auth_seen_path():
     return Path(_base_dir) / "state" / "gmail-mcp-auth-seen.json"
 
 
-def _load_auth_seen():
-    """Fetch tools recorded as returning Authentication-Results.
-
-    A missing file means none. A file that exists but cannot be read or
-    parsed counts as every tool, so a damaged record never re-arms trust.
-    """
+def _read_auth_seen():
+    """The recorded fetch tools, set() when there is no record, None if unreadable."""
     if _base_dir is None:
         return set()
     try:
@@ -1234,48 +1229,61 @@ def _load_auth_seen():
     except FileNotFoundError:
         return set()
     except (OSError, ValueError):
-        return {_ALL_TOOLS}
+        return None
     if not isinstance(data, list) or not all(isinstance(t, str) for t in data):
-        return {_ALL_TOOLS}
+        return None
     return set(data)
 
 
 def auth_seen(fetch_tool):
-    """Whether a message read through `fetch_tool` carried Authentication-Results."""
-    seen = _auth_seen_memory | _load_auth_seen()
-    return fetch_tool in seen or _ALL_TOOLS in seen
+    """Whether a message read through `fetch_tool` carried Authentication-Results.
+
+    A record that exists but cannot be read counts as every tool, so a
+    damaged record never re-arms From-only trust.
+    """
+    if fetch_tool in _auth_seen_memory:
+        return True
+    recorded = _read_auth_seen()
+    return recorded is None or fetch_tool in recorded or _ALL_TOOLS in recorded
 
 
-def _mark_auth_seen(fetch_tool):
+def _mark_auth_seen(fetch_tool, announce):
+    """Record that `fetch_tool` returns the header; WARN only if `announce`."""
     if auth_seen(fetch_tool):
         return
     _auth_seen_memory.add(fetch_tool)
-    saved = _base_dir is None
+    saved = False
     if _base_dir is not None:
         path = _auth_seen_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            state.ensure_private_dir(path.parent)
             # Locked read-modify-write, so routines on different connectors
-            # cannot drop each other's entry.
+            # cannot drop each other's entry. A record unreadable right now is
+            # left alone rather than overwritten with a guess.
             lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                tools = _load_auth_seen() | {fetch_tool}
-                state.write_atomic(path, json.dumps(sorted(tools)), mode=0o600)
-                saved = True
+                recorded = _read_auth_seen()
+                if recorded is not None:
+                    state.write_atomic(
+                        path, json.dumps(sorted(recorded | {fetch_tool})),
+                        mode=0o600)
+                    saved = True
             finally:
                 os.close(lock_fd)
         except OSError:
             pass
+    if not announce:
+        return
     if saved:
         log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
             "From-only trust is now off for this connector. Remove "
             "trust_from_without_auth.")
     else:
         log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
-            "From-only trust is off for this process only: saving "
-            "state/gmail-mcp-auth-seen.json failed, so the next run trusts "
-            "From again. Remove trust_from_without_auth.")
+            "From-only trust is off for this process only: the record in "
+            "state/gmail-mcp-auth-seen.json was not saved, so the next run "
+            "may trust From again. Remove trust_from_without_auth.")
 
 
 def _attempts_path():
@@ -1469,11 +1477,15 @@ def fetch(routine, candidate, source=None):
     # trust a connector already known to return the header.
     # Only a header above the message's own headers counts: one a sender
     # printed lower (None) must not let them switch trust off for everyone.
-    if any(result is not None
-           for read in batch["threads"].values()
-           for m in read.get("messages") or []
-           for result in m["auth_results"]):
-        _mark_auth_seen(cfg["fetch_tool"])
+    # Recorded (quietly when the flag is off) whenever verification is on, so
+    # turning the flag on later cannot trust a connector known to show it.
+    if cfg["verified_sender_domains"] and any(
+        result is not None
+        for read in batch["threads"].values()
+        for m in read.get("messages") or []
+        for result in m["auth_results"]
+    ):
+        _mark_auth_seen(cfg["fetch_tool"], cfg["trust_from_without_auth"])
     if cfg["verified_sender_domains"]:
         if cfg["trust_from_without_auth"] and auth_seen(cfg["fetch_tool"]):
             cfg = dict(cfg, trust_from_without_auth=False)
@@ -1487,9 +1499,9 @@ def fetch(routine, candidate, source=None):
             _log_skipped("without a verified sender", unverified)
         from_only = {m["id"] for m in messages if verdict[m["id"]] == "from_only"}
         if from_only:
-            newest = [m["id"] for m in messages if m["id"] in from_only][-1:]
             _log_ids(f"accepted {len(from_only)} message(s) on From only "
-                     "(no Authentication-Results), newest", newest)
+                     "(no Authentication-Results)",
+                     [m["id"] for m in messages if m["id"] in from_only])
         if not messages:
             _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")
@@ -1497,8 +1509,10 @@ def fetch(routine, candidate, source=None):
     out = []
     for message in messages:
         if message["id"] in from_only:
-            body = FROM_ONLY_NOTE + "\n" + _bound_body(
+            body = _bound_body(
                 message, cfg["max_message_chars"] - len(FROM_ONLY_NOTE) - 1)
+            if body.strip():  # an empty message stays empty
+                body = FROM_ONLY_NOTE + "\n" + body
         else:
             body = _bound_body(message, cfg["max_message_chars"])
         out.append({
@@ -1511,7 +1525,6 @@ def fetch(routine, candidate, source=None):
         "messages": out,
         "omitted": max(0, len(raw["message_ids"]) - len(outcome["messages"])),
         "withheld": len(unverified) + raw.get("listing_withheld", 0),
-        "from_only": len(from_only),
     }
 
 

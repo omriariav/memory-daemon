@@ -1602,7 +1602,6 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         self.assertEqual([m["body"] for m in thread["messages"]],
                          [f"{gmail_mcp.FROM_ONLY_NOTE}\nbody 1"])
         self.assertEqual(thread["withheld"], 0)
-        self.assertEqual(thread["from_only"], 1)
         line = " ".join(str(c.args[0]) for c in logged.call_args_list)
         self.assertIn("accepted 1 message(s) on From only", line)
         self.assertIn(hexid(1), line)
@@ -1682,7 +1681,6 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         with mock.patch.object(gmail_mcp, "log") as logged:
             thread = gmail_mcp.fetch({"id": "r"}, first, src)
         self.assertEqual([m["id"] for m in thread["messages"]], [hexid(2)])
-        self.assertEqual(thread["from_only"], 0)
         self.assertTrue(gmail_mcp.auth_seen(FETCH))
         self.assertIn("From-only trust is now off",
                       " ".join(str(c.args[0]) for c in logged.call_args_list))
@@ -1711,7 +1709,7 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
 
     def test_marker_is_per_connector_and_persists(self):
         with mock.patch.object(gmail_mcp, "log"):
-            gmail_mcp._mark_auth_seen("other_fetch_tool")
+            gmail_mcp._mark_auth_seen("other_fetch_tool", True)
         gmail_mcp._auth_seen_memory.clear()
         self.assertTrue(gmail_mcp.auth_seen("other_fetch_tool"))
         self.assertFalse(gmail_mcp.auth_seen(FETCH))
@@ -1720,7 +1718,7 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         with mock.patch.object(gmail_mcp.state, "write_atomic",
                                side_effect=OSError("read-only")), \
                 mock.patch.object(gmail_mcp, "log"):
-            gmail_mcp._mark_auth_seen(FETCH)
+            gmail_mcp._mark_auth_seen(FETCH, True)
         self.assertTrue(gmail_mcp.auth_seen(FETCH))
 
     def test_each_from_only_message_is_marked_in_its_body(self):
@@ -1754,8 +1752,43 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         with mock.patch.object(gmail_mcp.state, "write_atomic",
                                side_effect=OSError("read-only")), \
                 mock.patch.object(gmail_mcp, "log") as logged:
-            gmail_mcp._mark_auth_seen(FETCH)
+            gmail_mcp._mark_auth_seen(FETCH, True)
         self.assertIn("this process only", logged.call_args.args[0])
+
+    def test_flag_off_records_quietly(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1)},
+            trust=False)
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertTrue(gmail_mcp.auth_seen(FETCH))
+        self.assertNotIn("trust_from_without_auth",
+                         " ".join(str(c.args[0]) for c in logged.call_args_list))
+
+    def test_unreadable_record_is_never_overwritten(self):
+        path = Path(self.tmp.name) / "state" / "gmail-mcp-auth-seen.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        gmail_mcp._auth_seen_memory.clear()
+        with mock.patch.object(gmail_mcp, "auth_seen", return_value=False), \
+                mock.patch.object(gmail_mcp, "log"):
+            gmail_mcp._mark_auth_seen(FETCH, True)
+        self.assertEqual(path.read_text(), "{not json")
+
+    def test_unconfigured_disarm_is_reported_as_process_only(self):
+        gmail_mcp.configure(None)
+        self.addCleanup(gmail_mcp.configure, self.tmp.name)
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            gmail_mcp._mark_auth_seen(FETCH, True)
+        self.assertIn("this process only", logged.call_args.args[0])
+
+    def test_empty_from_only_message_stays_empty(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, auth=(), body=" ")})
+        with mock.patch.object(gmail_mcp, "log"):
+            thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertFalse(thread["messages"][0]["body"].strip())
 
     def test_settings_need_owner_email_too(self):
         cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],

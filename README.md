@@ -2311,14 +2311,17 @@ all:
   unreadable verdict is still dropped, and a header printed below the
   message's own headers still counts as forged.
 - The first time any message read through a `fetch_tool` carries the header
-  (whether the flag is on or not), From-only trust turns itself off for that
-  tool for good (`state/gmail-mcp-auth-seen.json`, plus a WARN in the log):
-  the connector evidently returns it, so a message without it was not stamped
-  by the receiving server. Remove the flag then.
+  (recorded whenever `verified_sender_domains` is set, flag on or off),
+  From-only trust turns itself off for that tool for good
+  (`state/gmail-mcp-auth-seen.json`, plus a WARN when the flag is on): the
+  connector evidently returns it, so a message without it was not stamped by
+  the receiving server. Remove the flag then. A connector that returns the
+  header for only some mail therefore stops header-less (often internal)
+  mail entirely; that is the fail-closed direction.
 - Only a header above the message's own headers disarms: one a sender
   printed lower cannot switch trust off. If the record cannot be read, every
-  connector counts as disarmed. If it cannot be saved, the log says trust is
-  off for that process only.
+  connector counts as disarmed (it is never overwritten while unreadable). If
+  it cannot be saved, the log says trust is off for that process only.
 - A thread accepted before a later bridge session of the same run shows the
   header stays accepted.
 - Each message accepted this way starts with a "Sender not authenticated"
@@ -2338,7 +2341,11 @@ all:
     includes, or that signs DKIM for it (helpdesk, CRM and marketing
     platforms). Mail sent that way through a shared platform account can pass.
   - Legitimate notifications from the domain (for example helpdesk tickets)
-    can carry text written by outsiders; it is treated as internal mail. The
+    can carry text written by outsiders; it is treated as internal mail.
+  - Group and mailing-list addresses in the domain that accept outside posts
+    rewrite the poster's `From` to the group address, so an outsider's post
+    passes without any spoofing. Close such groups to outside posters, or
+    keep their mail out of the routine `query`. The
     prompt still marks all mail text as untrusted data.
   - Keep `gmail:` out of task export sources (`fibery-tasks-outbound`
     `from_sources`) so a spoofed or relayed message cannot become a task.
