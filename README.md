@@ -751,17 +751,20 @@ maintenance:
 are exact MCP names from your connector and are never defaulted.
 
 Calendar events: the listing asks for `events_window_days` (default 7, `0`
-turns this off) instead of `window_hours`, cut into windows of at most
-`list_chunk_days` (default 7; it must cover `window_hours`, and a refresh
-uses at most 5 windows), so each listing stays inside the connector's result
-cap and the tool-result size limit. The first window and its detail lookups
-are one bridge session, as with a single window. Each later window is its
-own small pinned session, listed at most once an hour (only the diff needs
-it; `state/calendar-chunks-at`); in between, and when a later window fails,
-the diff is skipped for that run while the output still refreshes. Keep
-`max_events` at or below the connector's own cap (many cap `max_results` at
-100): a listing cut by the connector below `max_events` is not detected as
-full. Events listed by two windows are merged; `output` and the JSON
+turns this off) instead of `window_hours`, cut into windows of
+`list_chunk_days` (default 7 days, or `window_hours` when longer; it must
+cover `window_hours`, and a refresh uses at most 5 windows), so each listing
+stays inside the connector's result cap and the tool-result size limit. The
+first window and its detail lookups are one bridge session, as with a single
+window. Later windows (only the diff needs them) are each their own small
+pinned session, listed after the outputs are written, at most once an hour,
+and cached in `state/calendar-chunks.json`. Every run diffs the fresh first
+window plus the cached later windows (a cache older than 3h is not used),
+over exactly the range they cover, so a missing later window never makes an
+event look cancelled; changes past the first window can show up to an hour
+late. Keep `max_events` at or below the connector's own cap (many cap
+`max_results` at 100): a listing cut by the connector below `max_events` is
+not detected as full. `output` and the JSON
 twin still hold only the next `window_hours`. Each successful run diffs that
 listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
 `{event_id: {start, end, location, conference, status, my_rsvp, title,

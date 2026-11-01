@@ -1538,6 +1538,9 @@ class ChunkConfigTest(unittest.TestCase):
         self.assertTrue(self.problems(events_window_days=31,
                                       list_chunk_days=2))
         self.assertTrue(self.problems(list_chunk_days=0))
+        self.assertEqual(self.problems(window_hours=240), [])
+        self.assertEqual(self.problems(events_window_days=7, window_hours=24,
+                                       list_chunk_days=1.4), [])
 
 
 if __name__ == "__main__":

@@ -112,34 +112,67 @@ class EventsTest(unittest.TestCase):
         data = json.loads(self.snapshot.read_text())
         self.assertEqual(sorted(data["events"]), ["a", "b", "c", "span"])
 
-    def test_later_chunks_are_listed_at_most_hourly(self):
+    def test_later_chunks_are_cached_and_relisted_hourly(self):
         texts = [listing(block("a", soon())), listing(), listing()]
         _, _, first = self.run_chunked(texts, events_window_days=21)
         _, _, again = self.run_chunked(
             texts, now=NOW + datetime.timedelta(minutes=15),
             events_window_days=21)
         _, _, later = self.run_chunked(
-            texts, now=NOW + datetime.timedelta(hours=1),
+            texts, now=NOW + datetime.timedelta(minutes=59),
             events_window_days=21)
         self.assertEqual((len(first), len(again), len(later)), (3, 1, 3))
 
-    def test_a_failed_later_chunk_only_skips_the_diff(self):
+    def test_the_diff_runs_every_run_with_cached_later_chunks(self):
+        far = block("far", soon(12), title="Far", rsvp="accepted")
+        self.run_chunked([listing(), listing(far), listing()],
+                         events_window_days=21)
+        moved = block("far", soon(12), title="Far", rsvp="accepted",
+                      location="Moved")
+        # 15 minutes later the later chunks come from the cache, so the
+        # far change is only seen at the next hourly listing.
+        self.run_chunked([listing(), listing(moved), listing()],
+                         now=NOW + datetime.timedelta(minutes=15),
+                         events_window_days=21)
+        self.assertEqual(self.emitted(), [])
+        near = block("a", soon(), title="Near", rsvp="accepted")
+        self.run_chunked([listing(near), listing(far), listing()],
+                         now=NOW + datetime.timedelta(minutes=30),
+                         events_window_days=21)
+        self.run_chunked([listing(block("a", soon(), title="Near",
+                                        rsvp="accepted", location="X")),
+                          listing(far), listing()],
+                         now=NOW + datetime.timedelta(minutes=45),
+                         events_window_days=21)
+        self.assertEqual([e["kind"] for e in self.emitted()], ["update"])
+
+    def test_a_failed_later_chunk_still_diffs_the_first_chunk(self):
         self.seed(block("a", soon(), title="A", rsvp="accepted"))
         report, _, _ = self.run_chunked(
             [listing(block("a", soon(), title="A", rsvp="accepted",
                            location="Moved")), None, listing()],
             events_window_days=21)
         self.assertTrue(report["ok"])
+        self.assertEqual([e["kind"] for e in self.emitted()], ["update"])
+
+    def test_far_events_are_not_cancelled_when_later_chunks_are_missing(self):
+        far = block("far", soon(12), title="Far", rsvp="accepted")
+        self.run_chunked([listing(), listing(far), listing()],
+                         events_window_days=21)
+        # Hours later the cache is stale and the re-listing fails.
+        self.run_chunked([listing(), None, None],
+                         now=NOW + datetime.timedelta(hours=4),
+                         events_window_days=21)
         self.assertEqual(self.emitted(), [])
 
-    def test_an_unreadable_later_chunk_only_skips_the_diff(self):
+    def test_an_unreadable_later_chunk_still_diffs_the_first_chunk(self):
         self.seed(block("a", soon(), title="A", rsvp="accepted"))
         report, _, _ = self.run_chunked(
             [listing(block("a", soon(), title="A", rsvp="accepted",
                            location="Moved")), "garbage"],
             events_window_days=14)
         self.assertTrue(report["ok"])
-        self.assertEqual(self.emitted(), [])
+        self.assertEqual([e["kind"] for e in self.emitted()], ["update"])
 
     def test_a_failed_first_chunk_fails_the_refresh(self):
         with self.assertRaises(claude_bridge.BridgeError):

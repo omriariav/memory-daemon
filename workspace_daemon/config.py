@@ -1,6 +1,5 @@
 """Routine discovery, loading, and validation."""
 import datetime
-import math
 import os
 import re
 from pathlib import Path
@@ -1549,25 +1548,24 @@ def _validate_calendar_cache(rid, cfg):
             f"{rid}: maintenance.window_hours must be a positive number "
             "of at most 744"
         )
-    chunk = cfg.get("list_chunk_days", 7)
-    if (
-        not isinstance(chunk, (int, float)) or isinstance(chunk, bool)
-        or not 1 <= chunk <= 31
-    ):
+    chunk = cfg.get("list_chunk_days")
+    hours = cfg.get("window_hours", 48)
+    days = cfg.get("events_window_days", 7)
+    numeric = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    if chunk is not None and not (numeric(chunk) and 1 <= chunk <= 31):
         problems.append(
             f"{rid}: maintenance.list_chunk_days must be a number from 1 to 31"
         )
-    else:
-        hours = cfg.get("window_hours", 48)
-        days = cfg.get("events_window_days", 7)
-        # The first chunk must cover the output window, and one session
-        # holds a bounded number of list calls.
-        if isinstance(hours, (int, float)) and hours > chunk * 24:
+    elif numeric(hours) and numeric(days):
+        # Same whole-second steps as calendar_cache.list_chunks.
+        step = (round(chunk * 86400) if chunk is not None
+                else max(7 * 86400, round(hours * 3600)))
+        if step < round(hours * 3600):
             problems.append(
-                f"{rid}: maintenance.list_chunk_days must cover window_hours")
-        if isinstance(days, (int, float)) and math.ceil(
-                max(days * 24, hours if isinstance(hours, (int, float))
-                    else 48) / (chunk * 24)) > MAX_LIST_CHUNKS:
+                f"{rid}: maintenance.list_chunk_days must cover window_hours "
+                f"(at least {hours / 24:g})")
+        total = round(max(days * 24, hours) * 3600)
+        if -(-total // step) > MAX_LIST_CHUNKS:
             problems.append(
                 f"{rid}: maintenance.events_window_days / list_chunk_days "
                 f"needs at most {MAX_LIST_CHUNKS} list calls")

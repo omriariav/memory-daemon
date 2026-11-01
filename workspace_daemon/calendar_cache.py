@@ -55,9 +55,13 @@ QUIET_RSVPS = frozenset({"organizer", "declined"})
 # One list call covers at most this many days: a week of a busy calendar
 # fits the connector's result cap and the bridge's tool-result size limit.
 DEFAULT_LIST_CHUNK_DAYS = 7
-# Later chunks (only the event diff needs them) are listed at most this often.
+# Later chunks (only the event diff needs them) are listed at most this often
+# (less a little scheduler jitter) and cached; a cache older than
+# CHUNKS_MAX_AGE is not used.
 CHUNKS_EVERY = 3600
-CHUNKS_FILE = "calendar-chunks-at"
+CHUNKS_SLACK = 120
+CHUNKS_MAX_AGE = 3 * 3600
+CHUNKS_FILE = "calendar-chunks.json"
 # Titles, places, agendas and links are written by whoever sends the invite,
 # and this file is printed into prompts.
 UNTRUSTED_NOTE = ("Event titles, places, agendas and links below are calendar "
@@ -818,6 +822,15 @@ def fetch_hours(cfg):
     return max(float(cfg.get("window_hours", 48)), diff_hours(cfg))
 
 
+def chunk_seconds(cfg):
+    """Seconds per list call: list_chunk_days, by default 7 days or the
+    output window when that is longer (the first chunk covers it)."""
+    if "list_chunk_days" in cfg:
+        return round(float(cfg["list_chunk_days"]) * 86400)
+    return max(DEFAULT_LIST_CHUNK_DAYS * 86400,
+               round(float(cfg.get("window_hours", 48)) * 3600))
+
+
 def list_chunks(cfg, now):
     """The exact list calls, consecutive windows of at most `list_chunk_days`.
 
@@ -827,8 +840,7 @@ def list_chunks(cfg, now):
     """
     # Whole seconds, so float steps cannot leave a zero-length last chunk.
     total = round(fetch_hours(cfg) * 3600)
-    step = round(
-        float(cfg.get("list_chunk_days", DEFAULT_LIST_CHUNK_DAYS)) * 86400)
+    step = chunk_seconds(cfg)
     start = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
     end = start + datetime.timedelta(seconds=total)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -890,42 +902,85 @@ def _chunks_path(base_dir):
     return Path(base_dir) / "state" / CHUNKS_FILE
 
 
-def _later_chunks_due(base_dir, now):
-    """Whether the later chunks were last listed CHUNKS_EVERY or more ago."""
+def _load_later(base_dir):
+    """The cached later-chunk listings: {"at", "tried", "end", "texts"}."""
     try:
-        last = float(_chunks_path(base_dir).read_text().strip())
+        data = json.loads(_chunks_path(base_dir).read_text())
     except (OSError, ValueError):
-        return True
-    return now.timestamp() - last >= CHUNKS_EVERY
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _list_later_chunks(cfg, base_dir, chunks, tz):
-    """Parsed events of every later chunk, each in its own bridge session.
+def _list_later_chunks(cfg, base_dir, chunks):
+    """Raw listing texts of the later chunks, each its own pinned session.
 
-    Returns (events, full) or None when any chunk failed: only the diff
-    needs them, so a failure skips this run's diff, never the refresh.
+    Returns the texts, or None when any chunk failed.
     """
     list_tool = cfg["list_tool"]
-    events, full = [], False
+    texts = []
     for args in chunks:
         try:
             results = claude_bridge.call_tools(
                 _chunk_prompt(cfg, args), {list_tool: args},
                 model=cfg.get("model", "haiku"), base_dir=base_dir,
-                max_turns=4, max_budget_usd=0.05, timeout=BRIDGE_TIMEOUT,
+                max_turns=4, max_budget_usd=0.1, timeout=BRIDGE_TIMEOUT,
                 attempts=BRIDGE_ATTEMPTS, required=[list_tool],
+                # The listing is all that is needed; a stop after it is fine.
+                accept_partial=True,
             )
-            listing = _listing(results, list_tool, args)
-            if listing is None:
-                raise CalendarParseError("no result with the pinned arguments")
-            part = parse_list(listing["text"], tz)
-        except (claude_bridge.BridgeError, CalendarParseError) as exc:
-            log(f"calendar_cache: a later listing chunk failed "
-                f"({type(exc).__name__}); event diff skipped this run")
+        except claude_bridge.BridgeError as exc:
+            log(f"calendar_cache: a later listing chunk failed: {exc}")
             return None
-        full = full or len(part) >= args["max_results"]
-        events.extend(part)
-    return events, full
+        listing = _listing(results, list_tool, args)
+        if listing is None:
+            log("calendar_cache: a later listing chunk returned no result")
+            return None
+        texts.append(listing["text"])
+    return texts
+
+
+def later_events(cfg, base_dir, now, tz):
+    """(events, end) of the later chunks for the diff, from the hourly cache.
+
+    The later chunks are re-listed when the cache is older than
+    CHUNKS_EVERY (a failed attempt backs off just as long); a cache older
+    than CHUNKS_MAX_AGE is not used. Returns ([], None) when nothing usable
+    is cached: the diff then covers the first chunk only. Never raises.
+    """
+    chunks = list_chunks(cfg, now)
+    if len(chunks) < 2:
+        return [], None
+    stamp = now.timestamp()
+    try:
+        cache = _load_later(base_dir)
+        tried = float(cache.get("tried", 0))
+        if stamp - tried >= CHUNKS_EVERY - CHUNKS_SLACK:
+            texts = _list_later_chunks(cfg, base_dir, chunks[1:])
+            cache = dict(cache, tried=stamp)
+            if texts is not None:
+                cache.update(at=stamp, end=chunks[-1]["time_max"],
+                             texts=texts)
+            state.write_atomic(_chunks_path(base_dir), json.dumps(cache),
+                               mode=0o600)
+        if stamp - float(cache.get("at", 0)) > CHUNKS_MAX_AGE \
+                or not isinstance(cache.get("texts"), list):
+            return [], None
+        events = []
+        for text in cache["texts"]:
+            part = parse_list(text, tz)
+            if len(part) >= int(cfg.get("max_events", 50)):
+                log("calendar_cache: a later listing reached max_events; "
+                    "the diff covers the first chunk only")
+                return [], None
+            events.extend(part)
+        end = datetime.datetime.strptime(
+            cache["end"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=datetime.timezone.utc)
+        return events, end
+    except Exception as exc:  # noqa: BLE001 - only the diff depends on it
+        log(f"calendar_cache: later chunks unusable "
+            f"({type(exc).__name__}); the diff covers the first chunk only")
+        return [], None
 
 
 def _event_id_of(call):
@@ -961,17 +1016,13 @@ def in_window(listed, now, window_hours, tz):
 
 
 def fetch(cfg, base_dir, now, tz):
-    """Returns (listed events, {event_id: detail}, wide).
+    """One bridge session; returns (listed events, {event_id: detail}, first).
 
-    The first chunk (which covers the output window) and its detail lookups
-    are one bridge session, as before. With a diff window longer than one
-    chunk, each later chunk is its own small session, at most every
-    CHUNKS_EVERY seconds. `wide` is the complete listing over the diff
-    window, or None when the diff must not run (diff off, a listing cut at
-    max_events, later chunks not due or failed).
+    `first` is the complete first-chunk listing (the output window and the
+    near part of the diff window), or None when it hit max_events and may
+    be cut, so the diff must not run on it.
     """
-    chunks = list_chunks(cfg, now)
-    args = chunks[0]
+    args = list_chunks(cfg, now)[0]
     max_details = int(cfg.get("max_details", DEFAULT_MAX_DETAILS))
     list_tool, get_tool = cfg["list_tool"], cfg["get_tool"]
     results = claude_bridge.call_tools(
@@ -995,33 +1046,13 @@ def fetch(cfg, base_dir, now, tz):
         raise claude_bridge.BridgeError(
             "list_events produced no result with the pinned arguments"
         )
-    first = parse_list(listing["text"], tz)
-    listed = in_window(first, now, cfg.get("window_hours", 48), tz)
-    if len(first) >= args["max_results"]:
-        log("calendar_cache: listing reached max_events; later events may be "
-            "cut (raise max_events)")
-    wide = None
-    if diff_hours(cfg) > 0 and len(first) < args["max_results"]:
-        parsed = list(first)
-        later = None
-        if len(chunks) == 1:
-            later = ([], False)
-        elif _later_chunks_due(base_dir, now):
-            later = _list_later_chunks(cfg, base_dir, chunks[1:], tz)
-            if later is not None:
-                state.write_atomic(_chunks_path(base_dir),
-                                   f"{now.timestamp():.0f}\n", mode=0o600)
-        if later is not None and later[1]:
-            log("calendar_cache: a later listing reached max_events; event "
-                "diff skipped (raise max_events or lower list_chunk_days)")
-        elif later is not None:
-            # An event spanning a chunk boundary is listed by both chunks.
-            seen = {event["event_id"] for event in parsed}
-            for event in later[0]:
-                if event["event_id"] not in seen:
-                    seen.add(event["event_id"])
-                    parsed.append(event)
-            wide = in_window(parsed, now, fetch_hours(cfg), tz)
+    parsed = parse_list(listing["text"], tz)
+    listed = in_window(parsed, now, cfg.get("window_hours", 48), tz)
+    first = parsed
+    if diff_hours(cfg) > 0 and len(parsed) >= args["max_results"]:
+        log("calendar_cache: listing hit max_events; event diff skipped "
+            "(raise max_events or lower list_chunk_days)")
+        first = None
     timed = sorted((e for e in listed if not e["all_day"]),
                    key=lambda e: e["start"])
     known = {event["event_id"] for event in timed[:max_details]}
@@ -1043,7 +1074,7 @@ def fetch(cfg, base_dir, now, tz):
     if skipped:
         log(f"calendar_cache: {skipped} event detail lookup(s) failed; "
             "those events render from the listing only")
-    return listed, details, wide
+    return listed, details, first
 
 
 def _output_paths(cfg):
@@ -1322,13 +1353,15 @@ def _collapse_series(found, shape):
     return result
 
 
-def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
+def track_events(cfg, base_dir, routine_id, wide, details, now, tz,
+                 hours=None):
     """Diff this snapshot against the last one, store it, emit the changes.
 
-    The snapshot is written first, so a crash loses an event rather than
-    repeating it on every later run.
+    `hours` is the window the listing actually covers (default the whole
+    diff window). The snapshot is written first, so a crash loses an event
+    rather than repeating it on every later run.
     """
-    hours = diff_hours(cfg)
+    hours = diff_hours(cfg) if hours is None else hours
     rows = snapshot_rows(wide, details, cfg, tz)
     prev = load_snapshot(base_dir)
     save_snapshot(base_dir, rows, now, hours)
@@ -1370,7 +1403,7 @@ def run(cfg, base_dir, dry_run=False, now=None, routine_id="calendar-cache"):
         return {"ok": True, "dry_run": True, "events": 0,
                 "output": str(text_path), "json": str(json_path)}
     try:
-        listed, details, wide = fetch(cfg, base_dir, now, tz)
+        listed, details, first = fetch(cfg, base_dir, now, tz)
         events = normalize(listed, details, cfg, tz)
         text = render_text(events, cfg, now)
         twin = render_json(events, cfg, now)
@@ -1386,12 +1419,20 @@ def run(cfg, base_dir, dry_run=False, now=None, routine_id="calendar-cache"):
     state.write_atomic(json_path, twin, mode=0o600)
     state.write_atomic(text_path, text, mode=0o600)
     emitted = 0
-    if wide is not None:
-        # A complete listing only; a failed or cut-off fetch never reaches here
-        # with `wide`, so it cannot make events look cancelled.
+    if first is not None and diff_hours(cfg) > 0:
+        # Only after the outputs are written: the later chunks never delay
+        # or break the refresh. The diff covers exactly what was listed (the
+        # fresh first chunk plus cached later chunks), so events outside it
+        # can never look cancelled.
         try:
+            first_end = now + datetime.timedelta(seconds=chunk_seconds(cfg))
+            later, end = later_events(cfg, base_dir, now, tz)
+            covered = min(fetch_hours(cfg),
+                          ((end or first_end) - now).total_seconds() / 3600)
+            wide = in_window(first + later, now, covered, tz)
             emitted = track_events(
-                cfg, base_dir, routine_id, wide, details, now, tz
+                cfg, base_dir, routine_id, wide, details, now, tz,
+                hours=covered,
             )
         except Exception as exc:
             log(f"calendar_cache WARN event diff failed: "
