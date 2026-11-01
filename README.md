@@ -731,6 +731,7 @@ maintenance:
   calendar_id: primary                 # pinned in the bridge allowlist
   window_hours: 48
   events_window_days: 7                # diff window for state/events.jsonl; 0 = off
+  invite_lookahead_days: 0             # also announce unanswered invites up to N days out
   timezone: UTC                        # rendering timezone (IANA)
   owner_email: me@example.com          # "my RSVP"; organizer => "organizer"
   internal_domains: [example.com]      # agendas/links only for these organizers
@@ -787,6 +788,28 @@ have not ended and start inside the window count.
 - `cancel`: `Status: cancelled`, or the event vanished while its previous start
   was still ahead and inside the window. The
   list call does not pass `showDeleted`, so vanishing is the usual signal.
+
+Far invites: with `invite_lookahead_days` past the diff window (e.g. 21),
+an unanswered invite further out is announced too. Once an hour (a failed
+attempt backs off an hour), after the outputs are written, the range from
+the end of the diff window (the output window when the diff is off) to
+`invite_lookahead_days` is listed in pinned
+7-day windows, each its own small bridge session, and every invite I have
+not answered that was not listed before (and that starts in that range)
+emits one gcal `new` event (with `far: true` and `untrusted: true`; it may
+be an older invite reaching the lookahead for the first time; naming its next
+instance); a recurring series is announced once, and one the diff already
+tracks is not announced. Invites are remembered for 60 days after they were
+last listed. The first scan, and the first after the range changes, only
+record what is there (and only when every window listed in full); `skip_titles`
+applies. Limits: an invite created to start within about an hour past the
+diff window's edge can be missed by both checks, and one the scan announced
+that is later moved into the diff window is announced again there. The record of seen invites is `state/calendar-invites.json`. It
+never emits update or cancel events and does not touch the diff snapshot;
+an invite it announced is not announced again when it reaches the diff
+window, because the diff never treats an invite that scrolled in as new.
+Keep `max_events` at or below the connector's own cap (many cap
+`max_results` at 100).
 
 Output, one block per event sorted by start (declined events are kept; rooms
 are shown only under `where`, not counted as attendees):

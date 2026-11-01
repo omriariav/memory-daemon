@@ -67,6 +67,137 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(*blocks) if blocks else "No events found", now=now)
         self.assertEqual(self.emitted(), [])
 
+    def run_far(self, main_text, far_texts, now=NOW, **over):
+        """Main listing answers the main session; far_texts[i] window i."""
+        config_ = dict(self.cfg, **dict({"invite_lookahead_days": 21}, **over))
+        windows = calendar_cache.invite_windows(config_, now)
+        main_args = calendar_cache.list_args(config_, now)
+        far_calls = []
+
+        def bridge(prompt, tools, **kwargs):
+            args = tools[LIST_TOOL]
+            if args == main_args:
+                return [{"name": LIST_TOOL, "text": main_text,
+                         "is_error": False, "input": args}]
+            far_calls.append(args)
+            text = far_texts[windows.index(args)]
+            if text is None:
+                raise claude_bridge.BridgeError("session failed")
+            return [{"name": LIST_TOOL, "text": text, "is_error": False,
+                     "input": args}]
+
+        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
+                               side_effect=bridge):
+            calendar_cache.run(config_, self.base, now=now)
+        return windows, far_calls
+
+    def test_far_windows_start_where_the_main_listing_ends(self):
+        windows = calendar_cache.invite_windows(
+            dict(self.cfg, invite_lookahead_days=21), NOW)
+        self.assertEqual([(w["time_min"], w["time_max"]) for w in windows], [
+            (at(NOW + 7 * DAY), at(NOW + 14 * DAY)),
+            (at(NOW + 14 * DAY), at(NOW + 21 * DAY)),
+        ])
+        self.assertEqual(calendar_cache.invite_windows(self.cfg, NOW), [])
+
+    def test_new_far_invites_are_announced_once_after_the_first_scan(self):
+        old = block("old", soon(10), title="Already there")
+        self.run_far(listing(), [listing(old), listing()])
+        self.assertEqual(self.emitted(), [])
+        new = block("new", soon(12), title="Offsite")
+        answered = block("ok", soon(13), title="Answered", rsvp="accepted")
+        hour = datetime.timedelta(hours=1)
+        _, calls = self.run_far(listing(), [listing(old, new, answered),
+                                            listing()], now=NOW + hour)
+        self.assertEqual(len(calls), 2)
+        (event,) = self.emitted()
+        self.assertEqual((event["kind"], event["title"], event["source_id"]),
+                         ("new", "Offsite", "gcal:new"))
+        self.assertTrue(event["details"]["untrusted"])
+        self.run_far(listing(), [listing(old, new), listing()],
+                     now=NOW + 2 * hour)
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_far_scan_runs_at_most_hourly_and_backs_off_on_failure(self):
+        _, first = self.run_far(listing(), [None, listing()])
+        self.assertEqual(len(first), 1)
+        _, soon_after = self.run_far(
+            listing(), [listing(), listing()],
+            now=NOW + datetime.timedelta(minutes=15))
+        self.assertEqual(soon_after, [])
+        _, later = self.run_far(
+            listing(), [listing(), listing()],
+            now=NOW + datetime.timedelta(minutes=59))
+        self.assertEqual(len(later), 2)
+
+    def test_an_incomplete_first_scan_announces_nothing_later(self):
+        there = block("there", soon(16), title="Already there")
+        self.run_far(listing(), [None, listing(there)])
+        self.run_far(listing(), [listing(), listing(there)],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_far_recurring_series_is_announced_once(self):
+        self.run_far(listing(), [listing(), listing()])
+        hour = datetime.timedelta(hours=1)
+        series = [block(f"wk_202611{d:02d}T090000Z", soon(d - 13),
+                        title="Weekly all-hands") for d in (21, 28)]
+        self.run_far(listing(), [listing(series[0]), listing(series[1])],
+                     now=NOW + hour)
+        self.run_far(listing(), [listing(series[0]), listing(series[1])],
+                     now=NOW + 2 * hour)
+        self.assertEqual([e["title"] for e in self.emitted()],
+                         ["Weekly all-hands"])
+
+    def test_an_event_starting_inside_the_diff_window_is_not_announced(self):
+        self.run_far(listing(), [listing(), listing()])
+        spans = block("spans", soon(6) + datetime.timedelta(hours=23),
+                      hours=48, title="Offsite")
+        self.run_far(listing(), [listing(spans), listing()],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_truncated_first_scan_records_nothing(self):
+        there = block("there", soon(10), title="Already there")
+        self.run_far(listing(there), [listing(there), listing()],
+                     max_events=1)
+        path = self.base / "state" / "calendar-invites.json"
+        self.assertNotIn("seen", json.loads(path.read_text()))
+
+    def test_a_series_the_diff_already_tracks_is_not_announced(self):
+        def inst(day):
+            return block(f"wk_202610{day:02d}T090000Z", soon(day - 20),
+                         title="Weekly")
+        # The diff sees (and announces) the first instance near-term.
+        self.run_far(listing(inst(23)), [listing(), listing()])
+        self.run_far(listing(inst(23)), [listing(inst(30)), listing()],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_changed_range_rebaselines_silently(self):
+        far = block("far", soon(25), title="Far")
+        self.run_far(listing(), [listing(), listing()])
+        self.run_far(listing(), [listing(), listing(), listing(far)],
+                     now=NOW + datetime.timedelta(hours=1),
+                     invite_lookahead_days=28)
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_monthly_series_is_not_announced_again(self):
+        self.run_far(listing(), [listing(), listing()])
+        nov = block("mo_20261102T090000Z", soon(16), title="Monthly")
+        dec = block("mo_20261202T090000Z", soon(46), title="Monthly")
+        self.run_far(listing(), [listing(), listing(nov)],
+                     now=NOW + datetime.timedelta(hours=1))
+        later = NOW + datetime.timedelta(days=30)
+        self.run_far(listing(), [listing(), listing(dec)], now=later)
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_a_far_scan_failure_never_fails_the_refresh(self):
+        with mock.patch.object(calendar_cache, "scan_far_invites",
+                               side_effect=RuntimeError("boom")):
+            report = self.run_at(listing(block("a", soon(1), title="Near")))
+        self.assertTrue(report["ok"])
+
     def test_fetch_is_one_wide_call_and_output_stays_48h(self):
         args = calendar_cache.list_args(self.cfg, NOW)
         self.assertEqual(args["time_max"], at(NOW + 7 * DAY))
