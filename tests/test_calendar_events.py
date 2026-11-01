@@ -137,6 +137,33 @@ class EventsTest(unittest.TestCase):
                      now=NOW + datetime.timedelta(hours=1))
         self.assertEqual(self.emitted(), [])
 
+    def test_a_far_recurring_series_is_announced_once(self):
+        self.run_far(listing(), [listing(), listing()])
+        hour = datetime.timedelta(hours=1)
+        series = [block(f"wk_202611{d:02d}T090000Z", soon(d - 13),
+                        title="Weekly all-hands") for d in (21, 28)]
+        self.run_far(listing(), [listing(series[0]), listing(series[1])],
+                     now=NOW + hour)
+        self.run_far(listing(), [listing(series[0]), listing(series[1])],
+                     now=NOW + 2 * hour)
+        self.assertEqual([e["title"] for e in self.emitted()],
+                         ["Weekly all-hands"])
+
+    def test_an_event_starting_inside_the_diff_window_is_not_announced(self):
+        self.run_far(listing(), [listing(), listing()])
+        spans = block("spans", soon(6) + datetime.timedelta(hours=23),
+                      hours=48, title="Offsite")
+        self.run_far(listing(), [listing(spans), listing()],
+                     now=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_truncated_first_scan_records_nothing(self):
+        there = block("there", soon(10), title="Already there")
+        self.run_far(listing(there), [listing(there), listing()],
+                     max_events=1)
+        path = self.base / "state" / "calendar-invites.json"
+        self.assertNotIn("seen", json.loads(path.read_text()))
+
     def test_a_far_scan_failure_never_fails_the_refresh(self):
         with mock.patch.object(calendar_cache, "scan_far_invites",
                                side_effect=RuntimeError("boom")):

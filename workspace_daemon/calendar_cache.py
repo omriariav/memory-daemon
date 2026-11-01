@@ -854,12 +854,12 @@ def _fetch_prompt(cfg, now):
 
 
 def invite_windows(cfg, now):
-    """Pinned list arguments covering [end of the main listing, lookahead).
+    """Pinned list arguments covering [end of the diff window, lookahead).
 
-    Empty when invite_lookahead_days does not reach past the main listing.
+    Empty when invite_lookahead_days does not reach past the diff window.
     """
     start = now.astimezone(datetime.timezone.utc).replace(microsecond=0) \
-        + datetime.timedelta(hours=fetch_hours(cfg))
+        + datetime.timedelta(hours=diff_hours(cfg))
     end = now.astimezone(datetime.timezone.utc).replace(microsecond=0) \
         + datetime.timedelta(days=float(cfg.get("invite_lookahead_days", 0)))
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -929,8 +929,7 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
                 _invite_prompt(cfg, args), {list_tool: args},
                 model=cfg.get("model", "haiku"), base_dir=base_dir,
                 max_turns=4, max_budget_usd=0.1, timeout=BRIDGE_TIMEOUT,
-                attempts=BRIDGE_ATTEMPTS, required=[list_tool],
-                accept_partial=True,
+                attempts=1, required=[list_tool], accept_partial=True,
             )
             listing = next(
                 (r for r in results if r["name"] == list_tool
@@ -945,37 +944,56 @@ def scan_far_invites(cfg, base_dir, routine_id, now, tz):
                 f"({type(exc).__name__}); retried in an hour")
             complete = False
             break
+        if len(listed) >= args["max_results"]:
+            log("calendar_cache: a far invite listing reached max_events; "
+                "later invites in it may be missed")
+            complete = False
+        floor = datetime.datetime.strptime(
+            args["time_min"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=datetime.timezone.utc)
         for raw in listed:
             if (raw.get("status") or "") == "cancelled":
                 continue
+            # An event that starts inside the diff window belongs to it,
+            # even when it runs into this one.
+            if _bounds(raw, tz)[0] < floor:
+                continue
             if _rsvp_for_owner(owner, raw.get("organizer"),
                                raw["attendees"]) == "needsAction":
-                pending[raw["event_id"]] = raw
-    emitted = 0
-    for event_id, raw in pending.items():
-        if event_id in seen:
-            continue
+                # One announcement per recurring series, not per instance.
+                key = _series(raw["event_id"])
+                start = _iso(raw["start"], raw["all_day"])
+                if key not in pending or start > _iso(
+                        pending[key]["start"], pending[key]["all_day"]):
+                    pending[key] = raw
+    fresh = [key for key in pending if key not in seen]
+    for key, raw in pending.items():
+        # The latest start keeps a moved invite or a series remembered.
         start = _iso(raw["start"], raw["all_day"])
-        seen[event_id] = start
-        if first_scan:
-            continue
-        event_stream.emit(base_dir, event_stream.build(
-            routine_id, "new", None, f"{SOURCE}:{event_id}",
-            clean(raw.get("title"), EXTERNAL_TITLE_MAX), people=[],
-            details={"start": start, "end": _iso(raw["end"], raw["all_day"]),
-                     "untrusted": True},
-        ))
-        emitted += 1
+        seen[key] = max(str(seen.get(key, "")), start)
     # Forget invites that have started; the record stays small.
     today = now.astimezone(tz).date().isoformat()
     seen = {k: v for k, v in seen.items() if str(v)[:10] >= today}
     record = {"tried": stamp}
     if not first_scan or complete:
-        # A first scan only starts the record when it saw every window;
-        # otherwise the windows it missed would be announced next time.
+        # A first scan only starts the record when it saw every window
+        # whole; otherwise what it missed would be announced next time.
         record["seen"] = seen
+    # Saved before announcing: a crash loses an announcement rather than
+    # repeating it.
     state.write_atomic(path, json.dumps(record, sort_keys=True), mode=0o600)
-    return emitted
+    if first_scan:
+        return 0
+    for key in fresh:
+        raw = pending[key]
+        event_stream.emit(base_dir, event_stream.build(
+            routine_id, "new", None, f"{SOURCE}:{raw['event_id']}",
+            clean(raw.get("title"), EXTERNAL_TITLE_MAX), people=[],
+            details={"start": _iso(raw["start"], raw["all_day"]),
+                     "end": _iso(raw["end"], raw["all_day"]),
+                     "untrusted": True},
+        ))
+    return len(fresh)
 
 
 def _event_id_of(call):
