@@ -2283,7 +2283,9 @@ One JSON object per line, oldest message first:
   recorded with `name: null`. More than 20 new channels at once (a changed
   scope or workspace) re-baselines silently. State, one per connector tool
   and owner (shared by routines, so a join is recorded once):
-  `state/comms-inbox-joined-<hash>-<hash>.json`.
+  `state/comms-inbox-joined-<tool>-<hash>.json`. An owner in more than 200
+  channels never gets a complete listing, so nothing is recorded (each check
+  logs it).
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

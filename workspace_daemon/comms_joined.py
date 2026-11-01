@@ -81,6 +81,8 @@ _INFO_BLOCK = re.compile(
     r"Creator: ([^\n]{1,120}?) \(<@([UW][A-Z0-9]{8,})>?\)\s*\n"
     r"Created: ([0-9: -]{10,25}[A-Z]{0,5}(?:[+-][0-9]{1,2}(?::?[0-9]{2})?)?)"
     r"\s*\n"
+    # Purpose and Topic sit here when the channel has them.
+    r"(?:(?:Purpose|Topic): [^\n]*\n){0,2}"
     r"Permalink: \[link\]\([^)\s]*?/archives/([CG][A-Z0-9]{8,})\)",
     re.MULTILINE,
 )
@@ -114,7 +116,8 @@ def info_call(name):
     return {
         "keywords": [name], "natural_language_query": f"the {name} channel",
         "channel_types": "public_channel,private_channel",
-        "include_archived": False, "limit": 5, "response_format": "detailed",
+        "include_archived": False, "limit": 20,
+        "response_format": "detailed",
     }
 
 

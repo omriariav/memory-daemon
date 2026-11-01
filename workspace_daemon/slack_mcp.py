@@ -1626,7 +1626,7 @@ def candidates(source):
         _check_reactions(cfg, now)
         # One state per connector and owner, shared across routines.
         _check_joined(
-            cfg, now, _digest(cfg["channels_tool"], cfg["self_user_id"])
+            cfg, now, f"{cfg['channels_tool']}:{cfg['self_user_id']}"
         )
     # Inbox-only hits never become candidates.
     found = [

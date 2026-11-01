@@ -81,6 +81,13 @@ class ParseTest(unittest.TestCase):
         names = comms_joined.parse_names(full_text([("קנאל", A, False)]), {A})
         self.assertEqual(names, {A: ("קנאל", False)})
 
+    def test_info_with_purpose_and_topic(self):
+        text = info_text("new-room", A).replace(
+            "IST\\nPermalink", "IST\\nPurpose: Plans\\nTopic: Q4\\nPermalink")
+        self.assertIn("Purpose", json.loads(text)["results"])
+        info = comms_joined.parse_info(text, A, "new-room")
+        self.assertEqual(info["creator_id"], "U0EXAMPLEB")
+
     def test_created_with_offset(self):
         info = comms_joined.parse_info(
             info_text("r", A, created="2026-11-01 13:57:21 GMT+2"), A, "r")
