@@ -1361,6 +1361,12 @@ def fetch(_routine, source, candidate):
                 str(v) for v in (record.get("speakerNames") or {}).values()
                 if isinstance(v, str) and v.strip()
             }),
+            # Distinct diarized speakers, named or not: attendance needs to
+            # know whether every voice has a name.
+            "mila_speaker_count": len({
+                seg.get("speaker") for seg in record.get("segments") or []
+                if isinstance(seg, dict) and seg.get("speaker")
+            }),
             "calendar_candidate_count": len(events),
         },
     }

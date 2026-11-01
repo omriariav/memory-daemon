@@ -1233,15 +1233,19 @@ directory (symlinks resolved) as its working directory.
   name the store knows but the invitation lacks (someone discussed, or named
   in the recording app's own summary) is dropped, since they were mentioned,
   not present. Per invitee besides the owner: **declined** when the RSVP
-  says so; **attended** when a speaker the recording names (Mila speaker
-  names) matches them, when the model names them as a participant, or, when
-  the recording names no speaker besides the owner, when they accepted;
-  otherwise **not present** (a no-show when other speakers are named,
-  unconfirmed when none is). Declined and not-present invitees go on one
-  line appended to the body, "Invited, not present: Name (declined), Name
-  (no-show)", marked "attendance unconfirmed" when no speaker is named; a
-  meeting with more than 4 invitees counts unconfirmed ones instead of
-  naming them. This applies only when every invitee is verified (safe owner
+  says so (listed even when the directory cannot verify them); **attended**
+  when a speaker the recording names (Mila speaker names, generic labels
+  like "Speaker 2" ignored, the owner's names from `owner_todos` excluded)
+  matches them or the model names them as a participant, and, in a meeting
+  of at most 4 (the owner included) whose recording names no speaker besides
+  the owner, when they accepted; otherwise a **no-show** when every voice in
+  the recording is named (`mila_speaker_count`), else **unconfirmed**.
+  Appended to the body: "Invited, not present: Name (declined), Name
+  (no-show)." and "Attendance unconfirmed (reason): Name (no reply)."; a
+  larger meeting counts unconfirmed invitees instead of naming them, and
+  long lists end with "and N more". Limit: the store merges `people` on an
+  update, so a re-capture never removes someone listed by an earlier one.
+  This applies only when every invitee is verified (safe owner
   identity, every directory lookup found the person, at most 20 rows) and
   someone besides the owner was invited (an owner's own block says nothing
   about who else was there); otherwise a real invitee may have only a

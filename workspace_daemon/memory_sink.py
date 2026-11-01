@@ -54,8 +54,9 @@ NO_OWNER_ACTION_TAG = "no-owner-action"
 SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 SOURCE_FOLLOWS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,200}")
 MAX_SOURCE_PEOPLE = 20
-# At most this many invitees: unconfirmed ones are named on the "Invited,
-# not present" line; a larger meeting only counts them.
+# At most this many invitees (the owner included): one who accepted counts
+# as attended when the recording names no other speaker, and unconfirmed
+# ones are named; a larger meeting needs evidence and only counts them.
 SMALL_MEETING = 4
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -702,39 +703,60 @@ def _name_key(name):
     return " ".join(str(name or "").casefold().split())
 
 
-def _attendance(meta, verified_source, identity, model_people):
-    """(attended slugs, "Invited, not present" line or "") for an invitation.
+def _listed(names):
+    shown = names[:MAX_NOT_PRESENT]
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more else "")
 
-    Per verified invitee besides the owner: declined (RSVP declined);
-    attended when a named speaker in the recording matches them, or the
-    model names them as a participant, or, when the recording names no
-    speaker besides the owner, they accepted; otherwise not present. Without
-    speaker names that last group is unconfirmed, and the line says so. A
-    large meeting without speaker names lists no unconfirmed names, only
-    their count.
+
+def _attendance(meta, verified_source, identity, model_people, owner_names):
+    """(attended slugs, attendance line or "") for an invitation capture.
+
+    Per invitee besides the owner: declined when the RSVP says so (any
+    calendar row, verified or not). Of the verified others, attended when a
+    named speaker in the recording matches them or the model names them as a
+    participant; in a small meeting whose recording names no speaker besides
+    the owner, also when they accepted. A verified invitee without such
+    evidence is a no-show only when every speaker in the recording is named
+    (``mila_speaker_count``); otherwise their attendance is unconfirmed.
     """
+    from . import calendar_cache, owner_todos  # late import to avoid cycles
+
     own = str(identity.get("email") or "").strip().casefold()
-    owner_name = _name_key((identity.get("person") or {}).get("name"))
+    owners = {_name_key(name) for name in owner_names} | {
+        _name_key((identity.get("person") or {}).get("name"))
+    }
+    owners.discard("")
     by_email = {
         str(person.get("email") or "").strip().casefold(): person
         for person in verified_source
     }
-    speakers = [
+    named = [
         _name_key(name) for name in meta.get("mila_speaker_names") or []
-        if _name_key(name) and _name_key(name) != owner_name
+        if _name_key(name)
+        and not owner_todos._GENERIC_SPEAKER_RE.match(str(name).strip())
     ]
-    invitees = []
+    speakers = [name for name in named if name not in owners]
+    count = meta.get("mila_speaker_count")
+    all_named = isinstance(count, int) and 0 < count <= len(named)
+    declined, invitees = [], []
     for row in meta.get("source_people") or []:
         if not isinstance(row, dict) \
                 or not str(row.get("role") or "").startswith("calendar-"):
             continue
-        person = by_email.get(str(row.get("email") or "").strip().casefold())
-        if not person or str(row.get("email") or "").casefold() == own:
+        email = str(row.get("email") or "").strip().casefold()
+        if not email or email == own:
             continue
-        name = person.get("name") or row.get("name") or person["slug"]
-        if all(i["slug"] != person["slug"] for i in invitees):
-            invitees.append({"slug": person["slug"], "name": str(name),
+        person = by_email.get(email)
+        name = str((person or {}).get("name") or row.get("name")
+                   or calendar_cache.name_from_email(email) or email)
+        if row.get("rsvp") == "declined":
+            if name not in declined:
+                declined.append(name)
+        elif person and all(i["slug"] != person["slug"] for i in invitees):
+            invitees.append({"slug": person["slug"], "name": name,
                              "rsvp": row.get("rsvp") or "needsAction"})
+    small = len(invitees) + 1 <= SMALL_MEETING
     firsts = {}
     for invitee in invitees:
         first = _name_key(invitee["name"]).split(" ")[0]
@@ -749,30 +771,30 @@ def _attendance(meta, verified_source, identity, model_people):
             for label in speakers
         )
 
-    attended, absent, unconfirmed = [], [], []
+    attended, no_show, unconfirmed = [], [], []
     for invitee in invitees:
-        if invitee["rsvp"] == "declined":
-            absent.append(f"{invitee['name']} (declined)")
-        elif spoke(invitee) or invitee["slug"] in model_people:
+        if spoke(invitee) or invitee["slug"] in model_people:
             attended.append(invitee["slug"])
-        elif speakers:
-            absent.append(f"{invitee['name']} (no-show)")
-        elif invitee["rsvp"] == "accepted":
+        elif small and not speakers and invitee["rsvp"] == "accepted":
             attended.append(invitee["slug"])
+        elif all_named and speakers:
+            no_show.append(invitee["name"])
         else:
-            reply = {"tentative": "tentative"}.get(invitee["rsvp"], "no reply")
+            reply = {"tentative": "tentative", "accepted": "accepted"}.get(
+                invitee["rsvp"], "no reply")
             unconfirmed.append(f"{invitee['name']} ({reply})")
-    parts = absent[:MAX_NOT_PRESENT]
+    parts = []
+    gone = [f"{name} (declined)" for name in declined] \
+        + [f"{name} (no-show)" for name in no_show]
+    if gone:
+        parts.append(f"Invited, not present: {_listed(gone)}.")
     if unconfirmed:
-        if len(invitees) <= SMALL_MEETING:
-            parts += unconfirmed[:MAX_NOT_PRESENT]
-        else:
-            parts.append(f"{len(unconfirmed)} other invitee(s)")
-    if not parts:
-        return attended, ""
-    note = (" (attendance unconfirmed: the recording names no other speaker)"
-            if unconfirmed else "")
-    return attended, f"Invited, not present{note}: {', '.join(parts)}."
+        why = ("not every speaker in the recording is named" if named
+               else "the recording names no speaker besides the owner")
+        listed = (_listed(unconfirmed) if small
+                  else f"{len(unconfirmed)} other invitee(s)")
+        parts.append(f"Attendance unconfirmed ({why}): {listed}.")
+    return attended, " ".join(parts)
 
 
 def _extract(routine, item, summary, store, verified_people=(), identity=None,
@@ -1282,12 +1304,10 @@ def capture(routine, item, summary, dry_run=False):
     if invitees_only:
         # People are those who attended; the other invitees go on one line.
         attended, not_present = _attendance(
-            meta, verified_source, identity, model_people
+            meta, verified_source, identity, model_people,
+            owner_todos.owner_names(routine, _verified_owner_name(identity)),
         )
-        people = list(dict.fromkeys(
-            verified_owners + [p for p in people if p in attended]
-            + attended
-        ))
+        people = list(dict.fromkeys(verified_owners + attended))
     # Known people left out because they were not invited are expected, not
     # an identity gap: they do not count as dropped.
     mentioned = [

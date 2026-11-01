@@ -261,7 +261,8 @@ class CaptureTest(Base):
 
     def capture(self, people, source_people, safe=True, extra=None,
                 owner_email="me.owner@example.com", verified=(),
-                unresolved=(), want_args=False, speakers=None):
+                unresolved=(), want_args=False, speakers=None,
+                speaker_count=None):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True, **(extra or {})})
@@ -272,6 +273,8 @@ class CaptureTest(Base):
                 "frontmatter": {"source_people": source_people}}
         if speakers is not None:
             item["frontmatter"]["mila_speaker_names"] = list(speakers)
+        if speaker_count is not None:
+            item["frontmatter"]["mila_speaker_count"] = speaker_count
         extraction = {"worthy": True, "type": "meeting", "title": "T",
                       "people": people, "tags": ["x"], "body": "b"}
         seen = {}
@@ -445,8 +448,9 @@ class CaptureTest(Base):
             [], [attendee("me.owner@example.com"),
                  attendee("ada.lovelace@example.com")], verified=[ADA])
         self.assertIsNone(people)
-        self.assertIn("Invited, not present (attendance unconfirmed", self.body)
-        self.assertIn("Ada Lovelace (no reply)", self.body)
+        self.assertIn("Attendance unconfirmed (the recording names no "
+                      "speaker besides the owner): Ada Lovelace (no reply).",
+                      self.body)
 
     def test_declined_invitee_is_on_the_not_present_line(self):
         gus = {"email": "augusta.king@example.com", "slug": "augusta-king",
@@ -465,10 +469,53 @@ class CaptureTest(Base):
         people = self.capture(
             [], [attendee("ada.lovelace@example.com"),
                  attendee("augusta.king@example.com", rsvp="accepted")],
-            verified=[ADA, gus], speakers=["Me Owner", "Ada Lovelace"])
+            verified=[ADA, gus], speakers=["Me Owner", "Ada Lovelace"],
+            speaker_count=2)
         self.assertEqual(people, "ada-lovelace")
-        self.assertIn("Augusta King (no-show)", self.body)
+        self.assertIn("Invited, not present: Augusta King (no-show).",
+                      self.body)
         self.assertNotIn("unconfirmed", self.body)
+
+    def test_an_unnamed_voice_makes_absence_unconfirmed(self):
+        gus = {"email": "augusta.king@example.com", "slug": "augusta-king",
+               "name": "Augusta King"}
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com"),
+                 attendee("augusta.king@example.com", rsvp="accepted")],
+            verified=[ADA, gus], speakers=["Me Owner", "Ada Lovelace"],
+            speaker_count=3)
+        self.assertEqual(people, "ada-lovelace")
+        self.assertIn("Attendance unconfirmed (not every speaker in the "
+                      "recording is named): Augusta King (accepted).",
+                      self.body)
+
+    def test_unverified_decliner_is_still_listed(self):
+        # The directory check drops declined rows; the line must not.
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com", rsvp="accepted"),
+                 attendee("augusta.king@example.com", "Augusta King",
+                          rsvp="declined")],
+            verified=[ADA])
+        self.assertEqual(people, "ada-lovelace")
+        self.assertIn("Invited, not present: Augusta King (declined).",
+                      self.body)
+
+    def test_large_meeting_needs_evidence_beyond_accepting(self):
+        rows = [attendee(f"p{n}@example.com", rsvp="accepted")
+                for n in range(6)]
+        verified = [{"email": f"p{n}@example.com", "slug": f"person-{n}",
+                     "name": f"Person {n}"} for n in range(6)]
+        people = self.capture(["person-2"], rows, verified=verified)
+        self.assertEqual(people, "person-2")
+        self.assertIn("5 other invitee(s)", self.body)
+
+    def test_generic_speaker_labels_are_not_names(self):
+        people = self.capture(
+            [], [attendee("me.owner@example.com"),
+                 attendee("ada.lovelace@example.com", rsvp="accepted")],
+            verified=[ADA], speakers=["Me Owner", "Speaker 2"],
+            speaker_count=2)
+        self.assertEqual(people, "ada-lovelace")
 
     def test_a_participant_the_model_names_attends(self):
         people = self.capture(
