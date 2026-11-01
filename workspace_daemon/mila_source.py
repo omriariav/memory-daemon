@@ -293,7 +293,10 @@ def _suspect(record, directory, check):
 
 def _wrong_language(record, directory, check):
     """Whether ``record`` looks transcribed in the wrong language."""
-    language = str(record.get("language") or "").strip().lower()
+    # Primary subtag only ("he-IL" is Hebrew); "iw" is Hebrew's old code.
+    language = re.split(r"[-_]", str(record.get("language") or "").strip()
+                        .lower(), maxsplit=1)[0]
+    language = {"iw": "he"}.get(language, language)
     if not language or language == check["expect"]:
         return False
     if _in_script(record.get("summary"), check["expect"],

@@ -151,6 +151,13 @@ class LanguageCheckTest(unittest.TestCase):
         self.assertEqual(len(self.events()), 1)
         self.assertEqual(json.loads(path.read_text())["A"], "held")
 
+    def test_regional_and_legacy_hebrew_codes_match(self):
+        found = self.run_candidates([
+            self.rec("R", "he-IL", summary=HEBREW, text=HEBREW),
+            self.rec("I", "iw", summary=HEBREW, text=HEBREW),
+        ])
+        self.assertEqual(sorted(found), ["mila:I", "mila:R"])
+
     def test_validation(self):
         base = {"kind": "mila", "recordings_file": "/tmp/mila/recordings.json",
                 "calendar_timezone": "UTC"}
