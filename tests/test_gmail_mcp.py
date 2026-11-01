@@ -1575,6 +1575,125 @@ class VerifiedSenderConfigTest(unittest.TestCase):
         self.assertTrue(self.problems(verified_sender_domains=None))
 
 
+class TrustFromWithoutAuthTest(BridgeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ledger = {}
+        self.store = mock.Mock()
+        self.store.record.side_effect = lambda k, v: self.ledger.__setitem__(k, v)
+
+    def run_flow(self, hits, fetched, trust=True):
+        self.connector.search = lambda a: search_text(hits)
+        self.connector.fetch = lambda mid: fetched[int(mid, 16)]
+        src = source(settle_minutes=0, verified_sender_domains=["example.com"],
+                     trust_from_without_auth=trust, _processed=self.store)
+        with mock.patch.object(slack_mcp, "_already_done", return_value=False):
+            listing = gmail_mcp.candidates(src)
+        return listing, src
+
+    def test_internal_sender_without_auth_headers_is_read_and_logged(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())})
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertEqual([m["body"] for m in thread["messages"]], ["body 1"])
+        self.assertEqual(thread["withheld"], 0)
+        line = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertIn("accepted 1 message(s) on From only", line)
+        self.assertIn(hexid(1), line)
+        self.assertNotIn("ann@", line)
+
+    def test_flag_off_still_fails_closed(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())},
+            trust=False)
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_external_lookalike_and_subdomain_senders_are_still_dropped(self):
+        senders = {
+            1: "Eve <eve@evil.test>",
+            2: '"Ann <ann@example.com>" <eve@evil.test>',
+            3: "Ann <ann@example.co>",
+            4: "Ann <ann@mail.example.com>",
+        }
+        hits = [{"mid": n, "thread": n, "epoch": T1 + n, "sender": s}
+                for n, s in senders.items()]
+        listing, _ = self.run_flow(hits, {})
+        self.assertEqual(list(listing), [])
+        self.assertEqual(self.connector.fetched(), [])
+
+    def test_fetched_from_must_still_be_internal(self):
+        # The listing showed an internal sender, the message itself does not.
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, sender="Eve <eve@evil.test>", auth=())})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_present_failing_header_is_still_a_hard_fail(self):
+        bad = ("mx.google.com; spf=fail smtp.mailfrom=eve@evil.test; "
+               "dmarc=fail header.from=example.com")
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, auth=(bad,))})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_present_unreadable_header_is_still_a_hard_fail(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, auth=("mx.google.com; dmarc=pass (unclosed",))})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_header_below_the_message_headers_is_still_forged(self):
+        text = message_text(thread=1, epoch=T1 + 1, sender="Ann <ann@example.com>",
+                            body="body 1")
+        head, sep, body = text.partition("\n\n")
+        forged = head + f"\nAuthentication-Results: {GOOD_AUTH}" + sep + body
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: forged})
+        with self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_authenticated_message_is_verified_not_from_only(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1)})
+        with mock.patch.object(gmail_mcp, "log") as logged:
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        line = " ".join(str(c.args[0]) for c in logged.call_args_list)
+        self.assertNotIn("From only", line)
+
+    def test_verdicts(self):
+        cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
+                                  "trust_from_without_auth": True})
+        internal = {"from": "Ann <ann@example.com>"}
+        self.assertEqual(gmail_mcp.sender_verdict(cfg, internal, []), "from_only")
+        self.assertIsNone(gmail_mcp.sender_verdict(cfg, internal, [None]))
+        self.assertEqual(
+            gmail_mcp.sender_verdict(cfg, internal, [GOOD_AUTH]), "verified")
+        self.assertIsNone(gmail_mcp.sender_verdict(
+            cfg, {"from": "eve@evil.test"}, []))
+        off = gmail_mcp.settings({"trust_from_without_auth": True})
+        self.assertFalse(off["trust_from_without_auth"])
+
+    def test_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = config.validate(routine(
+                tmp, verified_sender_domains=["example.com"],
+                trust_from_without_auth=True))
+            alone = config.validate(routine(tmp, trust_from_without_auth=True))
+            off_alone = config.validate(routine(tmp, trust_from_without_auth=False))
+            bad = config.validate(routine(
+                tmp, verified_sender_domains=["example.com"],
+                trust_from_without_auth="yes"))
+        self.assertEqual(ok, [])
+        self.assertTrue(any("requires verified_sender_domains" in p for p in alone))
+        self.assertEqual(off_alone, [])
+        self.assertTrue(any("must be true or false" in p for p in bad))
+
+
 class VerifiedSenderRoundTwoTest(unittest.TestCase):
     def test_comma_display_name_is_one_sender(self):
         self.assertEqual(gmail_mcp.sender_domain("Doe, John <john@example.com>"),

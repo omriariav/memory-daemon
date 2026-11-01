@@ -1943,6 +1943,16 @@ def _validate_gmail_mcp(prefix, source):
             )
     if "auth_servers" in source and "verified_sender_domains" not in source:
         problems.append(f"{prefix}.auth_servers requires verified_sender_domains")
+    if "trust_from_without_auth" in source:
+        if not isinstance(source["trust_from_without_auth"], bool):
+            problems.append(
+                f"{prefix}.trust_from_without_auth must be true or false")
+        elif source["trust_from_without_auth"] and (
+            "verified_sender_domains" not in source
+        ):
+            problems.append(
+                f"{prefix}.trust_from_without_auth requires "
+                "verified_sender_domains")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
     for key in ("queue_query", "exclude_query", "max_results"):

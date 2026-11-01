@@ -22,6 +22,7 @@ Routine config:
       exclude_self_only: false
       verified_sender_domains: [example.com]  # optional; see below
       auth_servers: [mx.google.com]           # whose verdict is trusted
+      trust_from_without_auth: false          # see "From-only trust" below
 
 With `verified_sender_domains` set, only mail from those exact domains is
 read, and only when the receiving server authenticated it. A message's From
@@ -34,6 +35,16 @@ never captured, and only counts and message ids are logged. An
 Authentication-Results line printed below the message's own headers counts as
 forged. The owner's own mail never passes the receiving server, so it is
 dropped at listing; skipped messages of a kept thread are noted as withheld.
+
+From-only trust: a connector that never shows Authentication-Results would
+make every message fail closed. `trust_from_without_auth: true` (only with
+`verified_sender_domains`) accepts a message whose From passes the same strict
+domain check when it carries no Authentication-Results header at all. A
+message that has one still gets the full check, so a failing verdict is still
+a hard fail, and a header printed below the message's own headers still
+counts as forged. Each such acceptance is logged ("accepted on From only")
+with counts and message ids. The From header can be spoofed: this relies on
+the domain's DMARC policy making the receiving server reject forged mail.
 
 Headless Claude only transports: through the least-privilege bridge it calls
 one read-only connector tool and hands back the raw text. Everything else
@@ -98,7 +109,7 @@ DEFAULTS = {
 # Keys only a gmail_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "fetch_tool", "owner_email", "verified_sender_domains",
-    "auth_servers",
+    "auth_servers", "trust_from_without_auth",
 }
 DEFAULT_AUTH_SERVERS = ("mx.google.com",)
 MAX_LOGGED_IDS = 20
@@ -167,6 +178,10 @@ def settings(source):
         str(s).strip().casefold()
         for s in source.get("auth_servers") or DEFAULT_AUTH_SERVERS
     ]
+    cfg["trust_from_without_auth"] = (
+        source.get("trust_from_without_auth") is True
+        and bool(cfg["verified_sender_domains"])
+    )
     return cfg
 
 
@@ -811,12 +826,27 @@ def sender_authenticated(results, domain, servers):
     return verdicts["dmarc"] or (verdicts["dkim"] and verdicts["spf"])
 
 
-def verified_sender(cfg, headers, auth_results):
-    """A fetched message's From is a listed domain and authenticated for it."""
+def sender_verdict(cfg, headers, auth_results):
+    """"verified", "from_only" or None for a fetched message.
+
+    "verified": From is a listed domain and authenticated for it.
+    "from_only": From is a listed domain, the message has no
+    Authentication-Results header at all (an empty list, not one holding a
+    forged or unreadable header), and trust_from_without_auth is on.
+    """
     domain = sender_domain(headers.get("from"))
-    return domain in cfg["verified_sender_domains"] and sender_authenticated(
-        auth_results, domain, cfg["auth_servers"]
-    )
+    if domain not in cfg["verified_sender_domains"]:
+        return None
+    if cfg.get("trust_from_without_auth") and auth_results == []:
+        return "from_only"
+    if sender_authenticated(auth_results, domain, cfg["auth_servers"]):
+        return "verified"
+    return None
+
+
+def verified_sender(cfg, headers, auth_results):
+    """A fetched message's From is a listed domain and accepted for it."""
+    return sender_verdict(cfg, headers, auth_results) is not None
 
 
 def _partition(items, keep):
@@ -827,10 +857,14 @@ def _partition(items, keep):
     return kept, [item["id"] for item in dropped]
 
 
-def _log_skipped(what, ids):
+def _log_ids(summary, ids):
     shown = ",".join(ids[:MAX_LOGGED_IDS])
     more = f" (+{len(ids) - MAX_LOGGED_IDS} more)" if len(ids) > MAX_LOGGED_IDS else ""
-    log(f"gmail_mcp: skipped {len(ids)} message(s) {what}: {shown}{more}")
+    log(f"gmail_mcp: {summary}: {shown}{more}")
+
+
+def _log_skipped(what, ids):
+    _log_ids(f"skipped {len(ids)} message(s) {what}", ids)
 
 
 # --- bridge sessions ---------------------------------------------------------
@@ -1350,10 +1384,19 @@ def fetch(routine, candidate, source=None):
     messages = outcome["messages"]
     unverified = []
     if cfg["verified_sender_domains"]:
-        messages, unverified = _partition(messages, lambda m: verified_sender(
-            cfg, m["headers"], m["auth_results"]))
+        verdicts = {
+            m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
+            for m in messages
+        }
+        messages, unverified = _partition(
+            messages, lambda m: verdicts[m["id"]] is not None)
         if unverified:
             _log_skipped("without a verified sender", unverified)
+        from_only = [m["id"] for m in messages
+                     if verdicts[m["id"]] == "from_only"]
+        if from_only:
+            _log_ids(f"accepted {len(from_only)} message(s) on From only "
+                     "(no Authentication-Results)", from_only)
         if not messages:
             _mark_terminal(routine, candidate, batch, "unverified sender",
                              status="unverified")

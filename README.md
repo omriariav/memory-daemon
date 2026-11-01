@@ -2300,6 +2300,32 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 - This fails closed. A connector whose `fetch_message` does not return
   `Authentication-Results` therefore yields no captures at all.
 
+**From-only trust** (`trust_from_without_auth: true`, valid only with
+`verified_sender_domains`). For a connector that never returns
+`Authentication-Results`, this accepts a message whose `From` passes the exact
+domain check above when the message has no `Authentication-Results` header at
+all:
+
+- A message that has the header still gets the full check, so a failing or
+  unreadable verdict is still dropped, and a header printed below the
+  message's own headers still counts as forged.
+- Each acceptance is logged as `accepted N message(s) on From only`, with
+  message ids only, so you can see when the connector starts returning the
+  header and the flag can go.
+- Known gaps:
+  - The `From` header can be spoofed. This relies on the domain publishing a
+    DMARC `p=reject` (or `quarantine`) policy, so the receiving server rejects
+    forged external mail before it reaches the inbox. Check the domain's
+    `_dmarc` record before turning this on.
+  - DMARC passes for mail sent through any service the domain's SPF record
+    includes, or that signs DKIM for it (helpdesk, CRM and marketing
+    platforms). Mail sent that way through a shared platform account can pass.
+  - Legitimate notifications from the domain (for example helpdesk tickets)
+    can carry text written by outsiders; it is treated as internal mail. The
+    prompt still marks all mail text as untrusted data.
+  - Keep `gmail:` out of task export sources (`fibery-tasks-outbound`
+    `from_sources`) so a spoofed or relayed message cannot become a task.
+
 How a run works:
 
 1. The connector has no thread tool, so a thread is the messages that share a
