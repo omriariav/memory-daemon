@@ -129,13 +129,37 @@ class LanguageCheckTest(unittest.TestCase):
                                     check=False)
         self.assertEqual(found, ["mila:A"])
 
+    def test_a_looping_transcript_is_held_in_any_language(self):
+        rec = record("L", segments=[
+            {"start": i, "end": i + 1, "text": "I will tell you how much."}
+            for i in range(60)])
+        rec["language"] = "he"
+        self.assertEqual(self.run_candidates([rec]), [])
+        self.assertEqual(self.events()[0]["details"]["reason"], "looped")
+
+    def test_first_seen_after_the_hold_is_not_captured_silently(self):
+        later = NOW + datetime.timedelta(hours=3)
+        found = self.run_candidates([self.rec("A", "en", summary=HEBREW)],
+                                    now=later)
+        self.assertEqual(found, ["mila:A"])
+        self.assertTrue(any("capturing as is" in line for line in self.log))
+
+    def test_a_pending_alert_is_sent_again(self):
+        path = self.root / "state" / mila_source.LANGUAGE_FLAGGED_FILE
+        path.write_text(json.dumps({"A": "pending"}))
+        self.run_candidates([self.rec("A", "en", summary=HEBREW)])
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(json.loads(path.read_text())["A"], "held")
+
     def test_validation(self):
         base = {"kind": "mila", "recordings_file": "/tmp/mila/recordings.json",
                 "calendar_timezone": "UTC"}
         ok = dict(base, language_check={"expect": "he", "hold_minutes": 120})
         self.assertEqual(config.validate(routine("/tmp/store", ok)), [])
         for bad in ({"expect": "fr"}, {"expect": "he", "hold_minutes": 600},
-                    {"expect": "he", "extra": 1}, "he"):
+                    {"expect": "he", "extra": 1}, "he", {"expect": ["he"]},
+                    {"expect": "he", "hold_minutes": float("nan")},
+                    {"expect": "he", "hold_minutes": 340}):
             problems = config.validate(
                 routine("/tmp/store", dict(base, language_check=bad)))
             self.assertTrue(any("language_check" in p for p in problems), bad)

@@ -2193,21 +2193,28 @@ def _validate_mila_match(source, prefix):
                     f"{prefix}.language_check has unknown key(s) "
                     f"{', '.join(sorted(unknown))}"
                 )
-            if check.get("expect") not in mila_source.LANGUAGE_SCRIPTS:
+            expect = check.get("expect")
+            if not isinstance(expect, str) \
+                    or expect not in mila_source.LANGUAGE_SCRIPTS:
                 problems.append(
                     f"{prefix}.language_check.expect must be one of "
                     f"{', '.join(sorted(mila_source.LANGUAGE_SCRIPTS))}"
                 )
             minutes = check.get("hold_minutes", 120)
             hours = source.get("calendar_match_hours", 6)
+            limit = (
+                hours * 60 - mila_source.LANGUAGE_MATCH_MARGIN / 60
+                if isinstance(hours, (int, float)) else float("inf")
+            )
+            # The hold ends LANGUAGE_MATCH_MARGIN before the calendar match
+            # gives up, so a longer one would be cut short.
             if (
                 not isinstance(minutes, (int, float))
-                or isinstance(minutes, bool) or minutes <= 0
-                or (isinstance(hours, (int, float)) and minutes >= hours * 60)
+                or isinstance(minutes, bool) or not 0 < minutes <= limit
             ):
                 problems.append(
                     f"{prefix}.language_check.hold_minutes must be positive "
-                    "and less than calendar_match_hours * 60"
+                    "and at most calendar_match_hours * 60 - 30"
                 )
     limit = source.get("max_transcript_chars")
     if limit is not None and (

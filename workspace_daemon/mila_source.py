@@ -247,6 +247,10 @@ LANGUAGE_MIN_LETTERS = 20
 LANGUAGE_SUMMARY_SHARE = 0.3
 LANGUAGE_TRANSCRIPT_SHARE = 0.2
 LANGUAGE_MATCH_MARGIN = 1800
+# A failed transcription loops: most lines repeat. Such a transcript is held
+# and flagged the same way, whatever its language.
+LOOP_MIN_SEGMENTS = 40
+LOOP_UNIQUE_SHARE = 0.5
 LANGUAGE_FLAGGED_FILE = "mila-language-flagged.json"
 MAX_LANGUAGE_FLAGGED = 500
 
@@ -254,7 +258,8 @@ MAX_LANGUAGE_FLAGGED = 500
 def language_check_settings(source):
     """``{"expect", "hold_minutes"}``, or None when the check is off."""
     cfg = source.get("language_check")
-    if not isinstance(cfg, dict) or cfg.get("expect") not in LANGUAGE_SCRIPTS:
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("expect"), str) \
+            or cfg["expect"] not in LANGUAGE_SCRIPTS:
         return None
     return {"expect": cfg["expect"],
             "hold_minutes": float(cfg.get("hold_minutes", 120))}
@@ -266,6 +271,24 @@ def _in_script(text, expect, share):
     letters = sum(1 for ch in text if ch.isalpha())
     hits = sum(1 for ch in text if low <= ch <= high)
     return hits >= LANGUAGE_MIN_LETTERS and hits >= share * letters
+
+
+def _looped(record):
+    """Whether Mila's transcript of ``record`` repeats itself (a failed run)."""
+    lines = [
+        str(seg.get("text") or "").strip()
+        for seg in record.get("segments") or [] if isinstance(seg, dict)
+    ]
+    lines = [line for line in lines if line]
+    return (len(lines) >= LOOP_MIN_SEGMENTS
+            and len(set(lines)) < LOOP_UNIQUE_SHARE * len(lines))
+
+
+def _suspect(record, directory, check):
+    """"looped", "language", or None: why ``record`` should be redone."""
+    if _looped(record):
+        return "looped"
+    return "language" if _wrong_language(record, directory, check) else None
 
 
 def _wrong_language(record, directory, check):
@@ -315,53 +338,59 @@ def _save_language_state(path, flagged):
     state_mod.write_atomic(path, json.dumps(kept), mode=0o600)
 
 
-def _flag_language(record, check, dry_run):
-    """Alert once per recording that it is held for a language mismatch."""
+def _flag_language(record, check, reason, dry_run):
+    """Alert once per recording that it is held for re-transcription.
+
+    The state goes "pending" before the alert and "held" after it, so an
+    alert lost to a crash or a failed write is sent again on the next run.
+    """
     recording_id = str(record["id"])
     if dry_run:
-        log(f"mila: dry run: would hold recording {recording_id} "
-            f"(transcribed as {record.get('language')!r})")
+        log(f"mila: dry run: would hold recording {recording_id} ({reason})")
         return
     path, flagged = _language_state()
-    if path is None or recording_id in flagged:
+    if path is None or flagged.get(recording_id) in ("held", "released"):
         return
     title = str(record.get("title") or recording_id)[:120]
-    message = (
-        f"Mila recording '{title}' was transcribed as "
-        f"'{record.get('language')}' but looks like '{check['expect']}': "
-        "re-transcribe it in Mila before it is captured as is"
+    why = (
+        "its transcript repeats itself (a failed transcription)"
+        if reason == "looped" else
+        f"it was transcribed as '{record.get('language')}' but looks like "
+        f"'{check['expect']}'"
     )
+    message = (f"Mila recording '{title}': {why}. Re-transcribe it in Mila "
+               "before it is captured as is")
     key = f"mila-language:{recording_id}"
-    # Saved first, so a save that keeps failing sends nothing (no alert per
-    # run); an alert that could not be written is forgotten and retried.
     try:
-        _save_language_state(path, {**flagged, recording_id: "held"})
+        _save_language_state(path, {**flagged, recording_id: "pending"})
     except OSError:
         log("mila: language-check state not saved; no alert sent")
         return
-    log(f"mila: WARN recording {recording_id} transcribed as "
-        f"{record.get('language')!r}, looks {check['expect']!r}; held")
-    sent = events.emit(llm.base_dir(), events.build(
+    log(f"mila: WARN recording {recording_id} held: {why}")
+    if events.emit(llm.base_dir(), events.build(
         "daemon", "alert", None, f"daemon:{key}", message, [],
-        details={"key": key, "recording_id": recording_id,
+        details={"key": key, "recording_id": recording_id, "reason": reason,
                  "language": record.get("language"),
                  "expected": check["expect"]},
-    ))
-    if not sent:
+    )):
         try:
-            _save_language_state(path, flagged)
+            _save_language_state(path, {**flagged, recording_id: "held"})
         except OSError:
             pass
 
 
-def _release_language(record, dry_run):
-    """Log once that a held recording is now captured as is."""
+def _release_language(record, reason, dry_run):
+    """Log once that a suspect recording is now captured as is.
+
+    Also when it was never held (first seen after its hold, e.g. while the
+    daemon was paused), so it is not captured silently.
+    """
     recording_id = str(record["id"])
     path, flagged = _language_state()
-    if path is None or flagged.get(recording_id) != "held":
+    if path is None or flagged.get(recording_id) == "released":
         return
-    log(f"mila: WARN recording {recording_id} still transcribed as "
-        f"{record.get('language')!r} after the hold; capturing as is")
+    log(f"mila: WARN recording {recording_id} ({reason}) is past its hold; "
+        "capturing as is")
     if not dry_run:
         try:
             _save_language_state(path, {**flagged, recording_id: "released"})
@@ -724,13 +753,15 @@ def candidates(source):
         if source_id in found:
             continue
         try:
-            if check and _wrong_language(record, metadata_file.parent, check):
+            reason = check and _suspect(record, metadata_file.parent, check)
+            if reason:
                 end = _recording_interval(record, zone)[1]
                 if _now() < _language_deadline(record, end, check, source):
-                    _flag_language(record, check, source.get("_dry_run"))
+                    _flag_language(record, check, reason,
+                                   source.get("_dry_run"))
                     held += 1  # not a candidate: retried next run
                     continue
-                _release_language(record, source.get("_dry_run"))
+                _release_language(record, reason, source.get("_dry_run"))
             built = _candidate(
                 record, metadata_file.parent, zone=zone, app=app, wait=True
             )
@@ -783,7 +814,7 @@ def candidates(source):
             f"{waiting} waiting for hints"
         )
     if held:
-        log(f"mila: {held} recording(s) held for a language mismatch")
+        log(f"mila: {held} recording(s) held for re-transcription")
     return ordered
 
 
