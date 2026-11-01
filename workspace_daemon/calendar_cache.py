@@ -622,6 +622,11 @@ def normalize(listed, details, cfg, tz):
             "end": end,
             "all_day": raw["all_day"],
             "title": title,
+            # The title as listed, cut like the shown one: detail lookups
+            # (which come and go) never change it.
+            "list_title": clean(
+                raw["title"], TITLE_MAX if is_internal else EXTERNAL_TITLE_MAX
+            ),
             "my_rsvp": _rsvp_for_owner(owner, organizer, entries),
             "organizer": {
                 "email": organizer, "name": organizer_name,
@@ -1015,12 +1020,6 @@ def snapshot_rows(wide, details, cfg, tz):
     the only ones whose answers are reported.
     """
     status = {raw["event_id"]: raw.get("status") or "confirmed" for raw in wide}
-    # Capped at the longest shown title, so a change past what any title
-    # shows is not a change and no event carries an uncapped title.
-    listed = {
-        raw["event_id"]: clean(raw.get("title"), TITLE_MAX)
-        for raw in wide
-    }
     owner = str(cfg.get("owner_email") or "").strip().lower()
     rows = {}
     for event in normalize(wide, details, cfg, tz):
@@ -1032,7 +1031,7 @@ def snapshot_rows(wide, details, cfg, tz):
             "status": status.get(event["event_id"], "confirmed"),
             "my_rsvp": event["my_rsvp"],
             "title": event["title"],
-            "list_title": listed.get(event["event_id"], ""),
+            "list_title": event["list_title"],
         }
         if event["my_rsvp"] == "organizer":
             row["rsvps"] = {
@@ -1046,11 +1045,14 @@ def snapshot_rows(wide, details, cfg, tz):
 
 
 def _rsvp_changes(before, after):
-    """{"Name <email>": [old, new]} for attendees in both maps whose answer
-    changed. The email keeps two people with one name apart. Malformed old
-    entries are skipped."""
+    """{label: [old, new]} for attendees in both maps whose answer changed.
+
+    The label is the attendee's name, or their email when the name is empty
+    or shared with another attendee. Malformed old entries are skipped.
+    """
+    shared = collections.Counter(name for name, _ in after.values())
     return {
-        (f"{name} <{email}>" if name else email): [before[email][1], rsvp]
+        (name if name and shared[name] == 1 else email): [before[email][1], rsvp]
         for email, (name, rsvp) in sorted(after.items())
         if isinstance(before.get(email), list) and len(before[email]) == 2
         and before[email][1] != rsvp
@@ -1109,8 +1111,10 @@ def diff_snapshots(prev, rows, now, hours, tz):
     Neither update nor cancel fires when my RSVP is "organizer" or "declined"
     in the old or the new row. `rsvp` fires for an event I organize when an
     attendee present in both snapshots changed their answer; `changed` is
-    {"Name <email>": [old, new]}. The same update (times as a shift), rsvp
-    answer or cancel on several instances of one series is reported once. A snapshot written before rsvps were stored compares nothing.
+    {name (email when empty or shared): [old, new]}. The same new, update
+    (times as a shift) or cancel on several instances of one series is one
+    event whose `changed` lists the `instances`; an attendee's same answer
+    across a series is reported once. A snapshot written before rsvps were stored compares nothing.
     """
     limit = now + datetime.timedelta(hours=hours)
     prev_limit = datetime.datetime.fromisoformat(prev["fetched_at"]) \
@@ -1119,13 +1123,9 @@ def diff_snapshots(prev, rows, now, hours, tz):
     found = []
     reported = set()
 
-    def once(kind, event_id, changed):
-        """One change to a whole series changes every instance: report it once.
-
-        Times are compared as the shift they make, so moving a series by an
-        hour collapses while each instance's date differs.
-        """
-        shape = {}
+    def shape(changed):
+        """A change as it applies to a whole series: times as their shift."""
+        out = {}
         for field, value in (changed or {}).items():
             if field in ("start", "end"):
                 try:
@@ -1133,12 +1133,8 @@ def diff_snapshots(prev, rows, now, hours, tz):
                              - _row_when(value[0], tz)).total_seconds()
                 except (TypeError, ValueError):
                     pass
-            shape[field] = value
-        key = (kind, _series(event_id), json.dumps(shape, sort_keys=True))
-        if key in reported:
-            return False
-        reported.add(key)
-        return True
+            out[field] = value
+        return json.dumps(out, sort_keys=True)
 
     for event_id, row in rows.items():
         start, end = _row_when(row["start"], tz), _row_when(row["end"], tz)
@@ -1147,8 +1143,7 @@ def diff_snapshots(prev, rows, now, hours, tz):
         old = before.get(event_id)
         if row["status"] == "cancelled":
             if old and old["status"] != "cancelled" \
-                    and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS \
-                    and once("cancel", event_id, None):
+                    and not {old["my_rsvp"], row["my_rsvp"]} & QUIET_RSVPS:
                 found.append(("cancel", event_id, row, None))
         elif old is None:
             if row["my_rsvp"] == "needsAction" and start < prev_limit:
@@ -1163,7 +1158,10 @@ def diff_snapshots(prev, rows, now, hours, tz):
             # another attendee answered one instance only.
             answers = {
                 who: change for who, change in answers.items()
-                if once("rsvp", event_id, {who: change})
+                if ("rsvp", _series(event_id), who, tuple(change))
+                not in reported
+                and not reported.add(("rsvp", _series(event_id), who,
+                                      tuple(change)))
             }
             if answers:
                 found.append(("rsvp", event_id, row, answers))
@@ -1181,16 +1179,42 @@ def diff_snapshots(prev, rows, now, hours, tz):
             }
             if "list_title" in changed:
                 changed["title"] = changed.pop("list_title")
-            if changed and once("update", event_id, changed):
+            if changed:
                 found.append(("update", event_id, row, changed))
     for event_id, old in before.items():
         if event_id in rows or old["status"] == "cancelled" \
                 or old["my_rsvp"] in QUIET_RSVPS:
             continue
-        if now < _row_when(old["start"], tz) < limit \
-                and once("cancel", event_id, None):
+        if now < _row_when(old["start"], tz) < limit:
             found.append(("cancel", event_id, old, None))
-    return found
+    return _collapse_series(found, shape)
+
+
+def _collapse_series(found, shape):
+    """One event per (kind, series, change) instead of one per instance.
+
+    The first instance stands for the series; when several collapse, its
+    changes gain `instances`, every instance id it stands for. An rsvp is
+    already deduped per attendee.
+    """
+    groups = {}
+    out = []
+    for kind, event_id, row, changed in found:
+        if kind == "rsvp":
+            out.append([kind, event_id, row, changed])
+            continue
+        key = (kind, _series(event_id), shape(changed))
+        if key in groups:
+            groups[key].append(event_id)
+            continue
+        groups[key] = [event_id]
+        out.append([kind, event_id, row, changed, groups[key]])
+    result = []
+    for item in out:
+        if len(item) == 5 and len(item[4]) > 1:
+            item[3] = dict(item[3] or {}, instances=item[4])
+        result.append(tuple(item[:4]))
+    return result
 
 
 def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
@@ -1211,7 +1235,7 @@ def track_events(cfg, base_dir, routine_id, wide, details, now, tz):
         if changed:
             info["changed"] = changed
         # Titles and attendee names are written by others.
-        info["untrusted"] = UNTRUSTED_NOTE
+        info["untrusted"] = True
         event_stream.emit(base_dir, event_stream.build(
             routine_id, kind, None, f"{SOURCE}:{event_id}", row["title"],
             people=[], details=info,

@@ -15,7 +15,8 @@ One JSON object per line, oldest first:
 events add "cancel" and "rsvp" and carry `memory_id` null, `source_id`
 `gcal:<event id>` and a trailing optional "details" object (omitted when
 empty): `{"start", "end"}` ISO times, plus `{"changed": {field: [old, new]}}`
-on update or `{"changed": {attendee name: [old, new]}}` on rsvp.
+on update or `{"changed": {attendee: [old, new]}}` on rsvp (keyed by name,
+or by email when the name is empty or shared).
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
 `state/events.lock`. The file is rotated to `events.jsonl.1` (one

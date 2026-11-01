@@ -103,7 +103,7 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(event["details"], {
             "start": "2026-10-23T08:30:00+00:00",
             "end": "2026-10-23T09:30:00+00:00",
-            "untrusted": calendar_cache.UNTRUSTED_NOTE,
+            "untrusted": True,
         })
 
     def test_accepted_and_organized_are_not_new(self):
@@ -156,8 +156,7 @@ class EventsTest(unittest.TestCase):
         (event,) = self.emitted()
         self.assertEqual(event["kind"], "rsvp")
         self.assertEqual(event["details"]["changed"],
-                         {"Bob Jones <bob.jones@example.com>":
-                          ["needsAction", "accepted"]})
+                         {"Bob Jones": ["needsAction", "accepted"]})
 
     def test_unchanged_answers_and_others_events_emit_no_rsvp(self):
         self.seed(self.mine("accepted"),
@@ -193,8 +192,8 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(two("accepted", "declined")))
         (event,) = self.emitted()
         self.assertEqual(event["details"]["changed"], {
-            "Bob Jones <bob.jones@example.com>": ["needsAction", "accepted"],
-            "Bob Jones <bob.jones@other.test>": ["needsAction", "declined"],
+            "bob.jones@example.com": ["needsAction", "accepted"],
+            "bob.jones@other.test": ["needsAction", "declined"],
         })
 
     def test_malformed_old_entry_is_skipped_not_fatal(self):
@@ -224,8 +223,7 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(two("declined")))
         (event,) = self.emitted()
         self.assertEqual(event["details"]["changed"],
-                         {"Bob Jones <bob.jones@example.com>":
-                          ["needsAction", "declined"]})
+                         {"bob.jones@example.com": ["needsAction", "declined"]})
 
     def test_series_rename_is_reported_once(self):
         def inst(day, title):
@@ -270,16 +268,34 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(inst(3, "accepted", "accepted"),
                             inst(4, "accepted", "needsAction")))
         changes = [e["details"]["changed"] for e in self.emitted()]
-        bob = "Bob Jones <bob.jones@example.com>"
+        bob = "Bob Jones"
         self.assertEqual(sum(bob in c for c in changes), 1)
 
-    def test_series_deletion_is_one_cancel(self):
+    def test_series_deletion_is_one_cancel_listing_instances(self):
         def inst(day):
             return block(f"ser_2026102{day}T083000Z", soon(day - 2),
                          title="Daily", rsvp="accepted")
         self.seed(inst(3), inst(4))
         self.run_at(listing(block("other", soon(), rsvp="accepted")))
-        self.assertEqual([e["kind"] for e in self.emitted()], ["cancel"])
+        (event,) = self.emitted()
+        self.assertEqual(event["kind"], "cancel")
+        self.assertEqual(event["details"]["changed"]["instances"],
+                         ["ser_20261023T083000Z", "ser_20261024T083000Z"])
+
+    def test_series_invite_is_one_new(self):
+        def inst(day):
+            return block(f"ser_2026102{day}T083000Z", soon(day - 2),
+                         title="Daily")
+        self.seed()
+        self.run_at(listing(inst(3), inst(4), inst(5)))
+        self.assertEqual([e["kind"] for e in self.emitted()], ["new"])
+
+    def test_external_title_change_past_100_chars_is_not_an_update(self):
+        long = "x" * 120
+        ext = dict(organizer="eve@evil.test", rsvp="accepted")
+        self.seed(block("a", soon(), title=long + "A", **ext))
+        self.run_at(listing(block("a", soon(), title=long + "B", **ext)))
+        self.assertEqual(self.emitted(), [])
 
     def test_snapshot_without_rsvps_compares_nothing(self):
         self.seed(self.mine("needsAction"))
