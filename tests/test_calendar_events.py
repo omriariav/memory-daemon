@@ -213,6 +213,39 @@ class EventsTest(unittest.TestCase):
         self.run_at(listing(inst(3, "accepted"), inst(4, "accepted")))
         self.assertEqual([e["kind"] for e in self.emitted()], ["rsvp"])
 
+    def test_name_shared_with_an_unchanged_attendee_uses_email(self):
+        two = lambda a: block(
+            "m", soon(), title="Mine", organizer="me@example.com",
+            rsvp="accepted",
+            extra=f", bob.jones@example.com ({a}), bob.jones@other.test (accepted)")
+        self.seed(two("needsAction"))
+        self.run_at(listing(two("declined")))
+        (event,) = self.emitted()
+        self.assertEqual(event["details"]["changed"],
+                         {"bob.jones@example.com": ["needsAction", "declined"]})
+
+    def test_series_rename_is_reported_once(self):
+        def inst(day, title):
+            return block(f"ser_2026102{day}T083000Z", soon(day - 2),
+                         title=title, rsvp="accepted")
+        self.seed(inst(3, "Daily"), inst(4, "Daily"))
+        self.run_at(listing(inst(3, "Standup"), inst(4, "Standup")))
+        self.assertEqual([e["kind"] for e in self.emitted()], ["update"])
+
+    def test_change_past_the_shown_length_is_not_an_update(self):
+        long = "x" * 120
+        self.seed(block("a", soon(), rsvp="accepted", title=long + "A"))
+        self.run_at(listing(block("a", soon(), rsvp="accepted",
+                                  title=long + "B")))
+        self.assertEqual(self.emitted(), [])
+
+    def test_owner_alias_marked_self_is_not_an_attendee(self):
+        self.seed(block("m", soon(), title="Mine", organizer="me@example.com",
+                        rsvp="accepted",
+                        extra=", me.alias@example.com (needsAction, self)"))
+        data = json.loads(self.snapshot.read_text())
+        self.assertNotIn("me.alias@example.com", data["events"]["m"]["rsvps"])
+
     def test_snapshot_without_rsvps_compares_nothing(self):
         self.seed(self.mine("needsAction"))
         data = json.loads(self.snapshot.read_text())

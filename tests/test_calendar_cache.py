@@ -620,7 +620,7 @@ class RealConnectorShapeTest(unittest.TestCase):
         text = calendar_cache.render_text(events, config_, NOW)
         lines = text.split("\n")
         self.assertTrue(lines[0].startswith("# Calendar next"))
-        self.assertEqual(lines[1], calendar_cache.UNTRUSTED_NOTE)
+        self.assertEqual(lines[1], "# " + calendar_cache.UNTRUSTED_NOTE)
         self.assertTrue(lines[2].startswith("Tue 20 Oct"))
         self.assertEqual(text.count("\n\n"), 1)
 
