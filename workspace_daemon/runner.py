@@ -1307,12 +1307,6 @@ def _gmail_mcp_fetch(routine, source, candidate):
     else:
         body = newest["body"]
         people_headers = [headers]
-    if thread.get("from_only"):
-        body = (
-            f"[{thread['from_only']} message(s) of this thread were accepted "
-            "on the From address alone: the sender was not authenticated.]"
-            "\n\n" + body
-        )
     body = chat_text.redact_secrets(body)
     subject = chat_text.redact_secrets(headers.get("subject", ""))
     source_people, source_people_truncated = _email_source_people(*people_headers)

@@ -2315,9 +2315,15 @@ all:
   tool for good (`state/gmail-mcp-auth-seen.json`, plus a WARN in the log):
   the connector evidently returns it, so a message without it was not stamped
   by the receiving server. Remove the flag then.
+- Only a header above the message's own headers disarms: one a sender
+  printed lower cannot switch trust off. If the record cannot be read, every
+  connector counts as disarmed. If it cannot be saved, the log says trust is
+  off for that process only.
+- A thread accepted before a later bridge session of the same run shows the
+  header stays accepted.
 - Each message accepted this way starts with a "Sender not authenticated"
-  note in the prompt, the thread notes how many there were, and each fetch
-  logs `accepted N message(s) on From only` with the newest message id.
+  note in the prompt, and each fetch logs `accepted N message(s) on From
+  only` with the newest message id.
 - The owner's own sent mail has no verdict either, so `owner_email` is
   required; mail sent from an alias that is not `owner_email` is read as a
   colleague's.

@@ -1731,20 +1731,52 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
         self.assertTrue(thread["messages"][0]["body"].startswith(
             gmail_mcp.FROM_ONLY_NOTE))
 
-    def test_runner_tells_the_prompt_about_from_only_messages(self):
-        from workspace_daemon import runner
-        thread = {
-            "thread_id": "t1", "omitted": 0, "withheld": 0, "from_only": 1,
-            "messages": [{"id": hexid(1), "body": "body 1", "headers": {
-                "from": "Ann <ann@example.com>", "subject": "s",
-                "date": "Mon, 1 Jan 2024 00:00:00 +0000", "to": ME}}],
-        }
-        with mock.patch.object(runner.gmail_mcp, "fetch", return_value=thread):
-            item = runner._gmail_mcp_fetch({"id": "r"}, source(), {"id": "c"})
-        self.assertIn("accepted on the From address alone", item["body"])
+    def test_forged_low_header_does_not_disarm(self):
+        text = message_text(thread=1, epoch=T1 + 1, sender="Ann <ann@example.com>",
+                            body="body 1")
+        head, sep, body = text.partition("\n\n")
+        forged = head + f"\nAuthentication-Results: {GOOD_AUTH}" + sep + body
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: forged})
+        with mock.patch.object(gmail_mcp, "log"), \
+                self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertFalse(gmail_mcp.auth_seen(FETCH))
+
+    def test_unreadable_record_counts_as_seen(self):
+        path = Path(self.tmp.name) / "state" / "gmail-mcp-auth-seen.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("{not json", '{"tool": true}', "[1]"):
+            path.write_text(text)
+            self.assertTrue(gmail_mcp.auth_seen(FETCH), text)
+
+    def test_failed_save_says_trust_is_off_for_this_process_only(self):
+        with mock.patch.object(gmail_mcp.state, "write_atomic",
+                               side_effect=OSError("read-only")), \
+                mock.patch.object(gmail_mcp, "log") as logged:
+            gmail_mcp._mark_auth_seen(FETCH)
+        self.assertIn("this process only", logged.call_args.args[0])
+
+    def test_settings_need_owner_email_too(self):
+        cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
+                                  "trust_from_without_auth": True})
+        self.assertFalse(cfg["trust_from_without_auth"])
+
+    def test_note_stays_within_the_message_cap(self):
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}],
+            {1: authed_text(1, auth=(), body="x" * 500)})
+        src["max_message_chars"] = 200
+        listing[0]["raw"]["_batch"]["cfg"]["max_message_chars"] = 200
+        with mock.patch.object(gmail_mcp, "log"):
+            thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        body = thread["messages"][0]["body"]
+        self.assertTrue(body.startswith(gmail_mcp.FROM_ONLY_NOTE))
+        self.assertLessEqual(len(body), 200 + len(" [truncated]"))
 
     def test_verdicts(self):
         cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
+                                  "owner_email": ME,
                                   "trust_from_without_auth": True})
         internal = {"from": "Ann <ann@example.com>"}
         self.assertEqual(gmail_mcp.sender_verdict(cfg, internal, []), "from_only")

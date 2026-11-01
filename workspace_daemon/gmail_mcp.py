@@ -49,7 +49,9 @@ itself off for that tool for good (state/gmail-mcp-auth-seen.json), since the
 connector evidently returns it and a message without it was not stamped by
 the receiving server. Each accepted message's body starts with a
 "Sender not authenticated" note, the thread counts them ("from_only"), and
-the log carries counts and message ids. The From header can be spoofed: this
+the log carries counts and message ids. A thread accepted before a later
+bridge session in the same run shows the header stays accepted. The From
+header can be spoofed: this
 relies on the domain's DMARC policy making the receiving server reject
 forged mail.
 
@@ -85,12 +87,14 @@ first advances it to the newest message read.
 """
 import datetime
 import email.utils
+import fcntl
 import hashlib
 import html
 import html.parser
 import itertools
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -185,9 +189,12 @@ def settings(source):
         str(s).strip().casefold()
         for s in source.get("auth_servers") or DEFAULT_AUTH_SERVERS
     ]
+    # Also enforced here, not only by config validation: without owner_email
+    # the owner's own sent mail would be read as a colleague's.
     cfg["trust_from_without_auth"] = (
         source.get("trust_from_without_auth") is True
         and bool(cfg["verified_sender_domains"])
+        and bool((cfg.get("owner_email") or "").strip())
     )
     return cfg
 
@@ -1207,6 +1214,7 @@ def candidates(source):
 # --- fetch -------------------------------------------------------------------
 
 _auth_seen_memory = set()  # fetch tools seen this process (covers a failed save)
+_ALL_TOOLS = "*"  # an unreadable record disarms every tool (fail closed)
 
 
 def _auth_seen_path():
@@ -1214,37 +1222,60 @@ def _auth_seen_path():
 
 
 def _load_auth_seen():
+    """Fetch tools recorded as returning Authentication-Results.
+
+    A missing file means none. A file that exists but cannot be read or
+    parsed counts as every tool, so a damaged record never re-arms trust.
+    """
     if _base_dir is None:
-        return []
+        return set()
     try:
         data = json.loads(_auth_seen_path().read_text())
+    except FileNotFoundError:
+        return set()
     except (OSError, ValueError):
-        return []
-    return [tool for tool in data if isinstance(tool, str)] \
-        if isinstance(data, list) else []
+        return {_ALL_TOOLS}
+    if not isinstance(data, list) or not all(isinstance(t, str) for t in data):
+        return {_ALL_TOOLS}
+    return set(data)
 
 
 def auth_seen(fetch_tool):
     """Whether a message read through `fetch_tool` carried Authentication-Results."""
-    return fetch_tool in _auth_seen_memory or fetch_tool in _load_auth_seen()
+    seen = _auth_seen_memory | _load_auth_seen()
+    return fetch_tool in seen or _ALL_TOOLS in seen
 
 
 def _mark_auth_seen(fetch_tool):
     if auth_seen(fetch_tool):
         return
     _auth_seen_memory.add(fetch_tool)
+    saved = _base_dir is None
     if _base_dir is not None:
+        path = _auth_seen_path()
         try:
-            state.write_atomic(
-                _auth_seen_path(),
-                json.dumps(sorted(set(_load_auth_seen()) | {fetch_tool})),
-                mode=0o600,
-            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Locked read-modify-write, so routines on different connectors
+            # cannot drop each other's entry.
+            lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                tools = _load_auth_seen() | {fetch_tool}
+                state.write_atomic(path, json.dumps(sorted(tools)), mode=0o600)
+                saved = True
+            finally:
+                os.close(lock_fd)
         except OSError:
-            pass  # the in-memory set still disarms this process
-    log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
-        "From-only trust is now off for this connector. Remove "
-        "trust_from_without_auth.")
+            pass
+    if saved:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "From-only trust is now off for this connector. Remove "
+            "trust_from_without_auth.")
+    else:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "From-only trust is off for this process only: saving "
+            "state/gmail-mcp-auth-seen.json failed, so the next run trusts "
+            "From again. Remove trust_from_without_auth.")
 
 
 def _attempts_path():
@@ -1430,15 +1461,18 @@ def fetch(routine, candidate, source=None):
     _clear_attempts(candidate["id"])
     cfg = batch["cfg"]
     messages = outcome["messages"]
-    unverified, from_only = [], []
+    unverified, from_only = [], set()
     # A connector that shows the header for one message shows it for all, so
     # once any message of the batch carries it, a message without it was
     # never stamped by the receiving server: From-only trust stops for good.
     # Recorded whether or not the flag is on, so turning it on later cannot
     # trust a connector already known to return the header.
-    if any(m["auth_results"] != []
+    # Only a header above the message's own headers counts: one a sender
+    # printed lower (None) must not let them switch trust off for everyone.
+    if any(result is not None
            for read in batch["threads"].values()
-           for m in read.get("messages") or []):
+           for m in read.get("messages") or []
+           for result in m["auth_results"]):
         _mark_auth_seen(cfg["fetch_tool"])
     if cfg["verified_sender_domains"]:
         if cfg["trust_from_without_auth"] and auth_seen(cfg["fetch_tool"]):
@@ -1462,9 +1496,11 @@ def fetch(routine, candidate, source=None):
             raise SenderUnverified("no message from a verified sender")
     out = []
     for message in messages:
-        body = _bound_body(message, cfg["max_message_chars"])
         if message["id"] in from_only:
-            body = f"{FROM_ONLY_NOTE}\n{body}"
+            body = FROM_ONLY_NOTE + "\n" + _bound_body(
+                message, cfg["max_message_chars"] - len(FROM_ONLY_NOTE) - 1)
+        else:
+            body = _bound_body(message, cfg["max_message_chars"])
         out.append({
             "id": message["id"],
             "headers": message["headers"],
