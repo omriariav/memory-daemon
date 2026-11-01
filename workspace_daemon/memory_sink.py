@@ -54,9 +54,8 @@ NO_OWNER_ACTION_TAG = "no-owner-action"
 SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 SOURCE_FOLLOWS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,200}")
 MAX_SOURCE_PEOPLE = 20
-# A meeting with at most this many invitees who did not decline (the owner
-# included) lists all of them as people: in a 1:1 or a small meeting the
-# invitation is better evidence of who was there than the model's reading.
+# At most this many invitees: unconfirmed ones are named on the "Invited,
+# not present" line; a larger meeting only counts them.
 SMALL_MEETING = 4
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -696,6 +695,86 @@ def _invitees_only(item, identity, unresolved_source, verified_source=()):
     )
 
 
+MAX_NOT_PRESENT = 10
+
+
+def _name_key(name):
+    return " ".join(str(name or "").casefold().split())
+
+
+def _attendance(meta, verified_source, identity, model_people):
+    """(attended slugs, "Invited, not present" line or "") for an invitation.
+
+    Per verified invitee besides the owner: declined (RSVP declined);
+    attended when a named speaker in the recording matches them, or the
+    model names them as a participant, or, when the recording names no
+    speaker besides the owner, they accepted; otherwise not present. Without
+    speaker names that last group is unconfirmed, and the line says so. A
+    large meeting without speaker names lists no unconfirmed names, only
+    their count.
+    """
+    own = str(identity.get("email") or "").strip().casefold()
+    owner_name = _name_key((identity.get("person") or {}).get("name"))
+    by_email = {
+        str(person.get("email") or "").strip().casefold(): person
+        for person in verified_source
+    }
+    speakers = [
+        _name_key(name) for name in meta.get("mila_speaker_names") or []
+        if _name_key(name) and _name_key(name) != owner_name
+    ]
+    invitees = []
+    for row in meta.get("source_people") or []:
+        if not isinstance(row, dict) \
+                or not str(row.get("role") or "").startswith("calendar-"):
+            continue
+        person = by_email.get(str(row.get("email") or "").strip().casefold())
+        if not person or str(row.get("email") or "").casefold() == own:
+            continue
+        name = person.get("name") or row.get("name") or person["slug"]
+        if all(i["slug"] != person["slug"] for i in invitees):
+            invitees.append({"slug": person["slug"], "name": str(name),
+                             "rsvp": row.get("rsvp") or "needsAction"})
+    firsts = {}
+    for invitee in invitees:
+        first = _name_key(invitee["name"]).split(" ")[0]
+        firsts[first] = firsts.get(first, 0) + 1
+
+    def spoke(invitee):
+        full = _name_key(invitee["name"])
+        first = full.split(" ")[0]
+        return any(
+            label == full
+            or (firsts.get(first) == 1 and label.split(" ")[0] == first)
+            for label in speakers
+        )
+
+    attended, absent, unconfirmed = [], [], []
+    for invitee in invitees:
+        if invitee["rsvp"] == "declined":
+            absent.append(f"{invitee['name']} (declined)")
+        elif spoke(invitee) or invitee["slug"] in model_people:
+            attended.append(invitee["slug"])
+        elif speakers:
+            absent.append(f"{invitee['name']} (no-show)")
+        elif invitee["rsvp"] == "accepted":
+            attended.append(invitee["slug"])
+        else:
+            reply = {"tentative": "tentative"}.get(invitee["rsvp"], "no reply")
+            unconfirmed.append(f"{invitee['name']} ({reply})")
+    parts = absent[:MAX_NOT_PRESENT]
+    if unconfirmed:
+        if len(invitees) <= SMALL_MEETING:
+            parts += unconfirmed[:MAX_NOT_PRESENT]
+        else:
+            parts.append(f"{len(unconfirmed)} other invitee(s)")
+    if not parts:
+        return attended, ""
+    note = (" (attendance unconfirmed: the recording names no other speaker)"
+            if unconfirmed else "")
+    return attended, f"Invited, not present{note}: {', '.join(parts)}."
+
+
 def _extract(routine, item, summary, store, verified_people=(), identity=None,
              owner_names=(), existing_titles=(), invitees_only=False):
     """Structured second pass over the already-distilled summary."""
@@ -1199,9 +1278,15 @@ def capture(routine, item, summary, dry_run=False):
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))
-    if invitees_only and 0 < len(attendees) <= SMALL_MEETING:
+    not_present = ""
+    if invitees_only:
+        # People are those who attended; the other invitees go on one line.
+        attended, not_present = _attendance(
+            meta, verified_source, identity, model_people
+        )
         people = list(dict.fromkeys(
-            people + sorted(source_slugs - set(people))
+            verified_owners + [p for p in people if p in attended]
+            + attended
         ))
     # Known people left out because they were not invited are expected, not
     # an identity gap: they do not count as dropped.
@@ -1273,6 +1358,8 @@ def capture(routine, item, summary, dry_run=False):
             )
     title = (entry.get("title") or item.get("title") or "untitled")[:120]
     body = entry.get("body") or summary
+    if not_present:
+        body = f"{body.rstrip()}\n\n{not_present}"
     if personal.redact_enabled(cfg):
         title, _ = personal.redact(title)
         body, n = personal.redact(body)

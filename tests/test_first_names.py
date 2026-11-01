@@ -250,7 +250,8 @@ class InternalDomainsValidationTest(unittest.TestCase):
         self.assertEqual(memory_sink._owner_domains({}, "me@gmail.com"), set())
 
 
-ADA = {"email": "ada.lovelace@example.com", "slug": "ada-lovelace"}
+ADA = {"email": "ada.lovelace@example.com", "slug": "ada-lovelace",
+       "name": "Ada Lovelace"}
 
 
 class CaptureTest(Base):
@@ -260,7 +261,7 @@ class CaptureTest(Base):
 
     def capture(self, people, source_people, safe=True, extra=None,
                 owner_email="me.owner@example.com", verified=(),
-                unresolved=(), want_args=False):
+                unresolved=(), want_args=False, speakers=None):
         routine = self.routine()
         routine["memory"].update({"store": "/store", "type": "meeting",
                                   "extract": True, **(extra or {})})
@@ -269,12 +270,15 @@ class CaptureTest(Base):
         item = {"id": "zoom:U@1", "source_id": "zoom:U", "title": "t",
                 "date": "2026-07-27", "source_kind": "zoom",
                 "frontmatter": {"source_people": source_people}}
+        if speakers is not None:
+            item["frontmatter"]["mila_speaker_names"] = list(speakers)
         extraction = {"worthy": True, "type": "meeting", "title": "T",
                       "people": people, "tags": ["x"], "body": "b"}
         seen = {}
 
         def fake_cli(store, args, stdin_text=None, timeout=120):
             seen["args"] = args
+            seen["body"] = stdin_text
             return mock.Mock(returncode=0, stdout="✓ created e\n", stderr="")
 
         ident = {"email": owner_email, "safe": safe,
@@ -294,6 +298,7 @@ class CaptureTest(Base):
                 mock.patch.object(memory_sink, "log"):
             memory_sink.capture(routine, item, "summary")
         args = seen["args"]
+        self.body = seen.get("body") or ""
         if want_args:
             return args
         return args[args.index("--people") + 1] if "--people" in args else None
@@ -426,12 +431,49 @@ class CaptureTest(Base):
             verified=[ADA])
         self.assertEqual(people, "ada-lovelace")
 
-    def test_small_meeting_lists_every_verified_invitee(self):
-        ada = ADA
+    def test_accepted_invitee_attends_when_no_speaker_is_named(self):
         people = self.capture(
             ["jane-doe"],
             [attendee("me.owner@example.com"),
-             attendee("ada.lovelace@example.com")], verified=[ada])
+             attendee("ada.lovelace@example.com", rsvp="accepted")],
+            verified=[ADA])
+        self.assertEqual(people, "ada-lovelace")
+        self.assertNotIn("Invited, not present", self.body)
+
+    def test_unanswered_invitee_is_unconfirmed_not_a_participant(self):
+        people = self.capture(
+            [], [attendee("me.owner@example.com"),
+                 attendee("ada.lovelace@example.com")], verified=[ADA])
+        self.assertIsNone(people)
+        self.assertIn("Invited, not present (attendance unconfirmed", self.body)
+        self.assertIn("Ada Lovelace (no reply)", self.body)
+
+    def test_declined_invitee_is_on_the_not_present_line(self):
+        gus = {"email": "augusta.king@example.com", "slug": "augusta-king",
+               "name": "Augusta King"}
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com", rsvp="accepted"),
+                 attendee("augusta.king@example.com", rsvp="declined")],
+            verified=[ADA, gus])
+        self.assertEqual(people, "ada-lovelace")
+        self.assertIn("Invited, not present: Augusta King (declined).",
+                      self.body)
+
+    def test_named_speakers_decide_attendance(self):
+        gus = {"email": "augusta.king@example.com", "slug": "augusta-king",
+               "name": "Augusta King"}
+        people = self.capture(
+            [], [attendee("ada.lovelace@example.com"),
+                 attendee("augusta.king@example.com", rsvp="accepted")],
+            verified=[ADA, gus], speakers=["Me Owner", "Ada Lovelace"])
+        self.assertEqual(people, "ada-lovelace")
+        self.assertIn("Augusta King (no-show)", self.body)
+        self.assertNotIn("unconfirmed", self.body)
+
+    def test_a_participant_the_model_names_attends(self):
+        people = self.capture(
+            ["Ada"], [attendee("ada.lovelace@example.com")],
+            verified=[ADA], speakers=["Someone Else"])
         self.assertEqual(people, "ada-lovelace")
 
     def test_large_meeting_keeps_only_named_invitees(self):

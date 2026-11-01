@@ -1229,23 +1229,30 @@ directory (symlinks resolved) as its working directory.
   and tagged `people-unmapped`. The one exception is the meeting first-name
   path below, whose slugs are attested by the calendar invitation instead.
 - **Meeting attendance.** A capture matched to a calendar invitation (`mila`,
-  `whisper`, `zoom`) lists as `people` only invitees who did not decline: a
+  `whisper`, `zoom`) lists as `people` only the invitees who attended: a
   name the store knows but the invitation lacks (someone discussed, or named
   in the recording app's own summary) is dropped, since they were mentioned,
-  not present. With at most 4 such invitees (the owner included) every
-  verified invitee is listed even when the model left them out; above that,
-  only the invitees the model names. This applies only when every invitee is
-  verified (safe owner identity, every directory lookup found the person, at
-  most 20 rows) and someone besides the owner was invited (an owner's own
-  block says nothing about who else was there); otherwise a real invitee may
-  have only a hand-made store slug, and capture works as before. A known person left out for not being
-  invited is logged, not tagged `people-unmapped`. The summary, extraction
-  and operator-confirmed prompts carry the invitee names in their own
-  untrusted block, with the rule that only they and the owner can have
-  attended or be credited with a statement; the note is left out when the
-  list is cut, has more than 20 rows or names no one besides one person.
-  Mila invitees get a display name from their address (`first.last`). Without an invitation capture
-  works as before.
+  not present. Per invitee besides the owner: **declined** when the RSVP
+  says so; **attended** when a speaker the recording names (Mila speaker
+  names) matches them, when the model names them as a participant, or, when
+  the recording names no speaker besides the owner, when they accepted;
+  otherwise **not present** (a no-show when other speakers are named,
+  unconfirmed when none is). Declined and not-present invitees go on one
+  line appended to the body, "Invited, not present: Name (declined), Name
+  (no-show)", marked "attendance unconfirmed" when no speaker is named; a
+  meeting with more than 4 invitees counts unconfirmed ones instead of
+  naming them. This applies only when every invitee is verified (safe owner
+  identity, every directory lookup found the person, at most 20 rows) and
+  someone besides the owner was invited (an owner's own block says nothing
+  about who else was there); otherwise a real invitee may have only a
+  hand-made store slug, and capture works as before. A known person left
+  out for not being invited is logged, not tagged `people-unmapped`. The
+  summary, extraction and operator-confirmed prompts carry the invitee names
+  in their own untrusted block, with the rule that only they and the owner
+  can have attended or be credited with a statement; the note is left out
+  when the list is cut, has more than 20 rows or names no one besides one
+  person. Mila invitees get a display name from their address
+  (`first.last`). Without an invitation capture works as before.
 - **Meeting first names.** A capture with calendar attendees (`mila`,
   `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one
   attendee who goes by it, never to anyone else in the directory. This runs on
