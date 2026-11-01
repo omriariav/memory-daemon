@@ -1063,7 +1063,8 @@ def _group(cfg, hits):
         # trust, be read as a colleague's mail).
         kept, external = [], set()
         for hit in hits:
-            if owner and _address(hit["from"]) == owner:
+            if _same_mailbox(sender_address(hit["from"]) or _address(hit["from"]),
+                             owner):
                 continue  # the owner's own mail is not withheld, just unread
             if sender_domain(hit["from"]) in domains:
                 kept.append(hit)
@@ -1085,7 +1086,8 @@ def _group(cfg, hits):
              for mid, (epoch, sender) in group["messages"].items())
         )
         if cfg["exclude_self_only"] and owner and all(
-            _address(sender) == owner for _, _, sender in messages
+            _same_mailbox(sender_address(sender) or _address(sender), owner)
+            for _, _, sender in messages
         ):
             continue
         newest_epoch, newest_id, _ = messages[-1]
@@ -1297,6 +1299,10 @@ def _mark_auth_seen(fetch_tool, announce):
         log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
             "From-only trust is now off for this connector. Remove "
             "trust_from_without_auth.")
+    elif _base_dir is not None and _read_auth_seen() is None:
+        log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
+            "state/gmail-mcp-auth-seen.json is unreadable, so From-only trust "
+            "stays off for every connector. Remove trust_from_without_auth.")
     else:
         log("gmail_mcp WARN: a fetched message carried Authentication-Results; "
             "From-only trust is off for this process only: the record in "
@@ -1507,9 +1513,14 @@ def fetch(routine, candidate, source=None):
             cfg = dict(cfg, trust_from_without_auth=False)
             if not batch.get("disarm_noted"):
                 batch["disarm_noted"] = True
-                log("gmail_mcp: trust_from_without_auth is set but disarmed "
-                    "for this connector (it returns Authentication-Results); "
-                    "header-less mail is skipped. Remove the flag.")
+                cause = (
+                    "state/gmail-mcp-auth-seen.json is unreadable, which "
+                    "disarms every connector"
+                    if _base_dir is not None and _read_auth_seen() is None
+                    else "this connector returns Authentication-Results"
+                )
+                log(f"gmail_mcp: trust_from_without_auth is set but disarmed "
+                    f"({cause}); header-less mail is skipped.")
         verdict = {
             m["id"]: sender_verdict(cfg, m["headers"], m["auth_results"])
             for m in messages
@@ -1518,6 +1529,17 @@ def fetch(routine, candidate, source=None):
             messages, lambda m: verdict[m["id"]] is not None)
         if unverified:
             _log_skipped("without a verified sender", unverified)
+        # A From-only message with no text has nothing to carry the "not
+        # authenticated" note, while its headers still reach the prompt.
+        for m in messages:
+            if verdict[m["id"]] == "from_only" and not _bound_body(
+                    m, cfg["max_message_chars"]).strip():
+                verdict[m["id"]] = None
+        messages, empty = _partition(
+            messages, lambda m: verdict[m["id"]] is not None)
+        unverified += empty
+        if empty:
+            _log_skipped("accepted on From only but empty", empty)
         from_only = {m["id"] for m in messages if verdict[m["id"]] == "from_only"}
         if from_only:
             _log_ids(f"accepted {len(from_only)} message(s) on From only "
@@ -1530,10 +1552,8 @@ def fetch(routine, candidate, source=None):
     out = []
     for message in messages:
         if message["id"] in from_only:
-            body = _bound_body(
+            body = FROM_ONLY_NOTE + "\n" + _bound_body(
                 message, cfg["max_message_chars"] - len(FROM_ONLY_NOTE) - 1)
-            if body.strip():  # an empty message stays empty
-                body = FROM_ONLY_NOTE + "\n" + body
         else:
             body = _bound_body(message, cfg["max_message_chars"])
         out.append({

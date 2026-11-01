@@ -2332,7 +2332,11 @@ all:
   on From only. Mail sent from a send-as alias that is not `owner_email` is
   still read as a colleague's.
 - While the flag is set but disarmed, each run logs once that header-less
-  mail is being skipped.
+  mail is being skipped, and why (the connector returned the header, or the
+  record is unreadable).
+- A From-only message with an empty body is skipped, since there is no text
+  to carry the note. Owner matching (listing, `exclude_self_only` and fetch)
+  ignores display names and `+tag`s alike.
 - Threads recorded as `unverified` before the flag was turned on are not
   re-read until they get a new message.
 - Known gaps:

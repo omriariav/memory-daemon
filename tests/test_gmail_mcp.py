@@ -1782,13 +1782,32 @@ class TrustFromWithoutAuthTest(BridgeTestCase):
             gmail_mcp._mark_auth_seen(FETCH, True)
         self.assertIn("this process only", logged.call_args.args[0])
 
-    def test_empty_from_only_message_stays_empty(self):
+    def test_empty_from_only_message_is_skipped(self):
         listing, src = self.run_flow(
             [{"mid": 1, "thread": 1, "epoch": T1}],
             {1: authed_text(1, auth=(), body=" ")})
+        with mock.patch.object(gmail_mcp, "log"), \
+                self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+
+    def test_owner_plus_address_is_dropped_at_listing(self):
+        hits = [{"mid": 1, "thread": 1, "epoch": T1,
+                 "sender": "Owner <owner+notes@example.com>"}]
         with mock.patch.object(gmail_mcp, "log"):
-            thread = gmail_mcp.fetch({"id": "r"}, listing[0], src)
-        self.assertFalse(thread["messages"][0]["body"].strip())
+            listing, _ = self.run_flow(hits, {})
+        self.assertEqual(list(listing), [])
+
+    def test_unreadable_record_is_named_as_the_cause(self):
+        path = Path(self.tmp.name) / "state" / "gmail-mcp-auth-seen.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+        listing, src = self.run_flow(
+            [{"mid": 1, "thread": 1, "epoch": T1}], {1: authed_text(1, auth=())})
+        with mock.patch.object(gmail_mcp, "log") as logged, \
+                self.assertRaises(gmail_mcp.SenderUnverified):
+            gmail_mcp.fetch({"id": "r"}, listing[0], src)
+        self.assertIn("unreadable",
+                      " ".join(str(c.args[0]) for c in logged.call_args_list))
 
     def test_owner_mail_is_never_from_only(self):
         cfg = gmail_mcp.settings({"verified_sender_domains": ["example.com"],
