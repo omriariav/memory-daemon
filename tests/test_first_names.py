@@ -316,7 +316,8 @@ class CaptureTest(Base):
         people = self.capture(
             ["Ada", "jane-doe"],
             [attendee("ada.lovelace@example.com", rsvp="declined")])
-        self.assertIsNone(people)
+        # No one besides the owner was expected: the old allow-list applies.
+        self.assertEqual(people, "jane-doe")
 
     def test_declined_owner_still_makes_a_name_ambiguous(self):
         people = self.capture(
@@ -451,6 +452,12 @@ class CaptureTest(Base):
             want_args=True)
         tags = args[args.index("--tags") + 1]
         self.assertNotIn("people-unmapped", tags)
+
+    def test_owners_own_block_keeps_the_store_wide_allow_list(self):
+        people = self.capture(
+            ["jane-doe"],
+            [attendee("me.owner@example.com", role="calendar-organizer")])
+        self.assertEqual(people, "jane-doe")
 
     def test_declined_invitee_is_not_listed_in_a_small_meeting(self):
         # _verified_source_people already drops declined rows; the count

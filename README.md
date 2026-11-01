@@ -1236,12 +1236,15 @@ directory (symlinks resolved) as its working directory.
   verified invitee is listed even when the model left them out; above that,
   only the invitees the model names. This applies only when every invitee is
   verified (safe owner identity, every directory lookup found the person, at
-  most 20 rows); otherwise a real invitee may have only a hand-made store
-  slug, and capture works as before. A known person left out for not being
+  most 20 rows) and someone besides the owner was invited (an owner's own
+  block says nothing about who else was there); otherwise a real invitee may
+  have only a hand-made store slug, and capture works as before. A known person left out for not being
   invited is logged, not tagged `people-unmapped`. The summary, extraction
   and operator-confirmed prompts carry the invitee names in their own
   untrusted block, with the rule that only they and the owner can have
-  attended or be credited with a statement. Without an invitation capture
+  attended or be credited with a statement; the note is left out when the
+  list is cut, has more than 20 rows or names no one besides one person.
+  Mila invitees get a display name from their address (`first.last`). Without an invitation capture
   works as before.
 - **Meeting first names.** A capture with calendar attendees (`mila`,
   `whisper`, `zoom`) maps a bare first name the model wrote ("Ada") to the one

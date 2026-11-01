@@ -27,28 +27,61 @@ def base_dir():
 MAX_INVITEES = 20
 
 
+def _calendar_rows(item):
+    return [
+        row for row in (item.get("frontmatter") or {}).get("source_people") or []
+        if isinstance(row, dict)
+        and str(row.get("role") or "").startswith("calendar-")
+    ]
+
+
+def _name_from_email(email):
+    local = str(email or "").split("@", 1)[0].split("+", 1)[0]
+    return " ".join(
+        word[:1].upper() + word[1:]
+        for word in re.split(r"[._\-]+", local) if word
+    )
+
+
 def invitees(item):
     """Display names of a matched invitation's invitees who did not decline.
 
-    Empty when the item has no calendar rows. A name is calendar data written
-    by others: control characters are dropped and it is capped, and a row
-    without a name shows the address's local part.
+    A name is calendar data written by others: anything not printable (line
+    breaks of any kind included) becomes a space and it is capped; a row
+    without a name shows one derived from the address.
     """
     names = []
-    for row in (item.get("frontmatter") or {}).get("source_people") or []:
-        if not isinstance(row, dict) or row.get("rsvp") == "declined" \
-                or not str(row.get("role") or "").startswith("calendar-"):
+    for row in _calendar_rows(item):
+        if row.get("rsvp") == "declined":
             continue
         name = str(row.get("name") or "").strip() \
-            or str(row.get("email") or "").split("@")[0]
-        name = re.sub(r"[\x00-\x1f\x7f]+", " ", name).strip()[:80]
+            or _name_from_email(row.get("email"))
+        name = "".join(ch if ch.isprintable() else " " for ch in name)
+        name = re.sub(r"\s+", " ", name).strip()[:80]
         if name and name not in names:
             names.append(name)
-    return names[:MAX_INVITEES]
+    return names
 
 
-def invitees_note(item):
-    """The prompt line that bounds who can have attended, or ""."""
+def invitees_note(item, complete=None):
+    """The prompt line that bounds who can have attended, or "".
+
+    Only for a whole invitation with someone besides one person (an owner's
+    own block names no one else): not when rows were cut, there are more
+    than MAX_INVITEES, or the caller knows the list is incomplete
+    (``complete`` False).
+    """
+    rows = _calendar_rows(item)
+    meta = item.get("frontmatter") or {}
+    present = {
+        str(row.get("email") or "").strip().casefold() for row in rows
+        if row.get("rsvp") != "declined"
+    }
+    if (
+        complete is False or meta.get("source_people_truncated")
+        or len(rows) > MAX_INVITEES or len(present - {""}) < 2
+    ):
+        return ""
     names = invitees(item)
     if not names:
         return ""

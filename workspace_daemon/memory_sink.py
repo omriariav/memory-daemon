@@ -677,15 +677,20 @@ def _invitees_only(item, identity, unresolved_source):
     """
     meta = item.get("frontmatter") or {}
     rows = meta.get("source_people") or []
+    own = str(identity.get("email") or "").strip().casefold()
+    # An owner's own block (no one else invited) says nothing about who
+    # else was there.
+    others = [
+        row for row in rows
+        if isinstance(row, dict)
+        and str(row.get("role") or "").startswith("calendar-")
+        and row.get("rsvp") != "declined"
+        and str(row.get("email") or "").strip().casefold() not in ("", own)
+    ]
     return bool(
         identity.get("safe") and not unresolved_source
         and not meta.get("source_people_truncated")
-        and len(rows) <= MAX_SOURCE_PEOPLE
-        and any(
-            isinstance(row, dict)
-            and str(row.get("role") or "").startswith("calendar-")
-            for row in rows
-        )
+        and len(rows) <= MAX_SOURCE_PEOPLE and others
     )
 
 
@@ -730,7 +735,7 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
             else ""
         ),
         related_entries=related_catalog or "(none)",
-        invitees=llm.invitees_note(item),
+        invitees=llm.invitees_note(item, complete=invitees_only),
         note=llm.fence(
             f"Title: {item.get('title', '')}\nDate: {item.get('date', '')}\n"
             f"{summary}", "NOTE"),
