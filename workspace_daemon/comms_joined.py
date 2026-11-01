@@ -15,9 +15,11 @@ plus, when `channel_info_tool` (`slack_search_channels`) finds the channel,
 detected, not when it happened: the listing carries no join time.
 
 The first listing only records the current channels (no lines), so turning
-the option on does not announce every channel. A channel must be missing
-from two listings in a row to count as left; one left and later rejoined is
-announced again. DMs and archived channels are not listed.
+the option on does not announce every channel. The known set only grows:
+leaving is not tracked, so a channel left and later rejoined is not announced
+again, and a channel that disappears from a listing (archived, or a scope
+briefly lost) is not announced when it comes back. DMs and archived channels
+are not listed.
 
 Cost: one bridge session per check (ids only). Only when a new channel
 appears, a full listing (names, types) and, with `channel_info_tool`, a
@@ -34,9 +36,10 @@ failed, or its entry unparseable or contested) waits for later checks and is
 recorded without a name after NAME_TRIES. More than MAX_NEW new channels at
 once is taken for a changed scope and re-baselines silently.
 
-State: `state/comms-inbox-joined-<lane>-<hash>.json`, one file per lane (the
-routine plus its source's tool and owner), so two sources or workspaces never
-overwrite each other's membership. A state write
+State: `state/comms-inbox-joined-<lane>-<hash>.json`, one file per connector
+tool and owner, shared by every routine that lists the same channels (they
+run under one lock), so a join is recorded once and two workspaces never
+overwrite each other's set. A state write
 failure is logged, never raised: the run goes on, and the next check may
 record the same join again.
 """
@@ -47,6 +50,7 @@ import time
 from pathlib import Path
 
 from . import slack_watch, state
+from .chat_text import redact_secrets
 from .shell import log
 
 STATE_PREFIX = "comms-inbox-joined"
@@ -65,13 +69,15 @@ LIST_PINS = {
 }
 _HEADER = re.compile(r"showing (\d+) of (\d+) total", re.IGNORECASE)
 _BLOCK = re.compile(
-    r"^### #([a-z0-9][a-z0-9._-]{0,79})\s*\n- \*\*ID:\*\* ([CG][A-Z0-9]{8,})"
+    r"^### #([\w.-]{1,80})\s*\n- \*\*ID:\*\* ([CG][A-Z0-9]{8,})"
     r"\s*\n- \*\*Type:\*\* (Public|Private) Channel\s*$",
     re.MULTILINE,
 )
+_RESULTS = re.compile(r"^## Channels \((\d+) results?\)", re.MULTILINE)
+_RESULT = re.compile(r"^### Result \d+ of \d+", re.MULTILINE)
 _INFO_BLOCK = re.compile(
     r"^### Result \d+ of \d+\s*\n"
-    r"Name: #([a-z0-9][a-z0-9._-]{0,79})\s*\n"
+    r"Name: #([\w.-]{1,80})\s*\n"
     r"Creator: ([^\n]{1,120}?) \(<@([UW][A-Z0-9]{8,})>?\)\s*\n"
     r"Created: ([0-9: -]{10,25}[A-Z]{0,5}(?:[+-][0-9]{1,2}(?::?[0-9]{2})?)?)"
     r"\s*\n"
@@ -141,14 +147,18 @@ def parse_names(text, ids):
 
 def parse_info(text, channel, name):
     """Creator details of `channel` (named `name`) from a search, or {}."""
-    blocks = [
-        b for b in _INFO_BLOCK.findall(_body(text, "results"))
-        if b[4] == channel
-    ]
+    text = _body(text, "results")
+    # A result block embedded in another result's text adds a header the
+    # count does not include: then nothing in the answer is trusted.
+    count = _RESULTS.search(text)
+    if not count or int(count.group(1)) != len(_RESULT.findall(text)):
+        return {}
+    blocks = [b for b in _INFO_BLOCK.findall(text) if b[4] == channel]
     if len(blocks) != 1 or blocks[0][0] != name:
         return {}
     _name, creator, creator_id, created, _id = blocks[0]
-    return {"creator_id": creator_id, "creator_name": creator[:MAX_NAME],
+    return {"creator_id": creator_id,
+            "creator_name": redact_secrets(creator)[:MAX_NAME],
             "created": created.strip()}
 
 
@@ -160,17 +170,16 @@ def _path(base_dir, lane):
 
 
 def load(base_dir, lane):
-    """{"members": set or None (no baseline yet), "missing": set,
-    "unnamed": {id: tries}, "checked": epoch or None}."""
-    empty = {"members": None, "missing": set(), "unnamed": {},
-             "checked": None}
+    """{"members": set or None (no baseline yet), "unnamed": {id: tries},
+    "checked": epoch or None}."""
+    empty = {"members": None, "unnamed": {}, "checked": None}
     try:
         data = json.loads(_path(base_dir, lane).read_text())
         members, checked = data["members"], data.get("checked")
-        missing = data.get("missing") or []
-        for group in (members or [], missing):
-            if not isinstance(group, list) or not all(map(_channel, group)):
-                raise ValueError("bad channel list")
+        if members is not None and (
+            not isinstance(members, list) or not all(map(_channel, members))
+        ):
+            raise ValueError("bad channel list")
         unnamed = data.get("unnamed") or {}
         if not isinstance(unnamed, dict) or not all(
             _channel(k) and isinstance(v, int) for k, v in unnamed.items()
@@ -184,18 +193,18 @@ def load(base_dir, lane):
         log("comms inbox: joined-channel state unreadable; re-baselining")
         return empty
     return {"members": None if members is None else set(members),
-            "missing": set(missing), "unnamed": dict(unnamed),
+            "unnamed": dict(unnamed),
             "checked": checked}
 
 
-def save(base_dir, lane, members, missing, checked, unnamed=None):
+def save(base_dir, lane, members, checked, unnamed=None):
     """Write the state; a failure is logged, never raised."""
     try:
         state.write_atomic(
             _path(base_dir, lane),
             json.dumps({
                 "members": None if members is None else sorted(members),
-                "missing": sorted(missing), "checked": checked,
+                "checked": checked,
                 "unnamed": dict(sorted((unnamed or {}).items())),
             }, sort_keys=True),
             mode=0o600,
@@ -233,9 +242,7 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
     """
     now = time.time() if now is None else now
     saved = load(base_dir, lane)
-    members, missing, checked = (
-        saved["members"], saved["missing"], saved["checked"]
-    )
+    members, checked = saved["members"], saved["checked"]
     # A check time in the future (clock change, restored file) is ignored.
     if checked is not None and 0 <= now - checked \
             < inbox["joined_check_minutes"] * 60:
@@ -244,20 +251,16 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
     if ids is None:
         log("comms inbox: channel listing incomplete or unreadable; "
             "joined channels not checked this run")
-        save(base_dir, lane, members, missing, now, saved["unnamed"])
+        save(base_dir, lane, members, now, saved["unnamed"])
         return 0
     if members is None or len(ids - members) > MAX_NEW:
-        save(base_dir, lane, ids, set(), now)
+        save(base_dir, lane, ids | (members or set()), now)
         log(f"comms inbox: joined-channel baseline of {len(ids)} channel(s)")
         return 0
-    # Left only after two listings in a row without it.
-    absent = members - ids
-    kept = (members & ids) | (absent - missing)
-    missing = absent - missing
     new = ids - members
     unnamed = {c: n for c, n in saved["unnamed"].items() if c in new}
     if not new:
-        save(base_dir, lane, kept, missing, now)
+        save(base_dir, lane, members, now)
         return 0
     text = (list_session([names_call()]) or [None])[0]
     names = parse_names(text, new) if text is not None else {}
@@ -268,7 +271,7 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
         unnamed[channel] = unnamed.get(channel, 0) + 1
     ready = {c for c in new if c in names or unnamed[c] >= NAME_TRIES}
     if not ready:
-        save(base_dir, lane, kept, missing, now, unnamed)
+        save(base_dir, lane, members, now, unnamed)
         return 0
     infos = {}
     lookups = [c for c in sorted(ready) if c in names][:MAX_INFO]
@@ -281,7 +284,7 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
     rows = rows_for(ready, names, infos, now)
     added = record(rows)
     written = ready if added == len(rows) else set()
-    save(base_dir, lane, kept | written, missing, now,
+    save(base_dir, lane, members | written, now,
          {c: n for c, n in unnamed.items() if c not in written})
     log(f"comms inbox: {len(ready)} newly joined channel(s), {added} recorded"
         + (f", {len(new - ready)} waiting for a name" if new - ready else ""))

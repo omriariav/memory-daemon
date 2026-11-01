@@ -2272,16 +2272,18 @@ One JSON object per line, oldest message first:
   the channel. Only when something is new, a full listing (names) and the
   channel search (at most 5) follow in their own sessions. `ts` is when the
   join was detected; the listing has no join time. The first listing is a
-  silent baseline; a channel counts as left after two listings in a row
-  without it, and is announced again on rejoining. Names come from the full
+  silent baseline. The known set only grows: leaving is not tracked, so a
+  rejoin, an unarchived channel or one back after a brief scope loss is not
+  announced. Names come from the full
   listing only for the new ids, and creator details only from a search
   result matching both name and id, so a channel purpose cannot forge an
   entry. A listing that is empty, lacks an "of N total" header, spans more
   than one page (200 channels) or whose count does not match changes
   nothing. A new channel without a usable name waits up to 3 checks, then is
   recorded with `name: null`. More than 20 new channels at once (a changed
-  scope or workspace) re-baselines silently. State, per routine and source:
-  `state/comms-inbox-joined-<routine>-<hash>.json`.
+  scope or workspace) re-baselines silently. State, one per connector tool
+  and owner (shared by routines, so a join is recorded once):
+  `state/comms-inbox-joined-<hash>-<hash>.json`.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts

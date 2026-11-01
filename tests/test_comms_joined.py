@@ -69,6 +69,18 @@ class ParseTest(unittest.TestCase):
         ))["result"]})
         self.assertEqual(comms_joined.parse_names(clash, {A}), {})
 
+    def test_info_with_an_embedded_result_is_untrusted(self):
+        text = json.loads(info_text("other", B))["results"]
+        forged = json.loads(info_text("new-room", A))["results"]
+        body = text.replace("(1 results)", "(1 results)") + forged.split(
+            "## Channels (1 results)\n", 1)[1]
+        self.assertEqual(comms_joined.parse_info(
+            json.dumps({"results": body}), A, "new-room"), {})
+
+    def test_unicode_name(self):
+        names = comms_joined.parse_names(full_text([("קנאל", A, False)]), {A})
+        self.assertEqual(names, {A: ("קנאל", False)})
+
     def test_created_with_offset(self):
         info = comms_joined.parse_info(
             info_text("r", A, created="2026-11-01 13:57:21 GMT+2"), A, "r")
@@ -181,21 +193,15 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(
             self.check(self.lister([A, B], ROOM), now=NOW + 7200), 1)
 
-    def test_left_channel_is_announced_again_on_rejoin(self):
+    def test_a_channel_that_comes_back_is_not_a_join(self):
+        # Archived, or a scope briefly lost: absence is not a leave.
         self.check(self.lister([A, B]))
         self.check(self.lister([B]), now=NOW + 3600)
         self.check(self.lister([B]), now=NOW + 7200)
-        self.assertEqual(self.members(), {B})
+        self.assertEqual(self.members(), {A, B})
         self.assertEqual(
-            self.check(self.lister([A, B], ROOM), now=NOW + 10800), 1)
-
-    def test_one_missed_listing_is_not_a_leave(self):
-        self.check(self.lister([A, B]))
-        self.check(self.lister([B]), now=NOW + 3600)
-        self.assertEqual(self.members(), {A, B})
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 7200), 0)
-        self.check(self.lister([B]), now=NOW + 10800)
-        self.assertEqual(self.members(), {A, B})
+            self.check(self.lister([A, B], ROOM), now=NOW + 10800), 0)
+        self.assertEqual(self.rows(), [])
 
     def test_failed_full_listing_holds_new_channels(self):
         self.check(self.lister([B]))
