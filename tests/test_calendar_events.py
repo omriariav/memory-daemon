@@ -52,7 +52,7 @@ class EventsTest(unittest.TestCase):
     def run_at(self, text, now=NOW, **over):
         config_ = dict(self.cfg, **over)
         call = {"name": LIST_TOOL, "text": text, "is_error": False,
-                "input": calendar_cache.list_args(config_, now)}
+                "input": calendar_cache.list_chunks(config_, now)[0]}
         with mock.patch.object(
             calendar_cache.claude_bridge, "call_tools", return_value=[call]
         ):
@@ -104,10 +104,30 @@ class EventsTest(unittest.TestCase):
         data = json.loads(self.snapshot.read_text())
         self.assertEqual(sorted(data["events"]), ["a", "b", "c", "span"])
 
-    def test_a_missing_chunk_fails_the_refresh(self):
-        with self.assertRaises(Exception):
-            self.run_chunked([listing(block("a", soon()))],
-                             events_window_days=21)
+    def test_a_missing_later_chunk_only_skips_the_diff(self):
+        self.seed(block("a", soon(), title="A", rsvp="accepted"))
+        report, _, _ = self.run_chunked(
+            [listing(block("a", soon(), title="A", rsvp="accepted",
+                           location="Moved"))],
+            events_window_days=21)
+        self.assertTrue(report["ok"])
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_missing_first_chunk_fails_the_refresh(self):
+        config_ = dict(self.cfg, events_window_days=21)
+        second = calendar_cache.list_chunks(config_, NOW)[1]
+        call = {"name": LIST_TOOL, "text": listing(), "is_error": False,
+                "input": second}
+        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
+                               return_value=[call]), \
+                self.assertRaises(claude_bridge.BridgeError):
+            calendar_cache.run(config_, self.base, now=NOW)
+
+    def test_fractional_chunk_days_leave_no_empty_chunk(self):
+        chunks = calendar_cache.list_chunks(
+            dict(self.cfg, events_window_days=7, list_chunk_days=7 / 3), NOW)
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(all(c["time_min"] < c["time_max"] for c in chunks))
 
     def test_a_full_chunk_skips_the_diff(self):
         self.seed(block("a", soon(), title="A"))
@@ -118,7 +138,7 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(self.emitted(), [])
 
     def test_fetch_is_one_wide_call_and_output_stays_48h(self):
-        args = calendar_cache.list_args(self.cfg, NOW)
+        args = calendar_cache.list_chunks(self.cfg, NOW)[0]
         self.assertEqual(args["time_max"], at(NOW + 7 * DAY))
         self.assertEqual(args["max_results"], 50)
         self.run_at(listing(block("far", soon(5), title="Far away"),

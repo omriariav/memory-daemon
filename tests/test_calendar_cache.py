@@ -818,7 +818,7 @@ def _timed(event_id, start, end, title="T"):
 
 class WindowTest(unittest.TestCase):
     def test_list_args_are_exact(self):
-        self.assertEqual(calendar_cache.list_args(cfg(max_events=7), NOW), {
+        self.assertEqual(calendar_cache.list_chunks(cfg(max_events=7), NOW)[0], {
             "calendar_id": "primary",
             "time_min": "2026-10-20T08:30:00Z",
             "time_max": "2026-10-22T08:30:00Z",
@@ -826,7 +826,7 @@ class WindowTest(unittest.TestCase):
         })
 
     def test_prompt_gives_the_exact_values(self):
-        prompt = calendar_cache._fetch_prompt(cfg(), NOW)
+        prompt = calendar_cache._fetch_prompt(cfg(), calendar_cache.list_chunks(cfg(), NOW))
         for value in ('calendar_id "primary"', 'time_min "2026-10-20T08:30:00Z"',
                       'time_max "2026-10-22T08:30:00Z"', "max_results 50"):
             self.assertIn(value, prompt)
@@ -1069,7 +1069,8 @@ class MeetingLinkAgendaTest(unittest.TestCase):
 
 class PromptTest(unittest.TestCase):
     def test_get_event_requested_for_every_timed_event(self):
-        prompt = calendar_cache._fetch_prompt(cfg(max_events=20), NOW)
+        prompt = calendar_cache._fetch_prompt(
+            cfg(max_events=20), calendar_cache.list_chunks(cfg(max_events=20), NOW))
         self.assertIn("not all-day events", prompt)
         self.assertIn("at most 20 events", prompt)
         self.assertNotIn("other than", prompt)
@@ -1081,7 +1082,7 @@ def tool_call(name, text, **given):
 
 def list_call(text, **over):
     """A list result whose input is exactly the pinned arguments."""
-    given = calendar_cache.list_args(cfg(**over), NOW)
+    given = calendar_cache.list_chunks(cfg(**over), NOW)[0]
     return tool_call(LIST_TOOL, text, **given)
 
 
@@ -1137,12 +1138,12 @@ class RunTest(unittest.TestCase):
         args, kwargs = call.call_args
         prompt, tools = args
         self.assertEqual(tools, {
-            LIST_TOOL: {
+            LIST_TOOL: [{
                 "calendar_id": "primary",
                 "time_min": "2026-10-20T08:30:00Z",
                 "time_max": "2026-10-22T08:30:00Z",
                 "max_results": 50,
-            },
+            }],
             GET_TOOL: {"calendar_id": "primary"},
         })
         self.assertEqual(kwargs["required"], [LIST_TOOL])

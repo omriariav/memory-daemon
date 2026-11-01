@@ -753,9 +753,12 @@ are exact MCP names from your connector and are never defaulted.
 Calendar events: the listing asks for `events_window_days` (default 7, `0`
 turns this off) instead of `window_hours`, in consecutive calls of at most
 `list_chunk_days` (default 7) each, every one pinned in the bridge allowlist,
-so a long window stays inside the connector's result cap (many cap
-`max_results` at 100) and the tool-result size limit. Events listed by two
-chunks are merged; `output` and the JSON
+so a long window stays inside the connector's result cap and the
+tool-result size limit. Keep `max_events` at or below the connector's own cap
+(many cap `max_results` at 100): a chunk cut by the connector below
+`max_events` is not detected as full. Events listed by two chunks are merged;
+the first chunk must list (it covers the output window), and a later chunk
+that returns nothing only skips this run's diff; `output` and the JSON
 twin still hold only the next `window_hours`. Each successful run diffs that
 listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
 `{event_id: {start, end, location, conference, status, my_rsvp, title,
