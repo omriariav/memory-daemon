@@ -1289,6 +1289,13 @@ def capture(routine, item, summary, dry_run=False):
             f"this thread; logging the reply as a new entry {source_id}"
         )
         r = _cli(store, args, stdin_text=body, timeout=300)
+    keep = None if etype == "meeting" else _keep_open_type_args(
+        args, r, source_id)
+    if keep:
+        args, todo_id = keep
+        log(f"routine={rid} memory: {todo_id} is an open entry for this "
+            "message; updating it in place with its own type")
+        r = _cli(store, args, stdin_text=body, timeout=300)
     out = (r.stdout or "") + (r.stderr or "")
     # Some store failures happen after the entry file was written. Preserve
     # any such write before deciding whether the result is an error.
@@ -1301,20 +1308,12 @@ def capture(routine, item, summary, dry_run=False):
             store, source_id, etype, title, people,
             list(dict.fromkeys(tags)), body,
         )
-        anchored = None if retry else _open_todo_anchor(r, source_id)
         if entry_id:
             verdict = "verified"
             log(
                 f"routine={rid} memory WARN ambiguous CLI result was "
                 f"verified on disk for source_id={source_id}"
             )
-        elif anchored:
-            # The same message (no reply of its own, e.g. a save reaction on
-            # the thread root) already anchors an open todo: the store keeps
-            # that todo as it is, so this capture changes nothing.
-            verdict, entry_id = "unchanged", anchored
-            log(f"routine={rid} memory: {anchored} is the open todo for this "
-                "message; left as it is")
         elif r.returncode != 0:
             raise RuntimeError(
                 f"memory add failed (exit {r.returncode}): "
@@ -1358,19 +1357,44 @@ def capture(routine, item, summary, dry_run=False):
     return outcome
 
 
-_OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open \S+ (\S+) —")
+_OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open (\S+) (\S+) —")
 _REPLY_TS_RE = re.compile(r"@(\d+\.\d+)")
 
 
-def _open_todo_anchor(result, source_id):
-    """The open todo `source_id` anchors, when the store refused for that."""
+def _open_todo_refusal(result, source_id):
+    """(type, todo id) when the store refused because `source_id` anchors an
+    open entry of that type, else None."""
     if result.returncode == 0 or not source_id:
         return None
     refusal = _OPEN_ANCHOR_RE.search((result.stdout or "") + (result.stderr or ""))
     if not refusal or refusal.group(1) != source_id \
-            or not SOURCE_FOLLOWS_RE.fullmatch(refusal.group(2)):
+            or not SOURCE_FOLLOWS_RE.fullmatch(refusal.group(3)):
         return None
-    return refusal.group(2)
+    return refusal.group(2), refusal.group(3)
+
+
+def _keep_open_type_args(args, result, source_id):
+    """Re-add args that keep the open entry's type, or None.
+
+    Used when the capture has no reply of its own to log as a follow-up
+    (the same message, an edit, or a save reaction on the root): updating
+    the open entry in place keeps its type and still records new text and
+    tags, instead of dropping them.
+    """
+    refusal = _open_todo_refusal(result, source_id)
+    if not refusal or "--type" not in args:
+        return None
+    kind, todo_id = refusal
+    retry = list(args)
+    retry[retry.index("--type") + 1] = kind
+    if "--follows" in retry:
+        at = retry.index("--follows")
+        kept = [v for v in retry[at + 1].split(",") if v != todo_id]
+        if kept:
+            retry[at + 1] = ",".join(kept)
+        else:
+            del retry[at:at + 2]
+    return retry, todo_id
 
 
 def _open_todo_outcome_retry(args, result, item, source_id):
@@ -1384,10 +1408,10 @@ def _open_todo_outcome_retry(args, result, item, source_id):
     """
     if result.returncode == 0 or not str(source_id or "").startswith("slack:"):
         return None
-    refusal = _OPEN_ANCHOR_RE.search((result.stdout or "") + (result.stderr or ""))
-    if not refusal or refusal.group(1) != source_id:
+    refusal = _open_todo_refusal(result, source_id)
+    if not refusal:
         return None
-    todo_id = refusal.group(2)
+    todo_id = refusal[1]
     reply = _REPLY_TS_RE.search(str(item.get("id", "")))
     if not SOURCE_FOLLOWS_RE.fullmatch(todo_id) or not reply \
             or reply.group(1) == source_id.rsplit(":", 1)[-1]:

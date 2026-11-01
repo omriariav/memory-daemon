@@ -472,15 +472,30 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(retry[retry.index("--source-ids") + 1],
                          "slack:C1:1.0:2.5")
 
-    def test_same_message_on_an_open_todo_is_unchanged_not_an_error(self):
+    def test_same_message_on_an_open_todo_updates_it_with_its_type(self):
         for item_id in ("slack:C1:1.0@1.0", "slack:C1:1.0",
                         "saved:slack:C1:1.0"):
             # A save-reaction candidate names its source explicitly.
-            self.item["source_id"] = "slack:C1:1.0"
-            out, calls = self._run_refused_capture(item_id)
-            self.assertEqual(len(calls), 1, item_id)
-            self.assertEqual(out["memory"], "unchanged", item_id)
-            self.assertEqual(out["memory_entry_id"], "2026-07-20-open-todo")
+            if item_id.startswith("saved:"):
+                self.item["source_id"] = "slack:C1:1.0"
+            out, calls = self._run_refused_capture(
+                item_id, follows=["2026-07-20-open-todo"])
+            self.assertEqual(len(calls), 2, item_id)
+            retry = calls[1]
+            self.assertEqual(retry[retry.index("--type") + 1], "todo")
+            self.assertEqual(retry[retry.index("--source-ids") + 1],
+                             "slack:C1:1.0")
+            self.assertNotIn("2026-07-20-open-todo",
+                             retry[retry.index("--follows") + 1]
+                             if "--follows" in retry else "")
+            self.assertNotIsInstance(out, Exception, item_id)
+
+    def test_other_sources_keep_the_open_type_too(self):
+        self.item["source_id"] = "gmail:t1"
+        out, calls = self._run_refused_capture(
+            "gmail:t1", refusal_source="gmail:t1")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][calls[1].index("--type") + 1], "todo")
 
     def test_refusal_for_another_anchor_is_not_retried(self):
         out, calls = self._run_refused_capture(
