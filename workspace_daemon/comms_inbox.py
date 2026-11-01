@@ -28,13 +28,26 @@ Watch file (or source) block:
 One JSON object per line, oldest message first:
 
     {"type": "message", "channel_id", "thread_ts", "ts", "user_id",
-     "is_owner", "is_bot", "text", "seen_at"}
+     "is_owner", "is_bot", "text", "seen_at"[, "channel_type",
+     "peer_is_bot"]}
     {"type": "owner_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
     {"type": "peer_reaction", "channel_id", "thread_ts", "ts", "emoji",
      "user_id", "seen_at"}
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
+
+Every line (any type) written since channel types were added also carries
+`channel_type`: "im" (a direct message), "mpim" (a group DM) or "channel"
+(public or private). It comes from the search hit's own label (`DM` on a
+`D...` id, `Group DM`), cached per channel in `state/comms-inbox-channels.json`
+so lines from thread reads and reactions get it too; a channel never seen in
+a search has none. Lines of an "im" also carry `peer_is_bot` once the other
+member has posted: true when every message they posted is marked as a bot
+(an app such as a helpdesk bot), false otherwise. A person whose own agent
+sometimes posts for them has non-bot messages too, so they stay false.
+Lines written before this have neither field; readers treat a missing field
+as unknown.
 
 A `track_reactions` emoji the owner puts on any message (found by a
 `hasmy::<emoji>:` search looking back `retention_days`, no cursor) writes a
@@ -112,6 +125,8 @@ DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "follow_threads": False, "thread_polls": 10,
             "ignore_reactors": []}
 FOLLOW_FILE = "comms-inbox-follow.json"
+CHANNELS_FILE = "comms-inbox-channels.json"
+MAX_CHANNELS = 2000
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
 TRACKED_FILE = "comms-inbox-tracked.json"
@@ -234,8 +249,24 @@ def _load(file):
     return rows
 
 
+def channel_type(hit):
+    """"im", "mpim" or "channel" from a search hit's label; None without one.
+
+    Same rule as slack_mcp.dm_kind: `DM` on a `D...` id is an IM, `Group DM`
+    an mpim; anything else labelled is a channel.
+    """
+    label = (hit.get("label") or "").strip()
+    if not label:
+        return None
+    if label == "DM" and hit["channel"].startswith("D"):
+        return "im"
+    if label == "Group DM":
+        return "mpim"
+    return "channel"
+
+
 def message_row(hit, self_user_id):
-    return {
+    row = {
         "type": "message",
         "channel_id": hit["channel"],
         "thread_ts": hit["root"],
@@ -245,16 +276,72 @@ def message_row(hit, self_user_id):
         "is_bot": bool(hit["is_bot"]),
         "text": redact_secrets(hit["text"])[:MAX_TEXT],
     }
+    kind = channel_type(hit)
+    if kind:
+        row["channel_type"] = kind
+    return row
 
 
 def reaction_row(hit, emoji):
-    return {
+    row = {
         "type": "owner_reaction",
         "channel_id": hit["channel"],
         "thread_ts": hit["root"],
         "ts": hit["ts"],
         "emoji": emoji,
     }
+    kind = channel_type(hit)
+    if kind:
+        row["channel_type"] = kind
+    return row
+
+
+def _channels_path(base_dir):
+    return Path(base_dir) / "state" / CHANNELS_FILE
+
+
+def _load_channels(base_dir):
+    """{channel_id: {"type", "peer_bot", "peer_human"}}; bad entries dropped."""
+    try:
+        data = json.loads(_channels_path(base_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value for key, value in data.items()
+        if isinstance(value, dict)
+        and value.get("type") in ("im", "mpim", "channel")
+        and isinstance(value.get("peer_bot", 0), int)
+        and isinstance(value.get("peer_human", 0), int)
+    }
+
+
+def _annotate(rows, channels):
+    """Learn channel types and IM peers from `rows`, then label them.
+
+    Returns whether `channels` changed.
+    """
+    changed = False
+    for row in rows:
+        entry = channels.get(row["channel_id"])
+        kind = row.get("channel_type")
+        if kind and (entry is None or entry["type"] != kind):
+            entry = channels[row["channel_id"]] = {
+                "type": kind, "peer_bot": 0, "peer_human": 0}
+            changed = True
+        if entry and entry["type"] == "im" and row["type"] == "message" \
+                and not row["is_owner"]:
+            entry["peer_bot" if row["is_bot"] else "peer_human"] += 1
+            changed = True
+    for row in rows:
+        entry = channels.get(row["channel_id"])
+        if entry is None:
+            continue
+        row["channel_type"] = entry["type"]
+        if entry["type"] == "im" and entry["peer_bot"] + entry["peer_human"]:
+            row["peer_is_bot"] = entry["peer_human"] == 0
+    return changed
 
 
 def peer_row(hit, emoji, user_id):
@@ -285,6 +372,17 @@ def record(base_dir, rows, retention_days, now=None):
             continue
         known.add(_key(row))
         added.append(dict(row, seen_at=stamp))
+    channels = _load_channels(base_dir)
+    if _annotate(added, channels):
+        live = {row["channel_id"] for row in kept + added}
+        channels = {k: v for k, v in channels.items() if k in live}
+        if len(channels) > MAX_CHANNELS:
+            channels = dict(list(channels.items())[-MAX_CHANNELS:])
+        try:
+            state.write_atomic(_channels_path(base_dir),
+                               json.dumps(channels, sort_keys=True), mode=0o600)
+        except OSError:
+            log("comms inbox: channel types not saved this run")
     if not added and len(kept) == len(existing) and file.exists():
         return 0
     merged = sorted(kept + added, key=lambda r: float(r["ts"]))
