@@ -666,6 +666,21 @@ def _candidate(record, directory, manual=None, zone=None, app=None,
     }
 
 
+def _all_speakers_named(record):
+    from . import owner_todos  # late import to avoid cycles
+
+    names = record.get("speakerNames") or {}
+    ids = {
+        seg.get("speaker") for seg in record.get("segments") or []
+        if isinstance(seg, dict) and seg.get("speaker")
+    }
+    return bool(ids) and all(
+        isinstance(names.get(i), str) and names[i].strip()
+        and not owner_todos._GENERIC_SPEAKER_RE.match(names[i].strip())
+        for i in ids
+    )
+
+
 def _completed(record):
     return record.get("status") == "completed" and not record.get("deletedAt")
 
@@ -1361,6 +1376,9 @@ def fetch(_routine, source, candidate):
                 str(v) for v in (record.get("speakerNames") or {}).values()
                 if isinstance(v, str) and v.strip()
             }),
+            # Whether every diarized voice has a real name: only then does
+            # a missing invitee mean a no-show (one person may span ids).
+            "mila_all_speakers_named": _all_speakers_named(record),
             "calendar_candidate_count": len(events),
         },
     }

@@ -54,9 +54,9 @@ NO_OWNER_ACTION_TAG = "no-owner-action"
 SAVE_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 SOURCE_FOLLOWS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,200}")
 MAX_SOURCE_PEOPLE = 20
-# A meeting with at most this many invitees who did not decline (the owner
-# included) lists all of them as people: in a 1:1 or a small meeting the
-# invitation is better evidence of who was there than the model's reading.
+# At most this many invitees (the owner included): one who accepted counts
+# as attended when the recording names no other speaker, and unconfirmed
+# ones are named; a larger meeting needs evidence and only counts them.
 SMALL_MEETING = 4
 RELATED_CONTEXT_DAYS = 14
 RELATED_CONTEXT_LIMIT = 8
@@ -696,6 +696,144 @@ def _invitees_only(item, identity, unresolved_source, verified_source=()):
     )
 
 
+MAX_NOT_PRESENT = 10
+
+
+def _name_key(name):
+    return " ".join(str(name or "").casefold().split())
+
+
+def _listed(names):
+    shown = names[:MAX_NOT_PRESENT]
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more else "")
+
+
+def _attendance(meta, verified_source, identity, model_people, owner_names):
+    """(attended slugs, attendance line or "") for an invitation capture.
+
+    Per invitee besides the owner: attended when a named speaker in the
+    recording matches them (a full-name label by full name, a one-word label
+    by a first name unique among invitees) or the model names them as a
+    participant, and, in a small meeting whose recording names no speaker
+    besides the owner, when they accepted (an organizer counts as accepted).
+    Otherwise declined when the RSVP says so (any calendar row), a no-show
+    when every voice in the recording is named, else unconfirmed. Evidence
+    beats a declined RSVP.
+    """
+    from . import calendar_cache, owner_todos  # late import to avoid cycles
+
+    own = str(identity.get("email") or "").strip().casefold()
+    owners = {_name_key(name) for name in owner_names} | {
+        _name_key((identity.get("person") or {}).get("name"))
+    }
+    owners.discard("")
+    owner_firsts = {name.split(" ")[0] for name in owners}
+    by_email = {
+        str(person.get("email") or "").strip().casefold(): person
+        for person in verified_source
+    }
+    mila = "mila_speaker_names" in meta
+    speakers = [
+        _name_key(name) for name in meta.get("mila_speaker_names") or []
+        if _name_key(name)
+        and not owner_todos._GENERIC_SPEAKER_RE.match(str(name).strip())
+        and _name_key(name) not in owners
+        and _name_key(name) not in owner_firsts
+    ]
+    all_named = bool(meta.get("mila_all_speakers_named"))
+    rank = {"accepted": 3, "tentative": 2, "needsAction": 1, "declined": 0}
+    invitees, declined = {}, []
+    for row in meta.get("source_people") or []:
+        if not isinstance(row, dict) \
+                or not str(row.get("role") or "").startswith("calendar-"):
+            continue
+        email = str(row.get("email") or "").strip().casefold()
+        if not email or email == own:
+            continue
+        person = by_email.get(email)
+        name = str((person or {}).get("name") or row.get("name")
+                   or calendar_cache.name_from_email(email) or email)
+        # Calendar data written by others: capped like other external names.
+        name = calendar_cache.capped_name(" ".join(name.split()))[:60] \
+            or email
+        if _name_key(name) in owners or _name_key(name) in owner_firsts:
+            continue  # an owner alias
+        rsvp = row.get("rsvp") or (
+            "accepted" if row.get("role") == "calendar-organizer"
+            else "needsAction")
+        if not person:
+            if rsvp == "declined" and name not in declined:
+                declined.append(name)
+            continue
+        known = invitees.get(person["slug"])
+        if not known or rank.get(rsvp, 1) > rank.get(known["rsvp"], 1):
+            invitees[person["slug"]] = {"slug": person["slug"], "name": name,
+                                        "rsvp": rsvp}
+    invitees = list(invitees.values())
+    small = len(invitees) + 1 <= SMALL_MEETING
+    firsts = {}
+    for name in [i["name"] for i in invitees] + declined:
+        first = _name_key(name).split(" ")[0]
+        firsts[first] = firsts.get(first, 0) + 1
+
+    def spoke(name):
+        full = _name_key(name)
+        first = full.split(" ")[0]
+        return any(
+            label == full
+            or (" " not in label and label == first and firsts.get(first) == 1)
+            for label in speakers
+        )
+
+    # A named voice that matches no invitee could be one of them under another
+    # label, so no absence is certain then.
+    certain = all_named and all(
+        any(label == _name_key(i["name"])
+            or (" " not in label
+                and label == _name_key(i["name"]).split(" ")[0])
+            for i in invitees)
+        for label in speakers
+    )
+    attended, no_show, unconfirmed = [], [], []
+    for invitee in invitees:
+        if spoke(invitee["name"]) or invitee["slug"] in model_people:
+            attended.append(invitee["slug"])
+        elif invitee["rsvp"] == "declined":
+            declined.append(invitee["name"])
+        elif small and not speakers and invitee["rsvp"] == "accepted":
+            attended.append(invitee["slug"])
+        elif certain and speakers:
+            no_show.append(invitee["name"])
+        else:
+            reply = {"tentative": "tentative", "accepted": "accepted"}.get(
+                invitee["rsvp"], "no reply")
+            unconfirmed.append(f"{invitee['name']} ({reply})")
+    # A decliner (never directory-verified) who spoke, whom the model names,
+    # or who is already credited under another address was there after all.
+    def came(name):
+        slug = re.sub(r"[^a-z0-9]+", "-", _name_key(name)).strip("-")
+        return spoke(name) or slug in model_people or slug in attended
+
+    declined = [name for name in declined if not came(name)]
+    parts = []
+    gone = [f"{name} (declined)" for name in declined] \
+        + [f"{name} (no-show)" for name in no_show]
+    if gone:
+        parts.append(f"Invited, not present: {_listed(gone)}.")
+    if unconfirmed:
+        if not mila:
+            why = "the source does not say who spoke"
+        elif not speakers:
+            why = "the recording names no speaker besides the owner"
+        else:
+            why = "not every speaker in the recording is named"
+        listed = (_listed(unconfirmed) if small
+                  else f"{len(unconfirmed)} other invitee(s)")
+        parts.append(f"Attendance unconfirmed ({why}): {listed}.")
+    return attended, " ".join(parts)
+
+
 def _extract(routine, item, summary, store, verified_people=(), identity=None,
              owner_names=(), existing_titles=(), invitees_only=False):
     """Structured second pass over the already-distilled summary."""
@@ -1199,10 +1337,14 @@ def capture(routine, item, summary, dry_run=False):
     people = list(dict.fromkeys(
         verified_owners + [p for p in model_people if p in allowed]
     ))
-    if invitees_only and 0 < len(attendees) <= SMALL_MEETING:
-        people = list(dict.fromkeys(
-            people + sorted(source_slugs - set(people))
-        ))
+    not_present = ""
+    if invitees_only:
+        # People are those who attended; the other invitees go on one line.
+        attended, not_present = _attendance(
+            meta, verified_source, identity, model_people,
+            owner_todos.owner_names(routine, _verified_owner_name(identity)),
+        )
+        people = list(dict.fromkeys(verified_owners + attended))
     # Known people left out because they were not invited are expected, not
     # an identity gap: they do not count as dropped.
     mentioned = [
@@ -1273,6 +1415,8 @@ def capture(routine, item, summary, dry_run=False):
             )
     title = (entry.get("title") or item.get("title") or "untitled")[:120]
     body = entry.get("body") or summary
+    if not_present:
+        body = f"{body.rstrip()}\n\n{not_present}"
     if personal.redact_enabled(cfg):
         title, _ = personal.redact(title)
         body, n = personal.redact(body)
