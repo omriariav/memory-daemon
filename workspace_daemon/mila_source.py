@@ -26,7 +26,8 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import calendar_cache, claude_bridge, events, llm, local_llm, transcripts
+from . import calendar_cache, claude_bridge, llm, local_llm, transcripts
+from . import events as event_log
 from . import state as state_mod
 from .chat_text import redact_secrets
 from .shell import gws_bin, log, run_json, yoetz_bin
@@ -370,7 +371,7 @@ def _flag_language(record, check, reason, dry_run):
         log("mila: language-check state not saved; no alert sent")
         return
     log(f"mila: WARN recording {recording_id} held: {why}")
-    if events.emit(llm.base_dir(), events.build(
+    if event_log.emit(llm.base_dir(), event_log.build(
         "daemon", "alert", None, f"daemon:{key}", message, [],
         details={"key": key, "recording_id": recording_id, "reason": reason,
                  "language": record.get("language"),

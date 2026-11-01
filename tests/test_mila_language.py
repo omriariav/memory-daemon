@@ -105,7 +105,7 @@ class LanguageCheckTest(unittest.TestCase):
 
     def test_an_alert_that_was_not_written_is_retried(self):
         rec = self.rec("A", "en", summary=HEBREW)
-        with mock.patch.object(mila_source.events, "emit", return_value=False):
+        with mock.patch.object(mila_source.event_log, "emit", return_value=False):
             self.run_candidates([rec])
         self.run_candidates([rec])
         self.assertEqual(len(self.events()), 1)
