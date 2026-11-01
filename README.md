@@ -1445,7 +1445,20 @@ source:
     min_chars: 200       # shorter summaries are ignored
     min_overlap: 0.3       # min share of summary words found in the transcript
     item_min_overlap: 0.25 # same, per action item, within +/-180s of its timestamp
+  language_check:
+    expect: he           # only he is supported
+    hold_minutes: 120    # < calendar_match_hours * 60
 ```
+
+`language_check` catches a recording transcribed in the wrong language (a
+Hebrew meeting transcribed as English loses its speakers and names). A
+recording whose Mila `language` is not `expect`, but whose Mila summary, title
+or transcript has at least 20 letters of the expected script, is held (not a
+candidate) until `hold_minutes` after it ended. The first time, a daemon
+`alert` event names it (once per recording, `state/mila-language-flagged.json`)
+so it can be re-transcribed in Mila; the re-transcribed version is captured as
+soon as its language matches. After the hold it is captured as is, with a
+warning in the log.
 
 - The transcript stays the analysis input exactly as before. In `hints` mode a
   delimited block, "Unverified hints from the recording app (may be wrong)",

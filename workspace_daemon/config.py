@@ -109,6 +109,7 @@ SOURCE_KEYS = {
     "manual_recordings", "calendar_timezone", "calendar_window_days",
     "max_calendar_candidates", "calendar_max_results", "match_max_output_tokens",
     "calendar_match_hours", "calendar", "match", "max_transcript_chars", "app_summary",
+    "language_check",
     "transcriptions_dir", "min_quiet_seconds", "exclude_base_names",
 }
 
@@ -2181,6 +2182,33 @@ def _validate_mila_match(source, prefix):
                 f"{prefix}.app_summary.wait_minutes must be less than "
                 "calendar_match_hours * 60"
             )
+    check = source.get("language_check")
+    if check is not None:
+        if not isinstance(check, dict):
+            problems.append(f"{prefix}.language_check must be a mapping")
+        else:
+            unknown = set(check) - mila_source.LANGUAGE_CHECK_KEYS
+            if unknown:
+                problems.append(
+                    f"{prefix}.language_check has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}"
+                )
+            if check.get("expect") not in mila_source.LANGUAGE_SCRIPTS:
+                problems.append(
+                    f"{prefix}.language_check.expect must be one of "
+                    f"{', '.join(sorted(mila_source.LANGUAGE_SCRIPTS))}"
+                )
+            minutes = check.get("hold_minutes", 120)
+            hours = source.get("calendar_match_hours", 6)
+            if (
+                not isinstance(minutes, (int, float))
+                or isinstance(minutes, bool) or minutes <= 0
+                or (isinstance(hours, (int, float)) and minutes >= hours * 60)
+            ):
+                problems.append(
+                    f"{prefix}.language_check.hold_minutes must be positive "
+                    "and less than calendar_match_hours * 60"
+                )
     limit = source.get("max_transcript_chars")
     if limit is not None and (
         not isinstance(limit, int) or isinstance(limit, bool)
@@ -2695,7 +2723,7 @@ def _validate_source(routine, source, prefix):
 
     if kind == "mila":
         problems.extend(_validate_mila_match(source, prefix))
-    elif any(key in source for key in ("calendar", "match", "max_transcript_chars", "app_summary")):
+    elif any(key in source for key in ("calendar", "match", "max_transcript_chars", "app_summary", "language_check")):
         problems.append(
             f"{prefix}: calendar, match, max_transcript_chars and "
             f"app_summary are only "
