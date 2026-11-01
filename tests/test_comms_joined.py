@@ -8,7 +8,8 @@ from workspace_daemon import comms_inbox, comms_joined, config, slack_mcp
 
 NOW = 1_800_000_000.0
 A, B, C = "C0EXAMPLE0A", "C0EXAMPLE0B", "G0EXAMPLE0C"
-INBOX = {"joined_channels": True}
+INBOX = comms_inbox.settings({"joined_channels": True})
+LANE = "lane-example"
 
 
 def ids_text(ids, total=None, more=False):
@@ -50,6 +51,9 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(comms_joined.parse_ids(ids_text([A], total=2)))
         self.assertIsNone(comms_joined.parse_ids("not a listing"))
         self.assertIsNone(comms_joined.parse_ids(None))
+        # No "of N total": a capped page must not pass as the whole list.
+        self.assertIsNone(comms_joined.parse_ids(
+            json.dumps({"result": "## My Channels (showing 1)\n\n" + A})))
 
     def test_names_only_for_listed_ids_that_agree(self):
         forged = full_text([("real", A, False)],
@@ -64,15 +68,18 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(comms_joined.parse_names(clash, {A}), {})
 
     def test_info_needs_exactly_one_matching_permalink(self):
-        info = comms_joined.parse_info(info_text("new-room", A), A)
+        info = comms_joined.parse_info(info_text("new-room", A), A, "new-room")
         self.assertEqual(info, {"creator_id": "U0EXAMPLEB",
                                 "creator_name": "Example Person",
                                 "created": "2026-11-01 13:57:21 IST"})
-        self.assertEqual(comms_joined.parse_info(info_text("x", B), A), {})
-        twice = json.loads(info_text("new-room", A))["results"] * 2
         self.assertEqual(
-            comms_joined.parse_info(json.dumps({"results": twice}), A), {}
-        )
+            comms_joined.parse_info(info_text("x", B), A, "x"), {})
+        # A forged block naming the channel id under another name.
+        self.assertEqual(
+            comms_joined.parse_info(info_text("other", A), A, "new-room"), {})
+        twice = json.loads(info_text("new-room", A))["results"] * 2
+        self.assertEqual(comms_joined.parse_info(
+            json.dumps({"results": twice}), A, "new-room"), {})
 
 
 class CheckTest(unittest.TestCase):
@@ -82,15 +89,22 @@ class CheckTest(unittest.TestCase):
         self.listings = []
         self.info_calls = []
 
-    def lister(self, ids, entries=()):
+    def lister(self, ids, entries=(), full=True):
         def call(calls):
             self.listings.append(calls)
-            return [ids_text(ids), full_text(entries)]
+            return [
+                ids_text(ids) if c["format"] == "ids_only"
+                else (full_text(entries) if full else None)
+                for c in calls
+            ]
         return call
 
     def info(self, calls):
         self.info_calls.append(calls)
         return [info_text(c["keywords"][0], A) for c in calls]
+
+    def members(self):
+        return comms_joined.load(self.tmp.name, LANE)["members"]
 
     def record(self, rows):
         return comms_inbox.record(self.tmp.name, rows, 14, NOW)
@@ -103,14 +117,14 @@ class CheckTest(unittest.TestCase):
 
     def check(self, lister, now=NOW, record=None, inbox=INBOX):
         return comms_joined.check(
-            self.tmp.name, inbox, lister, self.info, record or self.record,
-            now,
+            self.tmp.name, LANE, inbox, lister, self.info,
+            record or self.record, now,
         )
 
     def test_first_listing_is_a_silent_baseline(self):
         self.assertEqual(self.check(self.lister([A, B])), 0)
         self.assertEqual(self.rows(), [])
-        self.assertEqual(comms_joined.load(self.tmp.name)["members"], {A, B})
+        self.assertEqual(self.members(), {A, B})
 
     def test_new_channel_is_recorded_once(self):
         self.check(self.lister([B]))
@@ -132,37 +146,74 @@ class CheckTest(unittest.TestCase):
 
     def test_listing_waits_for_the_interval(self):
         self.check(self.lister([B]))
-        self.check(self.lister([A, B]), now=NOW + 600)
+        self.check(self.lister([B]), now=NOW + 600)
         self.assertEqual(len(self.listings), 1)
-        self.check(self.lister([A, B]), now=NOW + 1800,
+        self.check(self.lister([B]), now=NOW + 1800,
                    inbox=dict(INBOX, joined_check_minutes=30))
-        self.assertEqual(len(self.listings), 2)
+        # Only the ids listing runs when nothing is new.
+        self.assertEqual([c[0]["format"] for c in self.listings],
+                         ["ids_only", "ids_only"])
 
     def test_incomplete_listing_changes_nothing(self):
         self.check(self.lister([B]))
 
         def partial(calls):
-            return [ids_text([A], more=True), None]
+            return [ids_text([A], more=True)]
         self.check(partial, now=NOW + 3600)
-        self.assertEqual(comms_joined.load(self.tmp.name)["members"], {B})
+        self.assertEqual(self.members(), {B})
         self.assertEqual(self.rows(), [])
 
     def test_unwritten_joins_are_retried(self):
         self.check(self.lister([B]))
         self.check(self.lister([A, B]), now=NOW + 3600, record=lambda rows: 0)
-        self.assertEqual(comms_joined.load(self.tmp.name)["members"], {B})
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 3700), 1)
+        self.assertEqual(self.members(), {B})
+        # Not due again before the interval, then retried.
+        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 3700), 0)
+        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 7200), 1)
 
     def test_left_channel_is_announced_again_on_rejoin(self):
         self.check(self.lister([A, B]))
         self.check(self.lister([B]), now=NOW + 3600)
-        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 7200), 1)
+        self.check(self.lister([B]), now=NOW + 7200)
+        self.assertEqual(self.members(), {B})
+        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 10800), 1)
+
+    def test_one_missed_listing_is_not_a_leave(self):
+        self.check(self.lister([A, B]))
+        self.check(self.lister([B]), now=NOW + 3600)
+        self.assertEqual(self.members(), {A, B})
+        self.assertEqual(self.check(self.lister([A, B]), now=NOW + 7200), 0)
+        self.check(self.lister([B]), now=NOW + 10800)
+        self.assertEqual(self.members(), {A, B})
+
+    def test_failed_full_listing_holds_new_channels(self):
+        self.check(self.lister([B]))
+        self.assertEqual(self.check(
+            self.lister([A, B], full=False), now=NOW + 3600), 0)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.members(), {B})
+        self.assertEqual(self.check(
+            self.lister([A, B], [("new-room", A, False)]), now=NOW + 7200), 1)
+        self.assertEqual(self.rows()[0]["name"], "new-room")
+
+    def test_lanes_keep_their_own_state(self):
+        self.check(self.lister([A]))
+        comms_joined.check(self.tmp.name, "other", INBOX, self.lister([B]),
+                           None, self.record, NOW)
+        self.assertEqual(self.members(), {A})
+        self.assertEqual(
+            comms_joined.load(self.tmp.name, "other")["members"], {B})
+
+    def test_state_write_failure_does_not_raise(self):
+        with mock.patch.object(comms_joined.state, "write_atomic",
+                               side_effect=OSError("full")):
+            self.assertEqual(self.check(self.lister([A])), 0)
 
     def test_unreadable_state_rebaselines(self):
-        comms_joined._path(self.tmp.name).parent.mkdir(parents=True)
-        comms_joined._path(self.tmp.name).write_text("{")
+        comms_joined._path(self.tmp.name, LANE).parent.mkdir(parents=True)
+        comms_joined._path(self.tmp.name, LANE).write_text("{")
         self.assertEqual(self.check(self.lister([A])), 0)
-        self.assertEqual(comms_joined.load(self.tmp.name)["members"], {A})
+        self.assertEqual(self.members(), {A})
 
 
 class SlackMcpTest(unittest.TestCase):
@@ -170,7 +221,7 @@ class SlackMcpTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         cfg = {
-            "comms_inbox": dict(comms_inbox.settings(INBOX), keep_days=14),
+            "comms_inbox": dict(INBOX, keep_days=14),
             "channels_tool": "mcp__x__slack_list_user_channels",
             "channel_info_tool": None,
         }
@@ -179,7 +230,7 @@ class SlackMcpTest(unittest.TestCase):
                     slack_mcp, "_session",
                     side_effect=slack_mcp.claude_bridge.BridgeError("down")), \
                 mock.patch.object(slack_mcp, "log") as log:
-            slack_mcp._check_joined(cfg, NOW)
+            slack_mcp._check_joined(cfg, NOW, LANE)
         self.assertTrue(any("channel listing failed" in c.args[0]
                             for c in log.call_args_list))
 
@@ -188,7 +239,7 @@ class SlackMcpTest(unittest.TestCase):
                "channels_tool": "mcp__x__slack_list_user_channels",
                "channel_info_tool": None}
         with mock.patch.object(slack_mcp, "_session") as session:
-            slack_mcp._check_joined(cfg, NOW)
+            slack_mcp._check_joined(cfg, NOW, LANE)
         session.assert_not_called()
 
 

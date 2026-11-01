@@ -1624,7 +1624,7 @@ def candidates(source):
             log(f"slack_mcp: comms inbox recorded {added} new line(s), "
                 f"{started} conversation(s) newly tracked or followed")
         _check_reactions(cfg, now)
-        _check_joined(cfg, now)
+        _check_joined(cfg, now, source.get("_routine_id") or "default")
     # Inbox-only hits never become candidates.
     found = [
         (query, hit) for query, hit in found
@@ -2026,7 +2026,7 @@ def _check_reactions(cfg, now):
         + (f", {bad} without a usable result" if bad else ""))
 
 
-def _check_joined(cfg, now):
+def _check_joined(cfg, now, lane):
     """Record channels the owner newly joined (see comms_joined.py).
 
     A failed bridge session is logged and retried later; a budget or pause
@@ -2050,7 +2050,7 @@ def _check_joined(cfg, now):
 
     info_tool = cfg["channel_info_tool"]
     comms_joined.check(
-        _base_dir, inbox,
+        _base_dir, lane, inbox,
         run(tool, dict(comms_joined.LIST_PINS), "channel listing"),
         run(info_tool, {}, "channel lookup") if info_tool else None,
         lambda rows: comms_inbox.record(_base_dir, rows, inbox["keep_days"], now),

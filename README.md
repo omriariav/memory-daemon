@@ -2264,19 +2264,22 @@ One JSON object per line, oldest message first:
   user ids only, never message text.
 - Joined channels: with `joined_channels` a run lists the owner's public and
   private channels (DMs and archived channels excluded) at most every
-  `joined_check_minutes`, in one extra bridge session, and records a
-  `channel_joined` line per channel not in the previous listing:
+  `joined_check_minutes`, in one extra bridge session (channel ids only), and
+  records a `channel_joined` line per channel not in the previous listing:
   `{"type": "channel_joined", "channel_id", "name", "private",
   "channel_type": "channel", "ts", "thread_ts", "seen_at"}`, plus
   `creator_id`, `creator_name` and `created` when `channel_info_tool` finds
-  the channel (one more session, at most 5 lookups). `ts` is when the join
-  was detected; the listing has no join time. The first listing is a silent
-  baseline; a channel left and rejoined is announced again. Membership comes
-  from an ids-only listing; names come from a full listing in the same session
-  and are used only for those ids, so a channel purpose cannot forge an entry.
-  A listing of more than one page (200 channels) or with a count that does
-  not match its header changes nothing. State:
-  `state/comms-inbox-joined.json`.
+  the channel. Only when something is new, a full listing (names) and the
+  channel search (at most 5) follow in their own sessions. `ts` is when the
+  join was detected; the listing has no join time. The first listing is a
+  silent baseline; a channel counts as left after two listings in a row
+  without it, and is announced again on rejoining. Names come from the full
+  listing only for the new ids, and creator details only from a search
+  result matching both name and id, so a channel purpose cannot forge an
+  entry. A listing without an "of N total" header, of more than one page
+  (200 channels), or whose count does not match changes nothing; when the
+  full listing fails, new channels wait for the next check. State, per
+  routine: `state/comms-inbox-joined-<routine>.json`.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts
