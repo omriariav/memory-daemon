@@ -1525,3 +1525,20 @@ class LockGroupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunkConfigTest(unittest.TestCase):
+    def problems(self, **maintenance):
+        routine = {"id": "cal", "enabled": True, "role": "maintenance",
+                   "schedule": {"every": "15m"},
+                   "maintenance": dict(cfg(), kind="calendar_cache",
+                                       **maintenance)}
+        return [p for p in config.validate(routine) if "list_chunk" in p
+                or "list calls" in p]
+
+    def test_chunk_must_cover_the_output_window_and_bound_calls(self):
+        self.assertEqual(self.problems(events_window_days=21), [])
+        self.assertTrue(self.problems(window_hours=48, list_chunk_days=1))
+        self.assertTrue(self.problems(events_window_days=31,
+                                      list_chunk_days=2))
+        self.assertTrue(self.problems(list_chunk_days=0))

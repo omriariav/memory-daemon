@@ -824,8 +824,8 @@ def list_chunks(cfg, now):
     """
     # Whole seconds, so float steps cannot leave a zero-length last chunk.
     total = round(fetch_hours(cfg) * 3600)
-    step = max(60, round(
-        float(cfg.get("list_chunk_days", DEFAULT_LIST_CHUNK_DAYS)) * 86400))
+    step = round(
+        float(cfg.get("list_chunk_days", DEFAULT_LIST_CHUNK_DAYS)) * 86400)
     start = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
     end = start + datetime.timedelta(seconds=total)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
@@ -858,7 +858,8 @@ def _fetch_prompt(cfg, chunks):
         f'1. Call {cfg["list_tool"]} {times}, with calendar_id '
         f'"{calendar_id}" and max_results {chunks[0]["max_results"]}. Use '
         f"these exact values.\n{calls}\n"
-        f'2. For the earliest-starting events in the first result that are not '
+        f'2. For the earliest-starting events in the result for the window '
+        f'starting {chunks[0]["time_min"]} that are not '
         f'all-day events (their Time has a clock time, not just dates), call '
         f'{cfg["get_tool"]} with calendar_id "{calendar_id}" and that '
         f"event's ID, to read its description, for at most {details} events. "
@@ -931,9 +932,12 @@ def fetch(cfg, base_dir, now, tz):
     parsed, seen, full, missing = [], set(), False, False
     first = []
     for index, args in enumerate(chunks):
+        # The hook checks only the pinned keys, so match on those too.
         listing = next(
             (r for r in results if r["name"] == list_tool
-             and not r.get("is_error") and r.get("input") == args),
+             and not r.get("is_error")
+             and all((r.get("input") or {}).get(key) == value
+                     for key, value in args.items())),
             None,
         )
         if listing is None:
@@ -945,7 +949,13 @@ def fetch(cfg, base_dir, now, tz):
             # makes the diff incomplete.
             missing = True
             continue
-        part = parse_list(listing["text"], tz)
+        try:
+            part = parse_list(listing["text"], tz)
+        except CalendarParseError:
+            if index == 0:
+                raise
+            missing = True
+            continue
         full = full or len(part) >= args["max_results"]
         if index == 0:
             first = part
@@ -958,11 +968,11 @@ def fetch(cfg, base_dir, now, tz):
     wide = None
     if full:
         log("calendar_cache: a listing reached max_events; later events may "
-            "be cut and the event diff is skipped (raise max_events or lower "
-            "list_chunk_days)")
+            "be cut" + (" and the event diff is skipped" if diff_hours(cfg) > 0
+                        else "") + " (raise max_events)")
     elif missing:
-        log("calendar_cache: a later listing chunk returned nothing; event "
-            "diff skipped this run")
+        log("calendar_cache: a later listing chunk was missing or unreadable; "
+            "event diff skipped this run")
     elif diff_hours(cfg) > 0:
         wide = in_window(parsed, now, fetch_hours(cfg), tz)
     # Details are looked up from the first result only (as the prompt says).

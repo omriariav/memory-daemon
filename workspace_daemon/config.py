@@ -1,5 +1,6 @@
 """Routine discovery, loading, and validation."""
 import datetime
+import math
 import os
 import re
 from pathlib import Path
@@ -13,6 +14,8 @@ from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
 from . import comms_inbox, slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
+
+MAX_LIST_CHUNKS = 5  # calendar list calls per refresh session
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {
@@ -1554,6 +1557,20 @@ def _validate_calendar_cache(rid, cfg):
         problems.append(
             f"{rid}: maintenance.list_chunk_days must be a number from 1 to 31"
         )
+    else:
+        hours = cfg.get("window_hours", 48)
+        days = cfg.get("events_window_days", 7)
+        # The first chunk must cover the output window, and one session
+        # holds a bounded number of list calls.
+        if isinstance(hours, (int, float)) and hours > chunk * 24:
+            problems.append(
+                f"{rid}: maintenance.list_chunk_days must cover window_hours")
+        if isinstance(days, (int, float)) and math.ceil(
+                max(days * 24, hours if isinstance(hours, (int, float))
+                    else 48) / (chunk * 24)) > MAX_LIST_CHUNKS:
+            problems.append(
+                f"{rid}: maintenance.events_window_days / list_chunk_days "
+                f"needs at most {MAX_LIST_CHUNKS} list calls")
     days = cfg.get("events_window_days", 7)
     if (
         not isinstance(days, (int, float)) or isinstance(days, bool)

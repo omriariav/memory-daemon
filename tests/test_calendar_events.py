@@ -123,6 +123,24 @@ class EventsTest(unittest.TestCase):
                 self.assertRaises(claude_bridge.BridgeError):
             calendar_cache.run(config_, self.base, now=NOW)
 
+    def test_an_unreadable_later_chunk_only_skips_the_diff(self):
+        self.seed(block("a", soon(), title="A", rsvp="accepted"))
+        report, _, _ = self.run_chunked(
+            [listing(block("a", soon(), title="A", rsvp="accepted",
+                           location="Moved")), "garbage"],
+            events_window_days=14)
+        self.assertTrue(report["ok"])
+        self.assertEqual(self.emitted(), [])
+
+    def test_a_chunk_call_with_an_extra_argument_still_counts(self):
+        config_ = dict(self.cfg, events_window_days=7)
+        args = dict(calendar_cache.list_chunks(config_, NOW)[0], extra="x")
+        call = {"name": LIST_TOOL, "text": listing(block("a", soon())),
+                "is_error": False, "input": args}
+        with mock.patch.object(calendar_cache.claude_bridge, "call_tools",
+                               return_value=[call]):
+            self.assertTrue(calendar_cache.run(config_, self.base, now=NOW)["ok"])
+
     def test_fractional_chunk_days_leave_no_empty_chunk(self):
         chunks = calendar_cache.list_chunks(
             dict(self.cfg, events_window_days=7, list_chunk_days=7 / 3), NOW)
