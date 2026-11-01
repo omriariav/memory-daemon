@@ -667,7 +667,7 @@ def _summary_title(summary):
     return "untitled"
 
 
-def _invitees_only(item, identity, unresolved_source):
+def _invitees_only(item, identity, unresolved_source, verified_source=()):
     """Whether `people` must come from the matched invitation alone.
 
     Only when every invitee is accounted for: a safe owner identity, no
@@ -691,6 +691,8 @@ def _invitees_only(item, identity, unresolved_source):
         identity.get("safe") and not unresolved_source
         and not meta.get("source_people_truncated")
         and len(rows) <= MAX_SOURCE_PEOPLE and others
+        # An owner alias the directory maps to the owner is not someone else.
+        and verified_source
     )
 
 
@@ -1032,7 +1034,7 @@ def capture(routine, item, summary, dry_run=False):
     else:
         verified_source, unresolved_source = [], []
     invitees_only = extract and _invitees_only(
-        item, identity, unresolved_source
+        item, identity, unresolved_source, verified_source
     )
     verified_owners, unresolved_owners = _verified_owner_people(
         item, rid, identity, provider

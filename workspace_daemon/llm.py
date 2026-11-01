@@ -28,19 +28,15 @@ MAX_INVITEES = 20
 
 
 def _calendar_rows(item):
+    """Calendar rows of real people (a shared or resource calendar is not)."""
+    from . import calendar_cache  # late import to avoid cycles
+
     return [
         row for row in (item.get("frontmatter") or {}).get("source_people") or []
         if isinstance(row, dict)
         and str(row.get("role") or "").startswith("calendar-")
+        and not calendar_cache._is_calendar_email(str(row.get("email") or ""))
     ]
-
-
-def _name_from_email(email):
-    local = str(email or "").split("@", 1)[0].split("+", 1)[0]
-    return " ".join(
-        word[:1].upper() + word[1:]
-        for word in re.split(r"[._\-]+", local) if word
-    )
 
 
 def invitees(item):
@@ -54,8 +50,10 @@ def invitees(item):
     for row in _calendar_rows(item):
         if row.get("rsvp") == "declined":
             continue
+        from . import calendar_cache  # late import to avoid cycles
+
         name = str(row.get("name") or "").strip() \
-            or _name_from_email(row.get("email"))
+            or calendar_cache.name_from_email(row.get("email"))
         name = "".join(ch if ch.isprintable() else " " for ch in name)
         name = re.sub(r"\s+", " ", name).strip()[:80]
         if name and name not in names:
@@ -73,10 +71,9 @@ def invitees_note(item, complete=None):
     """
     rows = _calendar_rows(item)
     meta = item.get("frontmatter") or {}
-    present = {
-        str(row.get("email") or "").strip().casefold() for row in rows
-        if row.get("rsvp") != "declined"
-    }
+    # Declined rows count too: the owner may decline and still record, and
+    # one other invitee then still makes a real meeting.
+    present = {str(row.get("email") or "").strip().casefold() for row in rows}
     if (
         complete is False or meta.get("source_people_truncated")
         or len(rows) > MAX_INVITEES or len(present - {""}) < 2
