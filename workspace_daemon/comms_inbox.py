@@ -131,14 +131,14 @@ KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
     "thread_polls", "ignore_reactors", "joined_channels",
-    "joined_check_minutes",
+    "joined_check_minutes", "suggest_watch",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
             "follow_threads": False, "thread_polls": 10,
             "ignore_reactors": [], "joined_channels": False,
-            "joined_check_minutes": 60}
+            "joined_check_minutes": 60, "suggest_watch": None}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -202,6 +202,12 @@ def problem(value):
         )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
+    suggest = value.get("suggest_watch")
+    if suggest is not None and not (
+        isinstance(suggest, str) and suggest
+        and (suggest.startswith("/") or suggest.startswith("~"))
+    ):
+        return "`suggest_watch` must be an absolute or ~ path to a watch file"
 
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),

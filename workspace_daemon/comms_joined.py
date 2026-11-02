@@ -242,12 +242,14 @@ def rows_for(new, names, infos, now):
 
 
 def check(base_dir, lane, inbox, list_session, info_session, record,
-          now=None):
+          now=None, suggest=None):
     """List the owner's channels when due; record newly joined ones.
 
     `list_session(calls)` and `info_session(calls)` return one text (or None)
     per call; `info_session` may be None. `record(rows)` returns the number
-    of lines written. Returns the number of channel_joined lines recorded.
+    of lines written. `suggest(rows)`, when given, may flag rows before they
+    are recorded (see watch_joins.py). Returns the number of channel_joined
+    lines recorded.
     A failed or incomplete listing changes nothing but the check time, so it
     is retried after `joined_check_minutes`; joins that could not be written
     (or named) are retried at the next check.
@@ -296,6 +298,8 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
             if info:
                 infos[channel] = info
     rows = rows_for(ready, names, infos, now)
+    if suggest:
+        suggest(rows)
     added = record(rows)
     written = ready if added == len(rows) else set()
     save(base_dir, lane, members | written, now,

@@ -503,6 +503,36 @@ def _expanded(source, missing_ok=False):
     return merged
 
 
+def joined_warnings(routines):
+    """Cross-check `suggest_watch` against the watch files with `joined_from`.
+
+    Warnings, not errors, like discovery_warnings. Returns a list of messages.
+    """
+    readers = {}
+    for routine in routines:
+        for source in sources(routine):
+            if source.get("kind") == "slack_mcp" and source.get(
+                "_watch_joined_from"
+            ) and isinstance(source.get("watch"), str):
+                readers[str(Path(source["watch"]).expanduser())] = routine
+    out = []
+    for routine in routines:
+        for source in sources(routine):
+            inbox = source.get("comms_inbox")
+            target = inbox.get("suggest_watch") if isinstance(inbox, dict) \
+                else None
+            if not target or source.get("kind") != "slack_mcp":
+                continue
+            rid = routine.get("id", "?")
+            if not inbox.get("joined_channels"):
+                out.append(f"{rid}: comms_inbox.suggest_watch needs "
+                           "joined_channels: true")
+            if str(Path(target).expanduser()) not in readers:
+                out.append(f"{rid}: comms_inbox.suggest_watch names no "
+                           "slack_mcp watch file with joined_from")
+    return out
+
+
 def discovery_warnings(routines):
     """Cross-check watch `discover_from` paths against discovery routines.
 

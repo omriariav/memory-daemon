@@ -26,7 +26,7 @@ from time import time as current_epoch
 
 import yaml
 
-from workspace_daemon import alerts, config, identity, llm, memory_sink, mila_source, preflight, runner, state, status, tui
+from workspace_daemon import alerts, config, identity, llm, memory_sink, mila_source, preflight, runner, slack_watch, state, status, tui, watch_joins
 from workspace_daemon.actions import VALID_ACTIONS
 from workspace_daemon.shell import MissingBinary, log, set_log_file
 
@@ -125,6 +125,34 @@ def cmd_ctl(args):
 
 # --- backfill-owner-todos ---------------------------------------------------
 
+def cmd_joined(args):
+    """Review watch suggestions for joined channels (see watch_joins.py)."""
+    routines = {r["id"]: r for r in config.discover(BASE_DIR)}
+    routine = routines.get(args.routine)
+    if routine is None:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
+    watches = [
+        source["watch"] for source in config.sources(routine)
+        if isinstance(source.get("watch"), str)
+    ]
+    if not watches:
+        print(f"{args.routine} has no watch file", file=sys.stderr)
+        return 1
+    try:
+        if args.action == "list":
+            print("\n".join(watch_joins.listing(watches[0])))
+            return 0
+        if not args.channel:
+            print(f"`{args.action}` needs a channel id", file=sys.stderr)
+            return 1
+        do = watch_joins.approve if args.action == "add" else watch_joins.dismiss
+        print(do(watches[0], args.channel))
+    except (watch_joins.JoinedError, slack_watch.WatchError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_backfill_owner_todos(args):
     set_log_file(LOG_FILE)
     routines = {r["id"]: r for r in config.discover(BASE_DIR)}
@@ -185,7 +213,8 @@ def cmd_validate(args):
                 print(f"    {p}")
         else:
             print(f"✓ {source}")
-    for warning in config.discovery_warnings(routines):
+    for warning in (config.discovery_warnings(routines)
+                    + config.joined_warnings(routines)):
         print(f"warning: {warning}")
     if all_problems:
         print(f"\n{len(all_problems)} problem(s) found")
@@ -696,6 +725,16 @@ def main(argv=None):
     p_bf.add_argument("-n", "--dry-run", action="store_true",
                       help="extract and count, but write nothing to the store")
     p_bf.set_defaults(func=cmd_backfill_owner_todos)
+    p_jn = sub.add_parser(
+        "joined",
+        help="list, watch or dismiss channels suggested after you joined them",
+    )
+    p_jn.add_argument("--routine", required=True,
+                      help="routine whose watch file has joined_from")
+    p_jn.add_argument("action", nargs="?", default="list",
+                      choices=["list", "add", "dismiss"])
+    p_jn.add_argument("channel", nargs="?", help="channel id (add, dismiss)")
+    p_jn.set_defaults(func=cmd_joined)
     p_tr = sub.add_parser(
         "triage-report",
         help="agreement of the local triage label with the paid outcome",
