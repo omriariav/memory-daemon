@@ -70,13 +70,15 @@ class SuggestTest(Base):
         self.assertEqual(watch_joins.suggest(self.watch, rows, TODAY), 0)
         self.assertEqual(self.ids("suggested"), [C])
 
-    def test_discovered_channel_is_covered(self):
+    def test_discovered_channel_is_still_suggested_and_kept(self):
         found = self.dir / "found.yaml"
         slack_watch.write_discovered(found, [
             {"id": C, "last_active": TODAY, "reason": "posted"}])
         self.write_watch(discover_from=str(found))
         self.assertEqual(
-            watch_joins.suggest(self.watch, [joined_row(C)], TODAY), 0)
+            watch_joins.suggest(self.watch, [joined_row(C)], TODAY), 1)
+        watch_joins.suggest(self.watch, [joined_row(D)], TODAY)
+        self.assertEqual(self.ids("suggested"), [C, D])
 
     def test_watch_without_joined_from_is_logged_not_raised(self):
         self.watch.write_text(yaml.safe_dump({"channels": [A]}))
@@ -350,7 +352,7 @@ class ConfigTest(unittest.TestCase):
     def test_suggest_watch_must_be_a_path(self):
         self.assertIsNone(comms_inbox.problem(
             {"joined_channels": True, "suggest_watch": "~/watch.yaml"}))
-        for bad in ("", "relative.yaml", 3):
+        for bad in ("", "relative.yaml", 3, "~nosuchuser-example/w.yaml"):
             self.assertIn("suggest_watch", comms_inbox.problem(
                 {"suggest_watch": bad}))
 
@@ -368,6 +370,16 @@ class ConfigTest(unittest.TestCase):
             "kind": "slack_mcp", "watch": str(target),
             "_watch_joined_from": "x" if joined_from else None}}
         return [direct, channels], str(target)
+
+    def test_routines_on_one_lane_with_different_targets(self):
+        routines = [
+            {"id": rid, "source": {
+                "kind": "slack_mcp", "comms_inbox": {
+                    "joined_channels": True, "suggest_watch": target}}}
+            for rid, target in (("a", "/w1.yaml"), ("b", "/w2.yaml"))]
+        warnings = [w for w in config.joined_warnings(routines)
+                    if "differs" in w]
+        self.assertEqual(len(warnings), 2)
 
     def test_non_string_suggest_watch_does_not_crash(self):
         routines = [{"id": "d", "source": {

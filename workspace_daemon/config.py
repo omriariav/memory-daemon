@@ -538,10 +538,18 @@ def joined_warnings(routines):
             if inbox.get("joined_channels") is not True:
                 out.append(f"{rid}: comms_inbox.suggest_watch needs "
                            "joined_channels: true")
-            if str(Path(target).expanduser()) not in readers:
+            if os.path.expanduser(target) not in readers:
                 out.append(f"{rid}: comms_inbox.suggest_watch names no "
                            "watch file with joined_from")
     for members in lanes.values():
+        targets = {os.path.expanduser(t) for _r, t in members
+                   if isinstance(t, str) and t}
+        if len(targets) > 1:
+            out.extend(
+                f"{rid}: suggest_watch differs from another routine sharing "
+                "its channel listing; each join is suggested to one of them"
+                for rid, target in members if target
+            )
         if any(t for _r, t in members) and not all(t for _r, t in members):
             out.extend(
                 f"{rid}: joined_channels without suggest_watch shares its "

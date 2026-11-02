@@ -372,15 +372,19 @@ def hand_written(path):
 def joined_ids(path):
     """(approved, dismissed) channel ids of a watch file's `joined_from`.
 
-    Empty when the watch names none or the joined file is unreadable (load()
-    logs that case).
+    Empty when the watch names none or the joined file is unreadable (logged
+    once per process).
     """
     joined_from = _parse(path)["joined_from"]
     if not joined_from:
         return [], []
+    joined = _private_path(joined_from, "joined file")
     try:
-        lists = read_joined(_private_path(joined_from, "joined file"))
-    except WatchError:
+        lists = read_joined(joined)
+    except WatchError as exc:
+        if f"bad:{joined}" not in _WARNED:
+            _WARNED.add(f"bad:{joined}")
+            log(f"slack joined file ignored: {exc}")
         return [], []
     return ([e["id"] for e in lists["channels"]],
             [e["id"] for e in lists["dismissed"]])

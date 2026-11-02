@@ -119,6 +119,7 @@ older than the retention window are dropped. The file is rewritten atomically
 (mode 600), so a reader never sees a partial line.
 """
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -206,7 +207,8 @@ def problem(value):
     suggest = value.get("suggest_watch")
     if suggest is not None and not (
         isinstance(suggest, str) and suggest
-        and (suggest.startswith("/") or suggest.startswith("~"))
+        # os.path leaves an unknown ~user as is (pathlib raises).
+        and os.path.isabs(os.path.expanduser(suggest))
     ):
         return "`suggest_watch` must be an absolute or ~ path to a watch file"
 

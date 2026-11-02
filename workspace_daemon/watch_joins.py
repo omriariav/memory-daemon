@@ -2,8 +2,8 @@
 
 With `suggest_watch: <watch file>` in a `comms_inbox` block that also sets
 `joined_channels: true`, each newly joined channel that watch file does not
-already cover (its channels, discovered or approved, and its
-`ignore_channels`) becomes a suggestion in the file the watch file names with
+already list for good (its hand-written `channels` and `ignore_channels`,
+and the joined file's own lists) becomes a suggestion in the file the watch file names with
 `joined_from`, and its `channel_joined` line carries `"watch_suggested":
 true`. Nothing is watched until the owner approves:
 
@@ -15,7 +15,9 @@ true`. Nothing is watched until the owner approves:
 moves to the joined file's `channels`, which the watch file merges at load
 like discovered channels; a dismissed one is never suggested again and is
 kept out of the watch even when discovery finds it. A channel in
-`ignore_channels` cannot be approved. A suggestion is made once; a join whose
+`ignore_channels` cannot be approved. A discovered channel is still
+suggested: discovery drops idle channels, and approving one keeps it. A
+suggestion is made once; a join whose
 inbox line was not written yet is flagged again when it is retried. A
 failure to read or write the joined file is logged and never stops the run;
 the channel_joined line is recorded either way.
@@ -78,11 +80,11 @@ def suggest(watch_path, rows, today=None):
     today = today or datetime.date.today()
     try:
         path = joined_path(watch_path)
-        watched = set(slack_watch.load(watch_path)["channels"])
-        _hand, ignore = slack_watch.hand_written(watch_path)
+        hand, ignore = slack_watch.hand_written(watch_path)
         with _locked(path):
             lists = slack_watch.read_joined(path)
-            covered = watched | set(ignore)
+            # Only lasting coverage counts: discovery drops idle channels.
+            covered = set(hand) | set(ignore)
             # A suggestion the watch has since come to cover is settled.
             stale = [e for e in lists["suggested"] if e["id"] in covered]
             for entry in stale:

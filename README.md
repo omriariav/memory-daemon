@@ -2350,8 +2350,10 @@ One JSON object per line, oldest message first:
   watches one, `... dismiss <channel>` drops it for good (and stops watching
   it if it was approved). A channel is suggested once. A problem with the
   joined file is logged and never stops the run. `daemon.py validate` warns
-  when `suggest_watch` names no `slack_mcp` watch file with `joined_from`, or
-  `joined_channels` is off. See `workspace_daemon/watch_joins.py`.
+  when `suggest_watch` names no watch file with `joined_from`, when
+  `joined_channels` is off, or when routines sharing one channel listing
+  disagree on `suggest_watch`. A channel discovery currently finds is still
+  suggested: discovery drops idle channels, and an approved one stays. See `workspace_daemon/watch_joins.py`.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts
