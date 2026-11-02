@@ -2189,6 +2189,8 @@ comms_inbox:
   reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
   reaction_check_hours: 72   # how long an unanswered message is re-checked
   track_reactions: [track-example]   # "watch this conversation", at most 3
+  track_lookback_days: 7   # optional: track emoji count on messages this recent (default retention_days;
+                           # Slack filters on the message date, so a track emoji on an older message is not seen)
   ignore_reactors: [U0EXAMPLE09]   # user ids never recorded as peer reactions, at most 20
   follow_threads: true   # follow every channel thread the owner posted in
   thread_polls: 10       # followed-thread reads per run, 0 to 30
@@ -2263,7 +2265,8 @@ One JSON object per line, oldest message first:
   level from that message on. Its messages are then recorded like those of
   `channels`, even outside `channels` and `all_dms`, until the request is
   older than `retention_days` (a removed reaction is not seen). One search
-  per emoji per run (`hasmy::<emoji>:`, look-back `retention_days`, no
+  per emoji per run (`hasmy::<emoji>:`, look-back `track_lookback_days`,
+  default `retention_days`, no
   cursor); a tracked channel no other query lists gets an extra search
   (channels in chunks of 15, at most 2 per run and within
   `max_queries_per_run`), from a per-channel scan mark that advances like a
