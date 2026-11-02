@@ -503,6 +503,63 @@ def _expanded(source, missing_ok=False):
     return merged
 
 
+def joined_warnings(routines):
+    """Cross-check `suggest_watch` against the watch files with `joined_from`.
+
+    Warnings, not errors, like discovery_warnings. Returns a list of messages.
+    """
+    readers = set()
+    lanes = {}
+    for routine in routines:
+        for source in sources(routine):
+            if source.get("_watch_joined_from") and isinstance(
+                source.get("watch"), str
+            ):
+                readers.add(str(Path(source["watch"]).expanduser()))
+            inbox = source.get("comms_inbox")
+            if source.get("kind") == "slack_mcp" and isinstance(inbox, dict) \
+                    and inbox.get("joined_channels") is True:
+                # Routines listing the same channels share one joined state
+                # (comms_joined.py): the first to see a join records it.
+                lane = (source.get("channels_tool"),
+                        source.get("self_user_id"))
+                lanes.setdefault(lane, []).append(
+                    (routine.get("id", "?"), inbox.get("suggest_watch")))
+    out = []
+    for routine in routines:
+        for source in sources(routine):
+            inbox = source.get("comms_inbox")
+            target = inbox.get("suggest_watch") if isinstance(inbox, dict) \
+                else None
+            if not isinstance(target, str) or not target \
+                    or source.get("kind") != "slack_mcp":
+                continue
+            rid = routine.get("id", "?")
+            if inbox.get("joined_channels") is not True:
+                out.append(f"{rid}: comms_inbox.suggest_watch needs "
+                           "joined_channels: true")
+            if os.path.expanduser(target) not in readers:
+                out.append(f"{rid}: comms_inbox.suggest_watch names no "
+                           "watch file with joined_from")
+    for members in lanes.values():
+        targets = {os.path.expanduser(t) for _r, t in members
+                   if isinstance(t, str) and t}
+        if len(targets) > 1:
+            out.extend(
+                f"{rid}: suggest_watch differs from another routine sharing "
+                "its channel listing; each join is suggested to one of them"
+                for rid, target in members if target
+            )
+        if any(t for _r, t in members) and not all(t for _r, t in members):
+            out.extend(
+                f"{rid}: joined_channels without suggest_watch shares its "
+                "channel listing with a routine that suggests; joins it sees "
+                "first are not suggested"
+                for rid, target in members if not target
+            )
+    return out
+
+
 def discovery_warnings(routines):
     """Cross-check watch `discover_from` paths against discovery routines.
 
