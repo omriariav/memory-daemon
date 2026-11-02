@@ -221,6 +221,11 @@ def run(cfg, base_dir, dry_run=False, now=None):
     hand, ignore = (
         slack_watch.hand_written(cfg["watch"]) if cfg["watch"] else ([], [])
     )
+    if cfg["watch"]:
+        # Joined channels the owner approved are watched already, and
+        # dismissed ones never are: neither takes a discovered slot.
+        approved, dismissed = slack_watch.joined_ids(cfg["watch"])
+        hand, ignore = list(hand) + approved, list(ignore) + dismissed
     try:
         existing = slack_watch.read_discovered(cfg["discovered"])
     except slack_watch.WatchError as exc:

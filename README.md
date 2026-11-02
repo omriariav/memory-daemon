@@ -2194,6 +2194,7 @@ comms_inbox:
   thread_polls: 10       # followed-thread reads per run, 0 to 30
   joined_channels: true  # a line per newly joined channel (needs channels_tool)
   joined_check_minutes: 60   # how often channels are listed, 15 to 1440
+  suggest_watch: ~/path/slack-watch.yaml   # optional: suggest new joins for this watch
 ```
 
 and on the routine's source (not the watch file):
@@ -2340,6 +2341,19 @@ One JSON object per line, oldest message first:
   `state/comms-inbox-joined-<tool>-<hash>.json`. An owner in more than 200
   channels never gets a complete listing, so nothing is recorded (each check
   logs it).
+- Watch suggestions: with `suggest_watch` naming another routine's watch
+  file, a newly joined channel that watch does not cover (its channels,
+  discovered or approved, or `ignore_channels`) is added to the file that
+  watch names with `joined_from`, and its `channel_joined` line carries
+  `"watch_suggested": true`. Nothing is watched until you approve it:
+  `daemon.py joined --routine <id>` lists suggestions, `... add <channel>`
+  watches one, `... dismiss <channel>` drops it for good (and stops watching
+  it if it was approved). A channel is suggested once. A problem with the
+  joined file is logged and never stops the run. `daemon.py validate` warns
+  when `suggest_watch` names no watch file with `joined_from`, when
+  `joined_channels` is off, or when routines sharing one channel listing
+  disagree on `suggest_watch`. A channel discovery currently finds is still
+  suggested: discovery drops idle channels, and an approved one stays. See `workspace_daemon/watch_joins.py`.
 
 Cursors are per query key: `channels:<id>` for each channel, `from:<id>` for
 each person, `me` for mentions and `dms`, so changing the watch list restarts
@@ -2579,6 +2593,7 @@ activity for `idle_days` (default 30) is dropped, and at most `max_channels`
 channels: [C0EXAMPLE01]
 ignore_channels: [C0EXAMPLE09]       # discovery never adds these
 discover_from: ~/path/slack-discovered.yaml
+joined_from: ~/path/slack-joined.yaml   # joined channels you approved
 ```
 
 `discover_from` merges the discovered channels after the hand-written ones when
@@ -2597,6 +2612,11 @@ hand-written channels keep working. `daemon.py validate` prints a warning (not
 an error) when a watch's `discover_from` is not written by any
 `slack_discovery` routine in the config set, or a discovery routine's file is
 read by no watch.
+
+`joined_from` merges, after the discovered ones and on the same terms, the
+channels you approved from watch suggestions (see Joined channels above). The
+file is written by the daemon; its suggested and dismissed channels are not
+watched.
 
 A run that cannot read every page it started (an unparseable page, a missing
 result) leaves the file untouched, and only hits that every valid reading of a

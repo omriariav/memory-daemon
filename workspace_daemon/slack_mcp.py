@@ -117,7 +117,7 @@ from pathlib import Path
 
 from . import (
     claude_bridge, comms_inbox, comms_joined, slack_source, slack_watch,
-    sleepclock, state,
+    sleepclock, state, watch_joins,
 )
 from .chat_text import redact_secrets
 from .shell import log, utc_now_iso
@@ -2057,12 +2057,14 @@ def _check_joined(cfg, now, lane):
         return call
 
     info_tool = cfg["channel_info_tool"]
+    target = inbox["suggest_watch"]
     comms_joined.check(
         _base_dir, lane, inbox,
         run(tool, dict(comms_joined.LIST_PINS), "channel listing"),
         run(info_tool, {}, "channel lookup") if info_tool else None,
         lambda rows: comms_inbox.record(_base_dir, rows, inbox["keep_days"], now),
         now,
+        (lambda rows: watch_joins.suggest(target, rows)) if target else None,
     )
 
 

@@ -42,7 +42,8 @@ described below.
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
     {"type": "channel_joined", "channel_id", "name", "private", "ts",
-     "thread_ts", "seen_at"} (+ creator details; see comms_joined.py)
+     "thread_ts", "seen_at"} (+ creator details; see comms_joined.py, and
+     "watch_suggested": true when suggested for a watch; see watch_joins.py)
 
 Every line (any type) written since channel types were added also carries
 `channel_type`: "im" (a direct message), "mpim" (a group DM) or "channel"
@@ -118,6 +119,7 @@ older than the retention window are dropped. The file is rewritten atomically
 (mode 600), so a reader never sees a partial line.
 """
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -131,14 +133,14 @@ KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
     "thread_polls", "ignore_reactors", "joined_channels",
-    "joined_check_minutes",
+    "joined_check_minutes", "suggest_watch",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
             "follow_threads": False, "thread_polls": 10,
             "ignore_reactors": [], "joined_channels": False,
-            "joined_check_minutes": 60}
+            "joined_check_minutes": 60, "suggest_watch": None}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -202,6 +204,13 @@ def problem(value):
         )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
+    suggest = value.get("suggest_watch")
+    if suggest is not None and not (
+        isinstance(suggest, str) and suggest
+        # os.path leaves an unknown ~user as is (pathlib raises).
+        and os.path.isabs(os.path.expanduser(suggest))
+    ):
+        return "`suggest_watch` must be an absolute or ~ path to a watch file"
 
     for key, lower, upper in (
         ("retention_days", 1, MAX_RETENTION_DAYS),

@@ -28,7 +28,8 @@ candidate ids.
       reactions: [eyes]
     bootstrap: 3d             # first-run look-back when no cursor exists
     discover_from: ~/path/slack-discovered.yaml   # channels found by discovery
-    ignore_channels: [C0EXAMPLE09]                # never added by discovery
+    joined_from: ~/path/slack-joined.yaml         # joined channels approved
+    ignore_channels: [C0EXAMPLE09]                # never added by either
 
 `discover_from` names a separate private file kept by the `slack_discovery`
 maintenance routine; its channels are appended to the hand-written `channels`
@@ -41,6 +42,12 @@ The discovered file is YAML written by the daemon, never by hand:
     channels:
       - {id: C0EXAMPLE05, name: example-name, last_active: 2026-10-20,
          reason: posted}
+
+`joined_from` names the file of watch suggestions for channels the owner
+joins (see watch_joins.py). Its approved `channels` are merged after the
+discovered ones and on the same terms; its `dismissed` channels are kept out
+of the discovered merge too, and its `suggested` ones are not watched.
+Missing adds nothing; corrupt is treated as empty with a warning.
 """
 import datetime
 import os
@@ -55,7 +62,7 @@ from .shell import log
 WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap", "all_dms", "discover_from", "ignore_channels",
-    "save_reactions", "dm_sessions", "comms_inbox",
+    "save_reactions", "dm_sessions", "comms_inbox", "joined_from",
 }
 DM_SESSION_KEYS = {"enabled", "gap_minutes", "max_span_hours", "channel_types"}
 DM_SESSION_TYPES = ("im", "mpim")
@@ -65,6 +72,9 @@ MAX_SAVE_REACTIONS = 3
 DISCOVERED_ID = re.compile(r"^[CG][A-Z0-9]{8,}$")
 DISCOVERED_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 DISCOVERED_REASONS = ("posted", "mentioned")
+# Joined-channel names come from the connector's listing (comms_joined), which
+# allows any word character, so non-Latin names are kept.
+JOINED_NAME = re.compile(r"^[\w.-]{1,80}$")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
@@ -202,6 +212,77 @@ def write_discovered(path, entries):
     state.write_atomic(path, text, mode=0o600)
 
 
+JOINED_LISTS = {
+    # list: the date field each entry carries (None: no date)
+    "suggested": "joined", "channels": "approved", "dismissed": None,
+}
+
+
+def read_joined(path):
+    """The joined file's lists, each [] when absent or the file is missing.
+
+    Entries are {"id", "name" (optional), plus "joined" (suggested) or
+    "approved" (channels) as a date}. A channel sits in one list at most. A
+    malformed file raises WatchError: it is never half-trusted.
+    """
+    path = _private_path(path, "joined file")
+    out = {key: [] for key in JOINED_LISTS}
+    if not path.exists():
+        return out
+    data = _read_yaml(path, "joined file")
+    if data is None:
+        return out
+    if not isinstance(data, dict) or set(data) - set(JOINED_LISTS):
+        raise WatchError(
+            "joined file must be a mapping of suggested, channels, dismissed"
+        )
+    seen = set()
+    for key, date_key in JOINED_LISTS.items():
+        rows = data.get(key)
+        rows = [] if rows is None else rows
+        if not isinstance(rows, list):
+            raise WatchError(f"joined `{key}` must be a list")
+        for row in rows:
+            allowed = {"id", "name"} | ({date_key} if date_key else set())
+            if not isinstance(row, dict) or set(row) - allowed:
+                raise WatchError(f"joined `{key}` entry has unknown fields")
+            cid = row.get("id")
+            if not isinstance(cid, str) or not DISCOVERED_ID.match(cid):
+                raise WatchError("joined entry has an id that is not a channel")
+            if cid in seen:
+                raise WatchError("joined file lists a channel twice")
+            seen.add(cid)
+            entry = {"id": cid}
+            name = row.get("name")
+            if name is not None:
+                if not (isinstance(name, str) and JOINED_NAME.match(name)):
+                    raise WatchError("joined entry has a bad name")
+                entry["name"] = name
+            if date_key:
+                when = _as_date(row.get(date_key))
+                if when is None:
+                    raise WatchError(f"joined entry has a bad {date_key}")
+                entry[date_key] = when
+            out[key].append(entry)
+    return out
+
+
+def write_joined(path, lists):
+    """Atomically write the joined file (mode 600), each list sorted by id."""
+    path = _private_path(path, "joined file")
+    data = {
+        key: [dict(sorted(e.items())) for e in
+              sorted(lists.get(key) or [], key=lambda e: e["id"])]
+        for key in JOINED_LISTS
+    }
+    text = (
+        "# Written by the daemon (channel joins, `daemon.py joined`); "
+        "do not edit.\n" + yaml.safe_dump(data, sort_keys=False)
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state.write_atomic(path, text, mode=0o600)
+
+
 def _parse(path):
     """Validated watch-file data (before discovery is merged)."""
     path = _private_path(path, "watch")
@@ -259,10 +340,16 @@ def _parse(path):
         isinstance(discover_from, str) and discover_from
     ):
         raise WatchError("`discover_from` must be a path string")
+    joined_from = data.get("joined_from")
+    if joined_from is not None and not (
+        isinstance(joined_from, str) and joined_from
+    ):
+        raise WatchError("`joined_from` must be a path string")
     return {
         "channels": hand,
         "ignore_channels": ignore,
         "discover_from": discover_from,
+        "joined_from": joined_from,
         "people": _ids(data, "people", USER_ID, "user"),
         "include_mentions": mentions,
         "all_dms": all_dms,
@@ -280,6 +367,27 @@ def hand_written(path):
     """(channels, ignore_channels) typed by hand in a watch file."""
     parsed = _parse(path)
     return parsed["channels"], parsed["ignore_channels"]
+
+
+def joined_ids(path):
+    """(approved, dismissed) channel ids of a watch file's `joined_from`.
+
+    Empty when the watch names none or the joined file is unreadable (logged
+    once per process).
+    """
+    joined_from = _parse(path)["joined_from"]
+    if not joined_from:
+        return [], []
+    joined = _private_path(joined_from, "joined file")
+    try:
+        lists = read_joined(joined)
+    except WatchError as exc:
+        if f"bad:{joined}" not in _WARNED:
+            _WARNED.add(f"bad:{joined}")
+            log(f"slack joined file ignored: {exc}")
+        return [], []
+    return ([e["id"] for e in lists["channels"]],
+            [e["id"] for e in lists["dismissed"]])
 
 
 def dm_sessions_problem(value):
@@ -310,12 +418,26 @@ def dm_sessions_problem(value):
 def load(path):
     """Parse a watch file into source keys; raises WatchError with the reason.
 
-    Channels of the file named by `discover_from` follow the hand-written
-    ones, minus anything already listed and anything in `ignore_channels`.
+    Channels of the file named by `discover_from`, then the approved ones of
+    the file named by `joined_from`, follow the hand-written ones, minus
+    anything already listed and anything in `ignore_channels`. A channel
+    dismissed in the joined file is not merged from discovery either.
     """
     parsed = _parse(path)
     ignore = set(parsed.pop("ignore_channels"))
     discover_from = parsed.pop("discover_from")
+    joined_from = parsed.pop("joined_from")
+    joined = {"channels": [], "dismissed": []}
+    if joined_from:
+        path = _private_path(joined_from, "joined file")
+        try:
+            joined = read_joined(path)
+        except WatchError as exc:
+            if f"bad:{path}" not in _WARNED:
+                _WARNED.add(f"bad:{path}")
+                log(f"slack joined file ignored: {exc}")
+        parsed["joined_from"] = joined_from
+    dismissed = {entry["id"] for entry in joined["dismissed"]}
     if discover_from:
         path = _private_path(discover_from, "discovered file")
         try:
@@ -325,11 +447,15 @@ def load(path):
                 _WARNED.add(f"bad:{path}")
                 log(f"slack discovered file ignored: {exc}")
             found = []
-        known = set(parsed["channels"]) | ignore
+        known = set(parsed["channels"]) | ignore | dismissed
         parsed["channels"] = parsed["channels"] + sorted(
             entry["id"] for entry in found if entry["id"] not in known
         )
         parsed["discover_from"] = discover_from
+    known = set(parsed["channels"]) | ignore
+    parsed["channels"] = parsed["channels"] + sorted(
+        entry["id"] for entry in joined["channels"] if entry["id"] not in known
+    )
     return parsed
 
 
@@ -365,6 +491,9 @@ def expand(source):
         elif key == "discover_from":
             # Kept only so validation can cross-check the discovery routine.
             merged["_watch_discover_from"] = str(Path(value).expanduser())
+        elif key == "joined_from":
+            # Kept only so validation can cross-check the suggesting routine.
+            merged["_watch_joined_from"] = str(Path(value).expanduser())
         elif key == "all_dms":
             # Only the connector-backed source can search every DM.
             if value and source.get("kind") == "slack_mcp":
