@@ -560,6 +560,17 @@ class TrackTest(InboxTestCase):
             [r for r in self.rows() if r["type"] == "track_request"], [])
         self.assertEqual(self.tracked()["conversations"], [])
 
+    def test_track_lookback_days_accepted_values(self):
+        for block in ({"track_lookback_days": 1},
+                      {"track_lookback_days": 14},
+                      {"retention_days": 30, "track_lookback_days": 30},
+                      {"track_lookback_days": None}):
+            with self.subTest(block=block):
+                self.assertIsNone(comms_inbox.problem(
+                    dict(block, track_reactions=[TRACK])))
+        self.assertIn("from 1 to 14", comms_inbox.problem(
+            {"track_reactions": [TRACK], "track_lookback_days": 15}))
+
     def test_track_on_own_dm_message_records_and_tracks_the_dm(self):
         self.table[TRACK_FILTER] = [{
             "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,

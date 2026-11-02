@@ -1613,7 +1613,11 @@ def candidates(source):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
-        elif key.startswith((REACTED_PREFIX, "track:")):
+        elif key.startswith("track:"):
+            log("slack_mcp: a comms-inbox track search hit "
+                "max_search_pages; newer track requests are not recorded "
+                "(shorten track_lookback_days or raise max_search_pages)")
+        elif key.startswith(REACTED_PREFIX):
             log("slack_mcp: a comms-inbox reaction search hit "
                 "max_search_pages; newer reactions are not recorded (shorten "
                 "retention_days or raise max_search_pages)")

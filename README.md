@@ -2189,7 +2189,8 @@ comms_inbox:
   reaction_checks: 10    # reaction reads per run, 0 to 30 (needs reactions_tool)
   reaction_check_hours: 72   # how long an unanswered message is re-checked
   track_reactions: [track-example]   # "watch this conversation", at most 3
-  track_lookback_days: 7   # optional: track emoji count on messages this recent (default retention_days)
+  track_lookback_days: 7   # optional: track emoji count on messages this recent (default retention_days;
+                           # Slack filters on the message date, so a track emoji on an older message is not seen)
   ignore_reactors: [U0EXAMPLE09]   # user ids never recorded as peer reactions, at most 20
   follow_threads: true   # follow every channel thread the owner posted in
   thread_polls: 10       # followed-thread reads per run, 0 to 30
