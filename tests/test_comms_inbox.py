@@ -541,6 +541,25 @@ class TrackTest(InboxTestCase):
         self.assertEqual(after[TRACK_FILTER], int(NOW) - 5 * 86400)
         self.assertEqual(list(slack_mcp.cursor_ids(src)), [f"channels:{CHAN}"])
 
+    def test_track_lookback_days_shortens_the_track_search(self):
+        src = inbox_source({"track_reactions": [TRACK], "retention_days": 14,
+                            "track_lookback_days": 7})
+        slack_mcp.candidates(src)
+        after = {a["filters"]: a["after"] for a in self.seen}
+        self.assertEqual(after[TRACK_FILTER], int(NOW) - 7 * 86400)
+
+    def test_track_older_than_the_lookback_is_not_recorded(self):
+        self.table[TRACK_FILTER] = [{
+            "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,
+            "name": "Me", "ts": f"{int(NOW) - 9 * 86400}.000100",
+            "text": "old ask",
+        }]
+        self.run_once(inbox={"track_reactions": [TRACK],
+                             "track_lookback_days": 7})
+        self.assertEqual(
+            [r for r in self.rows() if r["type"] == "track_request"], [])
+        self.assertEqual(self.tracked()["conversations"], [])
+
     def test_track_on_own_dm_message_records_and_tracks_the_dm(self):
         self.table[TRACK_FILTER] = [{
             "ch": DM, "dm": True, "people": [BOB, ME], "uid": ME,
@@ -905,6 +924,11 @@ class ConfigTest(unittest.TestCase):
             {"reactions": [ACK], "track_reactions": [ACK]},
             {"channels": [CHAN], "reaction_check_hours": 0},
             {"all_dms": "yes"},
+            {"track_reactions": [TRACK], "track_lookback_days": 0},
+            {"track_reactions": [TRACK], "track_lookback_days": 15},
+            {"track_reactions": [TRACK], "retention_days": 5,
+             "track_lookback_days": 7},
+            {"track_reactions": [TRACK], "track_lookback_days": True},
         ):
             with self.subTest(block=block):
                 self.assertTrue(any(

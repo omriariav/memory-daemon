@@ -1555,6 +1555,11 @@ def candidates(source):
         cfg["comms_inbox"]["retention_days"] * 86400 if cfg["comms_inbox"]
         else 0
     )
+    track_after = int(now) - (
+        (cfg["comms_inbox"]["track_lookback_days"]
+         or cfg["comms_inbox"]["retention_days"]) * 86400
+        if cfg["comms_inbox"] else 0
+    )
     mine_after = reacted_after
     if follow and follow["scanned"] is not None:
         mine_after = max(
@@ -1564,7 +1569,8 @@ def candidates(source):
     # date, and the owner reacts to old messages.
     afters = [
         saved_after if query["kind"] == "saved"
-        else reacted_after if query["kind"] in ("reacted", "track")
+        else reacted_after if query["kind"] == "reacted"
+        else track_after if query["kind"] == "track"
         else mine_after if query["kind"] == "mine"
         else query["after"] if query["kind"] == "tracked" else min(
             int(slack_source._rfc3339_epoch(since_map[key]))

@@ -63,7 +63,8 @@ the `dms` query still records) is typed "channel", as in dm_kind. Lines written 
 field; readers treat a missing field as unknown.
 
 A `track_reactions` emoji the owner puts on any message (found by a
-`hasmy::<emoji>:` search looking back `retention_days`, no cursor) writes a
+`hasmy::<emoji>:` search looking back `track_lookback_days`, default
+`retention_days`, no cursor) writes a
 `track_request` line for that message and starts tracking its conversation:
 the thread rooted at `thread_ts`, plus the whole conversation from that
 message on when it is a DM or group DM. Messages of tracked conversations are
@@ -131,14 +132,14 @@ KEYS = {
     "channels", "all_dms", "reactions", "retention_days", "reaction_checks",
     "reaction_check_hours", "track_reactions", "follow_threads",
     "thread_polls", "ignore_reactors", "joined_channels",
-    "joined_check_minutes",
+    "joined_check_minutes", "track_lookback_days",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
             "reaction_check_hours": 72, "track_reactions": [],
             "follow_threads": False, "thread_polls": 10,
             "ignore_reactors": [], "joined_channels": False,
-            "joined_check_minutes": 60}
+            "joined_check_minutes": 60, "track_lookback_days": None}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
@@ -214,6 +215,14 @@ def problem(value):
             and lower <= number <= upper
         ):
             return f"`{key}` must be an integer from {lower} to {upper}"
+    lookback = value.get("track_lookback_days")
+    if lookback is not None and not (
+        isinstance(lookback, int) and not isinstance(lookback, bool)
+        and 1 <= lookback <= value.get("retention_days",
+                                       DEFAULTS["retention_days"])
+    ):
+        return "`track_lookback_days` must be an integer from 1 to " \
+            "retention_days"
     return None
 
 
