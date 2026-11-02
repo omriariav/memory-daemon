@@ -131,22 +131,26 @@ def cmd_joined(args):
     routine = routines.get(args.routine)
     if routine is None:
         raise config.RoutineError(f"no routine with id '{args.routine}'")
-    watches = [
-        source["watch"] for source in config.sources(routine)
-        if isinstance(source.get("watch"), str)
-    ]
-    if not watches:
-        print(f"{args.routine} has no watch file", file=sys.stderr)
+    watches = {
+        source["_watch_joined_from"]: source["watch"]
+        for source in config.sources(routine)
+        if source.get("_watch_joined_from")
+        and isinstance(source.get("watch"), str)
+    }
+    if len(watches) != 1:
+        print(f"{args.routine} needs exactly one watch file with joined_from "
+              f"(found {len(watches)})", file=sys.stderr)
         return 1
+    watch, = watches.values()
     try:
         if args.action == "list":
-            print("\n".join(watch_joins.listing(watches[0])))
+            print("\n".join(watch_joins.listing(watch)))
             return 0
         if not args.channel:
             print(f"`{args.action}` needs a channel id", file=sys.stderr)
             return 1
         do = watch_joins.approve if args.action == "add" else watch_joins.dismiss
-        print(do(watches[0], args.channel))
+        print(do(watch, args.channel))
     except (watch_joins.JoinedError, slack_watch.WatchError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

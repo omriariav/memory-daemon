@@ -44,10 +44,10 @@ The discovered file is YAML written by the daemon, never by hand:
          reason: posted}
 
 `joined_from` names the file of watch suggestions for channels the owner
-joins (see watch_joins.py). Only its approved `channels` are merged, after
-the discovered ones and on the same terms; its `suggested` and `dismissed`
-entries are not watched. Missing adds nothing; corrupt is treated as empty
-with a warning.
+joins (see watch_joins.py). Its approved `channels` are merged after the
+discovered ones and on the same terms; its `dismissed` channels are kept out
+of the discovered merge too, and its `suggested` ones are not watched.
+Missing adds nothing; corrupt is treated as empty with a warning.
 """
 import datetime
 import os
@@ -72,6 +72,9 @@ MAX_SAVE_REACTIONS = 3
 DISCOVERED_ID = re.compile(r"^[CG][A-Z0-9]{8,}$")
 DISCOVERED_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 DISCOVERED_REASONS = ("posted", "mentioned")
+# Joined-channel names come from the connector's listing (comms_joined), which
+# allows any word character, so non-Latin names are kept.
+JOINED_NAME = re.compile(r"^[\w.-]{1,80}$")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
 _BOOTSTRAP = re.compile(r"^[1-9]\d*[mhd]$")
@@ -251,7 +254,7 @@ def read_joined(path):
             entry = {"id": cid}
             name = row.get("name")
             if name is not None:
-                if not (isinstance(name, str) and DISCOVERED_NAME.match(name)):
+                if not (isinstance(name, str) and JOINED_NAME.match(name)):
                     raise WatchError("joined entry has a bad name")
                 entry["name"] = name
             if date_key:
@@ -395,12 +398,24 @@ def load(path):
 
     Channels of the file named by `discover_from`, then the approved ones of
     the file named by `joined_from`, follow the hand-written ones, minus
-    anything already listed and anything in `ignore_channels`.
+    anything already listed and anything in `ignore_channels`. A channel
+    dismissed in the joined file is not merged from discovery either.
     """
     parsed = _parse(path)
     ignore = set(parsed.pop("ignore_channels"))
     discover_from = parsed.pop("discover_from")
     joined_from = parsed.pop("joined_from")
+    joined = {"channels": [], "dismissed": []}
+    if joined_from:
+        path = _private_path(joined_from, "joined file")
+        try:
+            joined = read_joined(path)
+        except WatchError as exc:
+            if f"bad:{path}" not in _WARNED:
+                _WARNED.add(f"bad:{path}")
+                log(f"slack joined file ignored: {exc}")
+        parsed["joined_from"] = joined_from
+    dismissed = {entry["id"] for entry in joined["dismissed"]}
     if discover_from:
         path = _private_path(discover_from, "discovered file")
         try:
@@ -410,25 +425,15 @@ def load(path):
                 _WARNED.add(f"bad:{path}")
                 log(f"slack discovered file ignored: {exc}")
             found = []
-        known = set(parsed["channels"]) | ignore
+        known = set(parsed["channels"]) | ignore | dismissed
         parsed["channels"] = parsed["channels"] + sorted(
             entry["id"] for entry in found if entry["id"] not in known
         )
         parsed["discover_from"] = discover_from
-    if joined_from:
-        path = _private_path(joined_from, "joined file")
-        try:
-            approved = read_joined(path)["channels"]
-        except WatchError as exc:
-            if f"bad:{path}" not in _WARNED:
-                _WARNED.add(f"bad:{path}")
-                log(f"slack joined file ignored: {exc}")
-            approved = []
-        known = set(parsed["channels"]) | ignore
-        parsed["channels"] = parsed["channels"] + sorted(
-            entry["id"] for entry in approved if entry["id"] not in known
-        )
-        parsed["joined_from"] = joined_from
+    known = set(parsed["channels"]) | ignore
+    parsed["channels"] = parsed["channels"] + sorted(
+        entry["id"] for entry in joined["channels"] if entry["id"] not in known
+    )
     return parsed
 
 

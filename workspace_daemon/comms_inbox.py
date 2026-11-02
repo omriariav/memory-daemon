@@ -42,7 +42,8 @@ described below.
     {"type": "track_request", "channel_id", "thread_ts", "ts", "emoji",
      "seen_at"}
     {"type": "channel_joined", "channel_id", "name", "private", "ts",
-     "thread_ts", "seen_at"} (+ creator details; see comms_joined.py)
+     "thread_ts", "seen_at"} (+ creator details; see comms_joined.py, and
+     "watch_suggested": true when suggested for a watch; see watch_joins.py)
 
 Every line (any type) written since channel types were added also carries
 `channel_type`: "im" (a direct message), "mpim" (a group DM) or "channel"

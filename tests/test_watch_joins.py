@@ -1,4 +1,6 @@
+import argparse
 import datetime
+import io
 import json
 import os
 import tempfile
@@ -66,7 +68,6 @@ class SuggestTest(Base):
         watch_joins.suggest(self.watch, [joined_row(C)], TODAY)
         rows = [joined_row(C)]
         self.assertEqual(watch_joins.suggest(self.watch, rows, TODAY), 0)
-        self.assertNotIn("watch_suggested", rows[0])
         self.assertEqual(self.ids("suggested"), [C])
 
     def test_discovered_channel_is_covered(self):
@@ -91,6 +92,38 @@ class SuggestTest(Base):
             self.assertEqual(
                 watch_joins.suggest(self.watch, [joined_row(C)], TODAY), 0)
         self.assertEqual(self.joined.read_text(), "suggested: nope\n")
+
+    def test_non_latin_name_is_kept_and_readable(self):
+        rows = [joined_row(C, "צוות-מוצר")]
+        self.assertEqual(watch_joins.suggest(self.watch, rows, TODAY), 1)
+        self.assertEqual(self.lists()["suggested"][0]["name"], "צוות-מוצר")
+        watch_joins.approve(self.watch, C, TODAY)
+        self.assertEqual(slack_watch.load(self.watch)["channels"], [A, C])
+
+    def test_unusable_name_is_dropped(self):
+        watch_joins.suggest(self.watch, [joined_row(C, "has space")], TODAY)
+        self.assertEqual(self.lists()["suggested"],
+                         [{"id": C, "joined": TODAY}])
+
+    def test_retried_join_is_flagged_again(self):
+        watch_joins.suggest(self.watch, [joined_row(C)], TODAY)
+        rows = [joined_row(C)]
+        self.assertEqual(watch_joins.suggest(self.watch, rows, TODAY), 0)
+        self.assertIs(rows[0]["watch_suggested"], True)
+
+    def test_suggestions_hold_the_lock(self):
+        held = []
+        real = watch_joins._locked
+
+        def spy(path):
+            held.append(str(path))
+            return real(path)
+
+        with mock.patch.object(watch_joins, "_locked", spy):
+            watch_joins.suggest(self.watch, [joined_row(C)], TODAY)
+            watch_joins.approve(self.watch, C, TODAY)
+        self.assertEqual(held, [str(self.joined)] * 2)
+        self.assertTrue(Path(f"{self.joined}.lock").exists())
 
     def test_write_failure_leaves_rows_unflagged(self):
         rows = [joined_row(C)]
@@ -124,6 +157,22 @@ class ReviewTest(Base):
         rows = [joined_row(D)]
         watch_joins.suggest(self.watch, rows, TODAY)
         self.assertNotIn("watch_suggested", rows[0])
+
+    def test_dismissed_channel_stays_out_of_discovery(self):
+        found = self.dir / "found.yaml"
+        slack_watch.write_discovered(found, [
+            {"id": D, "last_active": TODAY, "reason": "posted"}])
+        self.write_watch(discover_from=str(found))
+        self.assertEqual(slack_watch.load(self.watch)["channels"], [A, D])
+        watch_joins.dismiss(self.watch, D, TODAY)
+        self.assertEqual(slack_watch.load(self.watch)["channels"], [A])
+
+    def test_ignored_channel_cannot_be_approved(self):
+        slack_watch.write_joined(self.joined, {"suggested": [
+            {"id": B, "joined": TODAY}]})
+        with self.assertRaises(watch_joins.JoinedError):
+            watch_joins.approve(self.watch, B, TODAY)
+        self.assertEqual(self.ids("suggested"), [B])
 
     def test_dismiss_stops_watching_an_approved_channel(self):
         watch_joins.approve(self.watch, C, TODAY)
@@ -216,6 +265,35 @@ class CheckTest(Base):
         rows = [joined_row(C)]
         suggest(rows)
         self.assertIs(rows[0]["watch_suggested"], True)
+
+
+class CliTest(Base):
+    def run_cli(self, sources, action, channel=None):
+        import daemon
+        routine = {"id": "r", "sources": sources}
+        args = argparse.Namespace(routine="r", action=action, channel=channel)
+        with mock.patch.object(daemon.config, "discover",
+                               return_value=[routine]), \
+                mock.patch.object(daemon.config, "sources",
+                                  side_effect=lambda r: r["sources"]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = daemon.cmd_joined(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_picks_the_watch_with_joined_from(self):
+        watch_joins.suggest(self.watch, [joined_row(C)], TODAY)
+        other = {"kind": "slack", "watch": str(self.dir / "other.yaml")}
+        mine = {"kind": "slack_mcp", "watch": str(self.watch),
+                "_watch_joined_from": str(self.joined)}
+        code, out, _err = self.run_cli([other, mine], "add", C)
+        self.assertEqual((code, out.strip()), (0, f"{C} watched"))
+
+    def test_no_watch_with_joined_from(self):
+        code, _out, err = self.run_cli(
+            [{"kind": "slack_mcp", "watch": str(self.watch)}], "list")
+        self.assertEqual(code, 1)
+        self.assertIn("joined_from", err)
 
 
 class ConfigTest(unittest.TestCase):
