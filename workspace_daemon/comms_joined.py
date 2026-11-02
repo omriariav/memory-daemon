@@ -299,7 +299,11 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
                 infos[channel] = info
     rows = rows_for(ready, names, infos, now)
     if suggest:
-        suggest(rows)
+        try:
+            suggest(rows)
+        except Exception as exc:  # a suggestion never costs the join line
+            log(f"comms inbox: watch suggestions failed: "
+                f"{type(exc).__name__}: {exc}")
     added = record(rows)
     written = ready if added == len(rows) else set()
     save(base_dir, lane, members | written, now,

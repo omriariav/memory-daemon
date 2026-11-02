@@ -309,6 +309,24 @@ class SearchTest(DiscoveryCase):
         self.assertEqual(report["removed"], [CH2])
         self.assertEqual([e["id"] for e in self.stored()], [CH3])
 
+    def test_approved_and_dismissed_joins_take_no_discovered_slot(self):
+        watch = Path(self.dir) / "watch.yaml"
+        joined = Path(self.dir) / "joined.yaml"
+        watch.write_text(f"channels: []\njoined_from: {joined}\n")
+        watch.chmod(0o600)
+        today = datetime.date(2026, 11, 2)
+        slack_watch.write_joined(joined, {
+            "channels": [{"id": CH1, "approved": today}],
+            "dismissed": [{"id": CH2}]})
+        self.search(posted=[
+            {"ch": CH1, "uid": ME, "ts": day_ts(1)},
+            {"ch": CH2, "uid": ME, "ts": day_ts(1)},
+            {"ch": CH3, "uid": ME, "ts": day_ts(1)},
+        ])
+        report = self.run_discovery(watch=str(watch))
+        self.assertEqual(report["added"], [CH3])
+        self.assertEqual([e["id"] for e in self.stored()], [CH3])
+
     def test_dry_run_makes_no_call_and_writes_nothing(self):
         report = slack_discovery.run(self.cfg(), self.dir, dry_run=True)
         self.assertTrue(report["dry_run"])

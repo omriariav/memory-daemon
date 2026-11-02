@@ -82,8 +82,13 @@ def suggest(watch_path, rows, today=None):
         _hand, ignore = slack_watch.hand_written(watch_path)
         with _locked(path):
             lists = slack_watch.read_joined(path)
+            covered = watched | set(ignore)
+            # A suggestion the watch has since come to cover is settled.
+            stale = [e for e in lists["suggested"] if e["id"] in covered]
+            for entry in stale:
+                lists["suggested"].remove(entry)
             pending = {e["id"] for e in lists["suggested"]}
-            known = watched | set(ignore) | {
+            known = covered | {
                 e["id"] for key in slack_watch.JOINED_LISTS
                 for e in lists[key]
             }
@@ -104,7 +109,7 @@ def suggest(watch_path, rows, today=None):
                 fresh.append(row)
                 flag.append(row)
                 known.add(cid)
-            if fresh:
+            if fresh or stale:
                 slack_watch.write_joined(path, lists)
     except (JoinedError, slack_watch.WatchError, OSError) as exc:
         log(f"comms inbox: watch suggestions skipped: {exc}")

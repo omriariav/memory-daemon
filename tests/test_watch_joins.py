@@ -125,6 +125,14 @@ class SuggestTest(Base):
         self.assertEqual(held, [str(self.joined)] * 2)
         self.assertTrue(Path(f"{self.joined}.lock").exists())
 
+    def test_covered_suggestion_is_settled(self):
+        watch_joins.suggest(self.watch, [joined_row(C)], TODAY)
+        self.write_watch(channels=[A, C])
+        rows = [joined_row(C)]
+        watch_joins.suggest(self.watch, rows, TODAY)
+        self.assertNotIn("watch_suggested", rows[0])
+        self.assertEqual(self.ids("suggested"), [])
+
     def test_write_failure_leaves_rows_unflagged(self):
         rows = [joined_row(C)]
         with mock.patch.object(slack_watch, "write_joined",
@@ -223,6 +231,21 @@ class JoinedFileTest(Base):
         with mock.patch.object(slack_watch, "log"):
             self.assertEqual(slack_watch.load(self.watch)["channels"], [A])
 
+    def test_falsy_non_lists_raise(self):
+        for text in ("channels: {}\n", "dismissed: false\n",
+                     "suggested: ''\n"):
+            self.joined.write_text(text)
+            with self.assertRaises(slack_watch.WatchError, msg=text):
+                self.lists()
+
+    def test_joined_ids(self):
+        slack_watch.write_joined(self.joined, {
+            "channels": [{"id": C, "approved": TODAY}],
+            "dismissed": [{"id": D}]})
+        self.assertEqual(slack_watch.joined_ids(self.watch), ([C], [D]))
+        self.joined.write_text("channels: 3\n")
+        self.assertEqual(slack_watch.joined_ids(self.watch), ([], []))
+
     def test_joined_from_must_be_a_path(self):
         self.write_watch(joined_from=3)
         with self.assertRaises(slack_watch.WatchError):
@@ -250,6 +273,27 @@ class CheckTest(Base):
         self.assertEqual(row["channel_id"], C)
         self.assertIs(row["watch_suggested"], True)
         self.assertEqual(self.ids("suggested"), [C])
+
+    def test_a_failing_suggest_never_costs_the_line(self):
+        base = str(self.dir)
+        record = lambda rows: comms_inbox.record(base, rows, 14, NOW)
+
+        def lister(ids, entries=()):
+            return lambda calls: [
+                ids_text(ids) if c["format"] == "ids_only"
+                else full_text(entries) for c in calls]
+
+        def boom(rows):
+            raise RuntimeError("unexpected")
+
+        comms_joined.check(base, LANE, INBOX, lister([A]), None, record,
+                           NOW, boom)
+        with mock.patch.object(comms_joined, "log") as log:
+            added = comms_joined.check(
+                base, LANE, INBOX, lister([A, C], [("new-room", C, False)]),
+                None, record, NOW + 3600, boom)
+        self.assertEqual(added, 1)
+        self.assertIn("watch suggestions failed", log.call_args_list[0].args[0])
 
     def test_slack_mcp_passes_suggest_watch(self):
         cfg = {
@@ -289,6 +333,12 @@ class CliTest(Base):
         code, out, _err = self.run_cli([other, mine], "add", C)
         self.assertEqual((code, out.strip()), (0, f"{C} watched"))
 
+    def test_watch_error_is_shown(self):
+        code, _out, err = self.run_cli(
+            [{"kind": "slack_mcp", "_watch_error": "bad watch"}], "list")
+        self.assertEqual(code, 1)
+        self.assertIn("bad watch", err)
+
     def test_no_watch_with_joined_from(self):
         code, _out, err = self.run_cli(
             [{"kind": "slack_mcp", "watch": str(self.watch)}], "list")
@@ -318,6 +368,22 @@ class ConfigTest(unittest.TestCase):
             "kind": "slack_mcp", "watch": str(target),
             "_watch_joined_from": "x" if joined_from else None}}
         return [direct, channels], str(target)
+
+    def test_non_string_suggest_watch_does_not_crash(self):
+        routines = [{"id": "d", "source": {
+            "kind": "slack_mcp",
+            "comms_inbox": {"joined_channels": True, "suggest_watch": True}}}]
+        self.assertEqual(config.joined_warnings(routines), [])
+
+    def test_lane_without_suggest_watch_is_warned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routines, target = self.routines(tmp, None)
+            routines[0]["source"]["comms_inbox"]["suggest_watch"] = target
+            other = {"id": "other", "source": {
+                "kind": "slack_mcp", "comms_inbox": {"joined_channels": True}}}
+            warnings = config.joined_warnings(routines + [other])
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0].startswith("other: "))
 
     def test_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:

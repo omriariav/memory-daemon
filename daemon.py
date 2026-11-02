@@ -138,8 +138,12 @@ def cmd_joined(args):
         and isinstance(source.get("watch"), str)
     }
     if len(watches) != 1:
+        errors = [s["_watch_error"] for s in config.sources(routine)
+                  if s.get("_watch_error")]
         print(f"{args.routine} needs exactly one watch file with joined_from "
-              f"(found {len(watches)})", file=sys.stderr)
+              f"(found {len(watches)})"
+              + "".join(f"; watch error: {e}" for e in errors),
+              file=sys.stderr)
         return 1
     watch, = watches.values()
     try:

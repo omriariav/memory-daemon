@@ -238,7 +238,8 @@ def read_joined(path):
         )
     seen = set()
     for key, date_key in JOINED_LISTS.items():
-        rows = data.get(key) or []
+        rows = data.get(key)
+        rows = [] if rows is None else rows
         if not isinstance(rows, list):
             raise WatchError(f"joined `{key}` must be a list")
         for row in rows:
@@ -366,6 +367,23 @@ def hand_written(path):
     """(channels, ignore_channels) typed by hand in a watch file."""
     parsed = _parse(path)
     return parsed["channels"], parsed["ignore_channels"]
+
+
+def joined_ids(path):
+    """(approved, dismissed) channel ids of a watch file's `joined_from`.
+
+    Empty when the watch names none or the joined file is unreadable (load()
+    logs that case).
+    """
+    joined_from = _parse(path)["joined_from"]
+    if not joined_from:
+        return [], []
+    try:
+        lists = read_joined(_private_path(joined_from, "joined file"))
+    except WatchError:
+        return [], []
+    return ([e["id"] for e in lists["channels"]],
+            [e["id"] for e in lists["dismissed"]])
 
 
 def dm_sessions_problem(value):
