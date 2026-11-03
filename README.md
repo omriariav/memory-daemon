@@ -1628,7 +1628,11 @@ summary appears some unknown time later, so each meeting is checked
 only when its assets carry a summary with `has_permission` and `has_summary`,
 and their start time is within `match_tolerance_minutes` of the calendar event
 (a recurring meeting number can answer for another occurrence). The recording
-is never read.
+is never read. A meeting you may not read (the tool's permission error, usual
+for another host's meeting) is logged as `no_access` and re-checked on the same
+back-off in case the host shares it; it never fails the run for the other due
+meetings. The run fails only when no call answers at all (the connector is
+down).
 
 The memory source id is `zoom:<meeting uuid>`; the candidate id adds a hash of
 the summary, so a changed summary updates the same entry. Calendar organizer and

@@ -9,7 +9,11 @@ read-only meeting-assets tool for it, one bridge session per run.
 
 A summary shows up some unknown time after the meeting, and only when the host
 shares it. Each ended meeting is re-checked with a doubling back-off for
-`retry_hours`, then dropped. A meeting is captured when the assets carry a
+`retry_hours`, then dropped. A meeting the owner may not read (the tool's
+permission error, e.g. another host's meeting) is `no_access` for that check
+and is re-checked like the others, in case the host shares it later; it never
+fails the run for the other meetings. Only when every call of a session fails
+for another reason does the run fail (the connector is down). A meeting is captured when the assets carry a
 summary we may read; the recording is never used.
 
 Candidate identity has two layers:
@@ -329,8 +333,17 @@ def _call_prompt(tool, calls):
     )
 
 
+NO_ACCESS_RESULT = object()  # the owner may not read this meeting's assets
+NO_ACCESS = re.compile(r"\b403\b|permission denied|code\W+2315", re.IGNORECASE)
+
+
 def _fetch_assets(cfg, numbers):
-    """{meeting number: result text or None}, one bridge session."""
+    """{meeting number: result text, NO_ACCESS_RESULT or None}, one session.
+
+    A failed call is no longer fatal: a permission error marks that meeting,
+    any other failure leaves it None. Raises when no call answered at all and
+    none was a permission error, so a connector outage still fails the run.
+    """
     from . import slack_mcp  # late import: shares the argument comparison
     tool = cfg["assets_tool"]
     calls = [{"meetingId": n} for n in numbers]
@@ -346,6 +359,7 @@ def _fetch_assets(cfg, numbers):
             timeout=max(BRIDGE_TIMEOUT, 60 + 8 * len(calls)),
             attempts=BRIDGE_ATTEMPTS,
             accept_partial=True,
+            required=[],
         )
     except claude_bridge.BridgeError as exc:
         if isinstance(exc, (claude_bridge.BridgeOutage,)
@@ -355,13 +369,22 @@ def _fetch_assets(cfg, numbers):
             f"{exc} ({sleepclock.OUTAGE_NOTE})") from None
     texts = {n: None for n in numbers}
     for result in results:
-        if result["name"] != tool or result.get("is_error"):
+        if result["name"] != tool:
             continue
         for call in calls:
             if slack_mcp.same_args(call, result.get("input")):
-                if texts[call["meetingId"]] is None:
-                    texts[call["meetingId"]] = result["text"]
+                number = call["meetingId"]
+                if not result.get("is_error"):
+                    if texts[number] in (None, NO_ACCESS_RESULT):
+                        texts[number] = result["text"]
+                elif texts[number] is None and NO_ACCESS.search(
+                    str(result.get("text") or "")
+                ):
+                    texts[number] = NO_ACCESS_RESULT
                 break
+    if all(text is None for text in texts.values()):
+        raise claude_bridge.BridgeError(
+            f"tool returned no usable result: {tool}")
     return texts
 
 
@@ -474,7 +497,11 @@ def candidates(source):
         record["checks"] = int(record.get("checks", 0)) + 1
         record["last_check"] = now
         record["next_check"] = now + _interval(cfg, record["checks"])
-        assets = parse_assets(texts.get(record["number"]))
+        text = texts.get(record["number"])
+        if text is NO_ACCESS_RESULT:
+            record["last_result"] = "no_access"
+            continue
+        assets = parse_assets(text)
         if assets is None:
             record["last_result"] = "error"
             continue
