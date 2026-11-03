@@ -14,8 +14,9 @@ shares it. Each ended meeting is re-checked with a doubling back-off for
 re-checked like the others, in case the host shares it later; it never fails
 the run for the other meetings. The run fails when no call yields a result or
 a 2315 (no call made, or every call failed otherwise: the connector is down),
-and results lost across a machine sleep are an outage that charges nothing. A meeting is captured when the assets carry a
-summary we may read; the recording is never used.
+and results lost across a machine sleep are an outage that charges nothing.
+A meeting is captured when the assets carry a summary we may read; the
+recording is never used.
 
 Candidate identity has two layers:
 
@@ -338,7 +339,7 @@ NO_ACCESS_RESULT = object()  # the owner may not read this meeting's assets
 # Only Zoom's per-meeting refusal: a generic 403 (a revoked scope, a blocked
 # tool) must still fail the run.
 NO_ACCESS = re.compile(
-    r"code\W+2315|do not have access to this summary", re.IGNORECASE)
+    r"code\W+2315\b|do not have access to this summary", re.IGNORECASE)
 
 
 def _fetch_assets(cfg, numbers):
