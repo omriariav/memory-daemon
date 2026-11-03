@@ -206,10 +206,50 @@ class ZoomSourceTest(unittest.TestCase):
     def test_every_meeting_without_access_is_not_an_outage(self):
         self.write_calendar([event()])
         self.listing()
-        self.connector.errors["91234567890"] = "Permission denied"
+        self.connector.errors["91234567890"] = (
+            'HTTP 403 Forbidden error: {"code":2315,"message":"Permission '
+            'denied."}')
         self.at(41)
         self.assertEqual(self.listing(), [])
         self.assertEqual(self.meetings()["ev1"]["last_result"], "no_access")
+
+    def test_generic_403_on_every_call_fails_the_run(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        for number in ("91234567890", "91234567891"):
+            self.connector.errors[number] = "HTTP 403 Forbidden: scope revoked"
+        self.at(41)
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.listing()
+
+    def test_empty_session_is_retried_once(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        real = self.connector.__call__
+        sessions = []
+
+        def flaky(prompt, tools, **kwargs):
+            sessions.append(prompt)
+            if len(sessions) == 1:
+                return claude_bridge.ToolResults()
+            return real(prompt, tools, **kwargs)
+
+        self.at(41)
+        with mock.patch.object(claude_bridge, "call_tools", flaky):
+            self.assertEqual(len(self.listing()), 1)
+        self.assertEqual(len(sessions), 2)
+
+    def test_results_lost_to_sleep_are_an_outage(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        self.at(41)
+        with mock.patch.object(zoom_source.sleepclock.Span, "slept",
+                               return_value=True):
+            with self.assertRaises(claude_bridge.BridgeOutage):
+                self.listing()
+        self.assertEqual(self.meetings()["ev2"]["checks"], 0)
 
     def test_connector_outage_still_fails_the_run(self):
         self.write_calendar([event(), event("ev2", number="91234567891")])
