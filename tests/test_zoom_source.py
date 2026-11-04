@@ -55,14 +55,22 @@ class Connector:
 
     def __init__(self):
         self.answers = {}
+        self.errors = {}
         self.calls = []
+        self.kwargs = []
 
     def __call__(self, prompt, tools, **kwargs):
         self.calls.append(prompt)
+        self.kwargs.append(kwargs)
         out = claude_bridge.ToolResults()
         for line in prompt.splitlines():
             if line[:1].isdigit() and ". {" in line:
                 args = json.loads(line.split(". ", 1)[1])
+                error = self.errors.get(args["meetingId"])
+                if error is not None:
+                    out.append({"name": TOOL, "input": args, "text": error,
+                                "is_error": True})
+                    continue
                 text = self.answers.get(args["meetingId"])
                 if text is not None:
                     out.append({"name": TOOL, "input": args, "text": text,
@@ -177,6 +185,89 @@ class ZoomSourceTest(unittest.TestCase):
         state = self.meetings()
         self.assertEqual(state["ev1"]["last_result"], "no_permission")
         self.assertEqual(state["ev2"]["last_result"], "other_instance")
+
+    def test_no_access_meeting_does_not_block_the_others(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        self.connector.errors["91234567891"] = (
+            'HTTP 403 Forbidden error: {"code":2315,"message":"Permission '
+            'denied. You do not have access to this summary or recording or '
+            'transcript."}')
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        self.at(41)
+        found = self.listing()
+        self.assertEqual([c["raw"]["event_id"] for c in found], ["ev1"])
+        self.assertEqual(self.connector.kwargs[-1]["required"], [])
+        state = self.meetings()
+        self.assertEqual(state["ev2"]["last_result"], "no_access")
+        self.assertEqual(state["ev2"]["status"], "tracking")
+        self.assertGreater(state["ev2"]["next_check"], self.now.timestamp())
+
+    def test_every_meeting_without_access_is_not_an_outage(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.errors["91234567890"] = (
+            'HTTP 403 Forbidden error: {"code":2315,"message":"Permission '
+            'denied."}')
+        self.at(41)
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.meetings()["ev1"]["last_result"], "no_access")
+
+    def test_generic_403_on_every_call_fails_the_run(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        for number in ("91234567890", "91234567891"):
+            self.connector.errors[number] = "HTTP 403 Forbidden: scope revoked"
+        self.at(41)
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.listing()
+
+    def test_empty_session_is_retried_once(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        real = self.connector.__call__
+        sessions = []
+
+        def flaky(prompt, tools, **kwargs):
+            sessions.append(prompt)
+            if len(sessions) == 1:
+                return claude_bridge.ToolResults()
+            return real(prompt, tools, **kwargs)
+
+        self.at(41)
+        with mock.patch.object(claude_bridge, "call_tools", flaky):
+            self.assertEqual(len(self.listing()), 1)
+        self.assertEqual(len(sessions), 2)
+
+    def test_results_lost_to_sleep_are_an_outage(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        self.at(41)
+        with mock.patch.object(zoom_source.sleepclock.Span, "slept",
+                               return_value=True):
+            with self.assertRaises(claude_bridge.BridgeOutage):
+                self.listing()
+        self.assertEqual(self.meetings()["ev2"]["checks"], 0)
+
+    def test_connector_outage_still_fails_the_run(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        self.connector.errors["91234567890"] = "HTTP 500 upstream timeout"
+        self.at(41)
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.listing()
+        self.assertEqual(self.meetings()["ev1"]["checks"], 0)
+
+    def test_other_error_on_one_meeting_is_retried(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        self.connector.errors["91234567891"] = "HTTP 500 upstream timeout"
+        self.connector.answers["91234567890"] = assets(summary="Recap.")
+        self.at(41)
+        self.assertEqual(len(self.listing()), 1)
+        self.assertEqual(self.meetings()["ev2"]["last_result"], "error")
 
     def test_summary_becomes_a_candidate_and_settles_on_the_ledger(self):
         self.write_calendar([event()])
