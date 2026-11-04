@@ -1774,6 +1774,25 @@ class CalendarDateLineTest(unittest.TestCase):
                         end="2026-11-02T15:30:00Z")
         self.assertIsNone(self.rule(item, [close, full]))
 
+    def test_generic_title_short_recording_in_two_events(self):
+        item = self.item("Recording \u00b7 2 Nov 2026 at 17:07",
+                         start="15:07", end="15:21")  # 14 of 30 minutes
+        events = [self.ev("p", "Platform Sync", status="declined"),
+                  self.ev("w", "Weekly Product Sync", people=(
+                      "bob@example.com", "carol@example.com"))]
+        picked = self.rule(item, events)
+        self.assertEqual((picked[0]["id"], picked[1]),
+                         ("w", "only non-declined overlapping event"))
+
+    def test_five_minutes_in_an_hour_event_still_resolves(self):
+        item = self.item("New recording", start="15:10", end="15:15")
+        events = [self.ev("p", "Platform Sync", status="declined"),
+                  self.ev("w", "Weekly Product Sync",
+                          end="2026-11-02T16:00:00Z")]
+        picked = self.rule(item, events)
+        self.assertEqual((picked[0]["id"], picked[1]),
+                         ("w", "only non-declined overlapping event"))
+
     def test_tie_break_never_picks_a_conflicting_title(self):
         item = self.item("Budget review", speakers=["Carol Jones"])
         events = [self.ev("a", "Weekly Product Sync"),

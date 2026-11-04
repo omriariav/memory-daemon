@@ -1650,14 +1650,27 @@ def _speaker_overlap(item, candidates):
     return named[0] if len(named) == 1 else None
 
 
-def _tie_break(item, plausible):
+def _tie_break(item, events):
     """Pick among several overlapping events: ``(event, reason)`` or ``None``.
 
-    Only events with another attendee count.  Evidence, in order: the owner
-    declined all but one; exactly one has an invitee who spoke in the
-    recording; one overlaps far more than the runner-up.
+    Only events with another attendee that cover at least half of the
+    recording count, whatever share of the event it fills (people join late
+    and leave early).  Evidence, in order: the owner declined all but one;
+    exactly one has an invitee who spoke in the recording; one overlaps far
+    more than the runner-up.
     """
-    candidates = [event for event in plausible if _has_other_attendee(event)]
+    start = _parse_instant(item["frontmatter"]["mila_recording_start"])
+    end = _parse_instant(item["frontmatter"]["mila_recording_end"])
+    length = max(1.0, (end - start).total_seconds())
+    candidates = [
+        event for event in events
+        if _has_other_attendee(event)
+        and _event_instant(event.get("start")) and _event_instant(event.get("end"))
+        and _overlap_seconds(
+            start, end, _event_instant(event["start"]),
+            _event_instant(event["end"]),
+        ) / length >= 0.5
+    ]
     if len(candidates) < 2:
         return None
     open_ = [event for event in candidates if not _declined(event)]
@@ -1666,8 +1679,6 @@ def _tie_break(item, plausible):
     speaker = _speaker_overlap(item, candidates)
     if speaker:
         return speaker, "speaker overlap"
-    start = _parse_instant(item["frontmatter"]["mila_recording_start"])
-    end = _parse_instant(item["frontmatter"]["mila_recording_end"])
     ranked = sorted(
         (
             (_overlap_seconds(
@@ -1679,7 +1690,7 @@ def _tie_break(item, plausible):
         reverse=True,
     )
     overlaps = [overlap for overlap, _ in ranked[:2]]
-    if overlaps[0] - overlaps[1] >= 0.5 * (end - start).total_seconds():
+    if overlaps[0] - overlaps[1] >= 0.5 * length:
         return candidates[ranked[0][1]], "largest overlap"
     return None
 
@@ -1705,7 +1716,7 @@ def _rule_match(item, events, zone=None):
     # is for the model to judge, never for a rule, unless every other
     # overlapping invite was declined and the title names the one left.
     if any(_declined(event) for event in titled):
-        picked = _tie_break(item, plausible)
+        picked = _tie_break(item, events)
         if picked and picked[0] in titled and picked[1].startswith("only"):
             return picked
         return None
@@ -1742,8 +1753,8 @@ def _rule_match(item, events, zone=None):
         and not _title_conflicts(title, plausible[0])
     ):
         return plausible[0], "sole overlapping event"
-    if len(plausible) > 1:
-        picked = _tie_break(item, plausible)
+    if titled or len(plausible) != 1:
+        picked = _tie_break(item, titled or events)
         if picked and not _title_conflicts(title, picked[0]):
             return picked
     return None
