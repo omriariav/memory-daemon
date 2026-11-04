@@ -1415,6 +1415,15 @@ analyze:
   discarded, and neither it nor transcript text is logged. If Ollama is down,
   slow or returns garbage the recording stays unmatched and is retried next
   run; there is never a silent cloud fallback.
+- Titles are cleaned before comparing: a pasted Calendar date line ("Weekly
+  Sync Monday, November 2⋅17:00 – 17:30"), a "Part 2 -" prefix and Mila's
+  default "Recording · <date> at <time>" title are dropped. A date line that
+  exactly matches one candidate's start and end selects it ("pasted calendar
+  slot") unless the rest of the title names something else. When several
+  events overlap, a rule still decides if the owner declined all but one, or if
+  only one has an invitee who spoke in the recording; otherwise the model
+  decides, now also seeing the owner's RSVP, whether the owner organizes, and
+  the attendee count.
 - Title beats time: a recording title that equals exactly one candidate's
   title selects that event even when the computed interval misses it (a
   copy's `createdAt` can be an import time). The start is the Meet filename

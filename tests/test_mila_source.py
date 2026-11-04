@@ -1638,6 +1638,225 @@ class SavedBeforeDuplicateTest(DuplicateFixture):
         self.assertEqual(match["duplicate_of"], "mila:R")
 
 
+class CalendarDateLineTest(unittest.TestCase):
+    """Titles with a pasted Calendar date line, and the overlap tie-break."""
+
+    ZONE = mila_source.ZoneInfo("Asia/Jerusalem")
+    # Monday 2 Nov 2026, 17:00-17:30 local (UTC+2)
+    START, END = "2026-11-02T15:00:00Z", "2026-11-02T15:30:00Z"
+
+    def setUp(self):
+        mila_source._reset_run()
+
+    def item(self, title, speakers=(), start="15:05", end="15:25"):
+        item = match_item(title=title)
+        item["frontmatter"].update(
+            mila_recording_start=f"2026-11-02T{start}:00Z",
+            mila_recording_end=f"2026-11-02T{end}:00Z",
+            mila_duration_seconds=1200,
+            mila_speaker_names=list(speakers),
+        )
+        return item
+
+    def ev(self, event_id, summary, status="accepted", people=("bob@example.com",),
+           start=None, end=None):
+        found = event(event_id, summary, start=start or self.START,
+                      end=end or self.END)
+        found["response_status"] = status
+        found["attendees"] = [
+            {"email": email, "display_name": mila_source.calendar_cache
+             .name_from_email(email)} for email in people
+        ] + [{"email": "me@example.com", "self": True}]
+        return found
+
+    def rule(self, item, events):
+        return mila_source._rule_match(item, events, self.ZONE)
+
+    def test_clean_title_strips_both_date_line_forms(self):
+        for title in (
+            "Weekly Product Sync Monday, November 2\u22c517:00 \u2013 17:30",
+            "Weekly Product Sync, Monday, 2 Nov 2026 \u00b7 17:00-17:30",
+            "Weekly Product Sync Monday, November 2 \u00b7 17:00\u201317:30",
+        ):
+            self.assertEqual(mila_source.clean_title(title), "Weekly Product Sync")
+
+    def test_clean_title_strips_part_prefix_and_default_title(self):
+        self.assertEqual(
+            mila_source.clean_title("Part 2 - Weekly Product Sync"),
+            "Weekly Product Sync",
+        )
+        self.assertEqual(
+            mila_source.clean_title("Recording \u00b7 29 Oct 2026 at 17:28"), ""
+        )
+        self.assertEqual(mila_source.clean_title("Recording"), "")
+
+    def test_clean_title_leaves_a_normal_title(self):
+        for title in ("Budget review", "Q3 plan: Monday follow-up", "Alpha -- Beta"):
+            self.assertEqual(mila_source.clean_title(title), title)
+
+    def test_pasted_slot_resolves_the_year_and_zone(self):
+        around = mila_source._parse_instant("2026-11-02T15:07:00Z")
+        slot = mila_source.pasted_slot(
+            "Intro, Monday, 2 Nov \u00b7 17:00\u201317:30", self.ZONE, around
+        )
+        self.assertEqual(
+            [mila_source._parse_instant(self.START),
+             mila_source._parse_instant(self.END)], list(slot)
+        )
+        self.assertIsNone(mila_source.pasted_slot(
+            "Intro, Tuesday, 2 Nov \u00b7 17:00\u201317:30", self.ZONE, around
+        ))
+
+    def test_bug_fixture_picks_the_accepted_event(self):
+        item = self.item(
+            "Weekly Product Sync Monday, November 2\u22c517:00 \u2013 17:30",
+            start="15:07", end="15:21",
+        )
+        weekly = self.ev("w", "Weekly Product Sync", people=(
+            "bob@example.com", "carol@example.com"))
+        platform = self.ev("p", "Platform Sync", status="declined")
+        picked = self.rule(item, [platform, weekly])
+        self.assertEqual(picked[0]["id"], "w")
+
+    def test_renamed_title_with_exact_pasted_slot_matches(self):
+        item = self.item("My notes Monday, November 2\u22c517:00 \u2013 17:30")
+        a = self.ev("a", "Weekly Product Sync")
+        b = self.ev("b", "Platform Sync", start="2026-11-02T15:00:00Z",
+                    end="2026-11-02T15:45:00Z")
+        picked = self.rule(item, [a, b])
+        self.assertEqual((picked[0]["id"], picked[1]),
+                         ("a", "pasted calendar slot"))
+
+    def test_conflicting_title_blocks_the_pasted_slot(self):
+        item = self.item("Budget review Monday, November 2\u22c517:00 \u2013 17:30")
+        self.assertIsNone(self.rule(item, [self.ev("a", "Weekly Product Sync")]))
+
+    def test_generic_title_keeps_the_sole_overlap_rule(self):
+        item = self.item("Recording \u00b7 2 Nov 2026 at 17:07")
+        picked = self.rule(item, [self.ev("a", "Weekly Product Sync")])
+        self.assertEqual(picked[1], "sole overlapping event")
+
+    def test_two_accepted_events_without_evidence_go_to_the_model(self):
+        item = self.item("New recording")
+        events = [self.ev("a", "Weekly Product Sync"),
+                  self.ev("b", "Platform Sync", people=("carol@example.com",))]
+        self.assertIsNone(self.rule(item, events))
+
+    def test_speaker_overlap_breaks_the_tie(self):
+        item = self.item("New recording", speakers=["Carol Jones"])
+        events = [self.ev("a", "Weekly Product Sync"),
+                  self.ev("b", "Platform Sync", people=("carol.jones@example.com",))]
+        picked = self.rule(item, events)
+        self.assertEqual((picked[0]["id"], picked[1]), ("b", "speaker overlap"))
+
+    def test_first_name_speaker_must_be_unique(self):
+        item = self.item("New recording", speakers=["Carol"])
+        events = [self.ev("a", "Weekly Product Sync",
+                          people=("carol.jones@example.com",)),
+                  self.ev("b", "Platform Sync", people=("carol.smith@example.com",))]
+        self.assertIsNone(self.rule(item, events))
+
+    def test_only_non_declined_event_wins(self):
+        item = self.item("New recording")
+        events = [self.ev("a", "Weekly Product Sync", status="declined"),
+                  self.ev("b", "Platform Sync", status="tentative")]
+        self.assertEqual(self.rule(item, events)[1],
+                         "only non-declined overlapping event")
+
+    def test_declined_event_is_never_picked_by_speaker_overlap(self):
+        item = self.item("New recording", speakers=["Carol Jones"])
+        events = [self.ev("a", "Weekly Product Sync", status="declined",
+                          people=("carol.jones@example.com",)),
+                  self.ev("b", "Platform Sync"), self.ev("c", "Design Sync")]
+        self.assertIsNone(self.rule(item, events))
+
+    def test_declined_twin_blocks_the_pasted_slot(self):
+        item = self.item("Notes Monday, November 2\u22c517:00 \u2013 17:30")
+        declined = self.ev("d", "Platform Sync", status="declined")
+        accepted = self.ev("a", "Weekly Product Sync",
+                           end="2026-11-02T16:00:00Z")
+        picked = self.rule(item, [declined, accepted])
+        self.assertNotEqual(picked and picked[1], "pasted calendar slot")
+        self.assertNotEqual(picked and picked[0]["id"], "d")
+
+    def test_long_block_the_recording_barely_touches_is_not_evidence(self):
+        item = self.item("Recording \u00b7 2 Nov 2026 at 17:05")  # 20 minutes
+        block = self.ev("b", "Planning Block", end="2026-11-02T21:00:00Z")
+        declined = self.ev("d", "Platform Sync", status="declined",
+                           end="2026-11-02T16:00:00Z")
+        self.assertIsNone(self.rule(item, [block, declined]))
+
+    def test_owner_names_are_not_speaker_evidence(self):
+        item = self.item("New recording", speakers=["Owner Person", "Bob"])
+        a = self.ev("a", "Weekly Product Sync", people=("owner.person@example.com",))
+        b = self.ev("b", "Platform Sync", people=("bob@example.com",))
+        for found in (a, b):
+            found["attendees"][-1]["display_name"] = "Owner Person"
+        picked = self.rule(item, [a, b])
+        self.assertEqual((picked[0]["id"], picked[1]), ("b", "speaker overlap"))
+
+    def test_single_word_speaker_must_be_unique_even_on_exact_local_part(self):
+        item = self.item("New recording", speakers=["Dan"])
+        events = [self.ev("a", "Weekly Product Sync", people=("dan@example.com",)),
+                  self.ev("b", "Platform Sync", people=("dan.cohen@example.com",))]
+        self.assertIsNone(self.rule(item, events))
+
+    def test_clean_title_keeps_words_that_start_like_a_weekday(self):
+        title = "Satellite Nov 2 \u00b7 17:00 \u2013 17:30"
+        self.assertEqual(mila_source.clean_title(title), title)
+
+    def test_no_configured_zone_skips_the_pasted_slot(self):
+        # 17:00 read as UTC would hit this unrelated event exactly.
+        item = self.item("Notes Monday, November 2\u22c517:00 \u2013 17:30")
+        utc = self.ev("u", "Other Meeting", start="2026-11-02T17:00:00Z",
+                      end="2026-11-02T17:30:00Z")
+        self.assertIsNone(mila_source._rule_match(item, [utc]))
+        source = local_source(calendar={"owner_email": "me@example.com"})
+        self.assertIsNone(mila_source._slot_zone(source))
+        self.assertNotIn("pasted_slot", mila_source._match_prompt(item, [utc]))
+        self.assertIsNotNone(mila_source._slot_zone(
+            local_source(calendar_timezone="Asia/Jerusalem")))
+
+    def test_title_match_contradicted_by_its_own_date_line_goes_to_the_model(self):
+        item = self.item(
+            "Product Review Monday, November 2\u22c517:00 \u2013 17:30",
+            start="15:05", end="15:25",
+        )
+        review = self.ev("r", "Product Review", start="2026-11-02T13:00:00Z",
+                         end="2026-11-02T13:30:00Z")
+        other = self.ev("o", "Platform Sync")  # exactly 17:00-17:30 local
+        self.assertIsNone(self.rule(item, [review, other]))
+        # Without a different event in the slot the title match stands.
+        self.assertEqual(self.rule(item, [review])[0]["id"], "r")
+
+    def test_owner_email_name_is_not_speaker_evidence_without_a_self_row(self):
+        item = self.item("New recording", speakers=["Owner"])
+        a = self.ev("a", "Weekly Product Sync", people=("owner@example.com",))
+        b = self.ev("b", "Platform Sync", people=("bob@example.com",))
+        for found in (a, b):
+            found["attendees"] = [p for p in found["attendees"] if not p.get("self")]
+        self.assertIsNone(mila_source._rule_match(
+            item, [a, b], self.ZONE, "owner@example.com"))
+        picked = mila_source._rule_match(item, [a, b], self.ZONE, "")
+        self.assertEqual(picked[1], "speaker overlap")
+
+    def test_tie_break_never_picks_a_conflicting_title(self):
+        item = self.item("Budget review", speakers=["Carol Jones"])
+        events = [self.ev("a", "Weekly Product Sync"),
+                  self.ev("b", "Platform Sync", people=("carol.jones@example.com",))]
+        self.assertIsNone(self.rule(item, events))
+
+    def test_prompt_carries_rsvp_organizer_and_cleaned_title(self):
+        item = self.item("Weekly Product Sync Monday, November 2\u22c517:00 \u2013 17:30")
+        mine = self.ev("a", "Weekly Product Sync", status="organizer")
+        prompt = mila_source._match_prompt(item, [mine], self.ZONE)
+        self.assertIn('"owner_response": "organizer"', prompt)
+        self.assertIn('"owner_is_organizer": true', prompt)
+        self.assertIn('"attendee_count": 2', prompt)
+        self.assertIn('"recording_title_cleaned": "Weekly Product Sync"', prompt)
+        self.assertIn("2026-11-02T17:00:00+02:00", prompt)
+
+
 class StrictRuleTest(unittest.TestCase):
     def setUp(self):
         mila_source._reset_run()
