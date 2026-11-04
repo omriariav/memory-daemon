@@ -1384,13 +1384,48 @@ def fetch(_routine, source, candidate):
     }
 
 
-def _match_prompt(item, events):
+def _owner_is_organizer(event):
+    organizer = event.get("organizer")
+    if isinstance(organizer, dict):
+        organizer = organizer.get("email")
+    mine = {
+        str(person.get("email")).casefold()
+        for person in event.get("attendees") or []
+        if isinstance(person, dict) and person.get("self") and person.get("email")
+    }
+    return event.get("response_status") == "organizer" or (
+        isinstance(organizer, str) and organizer.casefold() in mine
+    )
+
+
+def _match_prompt(item, events, zone=None):
+    title = item.get("title")
     metadata = {
-        "recording_title": item.get("title"),
+        "recording_title": title,
         "recording_start": item["frontmatter"]["mila_recording_start"],
         "recording_end": item["frontmatter"]["mila_recording_end"],
         "duration_seconds": item["frontmatter"]["mila_duration_seconds"],
+        "recording_title_cleaned": clean_title(title),
     }
+    slot = pasted_slot(
+        title, zone or ZoneInfo("UTC"),
+        _parse_instant(item["frontmatter"]["mila_recording_start"]),
+    )
+    if slot:
+        metadata["pasted_slot"] = {
+            "start": slot[0].isoformat(), "end": slot[1].isoformat(),
+        }
+    # The owner's stance on each event is evidence: a declined twin of the
+    # accepted meeting is rarely the one that was recorded.
+    events = [
+        dict(
+            event,
+            owner_response=event.get("response_status"),
+            owner_is_organizer=_owner_is_organizer(event),
+            attendee_count=len(event.get("attendees") or []),
+        )
+        for event in events
+    ]
     return transcripts.match_prompt(
         metadata, events, item.get("_mila_match_excerpt", item["body"][:5000])
     )
@@ -1413,8 +1448,95 @@ def normalize_title(value):
     return " ".join(text.split())
 
 
+_MONTHS = (
+    "january february march april may june july august september october "
+    "november december"
+).split()
+_DATE_LINE = re.compile(
+    r"[\s,]*\b(?P<weekday>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s*"
+    r"(?:(?P<month>[a-z]{3,9})\.?\s+(?P<day>\d{1,2})"
+    r"|(?P<day2>\d{1,2})\s+(?P<month2>[a-z]{3,9})\.?)"
+    r"(?:,?\s+(?P<year>\d{4}))?"
+    r"\s*[\u22c5\u00b7]\s*"
+    r"(?P<h1>\d{1,2}):(?P<m1>\d{2})\s*[-\u2013\u2014]\s*"
+    r"(?P<h2>\d{1,2}):(?P<m2>\d{2})\s*$",
+    re.IGNORECASE,
+)
+_PART_PREFIX = re.compile(r"^\s*part\s*\d+\s*[-\u2013\u2014:]\s*", re.IGNORECASE)
+_DEFAULT_TITLE = re.compile(
+    r"^recording(\s*[\u00b7\u22c5]\s*\d{1,2}\s+\w+\s+\d{4}\s+at\s+\d{1,2}:\d{2})?$",
+    re.IGNORECASE,
+)
+
+
+def _date_line(title):
+    match = _DATE_LINE.search(str(title or ""))
+    if not match:
+        return None
+    month = (match["month"] or match["month2"]).casefold()
+    return match if any(name.startswith(month) for name in _MONTHS) else None
+
+
+def clean_title(value):
+    """A recording title without what Mila or Calendar pasted into it.
+
+    Drops a trailing Google Calendar date line ("Monday, November 2⋅17:00 –
+    17:30"), a leading "Part 2 -" and Mila's default "Recording · 29 Oct 2026
+    at 17:28" title, which is empty (generic) rather than descriptive.
+    """
+    text = str(value or "")
+    found = _date_line(text)
+    if found:
+        text = text[:found.start()]
+    text = _PART_PREFIX.sub("", text).strip()
+    return "" if _DEFAULT_TITLE.match(text) else text
+
+
+def pasted_slot(title, zone, around):
+    """``(start, end)`` of a date line pasted into the title, or ``None``.
+
+    The line carries no year (or an explicit one), so it is resolved to the
+    year nearest the recording ``around``; a weekday that does not fit the
+    date rejects it.
+    """
+    found = _date_line(title)
+    if not found:
+        return None
+    month_name = (found["month"] or found["month2"]).casefold()
+    month = next(
+        i for i, name in enumerate(_MONTHS, 1) if name.startswith(month_name)
+    )
+    day = int(found["day"] or found["day2"])
+    local = around.astimezone(zone)
+    years = [int(found["year"])] if found["year"] else [
+        local.year - 1, local.year, local.year + 1
+    ]
+    best = None
+    for year in years:
+        try:
+            date = datetime.date(year, month, day)
+            start = datetime.datetime(
+                year, month, day, int(found["h1"]), int(found["m1"]), tzinfo=zone
+            )
+            end = datetime.datetime(
+                year, month, day, int(found["h2"]), int(found["m2"]), tzinfo=zone
+            )
+        except ValueError:
+            continue
+        gap = abs((date - local.date()).days)
+        if best is None or gap < best[0]:
+            best = (gap, date, start, end)
+    if best is None or best[3] <= best[2]:
+        return None
+    weekdays = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    if weekdays[best[1].weekday()] != found["weekday"].casefold():
+        return None
+    return best[2], best[3]
+
+
 def titles_match(left, right):
-    a, b = normalize_title(left), normalize_title(right)
+    a = normalize_title(clean_title(left))
+    b = normalize_title(clean_title(right))
     if not a or not b:
         return False
     if a == b or sorted(a.split()) == sorted(b.split()):
@@ -1447,7 +1569,7 @@ def _has_other_attendee(event):
 
 _STOPWORDS = {
     "the", "and", "for", "with", "of", "to", "in", "on", "at", "a", "an",
-    "sync", "meeting", "call", "weekly", "daily", "intro",
+    "sync", "meeting", "call", "weekly", "daily", "intro", "my", "our",
 }
 _GENERIC_TITLE = {
     "new", "recording", "recordings", "voice", "memo", "memos", "untitled",
@@ -1457,7 +1579,7 @@ _GENERIC_TITLE = {
 
 def _meaningful_tokens(value):
     return {
-        token for token in normalize_title(value).split()
+        token for token in normalize_title(clean_title(value)).split()
         if len(token) > 1 and not token.isdigit()
         and token not in _STOPWORDS and token not in _GENERIC_TITLE
     }
@@ -1471,25 +1593,123 @@ def _title_conflicts(title, event):
     )
 
 
-def _rule_match(item, events):
+def _declined(event):
+    return event.get("response_status") == "declined"
+
+
+def _attendee_names(person):
+    """Normalized display name and address local-part of one invitee."""
+    email = str(person.get("email") or "")
+    return {
+        name for name in (
+            normalize_title(person.get("display_name")),
+            normalize_title(email.split("@", 1)[0]),
+        ) if name
+    }
+
+
+def _speaker_overlap(item, candidates):
+    """The one candidate with an invitee named like a Mila speaker, if any.
+
+    A speaker's first name alone counts only when exactly one invitee across
+    the candidates has it.
+    """
+    speakers = {
+        normalize_title(name)
+        for name in item["frontmatter"].get("mila_speaker_names") or []
+    } - {""}
+    if not speakers:
+        return None
+    people = {}
+    for event in candidates:
+        for person in event.get("attendees") or []:
+            if (
+                isinstance(person, dict) and person.get("email")
+                and not person.get("self")
+            ):
+                people[str(person["email"]).casefold()] = _attendee_names(person)
+    firsts = [name.split()[0] for names in people.values() for name in names]
+
+    def hit(person):
+        names = _attendee_names(person)
+        return any(
+            speaker in names
+            or (" " not in speaker and firsts.count(speaker) == 1
+                and any(name.split()[0] == speaker for name in names))
+            for speaker in speakers
+        )
+
+    named = [
+        event for event in candidates
+        if any(
+            isinstance(person, dict) and person.get("email")
+            and not person.get("self") and hit(person)
+            for person in event.get("attendees") or []
+        )
+    ]
+    return named[0] if len(named) == 1 else None
+
+
+def _tie_break(item, plausible):
+    """Pick among several overlapping events: ``(event, reason)`` or ``None``.
+
+    Only events with another attendee count.  Evidence, in order: the owner
+    declined all but one; exactly one has an invitee who spoke in the
+    recording; one overlaps far more than the runner-up.
+    """
+    candidates = [event for event in plausible if _has_other_attendee(event)]
+    if len(candidates) < 2:
+        return None
+    open_ = [event for event in candidates if not _declined(event)]
+    if len(open_) == 1:
+        return open_[0], "only non-declined overlapping event"
+    speaker = _speaker_overlap(item, candidates)
+    if speaker:
+        return speaker, "speaker overlap"
+    start = _parse_instant(item["frontmatter"]["mila_recording_start"])
+    end = _parse_instant(item["frontmatter"]["mila_recording_end"])
+    ranked = sorted(
+        (
+            (_overlap_seconds(
+                start, end, _event_instant(event["start"]),
+                _event_instant(event["end"]),
+            ), index)
+            for index, event in enumerate(candidates)
+        ),
+        reverse=True,
+    )
+    overlaps = [overlap for overlap, _ in ranked[:2]]
+    if overlaps[0] - overlaps[1] >= 0.5 * (end - start).total_seconds():
+        return candidates[ranked[0][1]], "largest overlap"
+    return None
+
+
+def _rule_match(item, events, zone=None):
     """Deterministic match: ``(event, reason)`` or ``None`` when ambiguous.
 
     Title evidence beats time: Mila copies the Calendar event's title, while a
     recording's computed interval can be an import time.  A title that names
-    exactly one candidate selects it even if the interval misses it.  Time
-    alone (sole overlapping event with another attendee) is used only when no
-    candidate's title matches and the recording title does not conflict.
+    exactly one candidate selects it even if the interval misses it.  Next
+    come a Calendar date line pasted into the title (an exact slot), then time
+    alone: the sole overlapping event with another attendee, or, when several
+    overlap, ``_tie_break``.  Time evidence is used only when no candidate's
+    title matches and the recording title does not conflict.
     """
+    title = item.get("title")
     plausible = [event for event in events if _plausible(item, event)]
     titled = [
         event for event in events
-        if titles_match(item.get("title"), event.get("summary"))
+        if titles_match(title, event.get("summary"))
     ]
     # A declined invite may still be the meeting that was recorded, but that
-    # is for the model to judge, never for a rule.
-    if any(event.get("response_status") == "declined" for event in titled):
+    # is for the model to judge, never for a rule, unless every other
+    # overlapping invite was declined and the title names the one left.
+    if any(_declined(event) for event in titled):
+        picked = _tie_break(item, plausible)
+        if picked and picked[0] in titled and picked[1].startswith("only"):
+            return picked
         return None
-    if not _meaningful_tokens(item.get("title")):
+    if not _meaningful_tokens(title):
         # A generic title ("Meeting", "New recording") is not identity: it may
         # only confirm an event the recording's time already supports.
         titled = [event for event in titled if event in plausible]
@@ -1502,14 +1722,30 @@ def _rule_match(item, events):
         both = [event for event in titled if event in plausible]
         if len(both) == 1:
             return both[0], "title and time match"
-        return None
+        plausible = both
+    slot = pasted_slot(
+        title, zone or ZoneInfo("UTC"),
+        _parse_instant(item["frontmatter"]["mila_recording_start"]),
+    )
+    if slot:
+        exact = [
+            event for event in events
+            if (_event_instant(event.get("start")),
+                _event_instant(event.get("end"))) == slot
+        ]
+        if len(exact) == 1 and not _title_conflicts(title, exact[0]):
+            return exact[0], "pasted calendar slot"
     if (
-        len(plausible) == 1
-        and plausible[0].get("response_status") != "declined"
+        len(plausible) == 1 and not titled
+        and not _declined(plausible[0])
         and _has_other_attendee(plausible[0])
-        and not _title_conflicts(item.get("title"), plausible[0])
+        and not _title_conflicts(title, plausible[0])
     ):
         return plausible[0], "sole overlapping event"
+    if len(plausible) > 1:
+        picked = _tie_break(item, plausible)
+        if picked and not _title_conflicts(title, picked[0]):
+            return picked
     return None
 
 
@@ -1535,7 +1771,9 @@ def _model_match(routine, source, item, events):
     reason is discarded (it is unreliable and could echo transcript text).
     """
     cfg = source.get("match")
-    prompt = _match_prompt(item, events)
+    prompt = _match_prompt(
+        item, events, ZoneInfo(source.get("calendar_timezone", "UTC"))
+    )
     ids = {event["id"] for event in events}
     if cfg is None:
         analyze = routine["analyze"]
@@ -1663,7 +1901,8 @@ def match_calendar(routine, source, item):
     ]
     if not events:
         return False, _unmatched("no plausible calendar candidates")
-    ruled = _rule_match(item, events) if source.get("match") else None
+    zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
+    ruled = _rule_match(item, events, zone) if source.get("match") else None
     if ruled is not None:
         event, reason = ruled
         match = {
@@ -1676,7 +1915,6 @@ def match_calendar(routine, source, item):
             return False, match
         event = next(e for e in events if e.get("id") == match["event_id"])
 
-    zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
     state = _run_state()
     prior = _copy_of(item, state["captured"].get(event["id"], []), zone)
     if prior:
