@@ -17,6 +17,7 @@ and summary are appended to the transcript as clearly delimited, unverified
 hints.  The transcript stays the analysis input; hints never change the
 candidate id, so a summary that shows up after capture does not reprocess.
 """
+import collections
 import datetime
 import difflib
 import hashlib
@@ -1453,7 +1454,8 @@ _MONTHS = (
     "november december"
 ).split()
 _DATE_LINE = re.compile(
-    r"[\s,]*\b(?P<weekday>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s*"
+    r"[\s,]*\b(?P<weekday>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?"
+    r"|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b\.?,?\s*"
     r"(?:(?P<month>[a-z]{3,9})\.?\s+(?P<day>\d{1,2})"
     r"|(?P<day2>\d{1,2})\s+(?P<month2>[a-z]{3,9})\.?)"
     r"(?:,?\s+(?P<year>\d{4}))?"
@@ -1529,7 +1531,7 @@ def pasted_slot(title, zone, around):
     if best is None or best[3] <= best[2]:
         return None
     weekdays = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-    if weekdays[best[1].weekday()] != found["weekday"].casefold():
+    if weekdays[best[1].weekday()] != found["weekday"].casefold()[:3]:
         return None
     return best[2], best[3]
 
@@ -1608,34 +1610,47 @@ def _attendee_names(person):
     }
 
 
+ONLY_OPEN = "only non-declined overlapping event"
+
+
 def _speaker_overlap(item, candidates):
     """The one candidate with an invitee named like a Mila speaker, if any.
 
-    A speaker's first name alone counts only when exactly one invitee across
-    the candidates has it.
+    The owner's own names are not evidence.  A single-word speaker counts
+    only when exactly one invitee across the candidates has that first name.
     """
     speakers = {
         normalize_title(name)
         for name in item["frontmatter"].get("mila_speaker_names") or []
     } - {""}
-    if not speakers:
-        return None
-    people = {}
+    people, owner = {}, set()
     for event in candidates:
         for person in event.get("attendees") or []:
-            if (
-                isinstance(person, dict) and person.get("email")
-                and not person.get("self")
-            ):
+            if not isinstance(person, dict) or not person.get("email"):
+                continue
+            if person.get("self"):
+                owner |= _attendee_names(person)
+            else:
                 people[str(person["email"]).casefold()] = _attendee_names(person)
-    firsts = [name.split()[0] for names in people.values() for name in names]
+    owner_firsts = {name.split()[0] for name in owner}
+    speakers = {
+        speaker for speaker in speakers
+        if speaker not in owner
+        and not (" " not in speaker and speaker in owner_firsts)
+    }
+    if not speakers:
+        return None
+    firsts = collections.Counter(
+        first for names in people.values()
+        for first in {name.split()[0] for name in names}
+    )
 
     def hit(person):
         names = _attendee_names(person)
         return any(
-            speaker in names
-            or (" " not in speaker and firsts.count(speaker) == 1
-                and any(name.split()[0] == speaker for name in names))
+            (speaker in names or any(n.split()[0] == speaker for n in names))
+            and firsts[speaker] == 1
+            if " " not in speaker else speaker in names
             for speaker in speakers
         )
 
@@ -1653,46 +1668,37 @@ def _speaker_overlap(item, candidates):
 def _tie_break(item, events):
     """Pick among several overlapping events: ``(event, reason)`` or ``None``.
 
-    Only events with another attendee that cover at least half of the
-    recording count, whatever share of the event it fills (people join late
-    and leave early).  Evidence, in order: the owner declined all but one;
-    exactly one has an invitee who spoke in the recording; one overlaps far
-    more than the runner-up.
+    Only events with another attendee count, and only those that cover at
+    least half of the recording and a quarter of the event (people join late
+    and leave early, but a long block the recording barely touches is not
+    evidence).  A declined invite is never picked here.  Evidence, in order:
+    the owner declined all but one; exactly one of the rest has an invitee
+    who spoke in the recording.
     """
     start = _parse_instant(item["frontmatter"]["mila_recording_start"])
     end = _parse_instant(item["frontmatter"]["mila_recording_end"])
     length = max(1.0, (end - start).total_seconds())
+
+    def covers(event):
+        first, last = _event_instant(event.get("start")), _event_instant(event.get("end"))
+        if not first or not last:
+            return False
+        overlap = _overlap_seconds(start, end, first, last)
+        return (
+            overlap / length >= 0.5
+            and overlap / max(1.0, (last - first).total_seconds()) >= 0.25
+        )
+
     candidates = [
-        event for event in events
-        if _has_other_attendee(event)
-        and _event_instant(event.get("start")) and _event_instant(event.get("end"))
-        and _overlap_seconds(
-            start, end, _event_instant(event["start"]),
-            _event_instant(event["end"]),
-        ) / length >= 0.5
+        event for event in events if _has_other_attendee(event) and covers(event)
     ]
     if len(candidates) < 2:
         return None
     open_ = [event for event in candidates if not _declined(event)]
     if len(open_) == 1:
-        return open_[0], "only non-declined overlapping event"
-    speaker = _speaker_overlap(item, candidates)
-    if speaker:
-        return speaker, "speaker overlap"
-    ranked = sorted(
-        (
-            (_overlap_seconds(
-                start, end, _event_instant(event["start"]),
-                _event_instant(event["end"]),
-            ), index)
-            for index, event in enumerate(candidates)
-        ),
-        reverse=True,
-    )
-    overlaps = [overlap for overlap, _ in ranked[:2]]
-    if overlaps[0] - overlaps[1] >= 0.5 * length:
-        return candidates[ranked[0][1]], "largest overlap"
-    return None
+        return open_[0], ONLY_OPEN
+    speaker = _speaker_overlap(item, open_)
+    return (speaker, "speaker overlap") if speaker else None
 
 
 def _rule_match(item, events, zone=None):
@@ -1717,7 +1723,7 @@ def _rule_match(item, events, zone=None):
     # overlapping invite was declined and the title names the one left.
     if any(_declined(event) for event in titled):
         picked = _tie_break(item, events)
-        if picked and picked[0] in titled and picked[1].startswith("only"):
+        if picked and picked[0] in titled and picked[1] == ONLY_OPEN:
             return picked
         return None
     if not _meaningful_tokens(title):
@@ -1744,6 +1750,10 @@ def _rule_match(item, events, zone=None):
             if (_event_instant(event.get("start")),
                 _event_instant(event.get("end"))) == slot
         ]
+        # A declined twin at the same slot makes the slot ambiguous.
+        if any(_declined(event) for event in exact):
+            exact = []
+        exact = [event for event in exact if _has_other_attendee(event)]
         if len(exact) == 1 and not _title_conflicts(title, exact[0]):
             return exact[0], "pasted calendar slot"
     if (
