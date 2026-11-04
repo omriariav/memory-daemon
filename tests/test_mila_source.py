@@ -1805,6 +1805,41 @@ class CalendarDateLineTest(unittest.TestCase):
         title = "Satellite Nov 2 \u00b7 17:00 \u2013 17:30"
         self.assertEqual(mila_source.clean_title(title), title)
 
+    def test_no_configured_zone_skips_the_pasted_slot(self):
+        # 17:00 read as UTC would hit this unrelated event exactly.
+        item = self.item("Notes Monday, November 2\u22c517:00 \u2013 17:30")
+        utc = self.ev("u", "Other Meeting", start="2026-11-02T17:00:00Z",
+                      end="2026-11-02T17:30:00Z")
+        self.assertIsNone(mila_source._rule_match(item, [utc]))
+        source = local_source(calendar={"owner_email": "me@example.com"})
+        self.assertIsNone(mila_source._slot_zone(source))
+        self.assertNotIn("pasted_slot", mila_source._match_prompt(item, [utc]))
+        self.assertIsNotNone(mila_source._slot_zone(
+            local_source(calendar_timezone="Asia/Jerusalem")))
+
+    def test_title_match_contradicted_by_its_own_date_line_goes_to_the_model(self):
+        item = self.item(
+            "Product Review Monday, November 2\u22c517:00 \u2013 17:30",
+            start="15:05", end="15:25",
+        )
+        review = self.ev("r", "Product Review", start="2026-11-02T13:00:00Z",
+                         end="2026-11-02T13:30:00Z")
+        other = self.ev("o", "Platform Sync")  # exactly 17:00-17:30 local
+        self.assertIsNone(self.rule(item, [review, other]))
+        # Without a different event in the slot the title match stands.
+        self.assertEqual(self.rule(item, [review])[0]["id"], "r")
+
+    def test_owner_email_name_is_not_speaker_evidence_without_a_self_row(self):
+        item = self.item("New recording", speakers=["Owner"])
+        a = self.ev("a", "Weekly Product Sync", people=("owner@example.com",))
+        b = self.ev("b", "Platform Sync", people=("bob@example.com",))
+        for found in (a, b):
+            found["attendees"] = [p for p in found["attendees"] if not p.get("self")]
+        self.assertIsNone(mila_source._rule_match(
+            item, [a, b], self.ZONE, "owner@example.com"))
+        picked = mila_source._rule_match(item, [a, b], self.ZONE, "")
+        self.assertEqual(picked[1], "speaker overlap")
+
     def test_tie_break_never_picks_a_conflicting_title(self):
         item = self.item("Budget review", speakers=["Carol Jones"])
         events = [self.ev("a", "Weekly Product Sync"),

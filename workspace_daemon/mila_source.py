@@ -1408,8 +1408,8 @@ def _match_prompt(item, events, zone=None):
         "duration_seconds": item["frontmatter"]["mila_duration_seconds"],
         "recording_title_cleaned": clean_title(title),
     }
-    slot = pasted_slot(
-        title, zone or ZoneInfo("UTC"),
+    slot = zone and pasted_slot(
+        title, zone,
         _parse_instant(item["frontmatter"]["mila_recording_start"]),
     )
     if slot:
@@ -1613,7 +1613,7 @@ def _attendee_names(person):
 ONLY_OPEN = "only non-declined overlapping event"
 
 
-def _speaker_overlap(item, candidates):
+def _speaker_overlap(item, candidates, owner_email=""):
     """The one candidate with an invitee named like a Mila speaker, if any.
 
     The owner's own names are not evidence.  A single-word speaker counts
@@ -1624,6 +1624,9 @@ def _speaker_overlap(item, candidates):
         for name in item["frontmatter"].get("mila_speaker_names") or []
     } - {""}
     people, owner = {}, set()
+    local = normalize_title(str(owner_email or "").split("@", 1)[0])
+    if local:  # the owner may have no ``self`` row on the event
+        owner.add(local)
     for event in candidates:
         for person in event.get("attendees") or []:
             if not isinstance(person, dict) or not person.get("email"):
@@ -1665,7 +1668,7 @@ def _speaker_overlap(item, candidates):
     return named[0] if len(named) == 1 else None
 
 
-def _tie_break(item, events):
+def _tie_break(item, events, owner_email=""):
     """Pick among several overlapping events: ``(event, reason)`` or ``None``.
 
     Only events with another attendee count, and only those that cover at
@@ -1697,11 +1700,21 @@ def _tie_break(item, events):
     open_ = [event for event in candidates if not _declined(event)]
     if len(open_) == 1:
         return open_[0], ONLY_OPEN
-    speaker = _speaker_overlap(item, open_)
+    speaker = _speaker_overlap(item, open_, owner_email)
     return (speaker, "speaker overlap") if speaker else None
 
 
-def _rule_match(item, events, zone=None):
+def _slot_zone(source):
+    """The display zone, or ``None`` when unset: a date line is then not read."""
+    name = source.get("calendar_timezone")
+    return ZoneInfo(name) if name else None
+
+
+def _slot_of(event):
+    return _event_instant(event.get("start")), _event_instant(event.get("end"))
+
+
+def _rule_match(item, events, zone=None, owner_email=""):
     """Deterministic match: ``(event, reason)`` or ``None`` when ambiguous.
 
     Title evidence beats time: Mila copies the Calendar event's title, while a
@@ -1722,15 +1735,32 @@ def _rule_match(item, events, zone=None):
     # is for the model to judge, never for a rule, unless every other
     # overlapping invite was declined and the title names the one left.
     if any(_declined(event) for event in titled):
-        picked = _tie_break(item, events)
+        picked = _tie_break(item, events, owner_email)
         if picked and picked[0] in titled and picked[1] == ONLY_OPEN:
             return picked
         return None
+    slot = zone and pasted_slot(
+        title, zone,
+        _parse_instant(item["frontmatter"]["mila_recording_start"]),
+    )
+
+    def contradicted(event):
+        """The title names this event but its date line fits another one."""
+        if not slot or _slot_of(event) == slot:
+            return False
+        return len([
+            other for other in events
+            if other is not event and _slot_of(other) == slot
+            and _has_other_attendee(other)
+        ]) == 1
+
     if not _meaningful_tokens(title):
         # A generic title ("Meeting", "New recording") is not identity: it may
         # only confirm an event the recording's time already supports.
         titled = [event for event in titled if event in plausible]
     if len(titled) == 1:
+        if contradicted(titled[0]):
+            return None
         reason = (
             "title and time match" if titled[0] in plausible else "title match"
         )
@@ -1738,18 +1768,12 @@ def _rule_match(item, events, zone=None):
     if titled:
         both = [event for event in titled if event in plausible]
         if len(both) == 1:
+            if contradicted(both[0]):
+                return None
             return both[0], "title and time match"
         plausible = both
-    slot = pasted_slot(
-        title, zone or ZoneInfo("UTC"),
-        _parse_instant(item["frontmatter"]["mila_recording_start"]),
-    )
     if slot:
-        exact = [
-            event for event in events
-            if (_event_instant(event.get("start")),
-                _event_instant(event.get("end"))) == slot
-        ]
+        exact = [event for event in events if _slot_of(event) == slot]
         # A declined twin at the same slot makes the slot ambiguous.
         if any(_declined(event) for event in exact):
             exact = []
@@ -1764,7 +1788,7 @@ def _rule_match(item, events, zone=None):
     ):
         return plausible[0], "sole overlapping event"
     if titled or len(plausible) != 1:
-        picked = _tie_break(item, titled or events)
+        picked = _tie_break(item, titled or events, owner_email)
         if picked and not _title_conflicts(title, picked[0]):
             return picked
     return None
@@ -1792,9 +1816,7 @@ def _model_match(routine, source, item, events):
     reason is discarded (it is unreliable and could echo transcript text).
     """
     cfg = source.get("match")
-    prompt = _match_prompt(
-        item, events, ZoneInfo(source.get("calendar_timezone", "UTC"))
-    )
+    prompt = _match_prompt(item, events, _slot_zone(source))
     ids = {event["id"] for event in events}
     if cfg is None:
         analyze = routine["analyze"]
@@ -1923,7 +1945,11 @@ def match_calendar(routine, source, item):
     if not events:
         return False, _unmatched("no plausible calendar candidates")
     zone = ZoneInfo(source.get("calendar_timezone", "UTC"))
-    ruled = _rule_match(item, events, zone) if source.get("match") else None
+    owner = (source.get("calendar") or {}).get("owner_email")
+    ruled = (
+        _rule_match(item, events, _slot_zone(source), owner)
+        if source.get("match") else None
+    )
     if ruled is not None:
         event, reason = ruled
         match = {
