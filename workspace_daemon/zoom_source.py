@@ -452,7 +452,16 @@ def summary_of(assets, record, cfg):
 # title, and a matching doc's markdown is used as the summary. The doc is
 # matched by exact (case-folded) name and, when the search result carries a
 # time, by that time lying in the meeting's window. Two or more matches are
-# refused, never guessed.
+# refused, never guessed. A doc whose search hit carries no timestamp is never
+# matched: a recurring meeting reuses its title, so a title alone cannot tell
+# today's doc from a previous session's.
+
+# A doc counts when one of its timestamps is in
+# [start - HUB_DOC_LEAD_SECONDS, end + HUB_DOC_GRACE_SECONDS]: a short lead for
+# notes opened as the meeting starts, and a grace after the end for notes saved
+# late, short enough that the next session of a daily meeting stays out.
+HUB_DOC_LEAD_SECONDS = 15 * 60
+HUB_DOC_GRACE_SECONDS = 2 * 3600
 
 _DOC_URL = re.compile(r"https?://[\w.-]*zoom[\w.-]*/doc/([A-Za-z0-9_-]{10,40})")
 _TIME_KEY = re.compile(r"time|date|modified|created|updated", re.IGNORECASE)
@@ -477,11 +486,14 @@ def _walk(value):
             yield from _walk(child)
 
 
-def hub_doc_matches(text, title, start, end, tolerance):
+def hub_doc_matches(text, title, start, end, skipped=None):
     """Doc ids in a search result that plausibly are this meeting's summary.
 
-    `title` is compared by exact case-folded name. A hit that carries any ISO
-    timestamp must have one inside [start - tolerance, end + one day].
+    `title` is compared by exact case-folded name. A hit must carry a
+    timezone-aware ISO timestamp inside
+    [start - HUB_DOC_LEAD_SECONDS, end + HUB_DOC_GRACE_SECONDS]. A title match
+    without any such timestamp is never accepted; its doc id is appended to
+    `skipped` (when given) and logged.
     """
     wanted = _norm_title(title)
     if not wanted or not isinstance(text, str):
@@ -510,8 +522,15 @@ def hub_doc_matches(text, title, start, end, tolerance):
             if isinstance(v, str) and _TIME_KEY.search(k)
         ]
         stamps = [t for t in stamps if t is not None]
-        if stamps and not any(
-            start - tolerance <= t <= end + 86400 for t in stamps
+        if not stamps:
+            log(f"zoom hub: skipping doc {doc_id}: title matches but it has "
+                "no timestamp")
+            if skipped is not None:
+                skipped.append(doc_id)
+            continue
+        if not any(
+            start - HUB_DOC_LEAD_SECONDS <= t <= end + HUB_DOC_GRACE_SECONDS
+            for t in stamps
         ):
             continue
         if doc_id not in found:
@@ -581,11 +600,10 @@ def hub_summary(cfg, record):
     result = _call_one(cfg, search_tool, {"query": title})
     if result is None or result.get("is_error"):
         return None, "hub_search_failed"
-    ids = hub_doc_matches(
-        result["text"], title, start, end,
-        cfg["match_tolerance_minutes"] * 60)
+    untimed = []
+    ids = hub_doc_matches(result["text"], title, start, end, untimed)
     if not ids:
-        return None, "hub_no_match"
+        return None, "hub_untimed" if untimed else "hub_no_match"
     if len(ids) > 1:
         return None, "hub_ambiguous"
     doc = _call_one(
@@ -659,6 +677,7 @@ def candidates(source):
         save_state(meetings)
         raise
     ready = 0
+    untimed = 0
     for _, event_id in due:
         record = meetings[event_id]
         record["checks"] = int(record.get("checks", 0)) + 1
@@ -686,6 +705,7 @@ def candidates(source):
             text, doc_id = hub_summary(cfg, record)
             if text is None:
                 record["last_result"] = f"{record['last_result']}+{doc_id}"
+                untimed += doc_id == "hub_untimed"
             else:
                 uuid = f"doc-{doc_id}"
                 assets = dict(assets, topic=assets.get("topic") or record.get("title"))
@@ -719,7 +739,9 @@ def candidates(source):
         })
     save_state(meetings)
     log(f"zoom: {tracking} meeting(s) tracked ({added} new), {len(due)} "
-        f"checked, {ready} summary(ies) ready")
+        f"checked, {ready} summary(ies) ready"
+        + (f", {untimed} hub doc match(es) skipped for no timestamp"
+           if untimed else ""))
     return out
 
 

@@ -411,20 +411,55 @@ class HubParsingTest(unittest.TestCase):
                      "'file_content': 12"):
             self.assertIsNone(zoom_source.parse_hub_content(text))
 
-    def test_match_by_exact_title_and_time_window(self):
+    def window(self):
         start = T0.timestamp()
-        end = start + 1800
+        return start, start + 1800
+
+    def match(self, text, title="Weekly sync", skipped=None):
+        start, end = self.window()
+        return zoom_source.hub_doc_matches(text, title, start, end, skipped)
+
+    def test_doc_inside_the_window_matches(self):
         inside = search_result(when=iso(T0 + datetime.timedelta(minutes=40)))
+        self.assertEqual(self.match(inside, "weekly  SYNC"), [DOC_ID])
+
+    def test_doc_from_last_week_does_not_match(self):
         stale = search_result(when=iso(T0 - datetime.timedelta(days=7)))
-        match = zoom_source.hub_doc_matches
-        self.assertEqual(match(inside, "weekly  SYNC", start, end, 7200),
-                         [DOC_ID])
-        self.assertEqual(match(stale, "Weekly sync", start, end, 7200), [])
-        self.assertEqual(
-            match(search_result("Other"), "Weekly sync", start, end, 7200), [])
-        self.assertEqual(
-            match(search_result(), "Weekly sync", start, end, 7200), [DOC_ID])
-        self.assertEqual(match("not json", "Weekly sync", start, end, 7200), [])
+        self.assertEqual(self.match(stale), [])
+
+    def test_doc_without_a_timestamp_is_skipped_and_reported(self):
+        skipped = []
+        self.assertEqual(self.match(search_result(), skipped=skipped), [])
+        self.assertEqual(skipped, [DOC_ID])
+        naive = search_result(when="2026-07-01T10:20:00")
+        self.assertEqual(self.match(naive), [])
+
+    def test_doc_saved_within_the_grace_after_the_end_matches(self):
+        end = T0 + datetime.timedelta(minutes=30)
+        late = search_result(when=iso(end + datetime.timedelta(minutes=110)))
+        self.assertEqual(self.match(late), [DOC_ID])
+        too_late = search_result(when=iso(end + datetime.timedelta(hours=3)))
+        self.assertEqual(self.match(too_late), [])
+        early = search_result(when=iso(T0 - datetime.timedelta(minutes=10)))
+        self.assertEqual(self.match(early), [DOC_ID])
+        too_early = search_result(when=iso(T0 - datetime.timedelta(hours=1)))
+        self.assertEqual(self.match(too_early), [])
+
+    def test_timezone_aware_timestamps_compare_correctly(self):
+        plus3 = datetime.timezone(datetime.timedelta(hours=3))
+        inside = search_result(
+            when=iso((T0 + datetime.timedelta(minutes=20)).astimezone(plus3)))
+        self.assertEqual(self.match(inside), [DOC_ID])
+        # The same wall clock without the offset conversion is 3h off.
+        wrong = search_result(when="2026-07-01T10:20:00+03:00")
+        self.assertEqual(self.match(wrong), [])
+        zulu = search_result(when="2026-07-01T10:20:00Z")
+        self.assertEqual(self.match(zulu), [DOC_ID])
+
+    def test_other_titles_and_bad_json_never_match(self):
+        when = iso(T0 + datetime.timedelta(minutes=10))
+        self.assertEqual(self.match(search_result("Other", when)), [])
+        self.assertEqual(self.match("not json"), [])
 
 
 class HubFallbackTest(unittest.TestCase):
@@ -444,7 +479,8 @@ class HubFallbackTest(unittest.TestCase):
         self.connector = Connector()
         self.now = T0 - datetime.timedelta(hours=1)
         self.hub_calls = []
-        self.search_text = search_result()
+        self.search_text = search_result(
+            when=iso(T0 + datetime.timedelta(minutes=20)))
         self.content_text = error_payload(DOC_BODY)
 
         def dispatch(prompt, tools, **kwargs):
@@ -521,10 +557,19 @@ class HubFallbackTest(unittest.TestCase):
         self.assertEqual(self.meetings()["ev1"]["last_result"],
                          "no_summary+hub_no_match")
 
+    def test_untimed_doc_is_not_used(self):
+        self.search_text = search_result()
+        self.ready()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual([c[0] for c in self.hub_calls], [SEARCH_TOOL])
+        self.assertEqual(self.meetings()["ev1"]["last_result"],
+                         "no_summary+hub_untimed")
+
     def test_two_matching_docs_are_refused(self):
-        first = json.loads(search_result(doc_id=DOC_ID))["data"][0]
-        second = json.loads(
-            search_result(doc_id="ZyXwVuTsRqPoNmLkJiHgFe"))["data"][0]
+        when = iso(T0 + datetime.timedelta(minutes=40))
+        first = json.loads(search_result(when=when, doc_id=DOC_ID))["data"][0]
+        second = json.loads(search_result(
+            when=when, doc_id="ZyXwVuTsRqPoNmLkJiHgFe"))["data"][0]
         self.search_text = json.dumps({"data": [first, second]})
         self.ready()
         self.assertEqual(self.listing(), [])
