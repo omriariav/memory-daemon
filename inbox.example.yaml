@@ -16,6 +16,13 @@ bidi_mode: auto
 # not the first one signed in to your browser.
 gmail_account: 0
 
+# Daemon alerts are urgent only while they are relevant. An alert older than
+# this many hours drops to the FYI section (1 to 168). An alert whose routine
+# (attention:*) or connector (connector:*) has a later success on record is
+# resolved: hidden, and shown under FYI when you press R. Only the newest
+# alert per key is listed. Details in docs/inbox.md.
+alert_urgent_max_age_h: 6
+
 sources:
   # Built-in: state/events.jsonl (plus the .1 rotation), read-only.
   - name: events

@@ -14,6 +14,7 @@ from collections import namedtuple
 from datetime import datetime, timezone
 
 from . import items as itm
+from .alertstate import Recovery
 
 SourceResult = namedtuple(
     "SourceResult", "name items stale age_min error", defaults=(None,)
@@ -23,6 +24,7 @@ EVENTS_FILE = "events.jsonl"
 MAX_EVENT_LINE = 64 * 1024
 MAX_EVENTS_BYTES = 16 * 1024 * 1024
 DEFAULT_WINDOW_H = 48.0
+DEFAULT_ALERT_MAX_AGE_H = 6.0
 STDERR_TAIL = 200       # characters of stderr shown in an error
 STDERR_KEEP = 64 * 1024  # bytes of stderr kept while the child runs
 
@@ -227,12 +229,33 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         sender=sender, where=where, gist=gist, ts=ts,
         link=link, thread=thread, draft=None,
         actions=actions,
-        meta={"source_id": _text(event.get("source_id")), "kind": _text(kind)},
+        meta=dict({"source_id": _text(event.get("source_id")),
+                   "kind": _text(kind)},
+                  **({"key": key} if key else {})),
     )
 
 
+def _alert_state(item, event, now, max_age_h, recovery):
+    """Apply the alert rules to one alert item (see docs/inbox.md).
+
+    Resolved (a later success is recorded): fyi, flagged `meta.resolved` so
+    the UI hides it unless asked. Older than `max_age_h`: fyi, not urgent.
+    """
+    key = item["meta"].get("key", "")
+    details = event.get("details") if isinstance(event.get("details"), dict) \
+        else {}
+    if key and recovery.resolved(key, details, item["ts"]):
+        item = dict(item, section="fyi", urgency="digest",
+                    meta=dict(item["meta"], resolved=True))
+    elif (item["section"] == "urgent"
+          and now - item["ts"] > float(max_age_h) * 3600):
+        item = dict(item, section="fyi", urgency="digest")
+    return item
+
+
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
-                rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0):
+                rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0,
+                alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H):
     """The built-in source: recent events as items. Never raises."""
     now = time.time() if now is None else now
     try:
@@ -251,9 +274,24 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
             continue
         sid = item["meta"].get("source_id") or item["id"]
         prev = latest.get(sid)
-        if prev is None or item["ts"] >= prev["ts"]:
-            latest[sid] = item
-    rows = sorted(latest.values(), key=lambda i: i["ts"], reverse=True)
+        if prev is None or item["ts"] >= prev[0]["ts"]:
+            latest[sid] = (item, event)
+    recovery = Recovery(base_dir, now)
+    rows, alerts = [], {}
+    for item, event in latest.values():
+        if item["source"] == "alert":
+            # The newest alert per key wins, whatever its source_id.
+            key = item["meta"].get("key")
+            if key:
+                prev = alerts.get(key)
+                if prev is None or item["ts"] >= prev[0]["ts"]:
+                    alerts[key] = (item, event)
+                continue
+            item = _alert_state(item, event, now, alert_max_age_h, recovery)
+        rows.append(item)
+    rows.extend(_alert_state(item, event, now, alert_max_age_h, recovery)
+                for item, event in alerts.values())
+    rows.sort(key=lambda i: i["ts"], reverse=True)
     newest = max((i["ts"] for i in rows), default=None)
     age = None if newest is None else max((now - newest) / 60.0, 0.0)
     return SourceResult(name, rows, False, age, None)
@@ -424,7 +462,10 @@ def collect(settings, base_dir, now=None):
         if src["type"] == "events":
             res = load_events(base_dir, now=now, window_h=src["window_h"],
                               rules=src["urgent"], name=src["name"],
-                              gmail_account=settings["gmail_account"])
+                              gmail_account=settings["gmail_account"],
+                              alert_max_age_h=settings.get(
+                                  "alert_urgent_max_age_h",
+                                  DEFAULT_ALERT_MAX_AGE_H))
         else:
             res = run_command_source(src["name"], src["argv"], src["timeout_s"])
         kept = [i for i in res.items if i["id"] not in seen]

@@ -421,6 +421,205 @@ class CommandSourceTest(unittest.TestCase):
         self.assertIn("bad response", out["message"])
 
 
+class AlertRulesTest(unittest.TestCase):
+    """Stale and recovered daemon alerts (synthetic run.log and usage log)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def alert(self, key, ago_h, **details):
+        return ev(f"daemon:{key}-{ago_h}", "alert", f"alert {key}", ago_h=ago_h,
+                  details=dict({"key": key}, **details))
+
+    def attention(self, routine, ago_h, issues=("last run",)):
+        return self.alert(f"attention:{routine}", ago_h, routine=routine,
+                          issues=list(issues))
+
+    def run_log(self, *lines):
+        logs = self.base / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "run.log").write_text("".join(line + "\n" for line in lines))
+
+    def usage(self, *entries):
+        state = self.base / "state"
+        state.mkdir(exist_ok=True)
+        (state / "claude-usage.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in entries))
+
+    def load(self, **kw):
+        res = sources.load_events(self.base, now=NOW, **kw)
+        return {i["meta"].get("key", i["gist"]): i for i in res.items}
+
+    def test_old_alert_drops_to_fyi_and_the_age_is_configurable(self):
+        write_events(self.base, [self.attention("a", 7), self.attention("b", 5)])
+        got = self.load()
+        self.assertEqual((got["attention:a"]["section"], got["attention:a"]["urgency"]),
+                         ("fyi", "digest"))
+        self.assertEqual(got["attention:b"]["section"], "urgent")
+        self.assertNotIn("resolved", got["attention:a"]["meta"])
+        got = self.load(alert_max_age_h=8)
+        self.assertEqual(got["attention:a"]["section"], "urgent")
+        got = self.load(alert_max_age_h=1)
+        self.assertEqual(got["attention:b"]["section"], "fyi")
+
+    def test_collect_passes_the_setting_through(self):
+        write_events(self.base, [self.attention("a", 3)])
+        cfg = settings.validate({"alert_urgent_max_age_h": 2})
+        (res,) = sources.collect(cfg, self.base, now=NOW)
+        self.assertEqual(res.items[0]["section"], "fyi")
+        (res,) = sources.collect(settings.default_settings(), self.base, now=NOW)
+        self.assertEqual(res.items[0]["section"], "urgent")
+
+    def test_recovered_routine_alert_is_resolved(self):
+        write_events(self.base, [self.attention("a", 3), self.attention("b", 3)])
+        self.run_log(
+            f"{iso(-2)} tick: due=a, b",
+            f"{iso(-2)} routine=b source ERROR: down",
+            f"{iso(-2)} tick done: 0 processed, 0 already-seen, 1 error(s)",
+            f"{iso(-1)} tick: due=a, b",
+            f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)",
+            f"{iso(-0.5)} tick: due=b",
+            f"{iso(-0.5)} routine=b source ERROR: down again",
+            f"{iso(-0.5)} tick done: 0 processed, 0 already-seen, 1 error(s)")
+        got = self.load()
+        self.assertTrue(got["attention:a"]["meta"]["resolved"])
+        self.assertEqual(got["attention:a"]["section"], "fyi")
+        self.assertNotIn("resolved", got["attention:b"]["meta"])  # failed again
+        self.assertEqual(got["attention:b"]["section"], "urgent")
+
+    def test_success_before_the_alert_does_not_resolve_it(self):
+        write_events(self.base, [self.attention("a", 1)])
+        self.run_log(f"{iso(-2)} tick: due=a",
+                     f"{iso(-2)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        self.assertNotIn("resolved", self.load()["attention:a"]["meta"])
+
+    def test_maintenance_routine_recovery_uses_the_same_log(self):
+        write_events(self.base, [self.attention("calendar-cache", 3, ("incomplete",)),
+                                 self.attention("sheet-watch", 3, ("2 last-run errors",))])
+        self.run_log(
+            f"{iso(-1)} tick[x1](calendar): due=calendar-cache",
+            f"{iso(-1)} tick[x1](calendar) done: 0 processed, 0 already-seen, 0 error(s)",
+            f"{iso(-1)} tick[x2](maintenance): due=sheet-watch",
+            f"{iso(-1)} tick[x2](maintenance) done: 0 processed, 0 already-seen, 0 error(s)")
+        got = self.load()
+        self.assertTrue(got["attention:calendar-cache"]["meta"]["resolved"])
+        self.assertTrue(got["attention:sheet-watch"]["meta"]["resolved"])
+
+    def test_ledger_issues_are_not_cleared_by_a_clean_tick(self):
+        write_events(self.base, [self.attention("a", 3, ("2 memory sink",)),
+                                 self.attention("b", 3, ("last run", "1 Gmail triage")),
+                                 self.attention("c", 3, ())])
+        self.run_log(f"{iso(-1)} tick: due=a, b, c",
+                     f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        for key, item in self.load().items():
+            self.assertNotIn("resolved", item["meta"], key)
+
+    def test_newest_alert_per_key_wins(self):
+        write_events(self.base, [
+            self.alert("attention:a", 5, routine="a", issues=["last run"]),
+            ev("daemon:other-id", "alert", "newer alert text", ago_h=1,
+               details={"key": "attention:a", "routine": "a", "issues": ["last run"]}),
+            self.alert("budget-hit:2023-11-15", 4)])
+        res = sources.load_events(self.base, now=NOW)
+        gists = sorted(i["gist"] for i in res.items)
+        self.assertEqual(gists, ["alert budget-hit:2023-11-15", "newer alert text"])
+
+    def test_newest_alert_is_judged_not_the_old_one(self):
+        # The old alert predates the success; the newer one follows it.
+        write_events(self.base, [self.attention("a", 4), self.attention("a", 1)])
+        self.run_log(f"{iso(-2)} tick: due=a",
+                     f"{iso(-2)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        (item,) = sources.load_events(self.base, now=NOW).items
+        self.assertEqual(item["section"], "urgent")
+        self.assertNotIn("resolved", item["meta"])
+
+    def test_unknown_state_falls_back_to_age_only(self):
+        write_events(self.base, [self.attention("a", 3), self.attention("b", 7)])
+        # no run.log at all
+        got = self.load()
+        self.assertEqual(got["attention:a"]["section"], "urgent")
+        self.assertEqual(got["attention:b"]["section"], "fyi")
+        # garbage run.log
+        self.run_log("\x00\x01 not a log", "tick: due=", "{}")
+        got = self.load()
+        self.assertEqual(got["attention:a"]["section"], "urgent")
+        self.assertNotIn("resolved", got["attention:a"]["meta"])
+
+    def test_a_different_status_shape_never_crashes(self):
+        write_events(self.base, [self.attention("a", 3), self.attention("b", 7)])
+        self.run_log(f"{iso(-1)} tick: due=a",
+                     f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        for bad in ({"routines": None}, {"routines": [1, 2]}, {},
+                    {"routines": {"a": {"state": "ok", "at": 12}}},
+                    {"routines": {"a": "ok"}}, [1]):
+            with mock.patch("workspace_daemon.status.read_tick_history",
+                            return_value=bad):
+                got = self.load()
+            self.assertEqual(got["attention:a"]["section"], "urgent", bad)
+            self.assertEqual(got["attention:b"]["section"], "fyi", bad)
+        with mock.patch("workspace_daemon.status.read_tick_history",
+                        side_effect=RuntimeError("boom")):
+            self.assertEqual(self.load()["attention:a"]["section"], "urgent")
+        with mock.patch("workspace_daemon.status.read_tick_history",
+                        side_effect=AttributeError):
+            self.assertEqual(self.load()["attention:a"]["section"], "urgent")
+
+    def test_connector_alert_resolved_by_a_later_successful_call(self):
+        write_events(self.base, [self.alert("connector:srv_a", 3, connector="srv_a"),
+                                 self.alert("connector:srv_b", 3, connector="srv_b")])
+        self.usage(
+            {"ts": iso(-4), "tools": ["mcp__srv_a__list"], "outcome": "ok"},
+            {"ts": iso(-1), "tools": ["mcp__srv_a__list"], "outcome": "ok"},
+            {"ts": iso(-1), "tools": ["mcp__srv_b__list"],
+             "outcome": "error: mcp__srv_b__list failed"})
+        got = self.load()
+        self.assertTrue(got["connector:srv_a"]["meta"]["resolved"])
+        self.assertEqual(got["connector:srv_a"]["section"], "fyi")
+        self.assertNotIn("resolved", got["connector:srv_b"]["meta"])
+        self.assertEqual(got["connector:srv_b"]["section"], "urgent")
+
+    def test_connector_alert_without_usage_state_uses_age_only(self):
+        write_events(self.base, [self.alert("connector:srv_a", 3, connector="srv_a"),
+                                 self.alert("connector:srv_b", 9, connector="srv_b")])
+        got = self.load()
+        self.assertEqual(got["connector:srv_a"]["section"], "urgent")
+        self.assertEqual(got["connector:srv_b"]["section"], "fyi")
+        (self.base / "state" / "claude-usage.jsonl").write_text("garbage\n")
+        self.assertEqual(self.load()["connector:srv_a"]["section"], "urgent")
+
+    def test_keys_without_a_recovery_signal_use_age_only(self):
+        write_events(self.base, [self.alert("budget-hit:2023-11-15", 3),
+                                 self.alert("budget-80:2023-11-15", 3)])
+        self.run_log(f"{iso(-1)} tick: due=budget-hit",
+                     f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        got = self.load()
+        self.assertEqual(got["budget-hit:2023-11-15"]["section"], "urgent")
+        self.assertNotIn("resolved", got["budget-hit:2023-11-15"]["meta"])
+
+    def test_alert_without_a_key_still_ages_out(self):
+        write_events(self.base, [
+            ev("daemon:nokey", "alert", "no key", ago_h=9, details={}),
+            ev("daemon:nokey2", "alert", "no key either", ago_h=1, details={})])
+        res = sources.load_events(self.base, now=NOW,
+                                  rules=[{"source": "daemon"}])
+        by = {i["gist"]: i["section"] for i in res.items}
+        self.assertEqual(by, {"no key": "fyi", "no key either": "urgent"})
+
+    def test_reading_state_does_not_modify_it(self):
+        write_events(self.base, [self.attention("a", 3)])
+        self.run_log(f"{iso(-1)} tick: due=a",
+                     f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)")
+        self.usage({"ts": iso(-1), "tools": ["mcp__s__x"], "outcome": "ok"})
+        before = {p: (p.stat().st_mtime_ns, p.read_bytes())
+                  for p in self.base.rglob("*") if p.is_file()}
+        self.load()
+        after = {p: (p.stat().st_mtime_ns, p.read_bytes())
+                 for p in self.base.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+
+
 class CollectTest(unittest.TestCase):
     def test_collect_mixes_sources_and_flags_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:

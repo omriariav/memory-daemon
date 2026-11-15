@@ -16,7 +16,7 @@ BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
 TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "gmail_account",
-            "sources")
+            "alert_urgent_max_age_h", "sources")
 SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent"),
     "command": ("name", "type", "argv", "timeout_s"),
@@ -27,6 +27,7 @@ DEFAULTS = {
     "theme": themes.DEFAULT,
     "bidi_mode": "auto",
     "gmail_account": 0,
+    "alert_urgent_max_age_h": sources.DEFAULT_ALERT_MAX_AGE_H,
 }
 
 
@@ -92,6 +93,13 @@ def validate(raw):
         problems.append("gmail_account must be an integer >= 0")
     else:
         out["gmail_account"] = account
+
+    max_age = raw.get("alert_urgent_max_age_h",
+                      DEFAULTS["alert_urgent_max_age_h"])
+    if not _num(max_age) or not 1 <= max_age <= 168:
+        problems.append("alert_urgent_max_age_h must be a number from 1 to 168")
+    else:
+        out["alert_urgent_max_age_h"] = float(max_age)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:

@@ -16,6 +16,7 @@ from textual.widgets import Input, Static, TextArea
 from . import bidi, themes
 from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
+                     copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
 from .screens import AuditScreen, ConfirmSend, HelpScreen, SnoozePicker
 from .sources import SourceResult
@@ -54,6 +55,8 @@ class InboxApp(App):
         Binding("n", "nudge", show=False), Binding("o", "open", show=False),
         Binding("r", "refresh", show=False), Binding("u", "undo", show=False),
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
+        Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
+        Binding("R", "toggle_resolved", show=False),
         Binding("question_mark", "help", show=False),
         Binding("ctrl+t", "toggle_theme", show=False),
         Binding("ctrl+s", "save_edit", show=False),
@@ -96,7 +99,7 @@ class InboxApp(App):
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #snooze-list { height: 6; background: transparent; border: none; }
     #snooze-hint { margin-top: 1; color: $text-muted; }
-    #help { width: 66; max-width: 94%; height: auto; max-height: 94%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #help { width: 66; max-width: 94%; height: auto; max-height: 94%; overflow-y: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
@@ -118,6 +121,7 @@ class InboxApp(App):
         self.undo_s, self.leave_s, self.stream_delay = undo_s, leave_s, stream_delay
         self.filter_text = ""
         self.source_filter = None
+        self.show_resolved = False         # R: list resolved alerts under fyi
         self.editing = False
         self.busy = 0
         self.polling = False
@@ -210,7 +214,8 @@ class InboxApp(App):
         busy_keys = {p.item.key for p in self.pending if not p.done}
         now = time.time()
         shown = [i for i in self.all_rows
-                 if i.key not in busy_keys and not self.store.is_hidden(i.key, now)]
+                 if i.key not in busy_keys and not self.store.is_hidden(i.key, now)
+                 and (self.show_resolved or not i.meta.get("resolved"))]
         changed = [i.key for i in shown] != [i.key for i in self.items]
         self.items = shown
         if redraw and changed:
@@ -219,6 +224,17 @@ class InboxApp(App):
             except NoMatches:  # timer fired during shutdown
                 pass
         return changed
+
+    @property
+    def resolved_hidden(self):
+        """How many resolved alerts R would reveal."""
+        if self.show_resolved:
+            return 0
+        busy_keys = {p.item.key for p in self.pending if not p.done}
+        now = time.time()
+        return sum(1 for i in self.all_rows
+                   if i.meta.get("resolved") and i.key not in busy_keys
+                   and not self.store.is_hidden(i.key, now))
 
     @property
     def current(self):
@@ -331,19 +347,19 @@ class InboxApp(App):
             return [("enter", "keep filter"), ("esc", "clear"), ("", "type to fuzzy-match")]
         it = self.current
         if it is None:
-            return [("r", "poll"), ("/", "filter"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
+            return [("r", "poll"), ("/", "filter"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
         if f is not None and f.id in ("thread", "draft-pane"):
-            return base + [("tab", "next pane"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
+            return base + [("tab", "next pane"), ("y", "copy"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
         if it.kind == "ack":
-            return base + [("a", "ack")] + opn + [("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
+            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
         if it.kind == "fyi":
-            return base + [("d", "dismiss")] + opn + [("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
+            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
         if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("u", "undo"), ("?", "help")]
+            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("?", "help")]
         return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
-            ("u", "undo"), ("/", "filter"), ("f", "source"), ("?", "help")]
+            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("?", "help")]
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -729,6 +745,47 @@ class InboxApp(App):
     def action_refresh(self):
         self.poll(manual=True)
 
+    # ---------- copy ----------
+    def _copy(self, text, count=1):
+        """Put `text` on the clipboard (OSC 52) and say so."""
+        self.copy_to_clipboard(text)
+        self.notify("Copied", title=f"{count} items" if count > 1 else "",
+                    timeout=2, markup=False)
+
+    def _section_items(self):
+        it = self.current
+        if it is None:
+            return []
+        return [i for i in self.visible() if i.section == it.section]
+
+    def action_copy_item(self):
+        it = self.current
+        if it is None:
+            self.notify("Nothing to copy", timeout=2, markup=False)
+            return
+        self._copy(copy_item_text(it))
+
+    def action_copy_section(self):
+        items = self._section_items()
+        if not items:
+            self.notify("Nothing to copy", timeout=2, markup=False)
+            return
+        self._copy(copy_section_text(items), len(items))
+
+    def action_copy_section_markdown(self):
+        items = self._section_items()
+        if not items:
+            self.notify("Nothing to copy", timeout=2, markup=False)
+            return
+        self._copy(copy_section_markdown(items), len(items))
+
+    def action_toggle_resolved(self):
+        self.show_resolved = not self.show_resolved
+        self.refilter(redraw=False)
+        self.redraw()
+        self.notify("Resolved alerts: " + ("shown" if self.show_resolved else "hidden"),
+                    timeout=2, markup=False)
+
     def action_audit(self):
         self.push_screen(AuditScreen(self.audit))
 
@@ -868,6 +925,10 @@ class InboxApp(App):
             ("Snooze…", "Pick a snooze time", self.action_snooze),
             ("Nudge", "Send the nudge draft (confirm first)", self.action_nudge),
             ("Open link", "Open the item's link in the browser", self.action_open),
+            ("Copy item", "y: sender, where, gist and the link", self.action_copy_item),
+            ("Copy section", "Y: every item in this section, one per line", self.action_copy_section),
+            ("Copy section as Markdown", "A - **sender** (where): gist list", self.action_copy_section_markdown),
+            ("Show / hide resolved alerts", "R", self.action_toggle_resolved),
             ("Undo last action", "Within the 5 s window", self.action_undo),
             ("Poll now", "Poll every source", self.action_refresh),
             ("Toggle dark/light theme", "ctrl+t", self.action_toggle_theme),

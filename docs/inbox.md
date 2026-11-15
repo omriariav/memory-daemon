@@ -134,6 +134,42 @@ Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
 
+### Stale and recovered alerts
+
+An alert stays urgent only while it is relevant. Three rules apply to every
+alert (`daemon` kind `alert`), after the urgent rules above:
+
+1. **Newest per key.** Alerts are grouped by `details.key`; only the newest
+   of each key is listed, so an older alert for the same condition never
+   shows beside it.
+2. **Age.** An alert older than `alert_urgent_max_age_h` (default 6, range 1
+   to 168) drops to `fyi`/`digest`. It stays listed until `window_h` passes.
+3. **Recovery.** An alert whose condition has since ended is *resolved*: it is
+   `fyi`, carries `meta.resolved: true`, and is hidden unless `R` is on
+   (`R` toggles "show resolved"; the header counts the hidden ones). Resolved
+   rows show a green check.
+   - `attention:<routine>`: resolved when the run log (`logs/run.log`, read
+     the way `status` reads it) shows the routine's latest result as `ok` and
+     later than the alert. This record exists for every routine kind,
+     maintenance routines (calendar-cache, sheet-watch) included, because it
+     comes from the scheduler tick and not from the capture ledger. Only
+     alerts whose `details.issues` are tick-derived (`last run`, `N last-run
+     errors`, `incomplete`, `overlap`) resolve this way; an alert about the
+     ledger (`memory sink`, `source expansion`, `Gmail triage`, `meeting
+     match`) is not proven fixed by a clean tick, so it only ages out.
+   - `connector:<server>`: resolved when `state/claude-usage.jsonl` holds a
+     successful call that used that connector, later than the alert.
+   - Every other key (`budget-*`, `hold:*`, `usage-unreadable`) has no
+     recovery signal: age rule only.
+
+Recovery is read-only and best effort. A missing file, an unfamiliar shape (a
+different daemon version) or any read error means "unknown", and the alert
+keeps only the age rule. Limits: a routine whose latest tick result is
+something other than `ok` (a later `skipped`, `paused`, `incomplete` or
+`error`) is not resolved, because only the latest result per routine is
+kept; and both logs are read in full on each poll that has an alert needing
+them.
+
 ## Local state
 
 `<base>/state/inbox-state.json`:
@@ -167,6 +203,7 @@ defaults; a broken one prints every problem and exits 2.
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
+| `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` (`window_h`, `urgent` rules) and `type: command` (`argv` list, `timeout_s` 1 to 120) |
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
@@ -189,8 +226,29 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` poll now,
+`R` show or hide resolved alerts, `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
+
+### Copying
+
+Copying uses the terminal clipboard escape (OSC 52), so the terminal must
+allow it (iTerm2: "Applications in terminal may access clipboard"; it does not
+work in macOS Terminal). The text is built from the item's own logical
+strings, never from the bidi-reordered display and never with markup.
+
+- `y`: `sender — where — gist`, then the link on its own line when there is one.
+- `Y`: every item in the focused item's section as the screen lists it
+  (filters applied), one per line: `sender — where — gist`, plus ` — link` when
+  there is one.
+- Palette: "Copy item", "Copy section", "Copy section as Markdown" (one
+  `- **sender** (where): gist [link](url)` line per item; Markdown specials
+  in the text are escaped).
+- Mouse: a drag in the thread or draft pane selects text and stays inside
+  that pane; `ctrl+c` copies it. The queue is a Textual `OptionList`, which
+  does not support selection (it draws lines without text offsets), so use
+  `y`/`Y` there. In visual bidi mode mouse selection is off in both panes
+  (the screen text is already reordered); `y`/`Y` still copy logical text.
 
 ## Safety model
 

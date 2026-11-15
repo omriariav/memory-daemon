@@ -353,6 +353,178 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.theme, "inbox-light")
 
 
+HEBREW = dict(sender="\u05e0\u05d5\u05e2\u05d4", where="#\u05db\u05dc\u05dc\u05d9",
+              gist="\u05d1\u05d3\u05d9\u05e7\u05d4 [x] *y*")
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class CopyTest(unittest.IsolatedAsyncioTestCase):
+    def rows(self):
+        return [
+            item(1, "urgent", "alert", link="https://example.com/a(1)"),
+            item(2, "urgent", "alert", link=None, actions=("ack",), **HEBREW),
+            item(3, "fyi", "calendar"),
+        ]
+
+    async def copied(self, pilot, app, *keys):
+        with mock.patch.object(app, "copy_to_clipboard") as clip, \
+                mock.patch.object(app, "notify", wraps=app.notify) as toast:
+            for key in keys:
+                await pilot.press(key)
+            await pilot.pause(0.1)
+        return clip, toast
+
+    async def test_y_copies_the_focused_item_as_plain_text(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            clip, toast = await self.copied(pilot, app, "y")
+            clip.assert_called_once_with(
+                "Person 1 \u2014 room \u2014 gist 1\nhttps://example.com/a(1)")
+            self.assertEqual(toast.call_args[0][0], "Copied")
+            clip, _ = await self.copied(pilot, app, "j", "y")   # no link: one line
+            clip.assert_called_once_with(
+                "\u05e0\u05d5\u05e2\u05d4 \u2014 #\u05db\u05dc\u05dc\u05d9 \u2014 "
+                "\u05d1\u05d3\u05d9\u05e7\u05d4 [x] *y*")
+
+    async def test_big_y_copies_the_whole_section_one_item_per_line(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            clip, toast = await self.copied(pilot, app, "Y")
+            clip.assert_called_once_with(
+                "Person 1 \u2014 room \u2014 gist 1 \u2014 https://example.com/a(1)\n"
+                "\u05e0\u05d5\u05e2\u05d4 \u2014 #\u05db\u05dc\u05dc\u05d9 \u2014 "
+                "\u05d1\u05d3\u05d9\u05e7\u05d4 [x] *y*")
+            self.assertEqual(toast.call_args[0][0], "Copied")
+            # focus the fyi item: only its section is copied
+            clip, _ = await self.copied(pilot, app, "j", "j", "Y")
+            clip.assert_called_once_with(
+                "Person 3 \u2014 room \u2014 gist 3 \u2014 https://example.com/3")
+
+    async def test_section_copy_follows_the_filter(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.filter_text = "person 1"
+            app.redraw()
+            clip, _ = await self.copied(pilot, app, "Y")
+            clip.assert_called_once_with(
+                "Person 1 \u2014 room \u2014 gist 1 \u2014 https://example.com/a(1)")
+
+    async def test_markdown_section_from_the_palette(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            cmds = {c.title: c for c in app.get_system_commands(app.screen)}
+            for title in ("Copy item", "Copy section", "Copy section as Markdown"):
+                self.assertIn(title, cmds)
+            with mock.patch.object(app, "copy_to_clipboard") as clip:
+                cmds["Copy section as Markdown"].callback()
+                clip.assert_called_once_with(
+                    "- **Person 1** (room): gist 1 [link](https://example.com/a%281%29)\n"
+                    "- **\u05e0\u05d5\u05e2\u05d4** (#\u05db\u05dc\u05dc\u05d9): "
+                    "\u05d1\u05d3\u05d9\u05e7\u05d4 \\[x\\] \\*y\\*")
+            with mock.patch.object(app, "copy_to_clipboard") as clip:
+                cmds["Copy item"].callback()
+                self.assertTrue(clip.call_args[0][0].startswith("Person 1 \u2014"))
+            with mock.patch.object(app, "copy_to_clipboard") as clip:
+                cmds["Copy section"].callback()
+                self.assertEqual(clip.call_args[0][0].count("\n"), 1)
+
+    async def test_copy_is_logical_text_even_in_visual_bidi_mode(self):
+        cfg = dict(DEFAULTS, bidi_mode="visual")
+        app, _, _ = make_app(self.rows(), settings=cfg)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.bidi_mode = "visual"
+            await pilot.press("j")
+            clip, _ = await self.copied(pilot, app, "y")
+            text = clip.call_args[0][0]
+            self.assertTrue(text.startswith(HEBREW["sender"] + " \u2014 "))
+            self.assertIn(HEBREW["gist"], text)
+            self.assertNotIn("\x1b", text)
+
+    async def test_copy_with_nothing_selected_says_so(self):
+        app, _, _ = make_app([])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            clip, toast = await self.copied(pilot, app, "y", "Y")
+            clip.assert_not_called()
+            self.assertEqual(toast.call_args[0][0], "Nothing to copy")
+
+    async def test_hints_and_help_list_the_copy_keys(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn(("y", "copy"), app.hints())
+            await pilot.press("question_mark")
+            await pilot.pause(0.1)
+            body = str(app.screen.query_one("#help-body").render())
+            for needle in ("copy this item", "every item in this section",
+                           "show / hide resolved"):
+                self.assertIn(needle, body)
+
+    async def test_thread_text_can_be_selected_with_the_mouse(self):
+        thread = [{"who": "Ann", "ts": time.time(), "text": "hello world"}]
+        app, _, _ = make_app([item(1, "urgent", "slack", thread=thread)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            body = app.query_one("#thread-body")
+            self.assertTrue(body.allow_select)
+            self.assertFalse(app.query_one("#queue").allow_select)
+            await pilot.mouse_down("#thread-body", offset=(0, 2))
+            await pilot.hover("#queue", offset=(20, 4))   # drag out of the pane
+            await pilot.mouse_up("#queue", offset=(20, 4))
+            await pilot.pause(0.1)
+            got = app.screen.get_selected_text()
+            self.assertIn("hello world", got)
+            self.assertNotIn("gist 1", got)               # stayed inside the thread
+
+    async def test_selection_is_off_in_visual_bidi_mode(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.bidi_mode = "visual"
+            self.assertFalse(app.query_one("#thread-body").allow_select)
+            self.assertFalse(app.query_one("#draft-view").allow_select)
+            app.bidi_mode = "logical"
+            self.assertTrue(app.query_one("#draft-view").allow_select)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
+    def rows(self):
+        return [item(1, "urgent", "alert"),
+                item(2, "fyi", "alert", meta={"resolved": True}),
+                item(3, "fyi", "calendar")]
+
+    async def test_resolved_alerts_are_hidden_until_r(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:3"])
+            self.assertEqual(app.resolved_hidden, 1)
+            await pilot.press("R")
+            await pilot.pause(0.1)
+            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:2", "t:3"])
+            self.assertEqual(app.resolved_hidden, 0)
+            self.assertEqual(
+                [i.key for i in app.query_one("#queue", Queue).rows if i.section == "fyi"],
+                ["t:2", "t:3"])
+            await pilot.press("R")
+            await pilot.pause(0.1)
+            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:3"])
+
+    async def test_a_resolved_alert_never_counts_as_urgent(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("R")
+            await pilot.pause(0.1)
+            self.assertEqual(sum(1 for i in app.items if i.section == "urgent"), 1)
+
+
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class SafetyTest(unittest.IsolatedAsyncioTestCase):
     async def test_markup_in_untrusted_text_is_inert(self):
