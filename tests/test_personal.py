@@ -81,7 +81,7 @@ class RedactTest(unittest.TestCase):
 
     def test_work_identifiers_unchanged(self):
         for text in (
-            "Claim ID: 4821937", "Policy ID: LP1234567", "Order id 98765432",
+            "Case ID: 4821937", "Invoice ID: INV1234567", "Order id 98765432",
             "Zoom Meeting ID: 91234567890", "Jira ticket ID 100234",
             "user id: 123456", "ID: 123456782", "id 987654321",
             "landline 031234567 and 021234567", "order number 123456782",
@@ -156,6 +156,7 @@ class KeywordTest(unittest.TestCase):
         for text in (
             "Roadmap review for Q3", "car loan renewal flow",
             "vendor invoice triage", "our lawyer reviewed the filing",
+            "medical device vendor review", "ספק ציוד רפואי",
             "חידוש הלוואת רכב חדשה", "טיפול בחשבוניות ספקים", "הלוואה לרכב ללקוחות",
         ):
             self.assertFalse(personal.keyword_hit(text, kws), text)
