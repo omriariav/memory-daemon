@@ -224,7 +224,7 @@ class WhisperSourceTest(unittest.TestCase):
                 "summary": "Value Reflection - product strategy brief",
                 "start": "2026-02-18T13:00:00+02:00",
                 "end": "2026-02-18T13:30:00+02:00",
-                "attendees": [{"email": "omri.a@taboola.com"}],
+                "attendees": [{"email": "owner@example.com"}],
             },
         ]
         candidate = whisper_source.candidates(source(self.dir))[0]
@@ -251,8 +251,8 @@ class WhisperSourceTest(unittest.TestCase):
             "summary": "Value Reflection",
             "start": "2026-02-18T13:00:00+02:00",
             "end": "2026-02-18T13:30:00+02:00",
-            "organizer": {"email": "omri.a@taboola.com"},
-            "attendees": [{"email": "guest@taboola.com"}],
+            "organizer": {"email": "owner@example.com"},
+            "attendees": [{"email": "guest@example.com"}],
         }]
         with mock.patch.object(
             whisper_source, "_raw_calendar_events", return_value=events
@@ -300,7 +300,7 @@ class WhisperSourceTest(unittest.TestCase):
         self.assertEqual(meta["calendar_event_id"], "EVENT")
         self.assertEqual(
             [person["email"] for person in meta["source_people"]],
-            ["omri.a@taboola.com", "guest@taboola.com"],
+            ["owner@example.com", "guest@example.com"],
         )
 
     def test_receipts_are_current_state_per_source_identity(self):
