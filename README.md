@@ -321,6 +321,31 @@ pause|resume|state|run <id>|logs [-f] [-n N]|status` (or `daemon.py ctl
 pause|resume|state`). Set `MEMORY_DAEMON_PYTHON` to pick the interpreter; the
 script otherwise prefers `.venv/bin/python` in the repo, then `python3`.
 
+### Unified inbox (`daemon.py inbox`)
+
+A keyboard-first terminal inbox that merges what needs you from several
+sources into one queue (Urgent, Needs reply, Waiting, FYI), with a thread
+pane, snooze, done, ack, undo, a fuzzy filter, a command palette, themes and
+Hebrew/RTL display. It is an optional extra: the daemon and its tests do not
+need Textual.
+
+```sh
+pip install 'textual>=8.2,<9' python-bidi   # python-bidi only for Hebrew in visual order
+python daemon.py inbox --demo               # invented data; reads and writes nothing
+python daemon.py inbox                      # your events, this checkout
+python daemon.py inbox --base-dir DIR       # another checkout's state/ and inbox.yaml
+```
+
+Press `?` for keys and `ctrl+p` for the command palette. Phase 1a is read and
+triage only: nothing is ever sent. `done`, `snooze` and `ack` are local marks
+in `state/inbox-state.json` (mode 0600; snoozed items return when due), `o`
+opens an item's http(s) link. The built-in `events` source turns
+`state/events.jsonl` (mail, calendar changes, recordings, daemon alerts) into
+items, read-only and without taking its lock. Any other program can feed the
+inbox by printing JSON for `<argv> list`. Settings live in `inbox.yaml`
+(gitignored; copy `inbox.example.yaml`). The item format, the source command
+protocol and the safety model are in [docs/inbox.md](docs/inbox.md).
+
 ## Codex and Claude Code plugin
 
 This repository is also a marketplace for the dual-compatible
@@ -2970,8 +2995,12 @@ workspace_daemon/
   alerts.py                once-per-condition operational alerts (budget, holds, health)
   state.py                 processed.json
   runner.py                the run loop
+  inbox/                   `daemon.py inbox`: item format, sources, local state, Textual UI
 routines/                  one YAML per routine (yours are gitignored)
 launchd/                   capture, maintenance + calendar LaunchAgent templates
+docs/inbox.md              inbox item format v1 and source-command protocol
+inbox.example.yaml         tracked template for the gitignored inbox.yaml
+tools/                     validate_examples.py, privacy_check.py (+ privacy_allowlist.txt)
 state/  logs/              runtime, gitignored
 ```
 
@@ -3026,6 +3055,25 @@ lock files while their work is running.
 python3 -m unittest discover -s tests   # no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
+python3 tools/privacy_check.py          # tracked files: emails, Slack-style ids, secrets
+```
+
+The inbox UI tests skip when Textual is missing; run them with
+`pip install 'textual>=8.2,<9' python-bidi` first (CI does so in a separate job).
+
+`tools/privacy_check.py` keeps real data out of this public repo. Besides the
+generic scan (false positives go in `tools/privacy_allowlist.txt`) it reads an
+optional **local** denylist at `~/.config/memory-daemon/private-denylist.txt`
+(one entry per line; `#` comments; a plain entry is a case-insensitive
+substring, `word:<term>` matches whole words only, `re:<regex>` is a regex;
+never committed) and fails on any match without printing the term. It also
+flags `/Users/<name>` and `/home/<name>` paths, `<workspace>.slack.com` hosts,
+Slack webhook URLs and Slack user, channel, DM and team ids. The allowlist file
+is scanned too, and `--commits A..B` checks commit messages and
+author/committer emails (CI runs it on the PR range). Install it as a pre-commit hook once per clone:
+
+```sh
+printf '#!/bin/sh\nexec python3 tools/privacy_check.py --staged\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 ```
 
 Every case in the suite is a bug that actually shipped and was caught in review:

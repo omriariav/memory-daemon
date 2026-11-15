@@ -1,0 +1,41 @@
+# Known false positives for tools/privacy_check.py. Every entry here must be
+# clearly fake, generic or public; a real address or id never belongs here.
+# Syntax: TOKEN | re:REGEX (whole match) | path-glob :: TOKEN-or-re:REGEX
+# Entries are scoped to the files that use them wherever possible, so the same
+# text turning up in a new file is still flagged.
+
+# Invented Slack-style ids that spell EXAMPLE (a zero, then EXAMPLE, a suffix):
+# fake by construction, so they are allowed anywhere.
+re:[CUGWDT]0EXAMPLE[A-Z0-9]*
+
+# Other invented ids in fixtures and example routines
+README.md :: C0123EXAMPLE
+tests/test_plugin_admin.py :: re:C0123EXAMPLE|CSECRET123
+tests/test_personal.py :: C0123ABCD
+routines/_example-slack-to-memory.yaml :: re:C0123ABCD|C0456EFGH
+routines/_example-domain-routine.yaml :: re:C0123PUBLIC|C0456PRIVATE
+workspace_daemon/slack_source.py :: re:C0123ABCD|C0123PUBLIC|C0234DIRECT|C0456PRIVATE|C0789LEGACY
+
+# An emoji code point and plain uppercase words that fit the id shape
+tests/test_capture_quality.py :: U0001F44D
+plugins/memory-daemon-manager/skills/*/SKILL.md :: CANDIDATE
+tests/test_slack_digests.py :: CEXTERNAL
+workspace_daemon/status.py :: CONNECTOR
+workspace_daemon/memory_sink.py :: GUARDRAILS
+workspace_daemon/fibery_tasks_outbound.py :: UNCONFIRMED
+tests/test_comms_inbox.py :: USLACKBOT
+workspace_daemon/comms_inbox.py :: USLACKBOT
+
+# Public service senders and invented addresses in docs and fixtures
+README.md :: gemini-notes@google.com
+routines/_example-meeting-notes.yaml :: gemini-notes@google.com
+tests/test_calendar_cache.py :: re:[\w.+-]*@(?:[\w-]+\.)*calendar\.google\.com
+tests/test_mila_source.py :: room-1@resource.calendar.google.com
+tests/test_calendar_cache.py :: re:[\w.+-]+@(?:google\.com|evil\.org|evil-example\.com|notexample\.com|example\.com\.evil\.org)
+tests/test_calendar_cache.py :: c@d.example.org
+tests/test_first_names.py :: re:(?:me|owner|ada\.lovelace)@gmail\.com
+tests/test_gmail_mcp.py :: re:ann@(?:example\.co|example-com\.net)
+tests/test_gmail_mcp.py :: re:token="05464679278938702803".*
+tests/test_identity.py :: re:(?:a@b\.co|alice\.smith@example\.com\.org)
+README.md :: re:alice@(?:acme|corp)\.com
+daemon.py :: x@y.com

@@ -16,6 +16,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the PR commit-range privacy scan needs history
 
       - uses: actions/setup-python@v5
         with:
@@ -49,3 +51,33 @@ jobs:
         # Check them directly, or the documented examples silently rot out of
         # sync with the schema whenever validation changes.
         run: python tools/validate_examples.py
+
+      - name: Privacy scan
+        # Real-looking emails, Slack-style ids and secrets in tracked files.
+        # False positives go in tools/privacy_allowlist.txt, never real data.
+        run: python tools/privacy_check.py
+
+      - name: Privacy scan of the PR's commits
+        # Commit messages and author/committer emails of the PR range.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python tools/privacy_check.py --commits "$BASE_SHA..$HEAD_SHA"
+
+  inbox-ui:
+    # The inbox UI is an optional extra: the job above runs without Textual
+    # (UI tests skip). This one installs it and runs the UI tests for real.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml 'textual>=8.2,<9' python-bidi
+
+      - name: Inbox tests with Textual
+        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli -v
