@@ -800,6 +800,56 @@ class CaptureValidationTest(unittest.TestCase):
         outcome, _ = self._run_capture(None, summary="NOT MEMORY-WORTHY")
         self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
 
+    def gmail_saved(self):
+        self.item["source_kind"] = "gmail"
+        self.item["frontmatter"].pop("slack_owner_evidence", None)
+        self.item["frontmatter"]["saved_request"] = True
+
+    def test_gmail_saved_request_overrides_a_not_worthy_source_analysis(self):
+        self.gmail_saved()
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            return_value="Forced summary.",
+        ):
+            outcome, calls = self._run_capture(
+                None, summary="NOT MEMORY-WORTHY",
+            )
+        self.assertEqual(outcome["memory"], "created")
+        self.assertEqual(calls["stdin"], "Forced summary.")
+
+    def test_gmail_saved_request_overrides_an_extraction_veto(self):
+        self.gmail_saved()
+        outcome, _ = self._run_capture({
+            "worthy": False, "owner_attention": False, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertEqual(outcome["memory"], "created")
+
+    def test_gmail_saved_fallback_text_is_source_neutral(self):
+        self.gmail_saved()
+        self.item["body"] = "shared doc notice"
+        with mock.patch.object(
+            memory_sink, "_operator_confirmed_summary",
+            side_effect=memory_sink.NoUsableSummary("no summary"),
+        ):
+            outcome, calls = self._run_capture(
+                None, summary="NOT MEMORY-WORTHY",
+            )
+        self.assertEqual(outcome["memory"], "created")
+        self.assertIn("shared doc notice", calls["stdin"])
+        self.assertNotIn("reaction", calls["stdin"])
+
+    def test_gmail_without_the_flag_is_still_skipped(self):
+        self.item["source_kind"] = "gmail"
+        self.item["frontmatter"].pop("slack_owner_evidence", None)
+        outcome, _ = self._run_capture(None, summary="NOT MEMORY-WORTHY")
+        self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
+        outcome, _ = self._run_capture({
+            "worthy": False, "owner_attention": False, "type": "note",
+            "title": "t", "people": [], "tags": [], "body": "b",
+        })
+        self.assertEqual(outcome, {"memory": "skipped_not_worthy"})
+
     def test_later_reply_keeps_the_tag_and_evidence_without_the_bypass(self):
         self.saved(requested=False)
         _, calls = self._run_capture({
@@ -1726,6 +1776,37 @@ class CaptureEventsTest(unittest.TestCase):
 
     def test_dry_run_emits_nothing(self):
         self.assertEqual(self._capture(dry_run=True), [])
+
+    def test_calendar_match_adds_event_id_and_attendee_count(self):
+        self.item["frontmatter"] = {
+            "calendar_event_id": "evt1", "calendar_attendee_count": 3}
+        for out, kind in (("✓ created 2026-07-27-t\n", "new"),
+                          ("↻ updated 2026-07-27-t\n", "update")):
+            rows = self._capture(out)
+            self.assertEqual(rows[-1]["kind"], kind)
+            self.assertEqual(
+                rows[-1]["details"],
+                {"calendar_event_id": "evt1", "attendee_count": 3})
+
+    def test_other_attendee_only_with_a_count_of_two(self):
+        self.item["frontmatter"] = {
+            "calendar_event_id": "evt1", "calendar_attendee_count": 2,
+            "calendar_other_attendee": "a@example.com"}
+        self.assertEqual(self._capture()[0]["details"], {
+            "calendar_event_id": "evt1", "attendee_count": 2,
+            "other_attendee": "a@example.com"})
+        self.item["frontmatter"]["calendar_attendee_count"] = 3
+        self.assertNotIn(
+            "other_attendee", self._capture()[-1]["details"])
+
+    def test_no_calendar_match_means_no_details(self):
+        rows = self._capture()
+        self.assertNotIn("details", rows[0])
+
+    def test_unknown_attendee_list_omits_the_count(self):
+        self.item["frontmatter"] = {"calendar_event_id": "evt1"}
+        rows = self._capture()
+        self.assertEqual(rows[0]["details"], {"calendar_event_id": "evt1"})
 
 
 class CanonicalPersonTest(unittest.TestCase):

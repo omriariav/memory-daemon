@@ -1882,6 +1882,7 @@ def _validate_slack_mcp(prefix, source):
         ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
         ("save_reaction_lookback_days", 1, 90), ("max_session_pages", 1, 10),
+        ("save_reaction_budget_s", 0, 3600),
         ("max_file_reads_per_run", 0, 50), ("file_scan_lookback_days", 1, 30),
         ("file_scan_minutes", 1, 1440),
     ):
@@ -1951,8 +1952,8 @@ def _validate_slack_mcp(prefix, source):
         + (1 if source.get("all_dms") is True else 0)
         + (len(reactions) if reactions_ok and reactions else 0)
         + (
-            len(set(inbox.get("reactions") or [])
-                - set(reactions if reactions_ok and reactions else []))
+            # Every inbox emoji gets its own `reacted` query (never folded into the saved search).
+            len(set(inbox.get("reactions") or []))
             + len(inbox.get("track_reactions") or [])
             + (1 if inbox.get("follow_threads") is True else 0)
             if inbox is not None and not inbox_problem else 0
@@ -2065,6 +2066,10 @@ def _validate_gmail_mcp(prefix, source):
                 if source.get(needed) is None:
                     problems.append(
                         f"{prefix}.trust_from_without_auth requires {needed}")
+    if "saved_request" in source and not isinstance(
+        source["saved_request"], bool
+    ):
+        problems.append(f"{prefix}.saved_request must be true or false")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
     for key in ("queue_query", "exclude_query", "max_results"):

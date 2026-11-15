@@ -874,6 +874,7 @@ def render_json(events, cfg, now):
         "window_hours": cfg.get("window_hours", 48),
         "timezone": cfg.get("timezone", "UTC"),
         "note": UNTRUSTED_NOTE,
+        "owner_email": str(cfg.get("owner_email") or "").strip().lower(),
         "events": rows,
     }, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 

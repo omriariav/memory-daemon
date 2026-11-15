@@ -38,7 +38,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import claude_bridge, sleepclock, state
+from . import claude_bridge, sleepclock, state, transcripts
 from .chat_text import redact_secrets
 from .shell import log
 
@@ -210,7 +210,20 @@ def _read_calendar(cfg, now):
     refreshed = _epoch(data.get("refreshed_at"))
     if refreshed is not None and now - refreshed > cfg["stale_calendar_hours"] * 3600:
         log("zoom WARN calendar file is stale; new meetings may be missed")
-    return [e for e in data["events"] if isinstance(e, dict)], refreshed
+    owner = str(data.get("owner_email") or "").strip().casefold()
+    events = [e for e in data["events"] if isinstance(e, dict)]
+    if owner:
+        # The file drops the per-row `self` flag; restore it from the owner.
+        for event in events:
+            rows = event.get("attendees")
+            if isinstance(rows, list):
+                event["attendees"] = [
+                    dict(r, self=True) if isinstance(r, dict)
+                    and str(r.get("email") or "").strip().casefold() == owner
+                    else r
+                    for r in rows
+                ]
+    return events, refreshed
 
 
 def _sync_calendar(cfg, meetings, events, refreshed, now):
@@ -248,6 +261,13 @@ def _sync_calendar(cfg, meetings, events, refreshed, now):
             "end": event["end"],
             "people": _source_people(event),
         })
+        count, other = transcripts.attendee_summary(event)
+        for key, value in (("attendee_count", count),
+                           ("other_attendee", other)):
+            if value is None:
+                record.pop(key, None)
+            else:
+                record[key] = value
     # A meeting the calendar file should still list but no longer does was
     # cancelled or moved away; stop tracking it.
     if refreshed is not None:
@@ -735,6 +755,10 @@ def fetch(_routine, source, candidate):
             "calendar_event_start": record.get("start"),
             "calendar_event_end": record.get("end"),
             "source_people": list(record.get("people") or []),
+            **({"calendar_attendee_count": record["attendee_count"]}
+               if isinstance(record.get("attendee_count"), int) else {}),
+            **({"calendar_other_attendee": record["other_attendee"]}
+               if isinstance(record.get("other_attendee"), str) else {}),
             "same_meeting_entry_ids": same_meeting,
         },
     }

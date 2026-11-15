@@ -1,11 +1,14 @@
 """Comms inbox: recorded hits, owner reactions, dedupe, retention, config."""
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import comms_inbox, config, slack_mcp, slack_watch
+from workspace_daemon import (
+    claude_bridge, comms_inbox, config, slack_mcp, slack_watch,
+)
 
 from test_slack_mcp import (
     BOB, CHAN, ME, NOW, ROOT, BridgeTestCase, hit_block, routine, search_text,
@@ -996,6 +999,14 @@ class ConfigTest(unittest.TestCase):
         ))
         self.assertIn("2 planned searches", text)
 
+    def test_save_emoji_that_is_also_an_inbox_reaction_counts_twice(self):
+        # The inbox reaction gets its own `reacted` query; it is never folded into the saved search.
+        text = "\n".join(self.problems(
+            max_queries_per_run=2, save_reactions=[ACK],
+            comms_inbox={"channels": [CHAN], "reactions": [ACK]},
+        ))
+        self.assertIn("3 planned searches", text)
+
     def test_watch_file_carries_the_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "watch.yaml"
@@ -1707,3 +1718,197 @@ class RealChannelFilesLayoutTest(unittest.TestCase):
         }), 0, 9e9, "D0EXAMPLE91")
         self.assertNotIn("files", msgs[0])
         self.assertIn("Files: see the drive folder", msgs[0]["text"])
+
+
+def is_saved_filter(args):
+    return (args.get("filters") or "").startswith("hasmy::")
+
+
+class InboxFirstTest(InboxTestCase):
+    """The inbox is written before the saved search's later pages run."""
+
+    EMOJI = "bookmark-example"
+
+    def paged_search(self, snapshots, fail_on_followup=False):
+        """Saved search: page 0 has a cursor, page 1 ends. `snapshots` gets
+        the inbox file text at each follow-up (cursor) call."""
+        file = comms_inbox.path(self.tmp.name)
+        inner = by_filter({
+            f"in:<#{CHAN}>": [{"ts": ts_at(10), "text": "question?"}],
+        })
+
+        def search(args):
+            if not is_saved_filter(args):
+                return inner(args)
+            if args.get("cursor"):
+                snapshots.append(file.read_text() if file.exists() else "")
+                if fail_on_followup:
+                    raise claude_bridge.BridgeError("saved search down")
+                return search_text([{"ts": ts_at(30), "text": "later"}])
+            return search_text(
+                [{"ts": ts_at(20), "text": "first"}], cursor="NEXT"
+            )
+
+        self.connector.search = search
+
+    def test_inbox_is_written_before_the_saved_followup_pages(self):
+        snapshots = []
+        self.paged_search(snapshots)
+        slack_mcp.candidates(inbox_source(save_reactions=[self.EMOJI]))
+        self.assertEqual(len(snapshots), 1)
+        self.assertIn("question?", snapshots[0])
+        # Page 0 shared the first session; only page 1 got its own.
+        self.assertEqual(len(self.connector.calls), 2)
+        self.assertEqual(len(re.findall(
+            r"^\d+\. ", self.connector.prompts[0], re.M)), 2)
+
+    def test_exception_between_the_record_calls_loses_no_rows(self):
+        snapshots = []
+        self.paged_search(snapshots, fail_on_followup=True)
+        with self.assertRaises(claude_bridge.BridgeError):
+            slack_mcp.candidates(inbox_source(save_reactions=[self.EMOJI]))
+        self.assertEqual(
+            [r["ts"] for r in self.messages()], [ts_at(10), ts_at(20)]
+        )
+        # The next run re-lists the look-back and records the rest.
+        snapshots.clear()
+        self.paged_search(snapshots)
+        slack_mcp.candidates(inbox_source(save_reactions=[self.EMOJI]))
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [r["ts"] for r in self.messages()],
+            [ts_at(10), ts_at(20), ts_at(30)],
+        )
+
+    def test_followup_hit_in_an_inbox_channel_is_recorded(self):
+        file = comms_inbox.path(self.tmp.name)
+
+        def search(args):
+            if not is_saved_filter(args):
+                return search_text([])
+            if args.get("cursor"):
+                return search_text([{"ts": ts_at(30), "text": "later"}])
+            return search_text([{"ts": ts_at(20)}], cursor="NEXT")
+
+        self.connector.search = search
+        slack_mcp.candidates(inbox_source(save_reactions=[self.EMOJI]))
+        self.assertEqual(
+            [r["ts"] for r in self.messages()], [ts_at(20), ts_at(30)]
+        )
+        self.assertTrue(file.exists())
+
+    def test_owner_reactions_come_from_group_zero_even_with_long_lookback(self):
+        file = comms_inbox.path(self.tmp.name)
+        snapshots = []
+
+        def search(args):
+            if not is_saved_filter(args):
+                return search_text([])
+            if args.get("cursor"):
+                snapshots.append(file.read_text() if file.exists() else "")
+                return search_text([])
+            return search_text([{"ts": ts_at(20)}], cursor="NEXT")
+
+        self.connector.search = search
+        slack_mcp.candidates(inbox_source(
+            inbox={"channels": [CHAN], "reactions": [self.EMOJI]},
+            save_reactions=[self.EMOJI], save_reaction_lookback_days=30,
+        ))
+        # The reacted query ran beside the saved page 0 (2 calls, 1 session);
+        # its follow-up page is in group 0, the saved one's after the write.
+        self.assertEqual(len(re.findall(
+            r"^\d+\. ", self.connector.prompts[0], re.M)), 3)
+        self.assertEqual(len(snapshots), 2)
+        self.assertIn("owner_reaction", snapshots[-1])
+        self.assertEqual(len(self.reactions()), 1)
+
+    def test_a_fast_run_uses_the_same_sessions_as_before(self):
+        # Channel, DMs, a save emoji and an inbox emoji, nothing paged: one
+        # session, exactly as before the split.
+        self.connector.search = lambda args: search_text([])
+        slack_mcp.candidates(inbox_source(
+            inbox={"channels": [CHAN], "all_dms": True, "reactions": [ACK]},
+            all_dms=True, save_reactions=[self.EMOJI],
+        ))
+        self.assertEqual(len(self.connector.calls), 1)
+        self.assertEqual(len(re.findall(
+            r"^\d+\. ", self.connector.prompts[0], re.M)), 4)
+
+
+class SavedBudgetTest(BridgeTestCase):
+    """`save_reaction_budget_s` bounds the saved-reaction follow-up pages."""
+
+    EMOJI = "bookmark-example"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = [NOW]
+        patcher = mock.patch.object(slack_mcp, "_now", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pages = []
+
+        def search(args):
+            if not is_saved_filter(args):
+                return search_text([])
+            page = len(self.pages)
+            self.pages.append(args.get("cursor"))
+            self.clock[0] += 100  # each saved page costs 100s
+            return search_text(
+                [{"ts": ts_at(10 + page)}], cursor=f"NEXT{page}"
+            )
+
+        self.connector.search = search
+
+    def run_listing(self, **over):
+        log = []
+        runtime = {}
+        with mock.patch.object(slack_mcp, "log", log.append):
+            listing = slack_mcp.candidates(source(
+                save_reactions=[self.EMOJI], max_search_pages=5,
+                _slack_mcp_runtime=runtime, **over
+            ))
+        return log, listing, runtime
+
+    def test_budget_stops_the_search_and_leaves_the_rest(self):
+        log, _listing, _rt = self.run_listing(save_reaction_budget_s=250)
+        # Page 0 (shared session) then follow-ups at +0, +100, +200 of the
+        # budget; the one at +300 does not start.
+        self.assertEqual(len(self.pages), 4)
+        stop = [line for line in log if "stopped at" in line]
+        self.assertEqual(len(stop), 1)
+        self.assertIn("save_reaction_budget_s", stop[0])
+        self.assertFalse(any("max_search_pages" in line for line in log
+                             if "saved-reaction" in line))
+
+    def test_budget_stopped_run_still_yields_the_pages_it_read(self):
+        _log, listing, runtime = self.run_listing(save_reaction_budget_s=150)
+        saved = [c for c in listing if c["id"].startswith("saved:slack:")]
+        self.assertEqual(len(saved), len(self.pages))
+        self.assertGreaterEqual(len(saved), 2)
+        # No cursor or watermark exists for a saved query: nothing moved.
+        self.assertEqual(runtime["watermarks"], {})
+        self.assertEqual(runtime["failed_keys"], [])
+
+    def test_page_cap_message_names_max_search_pages(self):
+        log, _l, _rt = self.run_listing(save_reaction_budget_s=0)
+        self.assertEqual(len(self.pages), 5)
+        self.assertTrue(any("hit max_search_pages" in line for line in log))
+        self.assertFalse(any("save_reaction_budget_s" in line for line in log))
+
+    def test_the_budget_never_cuts_a_fast_run(self):
+        self.connector.search = lambda args: search_text(
+            [{"ts": ts_at(10)}] if is_saved_filter(args) else []
+        )
+        log, _l, _rt = self.run_listing()
+        self.assertFalse(any("budget" in line for line in log))
+        self.assertEqual(slack_mcp.settings({})["save_reaction_budget_s"], 300)
+
+    def test_budget_is_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for value, ok in ((0, True), (300, True), (-1, False),
+                              ("5m", False), (3601, False)):
+                problems = config.validate(routine(
+                    tmp, save_reaction_budget_s=value
+                ))
+                self.assertEqual(not problems, ok, (value, problems))

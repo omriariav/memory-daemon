@@ -113,6 +113,9 @@ class TrivialVerdictTest(unittest.TestCase):
         self.assertTrue(runner._trivial_verdict(r, item))
         item["frontmatter"]["slack_saved"] = True
         self.assertIsNone(runner._trivial_verdict(r, item))
+        gmail = chat(("A", "hi hi"))
+        gmail["frontmatter"]["saved_request"] = True
+        self.assertIsNone(runner._trivial_verdict(r, gmail))
         # a later reply on a saved thread is ordinary again
         later = chat(("A", "hi hi"))
         later["frontmatter"].update({"slack_save_tag": "saved"})

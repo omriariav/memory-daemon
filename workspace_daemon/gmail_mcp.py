@@ -23,6 +23,13 @@ Routine config:
       verified_sender_domains: [example.com]  # optional; see below
       auth_servers: [mx.google.com]           # whose verdict is trusted
       trust_from_without_auth: false          # see "From-only trust" below
+      saved_request: false        # true: every listed thread is a save request
+
+`saved_request: true` is for a query that lists only threads the owner
+labeled to be saved (for example `label:save-to-memory`). Every thread it lists
+is then an explicit save request, handled like a Slack save reaction: it is
+never dropped as small talk, and neither the analysis step nor the extraction
+step may judge it "not memory-worthy". Leave it off for a general query.
 
 With `verified_sender_domains` set, only mail from those exact domains is
 read, and (unless From-only trust is on, below) only when the receiving
@@ -119,7 +126,7 @@ DEFAULTS = {
 # Keys only a gmail_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "fetch_tool", "owner_email", "verified_sender_domains",
-    "auth_servers", "trust_from_without_auth",
+    "auth_servers", "trust_from_without_auth", "saved_request",
 }
 DEFAULT_AUTH_SERVERS = ("mx.google.com",)
 MAX_LOGGED_IDS = 20
@@ -188,6 +195,7 @@ def settings(source):
         str(s).strip().casefold()
         for s in source.get("auth_servers") or DEFAULT_AUTH_SERVERS
     ]
+    cfg["saved_request"] = source.get("saved_request") is True
     # Also enforced here, not only by config validation: without owner_email
     # the owner's own sent mail would be read as a colleague's.
     cfg["trust_from_without_auth"] = (

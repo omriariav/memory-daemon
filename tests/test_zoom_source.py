@@ -108,6 +108,7 @@ class ZoomSourceTest(unittest.TestCase):
     def write_calendar(self, events, refreshed=None):
         self.calendar.write_text(json.dumps({
             "events": events, "refreshed_at": iso(refreshed or self.now),
+            "owner_email": "ann@example.com",
         }))
 
     def at(self, minutes_after_start):
@@ -288,6 +289,8 @@ class ZoomSourceTest(unittest.TestCase):
         meta = item["frontmatter"]
         self.assertEqual(meta["calendar_event_id"], "ev1")
         self.assertEqual(len(meta["source_people"]), 2)
+        self.assertEqual(meta["calendar_attendee_count"], 2)
+        self.assertEqual(meta["calendar_other_attendee"], "bob@example.com")
         self.assertEqual(meta["same_meeting_entry_ids"], [])
         self.assertNotIn("follows_entry_ids", meta)
 
