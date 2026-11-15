@@ -11,7 +11,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
-from . import comms_inbox, slack_watch
+from . import comms_inbox, external_events, slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
@@ -25,9 +25,12 @@ VALID_ROUTINE_ROLES = {
 VALID_MAINTENANCE_KINDS = {
     "google_tasks_sync", "slack_conversation_census", "calendar_cache",
     "fibery_tasks_inbound", "fibery_tasks_outbound",
-    "slack_discovery",
+    "slack_discovery", "external_events",
 }
 MAINTENANCE_ALLOWED_KEYS = {
+    "external_events": {
+        "kind", "command", "source", "timeout_s", "max_events", "env",
+    },
     "slack_conversation_census": {
         "kind", "checkpoint", "hours", "requests_per_minute",
         "thread_root_days",
@@ -61,7 +64,9 @@ MAINTENANCE_ALLOWED_KEYS = {
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.
-MAINTENANCE_NO_CHECKPOINT = {"calendar_cache", "slack_discovery"}
+MAINTENANCE_NO_CHECKPOINT = {
+    "calendar_cache", "slack_discovery", "external_events",
+}
 # Kinds whose checkpoint path has a built-in default.
 MAINTENANCE_DEFAULT_CHECKPOINT = {
     "fibery_tasks_inbound", "fibery_tasks_outbound",
@@ -679,6 +684,23 @@ def cross_problems(routines):
         and r["maintenance"].get("kind") == "fibery_tasks_outbound"
     }
     found = {}
+    sources = {}
+    for r in routines:
+        m = r.get("maintenance")
+        if (
+            isinstance(m, dict) and m.get("kind") == "external_events"
+            and r.get("enabled", True) and isinstance(m.get("source"), str)
+        ):
+            sources.setdefault(m["source"], []).append(
+                r.get("id", "<missing id>"))
+    for source, ids in sources.items():
+        if len(ids) > 1:
+            for rid in ids:
+                found.setdefault(rid, []).append(
+                    f"{rid}: maintenance.source {source!r} is also used by "
+                    f"{', '.join(i for i in ids if i != rid)}; each "
+                    "external_events routine needs its own source"
+                )
     if not outbound:
         return found
     for r in routines:
@@ -790,6 +812,8 @@ def validate(routine):
                 problems.extend(_validate_calendar_cache(rid, maintenance))
             elif kind == "slack_discovery":
                 problems.extend(_validate_slack_discovery(rid, maintenance))
+            elif kind == "external_events":
+                problems.extend(external_events.config_problems(rid, maintenance))
             elif kind == "slack_conversation_census":
                 hours = maintenance.get("hours", 48)
                 if (

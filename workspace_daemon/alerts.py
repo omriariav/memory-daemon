@@ -21,7 +21,22 @@ Conditions (`key` in the event's details):
   sends one alert, not one per routine.
 - `attention:<routine>`: `status` would show the routine as "attention".
   Tick states that a running tick produces on its own (incomplete, overlap)
-  are ignored.
+  are ignored, and so is "interrupted": a failure whose log line names a
+  sleep or offline outage is the laptop's, not the routine's. Last-run
+  errors alert only on a streak: the last ERROR_STREAK ticks in a row ended
+  in error (interrupted ticks neither count nor break the streak, a clean
+  tick ends it), or the routine has had no clean tick for AWAKE_WINDOW_SECONDS
+  of awake time since the streak's first error. Awake time sums the gaps
+  between consecutive daemon ticks that are at most status.AWAKE_GAP_CAP_SECONDS
+  apart; a longer gap is sleep and adds nothing. The second rule keeps
+  rarely scheduled routines alerting. Only a measured sleep or a dead network
+  counts as an outage; timeouts and refused connections stay errors. As a
+  safety net, `interrupted:<routine>` alerts (separately from `attention:`,
+  so a change of cause alerts again) when at least INTERRUPTED_STREAK ticks in
+  a row were interrupted, with no clean or error tick between, and
+  AWAKE_WINDOW_SECONDS of awake time passed since the first. A tick the budget held
+  neither counts nor resets anything.
+- `interrupted:<routine>`: the safety net for outages (see `attention:`).
 - `connector:<server>`: an MCP connector's last error has been newer than
   its last success for more than CONNECTOR_GRACE_SECONDS (counted from the
   first error since that success).
@@ -34,6 +49,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -44,8 +60,19 @@ ALERT_FILE = "alerts.json"
 LOCK_FILE = "alerts.lock"
 WARN_FRACTION = 0.8
 CONNECTOR_GRACE_SECONDS = 3600
-# Produced by ticks still in flight in another scheduler group, not by faults.
-TRANSIENT_ISSUES = ("incomplete", "overlap")
+# Failed ticks in a row (interrupted ones do not count) that raise attention.
+ERROR_STREAK = 3
+# Interrupted ticks in a row (no clean or error tick between) that, with
+# AWAKE_WINDOW_SECONDS of awake time since the first, raise `interrupted:`.
+INTERRUPTED_STREAK = 3
+# Awake time with no clean tick, counted from the first error of the streak,
+# that raises attention even when fewer than ERROR_STREAK ticks ran.
+AWAKE_WINDOW_SECONDS = 2 * 3600
+# Produced by ticks still in flight in another scheduler group, or by an
+# outage of the machine, not by faults.
+TRANSIENT_ISSUES = ("incomplete", "overlap", "interrupted")
+# status's wording for a failed last tick; the streak rules replace it.
+_LAST_RUN_ISSUE = re.compile(r"^(?:\d+ last-run errors?|last run)$")
 
 
 def _spend_text(spent):
@@ -145,17 +172,50 @@ def budget_conditions(routines, entries, budget, now):
     return found, quiet
 
 
+def _failing_streak(history, routine_id):
+    """Issue text when the routine's run of failed ticks is long enough."""
+    streak = history.get("streaks", {}).get(routine_id)
+    if not streak:
+        return None
+    if streak["errors"] >= ERROR_STREAK:
+        return f"{streak['errors']} failed runs in a row"
+    if streak["awake"] >= AWAKE_WINDOW_SECONDS:
+        return (f"failing for {status._duration(streak['awake'])} "
+                "of awake time")
+    return None
+
+
+def _cut_short(history, routine_id):
+    """Text when a routine only gets interrupted, for long enough."""
+    run = history.get("interrupted", {}).get(routine_id)
+    if (run and run["ticks"] >= INTERRUPTED_STREAK
+            and run["awake"] >= AWAKE_WINDOW_SECONDS):
+        return (f"{run['ticks']} interrupted runs in a row, "
+                f"{status._duration(run['awake'])} of awake time")
+    return None
+
+
 def health_conditions(base_dir, routines, entries, now):
     """Routines `status` flags for attention, and connectors failing too long."""
     found = {}
     history = status.read_tick_history(Path(base_dir) / "logs" / "run.log")
     for row in status.routine_rows(base_dir, routines, history, now=now):
-        if row["issues"] == "-" or row["armed"] != "yes":
+        if row["armed"] != "yes":
             continue
         issues = [
             issue for issue in row["issues"].split(", ")
-            if issue not in TRANSIENT_ISSUES
+            if issue != "-" and issue not in TRANSIENT_ISSUES
+            and not _LAST_RUN_ISSUE.match(issue)
         ]
+        failing = _failing_streak(history, row["routine"])
+        if failing:
+            issues.append(failing)
+        cut_short = _cut_short(history, row["routine"])
+        if cut_short:
+            found[f"interrupted:{row['routine']}"] = (
+                f"{row['routine']} keeps being interrupted: {cut_short}",
+                {"routine": row["routine"], "issues": [cut_short]},
+            )
         if issues:
             found[f"attention:{row['routine']}"] = (
                 f"{row['routine']} needs attention: {', '.join(issues)}",

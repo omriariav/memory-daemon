@@ -194,8 +194,19 @@ Never reproduce credentials, secrets, or unrelated sensitive personal data.
 {source}
 """
 
+# Source-id prefixes of captured entries; the operator-confirmed pattern is
+# built from them.
+CAPTURE_SOURCE_ID_PREFIXES = (
+    "gmail", "gchat", "slack", "gdrive", "mila", "whisper",
+)
+# Every `source` the daemon's own producers write to the event stream (capture
+# prefixes above, plus zoom, calendar, alerts and person briefs). An
+# `external_events` routine may not claim one of these.
+RESERVED_EVENT_SOURCES = frozenset(CAPTURE_SOURCE_ID_PREFIXES) | {
+    "zoom", "gcal", "daemon", "person", "slack-profile", "unknown",
+}
 OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
-    r"^(?:gmail|gchat|slack|gdrive|mila|whisper):[^\s]+$"
+    r"^(?:" + "|".join(CAPTURE_SOURCE_ID_PREFIXES) + r"):[^\s]+$"
 )
 
 

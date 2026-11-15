@@ -1,0 +1,61 @@
+# Feed state/events.jsonl from your own script.
+#
+# Every run executes `command` (argv, no shell, stdin closed, cwd = the daemon
+# directory). It sees two extra environment variables:
+#   MEMORY_DAEMON_CURSOR_FILE  path of this routine's cursor file (missing on
+#                              the first run); read your last position there.
+#   MEMORY_DAEMON_DRY_RUN      "1" on `run --dry-run`, else "0"; do not advance
+#                              any state of your own when it is "1".
+# and prints JSON on stdout:
+#
+#   {"events": [
+#     {"kind": "row_changed", "key": "sheet1:row7", "title": "Row 7 changed",
+#      "people": ["jane-doe"], "details": {"cell": "B7", "occurred_at": "2026-01-02T03:04:05Z"}}
+#   ],
+#   "cursor": {"last_row": 7}}
+#
+# `kind`, `key` and `title` are required; `people` (slugs) and `details` (an
+# object, up to 8 KB) are optional. There is no `ts`: the daemon stamps emit
+# time; put the real time in details.occurred_at. The event's source_id is
+# `<source>:<key>`. One invalid event (or a repeated kind+key) rejects the
+# whole batch; a non-zero exit, a timeout (the process group is killed),
+# non-JSON output or more than max_events events emits nothing and counts as a
+# failure (shown in `status`, raised as an attention alert).
+#
+# `cursor` is optional (any JSON, up to 256 KB). The daemon saves it only after
+# every event was appended, and never on a dry run, so a failed run loses
+# nothing. After a partial append failure the next run repeats the events that
+# were written (with new ids).
+#
+# The command's own spend is not covered by budget.daily_usd: cap it yourself.
+#
+# Scheduling: runs in the `maintenance` tick group, under its own lock. The
+# launchd tick is 900 s, so use 14m rather than 15m for a 15-minute cadence.
+id: external-events-example
+enabled: false
+description: Watch a spreadsheet with my-script.py and emit change events.
+role: maintenance
+
+schedule:
+  every: 7d
+  work_hours:
+    every: 14m
+    days: [sun, mon, tue, wed, thu]
+    start: "09:00"
+    end: "19:00"
+    timezone: UTC
+
+maintenance:
+  kind: external_events
+  # argv list; `~` is expanded in each element.
+  command: ["~/bin/my-script.py", "--since-last-run"]
+  # Event source prefix: ^[a-z][a-z0-9_-]{0,31}$. Names used by built-in
+  # producers (slack, gmail, mila, zoom, gcal, daemon, ...) are rejected.
+  source: spreadsheet
+  # Optional. Seconds before the command is killed (default 300, max 1800).
+  timeout_s: 120
+  # Optional. Cap per run (default 200); over the cap nothing is emitted.
+  max_events: 200
+  # Optional extra environment variables (strings).
+  env:
+    MY_SCRIPT_MODE: incremental

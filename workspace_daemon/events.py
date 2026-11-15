@@ -4,6 +4,7 @@ calendar invite, change or cancellation, and per operational alert.
 `state/events.jsonl` lets a reader (a notifier, a dashboard) follow captures
 without polling the memory store. `memory_sink.capture` (source from the
 `source_id` prefix, e.g. slack), the `calendar_cache` routine (source gcal)
+`external_events` routines (a user-chosen source),
 `alerts.check` (source daemon, kind "alert") and the Mila source's language
 check (also a daemon alert) write it; every other reader must treat it as
 read-only.
@@ -81,17 +82,19 @@ def source_of(source_id):
     return prefix if sep and prefix else "unknown"
 
 
-def event_id(source_id, memory_id, kind, ts):
+def event_id(source_id, memory_id, kind, ts, salt=None):
     raw = f"{source_id}|{memory_id}|{kind}|{ts}"
+    if salt is not None:
+        raw += f"|{salt}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def build(routine_id, kind, memory_id, source_id, title, people, ts=None,
-          details=None):
+          details=None, salt=None):
     ts = ts or utc_now_iso()
     event = {
         "v": SCHEMA_VERSION,
-        "id": event_id(source_id, memory_id, kind, ts),
+        "id": event_id(source_id, memory_id, kind, ts, salt),
         "ts": ts,
         "source": source_of(source_id),
         "kind": kind,

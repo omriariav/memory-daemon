@@ -8,13 +8,14 @@ import hashlib
 import json
 import math
 import re
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
 from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whisper_source
 from .count_only import report as count_report
-from . import gmail_mcp, person_resolver, slack_mcp, zoom_source
+from . import gmail_mcp, person_resolver, slack_mcp, sleepclock, zoom_source
 from .shell import log, utc_now_iso
 
 MAX_GMAIL_SOURCE_PEOPLE = 20
@@ -29,12 +30,67 @@ _SHARED_DEPENDENCY_ERRORS = (
     "quota exceeded", "unauthenticated", "invalid api key",
     # claude_bridge.BridgeOutage: the call failed across a machine sleep.
     "machine slept",
+    # claude_bridge tags a failed tool call whose body said so.
+    "auth failed",
 )
+# Wait before the one retry of a connector listing that failed with a tool
+# error not caused by a sleep or outage.
+CONNECTOR_RETRY_DELAY_SECONDS = 10
+_retry_sleep = time.sleep  # replaced in tests
 
 
 def _is_shared_dependency_failure(value):
     text = str(value).casefold()
     return any(marker in text for marker in _SHARED_DEPENDENCY_ERRORS)
+
+
+def _retryable_tool_error(exc, source):
+    """True for a connector tool error worth one more try in the same tick.
+
+    Not for a dry run or count-only pass, a guard stop, or a failure tagged (or worded) as a
+    sleep, outage, rate limit or auth problem: those would fail again.
+    """
+    return (
+        source.get("kind") in ("slack_mcp", "gmail_mcp")
+        and not source.get("_dry_run")
+        and not source.get("_count_only")
+        and isinstance(exc, claude_bridge.BridgeError)
+        and not isinstance(exc, claude_bridge.GUARD_STOPS)
+        and "tool returned an error" in str(exc)
+        and not sleepclock.text_is_outage(exc)
+        and not _is_shared_dependency_failure(exc)
+    )
+
+
+def _list_with_retry(list_candidates, source, rid, label):
+    """list_candidates(source), retried once after a connector tool error.
+
+    Listing only reads: cursors move later, in commit_points, from the
+    source's final coverage, and the comms-inbox rows it may already have
+    written are keyed by message, so a second pass cannot double-emit. Each
+    attempt is a separate bridge call under the routine's usage scope and
+    daily cap, so the retry is charged (and held) like any other call.
+    """
+    try:
+        return list_candidates(source)
+    except Exception as exc:
+        if not _retryable_tool_error(exc, source):
+            raise
+        first = exc
+        log(f"routine={rid} source={label} tool error, retrying once in "
+            f"{CONNECTOR_RETRY_DELAY_SECONDS}s: {exc}")
+    _retry_sleep(CONNECTOR_RETRY_DELAY_SECONDS)
+    try:
+        found = list_candidates(source)
+    except claude_bridge.GUARD_STOPS as stop:
+        # Held by a cap or the pause switch: the first failure still counts.
+        log(f"routine={rid} source={label} retry held: {stop}")
+        raise first from None
+    except Exception as exc:
+        log(f"routine={rid} source={label} retry failed: {exc}")
+        raise
+    log(f"routine={rid} source={label} retry succeeded")
+    return found
 
 
 def _catch_up_cursor_id(source):
@@ -1857,7 +1913,9 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             ownership_class = spec["ownership_class"]
             log(f"routine={rid} querying {spec_label}: {_scope(spec_source)}")
             try:
-                candidates = list_candidates(spec_source)
+                candidates = _list_with_retry(
+                    list_candidates, spec_source, rid, spec_label
+                )
             except Exception as exc:
                 coverage_problems.append(f"{spec_label} listing failed: {exc}")
                 if isinstance(exc, claude_bridge.GUARD_STOPS):
@@ -1910,7 +1968,9 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
                     f"scan to {discovery_limit}"
                 )
                 try:
-                    discovery = list_candidates(expanded_source)
+                    discovery = _list_with_retry(
+                        list_candidates, expanded_source, rid, spec_label
+                    )
                 except Exception as exc:
                     totals["errors"] += 1
                     log(

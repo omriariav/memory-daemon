@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import claude_bridge, config, state
+from . import claude_bridge, config, sleepclock, state
 
 
 DEFAULT_LAUNCHD_LABEL = "com.memory-daemon"
@@ -14,6 +14,9 @@ MAINTENANCE_LAUNCHD_LABEL = "com.memory-daemon-maintenance"
 CALENDAR_LAUNCHD_LABEL = "com.memory-daemon-calendar"
 LEGACY_LAUNCHD_LABEL = "com.workspace-daemon"
 TICK_STALE_INTERVALS = 2
+# Two ticks further apart than this mean the machine slept in between: the
+# gap adds nothing to a routine's awake time.
+AWAKE_GAP_CAP_SECONDS = 30 * 60
 # Memory-sink failures older than this no longer count as an open issue.
 MEMORY_ERROR_WINDOW_SECONDS = 24 * 3600
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
@@ -37,9 +40,16 @@ _TICK_PREFLIGHT = re.compile(
     _TICK_PREFIX + r" skipped: (?P<why>lid closed|dark wake|offline)$"
 )
 _TICK_TOTALS = re.compile(r"(?P<errors>\d+) error\(s\)")
+# Routines a budget cap held: written by the daemon after the totals.
+_TICK_HELD = re.compile(r" held=(\S+)")
 _ROUTINE_ERROR = re.compile(
     r"^routine=(?P<id>\S+)\b.*\b(?:ERROR|FATAL)\b"
 )
+
+
+def _empty_history():
+    return {"latest": None, "latest_by_group": {}, "routines": {},
+            "skipping_since": {}, "streaks": {}, "interrupted": {}}
 _LEGACY_TICK_KEY = "<legacy>"
 
 
@@ -117,11 +127,17 @@ def probe_launchd(label=DEFAULT_LAUNCHD_LABEL, uid=None):
 
 
 def read_tick_history(path, max_bytes=32 * 1024 * 1024):
-    """Summarize coordinator ticks and the last result for every routine."""
+    """Summarize coordinator ticks and the last result for every routine.
+
+    `streaks[routine]` describes the current run of failed ticks: `errors`
+    (ticks that ended in error; interrupted ticks neither count nor break
+    it, a clean tick ends it), `first_error_at`, and `awake` (seconds of
+    awake time since that first error: the gaps between consecutive ticks of
+    any group, each counted only when at most AWAKE_GAP_CAP_SECONDS).
+    """
     path = Path(path)
     if not path.exists():
-        return {"latest": None, "latest_by_group": {}, "routines": {},
-                "skipping_since": {}}
+        return _empty_history()
     try:
         # Status is interactive and must stay bounded even after years of
         # unattended operation. Rotation normally keeps this small; tailing is
@@ -133,8 +149,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 handle.readline()  # discard a partial first line
             lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
-        return {"latest": None, "latest_by_group": {}, "routines": {},
-                "skipping_since": {}}
+        return _empty_history()
 
     routine_results = {}
     # group -> time of the first of an unbroken run of preflight skips.
@@ -142,6 +157,39 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
     active = {}
     latest = None
     latest_by_group = {}
+    streaks = {}
+    # routine -> ticks cut short by an outage since its last clean or failed
+    # tick (see alerts: a safety net for a routine that never gets to run).
+    outage_runs = {}
+    last_tick = [None]
+
+    def note_tick(at):
+        """Add the gap since the previous tick to every open streak."""
+        epoch = _iso_epoch(at)
+        if epoch is None:
+            return
+        gap = epoch - last_tick[0] if last_tick[0] is not None else 0
+        # An out-of-order stamp must not make the next gap look longer.
+        last_tick[0] = max(epoch, last_tick[0] or epoch)
+        if 0 < gap <= AWAKE_GAP_CAP_SECONDS:
+            for streak in (*streaks.values(), *outage_runs.values()):
+                streak["awake"] += gap
+
+    def note_outcome(routine_id, at, outcome):
+        if outcome in ("ok", "error"):
+            outage_runs.pop(routine_id, None)
+        if outcome == "interrupted":
+            run = outage_runs.setdefault(
+                routine_id, {"first_at": at, "awake": 0.0, "ticks": 0})
+            run["ticks"] += 1
+        if outcome == "ok":
+            streaks.pop(routine_id, None)
+        elif outcome == "error":
+            streak = streaks.setdefault(
+                routine_id,
+                {"errors": 0, "first_error_at": at, "awake": 0.0},
+            )
+            streak["errors"] += 1
 
     def tick_group(match):
         return match.group("group") or "all"
@@ -202,8 +250,10 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 "dry_run": dry_run,
                 "group": group,
                 "routine_errors": {},
+                "routine_interrupted": {},
             }
             if not dry_run:
+                note_tick(at)
                 record_latest(group, {
                     "state": "incomplete",
                     "at": at,
@@ -223,16 +273,25 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
             totals = _TICK_TOTALS.search(message)
             error_count = int(totals.group("errors")) if totals else None
             if not dry_run:
+                note_tick(at)
                 if block:
                     routine_errors = block.get("routine_errors", {})
-                    attributed_count = sum(routine_errors.values())
+                    interrupted = block.get("routine_interrupted", {})
+                    attributed_count = (
+                        sum(routine_errors.values()) + sum(interrupted.values())
+                    )
                     attribution_complete = (
                         error_count is not None
                         and error_count > 0
                         and attributed_count >= error_count
                     )
                     paused = " (paused)" in message
+                    held = _TICK_HELD.search(message)
+                    held_ids = set(held.group(1).split(",")) if held else set()
                     for routine_id in block["due_ids"]:
+                        if (routine_id in held_ids
+                                and not routine_errors.get(routine_id, 0)):
+                            continue  # held by a cap: it did not run
                         routine_error_count = routine_errors.get(
                             routine_id, 0
                         )
@@ -240,14 +299,23 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                             not attribution_complete
                             or routine_error_count > 0
                         )
+                        # Only sleep/offline lines: the laptop, not the
+                        # routine, failed; neither an error nor a success.
+                        cut_short = (
+                            not failed and attribution_complete
+                            and interrupted.get(routine_id, 0) > 0
+                        )
+                        outcome = (
+                            "error" if failed
+                            else "interrupted" if cut_short
+                            else "paused" if paused else "ok"
+                        )
                         routine_results[routine_id] = {
-                            "state": (
-                                "error" if failed
-                                else "paused" if paused else "ok"
-                            ),
+                            "state": outcome,
                             "at": at,
                             "group": block["group"],
                         }
+                        note_outcome(routine_id, at, outcome)
                         if failed and attribution_complete:
                             routine_results[routine_id]["errors"] = (
                                 routine_error_count
@@ -262,6 +330,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
 
         gated = _TICK_PREFLIGHT.match(message)
         if gated:
+            # Nothing ran: the machine was not really awake for these.
             group = tick_group(gated)
             record_latest(group, {
                 "state": "preflight_skipped",
@@ -278,7 +347,11 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
             for block in active.values():
                 if block["dry_run"] or routine_id not in block["due_ids"]:
                     continue
-                counts = block["routine_errors"]
+                counts = block[
+                    "routine_interrupted"
+                    if sleepclock.text_is_outage(message)
+                    else "routine_errors"
+                ]
                 counts[routine_id] = counts.get(routine_id, 0) + 1
 
         skipped = _TICK_SKIPPED.match(message)
@@ -290,6 +363,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                 block and block["dry_run"]
             )
             if not dry_run:
+                note_tick(at)
                 if block:
                     explicit_ids = {
                         value.strip()
@@ -323,6 +397,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
             key = tick_key(noop)
             close_incomplete(active.pop(key, None))
             if not noop.group("dry"):
+                note_tick(at)
                 record_latest(group, {
                     "state": "idle", "at": at, "message": message,
                     "group": group,
@@ -335,6 +410,8 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         "latest_by_group": latest_by_group,
         "routines": routine_results,
         "skipping_since": skipping_since,
+        "streaks": streaks,
+        "interrupted": outage_runs,
     }
 
 
@@ -437,6 +514,8 @@ def routine_rows(
                 issues.append(f"{error_count} last-run {suffix}")
             else:
                 issues.append("last run")
+        elif tick_state == "interrupted":
+            issues.append("interrupted")
         elif tick_state == "skipped":
             issues.append("overlap")
         elif tick_state == "incomplete" and not current_tick:

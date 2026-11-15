@@ -18,6 +18,19 @@ _OFFLINE_MARKERS = (
     "network is unreachable", "connection refused", "connection reset",
     "nodename nor servname provided", "temporary failure in name resolution",
 )
+# Failures that are the service's answer, never the laptop's: a line that
+# carries one stays a real error.
+_NOT_OUTAGE_MARKERS = (
+    "rate limit", "too many requests", "quota exceeded", "unauthenticated",
+    "invalid api key", "auth failed",
+)
+# Pure network-down failures seen right after a wake. Timeouts and refused or
+# reset connections are left out: they also happen on a healthy network.
+_NETWORK_DOWN_MARKERS = (
+    "could not resolve host", "name or service not known",
+    "nodename nor servname provided", "temporary failure in name resolution",
+    "network is unreachable",
+)
 
 
 class Span:
@@ -44,3 +57,15 @@ def is_outage(exc):
 def looks_offline(exc):
     text = str(exc).casefold()
     return is_outage(exc) or any(m in text for m in _OFFLINE_MARKERS)
+
+
+def text_is_outage(text):
+    """True when a log or error text names a measured sleep or a dead network.
+
+    Rate-limit, quota and authentication failures are never an outage; nor
+    are timeouts and refused or reset connections.
+    """
+    text = str(text).casefold()
+    if any(m in text for m in _NOT_OUTAGE_MARKERS):
+        return False
+    return OUTAGE_NOTE in text or any(m in text for m in _NETWORK_DOWN_MARKERS)

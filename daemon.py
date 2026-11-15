@@ -255,6 +255,7 @@ def cmd_validate(args):
 
 CENSUS_KIND = "slack_conversation_census"
 CALENDAR_KIND = "calendar_cache"
+EXTERNAL_KIND = "external_events"
 
 
 def _maintenance_kind(routine):
@@ -282,9 +283,12 @@ def _execution_groups(routines, active_ids):
         (ids(lambda kind: kind is None), "run"),
         (
             ids(lambda kind: kind is not None
-                and kind not in (CENSUS_KIND, CALENDAR_KIND)),
+                and kind not in (CENSUS_KIND, CALENDAR_KIND, EXTERNAL_KIND)),
             "run",
         ),
+        # A user command may run long: its own lock keeps it from holding
+        # up (or being skipped by) capture.
+        (ids(lambda kind: kind == EXTERNAL_KIND), "external-events"),
         # Within one `all` tick the cheap calendar refresh runs before the census.
         (ids(lambda kind: kind == CALENDAR_KIND), "calendar-cache"),
         (ids(lambda kind: kind == CENSUS_KIND), "slack-census"),
@@ -305,7 +309,7 @@ def _in_tick_group(routine, group):
 
 def _manual_execution_groups(routines, active_ids):
     """Refresh census and calendar first, then the runner's maintenance order."""
-    capture, maintenance, calendar, census = _execution_groups(
+    capture, maintenance, external, calendar, census = _execution_groups(
         routines, active_ids
     )
     capture_ids, _ = capture
@@ -313,6 +317,7 @@ def _manual_execution_groups(routines, active_ids):
     return [
         census,
         calendar,
+        external,
         (capture_ids | maintenance_ids, "run"),
     ]
 
@@ -580,6 +585,7 @@ def cmd_tick(args):
     # the next tick cannot repeat capture merely because maintenance was slow.
     groups = _execution_groups(routines, due_ids)
     paused_mid_tick = False
+    held_all = set()
     for group_ids, lock_name in groups:
         if not group_ids:
             continue
@@ -608,11 +614,14 @@ def cmd_tick(args):
             break
         # A routine held by a cap or the pause switch did not really attempt.
         held = set(group_totals.get("held_ids", ()))
+        held_all |= held
         schedule.mark_attempted(group_ids - held, now=group_started_epoch)
         _merge_totals(totals, group_totals)
     log(
         f"{tick_name} done: {totals['processed']} processed, "
         f"{totals['skipped']} already-seen, {totals['errors']} error(s)"
+        # Held routines did not run: status gives them no outcome.
+        f"{' held=' + ','.join(sorted(held_all)) if held_all else ''}"
         f"{' (paused)' if paused_mid_tick else ''}{mode}"
     )
     return 1 if totals["errors"] else 0
