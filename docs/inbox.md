@@ -89,6 +89,12 @@ empty, nothing crashes. One bad item (failed validation, duplicate id) is
 dropped and counted in the error text without hiding the others. A duplicate id
 across sources keeps the first.
 
+**Background children.** The whole process group is killed when the command
+exits, times out or overflows, so a source that starts a background child it
+wants to outlive the call (a cache refresher, a daemon) must detach it into its
+own session, e.g. `setsid cmd &` (or `start_new_session=True` in Python);
+otherwise the child dies with the call.
+
 `act` (`run_command_act` in `sources.py`) is defined and tested but not called
 until phase 2. It has the same limits: its own process group, killed whole on
 timeout or an oversized response.

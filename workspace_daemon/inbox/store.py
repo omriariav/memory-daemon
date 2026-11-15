@@ -23,7 +23,9 @@ LOCK_NAME = "inbox-state.lock"
 SCHEMA_VERSION = 1
 # A mark is kept while its item is still listed by some source, and for this
 # long after the item was last listed (or the mark was last changed). Active
-# snoozes are never pruned by age.
+# snoozes are never pruned by age. Age pruning happens only in `note_listed`
+# after a successful poll: a write made before the first poll of a session
+# must not drop marks whose items that poll is about to list again.
 RETENTION_S = 7 * 86400
 LISTED_REFRESH_S = 3600  # how often a still-listed item's mark is re-stamped
 MAX_ENTRIES = 5000
@@ -74,7 +76,7 @@ class InboxStore:
             return self.marks
 
     def _write(self):
-        self._prune()
+        self._cap()
         if self.path is None:
             return
         if self._corrupt:
@@ -151,10 +153,13 @@ class InboxStore:
         """Drop every mark (undo)."""
         self._transaction(lambda marks: marks.pop(item_id, None) is not None)
 
-    def note_listed(self, item_ids):
+    def note_listed(self, item_ids, prune=False):
         """Record that these ids are still listed by a source, so their marks
-        outlive the item's time in the source's window. Cheap: it writes only
-        when a marked id has not been stamped for LISTED_REFRESH_S."""
+        outlive the item's time in the source's window; with `prune`, then
+        drop the marks that have not been listed for RETENTION_S. Pass
+        `prune=True` only after a poll in which every source answered (a source
+        that is down lists nothing). Cheap: it touches the disk only when a
+        marked id needs a fresh stamp or a mark has expired."""
         ids = set(item_ids)
         now = self.clock()
 
@@ -162,14 +167,24 @@ class InboxStore:
             return [k for k in ids if k in marks and
                     now - marks[k].get("last_listed", 0) > LISTED_REFRESH_S]
 
-        if not stale(self.marks):  # nothing to do: skip the lock and disk
-            return
+        def expired(marks, stamped=()):
+            return [k for k, m in marks.items()
+                    if k not in stamped and k not in ids
+                    and m.get("snooze_until", 0) <= now
+                    and now - max(m.get("last_listed", 0),
+                                  m.get("updated", 0)) > RETENTION_S]
+
+        if not stale(self.marks) and not (prune and expired(self.marks)):
+            return  # nothing to do: skip the lock and the disk
 
         def change(marks):
             todo = stale(marks)
             for key in todo:
                 marks[key]["last_listed"] = now
-            return bool(todo)
+            gone = expired(marks) if prune else []
+            for key in gone:
+                del marks[key]
+            return bool(todo or gone)
         self._transaction(change)
 
     # -- queries --
@@ -193,13 +208,9 @@ class InboxStore:
         return [r for r in rows if not self.is_hidden(r["id"], now)]
 
     # -- housekeeping --
-    def _prune(self, now=None):
-        now = self.clock() if now is None else now
-        for key in [k for k, m in self.marks.items()
-                    if m.get("snooze_until", 0) <= now
-                    and now - max(m.get("last_listed", 0),
-                                  m.get("updated", 0)) > RETENTION_S]:
-            del self.marks[key]
+    def _cap(self):
+        """Bound the file size on every write (never by age; see the module
+        notes): drop the least recently listed marks past MAX_ENTRIES."""
         if len(self.marks) > MAX_ENTRIES:
             oldest = sorted(self.marks, key=lambda k: max(
                 self.marks[k].get("last_listed", 0),

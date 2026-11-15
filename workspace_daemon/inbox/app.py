@@ -789,7 +789,10 @@ class InboxApp(App):
             return [SourceResult("inbox", [], False, None,
                                  f"poll failed: {type(exc).__name__}: {exc}")]
         try:
-            self.store.note_listed(i["id"] for r in results for i in r.items)
+            # Age-prune marks only when every source answered cleanly.
+            self.store.note_listed(
+                (i["id"] for r in results for i in r.items),
+                prune=all(r.error is None for r in results))
         except OSError:
             pass
         return results

@@ -120,13 +120,52 @@ class StoreTest(unittest.TestCase):
         s.done("gone")
         s.snooze("sleeper", self.clock.t + 90 * 86400)
         self.clock.t += store_mod.RETENTION_S - 10
-        s.done("probe")
+        s.note_listed([], prune=True)
         self.assertIn("gone", s.marks)            # not yet seven days
         self.clock.t += 20
-        s.done("probe2")
+        s.note_listed([], prune=True)
         self.assertNotIn("gone", s.marks)
         self.assertIn("sleeper", s.marks)          # an active snooze stays
-        self.assertIn("probe2", s.marks)
+        self.assertNotIn("gone", self.store().marks)
+
+    def test_age_pruning_needs_an_explicit_successful_poll(self):
+        s = self.store()
+        s.done("gone")
+        self.clock.t += 30 * 86400
+        s.note_listed([])                          # a poll with a failed source
+        s.done("other")                            # and plain writes
+        self.assertIn("gone", s.marks)
+        s.note_listed([], prune=True)
+        self.assertNotIn("gone", s.marks)
+
+    def test_writes_never_prune_by_age(self):
+        s = self.store()
+        s.done("old")
+        self.clock.t += 60 * 86400
+        for n in range(3):
+            s.done(f"w{n}")
+            s.ack(f"a{n}")
+            s.snooze(f"s{n}", self.clock.t + 60)
+            s.restore("nothing")
+        self.assertIn("old", self.store().marks)
+
+    def test_done_mark_written_before_the_first_poll_after_8_days_away(self):
+        """Reproduction: the app reopens after 8 days, the user marks another
+        item before the first poll lands; the still-listed marks must survive
+        (and the long-gone one is pruned only by the poll)."""
+        s = self.store()
+        s.done("listed")
+        s.done("gone")
+        self.clock.t += 8 * 86400
+        s = self.store()                           # reopened
+        s.done("new-before-poll")                  # a write before any poll
+        self.assertTrue(s.is_hidden("listed"))
+        self.assertIn("gone", s.marks)
+        s.note_listed(["listed", "new-before-poll"], prune=True)  # first poll
+        fresh = self.store()
+        self.assertTrue(fresh.is_hidden("listed"))
+        self.assertTrue(fresh.is_hidden("new-before-poll"))
+        self.assertNotIn("gone", fresh.marks)
 
     def test_a_twenty_day_old_done_item_stays_hidden_while_listed(self):
         s = self.store()
@@ -134,7 +173,8 @@ class StoreTest(unittest.TestCase):
         for _ in range(20):                        # a poll a day lists it
             self.clock.t += 86400
             s.note_listed(["old"])
-        s.done("other")                            # any later write prunes
+        s.note_listed(["old"], prune=True)
+        s.done("other")
         self.assertTrue(self.store().is_hidden("old"))
         self.assertIn("last_listed", s.marks["old"])
 
@@ -143,8 +183,8 @@ class StoreTest(unittest.TestCase):
         s.done("old")
         self.clock.t += 20 * 86400                 # app not run for 20 days
         s = self.store()
-        s.note_listed(["old"])                     # the poll runs first
-        s.done("new")
+        s.done("new")                              # a write before the poll
+        s.note_listed(["old"], prune=True)         # then the poll lists it
         self.assertTrue(self.store().is_hidden("old"))
 
     def test_note_listed_does_not_rewrite_the_file_every_poll(self):

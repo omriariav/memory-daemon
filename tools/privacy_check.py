@@ -13,8 +13,9 @@ Checks, per line of every tracked text file:
   * every entry of an optional local denylist, which is never in the repo:
       ~/.config/memory-daemon/private-denylist.txt  (override: --denylist, or
       $MEMORY_DAEMON_DENYLIST). One entry per line, `#` comments; a plain
-      entry is a case-insensitive substring, `word:<term>` the same but only as
-      a whole word, `re:<regex>` a case-insensitive regex.
+      entry is a case-insensitive substring, `word:<term>` matches whole words only,
+      allows spaces . _ - ' between its parts and, for names, "Last, First"
+      order; `re:<regex>` is a case-insensitive regex.
 
 False positives go in tools/privacy_allowlist.txt, one entry per line, `#`
 comments: `TOKEN` (exact flagged text, any file), `re:<regex>` (must match the
@@ -139,28 +140,76 @@ def allowed(path, text, entries):
     return False
 
 
+_SEP = r"[\s._'\u2019-]+"
+_TOKEN = re.compile(r"[^\W_]+")          # letters and digits, no underscore
+_B, _E = r"(?<![^\W_])", r"(?![^\W_])"  # whole-word edges that ignore "_"
+
+
+class Denylist:
+    """Compiled denylist. `hits(line)` returns the numbers of matching entries.
+
+    Plain and `re:` entries are few and tested directly. `word:` entries (one
+    per person, hundreds) go through an index on their first token: a line is
+    tokenised once and only entries whose first token occurs in it get their
+    regexes run, so scanning stays fast with a very long list.
+
+    A `word:` term matches as whole words, with any run of spaces, `.`, `_`,
+    `-` or an apostrophe between its parts, and for two or more parts also in
+    "Last, First" order (everything after the first part, a comma, then the
+    first part).
+    """
+
+    def __init__(self):
+        self.direct = []         # (n, compiled regex)
+        self.by_first = {}       # first token (lowercase) -> [(n, [regexes])]
+        self.count = 0
+
+    def __len__(self):
+        return self.count
+
+    def add_word(self, n, term):
+        tokens = _TOKEN.findall(term)
+        if not tokens:
+            raise ValueError(f"denylist entry {n}: empty word")
+        parts = [re.escape(t) for t in tokens]
+        forward = _B + _SEP.join(parts) + _E
+        regexes = [re.compile(forward, re.IGNORECASE)]
+        if len(parts) > 1:
+            reverse = (_B + _SEP.join(parts[1:]) + r"\s*,\s*" + parts[0] + _E)
+            regexes.append(re.compile(reverse, re.IGNORECASE))
+        self.by_first.setdefault(tokens[0].lower(), []).append((n, regexes))
+
+    def hits(self, line):
+        found = [n for n, pattern in self.direct if pattern.search(line)]
+        if self.by_first:
+            for token in set(_TOKEN.findall(line.lower())):
+                for n, regexes in self.by_first.get(token, ()):
+                    if any(r.search(line) for r in regexes):
+                        found.append(n)
+        return sorted(found)
+
+
 def compile_denylist(entries):
-    out = []
+    out = Denylist()
     for n, entry in enumerate(entries, 1):
+        out.count += 1
         if entry.startswith("word:"):
-            term = entry[5:].strip()
-            if not term:
-                raise ValueError(f"denylist entry {n}: empty word")
-            out.append((n, re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)",
-                                      re.IGNORECASE)))
+            out.add_word(n, entry[5:].strip())
         elif entry.startswith("re:"):
             try:
-                out.append((n, re.compile(entry[3:], re.IGNORECASE)))
+                out.direct.append((n, re.compile(entry[3:], re.IGNORECASE)))
             except re.error as exc:
                 raise ValueError(f"denylist entry {n}: bad regex ({exc})")
         else:
-            out.append((n, re.compile(re.escape(entry), re.IGNORECASE)))
+            out.direct.append((n, re.compile(re.escape(entry), re.IGNORECASE)))
     return out
 
 
 def deny_findings(path, lineno, line, deny):
+    if not deny:
+        return []
     return [Finding(path, lineno, f"denylist entry {n}", "", True)
-            for n, pattern in deny if pattern.search(line)]
+            for n in deny.hits(line)]
 
 
 def scan_text(path, text, allow, deny, email_safe=email_ok, message_safe=()):

@@ -18,13 +18,13 @@ spec = importlib.util.spec_from_file_location(
 pc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pc)
 
-REAL_EMAIL = "jane.roe" + "@" + "acme-insurance.io"
+REAL_EMAIL = "jane.roe" + "@" + "acme-widgets.io"
 SLACK_ID = "U" + "03AB4CD5EF"
 CHANNEL_ID = "C" + "07XY12ZZ9"
 AWS = "AKIA" + "IOSFODNN7ABCDEFG"
 GH = "ghp_" + "Zk3Qm9Lw2Xv8Rt5Yh1Bn7Cj4Dp6Fs0AgHeKu"
 HOME = "/Users/" + "jdoe"
-WORK_ID = "acme" + "-insurance"
+WORK_ID = "acme" + "-widgets"
 
 
 def scan(text, allow=(), deny=(), path="f.txt"):
@@ -89,6 +89,41 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(scan("Canada Lovelaces", deny=["word:ada lovelace"]), [])
         self.assertEqual(len(scan("x (Ada Lovelace)", deny=["word:Ada Lovelace"])), 1)
         self.assertEqual(len(scan("Canada Lovelace", deny=["ada lovelace"])), 1)  # plain = substring
+
+    def test_word_entries_allow_separators_and_last_first_order(self):
+        deny = ["word:Ada Lovelace", "word:Grace Brewster Hopper", "word:Cher"]
+        for text in ("Ada Lovelace", "ada.lovelace", "ADA_LOVELACE", "ada-lovelace",
+                     "Ada   Lovelace", "Lovelace, Ada", "lovelace,ada", "Lovelace ,Ada",
+                     "x ada.lovelace@host", "Brewster Hopper, Grace",
+                     "Grace.Brewster-Hopper", "hello, cher!"):
+            self.assertEqual(len(scan(text, deny=deny)), 1, text)
+        for text in ("Adam Lovelace", "Ada Lovelaces", "Canada Lovelace",
+                     "Lovelace Ada", "Ada, Lovelace", "Grace Hopper",
+                     "Cherry", "Ada the Lovelace"):
+            self.assertEqual(scan(text, deny=deny), [], text)
+
+    def test_word_entry_with_apostrophe_and_non_latin_names(self):
+        deny = ["word:Pat O'Neil", "word:\u05e0\u05d5\u05e2\u05dd \u05db\u05d4\u05df"]
+        for text in ("Pat O'Neil", "o\u2019neil, pat", "pat.o.neil",
+                     "\u05e0\u05d5\u05e2\u05dd \u05db\u05d4\u05df", "\u05db\u05d4\u05df, \u05e0\u05d5\u05e2\u05dd"):
+            self.assertEqual(len(scan(text, deny=deny)), 1, text)
+
+    def test_entry_numbers_are_reported_for_the_right_entries(self):
+        deny = ["plain term", "word:Ada Lovelace", "re:zz+", "word:Bo Peep"]
+        found = scan("zzz and Peep, Bo and ada lovelace and PLAIN TERM", deny=deny)
+        self.assertEqual(sorted(f.kind for f in found),
+                         ["denylist entry 1", "denylist entry 2",
+                          "denylist entry 3", "denylist entry 4"])
+
+    def test_a_long_denylist_scans_fast(self):
+        import time
+        names = [f"word:First{i} Last{i}" for i in range(2000)]
+        text = "\n".join(f"line {i} with some ordinary words and First{i % 7} only"
+                         for i in range(20000))
+        started = time.time()
+        self.assertEqual(scan(text, deny=names), [])
+        self.assertLess(time.time() - started, 5)
+        self.assertEqual(len(scan("x First5 Last5 y", deny=names)), 1)
 
     def test_secrets(self):
         for text in (AWS, GH, "xox" + "b-4827193056-Qw8Er5Ty2Ui9Op3As",
