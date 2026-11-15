@@ -17,3 +17,6 @@ __pycache__/
 
 # Personal handoff/scratch notes
 HANDOFF-PROMPT.md
+
+# Coverage profiles from local LLVM-instrumented runs
+*.profraw
