@@ -1893,7 +1893,8 @@ only after it clears.
 | `budget-invalid` | `state/budget.yaml` is malformed and routines are held because of it |
 | `usage-unreadable` | `state/claude-usage.jsonl` cannot be read; lists routines held because spend is unknown, and alerts even when none are, since spend and connector health are then unknown |
 | `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
-| `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap`, which a tick running in another group produces |
+| `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap` (a tick running in another group) and `interrupted` (every failure line of the tick names a measured sleep or a dead network such as an unresolvable host; timeouts, refused connections, rate-limit, quota and auth failures stay errors, and one real error makes the tick an error). Last-run errors alert only on a streak: the last 3 ticks in a row failed (interrupted ticks neither count nor break the streak, a clean tick resets it), or the routine has had no clean tick for 2 hours of awake time since the streak's first error. Awake time adds up the gaps between consecutive daemon ticks of any group; a gap over 30 minutes is sleep and adds nothing. Other issue kinds alert at once |
+| `interrupted:<routine>` | safety net for outages: at least 3 ticks in a row were interrupted (no clean or error tick between) and 2 hours of awake time passed since the first. A routine that is merely off schedule does not trigger it. It has its own key, so a change from outages to errors alerts again |
 | `connector:<server>` | a connector's last error has been newer than its last success for over an hour, counted from the first error since that success |
 
 Who is held comes from the same check the runner uses, and budget alerts
@@ -1904,6 +1905,16 @@ failed append is retried on the next tick, a save that keeps failing sends
 nothing, and only a failure between the two saves can repeat one. A failed check is logged and
 never fails the tick. To have a notifier show them, enable
 source `daemon` in its filter.
+
+A Slack or Gmail connector listing that fails with a tool error not tagged as a
+sleep or offline outage is retried once, 10 seconds later, in the same tick
+(not on a dry run or count-only pass, and not for rate-limit or auth errors).
+The retry repeats the whole source listing, so a failing source can cost up to
+twice its usual listing, and the scheduler holds `run.lock` for the 10 seconds.
+Both attempts are logged, each is charged as its own call under the routine's
+cap, and cursors move only after the whole source succeeds. A tick held by a
+budget cap is written as `held=<ids>` on its done line and neither counts toward
+nor resets a failure streak.
 
 ### Personal content
 
@@ -2830,6 +2841,9 @@ polling the store:
   is `alert`, `routine` is `daemon`, `memory_id` is `null`, `source_id` is
   `daemon:<key>`, `title` is the message, and `details` holds `key` plus the
   condition's data.
+- External events (writer: a routine of `maintenance.kind: external_events`,
+  see "External event producers"): `source` is the routine's configured
+  `source`, `memory_id` is `null`, `source_id` is `<source>:<key>`.
 - Writer for captures: `memory_sink.capture`. The other `add` paths (owner todos,
   person briefs, Fibery, Google Tasks, the Gmail follow-up note) emit nothing.
   Appends are one `write` on an `O_APPEND` descriptor under `flock` on
@@ -2841,6 +2855,86 @@ polling the store:
   event is lost if the process dies between the store write and the append
   (the retry sees `unchanged`).
 - Readers must treat the files as read-only.
+
+### External event producers
+
+A `maintenance.kind: external_events` routine runs a local command you
+configure and appends the events it prints to `state/events.jsonl`, so private
+scripts can feed the stream without their logic living in this repo. Copy
+`routines/_example-external-events.yaml`:
+
+```yaml
+schedule:
+  every: 7d                       # idle cadence outside the work window
+  work_hours:
+    every: 14m                    # the launchd tick is 900 s: 15m would skip a tick
+    days: [sun, mon, tue, wed, thu]
+    start: "09:00"
+    end: "19:00"
+    timezone: UTC                 # your IANA timezone
+maintenance:
+  kind: external_events
+  command: ["~/bin/my-script.py", "--since-last-run"]   # argv, no shell; ~ expanded
+  source: spreadsheet        # ^[a-z][a-z0-9_-]{0,31}$; not a built-in source,
+                             # and unique among external_events routines
+  timeout_s: 120             # default 300, max 1800
+  max_events: 200            # default 200
+  env: {MY_SCRIPT_MODE: incremental}   # optional
+```
+
+**Protocol.** The command gets no stdin, runs in the daemon directory, and
+inherits the daemon's environment (plus any `env:` entries), so it can read
+whatever the daemon can. It sees two extra environment variables:
+
+- `MEMORY_DAEMON_CURSOR_FILE`: path of this routine's cursor file
+  (`state/external-events/<routine id>.cursor`, mode 0600). It does not exist
+  on the first run. Read it to learn where the last successful run stopped.
+- `MEMORY_DAEMON_DRY_RUN`: `1` on `run --dry-run`, else `0`. A script must not
+  advance state of its own (files, remote markers) when it is `1`.
+
+It prints one JSON object on stdout:
+
+```json
+{"events": [{"kind": "row_changed", "key": "sheet1:row7", "title": "Row 7 changed",
+             "people": ["jane-doe"], "details": {"cell": "B7", "occurred_at": "2026-01-02T03:04:05Z"}}],
+ "cursor": {"last_row": 7}}
+```
+
+- `kind` (`^[a-z][a-z0-9_]{0,31}$`), `key` (stable id of the thing that changed,
+  up to 256 chars) and `title` (up to 300) are required; `key` and `title` are
+  single-line text. `people` is an optional list of kebab-case slugs;
+  `details` an optional JSON object of up to 8 KB. The event's `source_id` is
+  `<source>:<key>`. There is no `ts`: the daemon stamps emit time, which keeps
+  the file oldest-first. To report when something happened, put it in
+  `details.occurred_at` (ISO-8601 UTC, by convention).
+- Validation is all-or-nothing: an unknown field, a bad value or a repeated
+  (`kind`, `key`) pair rejects the whole batch (the log names the index), as do
+  more than `max_events` events.
+- `cursor` is optional and may be any JSON value of up to 256 KB. The daemon
+  saves it to the cursor file **only after every event of the batch was
+  appended**, and never on a dry run. Without a `cursor` key the file is left
+  unchanged. Keep your state there, not in files of your own, and a rejected
+  batch, a timeout, a failed append or a dry run loses nothing: the next run
+  starts from the old cursor.
+- Each event id is unique (it mixes in a per-run nonce and the batch index), so
+  readers that locate a cursor by id never see the same id twice. If the
+  append fails halfway, the routine fails and the cursor does not advance, so
+  the next run repeats the events that were already written: a consumer may see
+  the same change twice after a partial failure (the repeat has a new id; match
+  on `source_id` if that matters).
+
+A non-zero exit, a timeout (the process group is killed; a child that keeps
+stdout open after the command exits runs into the same timeout), non-JSON or
+non-UTF-8 output, or an invalid batch emits nothing and fails the routine, which
+`status` and the alerts report like any maintenance failure; the last ~500
+characters of stderr (and, for non-JSON output, the first 200 characters of
+stdout) go into that message after the secret redactor has run over them.
+Output is read with bounds (8 MB of stdout, the last 64 KB of stderr). The
+routine runs under its own lock (`external-events`), so a long command does not
+hold up capture.
+
+The command's own spend (API calls, paid services) is not covered by
+`budget.daily_usd`; a script that spends must cap itself.
 
 ## Output
 

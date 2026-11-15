@@ -509,6 +509,21 @@ def _result_text(content):
     return ""
 
 
+def _error_category(text):
+    """A short fixed tag for a tool error body; never the body itself."""
+    text = text.casefold()
+    if any(m in text for m in (
+            "rate limit", "too many requests", "quota exceeded",
+            "ratelimited", "rate_limited")):
+        return " (rate limited)"
+    if any(m in text for m in (
+            "unauthenticated", "unauthorized", "invalid api key",
+            "authentication", "invalid_auth", "not_authed", "token_expired",
+            "token_revoked", "invalid_grant")):
+        return " (auth failed)"
+    return ""
+
+
 def _content_blocks(event):
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
@@ -700,7 +715,11 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     # A failed required call fails the run; a failed optional
                     # one (e.g. one detail lookup) is returned marked is_error.
                     if is_error and name in needed:
-                        raise BridgeError(f"tool returned an error: {name}")
+                        raise BridgeError(
+                            f"tool returned an error: {name}"
+                            + _error_category(
+                                _result_text(block.get("content")))
+                        )
                     results.append({
                         "name": name,
                         "input": tool_input,

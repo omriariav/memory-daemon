@@ -1657,7 +1657,7 @@ class LockGroupTest(unittest.TestCase):
     def test_own_lock_group(self):
         groups = daemon_cli._execution_groups(self.routines, self.active)
         self.assertEqual(
-            {name: ids for ids, name in groups if name != "run"},
+            {name: ids for ids, name in groups if name != "run" and ids},
             {"calendar-cache": {"calendar-cache"}, "slack-census": {"census"}},
         )
         run_ids = set().union(*(ids for ids, name in groups if name == "run"))
@@ -1715,6 +1715,7 @@ class LockGroupTest(unittest.TestCase):
         self.assertEqual(groups, [
             ({"census"}, "slack-census"),
             ({"calendar-cache"}, "calendar-cache"),
+            (set(), "external-events"),
             ({"capture", "tasks"}, "run"),
         ])
 

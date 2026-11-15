@@ -669,6 +669,14 @@ class TickHeldAndMidRunPauseTest(TempBase):
             self.assertEqual(daemon_cli.cmd_tick(self.args), 0)
         self.assertNotIn("domain", state.ScheduleStore(self.base).entries)
 
+    def test_done_line_names_the_held_routines(self):
+        totals = dict(EMPTY_TOTALS, held_ids=["domain"])
+        with mock.patch.object(daemon_cli.runner, "run", return_value=totals), \
+             mock.patch.object(daemon_cli, "log") as log:
+            daemon_cli.cmd_tick(self.args)
+        self.assertRegex(log.call_args_list[-1].args[0],
+                         r" done: .* 0 error\(s\) held=domain$")
+
     def test_pause_appearing_mid_tick_stops_but_closes_the_tick(self):
         with mock.patch.object(
                 daemon_cli.runner, "run",
