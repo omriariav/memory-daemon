@@ -85,6 +85,19 @@ def body_text(item, text, pal, width, visual):
     return slackfmt.render_plain(text, pal, width, visual)
 
 
+class SelectableText(Static):
+    """Static text with Textual's mouse selection (a drag starting here stays
+    inside this widget's parent pane; ctrl+c copies it).
+
+    Off in visual bidi mode: the displayed Hebrew is already reordered, so a
+    selection would copy backwards text. `y`/`Y` copy the logical text.
+    """
+
+    @property
+    def allow_select(self):
+        return not getattr(self.app, "bidi", False)
+
+
 class Queue(OptionList):
     """Sectioned queue. Rows are Options keyed `i:<item id>`; headers are
     disabled Options."""
@@ -139,8 +152,11 @@ class Queue(OptionList):
         if it.kind == "nudge" and it.draft:
             age = "⏰ " + age
         mark = "●" if urgent else ("↻" if it.kind == "nudge" else ("·" if it.kind == "fyi" else "○"))
+        resolved = it.resolved
+        if resolved:
+            mark = "✓"
         t = Text(no_wrap=True, overflow="ellipsis")
-        t.append(f" {mark} ", Style(color=pal["urgent"] if urgent else pal["primary"]))
+        t.append(f" {mark} ", Style(color=pal["ok"] if resolved else pal["urgent"] if urgent else pal["primary"]))
         glyph, scol, _ = SOURCES.get(it.source, SOURCES["other"])
         t.append(glyph + " ", Style(color=pal[scol], bold=True))
         who = fit(vis(it.who, visual), max(8, width // 2 - 2))
@@ -167,7 +183,7 @@ class ThreadView(VerticalScroll):
     can_focus = True
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="thread-body")
+        yield SelectableText("", id="thread-body")
 
     def show(self, item, pal, now, visual):
         body = self.query_one("#thread-body", Static)
@@ -201,7 +217,7 @@ class DraftPane(Vertical):
             yield Static("", id="badge")
             yield Static("", id="draft-status")
         with VerticalScroll(id="draft-scroll"):
-            yield Static("", id="draft-view")
+            yield SelectableText("", id="draft-view")
         yield TextArea("", id="draft-edit", soft_wrap=True, show_line_numbers=False, read_only=True)
 
 
@@ -226,6 +242,9 @@ class StatusHeader(Static):
         left.append(f"  {n_open} open", Style(color=pal["fg"]))
         if n_urg:
             left.append(f"  ● {n_urg} urgent", Style(color=pal["urgent"], bold=True))
+        hidden = app.resolved_hidden
+        if hidden:
+            left.append(f"  ✓ {hidden} resolved (R)", Style(color=pal["muted"]))
         mid = Text(no_wrap=True)
         if app.busy:
             mid.append(SPINNER[int(now * 10) % len(SPINNER)] + " ", Style(color=pal["accent"]))

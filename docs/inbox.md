@@ -134,6 +134,39 @@ Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
 
+### Stale and recovered alerts
+
+An alert stays urgent only while it is relevant. Three rules apply to every
+alert (`daemon` kind `alert`), after the urgent rules above:
+
+1. **Newest per key.** Alerts are grouped by `details.key`; only the newest
+   of each key is listed, so an older alert for the same condition never
+   shows beside it.
+2. **Age.** An alert older than `alert_urgent_max_age_h` (default 6, range 1
+   to 168) drops to `fyi`/`digest`. It stays listed until `window_h` passes.
+3. **Recovery.** An alert whose condition has ended is *resolved*: it is
+   `fyi`, carries `meta.resolved: true`, and is hidden unless `R` is on
+   (`R` toggles "show resolved"; the header counts the hidden ones). Resolved
+   rows show a green check. Only `alert` items can be resolved; a command
+   source's own `meta.resolved` hides nothing.
+
+   The signal is the daemon's own record of active alerts,
+   `state/alerts.json` (key to time sent, or `{"pending": time}`).
+   `alerts.check` drops a key on the first tick that finds its condition
+   cleared, for every key kind (`attention:`, `interrupted:`, `connector:`,
+   `budget-*`, `hold:`, ...) and every routine kind, maintenance routines
+   such as calendar-cache and sheet-watch included. An alert is resolved only
+   when its key is **no longer listed** there. A key that is still listed is
+   active even if the problem changed (a last-run error that became a memory
+   sink issue keeps its key), so it is never resolved early. The run log and
+   the usage log are not consulted.
+
+Recovery is read-only and best effort. A missing, unreadable, oversized or
+unfamiliar `alerts.json` (a different daemon version), or one last written
+before the alert (a copied file, a clock jump), means "unknown", and the alert
+keeps only the age rule. Limit: an alert is resolved on the poll after the
+daemon's next tick that drops the key, so it can lag by a tick.
+
 ## Local state
 
 `<base>/state/inbox-state.json`:
@@ -167,6 +200,7 @@ defaults; a broken one prints every problem and exits 2.
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
+| `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` (`window_h`, `urgent` rules) and `type: command` (`argv` list, `timeout_s` 1 to 120) |
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
@@ -189,8 +223,29 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` poll now,
+`R` show or hide resolved alerts, `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
+
+### Copying
+
+Copying uses the terminal clipboard escape (OSC 52), so the terminal must
+allow it (iTerm2: "Applications in terminal may access clipboard"; it does not
+work in macOS Terminal). The text is built from the item's own logical
+strings, never from the bidi-reordered display and never with markup.
+
+- `y`: `sender — where — gist`, then the link on its own line when there is one.
+- `Y`: every item in the focused item's section as the screen lists it
+  (filters applied), one per line: `sender — where — gist`, plus ` — link` when
+  there is one.
+- Palette: "Copy item", "Copy section", "Copy section as Markdown" (one
+  `- **sender** (where): gist [link](url)` line per item; Markdown specials
+  in the text are escaped).
+- Mouse: a drag in the thread or draft pane selects text and stays inside
+  that pane; `ctrl+c` copies it. The queue is a Textual `OptionList`, which
+  does not support selection (it draws lines without text offsets), so use
+  `y`/`Y` there. In visual bidi mode mouse selection is off in both panes
+  (the screen text is already reordered); `y`/`Y` still copy logical text.
 
 ## Safety model
 

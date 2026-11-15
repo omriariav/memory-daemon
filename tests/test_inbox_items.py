@@ -3,7 +3,7 @@ import copy
 import json
 import unittest
 
-from workspace_daemon.inbox import actions, bidi, items as itm, settings, themes
+from workspace_daemon.inbox import actions, bidi, items as itm, models, settings, themes
 
 
 def good(**over):
@@ -182,6 +182,33 @@ class ListOutputTest(unittest.TestCase):
             itm.parse_act_response('{"ok": "yes", "message": "x"}')
 
 
+class CopyTextTest(unittest.TestCase):
+    def item(self, **kw):
+        base = dict(key="k", section="urgent", who="Ann", where="#ops", ts=0.0,
+                    gist="down", link=None)
+        base.update(kw)
+        return models.Item(**base)
+
+    def test_item_text_has_the_link_on_its_own_line(self):
+        self.assertEqual(models.copy_item_text(self.item()), "Ann \u2014 #ops \u2014 down")
+        self.assertEqual(models.copy_item_text(self.item(link="https://x.test/a")),
+                         "Ann \u2014 #ops \u2014 down\nhttps://x.test/a")
+
+    def test_section_text_is_one_line_per_item(self):
+        rows = [self.item(link="https://x.test/a"), self.item(who="Bo", gist="up")]
+        self.assertEqual(models.copy_section_text(rows),
+                         "Ann \u2014 #ops \u2014 down \u2014 https://x.test/a\nBo \u2014 #ops \u2014 up")
+        self.assertEqual(models.copy_section_text([]), "")
+
+    def test_markdown_escapes_specials_and_encodes_parentheses_in_links(self):
+        rows = [self.item(who="*A*", gist="see [x] `y` <b>", link="https://x.test/a_(1)"),
+                self.item(who="Bo", gist="plain_name ~x~ a&b")]
+        self.assertEqual(
+            models.copy_section_markdown(rows),
+            "- **\\*A\\*** (#ops): see \\[x\\] \\`y\\` \\<b> [link](https://x.test/a_%281%29)\n"
+            "- **Bo** (#ops): plain\\_name \\~x\\~ a\\&b")
+
+
 class SettingsTest(unittest.TestCase):
     def test_defaults(self):
         s = settings.default_settings()
@@ -237,6 +264,15 @@ class SettingsTest(unittest.TestCase):
         for bad in (-1, 1.5, "0", True, None):
             with self.assertRaises(settings.SettingsError, msg=repr(bad)):
                 settings.validate({"gmail_account": bad})
+
+    def test_alert_urgent_max_age(self):
+        self.assertEqual(settings.default_settings()["alert_urgent_max_age_h"], 6.0)
+        for ok, want in ((1, 1.0), (24, 24.0), (168, 168.0), (2.5, 2.5)):
+            self.assertEqual(settings.validate(
+                {"alert_urgent_max_age_h": ok})["alert_urgent_max_age_h"], want)
+        for bad in (0, 0.5, 169, -1, "6", True, None):
+            with self.assertRaises(settings.SettingsError, msg=repr(bad)):
+                settings.validate({"alert_urgent_max_age_h": bad})
 
     def test_duplicate_source_names_rejected(self):
         with self.assertRaises(settings.SettingsError):

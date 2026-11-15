@@ -421,6 +421,154 @@ class CommandSourceTest(unittest.TestCase):
         self.assertIn("bad response", out["message"])
 
 
+class AlertRulesTest(unittest.TestCase):
+    """Stale and recovered daemon alerts (synthetic fixtures)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def alert(self, key, ago_h, **details):
+        return ev(f"daemon:{key}-{ago_h}", "alert", f"alert {key}", ago_h=ago_h,
+                  details=dict({"key": key}, **details))
+
+    def attention(self, routine, ago_h, issues=("last run",)):
+        return self.alert(f"attention:{routine}", ago_h, routine=routine,
+                          issues=list(issues))
+
+    def active(self, doc):
+        """Write the daemon's alerts.json (key -> stamp, or pending)."""
+        state = self.base / "state"
+        state.mkdir(exist_ok=True)
+        text = doc if isinstance(doc, str) else json.dumps(doc)
+        (state / "alerts.json").write_text(text)
+
+    def load(self, **kw):
+        res = sources.load_events(self.base, now=NOW, **kw)
+        return {i["meta"].get("key", i["gist"]): i for i in res.items}
+
+    def test_old_alert_drops_to_fyi_and_the_age_is_configurable(self):
+        write_events(self.base, [self.attention("a", 7), self.attention("b", 5)])
+        got = self.load()
+        self.assertEqual((got["attention:a"]["section"], got["attention:a"]["urgency"]),
+                         ("fyi", "digest"))
+        self.assertEqual(got["attention:b"]["section"], "urgent")
+        self.assertNotIn("resolved", got["attention:a"]["meta"])
+        self.assertEqual(self.load(alert_max_age_h=8)["attention:a"]["section"], "urgent")
+        self.assertEqual(self.load(alert_max_age_h=1)["attention:b"]["section"], "fyi")
+
+    def test_collect_passes_the_setting_through(self):
+        write_events(self.base, [self.attention("a", 3)])
+        cfg = settings.validate({"alert_urgent_max_age_h": 2})
+        (res,) = sources.collect(cfg, self.base, now=NOW)
+        self.assertEqual(res.items[0]["section"], "fyi")
+        (res,) = sources.collect(settings.default_settings(), self.base, now=NOW)
+        self.assertEqual(res.items[0]["section"], "urgent")
+
+    def test_alert_is_resolved_when_its_key_left_alerts_json(self):
+        write_events(self.base, [
+            self.attention("a", 3), self.attention("b", 3), self.attention("c", 3),
+            self.attention("calendar-cache", 3), self.alert("connector:srv", 3),
+            self.alert("budget-hit:2023-11-15", 3)])
+        self.active({"attention:b": iso(-3),
+                     "attention:c": {"pending": iso(-3)},
+                     "budget-hit:2023-11-15": iso(-3)})
+        got = self.load()
+        for key in ("attention:a", "attention:calendar-cache", "connector:srv"):
+            self.assertTrue(got[key]["meta"]["resolved"], key)
+            self.assertEqual((got[key]["section"], got[key]["urgency"]),
+                             ("fyi", "digest"), key)
+        for key in ("attention:b", "attention:c", "budget-hit:2023-11-15"):
+            self.assertNotIn("resolved", got[key]["meta"], key)
+            self.assertEqual(got[key]["section"], "urgent", key)
+
+    def test_a_key_that_is_still_active_is_never_resolved_by_other_logs(self):
+        # The issue changed (last-run error -> memory sink) but the daemon
+        # still lists the key, and the run log shows a clean tick and a held
+        # tick: none of that resolves it.
+        write_events(self.base, [self.attention("a", 3, ("2 memory sink",))])
+        self.active({"attention:a": iso(-3)})
+        logs = self.base / "logs"
+        logs.mkdir()
+        (logs / "run.log").write_text(
+            f"{iso(-1)} tick: due=a\n"
+            f"{iso(-1)} tick done: 0 processed, 0 already-seen, 0 error(s)\n"
+            f"{iso(-0.5)} tick: due=a held=a\n"
+            f"{iso(-0.5)} tick done: 0 processed, 0 already-seen, 0 error(s)\n")
+        item = self.load()["attention:a"]
+        self.assertNotIn("resolved", item["meta"])
+        self.assertEqual(item["section"], "urgent")
+
+    def test_interrupted_key_is_resolved_like_attention(self):
+        write_events(self.base, [self.alert("interrupted:a", 2, routine="a"),
+                                 self.alert("interrupted:b", 2, routine="b")])
+        self.active({"interrupted:b": iso(-2)})
+        got = self.load()
+        self.assertTrue(got["interrupted:a"]["meta"]["resolved"])
+        self.assertNotIn("resolved", got["interrupted:b"]["meta"])
+
+    def test_newest_alert_per_key_wins(self):
+        write_events(self.base, [
+            self.alert("attention:a", 5, routine="a", issues=["last run"]),
+            ev("daemon:other-id", "alert", "newer alert text", ago_h=1,
+               details={"key": "attention:a", "routine": "a", "issues": ["last run"]}),
+            self.alert("budget-hit:2023-11-15", 4)])
+        res = sources.load_events(self.base, now=NOW)
+        self.assertEqual(sorted(i["gist"] for i in res.items),
+                         ["alert budget-hit:2023-11-15", "newer alert text"])
+
+    def test_unknown_alerts_json_falls_back_to_age_only(self):
+        write_events(self.base, [self.attention("a", 3), self.attention("b", 7)])
+        bad_docs = [None,                                  # no file at all
+                    "not json", "[]", '"x"', "null", "{",
+                    '{"attention:a": 5}', '{"attention:a": ""}',
+                    '{"attention:a": {"pending": 1}}', '{"attention:a": null}',
+                    '{"x": "' + "y" * (1024 * 1024) + '"}']
+        for doc in bad_docs:
+            if doc is not None:
+                self.active(doc)
+            got = self.load()
+            self.assertEqual(got["attention:a"]["section"], "urgent", str(doc)[:30])
+            self.assertEqual(got["attention:b"]["section"], "fyi", str(doc)[:30])
+            for key in got:
+                self.assertNotIn("resolved", got[key]["meta"], str(doc)[:30])
+
+    def test_unreadable_alerts_json_is_unknown(self):
+        write_events(self.base, [self.attention("a", 3)])
+        (self.base / "state" / "alerts.json").mkdir()  # open() fails
+        self.assertNotIn("resolved", self.load()["attention:a"]["meta"])
+
+    def test_alerts_json_older_than_the_alert_says_nothing(self):
+        write_events(self.base, [self.attention("a", 3)])
+        self.active({})
+        stale = NOW - 10 * 3600
+        os.utime(self.base / "state" / "alerts.json", (stale, stale))
+        self.assertNotIn("resolved", self.load()["attention:a"]["meta"])
+        fresh = NOW
+        os.utime(self.base / "state" / "alerts.json", (fresh, fresh))
+        self.assertTrue(self.load()["attention:a"]["meta"]["resolved"])
+
+    def test_alert_without_a_key_still_ages_out(self):
+        write_events(self.base, [
+            ev("daemon:nokey", "alert", "no key", ago_h=9, details={}),
+            ev("daemon:nokey2", "alert", "no key either", ago_h=1, details={})])
+        self.active({})
+        res = sources.load_events(self.base, now=NOW, rules=[{"source": "daemon"}])
+        self.assertEqual({i["gist"]: i["section"] for i in res.items},
+                         {"no key": "fyi", "no key either": "urgent"})
+        self.assertFalse(any(i["meta"].get("resolved") for i in res.items))
+
+    def test_reading_state_does_not_modify_it(self):
+        write_events(self.base, [self.attention("a", 3)])
+        self.active({"attention:b": iso(-1)})
+        snap = lambda: {p: (p.stat().st_mtime_ns, p.read_bytes())
+                        for p in self.base.rglob("*") if p.is_file()}
+        before = snap()
+        self.load()
+        self.assertEqual(before, snap())
+
+
 class CollectTest(unittest.TestCase):
     def test_collect_mixes_sources_and_flags_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:

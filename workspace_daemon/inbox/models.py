@@ -49,6 +49,12 @@ class Item:
     streamed: bool = False         # UI-only: the draft animation already ran
 
     @property
+    def resolved(self):
+        """A daemon alert whose condition has ended (hidden unless R is on).
+        Only alerts: another source's `meta.resolved` means nothing here."""
+        return self.source == "alert" and self.meta.get("resolved") is True
+
+    @property
     def kind(self):
         """What the main action key does: nudge | reply | ack | fyi."""
         if self.section == "waiting" and "nudge" in self.actions:
@@ -83,3 +89,43 @@ def from_v1(raw):
                  if a != "open" or raw["link"] is not None],
         link=raw["link"], meta=raw["meta"],
     )
+
+
+# --- clipboard text ---------------------------------------------------------
+# Built from the item's own logical strings (never the bidi-reordered display
+# text) and never from markup, so what is copied is what the source sent.
+
+COPY_SEP = " — "
+_MD_SPECIAL = "\\*_~&[]`<"
+
+
+def item_line(item):
+    """`sender — where — gist`, the one-line form of an item."""
+    return COPY_SEP.join((item.who, item.where, item.gist))
+
+
+def copy_item_text(item):
+    """One item for `y`: the line, then the link on its own line."""
+    return item_line(item) + (f"\n{item.link}" if item.link else "")
+
+
+def copy_section_text(items):
+    """A section for `Y`: one item per line, the link (if any) after a
+    separator on the same line."""
+    return "\n".join(item_line(i) + (COPY_SEP + i.link if i.link else "")
+                     for i in items)
+
+
+def _md_escape(text):
+    return "".join("\\" + c if c in _MD_SPECIAL else c for c in text)
+
+
+def copy_section_markdown(items):
+    """A section as a Markdown list: `- **sender** (where): gist [link](url)`."""
+    lines = []
+    for i in items:
+        line = f"- **{_md_escape(i.who)}** ({_md_escape(i.where)}): {_md_escape(i.gist)}"
+        if i.link:
+            line += f" [link]({i.link.replace('(', '%28').replace(')', '%29')})"
+        lines.append(line)
+    return "\n".join(lines)
