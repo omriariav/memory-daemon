@@ -18,15 +18,16 @@ ERROR = ("error",)   # signature of a path that cannot be stat-ed (not "missing"
 
 
 def file_signature(path, stat=os.stat):
-    """`(mtime_ns, size)`, None when the path does not exist, `ERROR` on any
-    other failure."""
+    """`(mtime_ns, size, inode)`, None when the path does not exist, `ERROR`
+    on any other failure. The inode catches an atomic replace (write a temp
+    file, rename it over) that happens to keep the same mtime and size."""
     try:
         st = stat(path)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except (OSError, ValueError):
         return ERROR
-    return (st.st_mtime_ns, st.st_size)
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 class Watcher:
@@ -42,6 +43,7 @@ class Watcher:
         self.committed = {}   # name -> signature at the last committed run
         self.last_run = {}    # name -> clock() at the last committed run
         self.seen = {}        # name -> signature seen by the last due() call
+        self.unchanged = []   # names the last due() call found unchanged
 
     def signature(self, name):
         try:
@@ -60,9 +62,12 @@ class Watcher:
                 self.commit([name])
 
     def due(self, now=None):
-        """Names of the units whose files changed and whose debounce is over."""
+        """Names of the units whose files changed and whose debounce is over.
+        `unchanged` lists the units this call checked and found unchanged (a
+        unit held back by the debounce is changed, so it is not listed)."""
         now = self.clock() if now is None else now
         out = []
+        self.unchanged = []
         for name in self.units:
             if not self.active.get(name):
                 continue
@@ -72,8 +77,10 @@ class Watcher:
             self.seen[name] = sig
             if name not in self.committed:
                 self.committed[name] = sig   # first look: the baseline
+                self.unchanged.append(name)
                 continue
             if sig == self.committed[name]:
+                self.unchanged.append(name)
                 continue
             if now - self.last_run.get(name, float("-inf")) < self.debounce_s:
                 continue

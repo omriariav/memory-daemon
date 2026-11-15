@@ -289,16 +289,18 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.polling)
                 await pilot.press("r", "r")        # manual: told, not queued
                 await pilot.pause(0.2)
-                app.poll()                         # timer-driven: silent skip
+                app.poll()                         # timer-driven: queued, silent
+                app.poll()                         # ... and merged with the first
                 told = [c.args[0] for c in note.call_args_list]
                 self.assertEqual(told.count("Poll already running"), 2)
                 self.assertEqual(len(calls), 2)    # no extra fetches started
                 gate.set()
-                await pilot.pause(0.5)
+                await pilot.pause(0.6)
             self.assertFalse(app.polling)
+            self.assertEqual(len(calls), 3)        # the queued one ran, once
             await pilot.press("r")
             await pilot.pause(0.4)
-            self.assertEqual(len(calls), 3)        # polling works again
+            self.assertEqual(len(calls), 4)        # polling works again
 
     async def test_each_poll_reloads_marks_written_by_another_pane(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -986,6 +988,7 @@ class CountingUnit:
         self.items = items
         self.runs, self.times, self.alls = 0, [], []
         self.active = self.peak = 0
+        self.reeval = None          # set to a callable(now) to enable
 
     def watch(self):
         return list(self.paths)
@@ -1080,18 +1083,33 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(a.runs, 2)
 
     async def test_a_burst_of_changes_is_debounced_per_source(self):
+        class Fake:
+            t = 1000.0
+
+            def __call__(self):
+                return self.t
+
+        clock = Fake()
         a = CountingUnit("a", [self.f("a.txt")])
-        app = unit_app([a], debounce_s=0.6)
+        app = unit_app([a], watch_s=1000.0, debounce_s=0.6)   # ticks are manual
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            for n in range(14):             # ~1.4 s of constant writes
+            app.watcher.clock = clock
+            app.watcher.commit()                  # baseline at fake t=1000
+            stamps = []
+            for n in range(14):                   # a write every fake 0.1 s
+                clock.t += 0.1
                 (self.dir / "a.txt").write_text("x" * (n + 2))
-                await pilot.pause(0.1)
-            await pilot.pause(0.9)
-            gaps = [y - x for x, y in zip(a.times[1:], a.times[2:])]
-            self.assertGreaterEqual(a.runs, 3)
-            self.assertLessEqual(a.runs, 5)
-            self.assertTrue(all(g >= 0.55 for g in gaps), gaps)
+                before = a.runs
+                app.watch_tick()
+                await until(pilot, lambda: not app.polling)
+                if a.runs > before:
+                    stamps.append(round(clock.t, 1))
+            self.assertEqual(stamps, [1000.6, 1001.2])
+            clock.t += 1.0                        # quiet now: the held change fires
+            app.watch_tick()
+            await until(pilot, lambda: a.runs == 4 and not app.polling)
+            self.assertEqual(a.runs, 4)           # the first run + three
 
     async def test_a_watched_file_that_appears_counts_as_a_change(self):
         later = self.dir / "later.jsonl"
@@ -1233,6 +1251,121 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             events_file.write_text("closed again, longer")
             await pilot.pause(0.5)
             self.assertEqual(len(calls), reads)     # closed: not watched
+
+
+    async def test_a_fallback_refresh_that_collides_is_queued_not_dropped(self):
+        a = CountingUnit("a", [], delay=0.4)
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")                 # a slow full refresh
+            await until(pilot, lambda: app.polling, tries=50)
+            app.poll()                             # the fallback timer fires
+            app.poll()
+            self.assertEqual(a.runs, 2)            # nothing extra started
+            await until(pilot, lambda: a.runs == 3 and not app.polling, tries=200)
+            await pilot.pause(0.6)
+            self.assertEqual((a.runs, b.runs), (3, 3))   # one queued full refresh
+
+    async def test_a_queued_toggle_and_fallback_merge_into_a_full_refresh(self):
+        wide = CountingUnit("wide", [], uses_all=True, delay=0.4)
+        plain = CountingUnit("plain", [])
+        app = unit_app([wide, plain])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")
+            await until(pilot, lambda: app.polling, tries=50)
+            await pilot.press("A")                 # subset, queued
+            app.poll()                             # full, merges and wins
+            await until(pilot, lambda: wide.runs == 3 and not app.polling, tries=200)
+            await pilot.pause(0.5)
+            self.assertEqual((wide.runs, plain.runs), (3, 3))
+            self.assertEqual(wide.alls[-1], True)
+
+    async def test_an_unchanged_watched_source_counts_as_fresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])                  # nothing to watch
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.updated_at["a"] -= 300
+            app.updated_at["b"] -= 300
+            await until(pilot, lambda: time.time() - app.updated_at["a"] < 5)
+            self.assertLess(time.time() - app.updated_at["a"], 5)
+            self.assertGreaterEqual(time.time() - app.updated_at["b"], 299)
+            self.assertEqual(a.runs, 1)            # fresh without a re-run
+            self.assertGreaterEqual(app.oldest_update_age(), 299)
+
+    async def test_a_changed_but_debounced_source_is_not_called_fresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a], debounce_s=3600.0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.watcher.commit()                   # last_run = now
+            app.updated_at["a"] -= 300
+            (self.dir / "a.txt").write_text("changed, longer")
+            await pilot.pause(0.4)
+            self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
+            self.assertEqual(a.runs, 1)
+
+    async def test_the_clock_is_re_applied_without_running_a_source(self):
+        a = CountingUnit("a", [])
+        calls = []
+
+        def reeval(now):
+            calls.append(now)
+            title = "later" if len(calls) > 1 else "first"
+            return [sources.SourceResult("a", [item(1, "fyi", "calendar",
+                                                     id=f"a:{title}")],
+                                         False, None, None)]
+
+        a.reeval = reeval
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual([i.key for i in app.items], ["a:1"])
+            app.updated_at["a"] -= 300
+            app.reeval()
+            await until(pilot, lambda: calls and not app.polling)
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["a:first"])
+            self.assertEqual(a.runs, 1)            # no source was run
+            self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
+            app.reeval()
+            await until(pilot, lambda: len(calls) == 2 and not app.polling)
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["a:later"])
+
+    async def test_a_unit_without_reeval_is_left_alone(self):
+        a = CountingUnit("a", [])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.reeval()
+            await pilot.pause(0.3)
+            self.assertEqual((a.runs, [i.key for i in app.items]), (1, ["a:1"]))
+
+    async def test_invites_list_soonest_first_after_the_replies(self):
+        now = time.time()
+        rows = [
+            item(1, "needs_reply", "slack", id="s:1", actions=("ack",)),
+            item(2, "needs_reply", "calendar", id="inv:late", ts=now + 5 * 86400 + 3600,
+                 actions=("ack",), meta={"kind": "invite"}),
+            item(3, "needs_reply", "calendar", id="inv:soon", ts=now + 3700,
+                 actions=("ack",), meta={"kind": "invite"}),
+        ]
+        app, _, _ = make_app(rows)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual([i.key for i in app.visible()],
+                             ["s:1", "inv:soon", "inv:late"])
+            q = app.query_one("#queue", Queue)
+            text = " ".join(str(q.get_option_at_index(n).prompt)
+                            for n in range(q.option_count))
+            self.assertIn("in 1h", text)
+            self.assertIn("in 5d", text)
+
 
 
 class WatchOffWithoutUnitsTest(unittest.IsolatedAsyncioTestCase):

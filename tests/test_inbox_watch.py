@@ -61,6 +61,33 @@ class WatcherTest(TmpBase):
         self.clock.t += 10
         self.assertEqual(w.due(), ["a"])
 
+    def test_an_atomic_replace_with_the_same_mtime_and_size_counts(self):
+        a = self.touch("a.txt", "AAAA", mtime=1_000_000)
+        w = self.make([FakeUnit("a", [a])])
+        w.commit()
+        tmp = self.touch("a.tmp", "BBBB", mtime=1_000_000)   # same size, mtime
+        before = os.stat(a)
+        os.replace(tmp, a)
+        after = os.stat(a)
+        self.assertEqual((before.st_mtime_ns, before.st_size),
+                         (after.st_mtime_ns, after.st_size))
+        self.clock.t += 10
+        self.assertEqual(w.due(), ["a"])
+
+    def test_unchanged_lists_what_was_checked_and_found_current(self):
+        a, b, c = (self.touch(n) for n in ("a.txt", "b.txt", "c.txt"))
+        w = self.make([FakeUnit("a", [a]), FakeUnit("b", [b]),
+                       FakeUnit("c", [c]), FakeUnit("none", [])],
+                      debounce_s=2.0)
+        w.commit()
+        self.touch("b.txt", "changed")        # b is changed
+        self.clock.t += 0.5                   # ... but held by the debounce
+        self.assertEqual(w.due(), [])
+        self.assertEqual(sorted(w.unchanged), ["a", "c"])
+        self.clock.t += 5
+        self.assertEqual(w.due(), ["b"])
+        self.assertEqual(sorted(w.unchanged), ["a", "c"])
+
     def test_same_size_new_mtime_counts(self):
         a = self.touch("a.txt", "x", mtime=1_000_000)
         w = self.make([FakeUnit("a", [a])])

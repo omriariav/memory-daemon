@@ -47,6 +47,13 @@ def fmt_age(secs):
     return f"{s // 86400}d"
 
 
+def rel(now, ts):
+    """`3m ago` for the past, `in 2h` for a time ahead (an invite's start)."""
+    if ts > now + 60:
+        return "in " + fmt_age(ts - now)
+    return f"{fmt_age(now - ts)} ago"
+
+
 def fit(s, width):
     """Truncate to `width` cells with an ellipsis (logical order)."""
     if width <= 0:
@@ -148,7 +155,7 @@ class Queue(OptionList):
 
     def _row(self, it, width, pal, now, visual):
         urgent = it.section == "urgent"
-        age = fmt_age(now - it.ts)
+        age = rel(now, it.ts) if it.ts > now + 60 else fmt_age(now - it.ts)
         if it.kind == "nudge" and it.draft:
             age = "⏰ " + age
         mark = "●" if urgent else ("↻" if it.kind == "nudge" else ("·" if it.kind == "fyi" else "○"))
@@ -195,14 +202,14 @@ class ThreadView(VerticalScroll):
         out.append(vis(item.who, visual), Style(bold=True, color=pal["urgent"] if item.section == "urgent" else pal["primary"]))
         glyph, scol, label = SOURCES.get(item.source, SOURCES["other"])
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
-        out.append(f"{label} · {item.where}  ·  {fmt_age(now - item.ts)} ago\n", Style(color=pal["muted"]))
+        out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
         if not item.messages:
             out.append(vis(item.gist, visual) + "\n", Style(color=pal["fg"]))
         for m in item.messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")
             out.append(f"{vis(m.who, visual)}", Style(bold=True, color=pal["mine"] if m.mine else pal["fg"]))
-            out.append(f"  {when}  {fmt_age(now - m.ts)} ago\n", Style(color=pal["muted"]))
+            out.append(f"  {when}  {rel(now, m.ts)}\n", Style(color=pal["muted"]))
             out.append_text(body_text(item, m.text, pal, width, visual))
             out.append("\n\n")
         body.update(out)

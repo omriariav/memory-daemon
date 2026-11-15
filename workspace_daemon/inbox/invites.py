@@ -119,30 +119,56 @@ def _gist(title, when, organizer):
     return itm.truncate(title, max(room, 1)) + tail
 
 
+def read(base_dir):
+    """Everything `build` needs, read once: the snapshot, the organizer names
+    from the JSON twin and the calendar id. `{"error": str}` or `{}` (no
+    cache in use) when there is nothing to build from."""
+    path = Path(base_dir) / "state" / SNAPSHOT_FILE
+    doc, err = _read_json(path, MAX_SNAPSHOT_BYTES)
+    if err:
+        return {"error": err}
+    if doc is None:
+        return {}  # the calendar cache is not in use
+    if not isinstance(doc, dict) or doc.get("v") != SNAPSHOT_VERSION \
+            or isinstance(doc.get("v"), bool):
+        return {"error": f"{SNAPSHOT_FILE} has an unknown format (expected v "
+                         f"{SNAPSHOT_VERSION})"}
+    rows = doc.get("events")
+    fetched = _when(doc.get("fetched_at"))
+    if not isinstance(rows, dict) or fetched is None or fetched[1]:
+        return {"error": f"{SNAPSHOT_FILE} is missing events or fetched_at"}
+    cfg = daemoncfg.calendar_cache(base_dir)
+    asked = any(isinstance(r, dict) and r.get("my_rsvp") == "needsAction"
+                for r in rows.values())
+    return {"doc": doc, "fetched": fetched[0], "cfg": cfg,
+            "names": _organizers(cfg["json"]) if asked else {}}
+
+
 def load(base_dir, now, days=DEFAULT_DAYS):
-    """`(items, stale, age_min, error)`: the unanswered invites from the cache.
+    """`(items, stale, age_min, error)`: the unanswered invites from the cache
+    (`read`, then `build`)."""
+    return build(read(base_dir), now, days)
+
+
+def build(data, now, days=DEFAULT_DAYS):
+    """`(items, stale, age_min, error)` from what `read` returned; pure, so
+    the time-dependent parts (not yet over, the window, staleness) can be
+    re-evaluated later without touching a file.
 
     An invite counts when its `my_rsvp` is `needsAction`, its status is not
     `cancelled`, it has not ended and it starts before `now + days`. A
     recurring series is listed once, at its next instance. Declined,
     accepted, tentative and organizer rows never show.
+
+    The item `ts` is the event's start: the cache records no arrival time
+    for an invite. (The app lists invites soonest first.)
     """
-    path = Path(base_dir) / "state" / SNAPSHOT_FILE
-    doc, err = _read_json(path, MAX_SNAPSHOT_BYTES)
-    if err:
-        return [], False, None, err
-    if doc is None:
-        return [], False, None, None  # the calendar cache is not in use
-    if not isinstance(doc, dict) or doc.get("v") != SNAPSHOT_VERSION \
-            or isinstance(doc.get("v"), bool):
-        return [], False, None, (
-            f"{SNAPSHOT_FILE} has an unknown format (expected v "
-            f"{SNAPSHOT_VERSION})")
-    rows = doc.get("events")
-    fetched = _when(doc.get("fetched_at"))
-    if not isinstance(rows, dict) or fetched is None or fetched[1]:
-        return [], False, None, f"{SNAPSHOT_FILE} is missing events or fetched_at"
-    fetched_ts = fetched[0]
+    if data.get("error"):
+        return [], False, None, data["error"]
+    if not data:
+        return [], False, None, None
+    doc, fetched_ts, cfg = data["doc"], data["fetched"], data["cfg"]
+    rows = doc["events"]
     age_min = max((now - fetched_ts) / 60.0, 0.0)
     stale = age_min > STALE_AFTER_H * 60
     limit = now + float(days) * 86400
@@ -165,8 +191,7 @@ def load(base_dir, now, days=DEFAULT_DAYS):
         if prev is None or start[0] < prev[0]:
             pending[key] = (start[0], event_id, row, end_ts, start[1])
 
-    cfg = daemoncfg.calendar_cache(base_dir)
-    names = _organizers(cfg["json"]) if pending else {}
+    names = data["names"]
     built, skipped = [], 0
     for key, (start_ts, event_id, row, end_ts, all_day) in sorted(
             pending.items(), key=lambda kv: kv[1][0])[:MAX_INVITES]:
@@ -185,8 +210,7 @@ def load(base_dir, now, days=DEFAULT_DAYS):
                 id=f"invites:{key}", source="calendar", section="needs_reply",
                 urgency="digest", sender=organizer or "calendar invite",
                 where="invite", gist=_gist(title, when, organizer),
-                ts=fetched_ts,  # equal ts keeps the soonest-first order
-                link=link, thread=thread, draft=None,
+                ts=start_ts, link=link, thread=thread, draft=None,
                 actions=["ack", "open"] if link else ["ack"],
                 meta={"kind": "invite", "event_id": event_id,
                       "calendar_id": cfg["calendar_id"], "series": key,

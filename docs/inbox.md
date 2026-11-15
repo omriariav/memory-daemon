@@ -132,10 +132,18 @@ and `r` refreshes everything at once.
 - Debounce: a source is re-run at most once per 2 s, however often its files
   change; the change is kept and fires when the 2 s are over. A change that
   lands while a refresh is running is picked up right after it.
+- Watched paths are stat-ed on the UI thread: keep them on local disks, not
+  network mounts, or a slow mount stalls the screen.
 - A stat failure counts as a stable state, never an error; a file that does
   not exist yet is watched, and its appearing is a change.
 - The header shows `updated Ns ago` for the least recently refreshed source;
-  per-source errors show as before.
+  per-source errors show as before. A watched source whose files were checked
+  and did not change counts as fresh; a source with no `watch` list is as old
+  as its last run.
+- Time-based rules are re-applied every 30 s to what the sources already read,
+  without touching a file: an invite that has ended, the `window_h` cutoff, an
+  alert dropping from urgent after `alert_urgent_max_age_h`, and
+  `starts_within_h` urgent rules.
 
 ## Built-in `events` source
 
@@ -182,12 +190,16 @@ window cannot reach past what the snapshot covers (`events_window_days` of the
 routine, 7 by default); asking for more adds a note to the source's status.
 Times are shown in the machine's local time zone. The row is `sender` = the
 organizer (or "calendar invite"), `where` = "invite", and a gist of
-`<title> - <when> - from <organizer>`. `meta` is
+`<title> - <when> - from <organizer>`. The item `ts` is the event's start (the
+cache records no arrival time for an invite), so the row's age reads `in 2h`,
+and invites list soonest first, after the replies in the section. `meta` is
 `{"kind": "invite", "event_id", "calendar_id", "series", "my_rsvp", "start",
 "source_id"}` so a later RSVP action has what it needs. Actions: `ack` (hides
 the row locally) and `open` (the meeting link from the cache, only when it is a
-plain http(s) URL; otherwise there is no `open`). Titles and organizers are
-untrusted display text. A missing cache means no invites and no error; an
+plain http(s) URL; otherwise there is no `open`). A `New invite` calendar row
+from the events stream is dropped when its series has a pending-invite row
+(the same event, now actionable). Titles and organizers are untrusted display
+text. A missing cache means no invites and no error; an
 unreadable or unfamiliar one is a source error (`events.invites`) and a cache
 older than 6 hours marks the source stale.
 
@@ -211,14 +223,20 @@ from a `saved_request` routine (`details` is empty for Gmail events), and the
 inbox never calls Gmail. So the filter works from what the daemon *does* keep:
 each event names its `routine`, and the routine's config holds its search
 query. The inbox reads `<base>/routines/*.yaml` and accepts a Gmail event only
-when its routine is a `gmail_mcp` routine whose `query` is a plain conjunction
-with a positive `label:MY_LABEL` term (case-insensitive; no `OR`, braces or
-parentheses, and `-label:MY_LABEL` does not count). Every thread such a routine
-captured matched the query, so it carried the label when it was captured.
+when its routine has at least one `gmail_mcp` block and **every** Gmail block
+(`gmail` or `gmail_mcp`) of that routine has a `query` that is a plain
+conjunction with a positive `label:MY_LABEL` term (case-insensitive). Events
+carry the routine id, not the block, so one unlabelled block rejects the whole
+routine. Quoted phrases are inert (`subject:"label:MY_LABEL"` is not a label
+term), `-label:MY_LABEL` does not count, and any `OR`, `NOT`, `|`, brace or
+parenthesis rejects the query. Every thread such a routine captured matched
+its query, so it carried the label when it was captured.
 
-What it does not prove: the label is checked at capture time, not now (removing
-the label later changes nothing), and a routine whose query selects the label
-in another way (a label id, a union) does not match. If no routine matches,
+What it does not prove: the label is checked at capture time, not now
+(removing the label later changes nothing), and a routine whose query selects
+the label in another way (a label id, a union) does not match. The filter uses
+the routine's **current** query: editing the query changes which older events
+show, not only new ones. If no routine matches,
 no mail is shown and the source's status says why. Showing the live labels, or
 the `saved_request` flag, per event would need the capture to record them in
 `details`.

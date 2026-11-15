@@ -240,6 +240,24 @@ class InvitesTest(TmpBase):
         self.assertEqual(by["e2"]["sender"], "calendar invite")
         self.assertNotIn("from", by["e2"]["gist"])
 
+    def test_ts_is_the_event_start_not_the_cache_fetch_time(self):
+        write_snapshot(self.base, {"e1": row(30, title="Later")},
+                       fetched_ago_h=1)
+        (item,), *_ = self.load()
+        self.assertEqual(item["ts"], NOW + 30 * H)
+
+    def test_build_re_evaluates_the_clock_without_reading_a_file(self):
+        write_snapshot(self.base, {"soon": row(2, title="Soon"),
+                                   "later": row(5 * 24, title="Later")})
+        data = invites.read(self.base)
+        (self.base / "state" / invites.SNAPSHOT_FILE).unlink()   # gone
+        titles = lambda n, d=7: sorted(i["gist"].split(" - ")[0]
+                                       for i in invites.build(data, n, d)[0])
+        self.assertEqual(titles(NOW), ["Later", "Soon"])
+        self.assertEqual(titles(NOW + 3 * H), ["Later"])            # Soon is over
+        self.assertEqual(titles(NOW, d=1), ["Soon"])
+        self.assertTrue(invites.build(data, NOW + 9 * H, 7)[1])     # now stale
+
     def test_missing_cache_is_empty_not_an_error(self):
         self.assertEqual(self.load(), ([], False, None, None))
 
@@ -329,6 +347,28 @@ class InvitesTest(TmpBase):
         self.assertEqual(res[1].name, "events.invites")
         self.assertEqual(res[1].items, [])
         self.assertIn("not valid JSON", res[1].error)
+
+    def test_a_new_invite_row_is_dropped_when_its_series_has_a_pending_row(self):
+        write_snapshot(self.base, {
+            "weekly_20231116T100000Z": row(30, title="Weekly sync"),
+            "solo": row(40, title="Solo invite")})
+        write_events(self.base, [
+            ev("gcal:weekly_20231123T100000Z", "new", "Weekly sync"),
+            ev("gcal:solo", "update", "Solo invite"),       # not a `new`
+            ev("gcal:other", "new", "Unrelated new invite")])
+        res = sources.collect(settings.default_settings(), self.base, now=NOW)
+        by = {r.name: [i["gist"] for i in r.items] for r in res}
+        self.assertEqual(sorted(g.split(" (")[0] for g in by["events"]),
+                         ["New invite: Unrelated new invite",
+                          "Updated: Solo invite"])
+        self.assertEqual(len(by["events.invites"]), 2)
+        self.assertIsNone(res[0].error)       # not reported as a duplicate id
+
+    def test_without_a_pending_row_the_new_invite_stays(self):
+        write_events(self.base, [ev("gcal:e5", "new", "Standalone")])
+        (res,) = sources.collect(settings.default_settings(), self.base,
+                                 now=NOW)
+        self.assertEqual(len(res.items), 1)
 
     def test_invites_days_setting(self):
         self.assertEqual(settings.default_settings()["sources"][0]
@@ -444,6 +484,44 @@ class LabelFilterTest(TmpBase):
         self.assertEqual(daemoncfg.label_routines(self.base, "MY_LABEL"),
                          {"multi"})
 
+    def test_query_parser_ignores_quoted_phrases_and_rejects_operators(self):
+        ok = daemoncfg.query_requires_label
+        self.assertFalse(ok('subject:"label:MY_LABEL"', "MY_LABEL"))
+        self.assertFalse(ok('subject:"a label:MY_LABEL b"', "MY_LABEL"))
+        self.assertFalse(ok('"label:MY_LABEL"', "MY_LABEL"))
+        self.assertFalse(ok('-label:"MY_LABEL"', "MY_LABEL"))
+        self.assertTrue(ok('label:"MY_LABEL"', "MY_LABEL"))
+        self.assertTrue(ok('subject:"two words" label:MY_LABEL', "MY_LABEL"))
+        self.assertTrue(ok('label:MY_LABEL subject:"this OR that"', "MY_LABEL"))
+        for bad in ("label:MY_LABEL NOT from:boss", "label:MY_LABEL not x",
+                    "label:MY_LABEL | label:X", "label:MY_LABEL or x",
+                    "label:MY_LABEL OR x", "label:MY_LABEL)"):
+            self.assertFalse(ok(bad, "MY_LABEL"), bad)
+
+    def test_every_gmail_block_of_a_routine_must_require_the_label(self):
+        def routine(name, blocks):
+            body = "\n".join(
+                f"  - kind: {kind}\n    query: '{query}'" for kind, query in blocks)
+            write(self.base / "routines" / f"{name}.yaml",
+                  f"id: {name}\nsources:\n{body}\n")
+        routine("all-labelled", [("gmail_mcp", "label:MY_LABEL"),
+                                 ("gmail_mcp", "label:MY_LABEL newer_than:2d")])
+        routine("mixed", [("gmail_mcp", "label:MY_LABEL"),
+                          ("gmail_mcp", "in:inbox")])
+        routine("mixed-with-gmail", [("gmail_mcp", "label:MY_LABEL"),
+                                     ("gmail", "in:inbox")])
+        routine("gmail-only", [("gmail", "label:MY_LABEL")])
+        routine("labelled-plus-slack", [("gmail_mcp", "label:MY_LABEL"),
+                                        ("slack_mcp", "in:inbox")])
+        self.assertEqual(daemoncfg.label_routines(self.base, "MY_LABEL"),
+                         {"all-labelled", "labelled-plus-slack"})
+
+    def test_an_oversized_routine_file_is_skipped_without_being_parsed(self):
+        write(self.base / "routines" / "big.yaml",
+              "id: big\nsource: {kind: gmail_mcp, query: 'label:MY_LABEL'}\n"
+              + "# pad\n" * (daemoncfg.MAX_FILE_BYTES // 6 + 10))
+        self.assertEqual(daemoncfg.label_routines(self.base, "MY_LABEL"), set())
+
     def test_setting_validation(self):
         cfg = settings.validate({"sources": [
             {"type": "events", "email_require_label": " MY_LABEL "}]})
@@ -454,6 +532,71 @@ class LabelFilterTest(TmpBase):
             with self.assertRaises(settings.SettingsError, msg=repr(bad)):
                 settings.validate({"sources": [
                     {"type": "events", "email_require_label": bad}]})
+
+
+# --- time-dependent rules without reading files ----------------------------
+
+class ReevalTest(TmpBase):
+    def units(self, **src):
+        cfg = settings.validate({"sources": [dict({"type": "events"}, **src)]})
+        return {u.name: u for u in sources.make_units(cfg, self.base)}
+
+    def test_the_events_window_and_alert_age_follow_the_clock(self):
+        write_events(self.base, [
+            ev("slack:C1:1", "new", "x"),   # not a mapped source: ignored
+            ev("gmail:aaaaaaaa11111111", "new", "Old mail", ago_h=40,
+               memory_id="m1"),
+            ev("daemon:alert:b", "alert", "Budget hit", ago_h=1,
+               details={"key": "budget-hit:x"})])
+        unit = self.units(window_h=48)["events"]
+        (res,) = unit.run(NOW, False)
+        by = {i["gist"]: i for i in res.items}
+        self.assertEqual(by["Budget hit"]["section"], "urgent")
+        self.assertIn("Old mail", by)
+        for path in (self.base / "state").glob("events.jsonl*"):
+            path.unlink()                    # no file is read from here on
+        (later,) = unit.reeval(NOW + 7 * H)  # 7 h on: past the 6 h alert age
+        by = {i["gist"]: i for i in later.items}
+        self.assertEqual(by["Budget hit"]["section"], "fyi")
+        self.assertIn("Old mail", by)
+        (much,) = unit.reeval(NOW + 20 * H)  # the 40 h-old mail leaves the window
+        self.assertEqual([i["gist"] for i in much.items], ["Budget hit"])
+
+    def test_starts_within_rule_follows_the_clock(self):
+        write_events(self.base, [ev(
+            "gcal:e1", "cancel", "Offsite", ago_h=1,
+            details={"start": iso(30), "end": iso(31)})])
+        unit = self.units(urgent=[{"source": "gcal", "kind": "cancel",
+                                   "starts_within_h": 24}])["events"]
+        (res,) = unit.run(NOW, False)
+        self.assertEqual(res.items[0]["section"], "fyi")
+        (later,) = unit.reeval(NOW + 10 * H)     # now within 24 h of the start
+        self.assertEqual(later.items[0]["section"], "urgent")
+
+    def test_resolved_alert_state_is_not_re_read(self):
+        write_events(self.base, [ev("daemon:alert:b", "alert", "Budget hit",
+                                    ago_h=1, details={"key": "budget-hit:x"})])
+        write(self.base / "state" / "alerts.json", "{}")
+        unit = self.units()["events"]
+        (res,) = unit.run(NOW + 5, False)
+        self.assertTrue(res.items[0]["meta"].get("resolved"))
+        write(self.base / "state" / "alerts.json",
+              json.dumps({"budget-hit:x": iso(-2)}))   # active again, unseen
+        (again,) = unit.reeval(NOW + 6)
+        self.assertTrue(again.items[0]["meta"].get("resolved"))
+
+    def test_reeval_before_any_run_has_nothing_to_do(self):
+        units = self.units()
+        self.assertIsNone(units["events"].reeval(NOW))
+        self.assertIsNone(units["events.invites"].reeval(NOW))
+
+    def test_invites_unit_reeval_hides_an_invite_that_ended(self):
+        write_snapshot(self.base, {"e1": row(2, title="Soon")})
+        unit = self.units()["events.invites"]
+        (res,) = unit.run(NOW, False)
+        self.assertEqual(len(res.items), 1)
+        (later,) = unit.reeval(NOW + 4 * H)
+        self.assertEqual(later.items, [])
 
 
 # --- Saved view rows ------------------------------------------------------

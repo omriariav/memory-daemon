@@ -14,12 +14,16 @@ import yaml
 MAX_FILES = 200
 MAX_FILE_BYTES = 1024 * 1024
 DEFAULT_CALENDAR_ID = "primary"
-# A positive `label:` term. The lookbehind rejects `-label:x` (a negation) and
-# anything glued to a word, e.g. `xlabel:x`.
-_LABEL_TERM = re.compile(r'(?<![-\w])label:("[^"]*"|\S+)', re.IGNORECASE)
-# OR, braces and parentheses make a query a union or a grouping, where one
-# `label:` term no longer guarantees the label on every listed thread.
-_NOT_A_CONJUNCTION = re.compile(r"\bOR\b|[{}()]")
+# One query token. A positive `label:` term comes first (a quoted value right
+# after it is kept whole); then any word with a quoted phrase attached
+# (`subject:"label:x"`, `-label:"x"`) is one inert token; then a bare word.
+_TOKEN = re.compile(
+    r'(?P<label>(?<![-\w])label:(?:"[^"]*"|\S+))|(?P<quoted>[^\s"]*"[^"]*"?)|\S+',
+    re.IGNORECASE)
+# OR, NOT, `|`, braces and parentheses make a query a union, a negation or a
+# grouping, where one `label:` term no longer guarantees the label on every
+# listed thread.
+_OPERATOR = re.compile(r"^(?:OR|NOT)$|[|{}()]", re.IGNORECASE)
 
 
 def routines(base_dir):
@@ -33,9 +37,11 @@ def routines(base_dir):
         return out
     for path in paths:
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_FILE_BYTES + 1)
+            if len(raw) > MAX_FILE_BYTES:
                 continue
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            data = yaml.safe_load(raw.decode("utf-8"))
         except (OSError, ValueError, yaml.YAMLError):
             continue
         if not isinstance(data, dict):
@@ -82,31 +88,45 @@ def calendar_cache(base_dir):
 def query_requires_label(query, label):
     """True when the search `query` is a plain conjunction that includes a
     positive `label:<label>` term (case-insensitive; a name with spaces may
-    be written with hyphens, as Gmail does)."""
+    be written with hyphens, as Gmail does).
+
+    Quoted phrases are inert (`subject:"label:x"` is not a label term) and
+    any OR, NOT, `|`, brace or parenthesis rejects the whole query.
+    """
     if not isinstance(query, str) or not isinstance(label, str):
         return False
     label = label.strip()
-    if not label or _NOT_A_CONJUNCTION.search(query):
+    if not label:
         return False
     wanted = {label.casefold(), label.casefold().replace(" ", "-")}
-    for match in _LABEL_TERM.finditer(query):
-        value = match.group(1).strip('"').strip().casefold()
-        if value in wanted:
-            return True
-    return False
+    found = False
+    for match in _TOKEN.finditer(query):
+        token = match.group(0)
+        if '"' not in token and _OPERATOR.search(token):
+            return False
+        if match.group("label"):
+            value = token[len("label:"):].strip('"').strip().casefold()
+            found = found or value in wanted
+    return found
 
 
 def label_routines(base_dir, label):
-    """Ids of the Gmail routines whose search query requires `label`.
+    """Ids of the Gmail routines whose search queries require `label`.
 
-    Every thread such a routine captured matched that query, so it carried the
-    label when it was captured. This is the only place the daemon records the
-    label: the event stream itself does not.
+    A routine counts only when it has a `gmail_mcp` block and EVERY Gmail
+    block it has (`gmail` or `gmail_mcp`) requires the label: events carry
+    the routine id, not the block, so one unlabelled block would let its
+    threads through. Every thread such a routine captured matched a query
+    that required the label, so it carried the label when it was captured.
+    This reads the routine's CURRENT query, not the one in force when an
+    older event was captured. The event stream itself does not record labels.
     """
     ids = set()
     for routine in routines(base_dir):
-        for block in _source_blocks(routine):
-            if (block.get("kind") == "gmail_mcp"
-                    and query_requires_label(block.get("query"), label)):
-                ids.add(routine["id"])
+        blocks = [b for b in _source_blocks(routine)
+                  if b.get("kind") in ("gmail", "gmail_mcp")]
+        if (any(b.get("kind") == "gmail_mcp" for b in blocks)
+                and all(query_requires_label(b.get("query"), label)
+                        for b in blocks)):
+            ids.add(routine["id"])
     return ids

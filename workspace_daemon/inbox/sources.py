@@ -257,18 +257,23 @@ def _alert_state(item, now, max_age_h, recovery):
 
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0,
-                alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H, email_routines=None):
+                alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H, email_routines=None,
+                events=None, recovery=None):
     """The built-in source: recent events as items. Never raises.
 
     `email_routines` (a set of routine ids, or None for no filter) keeps only
     the Gmail events written by those routines; see `daemoncfg.label_routines`.
+    `events` and `recovery` let a caller that kept them from an earlier read
+    rebuild the items for a later `now` without reading a file (the window,
+    alert age and `starts_within_h` rules depend on the time).
     """
     now = time.time() if now is None else now
-    try:
-        events = read_events(base_dir)
-    except OSError as exc:
-        return SourceResult(name, [], False, None,
-                            f"cannot read events: {exc.strerror or exc}")
+    if events is None:
+        try:
+            events = read_events(base_dir)
+        except OSError as exc:
+            return SourceResult(name, [], False, None,
+                                f"cannot read events: {exc.strerror or exc}")
     cutoff = now - float(window_h) * 3600
     latest = {}  # one row per source_id: the newest event wins
     for event in events:
@@ -285,7 +290,7 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
         prev = latest.get(sid)
         if prev is None or item["ts"] >= prev["ts"]:
             latest[sid] = item
-    recovery = Recovery(base_dir)
+    recovery = recovery if recovery is not None else Recovery(base_dir)
     rows, alerts = [], {}
     for item in latest.values():
         if item["source"] == "alert":
@@ -513,40 +518,82 @@ class Unit:
     """One independently refreshable source: `run(now, show_all)` returns a
     list of SourceResult (possibly empty), `watch()` the paths whose change
     makes it stale (stat-checked by `watch.Watcher`). `uses_all` marks a
-    command source that declared `supports_all`."""
+    command source that declared `supports_all`. `reeval(now)`, when given,
+    rebuilds the results from what the last `run` read, for the parts that
+    depend on the time (no file is touched); it returns None when there is
+    nothing to rebuild."""
 
-    def __init__(self, name, run, watch=lambda: [], uses_all=False):
+    def __init__(self, name, run, watch=lambda: [], uses_all=False,
+                 reeval=None):
         self.name, self.run, self.watch, self.uses_all = name, run, watch, uses_all
+        self.reeval = reeval
 
 
-def _events_result(src, settings, base_dir, now):
-    """The built-in events source."""
-    email_routines, note = None, None
-    label = src.get("email_require_label")
-    if label:
-        email_routines = daemoncfg.label_routines(base_dir, label)
-        if not email_routines:
-            note = (f"email_require_label '{label}': no Gmail routine requires "
-                    "that label in its query, so no mail is shown")
-    res = load_events(base_dir, now=now, window_h=src["window_h"],
-                      rules=src["urgent"], name=src["name"],
-                      gmail_account=settings["gmail_account"],
-                      alert_max_age_h=settings.get(
-                          "alert_urgent_max_age_h", DEFAULT_ALERT_MAX_AGE_H),
-                      email_routines=email_routines)
-    if note:
-        res = res._replace(error=f"{res.error}; {note}" if res.error else note)
-    return res
+def _events_unit_run(src, settings, base_dir):
+    """`(run, reeval)` for the built-in events source. `run` reads the event
+    files; `reeval` rebuilds the items for a later time from what `run` read
+    (and from the alert state it already loaded)."""
+    kept = {}
+
+    def build(now, events, recovery, note):
+        res = load_events(base_dir, now=now, window_h=src["window_h"],
+                          rules=src["urgent"], name=src["name"],
+                          gmail_account=settings["gmail_account"],
+                          alert_max_age_h=settings.get(
+                              "alert_urgent_max_age_h", DEFAULT_ALERT_MAX_AGE_H),
+                          email_routines=kept.get("routines"),
+                          events=events, recovery=recovery)
+        if note:
+            res = res._replace(
+                error=f"{res.error}; {note}" if res.error else note)
+        return res
+
+    def run(now, show_all):
+        kept.clear()
+        note = None
+        label = src.get("email_require_label")
+        if label:
+            kept["routines"] = daemoncfg.label_routines(base_dir, label)
+            if not kept["routines"]:
+                note = (f"email_require_label '{label}': no Gmail routine "
+                        "requires that label in its query, so no mail is shown")
+        try:
+            events = read_events(base_dir)
+        except OSError as exc:
+            kept.pop("events", None)
+            return [SourceResult(src["name"], [], False, None,
+                                 f"cannot read events: {exc.strerror or exc}")]
+        kept.update(events=events, recovery=Recovery(base_dir), note=note)
+        return [build(now, events, kept["recovery"], note)]
+
+    def reeval(now):
+        if "events" not in kept:
+            return None
+        return [build(now, kept["events"], kept["recovery"], kept["note"])]
+
+    return run, reeval
 
 
-def _invites_results(src, base_dir, now):
-    """The pending-invite source of an events source: `[]` when there is no
+def _invites_unit_run(src, base_dir):
+    """`(run, reeval)` for the pending-invite source: `[]` when there is no
     calendar cache at all (nothing to report)."""
-    rows, stale, age, error = invites.load(
-        base_dir, now, src.get("invites_days", invites.DEFAULT_DAYS))
-    if age is None and not error:
-        return []
-    return [SourceResult(f"{src['name']}.invites", rows, stale, age, error)]
+    kept = {}
+
+    def results(data, now):
+        rows, stale, age, error = invites.build(
+            data, now, src.get("invites_days", invites.DEFAULT_DAYS))
+        if age is None and not error:
+            return []
+        return [SourceResult(f"{src['name']}.invites", rows, stale, age, error)]
+
+    def run(now, show_all):
+        kept["data"] = invites.read(base_dir)
+        return results(kept["data"], now)
+
+    def reeval(now):
+        return results(kept["data"], now) if "data" in kept else None
+
+    return run, reeval
 
 
 def events_files(base_dir):
@@ -579,18 +626,15 @@ def make_units(settings, base_dir):
                         str(base_dir), "routines", "*.yaml")))
                 return files
 
-            units.append(Unit(
-                src["name"],
-                lambda now, show_all, src=src: [
-                    _events_result(src, settings, base_dir, now)],
-                watch))
+            run, reeval = _events_unit_run(src, settings, base_dir)
+            units.append(Unit(src["name"], run, watch, reeval=reeval))
             if src.get("invites_days", invites.DEFAULT_DAYS) > 0:
+                run, reeval = _invites_unit_run(src, base_dir)
                 units.append(Unit(
-                    f"{src['name']}.invites",
-                    lambda now, show_all, src=src: _invites_results(
-                        src, base_dir, now),
+                    f"{src['name']}.invites", run,
                     lambda: [os.path.join(str(base_dir), "state",
-                                          invites.SNAPSHOT_FILE)]))
+                                          invites.SNAPSHOT_FILE)],
+                    reeval=reeval))
         else:
             units.append(Unit(
                 src["name"],
@@ -607,15 +651,36 @@ def saved_watch(base_dir):
     return lambda: events_files(base_dir)
 
 
+def _announces_invite(item, series):
+    """A `New invite` calendar event row for an invite that now has its own
+    pending row (same recurring series)."""
+    meta = item["meta"]
+    source_id = meta.get("source_id")
+    return (item["source"] == "calendar" and meta.get("kind") == "new"
+            and isinstance(source_id, str) and source_id.startswith("gcal:")
+            and invites.series_of(source_id[len("gcal:"):]) in series)
+
+
 def merge(batches):
     """Flatten per-unit results (in source order). A duplicate item id across
-    sources keeps the first and flags the later source."""
+    sources keeps the first and flags the later source. A calendar `New
+    invite` row is dropped when its series has a pending-invite row, which
+    says the same thing and can be acted on."""
+    batches = [list(b) for b in batches]
+    series = {i["meta"]["series"] for b in batches for r in b for i in r.items
+              if i["id"].startswith("invites:")
+              and isinstance(i["meta"].get("series"), str)}
     results = []
     seen = set()
     for batch in batches:
         for res in batch:
-            kept = [i for i in res.items if i["id"] not in seen]
-            dropped = len(res.items) - len(kept)
+            dropped = 0
+            kept = []
+            for i in res.items:
+                if i["id"] in seen:
+                    dropped += 1   # a duplicate id
+                elif not (series and _announces_invite(i, series)):
+                    kept.append(i)
             seen.update(i["id"] for i in kept)
             error = res.error
             if dropped:

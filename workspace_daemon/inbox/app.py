@@ -159,7 +159,7 @@ class InboxApp(App):
         self.show_all = False              # A: ask `supports_all` sources for everything
         self.saved, self.saved_days = saved, saved_days
         self._saved_loading = False
-        self._repoll = False               # a toggle landed while a poll ran
+        self._queued = None                # a refresh asked for while one ran
         self._fetch_takes_all = _takes_show_all(fetch)
         self.units = list(units) if units is not None else None
         self._unit_results = {}            # unit name -> its latest raw results
@@ -173,7 +173,6 @@ class InboxApp(App):
             self.watcher = Watcher(watched)
             self.watcher.set_active(_SavedUnit.name, False)
         self.saved_screen = None
-        self._repoll_names = None
         self.editing = False
         self.busy = 0
         self.polling = False
@@ -219,6 +218,7 @@ class InboxApp(App):
         self.query_one("#draft-pane").border_title = "Draft"
         self.set_interval(0.25, self.tick_header)
         self.set_interval(30, self.refilter)
+        self.set_interval(30, self.reeval)
         self.set_interval(self.poll_s, self.poll)   # the fallback full refresh
         if self.watcher is not None:
             self.set_interval(self.watch_s, self.watch_tick)
@@ -266,7 +266,10 @@ class InboxApp(App):
                     continue
             out.append(it)
         order = {k: n for n, k in enumerate(SECTION_KEYS)}
-        out.sort(key=lambda i: (order[i.section], i.ts if i.section == "waiting" else -i.ts))
+        # Waiting items and pending invites (whose ts is the event start) list
+        # the oldest / soonest first; everything else newest first.
+        out.sort(key=lambda i: (order[i.section], i.ts if i.section == "waiting"
+                                or i.meta.get("kind") == "invite" else -i.ts))
         return out
 
     def refilter(self, redraw=True):
@@ -859,11 +862,7 @@ class InboxApp(App):
             names = {u.name for u in self.units if u.uses_all}
             if not names:
                 return
-        if self.polling:
-            self._repoll = True   # the poll in flight asked with the old state
-            self._repoll_names = names
-        else:
-            self.poll(quiet=True, names=names)
+        self.poll(quiet=True, names=names)   # queued when one is running
 
     async def action_saved(self):
         """S: the read-only Saved view."""
@@ -959,23 +958,30 @@ class InboxApp(App):
         self.exit(message=f"Nothing sent: {cancelled} pending send(s) cancelled on quit." if cancelled else None)
 
     # ---------- poll ----------
-    def _run_units(self, names, show_all):
+    def _run_units(self, names, show_all, reeval=False):
         """Run the named units (all when `names` is None) and merge them with
-        the cached results of the others. Worker thread."""
+        the cached results of the others. Worker thread. With `reeval`, a unit
+        rebuilds its results for the current time from what it already read
+        (no file is touched) and one that cannot is left as it was."""
         now = time.time()
         for unit in self.units:
             if names is not None and unit.name not in names:
                 continue
             try:
-                batch = list(unit.run(now, show_all))
+                if reeval:
+                    batch = unit.reeval(now) if unit.reeval else None
+                    batch = list(batch) if batch is not None else None
+                else:
+                    batch = list(unit.run(now, show_all))
             except Exception as exc:  # a source bug must never end the session
                 batch = [SourceResult(unit.name, [], False, None,
                                       f"poll failed: {type(exc).__name__}: {exc}")]
-            self._unit_results[unit.name] = batch
+            if batch is not None:
+                self._unit_results[unit.name] = batch
         return merge(self._unit_results[u.name] for u in self.units
                      if u.name in self._unit_results)
 
-    def _safe_fetch(self, show_all=None, names=None):
+    def _safe_fetch(self, show_all=None, names=None, reeval=False):
         """Runs in a worker thread: pick up other panes' marks, fetch, and
         stamp the marks of items that are still listed."""
         show_all = self.show_all if show_all is None else show_all
@@ -985,7 +991,7 @@ class InboxApp(App):
             pass
         try:
             if self.units is not None:
-                results = self._run_units(names, show_all)
+                results = self._run_units(names, show_all, reeval)
             else:
                 results = list(self.fetch(show_all=show_all) if self._fetch_takes_all
                                else self.fetch())
@@ -1002,21 +1008,47 @@ class InboxApp(App):
             pass
         return results
 
-    def poll(self, manual=False, quiet=False, names=None):
+    def _queue(self, names, quiet):
+        """Remember a refresh asked for while another one runs; it starts as
+        soon as that one ends. Requests merge: everything beats a subset."""
+        old = self._queued
+        if old is None:
+            self._queued = {"names": None if names is None else set(names),
+                            "quiet": quiet}
+            return
+        old["quiet"] = old["quiet"] and quiet
+        if old["names"] is not None:
+            old["names"] = None if names is None else old["names"] | set(names)
+
+    def poll(self, manual=False, quiet=False, names=None, reeval=False):
         """Start a refresh unless one is already running (they never overlap,
         so a slow source cannot pile up cancelled fetches). `names` limits it
         to those units (None: everything). A `quiet` refresh (after the A
-        toggle) does not announce the items it reveals."""
+        toggle) does not announce the items it reveals. A refresh asked for
+        while one runs is queued to run right after it (a manual `r` is told
+        instead); a `reeval` pass, which only re-applies the clock, is not."""
         if self.polling:
             if manual:
                 self.notify("Poll already running", timeout=2, markup=False)
+            elif not reeval:
+                self._queue(names, quiet)
             return
         self.polling = True
-        if names is None:
+        if names is None and not reeval:
             self.next_poll_at = time.time() + self.poll_s
             if self.watcher is not None:   # baseline: later changes are due again
                 self.watcher.commit()
-        self._poll_worker(manual, quiet, self.show_all, names)
+        self._poll_worker(manual, quiet, self.show_all, names, reeval)
+
+    def reeval(self):
+        """Every 30 s: re-apply the clock (invites that ended, the window,
+        alert age, urgent-soon rules) to what the sources already read,
+        without reading any file."""
+        if self.units is None or self.polling or not self.polled_once:
+            return
+        names = {u.name for u in self.units if u.reeval}
+        if names:
+            self.poll(quiet=True, names=names, reeval=True)
 
     def watch_tick(self):
         """Every `watch_interval_s`: stat the watched files and refresh only
@@ -1028,6 +1060,11 @@ class InboxApp(App):
             due = self.watcher.due()
         except Exception:  # stat-only and tolerant, but never end the session
             return
+        # A watched source whose files did not change is as fresh as its files.
+        now = time.time()
+        for name in self.watcher.unchanged:
+            if name in self.updated_at:
+                self.updated_at[name] = now
         reload_saved = _SavedUnit.name in due
         names = {n for n in due if n != _SavedUnit.name}
         if reload_saved and self.saved_screen is not None:
@@ -1038,15 +1075,18 @@ class InboxApp(App):
             self.poll(names=names)
 
     @work(exclusive=False, group="poll")
-    async def _poll_worker(self, manual, quiet=False, show_all=False, names=None):
+    async def _poll_worker(self, manual, quiet=False, show_all=False, names=None,
+                           reeval=False):
         self.busy += 1
         try:
-            results = await asyncio.to_thread(self._safe_fetch, show_all, names)
+            results = await asyncio.to_thread(self._safe_fetch, show_all, names, reeval)
         finally:
             self.busy -= 1
             self.polling = False
         stamp = time.time()
-        if self.units is not None:
+        if reeval:
+            pass                    # no file was read: nothing became fresher
+        elif self.units is not None:
             for unit in self.units:
                 if names is None or unit.name in names:
                     self.updated_at[unit.name] = stamp
@@ -1054,9 +1094,9 @@ class InboxApp(App):
             for res in results:
                 self.updated_at[res.name] = stamp
         self.apply_results(results, manual=manual, quiet=quiet)
-        if self._repoll:
-            self._repoll = False
-            self.poll(quiet=True, names=self._repoll_names)
+        queued, self._queued = self._queued, None
+        if queued:
+            self.poll(quiet=queued["quiet"], names=queued["names"])
 
     def apply_results(self, results, manual=False, quiet=False):
         """Merge a poll into the queue. Runs on the UI thread."""
