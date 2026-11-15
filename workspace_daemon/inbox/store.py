@@ -1,22 +1,31 @@
 """Local inbox state: done, snooze-until and ack per item id.
 
-`<base>/state/inbox-state.json`, written atomically with mode 0600. Every
-mutation re-reads the file first, so two inbox windows do not overwrite each
-other's marks. Corrupt or unreadable state reads as empty and the broken file
-is kept aside as `.bad` before the next write.
+`<base>/state/inbox-state.json`, written atomically with mode 0600. Several
+inbox panes (processes) and several threads of one pane may write at once, so
+every read-modify-write holds a `threading.Lock` and an `fcntl` lock on the
+sidecar `inbox-state.lock`, re-reads the file under the lock, and writes
+through a uniquely named temp file in the same directory. Marks written by
+another pane are therefore never lost. Corrupt or unreadable state reads as
+empty and the broken file is kept aside as `.bad` before the next write.
 """
+import fcntl
 import json
 import os
+import tempfile
+import threading
 import time
 from pathlib import Path
 
 from .. import state as daemon_state
 
 FILE_NAME = "inbox-state.json"
+LOCK_NAME = "inbox-state.lock"
 SCHEMA_VERSION = 1
-# A done/ack mark must outlive the longest event window, or the row would
-# come back. Snoozes are kept until due, then like any other mark.
-RETENTION_S = 14 * 86400
+# A mark is kept while its item is still listed by some source, and for this
+# long after the item was last listed (or the mark was last changed). Active
+# snoozes are never pruned by age.
+RETENTION_S = 7 * 86400
+LISTED_REFRESH_S = 3600  # how often a still-listed item's mark is re-stamped
 MAX_ENTRIES = 5000
 
 
@@ -28,6 +37,7 @@ class InboxStore:
         self.clock = clock
         self.marks = {}
         self._corrupt = False
+        self._lock = threading.RLock()
         self.load()
 
     # -- io --
@@ -48,7 +58,8 @@ class InboxStore:
             if not isinstance(key, str) or not isinstance(mark, dict):
                 continue
             clean = {}
-            for field in ("done", "ack", "snooze_until", "updated"):
+            for field in ("done", "ack", "snooze_until", "updated",
+                          "last_listed"):
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
@@ -57,10 +68,12 @@ class InboxStore:
         return marks, False
 
     def load(self):
-        self.marks, self._corrupt = self._read()
-        return self.marks
+        """Re-read the file (another pane may have written)."""
+        with self._lock:
+            self.marks, self._corrupt = self._read()
+            return self.marks
 
-    def _save(self):
+    def _write(self):
         self._prune()
         if self.path is None:
             return
@@ -70,34 +83,94 @@ class InboxStore:
             except OSError:
                 pass
             self._corrupt = False
-        daemon_state.ensure_private_dir(self.path.parent)
         text = json.dumps({"v": SCHEMA_VERSION, "items": self.marks},
                           indent=1, sort_keys=True)
-        daemon_state.write_atomic(self.path, text, mode=0o600)
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent),
+                                   prefix=f".{FILE_NAME}.", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:  # make the rename itself durable; best effort
+            dfd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
-    def _mutate(self, item_id, change):
-        self.marks, self._corrupt = self._read()
-        mark = dict(self.marks.get(item_id, {}))
-        change(mark)
-        mark["updated"] = self.clock()
-        self.marks[item_id] = mark
-        self._save()
+    def _transaction(self, change):
+        """Re-read under both locks, apply `change(marks)`, write if it
+        returns True."""
+        with self._lock:
+            if self.path is None:
+                if change(self.marks):
+                    self._write()
+                return
+            daemon_state.ensure_private_dir(self.path.parent)
+            lock_fd = os.open(str(self.path.parent / LOCK_NAME),
+                              os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                self.marks, self._corrupt = self._read()
+                if change(self.marks):
+                    self._write()
+            finally:
+                os.close(lock_fd)  # closing drops the flock
 
     # -- marks --
+    def _mark(self, item_id, **fields):
+        def change(marks):
+            mark = dict(marks.get(item_id, {}))
+            mark.update(fields)
+            mark["updated"] = self.clock()
+            marks[item_id] = mark
+            return True
+        self._transaction(change)
+
     def done(self, item_id):
-        self._mutate(item_id, lambda m: m.update(done=self.clock()))
+        self._mark(item_id, done=self.clock())
 
     def ack(self, item_id):
-        self._mutate(item_id, lambda m: m.update(ack=self.clock()))
+        self._mark(item_id, ack=self.clock())
 
     def snooze(self, item_id, until):
-        self._mutate(item_id, lambda m: m.update(snooze_until=float(until)))
+        self._mark(item_id, snooze_until=float(until))
 
     def restore(self, item_id):
         """Drop every mark (undo)."""
-        self.marks, self._corrupt = self._read()
-        if self.marks.pop(item_id, None) is not None:
-            self._save()
+        self._transaction(lambda marks: marks.pop(item_id, None) is not None)
+
+    def note_listed(self, item_ids):
+        """Record that these ids are still listed by a source, so their marks
+        outlive the item's time in the source's window. Cheap: it writes only
+        when a marked id has not been stamped for LISTED_REFRESH_S."""
+        ids = set(item_ids)
+        now = self.clock()
+
+        def stale(marks):
+            return [k for k in ids if k in marks and
+                    now - marks[k].get("last_listed", 0) > LISTED_REFRESH_S]
+
+        if not stale(self.marks):  # nothing to do: skip the lock and disk
+            return
+
+        def change(marks):
+            todo = stale(marks)
+            for key in todo:
+                marks[key]["last_listed"] = now
+            return bool(todo)
+        self._transaction(change)
 
     # -- queries --
     def is_hidden(self, item_id, now=None):
@@ -124,10 +197,12 @@ class InboxStore:
         now = self.clock() if now is None else now
         for key in [k for k, m in self.marks.items()
                     if m.get("snooze_until", 0) <= now
-                    and now - m.get("updated", 0) > RETENTION_S]:
+                    and now - max(m.get("last_listed", 0),
+                                  m.get("updated", 0)) > RETENTION_S]:
             del self.marks[key]
         if len(self.marks) > MAX_ENTRIES:
-            oldest = sorted(self.marks, key=lambda k:
-                            self.marks[k].get("updated", 0))
+            oldest = sorted(self.marks, key=lambda k: max(
+                self.marks[k].get("last_listed", 0),
+                self.marks[k].get("updated", 0)))
             for key in oldest[: len(self.marks) - MAX_ENTRIES]:
                 del self.marks[key]

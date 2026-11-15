@@ -3,7 +3,7 @@ import copy
 import json
 import unittest
 
-from workspace_daemon.inbox import bidi, items as itm, settings, themes
+from workspace_daemon.inbox import actions, bidi, items as itm, settings, themes
 
 
 def good(**over):
@@ -63,6 +63,28 @@ class ContractTest(unittest.TestCase):
         for bad in ("javascript:alert(1)", "file:///etc/passwd", "ftp://x",
                     "https://a b", 5):
             self.assertTrue(itm.validate_item(good(link=bad)), bad)
+
+    def test_link_rejects_controls_del_and_trailing_newline(self):
+        for bad in ("https://example.com/a\x9bb", "https://example.com/\x07",
+                    "https://example.com/\n", "https://example.com/a\x7f",
+                    "https://example.com/a\x1b[2J", "https://exa mple.com",
+                    "https://example.com/a\u2028b", "https://example.com/a\x85b",
+                    "https://", "http:///"):
+            self.assertTrue(itm.validate_item(good(link=bad)), repr(bad))
+            self.assertFalse(itm.valid_link(bad), repr(bad))
+        self.assertTrue(itm.valid_link("https://example.com/p?q=1&r=\u05e9#x"))
+
+    def test_open_action_refuses_unsafe_links(self):
+        opened = []
+        act = actions.LocalActions(None, opener=lambda url: opened.append(url) or True)
+        class Row:
+            def __init__(self, link):
+                self.link = link
+        for bad in ("https://example.com/a\x9bb", "https://example.com/\n",
+                    "https://example.com/\x07", "file:///etc/passwd", None):
+            self.assertFalse(act.open_link(Row(bad)).ok, repr(bad))
+        self.assertTrue(act.open_link(Row("https://example.com/ok")).ok)
+        self.assertEqual(opened, ["https://example.com/ok"])
 
     def test_thread_and_draft_shapes(self):
         self.assertTrue(itm.validate_item(good(thread={"who": "x"})))
@@ -193,6 +215,22 @@ class SettingsTest(unittest.TestCase):
                        "argv", "title_regex", "type"):
             self.assertIn(needle, text)
 
+    def test_command_timeout_must_stay_below_the_poll_interval(self):
+        def cfg(poll, timeout=None):
+            src = {"name": "c", "type": "command", "argv": ["x"]}
+            if timeout is not None:
+                src["timeout_s"] = timeout
+            return settings.validate({"poll_interval_s": poll, "sources": [src]})
+        self.assertEqual(cfg(30, 29)["sources"][0]["timeout_s"], 29.0)
+        for poll, timeout in ((30, 30), (30, 45), (10, 60)):
+            with self.assertRaises(settings.SettingsError, msg=(poll, timeout)) as ctx:
+                cfg(poll, timeout)
+            self.assertIn("poll_interval_s", str(ctx.exception))
+        # the default timeout adapts instead of failing a short interval
+        self.assertEqual(cfg(60)["sources"][0]["timeout_s"], 20.0)
+        self.assertEqual(cfg(10)["sources"][0]["timeout_s"], 9.0)
+        self.assertEqual(cfg(5)["sources"][0]["timeout_s"], 4.0)
+
     def test_gmail_account(self):
         self.assertEqual(settings.default_settings()["gmail_account"], 0)
         self.assertEqual(settings.validate({"gmail_account": 3})["gmail_account"], 3)
@@ -220,6 +258,13 @@ class BidiModeTest(unittest.TestCase):
         env = {"TERM_PROGRAM": "iTerm.app"}
         self.assertEqual(bidi.resolve("visual", env), "visual")
         self.assertEqual(bidi.resolve("logical", {"TERM_PROGRAM": "x"}), "logical")
+
+    def test_lc_terminal_iterm2_survives_tmux(self):
+        tmux = {"TERM_PROGRAM": "tmux", "LC_TERMINAL": "iTerm2"}
+        self.assertEqual(bidi.resolve("auto", tmux), "logical")
+        self.assertEqual(bidi.resolve("auto", {"TERM_PROGRAM": "tmux"}), "visual")
+        self.assertEqual(bidi.resolve("auto", {"LC_TERMINAL": "other"}), "visual")
+        self.assertEqual(bidi.resolve("visual", tmux), "visual")  # explicit wins
 
     def test_env_var_overrides_config(self):
         self.assertEqual(bidi.configured_mode("logical", {"INBOX_BIDI": "visual"}),

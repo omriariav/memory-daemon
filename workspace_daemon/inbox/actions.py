@@ -9,6 +9,8 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 
+from . import items
+
 
 @dataclass
 class Result:
@@ -18,10 +20,7 @@ class Result:
 
 def safe_link(link):
     """The link if it is a plain http(s) URL, else None."""
-    if isinstance(link, str) and link.startswith(("http://", "https://")) \
-            and not any(c in link for c in " \n\r\t\x1b"):
-        return link
-    return None
+    return link if items.valid_link(link) else None
 
 
 class LocalActions:

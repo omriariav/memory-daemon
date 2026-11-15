@@ -76,6 +76,17 @@ class InboxCliTest(unittest.TestCase):
         self.assertIn("theme", err.getvalue())
         self.assertIn("bogus", err.getvalue())
 
+    def test_demo_ignores_inbox_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "inbox.yaml").write_text("theme: neon" + chr(10))
+            with mock.patch("pathlib.Path.read_text",
+                            side_effect=AssertionError("demo read a file")):
+                got = cli.load_settings(Path(tmp), demo=True)
+            self.assertEqual(got["theme"], "dark")
+            from workspace_daemon.inbox import settings
+            with self.assertRaises(settings.SettingsError):
+                cli.load_settings(Path(tmp), demo=False)
+
     def test_inbox_is_in_help(self):
         out = io.StringIO()
         with mock.patch("sys.stdout", out), self.assertRaises(SystemExit):

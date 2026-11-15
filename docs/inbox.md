@@ -42,7 +42,7 @@ One item is one JSON object:
 | `sender`, `where` | string | one line, up to 200 chars |
 | `gist` | string | one line, up to 120 chars |
 | `ts` | number | epoch seconds (finite, not negative) |
-| `link` | string or null | `http://` or `https://` URL, or null |
+| `link` | string or null | `http://` or `https://` URL with a host and no whitespace, control (C0/C1) characters or DEL, or null |
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
@@ -68,7 +68,8 @@ is the strict check and `parse_item` is sanitise-then-validate.
 
 ## Source-command protocol
 
-A `command` source is any program, run without a shell:
+A `command` source is any program, run without a shell (`~` at the start of an
+argument is expanded):
 
 - `<argv...> list` prints to stdout
   `{"v": 1, "items": [...], "stale": bool, "age_min": number|null, "error": str|null}`.
@@ -78,7 +79,10 @@ A `command` source is any program, run without a shell:
   on stdin and prints `{"ok": bool, "message": str}`.
 
 Phase 1 calls only `list`, with the configured timeout, stdin closed, in its
-own process group (killed whole on timeout). Output over 4 MB, non-JSON output,
+own process group (killed whole on timeout). stdout is read in chunks and the
+group is killed as soon as it passes 4 MB; only the last 64 KB of stderr are
+kept, so a chatty source cannot exhaust memory. `timeout_s` must be below
+`poll_interval_s` (the default adapts to short intervals). Output over 4 MB, non-JSON output,
 a wrong `v`, a non-zero exit, a timeout or a program that will not start is a
 **source error**: shown in the header and a toast, items from that source are
 empty, nothing crashes. One bad item (failed validation, duplicate id) is
@@ -86,13 +90,20 @@ dropped and counted in the error text without hiding the others. A duplicate id
 across sources keeps the first.
 
 `act` (`run_command_act` in `sources.py`) is defined and tested but not called
-until phase 2.
+until phase 2. It has the same limits: its own process group, killed whole on
+timeout or an oversized response.
+
+Polls never overlap: a poll that is still running when the next one is due (or
+when you press `r`) is skipped, and `r` says "Poll already running". Each poll
+first re-reads the state file, so marks made in another pane show up.
 
 ## Built-in `events` source
 
 Reads `<base>/state/events.jsonl` and the `.1` rotation (schema in
-`workspace_daemon/events.py`), read-only and never taking `events.lock`. A torn
-last line or garbage line is skipped. Only the last `window_h` hours are shown
+`workspace_daemon/events.py`), read-only and never taking `events.lock`. The live
+file is read before the `.1` rotation and events are de-duplicated by `id`, so
+a rotation in between cannot hide events. A torn last line or garbage line is
+skipped. Only the last `window_h` hours are shown
 (default 48). One event per `source_id` is kept, the newest, so a calendar
 event that was created, then updated, appears once.
 
@@ -108,7 +119,9 @@ item with a null `link`, whatever a source says). Today only Gmail events have
 one, so the other rows are `ack` only.
 
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
-lines. A Gmail thread id becomes a link
+lines. A Gmail thread id (the second `:`-segment of
+`gmail:<thread>`, `gmail:<thread>:followup-open` or `gmail:<thread>@<message>`)
+becomes a link
 `https://mail.google.com/mail/u/<gmail_account>/#all/<thread id>`; other
 events have no link yet.
 Items are `fyi`/`digest` unless an urgent rule matches. By default
@@ -125,11 +138,17 @@ people are untrusted (see above).
 - Writes are atomic (temp file plus rename) with mode 0600 in a 0700 directory.
   Each write re-reads the file first so two windows do not lose each other's
   marks. A corrupt file reads as empty and is kept as `inbox-state.json.bad`.
-- Pruning: done/ack marks older than 14 days and expired snoozes go; at most
-  5000 entries are kept (oldest dropped first).
+- Pruning: a mark is dropped once its item has not been listed by any source
+  for 7 days (each poll re-stamps the marks of items that are still listed, at
+  most hourly), so a done item stays hidden for as long as a source keeps
+  showing it, however old. Active snoozes are never pruned by age. At most
+  5000 entries are kept (least recently listed dropped first).
+- Writes are serialised by a `threading.Lock` and an `fcntl` lock on
+  `inbox-state.lock`, and go through a uniquely named temp file, so several
+  panes (and threads) never corrupt the file or lose each other's marks.
 - Done, ack and snooze are queued for 5 seconds so `u` can undo them; quitting
   commits them. A queued send or nudge is never committed on quit.
-- `--demo` keeps marks in memory only.
+- `--demo` keeps marks in memory only and does not read `inbox.yaml`.
 
 ## Settings (`<base>/inbox.yaml`)
 
@@ -152,8 +171,9 @@ urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
 
 `bidi_mode`: `logical` passes text through (the terminal runs bidi),
 `visual` wraps and then reorders each line with python-bidi (the terminal does
-not). `auto` picks by `$TERM_PROGRAM`: iTerm2 does its own bidi, so it maps to
-`logical`; unknown terminals fall back to `visual`. `$INBOX_BIDI` overrides
+not). `auto` picks by `$TERM_PROGRAM` (or `LC_TERMINAL=iTerm2`, which survives tmux
+inside iTerm2): iTerm2 does its own bidi, so it maps to `logical`; unknown
+terminals fall back to `visual`. `$INBOX_BIDI` overrides
 `inbox.yaml`, and `b` toggles at runtime. Without python-bidi `visual` degrades
 to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `AUTO_TABLE` there is the one place to record a terminal's behaviour.

@@ -10,7 +10,8 @@ One setting picks the order: `bidi_mode` = `logical | visual | auto`.
 
 - `logical`: text is passed through untouched (the terminal does bidi).
 - `visual`: wrap, then get_display() each line (the terminal does not).
-- `auto`: choose by $TERM_PROGRAM from AUTO_TABLE, else AUTO_DEFAULT.
+- `auto`: choose by $TERM_PROGRAM (or LC_TERMINAL=iTerm2, which survives
+  tmux) from AUTO_TABLE, else AUTO_DEFAULT.
 
 Precedence: $INBOX_BIDI, then `bidi_mode` from inbox.yaml, then `auto`. The
 legacy values `on` (= visual) and `off` (= logical) are accepted. iTerm2 does
@@ -84,7 +85,12 @@ def resolve(mode, env=None):
     m = normalize_mode(mode)
     if m == "auto":
         e = os.environ if env is None else env
-        m = AUTO_TABLE.get(e.get("TERM_PROGRAM", ""), AUTO_DEFAULT)
+        term = e.get("TERM_PROGRAM", "")
+        # tmux (and ssh) inside iTerm2 hide it in TERM_PROGRAM; iTerm2 also
+        # exports LC_TERMINAL, which survives them.
+        if e.get("LC_TERMINAL", "") == "iTerm2":
+            term = "iTerm.app"
+        m = AUTO_TABLE.get(term, AUTO_DEFAULT)
     return m
 
 

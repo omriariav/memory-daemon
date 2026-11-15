@@ -15,11 +15,21 @@ def textual_available():
     return True
 
 
+def load_settings(base_dir, demo=False, settings_path=None):
+    """The settings to run with. `--demo` ignores inbox.yaml entirely (it
+    must not read your files), so it always gets the defaults. Raises
+    SettingsError for a broken inbox.yaml."""
+    from . import settings as cfg
+    if demo:
+        return cfg.default_settings()
+    return cfg.load(base_dir, settings_path)
+
+
 def run(base_dir, demo=False, empty=False, settings_path=None):
     """Start the inbox. Returns a process exit code."""
     from . import settings as cfg
     try:
-        settings = cfg.load(base_dir, settings_path)
+        settings = load_settings(base_dir, demo, settings_path)
     except cfg.SettingsError as exc:
         print("inbox.yaml problems:", file=sys.stderr)
         for problem in exc.problems:

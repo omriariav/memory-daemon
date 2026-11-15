@@ -37,6 +37,9 @@ _CONTROLS = re.compile(
     "[\x00-\x08\x0b-\x1f\x7f-\x9f" + _BIDI_CONTROLS + "  ]"
 )
 _WS = re.compile(r"\s+")
+# http(s) URL with no whitespace, C0/C1 controls or DEL anywhere. fullmatch
+# (not `$`) so a trailing newline cannot slip through.
+_LINK = re.compile(r"https?://[^\s/?#\x00-\x1f\x7f-\x9f][^\s\x00-\x1f\x7f-\x9f]*")
 
 
 class ItemError(ValueError):
@@ -72,6 +75,12 @@ def _is_number(value):
 
 def _has_controls(text):
     return bool(_CONTROLS.search(text)) or "\n" in text or "\r" in text
+
+
+def valid_link(link):
+    """True for a plain http(s) URL (no spaces, controls or DEL)."""
+    return (isinstance(link, str) and len(link) <= LINK_MAX
+            and _LINK.fullmatch(link) is not None)
 
 
 def validate_item(item):
@@ -120,8 +129,7 @@ def validate_item(item):
         problems.append("missing 'link'")
     elif item["link"] is not None:
         link = item["link"]
-        if not (isinstance(link, str) and re.match(r"https?://\S+$", link)
-                and len(link) <= LINK_MAX):
+        if not valid_link(link):
             problems.append("'link' must be null or an http(s) URL")
     if "thread" not in item or not isinstance(item["thread"], list):
         problems.append("'thread' must be a list")

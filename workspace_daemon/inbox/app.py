@@ -120,6 +120,7 @@ class InboxApp(App):
         self.source_filter = None
         self.editing = False
         self.busy = 0
+        self.polling = False
         mode = bidi.resolve(bidi.configured_mode(settings["bidi_mode"]))
         self.bidi_fallback = mode == "visual" and not bidi.available()
         self.bidi_mode = "logical" if self.bidi_fallback else mode
@@ -776,20 +777,42 @@ class InboxApp(App):
 
     # ---------- poll ----------
     def _safe_fetch(self):
+        """Runs in a worker thread: pick up other panes' marks, fetch, and
+        stamp the marks of items that are still listed."""
         try:
-            return list(self.fetch())
+            self.store.load()
+        except OSError:
+            pass
+        try:
+            results = list(self.fetch())
         except Exception as exc:  # a source bug must never end the session
             return [SourceResult("inbox", [], False, None,
                                  f"poll failed: {type(exc).__name__}: {exc}")]
+        try:
+            self.store.note_listed(i["id"] for r in results for i in r.items)
+        except OSError:
+            pass
+        return results
 
-    @work(exclusive=True, group="poll")
-    async def poll(self, manual=False):
+    def poll(self, manual=False):
+        """Start a poll unless one is already running (polls never overlap,
+        so a slow source cannot pile up cancelled fetches)."""
+        if self.polling:
+            if manual:
+                self.notify("Poll already running", timeout=2, markup=False)
+            return
+        self.polling = True
         self.next_poll_at = time.time() + self.poll_s
+        self._poll_worker(manual)
+
+    @work(exclusive=False, group="poll")
+    async def _poll_worker(self, manual):
         self.busy += 1
         try:
             results = await asyncio.to_thread(self._safe_fetch)
         finally:
             self.busy -= 1
+            self.polling = False
         self.apply_results(results, manual=manual)
 
     def apply_results(self, results, manual=False):

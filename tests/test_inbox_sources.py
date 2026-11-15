@@ -1,11 +1,13 @@
 """The events source (synthetic fixtures) and command sources."""
 import json
+import os
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from workspace_daemon import events
 from workspace_daemon.inbox import items as itm, settings, sources
@@ -57,12 +59,24 @@ class EventsMappingTest(unittest.TestCase):
         self.assertEqual(itm.validate_item(item), [])
         self.assertTrue(item["link"].startswith("https://mail.google.com/"))
 
-    def test_gmail_suffixed_id_gets_no_link(self):
+    def test_gmail_followup_id_uses_the_thread_segment(self):
         write_events(self.base, [ev("gmail:abcdef0123456789:followup-open",
                                     "new", "Follow up")])
         (item,) = self.load().items
-        self.assertIsNone(item["link"])
-        self.assertEqual(item["actions"], [])  # nothing to open, nothing to ack
+        self.assertTrue(item["link"].endswith("/#all/abcdef0123456789"))
+        self.assertEqual(item["actions"], ["open"])
+
+    def test_gmail_message_version_suffix_is_stripped(self):
+        write_events(self.base, [ev("gmail:abcdef0123456789@18c0ffee", "new", "V")])
+        (item,) = self.load().items
+        self.assertTrue(item["link"].endswith("/#all/abcdef0123456789"))
+
+    def test_gmail_id_that_is_not_a_thread_has_no_link_and_no_actions(self):
+        write_events(self.base, [ev("gmail:not-a-thread", "new", "Odd"),
+                                 ev("gmail:", "new", "Empty")])
+        for item in self.load().items:
+            self.assertIsNone(item["link"])
+            self.assertEqual(item["actions"], [])  # nothing to open
 
     def test_gmail_account_index_is_configurable(self):
         write_events(self.base, [ev("gmail:18c0ffee12345678", "new", "Hi")])
@@ -172,6 +186,41 @@ class EventsMappingTest(unittest.TestCase):
         (item,) = self.load().items
         self.assertTrue(item["gist"].startswith("Updated"))
 
+    def test_event_in_both_files_is_listed_once(self):
+        row = ev("mila:dup", "new", "Same event", ago_h=1)
+        write_events(self.base, [row], name="events.jsonl.1")
+        write_events(self.base, [row])
+        self.assertEqual(len(self.load().items), 1)
+        self.assertEqual(len(sources.read_events(self.base)), 1)
+
+    def test_live_file_is_read_before_the_rotation(self):
+        order = []
+        real = sources._read_file
+        def spy(path):
+            order.append(os.path.basename(path))
+            return real(path)
+        with mock.patch.object(sources, "_read_file", spy):
+            sources.read_events(self.base)
+        self.assertEqual(order, ["events.jsonl", "events.jsonl.1"])
+
+    def test_rotation_between_the_two_reads_loses_nothing(self):
+        """The writer rotates live -> .1 after we read live but before we read
+        .1: the old events must still be seen (once)."""
+        write_events(self.base, [ev("mila:old", "new", "Old", ago_h=2)])
+        state = Path(self.base) / "state"
+        real = sources._read_file
+        def rotate_after_live(path):
+            got = real(path)
+            if path.endswith("events.jsonl"):
+                os.replace(state / "events.jsonl", state / "events.jsonl.1")
+                write_events(self.base, [ev("mila:new", "new", "New", ago_h=1)])
+            return got
+        with mock.patch.object(sources, "_read_file", rotate_after_live):
+            titles = [e["title"] for e in sources.read_events(self.base)]
+        self.assertEqual(titles, ["Old"])  # next poll sees New; Old is not lost
+        self.assertEqual({e["title"] for e in sources.read_events(self.base)},
+                         {"Old", "New"})
+
     def test_torn_and_garbage_lines_are_skipped(self):
         write_events(self.base, [
             "not json", '{"v": 1', "[]", "",
@@ -271,6 +320,41 @@ class CommandSourceTest(unittest.TestCase):
         time.sleep(0.2)
         self.assertFalse(marker.exists())
 
+    def test_output_is_capped_while_reading_and_the_group_is_killed(self):
+        marker = Path(self.tmp.name) / "child-survived"
+        started = time.time()
+        res = self.run_src(f"""
+            import subprocess, sys, time
+            subprocess.Popen([sys.executable, "-c",
+                "import time; time.sleep(3); open({str(marker)!r}, 'w').write('x')"])
+            chunk = b"x" * 65536
+            out = sys.stdout.buffer
+            while True:
+                out.write(chunk); out.flush()""", timeout=20)
+        self.assertLess(time.time() - started, 10)
+        self.assertIn("larger than", res.error)
+        self.assertEqual(res.items, [])
+        time.sleep(3.3)
+        self.assertFalse(marker.exists(), "child outlived the killed group")
+
+    def test_stderr_flood_is_bounded_and_does_not_block_the_child(self):
+        res = self.run_src("""
+            import sys, json
+            sys.stderr.write("e" * (20 * 1024 * 1024))
+            sys.stderr.write("\\nTAIL-MARK")
+            print(json.dumps({"v": 1, "items": [], "error": None}))
+            sys.exit(2)""")
+        self.assertIn("exit 2", res.error)
+        self.assertIn("TAIL-MARK", res.error)
+        self.assertLess(len(res.error), 400)
+
+    def test_stderr_flood_on_success_is_harmless(self):
+        res = self.run_src("""
+            import sys, json
+            sys.stderr.write("e" * (5 * 1024 * 1024))
+            print(json.dumps({"v": 1, "items": [], "error": None}))""")
+        self.assertEqual((res.items, res.error), ([], None))
+
     def test_missing_binary(self):
         res = sources.run_command_source("cmd", ["/no/such/binary-xyz"], 2)
         self.assertIn("cannot start", res.error)
@@ -298,6 +382,33 @@ class CommandSourceTest(unittest.TestCase):
         out = sources.run_command_act(
             argv, {"action": "done", "id": "x", "meta": {}})
         self.assertEqual(out, {"ok": True, "message": "did done"})
+
+    def test_act_timeout_kills_the_process_group(self):
+        marker = Path(self.tmp.name) / "act-child"
+        argv = self.script(f"""
+            import subprocess, sys, time
+            subprocess.Popen([sys.executable, "-c",
+                "import time; time.sleep(2); open({str(marker)!r}, 'w').write('x')"])
+            time.sleep(30)""")
+        started = time.time()
+        out = sources.run_command_act(
+            argv, {"action": "done", "id": "x", "meta": {}}, timeout_s=0.5)
+        self.assertLess(time.time() - started, 5)
+        self.assertFalse(out["ok"])
+        self.assertIn("timed out", out["message"])
+        time.sleep(2.5)
+        self.assertFalse(marker.exists(), "child outlived the killed group")
+
+    def test_act_oversized_response_is_refused(self):
+        argv = self.script("""
+            import sys
+            chunk = b"x" * 65536
+            while True:
+                sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()""")
+        out = sources.run_command_act(
+            argv, {"action": "done", "id": "x", "meta": {}}, timeout_s=20)
+        self.assertFalse(out["ok"])
+        self.assertIn("too large", out["message"])
 
     def test_act_failures_never_raise(self):
         out = sources.run_command_act(

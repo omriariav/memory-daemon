@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -266,6 +267,53 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = "t:1"
             self.assertIn(("o", "open"), app.hints())
 
+    async def test_poll_while_running_is_skipped_not_stacked(self):
+        gate = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            if len(calls) == 2:       # the first poll (on mount) is quick
+                gate.wait(5)
+            return [sources.SourceResult("t", [item(1)], False, None, None)]
+
+        store = InboxStore(None)
+        app = InboxApp(slow, store, FakeActions(store=store), dict(DEFAULTS),
+                       leave_s=0, stream_delay=0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(app, "notify", wraps=app.notify) as note:
+                await pilot.press("r")             # starts the slow poll
+                await pilot.pause(0.2)
+                self.assertTrue(app.polling)
+                await pilot.press("r", "r")        # manual: told, not queued
+                await pilot.pause(0.2)
+                app.poll()                         # timer-driven: silent skip
+                told = [c.args[0] for c in note.call_args_list]
+                self.assertEqual(told.count("Poll already running"), 2)
+                self.assertEqual(len(calls), 2)    # no extra fetches started
+                gate.set()
+                await pilot.pause(0.5)
+            self.assertFalse(app.polling)
+            await pilot.press("r")
+            await pilot.pause(0.4)
+            self.assertEqual(len(calls), 3)        # polling works again
+
+    async def test_each_poll_reloads_marks_written_by_another_pane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mine = InboxStore(Path(tmp))
+            other = InboxStore(Path(tmp))
+            fetch = Fixed([item(1), item(2)])
+            app = InboxApp(fetch, mine, FakeActions(store=mine), dict(DEFAULTS),
+                           leave_s=0, stream_delay=0)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                self.assertEqual(len(app.items), 2)
+                other.done("t:1")                  # the other pane marks it
+                await pilot.press("r")
+                await pilot.pause(0.4)
+                self.assertEqual([i.key for i in app.items], ["t:2"])
+
     async def test_source_filter_and_text_filter(self):
         app, _, _ = make_app(self.rows())
         async with app.run_test(size=SIZE) as pilot:
@@ -363,12 +411,14 @@ class BidiAppTest(unittest.IsolatedAsyncioTestCase):
     def test_iterm_defaults_to_logical(self):
         with mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
             os.environ.pop("INBOX_BIDI", None)
+            os.environ.pop("LC_TERMINAL", None)
             self.assertEqual(self.app().bidi_mode, "logical")
 
     def test_unknown_terminal_defaults_to_visual_when_available(self):
         from workspace_daemon.inbox import bidi
         with mock.patch.dict(os.environ, {"TERM_PROGRAM": "mystery"}):
             os.environ.pop("INBOX_BIDI", None)
+            os.environ.pop("LC_TERMINAL", None)
             want = "visual" if bidi.available() else "logical"
             self.assertEqual(self.app().bidi_mode, want)
 
@@ -382,6 +432,7 @@ class BidiAppTest(unittest.IsolatedAsyncioTestCase):
             self.skipTest("python-bidi not installed")
         with mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
             os.environ.pop("INBOX_BIDI", None)
+            os.environ.pop("LC_TERMINAL", None)
             app = self.app()
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)

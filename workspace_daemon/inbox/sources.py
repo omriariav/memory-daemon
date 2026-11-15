@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections import namedtuple
 from datetime import datetime, timezone
@@ -22,7 +23,8 @@ EVENTS_FILE = "events.jsonl"
 MAX_EVENT_LINE = 64 * 1024
 MAX_EVENTS_BYTES = 16 * 1024 * 1024
 DEFAULT_WINDOW_H = 48.0
-STDERR_TAIL = 200
+STDERR_TAIL = 200       # characters of stderr shown in an error
+STDERR_KEEP = 64 * 1024  # bytes of stderr kept while the child runs
 
 # Alert keys that are urgent unless the config says otherwise.
 DEFAULT_URGENT_RULES = (
@@ -56,32 +58,49 @@ def parse_iso(value):
 
 # --- events source ----------------------------------------------------------
 
-def read_events(base_dir):
-    """Every parseable event line, oldest first, from the rotation then the
-    live file. Read-only; takes no lock (writers append whole lines, so a
-    torn last line is simply skipped)."""
-    state_dir = os.path.join(str(base_dir), "state")
+def _read_file(path):
+    """Parseable event objects of one file, in file order."""
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size > MAX_EVENTS_BYTES:
+                handle.seek(size - MAX_EVENTS_BYTES)
+                handle.readline()  # drop the partial first line
+            data = handle.read(MAX_EVENTS_BYTES)
+    except FileNotFoundError:
+        return []
     out = []
-    for name in (EVENTS_FILE + ".1", EVENTS_FILE):
-        path = os.path.join(state_dir, name)
-        try:
-            with open(path, "rb") as handle:
-                size = os.fstat(handle.fileno()).st_size
-                if size > MAX_EVENTS_BYTES:
-                    handle.seek(size - MAX_EVENTS_BYTES)
-                    handle.readline()  # drop the partial first line
-                data = handle.read(MAX_EVENTS_BYTES)
-        except FileNotFoundError:
+    for line in data.split(b"\n"):
+        if not line.strip() or len(line) > MAX_EVENT_LINE:
             continue
-        for line in data.split(b"\n"):
-            if not line.strip() or len(line) > MAX_EVENT_LINE:
+        try:
+            event = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            out.append(event)
+    return out
+
+
+def read_events(base_dir):
+    """Every parseable event, oldest file first, de-duplicated by `id`.
+
+    Read-only; takes no lock (writers append whole lines, so a torn last line
+    is simply skipped). The live file is read BEFORE the `.1` rotation: if a
+    rotation lands between the two reads, the old live content is then seen
+    twice (and de-duplicated) instead of not at all.
+    """
+    state_dir = os.path.join(str(base_dir), "state")
+    live = _read_file(os.path.join(state_dir, EVENTS_FILE))
+    rotated = _read_file(os.path.join(state_dir, EVENTS_FILE + ".1"))
+    seen, out = set(), []
+    for event in rotated + live:
+        eid = event.get("id")
+        if isinstance(eid, str) and eid:
+            if eid in seen:
                 continue
-            try:
-                event = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if isinstance(event, dict):
-                out.append(event)
+            seen.add(eid)
+        out.append(event)
     return out
 
 
@@ -134,8 +153,9 @@ def _map_source(event):
 
 def _event_link(event, source, gmail_account=0):
     if source == "email":
-        sid = _text(event.get("source_id"))
-        thread = sid.partition(":")[2]
+        # gmail:<thread>, gmail:<thread>:followup-open, gmail:<thread>@<msg>
+        parts = _text(event.get("source_id")).split(":")
+        thread = parts[1].split("@")[0] if len(parts) > 1 else ""
         if _THREAD_ID.match(thread):
             return f"https://mail.google.com/mail/u/{int(gmail_account)}/#all/{thread}"
     return None
@@ -241,6 +261,12 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
 
 # --- command sources --------------------------------------------------------
 
+
+
+def _expand(argv):
+    return [os.path.expanduser(a) if a.startswith("~") else a for a in argv]
+
+
 def _kill_group(proc):
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -256,36 +282,101 @@ def _stderr_tail(raw):
     return itm.truncate(text[-STDERR_TAIL:], STDERR_TAIL)
 
 
+def _run_capped(argv, timeout_s, stdin_bytes=None):
+    """Run argv in its own process group with bounded memory and time.
+
+    stdout is read in chunks and the whole group is killed once it passes
+    OUTPUT_MAX_BYTES; stderr keeps only its last STDERR_KEEP bytes (the rest is
+    drained and dropped so the child never blocks). Returns
+    `(status, returncode, out, err)` with status ok, timeout or overflow.
+    Raises OSError/ValueError when the program cannot start.
+    """
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE if stdin_bytes is not None
+        else subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True)
+    out, err = bytearray(), bytearray()
+    flags = {"overflow": False}
+
+    def pump_out():
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return
+            out.extend(chunk)
+            if len(out) > itm.OUTPUT_MAX_BYTES:
+                flags["overflow"] = True
+                _kill_group(proc)
+                return
+
+    def pump_err():
+        fd = proc.stderr.fileno()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return
+            err.extend(chunk)
+            if len(err) > 2 * STDERR_KEEP:
+                del err[:-STDERR_KEEP]
+
+    def feed():
+        try:
+            proc.stdin.write(stdin_bytes)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=pump_out, daemon=True),
+               threading.Thread(target=pump_err, daemon=True)]
+    if stdin_bytes is not None:
+        threads.append(threading.Thread(target=feed, daemon=True))
+    for t in threads:
+        t.start()
+    status = "ok"
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        status = "timeout"
+    if flags["overflow"]:
+        status = "overflow"
+    _kill_group(proc)  # also reaps stragglers that outlive the main process
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    for t in threads:
+        t.join(timeout=2)
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            stream.close()
+        except OSError:
+            pass
+    return status, proc.returncode, bytes(out), bytes(err)
+
+
 def run_command_source(name, argv, timeout_s=20.0):
     """Run `<argv...> list` and parse it. Never raises."""
-    argv = [os.path.expanduser(a) if a.startswith("~") else a for a in argv]
     try:
-        proc = subprocess.Popen(
-            argv + ["list"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        status, code, out, err = _run_capped(_expand(argv) + ["list"], timeout_s)
     except (OSError, ValueError) as exc:
         return SourceResult(name, [], False, None,
                             f"cannot start: {getattr(exc, 'strerror', None) or exc}")
-    try:
-        out, err = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        try:
-            proc.communicate(timeout=2)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+    if status == "timeout":
         return SourceResult(name, [], False, None,
                             f"timed out after {timeout_s:g}s")
-    if proc.returncode != 0:
+    if status == "overflow":
+        return SourceResult(name, [], False, None,
+                            f"output is larger than {itm.OUTPUT_MAX_BYTES} bytes")
+    if code != 0:
         detail = _stderr_tail(err)
         return SourceResult(
             name, [], False, None,
-            f"exit {proc.returncode}" + (f": {detail}" if detail else ""))
-    if len(out) > itm.OUTPUT_MAX_BYTES:
-        return SourceResult(name, [], False, None,
-                            f"output is larger than {itm.OUTPUT_MAX_BYTES} bytes")
+            f"exit {code}" + (f": {detail}" if detail else ""))
     try:
         rows, stale, age, error = itm.parse_list_output(
             out.decode("utf-8", "replace"))
@@ -298,24 +389,23 @@ def run_command_act(argv, request, timeout_s=20.0):
     """Phase 2: run `<argv...> act` with the request on stdin.
 
     Defined so sources can implement it now; nothing in phase 1 calls it.
-    Returns `{"ok": bool, "message": str}` and never raises.
+    Returns `{"ok": bool, "message": str}` and never raises. Like `list`, it
+    runs in its own process group, killed whole on timeout or oversized output.
     """
-    argv = [os.path.expanduser(a) if a.startswith("~") else a for a in argv]
     try:
-        payload = json.dumps(dict(request, v=itm.SCHEMA_VERSION))
-        proc = subprocess.run(
-            argv + ["act"], input=payload.encode("utf-8"),
-            capture_output=True, timeout=timeout_s, start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "message": f"timed out after {timeout_s:g}s"}
+        payload = json.dumps(dict(request, v=itm.SCHEMA_VERSION)).encode("utf-8")
+        status, code, out, err = _run_capped(
+            _expand(argv) + ["act"], timeout_s, stdin_bytes=payload)
     except (OSError, ValueError, TypeError) as exc:
         return {"ok": False, "message": f"cannot run: {exc}"}
-    if proc.returncode != 0:
-        return {"ok": False,
-                "message": f"exit {proc.returncode}: {_stderr_tail(proc.stderr)}"}
+    if status == "timeout":
+        return {"ok": False, "message": f"timed out after {timeout_s:g}s"}
+    if status == "overflow":
+        return {"ok": False, "message": "response is too large"}
+    if code != 0:
+        return {"ok": False, "message": f"exit {code}: {_stderr_tail(err)}"}
     try:
-        return itm.parse_act_response(proc.stdout.decode("utf-8", "replace"))
+        return itm.parse_act_response(out.decode("utf-8", "replace"))
     except itm.ItemError as exc:
         return {"ok": False, "message": f"bad response: {exc}"}
 

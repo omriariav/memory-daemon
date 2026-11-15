@@ -21,6 +21,7 @@ SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent"),
     "command": ("name", "type", "argv", "timeout_s"),
 }
+DEFAULT_TIMEOUT_S = 20
 DEFAULTS = {
     "poll_interval_s": 60.0,
     "theme": themes.DEFAULT,
@@ -135,10 +136,18 @@ def validate(raw):
                 problems.append(f"{label}.argv must be a non-empty list of "
                                 "strings (no shell)")
                 continue
-            timeout = src.get("timeout_s", 20)
+            timeout = src.get("timeout_s")
+            if timeout is None:  # default, kept under the poll interval
+                timeout = min(DEFAULT_TIMEOUT_S, out["poll_interval_s"] - 1)
             if not _num(timeout) or not 1 <= timeout <= 120:
                 problems.append(f"{label}.timeout_s must be 1 to 120")
-                timeout = 20
+                timeout = DEFAULT_TIMEOUT_S
+            elif timeout >= out["poll_interval_s"]:
+                # A slow source would still be running when the next poll
+                # is due, and polls do not overlap.
+                problems.append(
+                    f"{label}.timeout_s ({timeout:g}) must be below "
+                    f"poll_interval_s ({out['poll_interval_s']:g})")
             built.append({"name": name, "type": "command",
                           "argv": list(argv), "timeout_s": float(timeout)})
     out["sources"] = built
