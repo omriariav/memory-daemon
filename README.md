@@ -3064,8 +3064,13 @@ The inbox UI tests skip when Textual is missing; run them with
 `tools/privacy_check.py` keeps real data out of this public repo. Besides the
 generic scan (false positives go in `tools/privacy_allowlist.txt`) it reads an
 optional **local** denylist at `~/.config/memory-daemon/private-denylist.txt`
-(one term per line, or `re:<regex>`; never committed) and fails on any match
-without printing the term. Install it as a pre-commit hook once per clone:
+(one entry per line; `#` comments; a plain entry is a case-insensitive
+substring, `word:<term>` matches whole words only, `re:<regex>` is a regex;
+never committed) and fails on any match without printing the term. It also
+flags `/Users/<name>` and `/home/<name>` paths, `<workspace>.slack.com` hosts,
+Slack webhook URLs and Slack user, channel, DM and team ids. The allowlist file
+is scanned too, and `--commits A..B` checks commit messages and
+author/committer emails (CI runs it on the PR range). Install it as a pre-commit hook once per clone:
 
 ```sh
 printf '#!/bin/sh\nexec python3 tools/privacy_check.py --staged\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit

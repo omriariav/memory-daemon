@@ -16,6 +16,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the PR commit-range privacy scan needs history
 
       - uses: actions/setup-python@v5
         with:
@@ -54,6 +56,14 @@ jobs:
         # Real-looking emails, Slack-style ids and secrets in tracked files.
         # False positives go in tools/privacy_allowlist.txt, never real data.
         run: python tools/privacy_check.py
+
+      - name: Privacy scan of the PR's commits
+        # Commit messages and author/committer emails of the PR range.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python tools/privacy_check.py --commits "$BASE_SHA..$HEAD_SHA"
 
   inbox-ui:
     # The inbox UI is an optional extra: the job above runs without Textual

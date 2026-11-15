@@ -23,6 +23,8 @@ SLACK_ID = "U" + "03AB4CD5EF"
 CHANNEL_ID = "C" + "07XY12ZZ9"
 AWS = "AKIA" + "IOSFODNN7ABCDEFG"
 GH = "ghp_" + "Zk3Qm9Lw2Xv8Rt5Yh1Bn7Cj4Dp6Fs0AgHeKu"
+HOME = "/Users/" + "jdoe"
+WORK_ID = "acme" + "-insurance"
 
 
 def scan(text, allow=(), deny=(), path="f.txt"):
@@ -57,6 +59,36 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(scan("U" + "4Q8Z1M7"), [])                       # 7 after the prefix: short
         self.assertEqual(scan("Z" + "4Q8Z1M7K2"), [])                     # other prefix
         self.assertEqual(scan("u" + "4q8z1m7k2"), [])                     # lower case
+
+    def test_slack_dm_and_team_ids_need_a_digit(self):
+        self.assertEqual(self.kinds("D" + "04AB7CD9E"), ["slack-style"])
+        self.assertEqual(self.kinds("T" + "01ABC2DEF3"), ["slack-style"])
+        self.assertEqual(scan("TRANSCRIPT DIRECTORY DESCRIPTION"), [])
+
+    def test_home_paths(self):
+        for text in (f"cd {HOME}/code", "/home/" + "jdoe/x", f'"{HOME}"'):
+            self.assertEqual(self.kinds(text), ["home"], text)
+        for text in ("/Users/test/x", "/home/test", "/Users/Shared/x",
+                     "/home/runner/work", "~/Users/x", "see /Users/<name>/"):
+            self.assertEqual(scan(text), [], text)
+
+    def test_slack_workspace_hosts(self):
+        host = WORK_ID + ".slack" + ".com"
+        self.assertEqual(self.kinds(f"open https://{host}/archives/x"), ["slack"])
+        for text in ("https://api.slack.com/methods", "files.slack.com",
+                     "example.slack.com", "example-co.slack.com", "app.slack.com"):
+            self.assertEqual(scan(text), [], text)
+
+    def test_slack_webhook_urls_are_secrets(self):
+        url = "https://hooks.slack" + ".com/services/" + "T" + "04AB7CD9E/B05XY8ZW1Q/Kd83jFh2LpQ9"
+        kinds = self.kinds(url)
+        self.assertIn("secret", kinds)
+
+    def test_word_entries_match_whole_words_only(self):
+        self.assertEqual(len(scan("Ada Lovelace joined", deny=["word:ada lovelace"])), 1)
+        self.assertEqual(scan("Canada Lovelaces", deny=["word:ada lovelace"]), [])
+        self.assertEqual(len(scan("x (Ada Lovelace)", deny=["word:Ada Lovelace"])), 1)
+        self.assertEqual(len(scan("Canada Lovelace", deny=["ada lovelace"])), 1)  # plain = substring
 
     def test_secrets(self):
         for text in (AWS, GH, "xox" + "b-4827193056-Qw8Er5Ty2Ui9Op3As",
@@ -197,6 +229,110 @@ class CliTest(unittest.TestCase):
         self.addCleanup(lambda: deny.exists() and deny.unlink())
         deny.write_text("re:(\n")
         self.assertEqual(self.main("--denylist", str(deny))[0], 2)
+
+
+class AllowlistFileTest(unittest.TestCase):
+    def test_entry_lines_only_face_the_denylist(self):
+        deny = pc.compile_denylist(["word:zebra"])
+        text = f"# a comment about {REAL_EMAIL}\n{SLACK_ID}\nzebra.txt :: ok\nrepo :: Zebra\n"
+        found = pc.scan_allowlist("tools/privacy_allowlist.txt", text, deny)
+        got = sorted((f.line, f.kind.split(" ")[0]) for f in found)
+        self.assertEqual(got, [(1, "email"), (3, "denylist"), (4, "denylist")])
+
+    def test_comments_are_checked_for_ids_too(self):
+        found = pc.scan_allowlist("a", f"# {SLACK_ID}\n", [])
+        self.assertEqual([f.line for f in found], [1])
+
+    def test_the_shipped_allowlist_is_scanned_not_skipped(self):
+        # Through run(): the file is read and scanned, so a denylist hit in it
+        # is reported.
+        deny = pc.compile_denylist(["re:::\\s*(?:gemini-notes)"])
+        found = pc.run([pc.os.path.relpath(pc.ALLOWLIST, pc.ROOT)], False, [], deny)
+        self.assertTrue(found)
+        self.assertTrue(all(f.kind.startswith("denylist") for f in found))
+
+    def test_shipped_allowlist_is_clean_and_scoped(self):
+        entries = pc.load_entries(pc.ALLOWLIST)
+        self.assertEqual(pc.run([pc.os.path.relpath(pc.ALLOWLIST, pc.ROOT)],
+                                False, [], []), [])
+        unscoped = [e for e in entries if " :: " not in e]
+        self.assertEqual(unscoped, ["re:[CUGWDT]0EXAMPLE[A-Z0-9]*"])
+
+
+class CommitsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        patcher = mock.patch.object(pc, "ROOT", self.repo)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.run_git("init", "-q")
+        self.commit("base", "Base commit")
+        self.base = self.run_git("rev-parse", "HEAD").strip()
+
+    def run_git(self, *args, env=None):
+        full = dict(os.environ, **(env or {}))
+        return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                              capture_output=True, text=True, env=full).stdout
+
+    def commit(self, name, message, author="Dev One", email="dev@example.com"):
+        (self.repo / f"{name}.txt").write_text(name)
+        self.run_git("add", ".")
+        self.run_git("commit", "-q", "-m", message, env={
+            "GIT_AUTHOR_NAME": author, "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": author, "GIT_COMMITTER_EMAIL": email})
+
+    def scan(self, deny=()):
+        return pc.scan_commits(f"{self.base}..HEAD", [], pc.compile_denylist(deny))
+
+    def test_clean_range(self):
+        self.commit("a", "Fix a thing\n\nCo-Authored-By: Tool <noreply@" "anthropic.com>")
+        count, found = self.scan()
+        self.assertEqual((count, found), (1, []))
+
+    def test_only_the_range_is_scanned(self):
+        self.commit("a", f"mention {REAL_EMAIL}")
+        self.assertEqual(pc.scan_commits("HEAD..HEAD", [], [])[0], 0)
+
+    def test_message_findings_name_the_commit(self):
+        self.commit("a", f"line one\nwrite to {REAL_EMAIL} and {SLACK_ID}")
+        _, found = self.scan()
+        self.assertEqual(sorted(f.kind for f in found), ["email", "slack-style id"])
+        self.assertTrue(found[0].path.startswith("commit:"))
+        self.assertEqual({f.line for f in found}, {2})
+
+    def test_work_looking_author_email_is_flagged(self):
+        self.commit("a", "ok", email="jane" + "@" + WORK_ID + ".io")
+        _, found = self.scan()
+        self.assertEqual([f.kind for f in found], ["email", "email"])  # author, committer
+        self.assertTrue(str(found[0].line).startswith("identity"))
+
+    def test_personal_and_noreply_identities_pass(self):
+        for email in ("me" + "@gmail.com", "12345+me@" "users.noreply.github.com",
+                      "dev@example.org"):
+            self.commit(email[:5], "ok", email=email)
+        self.assertEqual(self.scan()[1], [])
+
+    def test_denylist_covers_message_name_and_email(self):
+        self.commit("a", "about the zebra launch", author="Zed Quux",
+                    email="zq@" "gmail.com")
+        for term in ("word:zebra", "word:zed quux", "zq@gmail"):
+            _, found = self.scan([term])
+            self.assertGreaterEqual(len(found), 1, term)
+            self.assertNotIn(term.split(":")[-1], str(found[0]).lower())
+
+    def test_cli_commits_option_and_bad_range(self):
+        self.commit("a", f"mention {REAL_EMAIL}")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = pc.main(["--commits", f"{self.base}..HEAD",
+                            "--allowlist", str(self.repo / "none"),
+                            "--denylist", str(self.repo / "none")])
+        self.assertEqual(code, 1)
+        self.assertIn("1 commit(s), 1 finding(s)", out.getvalue())
+        with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(pc.main(["--commits", "nope..alsonope"]), 2)
 
 
 class RepoAllowlistTest(unittest.TestCase):
