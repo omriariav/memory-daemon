@@ -242,13 +242,14 @@ def rows_for(new, names, infos, now):
 
 
 def check(base_dir, lane, inbox, list_session, info_session, record,
-          now=None, suggest=None):
+          now=None, suggest=None, exclude=()):
     """List the owner's channels when due; record newly joined ones.
 
     `list_session(calls)` and `info_session(calls)` return one text (or None)
     per call; `info_session` may be None. `record(rows)` returns the number
     of lines written. `suggest(rows)`, when given, may flag rows before they
-    are recorded (see watch_joins.py). Returns the number of channel_joined
+    are recorded (see watch_joins.py). Rows of `exclude`d channels are
+    dropped before both. Returns the number of channel_joined
     lines recorded.
     A failed or incomplete listing changes nothing but the check time, so it
     is retried after `joined_check_minutes`; joins that could not be written
@@ -297,7 +298,12 @@ def check(base_dir, lane, inbox, list_session, info_session, record,
             info = parse_info(text, channel, names[channel][0])
             if info:
                 infos[channel] = info
-    rows = rows_for(ready, names, infos, now)
+    # Excluded channels are neither suggested nor recorded (one filter for
+    # both); they still count as seen, so they are not retried.
+    rows = [
+        r for r in rows_for(ready, names, infos, now)
+        if r["channel_id"] not in exclude
+    ]
     if suggest:
         try:
             suggest(rows)

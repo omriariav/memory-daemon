@@ -1780,6 +1780,16 @@ def _validate_slack_mcp(prefix, source):
             f"{prefix}.comms_inbox.all_dms needs all_dms: true (no other "
             "query lists every DM)"
         )
+    if inbox is not None and not inbox_problem and inbox.get("bot_text_users"):
+        if source.get("read_channel_tool") is None:
+            problems.append(
+                f"{prefix}.comms_inbox.bot_text_users needs read_channel_tool"
+            )
+        if inbox.get("all_dms") is not True:
+            problems.append(
+                f"{prefix}.comms_inbox.bot_text_users needs "
+                "comms_inbox.all_dms: true"
+            )
     reactions_tool = source.get("reactions_tool")
     if reactions_tool is not None and not (
         _read_only_tool(reactions_tool, "slack_get_reactions")
@@ -1811,6 +1821,8 @@ def _validate_slack_mcp(prefix, source):
     for key, pattern in (
         ("channels", slack_watch.CHANNEL_ID),
         ("owner_action_channels", slack_watch.CHANNEL_ID),
+        ("exclude_channels", slack_watch.CHANNEL_ID),
+        ("include_channels", slack_watch.CHANNEL_ID),
         ("people", slack_watch.USER_ID),
     ):
         values = source.get(key)
@@ -1870,6 +1882,8 @@ def _validate_slack_mcp(prefix, source):
         ("calls_per_session", 1, 20),
         ("min_seconds_between_searches", 0, 120),
         ("save_reaction_lookback_days", 1, 90), ("max_session_pages", 1, 10),
+        ("max_file_reads_per_run", 0, 50), ("file_scan_lookback_days", 1, 30),
+        ("file_scan_minutes", 1, 1440),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(

@@ -312,6 +312,41 @@ class CheckTest(Base):
         suggest(rows)
         self.assertIs(rows[0]["watch_suggested"], True)
 
+    def test_excluded_channels_are_filtered_once_for_suggest_and_record(self):
+        cfg = {
+            "comms_inbox": dict(INBOX, keep_days=14,
+                                suggest_watch=str(self.watch)),
+            "channels_tool": "mcp__x__slack_list_user_channels",
+            "channel_info_tool": None, "exclude_channels": [C],
+        }
+        with mock.patch.object(slack_mcp, "_base_dir", str(self.dir)), \
+                mock.patch.object(comms_joined, "check") as check:
+            slack_mcp._check_joined(cfg, NOW, LANE)
+        self.assertEqual(check.call_args.kwargs["exclude"], {C})
+        seen = {}
+
+        def record(rows):
+            seen["record"] = [r["channel_id"] for r in rows]
+            return len(rows)
+
+        def suggest(rows):
+            seen["suggest"] = [r["channel_id"] for r in rows]
+
+        def lister(ids, entries=()):
+            return lambda calls: [
+                ids_text(ids) if c["format"] == "ids_only"
+                else full_text(entries) for c in calls]
+
+        base = str(self.dir)
+        comms_joined.check(base, LANE, INBOX, lister([A]), None, record,
+                           NOW, suggest, exclude={C})
+        comms_joined.check(
+            base, LANE, INBOX,
+            lister([A, C], [("new-room", C, False)]), None, record,
+            NOW + 3600, suggest, exclude={C})
+        self.assertEqual(seen["record"], [])
+        self.assertEqual(seen["suggest"], [])
+
 
 class CliTest(Base):
     def run_cli(self, sources, action, channel=None):

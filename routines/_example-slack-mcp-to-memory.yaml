@@ -25,6 +25,10 @@
 #                 channel_types: [im, mpim]}
 # to merge a DM back and forth into one memory per conversation session
 # (needs `read_channel_tool` below; see "DM sessions" in the README).
+# Its `comms_inbox` block can also set
+#   watch_channels: [C0EXAMPLE02]   # record every top-level post by anyone
+#   bot_text_users: [U0EXAMPLED]    # an app whose DM text search returns empty
+# (see "Comms inbox" in the README; the latter needs `read_channel_tool`).
 id: example-slack-mcp-to-memory
 enabled: false
 description: Distill watched Slack threads and mentions into memory entries.
