@@ -25,10 +25,12 @@ Candidate identity has two layers:
   same memory.
 
 A meeting that also has a transcript capture (Mila, Whisper) of the same
-calendar event keeps both entries: the Zoom entry follows the transcript entry,
-through `--follows` at capture time or `memory link` when the transcript is
-captured later.
+calendar event keeps both entries. They are siblings, never a `follows` chain
+(`follows` means "supersedes"): the Zoom entry opens with a "Same meeting as
+<id>" line and the capture compares the two for conflicts. A transcript that
+arrives after the Zoom entry is not cross-referenced.
 """
+import ast
 import datetime
 import hashlib
 import json
@@ -50,11 +52,16 @@ DEFAULTS = {
     "max_summary_chars": 30000,
     "match_tolerance_minutes": 120,
     "skip_declined": True,
-    "link_transcripts": True,
+    "hub_docs": False,
+    "hub_search_tool": None,
+    "hub_content_tool": None,
     "stale_calendar_hours": 6,
 }
 # Keys only a zoom source may carry (validated, not global source keys).
-SOURCE_KEYS = set(DEFAULTS) | {"assets_tool", "calendar_file"}
+# `link_transcripts` is accepted and ignored (it used to add `--follows`).
+SOURCE_KEYS = set(DEFAULTS) | {"assets_tool", "calendar_file", "link_transcripts"}
+HUB_SEARCH_TOOL_NAME = "search"
+HUB_CONTENT_TOOL_NAMES = ("hub_get_file_content", "get_file_content")
 ASSETS_TOOL_NAME = "get_meeting_assets"
 STATE_FILE = "zoom-meetings.json"
 STATE_VERSION = 1
@@ -90,6 +97,8 @@ def settings(source):
     cfg.update({k: v for k, v in source.items() if k in DEFAULTS})
     cfg["assets_tool"] = source.get("assets_tool")
     cfg["calendar_file"] = source.get("calendar_file")
+    cfg["hub_search_tool"] = source.get("hub_search_tool")
+    cfg["hub_content_tool"] = source.get("hub_content_tool")
     return cfg
 
 
@@ -292,31 +301,6 @@ def transcript_entries(event_id):
     return transcript_index().get(event_id, []) if event_id else []
 
 
-def _link_transcripts(meetings, store, dry_run):
-    """Link captured Zoom entries to transcript entries captured after them."""
-    from . import memory_sink  # late import to avoid cycles
-    pending = {
-        event_id: record for event_id, record in meetings.items()
-        if record.get("status") == "captured" and record.get("memory_entry_id")
-    }
-    index = transcript_index() if pending else {}
-    for event_id, record in pending.items():
-        zoom_id = record["memory_entry_id"]
-        linked = record.setdefault("linked", [])
-        for entry_id in index.get(event_id, []):
-            if entry_id in linked or entry_id == zoom_id:
-                continue
-            if dry_run or not store:
-                log(f"zoom [dry-run] would link {zoom_id} --follows {entry_id}")
-                continue
-            r = memory_sink._cli(store, ["link", zoom_id, "--follows", entry_id])
-            if r.returncode == 0:
-                linked.append(entry_id)
-                log(f"zoom: linked {zoom_id} to transcript entry {entry_id}")
-            else:
-                log(f"zoom WARN link failed (exit {r.returncode}) for {zoom_id}")
-
-
 # --- assets ----------------------------------------------------------------------
 
 def _call_prompt(tool, calls):
@@ -440,6 +424,160 @@ def summary_of(assets, record, cfg):
     return text, "summary"
 
 
+# --- Hub Docs fallback -----------------------------------------------------------
+#
+# Some hosts save the AI summary as a Zoom Hub Doc (docs.zoom.us/doc/<id>)
+# instead of the meeting-summary asset. With `hub_docs: true`, a meeting whose
+# assets carry no readable summary is looked up in the workspace search by its
+# title, and a matching doc's markdown is used as the summary. The doc is
+# matched by exact (case-folded) name and, when the search result carries a
+# time, by that time lying in the meeting's window. Two or more matches are
+# refused, never guessed.
+
+_DOC_URL = re.compile(r"https?://[\w.-]*zoom[\w.-]*/doc/([A-Za-z0-9_-]{10,40})")
+_TIME_KEY = re.compile(r"time|date|modified|created|updated", re.IGNORECASE)
+_PY_STR = (
+    r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
+)
+_PY_STRS = rf"{_PY_STR}(?:\s+{_PY_STR})*"
+
+
+def _norm_title(value):
+    return " ".join(str(value or "").casefold().split())
+
+
+def _walk(value):
+    """Every dict nested anywhere in a parsed JSON value."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk(child)
+
+
+def hub_doc_matches(text, title, start, end, tolerance):
+    """Doc ids in a search result that plausibly are this meeting's summary.
+
+    `title` is compared by exact case-folded name. A hit that carries any ISO
+    timestamp must have one inside [start - tolerance, end + one day].
+    """
+    wanted = _norm_title(title)
+    if not wanted or not isinstance(text, str):
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    found = []
+    rows = list(_walk(data)) if data is not None else []
+    for row in rows:
+        blob = json.dumps(row, ensure_ascii=False)
+        m = _DOC_URL.search(blob)
+        doc_id = m.group(1) if m else None
+        if doc_id is None:
+            continue
+        names = [
+            v for k, v in row.items()
+            if isinstance(v, str) and re.search(
+                r"name|title", k, re.IGNORECASE)
+        ]
+        if not any(_norm_title(n) == wanted for n in names):
+            continue
+        stamps = [
+            _epoch(v) for k, v in row.items()
+            if isinstance(v, str) and _TIME_KEY.search(k)
+        ]
+        stamps = [t for t in stamps if t is not None]
+        if stamps and not any(
+            start - tolerance <= t <= end + 86400 for t in stamps
+        ):
+            continue
+        if doc_id not in found:
+            found.append(doc_id)
+    return found
+
+
+def parse_hub_content(text):
+    """Markdown of a Hub Doc from a tool result, or None.
+
+    The content tool can return a normal JSON object, or fail output-schema
+    validation on a missing `file_link` while the validation error still prints
+    the whole payload as a Python dict: read `file_content` out of either.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("file_content"), str):
+        return data["file_content"] or None
+    m = re.search(rf"['\"]file_content['\"]\s*:\s*({_PY_STRS})", text)
+    if not m:
+        return None
+    try:
+        value = ast.literal_eval(f"({m.group(1)})")
+    except (ValueError, SyntaxError):
+        return None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _call_one(cfg, tool, call):
+    """Result dict of one read-only call, or None when none came back."""
+    try:
+        results = claude_bridge.call_tools(
+            _call_prompt(tool, [call]),
+            {tool: {}},
+            model=cfg["model"],
+            base_dir=_base_dir,
+            max_turns=5,
+            max_budget_usd=0.15,
+            timeout=BRIDGE_TIMEOUT,
+            attempts=1,
+            accept_partial=True,
+            required=[],
+        )
+    except claude_bridge.BridgeError as exc:
+        if isinstance(exc, (claude_bridge.BridgeOutage,)
+                      + claude_bridge.GUARD_STOPS):
+            raise
+        log(f"zoom hub: {tool} failed: {type(exc).__name__}")
+        return None
+    for result in results:
+        if result["name"] == tool:
+            return result
+    return None
+
+
+def hub_summary(cfg, record):
+    """(markdown, doc id) of the meeting's Hub Doc, or (None, reason)."""
+    search_tool, content_tool = cfg["hub_search_tool"], cfg["hub_content_tool"]
+    start, end = _epoch(record.get("start")), _epoch(record.get("end"))
+    if not (search_tool and content_tool and start and end):
+        return None, "hub_unconfigured"
+    title = record.get("title")
+    result = _call_one(cfg, search_tool, {"query": title})
+    if result is None or result.get("is_error"):
+        return None, "hub_search_failed"
+    ids = hub_doc_matches(
+        result["text"], title, start, end,
+        cfg["match_tolerance_minutes"] * 60)
+    if not ids:
+        return None, "hub_no_match"
+    if len(ids) > 1:
+        return None, "hub_ambiguous"
+    doc = _call_one(
+        cfg, content_tool, {"fileId": ids[0], "format": "markdown"})
+    # A schema-validation error still carries the content: do not trust
+    # is_error here, parse the text.
+    text = parse_hub_content(doc["text"]) if doc else None
+    if text is None:
+        return None, "hub_unreadable"
+    return text, ids[0]
+
+
 def _interval(cfg, checks):
     minutes = cfg["first_check_minutes"] * (2 ** max(checks, 0))
     return min(minutes, cfg["max_interval_minutes"]) * 60
@@ -469,17 +607,12 @@ def candidates(source):
             if slack_mcp._already_done(processed, candidate_id):
                 record["status"] = "captured"
                 record["memory_entry_id"] = (entry or {}).get("memory_entry_id")
-                record.setdefault("linked", list(record.get("follows") or []))
         if record.get("status") == "tracking" and now > end + retry:
             record["status"] = "expired"
             log(f"zoom: no summary within {cfg['retry_hours']}h, dropping "
                 f"meeting {record.get('number')} ({record.get('last_result')})")
         if now > end + retry + TOMBSTONE_DAYS * 86400:
             meetings.pop(event_id)
-
-    if cfg["link_transcripts"]:
-        _link_transcripts(
-            meetings, source.get("_memory_store"), dry_run or count_only)
 
     due = sorted(
         (
@@ -512,17 +645,32 @@ def candidates(source):
         record["last_check"] = now
         record["next_check"] = now + _interval(cfg, record["checks"])
         text = texts.get(record["number"])
+        uuid = None
         if text is NO_ACCESS_RESULT:
             record["last_result"] = "no_access"
-            continue
-        assets = parse_assets(text)
-        if assets is None:
-            record["last_result"] = "error"
-            continue
-        text, reason = summary_of(assets, record, cfg)
-        record["last_result"] = reason
-        uuid = assets.get("meeting_uuid")
-        if text is None or not isinstance(uuid, str) or not uuid.strip():
+            text = None
+            assets = {}
+        else:
+            assets = parse_assets(text)
+            if assets is None:
+                record["last_result"] = "error"
+                continue
+            text, reason = summary_of(assets, record, cfg)
+            record["last_result"] = reason
+            uuid = assets.get("meeting_uuid")
+            if not (isinstance(uuid, str) and uuid.strip()):
+                text = None
+        if text is None and cfg["hub_docs"] and record["last_result"] in (
+            "no_access", "no_summary", "no_permission",
+        ):
+            text, doc_id = hub_summary(cfg, record)
+            if text is None:
+                record["last_result"] = f"{record['last_result']}+{doc_id}"
+            else:
+                uuid = f"doc-{doc_id}"
+                assets = dict(assets, topic=assets.get("topic") or record.get("title"))
+                record["last_result"] = "hub_doc"
+        if text is None:
             continue
         text = text.strip()
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
@@ -567,12 +715,7 @@ def fetch(_routine, source, candidate):
     cfg = settings(source)
     raw = candidate["raw"]
     record = raw["meeting"]
-    follows = transcript_entries(raw["event_id"]) if cfg["link_transcripts"] else []
-    if follows and _base_dir is not None:
-        meetings = load_state()
-        if raw["event_id"] in meetings:
-            meetings[raw["event_id"]]["follows"] = follows
-            save_state(meetings)
+    same_meeting = transcript_entries(raw["event_id"])
     return {
         "id": candidate["id"],
         "source_id": raw["source_id"],
@@ -592,6 +735,6 @@ def fetch(_routine, source, candidate):
             "calendar_event_start": record.get("start"),
             "calendar_event_end": record.get("end"),
             "source_people": list(record.get("people") or []),
-            "follows_entry_ids": follows,
+            "same_meeting_entry_ids": same_meeting,
         },
     }

@@ -1085,6 +1085,210 @@ def list_call(text, **over):
     return tool_call(LIST_TOOL, text, **given)
 
 
+FREEBUSY_TOOL = "mcp__example_calendar__get_free_busy"
+
+# Real get_free_busy output shape (primary calendar, 2026-11-04 .. 11-06).
+FREEBUSY_TEXT = """Free/Busy Information (2026-11-04T00:00:00Z to 2026-11-06T00:00:00Z):
+
+Calendar: primary
+  Busy Times:
+  1. 2026-11-04T07:30:00Z - 2026-11-04T07:45:00Z
+  2. 2026-11-04T08:30:00Z - 2026-11-04T09:15:00Z
+  3. 2026-11-04T09:30:00Z - 2026-11-04T10:30:00Z
+  4. 2026-11-04T11:00:00Z - 2026-11-04T11:30:00Z
+  5. 2026-11-04T12:00:00Z - 2026-11-04T13:00:00Z
+  6. 2026-11-04T13:30:00Z - 2026-11-04T15:00:00Z
+  7. 2026-11-04T15:30:00Z - 2026-11-04T15:35:00Z
+  8. 2026-11-04T17:00:00Z - 2026-11-04T21:00:00Z
+  9. 2026-11-05T07:00:00Z - 2026-11-05T08:00:00Z
+  10. 2026-11-05T08:10:00Z - 2026-11-05T10:30:00Z
+  11. 2026-11-05T10:45:00Z - 2026-11-05T12:30:00Z
+  12. 2026-11-05T12:40:00Z - 2026-11-05T13:00:00Z
+  13. 2026-11-05T14:00:00Z - 2026-11-05T16:30:00Z
+"""
+
+
+def utc(day, hour, minute=0):
+    return datetime.datetime(
+        2026, 10, day, hour, minute, tzinfo=datetime.timezone.utc
+    )
+
+
+def timed_event(start, end, event_id="e1"):
+    return {"event_id": event_id, "start": start, "end": end,
+            "all_day": False}
+
+
+class BusyFreeTest(unittest.TestCase):
+    WIN = (utc(20, 8, 30), utc(22, 8, 30))
+
+    def mark(self, events, busy):
+        calendar_cache.mark_show_as(events, busy, *self.WIN)
+        return [e["show_as"] for e in events]
+
+    def test_parse_busy_from_real_output(self):
+        busy = calendar_cache.parse_busy(FREEBUSY_TEXT)
+        self.assertEqual(len(busy), 13)
+        self.assertEqual(busy[0], (
+            datetime.datetime(2026, 11, 4, 7, 30, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2026, 11, 4, 7, 45, tzinfo=datetime.timezone.utc),
+        ))
+        self.assertEqual(busy[-1][1].hour, 16)
+
+    def test_parse_busy_empty_and_errors(self):
+        empty = ("Free/Busy Information (a to b):\n\nCalendar: primary\n"
+                 "  No busy times\n")
+        self.assertEqual(calendar_cache.parse_busy(empty), [])
+        with self.assertRaises(calendar_cache.CalendarParseError):
+            calendar_cache.parse_busy("Error: calendar not found")
+        with self.assertRaises(calendar_cache.CalendarParseError):
+            calendar_cache.parse_busy(
+                "Free/Busy Information (a to b):\nCalendar: primary\n"
+                "  Busy Times:\n  1. garbage\n")
+
+    def test_parse_busy_offset_timezone(self):
+        text = ("Free/Busy Information (a to b):\nCalendar: primary\n"
+                "  Busy Times:\n"
+                "  1. 2026-10-20T12:00:00+03:00 - 2026-10-20T13:00:00+03:00\n")
+        (start, end), = calendar_cache.parse_busy(text)
+        self.assertEqual(start, utc(20, 9))
+        self.assertEqual(end, utc(20, 10))
+
+    def test_full_cover_is_busy(self):
+        event = timed_event(utc(20, 9, 15), utc(20, 9, 45))
+        self.assertEqual(self.mark([event], [(utc(20, 9), utc(20, 10))]),
+                         ["busy"])
+
+    def test_partial_overlap_is_free(self):
+        event = timed_event(utc(20, 9, 30), utc(20, 10, 30))
+        self.assertEqual(self.mark([event], [(utc(20, 9), utc(20, 10))]),
+                         ["free"])
+
+    def test_no_busy_blocks_is_free(self):
+        self.assertEqual(self.mark([timed_event(utc(20, 9), utc(20, 10))], []),
+                         ["free"])
+
+    def test_adjacent_blocks_merge(self):
+        event = timed_event(utc(20, 9, 30), utc(20, 10, 30))
+        busy = [(utc(20, 10), utc(20, 11)), (utc(20, 9), utc(20, 10))]
+        self.assertEqual(self.mark([event], busy), ["busy"])
+        self.assertEqual(
+            calendar_cache.merge_busy(busy), [(utc(20, 9), utc(20, 11))])
+
+    def test_gap_between_blocks_is_free(self):
+        event = timed_event(utc(20, 9, 30), utc(20, 10, 30))
+        busy = [(utc(20, 9), utc(20, 10)), (utc(20, 10, 1), utc(20, 11))]
+        self.assertEqual(self.mark([event], busy), ["free"])
+
+    def test_event_timezone_does_not_matter(self):
+        local = ZoneInfo("Asia/Tokyo")
+        event = timed_event(utc(20, 9).astimezone(local),
+                            utc(20, 10).astimezone(local))
+        self.assertEqual(self.mark([event], [(utc(20, 9), utc(20, 10))]),
+                         ["busy"])
+
+    def test_all_day_has_no_marker(self):
+        event = {"event_id": "d", "all_day": True,
+                 "start": datetime.date(2026, 10, 20),
+                 "end": datetime.date(2026, 10, 21)}
+        self.assertEqual(self.mark([event], []), [None])
+
+    def test_event_running_past_window_is_cut_to_window(self):
+        event = timed_event(utc(22, 8), utc(22, 10))
+        self.assertEqual(
+            self.mark([event], [(utc(22, 8), utc(22, 8, 30))]), ["busy"])
+
+    def test_render_marker(self):
+        _, events = build()
+        text = calendar_cache.render_event(by_id(events, "vendor1"))
+        self.assertNotIn("| free", text)
+        row = json.loads(calendar_cache.render_json(
+            events, cfg(), NOW))["events"][0]
+        self.assertIsNone(row["show_as"])
+        event = dict(by_id(events, "vendor1"), show_as="free")
+        self.assertIn("| free", calendar_cache.render_event(event).split("\n")[0])
+        event["show_as"] = "busy"
+        self.assertNotIn("busy", calendar_cache.render_event(event))
+        self.assertNotIn("| free", calendar_cache.render_event(event))
+        payload = json.loads(calendar_cache.render_json([event], cfg(), NOW))
+        self.assertEqual(payload["events"][0]["show_as"], "busy")
+
+
+class BusyFreeRunTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        self.out = self.base / "cache" / "next48h.txt"
+        self.cfg = cfg(output=str(self.out), freebusy_tool=FREEBUSY_TOOL)
+
+    def results(self, busy_text):
+        fb = calendar_cache.freebusy_args(self.cfg, NOW)
+        return [list_call(LIST_TEXT),
+                tool_call(FREEBUSY_TOOL, busy_text, **fb)]
+
+    def run_cache(self, results):
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools", return_value=results,
+        ) as call:
+            calendar_cache.run(self.cfg, self.base, now=NOW)
+        return call
+
+    def shows(self):
+        data = json.loads(self.out.with_suffix(".json").read_text())
+        return {e["event_id"]: e["show_as"] for e in data["events"]}
+
+    def test_marks_events_and_pins_tool(self):
+        busy = ("Free/Busy Information (a to b):\n\nCalendar: primary\n"
+                "  Busy Times:\n"
+                "  1. 2026-10-20T09:00:00Z - 2026-10-20T10:00:00Z\n")
+        call = self.run_cache(self.results(busy))
+        tools = call.call_args.args[1]
+        self.assertEqual(tools[FREEBUSY_TOOL],
+                         calendar_cache.freebusy_args(self.cfg, NOW))
+        self.assertEqual(call.call_args.kwargs["required"], [LIST_TOOL])
+        self.assertIn(FREEBUSY_TOOL, call.call_args.args[0])
+        self.assertEqual(self.shows(), {
+            "1abcdefrecurring_20261020T090000Z": "busy",
+            "vendor1": "free",
+        })
+        text = self.out.read_text()
+        free_lines = [l for l in text.splitlines() if l.endswith("| free")]
+        self.assertEqual(len(free_lines), 1)
+        self.assertIn("Vendor demo", free_lines[0])
+        self.assertNotIn("| busy", text)
+
+    def test_missing_result_means_no_marker(self):
+        with mock.patch.object(calendar_cache, "log") as log:
+            self.run_cache([list_call(LIST_TEXT)])
+        self.assertTrue(all(v is None for v in self.shows().values()))
+        self.assertNotIn("| free", self.out.read_text())
+        self.assertTrue(any("WARN" in c.args[0] for c in log.call_args_list))
+
+    def test_unparseable_means_no_marker(self):
+        with mock.patch.object(calendar_cache, "log") as log:
+            self.run_cache(self.results("Error: quota exceeded"))
+        self.assertTrue(all(v is None for v in self.shows().values()))
+        self.assertNotIn("| free", self.out.read_text())
+        self.assertTrue(any("WARN" in c.args[0] for c in log.call_args_list))
+
+    def test_error_result_means_no_marker(self):
+        results = self.results(FREEBUSY_TEXT)
+        results[1]["is_error"] = True
+        self.run_cache(results)
+        self.assertTrue(all(v is None for v in self.shows().values()))
+
+    def test_off_without_config(self):
+        self.cfg.pop("freebusy_tool")
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools",
+            return_value=[list_call(LIST_TEXT)],
+        ) as call:
+            calendar_cache.run(self.cfg, self.base, now=NOW)
+        self.assertNotIn(FREEBUSY_TOOL, call.call_args.args[1])
+        self.assertTrue(all(v is None for v in self.shows().values()))
+
+
 class RunTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

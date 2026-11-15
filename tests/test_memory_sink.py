@@ -407,17 +407,105 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertNotIn("--follows", calls["args"])
         self.assertEqual(out["memory"], "created")
 
-    def test_source_supplied_follows_are_linked(self):
-        self.item["frontmatter"]["follows_entry_ids"] = [
+    def _same_meeting_item(self):
+        self.item["frontmatter"]["same_meeting_entry_ids"] = [
             "2026-10-01-transcript-entry", "Bad Id!", 7,
         ]
+
+    def test_same_meeting_entry_is_never_followed(self):
+        self._same_meeting_item()
         out, calls = self._run_capture(
             {"worthy": True, "type": "meeting", "title": "T",
              "people": [], "tags": ["x"], "follows": ["invented-entry"],
              "body": "b"})
-        idx = calls["args"].index("--follows")
-        self.assertEqual(calls["args"][idx + 1], "2026-10-01-transcript-entry")
+        self.assertNotIn("--follows", calls["args"])
         self.assertEqual(out["memory"], "created")
+
+    def test_same_meeting_cross_reference_line_opens_the_body(self):
+        self._same_meeting_item()
+        _, calls = self._run_capture(
+            {"worthy": True, "type": "meeting", "title": "T",
+             "people": [], "tags": ["x"], "follows": [], "body": "b"})
+        self.assertEqual(
+            calls["stdin"],
+            "Same meeting as 2026-10-01-transcript-entry (transcript "
+            "capture).\n\nb")
+
+    def test_no_cross_reference_without_a_same_meeting_entry(self):
+        _, calls = self._run_capture(
+            {"worthy": True, "type": "meeting", "title": "T",
+             "people": [], "tags": ["x"], "follows": [], "differs": ["x"],
+             "body": "b"})
+        self.assertEqual(calls["stdin"], "b")
+
+    def test_conflicts_are_appended_and_emitted_as_an_event(self):
+        self._same_meeting_item()
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            out, calls = self._run_capture(
+                {"worthy": True, "type": "meeting", "title": "T",
+                 "people": [], "tags": ["x"], "follows": [],
+                 "differs": ["Launch is Friday here, Monday there", "  ", 5],
+                 "body": "b"})
+        self.assertIn(
+            "Differs from 2026-10-01-transcript-entry:\n"
+            "- Launch is Friday here, Monday there", calls["stdin"])
+        self.assertNotIn("- 5", calls["stdin"])
+        diff = [c for c in emit.call_args_list if c.args[1] == "diff"]
+        self.assertEqual(len(diff), 1)
+        self.assertEqual(diff[0].args[2], "2026-07-27-t")
+        self.assertEqual(diff[0].kwargs["details"]["entry_ids"],
+                         ["2026-07-27-t", "2026-10-01-transcript-entry"])
+        self.assertEqual(diff[0].kwargs["details"]["differs"],
+                         ["Launch is Friday here, Monday there"])
+        self.assertEqual(out["memory"], "created")
+
+    def test_no_conflicts_means_no_section_and_no_event(self):
+        self._same_meeting_item()
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            _, calls = self._run_capture(
+                {"worthy": True, "type": "meeting", "title": "T",
+                 "people": [], "tags": ["x"], "follows": [],
+                 "differs": [], "body": "b"})
+        self.assertNotIn("Differs from", calls["stdin"])
+        self.assertFalse(
+            [c for c in emit.call_args_list if c.args[1] == "diff"])
+
+    def test_extraction_prompt_carries_the_earlier_entry_body(self):
+        self._same_meeting_item()
+        self.routine["memory"]["extract"] = True
+        seen = {}
+
+        def fake_analyze(routine, prompt, **kwargs):
+            seen["prompt"] = prompt
+            return json.dumps({
+                "worthy": True, "owner_attention": False, "type": "meeting",
+                "title": "T", "people": [], "tags": ["x"], "follows": [],
+                "differs": [], "body": "b"})
+
+        with mock.patch.object(memory_sink, "read_entry_body",
+                               return_value="Transcript says ship Friday."), \
+                mock.patch.object(llm, "analyze", side_effect=fake_analyze), \
+                mock.patch.object(memory_sink, "known_person_slugs",
+                                  return_value=set()):
+            memory_sink._extract(self.routine, self.item, "s", "/store")
+        self.assertIn("Transcript says ship Friday.", seen["prompt"])
+        self.assertIn('"differs"', seen["prompt"])
+
+    def test_extraction_prompt_has_no_diff_section_without_an_earlier_entry(self):
+        seen = {}
+
+        def fake_analyze(routine, prompt, **kwargs):
+            seen["prompt"] = prompt
+            return json.dumps({
+                "worthy": True, "owner_attention": False, "type": "note",
+                "title": "T", "people": [], "tags": ["x"], "follows": [],
+                "body": "b"})
+
+        with mock.patch.object(llm, "analyze", side_effect=fake_analyze), \
+                mock.patch.object(memory_sink, "known_person_slugs",
+                                  return_value=set()):
+            memory_sink._extract(self.routine, self.item, "s", "/store")
+        self.assertNotIn('"differs"', seen["prompt"])
 
     def _run_refused_capture(self, item_id, refusal_source="slack:C1:1.0",
                              follows=None):
@@ -436,9 +524,18 @@ class CaptureValidationTest(unittest.TestCase):
                 )
             return FakeResult("✓ created 2026-07-27-outcome\n")
 
+        extraction = None
         if follows:
-            self.item["frontmatter"]["follows_entry_ids"] = follows
-        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+            self.item["frontmatter"]["related_memory_entries"] = [
+                {"id": value, "type": "todo", "date": "2026-07-01",
+                 "title": "t"} for value in follows]
+            self.routine["memory"]["extract"] = True
+            extraction = {"worthy": True, "type": "note", "title": "T",
+                          "people": [], "tags": ["x"], "follows": follows,
+                          "body": "b"}
+        with mock.patch.object(memory_sink, "_extract",
+                               return_value=extraction), \
+                mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
                 mock.patch.object(memory_sink, "_authenticated_identity",
                                   return_value={"email": None, "person": None,
                                                 "safe": False}), \
@@ -1618,6 +1715,90 @@ class CaptureEventsTest(unittest.TestCase):
 
     def test_dry_run_emits_nothing(self):
         self.assertEqual(self._capture(dry_run=True), [])
+
+
+class CanonicalPersonTest(unittest.TestCase):
+    """A slug minted from a display name maps onto the store's own slug."""
+
+    def setUp(self):
+        memory_sink._slug_cache.clear()
+        memory_sink._alias_memo.clear()
+        memory_sink._slug_cache["/store"] = {"kay-example", "sam-sample"}
+        self.person = {"email": "kaylee@example.com", "name": "Kaylee Example",
+                       "slug": "kaylee-example", "resource_name": "people/1"}
+        self.routine = {"id": "r", "memory": {"store": "/store"}}
+
+    def canon(self, out, routine=None):
+        with mock.patch.object(memory_sink, "_cli",
+                               return_value=out) as cli, \
+                mock.patch.object(memory_sink, "log"):
+            got = memory_sink._canonical_person(
+                routine or self.routine, "/store", dict(self.person))
+        return got, cli
+
+    def test_alias_maps_to_the_existing_slug(self):
+        got, cli = self.canon(FakeResult(
+            "kay-example  (resolved from 'Kaylee Example' via alias)\n"
+            "  no profile\n  3 entries, last 2026-11-01\n"))
+        self.assertEqual(got["slug"], "kay-example")
+        self.assertEqual(got["email"], "kaylee@example.com")
+        cli.assert_called_once_with(
+            "/store", ["people", "show", "Kaylee Example"], timeout=30)
+
+    def test_existing_slug_is_kept_without_a_lookup(self):
+        self.person["slug"] = "sam-sample"
+        got, cli = self.canon(FakeResult(""))
+        self.assertEqual(got["slug"], "sam-sample")
+        cli.assert_not_called()
+
+    def test_no_match_or_failure_keeps_the_minted_slug(self):
+        for result in (FakeResult("", returncode=1),
+                       FakeResult("kay-example\n  x\n")):
+            memory_sink._alias_memo.clear()
+            got, _ = self.canon(result)
+            self.assertEqual(got["slug"], "kaylee-example")
+
+    def test_fuzzy_and_unknown_targets_are_not_trusted(self):
+        for out in ("kay-exampl  (resolved from 'x' via fuzzy)\n",
+                    "ghost-person  (resolved from 'x' via alias)\n"):
+            memory_sink._alias_memo.clear()
+            got, _ = self.canon(FakeResult(out))
+            self.assertEqual(got["slug"], "kaylee-example")
+
+    def test_lookup_can_be_switched_off(self):
+        self.routine["memory"]["person_alias_lookup"] = False
+        got, cli = self.canon(FakeResult(""))
+        self.assertEqual(got["slug"], "kaylee-example")
+        cli.assert_not_called()
+
+    def test_resolver_hook_is_tried_first(self):
+        self.routine["memory"]["person_alias_lookup"] = False
+        with mock.patch.object(memory_sink.person_resolver, "configured",
+                               return_value=["/x"]), \
+                mock.patch.object(memory_sink.person_resolver, "canonicalize",
+                                  return_value=["kay-example"]):
+            got, _ = self.canon(FakeResult(""))
+        self.assertEqual(got["slug"], "kay-example")
+
+    def test_verified_source_people_use_the_mapping(self):
+        item = {"frontmatter": {"source_people": [
+            {"email": "kaylee@example.com", "name": "Kaylee Example"}]}}
+        identity = {"email": "me@example.com", "safe": True,
+                    "person": {"email": "me@example.com", "name": "Me",
+                               "slug": "me", "resource_name": "people/me"}}
+        provider = mock.Mock()
+        provider.resolve_email.return_value = dict(self.person)
+        people, unresolved = memory_sink._verified_source_people(
+            item, "r", identity, provider,
+            canon=lambda p: dict(p, slug="kay-example"))
+        self.assertEqual([p["slug"] for p in people], ["kay-example"])
+        self.assertEqual(unresolved, [])
+
+    def test_config_validation_rejects_a_non_bool(self):
+        problems = memory_sink.validate(
+            {"id": "r", "memory": {"store": "/store",
+                                   "person_alias_lookup": "yes"}})
+        self.assertTrue(any("person_alias_lookup" in x for x in problems))
 
 
 if __name__ == "__main__":

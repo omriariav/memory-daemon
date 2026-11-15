@@ -9,7 +9,9 @@
 #
 # Memory source id: zoom:<meeting uuid>, so a changed summary updates in place.
 # When a transcript routine (mila, whisper) captured the same calendar event,
-# the Zoom entry is kept separate and linked to follow it.
+# both entries are kept, never linked with follows. The Zoom entry opens with
+# "Same meeting as <id>" and lists conflicts under "Differs from <id>:"
+# (also a `diff` event in state/events.jsonl).
 id: example-zoom-to-memory
 enabled: false
 description: Capture shared Zoom meeting summaries.
@@ -32,7 +34,12 @@ source:
   match_tolerance_minutes: 120 # a recurring number must answer for this occurrence
   max_summary_chars: 30000
   skip_declined: true
-  link_transcripts: true
+  # Optional: when the assets carry no summary, look for a Zoom Hub Doc
+  # (docs.zoom.us/doc/<id>) with the meeting's exact title and use it instead.
+  # The source id is then zoom:doc-<doc id>.
+  hub_docs: false
+  # hub_search_tool: mcp__<server>__search
+  # hub_content_tool: mcp__<server>__hub_get_file_content
 
 analyze:
   provider: claude

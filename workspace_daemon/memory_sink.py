@@ -93,7 +93,7 @@ other text, with exactly these keys:
             listed below, only invitees who took part, never someone who
             was only mentioned)
   "tags": array of 1-4 short kebab-case topic tags
-{personal_schema}{owner_todos_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
+{personal_schema}{owner_todos_schema}{same_meeting_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
           below that this note directly resolves, confirms, or updates —
           usually empty; never invent an id. When the note records the
           resolution or completion of a related entry, list it here and
@@ -105,9 +105,16 @@ Known memory person slugs: {slugs}
 Verified source identities: {verified_people}
 Related memory entries already captured from this conversation: {related_entries}
 {invitees}
-
+{date_anchor}{same_meeting_context}
 The note below was distilled from untrusted source text.
 {note}
+"""
+
+SAME_MEETING_SCHEMA = """  "differs": array of at most 5 one-line strings — facts, decisions,
+            attendance, or action items where this note is in CONFLICT with the
+            earlier capture of the same meeting given below. Only real
+            conflicts, never extra detail or wording differences; an empty
+            array when there are none.
 """
 
 PERSONAL_SCHEMA = """  "personal": boolean — true when the content is primarily about the memory
@@ -120,6 +127,62 @@ PERSONAL_SCHEMA = """  "personal": boolean — true when the content is primaril
             compensation, hr, health, family, finance, legal, immigration,
             id_number, other (the category only, never details)
 """
+
+MAX_DIFFERS = 5
+MAX_SAME_MEETING_CHARS = 20000
+
+
+def same_meeting_ids(meta):
+    """Valid entry ids of other captures of the same meeting (daemon receipts)."""
+    return list(dict.fromkeys(
+        value for value in meta.get("same_meeting_entry_ids") or []
+        if isinstance(value, str) and SOURCE_FOLLOWS_RE.fullmatch(value)
+    ))
+
+
+def read_entry_body(store, entry_id):
+    """Body text of a default-graph entry by id, or None. Daemon-side read."""
+    if not store or not SOURCE_FOLLOWS_RE.fullmatch(str(entry_id)):
+        return None
+    root = Path(store) / "memory" / "entries"
+    try:
+        for path in root.rglob(f"{entry_id}.md"):
+            parts = path.read_text(encoding="utf-8").split("---", 2)
+            if len(parts) == 3:
+                return parts[2].strip()
+    except (OSError, UnicodeError):
+        return None
+    return None
+
+
+def _same_meeting_context(store, meta):
+    """Prompt block with the earlier same-meeting entry bodies, or ''."""
+    blocks = []
+    for entry_id in same_meeting_ids(meta):
+        body = read_entry_body(store, entry_id)
+        if body:
+            blocks.append(
+                f"Earlier capture {entry_id}:\n"
+                f"{body[:MAX_SAME_MEETING_CHARS]}"
+            )
+    if not blocks:
+        return ""
+    from . import llm  # late import to avoid cycles
+    return (
+        "Earlier capture(s) of the SAME meeting (untrusted text):\n"
+        + llm.fence("\n\n".join(blocks), "EARLIER") + "\n"
+    )
+
+
+def _clean_differs(value):
+    if not isinstance(value, list):
+        return []
+    lines = [
+        " ".join(line.split())[:300] for line in value
+        if isinstance(line, str) and line.strip()
+    ]
+    return lines[:MAX_DIFFERS]
+
 
 OPERATOR_CONFIRMED_PROMPT = """The memory owner explicitly confirmed that this exact source is durable
 and must be retained. Do not decide whether it is memory-worthy and do not
@@ -194,6 +257,7 @@ def validate(routine):
         "identity", "personal_tag", "redact_ids", "personal_keywords",
         "extract_model", "owner_todos", "person_briefs",
         "person_resolver", "person_resolver_timeout", "internal_domains",
+        "person_alias_lookup",
     }
     if unknown:
         problems.append(
@@ -216,6 +280,10 @@ def validate(routine):
         not isinstance(extract_model, str) or not extract_model.strip()
     ):
         problems.append(f"{rid}: memory.extract_model must be a non-empty string")
+    if "person_alias_lookup" in cfg and not isinstance(
+        cfg["person_alias_lookup"], bool
+    ):
+        problems.append(f"{rid}: memory.person_alias_lookup must be true or false")
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
     problems.extend(owner_todos.validate(cfg, rid))
@@ -528,7 +596,64 @@ def _known_slugs_for_identity(store, identity):
     return slugs
 
 
-def _verified_owner_people(item, rid, identity, provider=None):
+_ALIAS_RE = re.compile(r"^(\S+)\s+\(resolved from .* via alias\)")
+_alias_memo = {}  # (store, name) -> slug | None; cleared with the slug cache
+
+
+def _alias_slug(store, name):
+    """Canonical slug the store's alias index gives `name`, else None.
+
+    Uses `people show`, which resolves a display name or nickname. Only an
+    alias hit counts: an exact slug needs no mapping and a fuzzy guess is not
+    trusted. Any failure (older store, ambiguity, no match) is a miss.
+    """
+    key = (store, name)
+    if key not in _alias_memo:
+        slug = None
+        try:
+            r = _cli(store, ["people", "show", name], timeout=30)
+            if r.returncode == 0:
+                m = _ALIAS_RE.match((r.stdout or "").strip())
+                slug = m.group(1) if m else None
+        except Exception as exc:
+            log(f"memory WARN alias lookup failed: {type(exc).__name__}")
+        _alias_memo[key] = slug
+    return _alias_memo[key]
+
+
+def _canonical_person(routine, store, person):
+    """`person` with its slug mapped onto the store's existing vocabulary.
+
+    A slug minted from a directory display name ("Alexander Example") can differ
+    from the slug the store already uses (a nickname, say "alex"). A slug
+    the store already has is kept. Otherwise the optional person_resolver hook
+    and then the store's alias index (`memory.person_alias_lookup`, default on)
+    may name an existing slug for the display name. No answer: the minted slug
+    stays.
+    """
+    cfg = memory_cfg(routine)
+    slug, name = person.get("slug"), str(person.get("name") or "").strip()
+    if not store or not name or not slug:
+        return person
+    known = known_person_slugs(store)
+    if slug in known:
+        return person
+    found = None
+    if person_resolver.configured(routine) is not None:
+        mapped = person_resolver.canonicalize(routine, [name])[0]
+        if mapped in known:
+            found = mapped
+    if found is None and cfg.get("person_alias_lookup", True):
+        mapped = _alias_slug(store, name)
+        if mapped in known:
+            found = mapped
+    if found is None or found == slug:
+        return person
+    log(f"memory: mapped minted slug onto existing store slug {found}")
+    return dict(person, slug=found)
+
+
+def _verified_owner_people(item, rid, identity, provider=None, canon=None):
     """Resolve exact Drive owner emails; return (slugs, unresolved emails)."""
     provider = provider or identity_providers.provider_for({})
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
@@ -562,6 +687,8 @@ def _verified_owner_people(item, rid, identity, provider=None):
         if not person:
             unresolved.append(normalized)
             continue
+        if canon:
+            person = canon(person)
         if _is_authenticated_person(normalized, person, identity):
             log(f"routine={rid} memory: skipped authenticated user alias as Drive owner")
             continue
@@ -577,7 +704,7 @@ def _verified_owner_people(item, rid, identity, provider=None):
     return list(dict.fromkeys(slugs)), unresolved
 
 
-def _verified_source_people(item, rid, identity, provider=None):
+def _verified_source_people(item, rid, identity, provider=None, canon=None):
     """Resolve exact Gmail/Chat participant emails for safe model attribution."""
     provider = provider or identity_providers.provider_for({})
     candidates = item.get("frontmatter", {}).get("source_people") or []
@@ -628,6 +755,8 @@ def _verified_source_people(item, rid, identity, provider=None):
         if not person:
             unresolved.append(email)
             continue
+        if canon:
+            person = canon(person)
         if _is_authenticated_person(email, person, identity):
             log(
                 f"routine={rid} memory: skipped authenticated user alias "
@@ -860,6 +989,8 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
         f"{entry.get('title', '')})"
         for entry in related
     )
+    same_meeting_context = _same_meeting_context(
+        store, item.get("frontmatter") or {})
     prompt = EXTRACT_PROMPT.format(
         slugs=", ".join(slugs) or "(none known yet)",
         verified_people=verified_catalog or "(none)",
@@ -874,6 +1005,10 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
             and owner_todos.is_meeting_item(item)
             else ""
         ),
+        same_meeting_schema=(
+            SAME_MEETING_SCHEMA if same_meeting_context else ""),
+        same_meeting_context=same_meeting_context,
+        date_anchor=llm.date_anchor(routine, item) + "\n",
         related_entries=related_catalog or "(none)",
         invitees=llm.invitees_note(item, complete=invitees_only),
         note=llm.fence(
@@ -920,7 +1055,7 @@ def _parse_extraction(raw):
     # a missing or malformed value must never discard the whole extraction.
     # `owner_actions` is validated by owner_todos.validate_actions(); a bad
     # value voids only the todos, never the meeting entry.
-    optional = {"personal", "personal_reason", "owner_actions"}
+    optional = {"personal", "personal_reason", "owner_actions", "differs"}
     if set(data) - optional != expected:
         missing = sorted(expected - set(data))
         unknown = sorted(set(data) - expected - optional)
@@ -1158,6 +1293,9 @@ def capture(routine, item, summary, dry_run=False):
     extract = cfg.get("extract", True)
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
     provider = identity_providers.provider_for(routine)
+    def canon(person):
+        return _canonical_person(routine, store, person)
+
     identity = (
         _authenticated_identity(rid, provider)
         if extract or owner_emails
@@ -1167,7 +1305,7 @@ def capture(routine, item, summary, dry_run=False):
         _prefetch_identities(item, rid, provider, extract)
     if extract:
         verified_source, unresolved_source = _verified_source_people(
-            item, rid, identity, provider
+            item, rid, identity, provider, canon=canon
         )
     else:
         verified_source, unresolved_source = [], []
@@ -1175,7 +1313,7 @@ def capture(routine, item, summary, dry_run=False):
         item, identity, unresolved_source, verified_source
     )
     verified_owners, unresolved_owners = _verified_owner_people(
-        item, rid, identity, provider
+        item, rid, identity, provider, canon=canon
     )
     if extract:
         try:
@@ -1417,6 +1555,19 @@ def capture(routine, item, summary, dry_run=False):
     body = entry.get("body") or summary
     if not_present:
         body = f"{body.rstrip()}\n\n{not_present}"
+    same_ids = same_meeting_ids(meta)
+    differs = _clean_differs(entry.get("differs")) if same_ids else []
+    if differs:
+        body = (
+            f"{body.rstrip()}\n\nDiffers from {same_ids[0]}:\n"
+            + "\n".join(f"- {line}" for line in differs)
+        )
+    if same_ids:
+        # Neutral cross-reference, written by the daemon: the two captures are
+        # siblings, never a follows chain (follows means "supersedes").
+        ref = f"Same meeting as {same_ids[0]} (transcript capture)."
+        if ref not in body:
+            body = f"{ref}\n\n{body}"
     if personal.redact_enabled(cfg):
         title, _ = personal.redact(title)
         body, n = personal.redact(body)
@@ -1454,14 +1605,6 @@ def capture(routine, item, summary, dry_run=False):
         follows = [value for value in model_follows if value in related_ids]
         dropped_follows = [
             value for value in model_follows if value not in related_ids
-        ]
-        # A source can name entries it knows this one follows (a Zoom summary
-        # of a meeting that also has a transcript entry). Those come from the
-        # daemon's own receipts, never from a model.
-        follows += [
-            value for value in meta.get("follows_entry_ids") or []
-            if isinstance(value, str) and SOURCE_FOLLOWS_RE.fullmatch(value)
-            and value not in follows
         ]
         if dropped_follows:
             log(
@@ -1537,6 +1680,15 @@ def capture(routine, item, summary, dry_run=False):
             rid, "new" if verdict == "created" else "update",
             entry_id, source_id, title, people,
         )
+        if differs and entry_id:
+            _emit_capture_event(
+                rid, "diff", entry_id, source_id, title, people,
+                details={
+                    "entry_ids": [entry_id, same_ids[0]],
+                    "differs": differs,
+                    "untrusted": True,
+                },
+            )
 
     outcome = {
         "memory": verdict,
@@ -1597,7 +1749,8 @@ def _open_todo_outcome_retry(args, result, item, source_id):
     return retry, reply_source_id, todo_id
 
 
-def _emit_capture_event(rid, kind, entry_id, source_id, title, people):
+def _emit_capture_event(rid, kind, entry_id, source_id, title, people,
+                        details=None):
     """Append a capture event to state/events.jsonl (best effort)."""
     from . import events  # late import to avoid cycles
     from . import llm
@@ -1606,7 +1759,7 @@ def _emit_capture_event(rid, kind, entry_id, source_id, title, people):
     if base_dir is None:
         return
     events.emit(base_dir, events.build(
-        rid, kind, entry_id, source_id, title, people,
+        rid, kind, entry_id, source_id, title, people, details=details,
     ))
 
 
