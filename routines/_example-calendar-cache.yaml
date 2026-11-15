@@ -53,6 +53,9 @@ maintenance:
   model: haiku
   list_tool: mcp__claude_ai_Example_Calendar__list_events
   get_tool: mcp__claude_ai_Example_Calendar__get_event
+  # Optional: one free/busy call per run marks timed events busy or free
+  # (free = the owner set "Show as: Free"). Omit to turn it off.
+  freebusy_tool: mcp__claude_ai_Example_Calendar__get_free_busy
   max_events: 50
   # get_event lookups per run (soonest events first).
   max_details: 20

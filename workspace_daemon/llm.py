@@ -1,6 +1,8 @@
 """LLM analysis over the `yoetz` CLI, plus label extraction/validation."""
+import datetime
 import re
 import secrets
+import zoneinfo
 
 from .connector_prompts import resolve_instruction
 from . import claude_bridge, personal
@@ -278,6 +280,52 @@ def fence(text, label="SOURCE"):
     )
 
 
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+
+
+def routine_zone(routine):
+    """The routine's IANA timezone (a source's calendar_timezone, else a
+    routine `timezone`), or None for the machine's local time."""
+    names = [routine.get("timezone")] + [
+        source.get("calendar_timezone")
+        for source in routine.get("sources") or [routine.get("source") or {}]
+        if isinstance(source, dict)
+    ]
+    for name in names:
+        if isinstance(name, str) and name:
+            try:
+                return zoneinfo.ZoneInfo(name)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+                continue
+    return None
+
+
+def date_anchor(routine, item, today=None):
+    """Prompt block naming the meeting date's weekday and the next 7 days.
+
+    Models mis-count weekdays ("Thursday" written as the 6th when it is the
+    5th), so every relative day must be resolved from this table. A missing or
+    malformed item date falls back to today in the routine's timezone.
+    """
+    try:
+        day = datetime.date.fromisoformat(str((item or {}).get("date") or "")[:10])
+    except ValueError:
+        day = today or datetime.datetime.now(routine_zone(routine)).date()
+    rows = "\n".join(
+        f"{_WEEKDAYS[d.weekday()][:3]} {d.isoformat()}"
+        for d in (day + datetime.timedelta(days=n) for n in range(1, 8))
+    )
+    return (
+        f"Date reference: the source is dated {_WEEKDAYS[day.weekday()]} "
+        f"{day.isoformat()}.\nThe next 7 days are:\n{rows}\n"
+        "Resolve every relative day or date in the text (\"Thursday\", "
+        "\"tomorrow\", \"next week\", \"by Friday\") ONLY from this table, "
+        "and write dates as YYYY-MM-DD. Never count weekdays yourself; when "
+        "the day is not in the table, keep the original wording.\n"
+    )
+
+
 def build_prompt(routine, item, label_catalog):
     """Assemble the analysis prompt. Label catalog is only injected when asked for."""
     analyze = routine["analyze"]
@@ -297,6 +345,7 @@ def build_prompt(routine, item, label_catalog):
     note = invitees_note(item)
     if note:
         parts.append("\n" + note)
+    parts.append("\n" + date_anchor(routine, item))
 
     if analyze.get("pick_label") and label_catalog:
         labels_block = "\n".join(f"- {name}" for name in label_catalog)

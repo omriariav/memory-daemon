@@ -47,7 +47,7 @@ MAINTENANCE_ALLOWED_KEYS = {
         "internal_domains", "output", "skip_titles", "max_attendee_names",
         "model", "list_tool", "get_tool", "max_events", "max_details",
         "stale_after", "conference_hosts", "events_window_days",
-        "invite_lookahead_days",
+        "invite_lookahead_days", "freebusy_tool",
     },
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
@@ -1579,6 +1579,19 @@ def _validate_calendar_cache(rid, cfg):
     owner = cfg.get("owner_email")
     if _non_empty_str(owner) and not re.fullmatch(r"[^@\s]+@[^@\s]+", owner):
         problems.append(f"{rid}: maintenance.owner_email must be an email address")
+    if "freebusy_tool" in cfg:
+        value = cfg["freebusy_tool"]
+        if not (_non_empty_str(value)
+                and re.fullmatch(r"mcp__[A-Za-z0-9_-]+", value)):
+            problems.append(
+                f"{rid}: maintenance.freebusy_tool must be an exact MCP tool "
+                "name (mcp__<server>__<tool>)"
+            )
+        elif value in (cfg.get("list_tool"), cfg.get("get_tool")):
+            problems.append(
+                f"{rid}: maintenance.freebusy_tool must differ from "
+                "list_tool and get_tool"
+            )
     for key in ("list_tool", "get_tool"):
         value = cfg.get(key)
         if _non_empty_str(value) and not re.fullmatch(r"mcp__[A-Za-z0-9_-]+", value):
@@ -2077,9 +2090,25 @@ def _validate_zoom(prefix, source):
         or not all(_non_empty_str(h) for h in hosts)
     ):
         problems.append(f"{prefix}.conference_hosts must be a list of hosts")
-    for key in ("skip_declined", "link_transcripts"):
+    for key in ("skip_declined", "link_transcripts", "hub_docs"):
         if key in source and not isinstance(source[key], bool):
             problems.append(f"{prefix}.{key} must be true or false")
+    if source.get("hub_docs") is True:
+        if not _exact_tool(
+            source.get("hub_search_tool"), zoom_source.HUB_SEARCH_TOOL_NAME
+        ):
+            problems.append(
+                f"{prefix}.hub_search_tool must be the exact read-only MCP "
+                f"tool mcp__<server>__{zoom_source.HUB_SEARCH_TOOL_NAME} "
+                "when hub_docs is true")
+        if not any(
+            _exact_tool(source.get("hub_content_tool"), name)
+            for name in zoom_source.HUB_CONTENT_TOOL_NAMES
+        ):
+            problems.append(
+                f"{prefix}.hub_content_tool must be the exact read-only MCP "
+                "tool mcp__<server>__hub_get_file_content (or "
+                "get_file_content) when hub_docs is true")
     if "model" in source and not _non_empty_str(source["model"]):
         problems.append(f"{prefix}.model must be a non-empty string")
     for key in ("query", "max_results"):

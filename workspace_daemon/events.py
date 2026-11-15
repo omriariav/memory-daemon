@@ -21,6 +21,9 @@ on update or `{"changed": {attendee: [old, new]}}` on rsvp (keyed by name,
 or by email when the name is empty or shared), `"instances"` (every
 instance id) when one event stands for several instances of a series, and
 `"untrusted": true` (titles and names are written by others).
+`kind` "diff" (source of the captured entry, e.g. zoom) means a capture of the
+same meeting disagrees with an earlier one: `details` is
+`{"entry_ids": [new, earlier], "differs": [one line each], "untrusted": true}`.
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
 `state/events.lock`. The file is rotated to `events.jsonl.1` (one

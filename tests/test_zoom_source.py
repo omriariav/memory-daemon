@@ -288,7 +288,8 @@ class ZoomSourceTest(unittest.TestCase):
         meta = item["frontmatter"]
         self.assertEqual(meta["calendar_event_id"], "ev1")
         self.assertEqual(len(meta["source_people"]), 2)
-        self.assertEqual(meta["follows_entry_ids"], [])
+        self.assertEqual(meta["same_meeting_entry_ids"], [])
+        self.assertNotIn("follows_entry_ids", meta)
 
         # Not settled yet (a failed capture): offered again next run.
         self.source["_processed"] = {
@@ -315,7 +316,7 @@ class ZoomSourceTest(unittest.TestCase):
             "memory": "created", "memory_entry_id": entry_id,
         }))
 
-    def test_transcript_captured_first_is_followed(self):
+    def test_transcript_captured_first_is_cross_referenced_not_followed(self):
         self.write_receipt("ev1", "2026-07-01-transcript")
         self.write_receipt("ev9", "2026-07-01-other", name="mila-y")
         self.write_calendar([event()])
@@ -324,10 +325,11 @@ class ZoomSourceTest(unittest.TestCase):
         self.at(41)
         candidate = self.listing()[0]
         item = zoom_source.fetch({}, self.source, candidate)
-        self.assertEqual(item["frontmatter"]["follows_entry_ids"],
+        self.assertEqual(item["frontmatter"]["same_meeting_entry_ids"],
                          ["2026-07-01-transcript"])
+        self.assertNotIn("follows_entry_ids", item["frontmatter"])
 
-    def test_transcript_captured_later_is_linked_once(self):
+    def test_transcript_captured_later_is_never_linked(self):
         self.write_calendar([event()])
         self.listing()
         self.connector.answers["91234567890"] = assets()
@@ -340,16 +342,10 @@ class ZoomSourceTest(unittest.TestCase):
         self.at(45)
         self.listing()
         self.write_receipt("ev1", "2026-07-01-transcript")
-        result = mock.Mock(returncode=0, stdout="", stderr="")
-        with mock.patch.object(memory_sink, "_cli",
-                               return_value=result) as cli:
+        with mock.patch.object(memory_sink, "_cli") as cli:
             self.at(90)
             self.listing()
-            self.at(120)
-            self.listing()
-        cli.assert_called_once_with(
-            "/store", ["link", "2026-07-01-zoom", "--follows",
-                       "2026-07-01-transcript"])
+        cli.assert_not_called()
 
     def test_dry_run_calls_nothing_and_writes_nothing(self):
         self.write_calendar([event()])
@@ -373,6 +369,190 @@ class ZoomSourceTest(unittest.TestCase):
         self.assertEqual(self.meetings(), {})
 
 
+SEARCH_TOOL = "mcp__example_zoom__search"
+CONTENT_TOOL = "mcp__example_zoom__hub_get_file_content"
+DOC_ID = "AbCdEfGhIjKlMnOpQrStUv"
+DOC_BODY = (
+    "## Quick recap\n\nThe team agreed to ship Friday. Ann's plan won.\n\n"
+    "## Next steps\n\n- Bob: draft the \"launch\" note.\n" * 6)
+
+
+def error_payload(content, name="Weekly sync"):
+    """The schema-validation error text that still carries the content."""
+    import pprint
+    body = pprint.pformat({"file_content": content, "file_name": name},
+                          width=60)
+    return ("Invalid structured content returned by tool get_file_content: "
+            "'file_link' is a required property\n\nOn instance:\n" + body)
+
+
+def search_result(name="Weekly sync", when=None, doc_id=DOC_ID):
+    row = {"name": name, "url": f"https://docs.example.zoom.us/doc/{doc_id}"}
+    if when:
+        row["modified_time"] = when
+    return json.dumps({"data": [row], "has_more": False})
+
+
+class HubParsingTest(unittest.TestCase):
+    def test_content_from_plain_json(self):
+        text = json.dumps({"file_content": "Hello", "file_link": "x",
+                           "file_name": "n"})
+        self.assertEqual(zoom_source.parse_hub_content(text), "Hello")
+
+    def test_content_from_the_validation_error_payload(self):
+        got = zoom_source.parse_hub_content(error_payload(DOC_BODY))
+        self.assertEqual(got, DOC_BODY)
+
+    def test_unreadable_results_are_none(self):
+        for text in ("", "timed out", '{"file_content": ""}', None,
+                     "'file_content': 12"):
+            self.assertIsNone(zoom_source.parse_hub_content(text))
+
+    def test_match_by_exact_title_and_time_window(self):
+        start = T0.timestamp()
+        end = start + 1800
+        inside = search_result(when=iso(T0 + datetime.timedelta(minutes=40)))
+        stale = search_result(when=iso(T0 - datetime.timedelta(days=7)))
+        match = zoom_source.hub_doc_matches
+        self.assertEqual(match(inside, "weekly  SYNC", start, end, 7200),
+                         [DOC_ID])
+        self.assertEqual(match(stale, "Weekly sync", start, end, 7200), [])
+        self.assertEqual(
+            match(search_result("Other"), "Weekly sync", start, end, 7200), [])
+        self.assertEqual(
+            match(search_result(), "Weekly sync", start, end, 7200), [DOC_ID])
+        self.assertEqual(match("not json", "Weekly sync", start, end, 7200), [])
+
+
+class HubFallbackTest(unittest.TestCase):
+    """Meetings with no summary asset fall back to a Hub Doc when enabled."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        zoom_source.configure(str(self.base))
+        self.calendar = self.base / "next48h.json"
+        self.source = {
+            "kind": "zoom", "assets_tool": TOOL,
+            "calendar_file": str(self.calendar), "_processed": {},
+            "hub_docs": True, "hub_search_tool": SEARCH_TOOL,
+            "hub_content_tool": CONTENT_TOOL,
+        }
+        self.connector = Connector()
+        self.now = T0 - datetime.timedelta(hours=1)
+        self.hub_calls = []
+        self.search_text = search_result()
+        self.content_text = error_payload(DOC_BODY)
+
+        def dispatch(prompt, tools, **kwargs):
+            if TOOL in tools:
+                return self.connector(prompt, tools, **kwargs)
+            (tool,) = tools
+            line = [x for x in prompt.splitlines()
+                    if x[:1].isdigit() and ". {" in x][0]
+            args = json.loads(line.split(". ", 1)[1])
+            self.hub_calls.append((tool, args))
+            out = claude_bridge.ToolResults()
+            if tool == SEARCH_TOOL:
+                out.append({"name": tool, "input": args,
+                            "text": self.search_text, "is_error": False})
+            else:
+                out.append({"name": tool, "input": args,
+                            "text": self.content_text, "is_error": True})
+            return out
+
+        self.patches = [
+            mock.patch.object(claude_bridge, "call_tools", dispatch),
+            mock.patch.object(zoom_source, "_now",
+                              lambda: self.now.timestamp()),
+            mock.patch.object(zoom_source, "log"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        zoom_source.configure(None)
+        self.tmp.cleanup()
+
+    def write_calendar(self, events):
+        self.calendar.write_text(json.dumps({
+            "events": events, "refreshed_at": iso(self.now)}))
+
+    def at(self, minutes_after_start):
+        self.now = T0 + datetime.timedelta(minutes=minutes_after_start)
+
+    def listing(self):
+        return zoom_source.candidates(dict(self.source))
+
+    def meetings(self):
+        return zoom_source.load_state()
+
+    def ready(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.answers["91234567890"] = assets(summary=None)
+        self.at(41)
+
+    def test_hub_doc_becomes_the_summary(self):
+        self.ready()
+        found = self.listing()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["raw"]["source_id"], f"zoom:doc-{DOC_ID}")
+        self.assertEqual(found[0]["raw"]["summary"], DOC_BODY.strip())
+        self.assertEqual(
+            [c[0] for c in self.hub_calls], [SEARCH_TOOL, CONTENT_TOOL])
+        self.assertEqual(self.hub_calls[0][1], {"query": "Weekly sync"})
+        self.assertEqual(self.hub_calls[1][1],
+                         {"fileId": DOC_ID, "format": "markdown"})
+        item = zoom_source.fetch({}, self.source, found[0])
+        self.assertEqual(item["source_id"], f"zoom:doc-{DOC_ID}")
+        self.assertIn("ship Friday", item["body"])
+
+    def test_no_matching_doc_keeps_waiting(self):
+        self.search_text = search_result("Another meeting")
+        self.ready()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual([c[0] for c in self.hub_calls], [SEARCH_TOOL])
+        self.assertEqual(self.meetings()["ev1"]["last_result"],
+                         "no_summary+hub_no_match")
+
+    def test_two_matching_docs_are_refused(self):
+        first = json.loads(search_result(doc_id=DOC_ID))["data"][0]
+        second = json.loads(
+            search_result(doc_id="ZyXwVuTsRqPoNmLkJiHgFe"))["data"][0]
+        self.search_text = json.dumps({"data": [first, second]})
+        self.ready()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.meetings()["ev1"]["last_result"],
+                         "no_summary+hub_ambiguous")
+
+    def test_a_real_summary_never_calls_the_hub(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.answers["91234567890"] = assets()
+        self.at(41)
+        found = self.listing()
+        self.assertEqual(found[0]["raw"]["source_id"], "zoom:UUID-1")
+        self.assertEqual(self.hub_calls, [])
+
+    def test_no_access_meeting_can_still_use_its_hub_doc(self):
+        self.write_calendar([event()])
+        self.listing()
+        self.connector.errors["91234567890"] = (
+            'HTTP 403 {"code":2315,"message":"You do not have access to '
+            'this summary"}')
+        self.at(41)
+        self.assertEqual(len(self.listing()), 1)
+
+    def test_off_by_default(self):
+        self.source["hub_docs"] = False
+        self.ready()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.hub_calls, [])
+
+
 class ZoomConfigTest(unittest.TestCase):
     def routine(self, **source):
         base = {"kind": "zoom", "assets_tool": TOOL,
@@ -390,6 +570,23 @@ class ZoomConfigTest(unittest.TestCase):
 
     def test_valid(self):
         self.assertEqual(self.problems(retry_hours=12), [])
+
+    def test_legacy_link_transcripts_key_is_still_valid(self):
+        self.assertEqual(self.problems(link_transcripts=False), [])
+
+    def test_hub_docs_need_exact_tools(self):
+        self.assertEqual(self.problems(hub_docs=False), [])
+        self.assertEqual(len(self.problems(hub_docs=True)), 2)
+        self.assertEqual(self.problems(
+            hub_docs=True, hub_search_tool="mcp__x__search",
+            hub_content_tool="mcp__x__hub_get_file_content"), [])
+        self.assertEqual(self.problems(
+            hub_docs=True, hub_search_tool="mcp__x__search",
+            hub_content_tool="mcp__x__get_file_content"), [])
+        self.assertTrue(self.problems(
+            hub_docs=True, hub_search_tool="mcp__x__search_meetings",
+            hub_content_tool="mcp__x__hub_get_file_content"))
+        self.assertTrue(self.problems(hub_docs="yes"))
 
     def test_rejects_other_tools_and_bad_values(self):
         self.assertTrue(self.problems(assets_tool="mcp__x__search"))

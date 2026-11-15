@@ -766,6 +766,7 @@ maintenance:
   model: haiku
   list_tool: mcp__claude_ai_Example_Calendar__list_events
   get_tool: mcp__claude_ai_Example_Calendar__get_event
+  freebusy_tool: mcp__claude_ai_Example_Calendar__get_free_busy  # optional; omit = off
   max_events: 50
   max_details: 20                      # get_event lookups per run, soonest first
   stale_after: 2h                      # mark the text file STALE after this
@@ -774,6 +775,16 @@ maintenance:
 
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
 are exact MCP names from your connector and are never defaulted.
+
+Busy/free: `get_event` does not return "Show as", so with `freebusy_tool` set
+the fetch makes one extra free/busy call for the whole window (primary
+calendar). A timed event is `busy` when its interval is fully covered by the
+union of busy blocks (touching blocks merge), else `free`; all-day events get
+no marker. The text file appends ` | free` to a free event's first line (busy
+is unmarked); the JSON twin has `"show_as": "busy" | "free" | null` per event.
+Limit: a free event fully covered by other busy events shows as busy. If the
+free/busy call fails or its text is unparseable, the cache still refreshes
+with no marker and logs a warning.
 
 Calendar events: the same single list call asks for `events_window_days`
 (default 7, `0` turns this off) instead of `window_hours`; `output` and the JSON
@@ -1229,11 +1240,18 @@ memory:
                                    # meeting first-name match
 ```
 
-The executable receives `{"names": ["Ada", "kuba"]}` on stdin (the people
+Verified attendees get a slug minted from their directory display name, which
+can differ from the store's own slug (a nickname). Before use, the minted slug
+is mapped onto an existing store slug: kept if the store has it, else the
+`person_resolver` answer, else the store's alias index (`memory people show
+<name>`, alias hits only). `person_alias_lookup: false` turns the last step
+off. No answer keeps the minted slug.
+
+The executable receives `{"names": ["Ada", "alex"]}` on stdin (the people
 strings the model returned, deduped) and prints:
 
 ```json
-{"resolved": {"Ada": "ada-lovelace", "kuba": null},
+{"resolved": {"Ada": "ada-lovelace", "alex": null},
  "facts": {"ada-lovelace": {"title": "Staff Engineer", "team": "Engines"}},
  "first_names": {"ada-lovelace": ["Ada", "Augusta"]},
  "stale": true}
@@ -1670,15 +1688,28 @@ The run fails when no call yields a result or a 2315 (no call made, a generic
 twice), and results lost across a machine sleep count as an outage that
 charges no check.
 
+With `hub_docs: true` (plus `hub_search_tool` and `hub_content_tool`, exact
+read-only MCP tool names), a meeting whose assets carry no readable summary is
+searched by its calendar title, and a Zoom Hub Doc (`docs.zoom.us/doc/<id>`)
+whose name matches exactly (and whose time, when the hit carries one, falls in
+the meeting window) is used as the summary, under source id `zoom:doc-<id>`.
+Several matches are refused. The content tool's output-schema error (missing
+`file_link`) still carries the content, which is read from it.
+
 The memory source id is `zoom:<meeting uuid>`; the candidate id adds a hash of
 the summary, so a changed summary updates the same entry. Calendar organizer and
 attendees become `source_people`, resolved to existing person slugs like a
 transcript's. Captures go to `state/events.jsonl` with source `zoom`.
 
 When a transcript routine (`mila`, `whisper`) captured the same calendar event,
-both entries are kept. The Zoom entry follows the transcript entry: through
-`--follows` when the transcript was captured first, or `memory link` on a later
-run when it arrives afterwards (`link_transcripts: false` turns this off). See
+both entries are kept and never linked with `--follows` (that means "supersedes").
+The Zoom entry opens with `Same meeting as <transcript entry id> (transcript
+capture).` and the extraction model is given the transcript entry's body to list
+conflicts (facts, decisions, attendance, action items; at most 5). Any conflict
+is appended as `Differs from <id>:` and emitted as a `diff` event in
+`state/events.jsonl` (`details.entry_ids`, `details.differs`). Only a transcript
+captured before the Zoom entry is cross-referenced. `link_transcripts` is
+accepted and ignored. See
 `routines/_example-zoom-to-memory.yaml`.
 
 ### Whisper pipeline transcriptions
