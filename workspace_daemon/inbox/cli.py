@@ -42,6 +42,8 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
     from . import sources
 
     if demo:
+        # The demo's fake poll brings one arrival per refresh: keep it lively.
+        settings = dict(settings, poll_interval_s=60.0)
         store = InboxStore(None)
         app = InboxApp(DemoSource(empty=empty), store,
                        FakeActions(store=store), settings, demo=True,
@@ -62,6 +64,7 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
 
         app = InboxApp(fetch, store, LocalActions(store), settings,
                        stream_delay=0, saved=saved if events else None,
-                       saved_days=days)
+                       saved_days=days, units=sources.make_units(settings, base),
+                       saved_watch=sources.saved_watch(base) if events else None)
     app.run()
     return 0

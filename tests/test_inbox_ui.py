@@ -975,5 +975,275 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(rows), 3)
 
 
+
+class CountingUnit:
+    """A refreshable unit for the app: counts runs, lists one item, watches
+    the given paths."""
+
+    def __init__(self, name, paths=(), uses_all=False, delay=0.0, items=None):
+        self.name, self.paths, self.uses_all = name, list(paths), uses_all
+        self.delay = delay
+        self.items = items
+        self.runs, self.times, self.alls = 0, [], []
+        self.active = self.peak = 0
+
+    def watch(self):
+        return list(self.paths)
+
+    def run(self, now, show_all):
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            self.runs += 1
+            self.times.append(time.monotonic())
+            self.alls.append(show_all)
+            if self.delay:
+                time.sleep(self.delay)
+            rows = self.items if self.items is not None else [
+                item(1, "fyi", "calendar", id=f"{self.name}:1")]
+            return [sources.SourceResult(self.name, rows, False, None, None)]
+        finally:
+            self.active -= 1
+
+
+def unit_app(units, poll_s=300.0, watch_s=0.05, debounce_s=0.0, saved=None,
+             saved_watch=None, **kw):
+    store = InboxStore(None)
+    cfg = dict(DEFAULTS, watch_interval_s=watch_s)
+    app = InboxApp(lambda: [], store, FakeActions(store=store, draft_delay=0),
+                   cfg, undo_s=0.15, leave_s=0, stream_delay=0, poll_s=poll_s,
+                   units=units, saved=saved, saved_watch=saved_watch, **kw)
+    app.watcher.debounce_s = debounce_s
+    return app
+
+
+async def until(pilot, cond, tries=150, step=0.04):
+    for _ in range(tries):
+        if cond():
+            return True
+        await pilot.pause(step)
+    return cond()
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def f(self, name, text="x"):
+        path = self.dir / name
+        path.write_text(text)
+        return str(path)
+
+    async def test_a_changed_file_refreshes_only_its_source(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [self.f("b.txt")])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual((a.runs, b.runs), (1, 1))
+            (self.dir / "a.txt").write_text("changed, and longer")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+            await pilot.pause(0.4)
+            self.assertEqual((a.runs, b.runs), (2, 1))
+            # b's rows are still listed from its cached result
+            self.assertEqual(sorted(i.key for i in app.items), ["a:1", "b:1"])
+
+    async def test_no_change_means_no_re_run(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])           # no watch list: fallback only
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.8)          # ~15 watch ticks
+            self.assertEqual((a.runs, b.runs), (1, 1))
+
+    async def test_the_fallback_timer_refreshes_everything(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b], poll_s=0.5)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: a.runs >= 2 and b.runs >= 2, tries=100))
+
+    async def test_r_refreshes_everything(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")
+            self.assertTrue(await until(pilot, lambda: b.runs == 2))
+            self.assertEqual(a.runs, 2)
+
+    async def test_a_burst_of_changes_is_debounced_per_source(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a], debounce_s=0.6)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for n in range(14):             # ~1.4 s of constant writes
+                (self.dir / "a.txt").write_text("x" * (n + 2))
+                await pilot.pause(0.1)
+            await pilot.pause(0.9)
+            gaps = [y - x for x, y in zip(a.times[1:], a.times[2:])]
+            self.assertGreaterEqual(a.runs, 3)
+            self.assertLessEqual(a.runs, 5)
+            self.assertTrue(all(g >= 0.55 for g in gaps), gaps)
+
+    async def test_a_watched_file_that_appears_counts_as_a_change(self):
+        later = self.dir / "later.jsonl"
+        a = CountingUnit("a", [str(later)])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.3)
+            self.assertEqual(a.runs, 1)
+            later.write_text("hello")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+
+    async def test_stat_errors_do_not_crash_or_refresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+
+            def boom(path):
+                raise PermissionError("denied")
+
+            app.watcher._stat = boom
+            app.watcher.commit()            # baseline: every path now errors
+            await pilot.pause(0.5)
+            self.assertEqual(a.runs, 1)
+            self.assertTrue(app.is_running)
+
+    async def test_refreshes_never_overlap_and_a_change_is_picked_up_after(self):
+        a = CountingUnit("a", [self.f("a.txt")], delay=0.5)
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            for _ in range(100):
+                if a.runs:
+                    break
+                await pilot.pause(0.02)
+            (self.dir / "a.txt").write_text("changed while the first run is busy")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2, tries=200))
+            self.assertEqual(a.peak, 1)
+
+    async def test_the_header_shows_updated_age_not_a_countdown(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            head = str(app.query_one("#hdr").render())
+            self.assertIn("updated", head)
+            self.assertIn("ago", head)
+            self.assertNotIn("next poll", head)
+
+    async def test_the_oldest_source_sets_the_header_age(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.updated_at["b"] -= 120
+            self.assertGreaterEqual(app.oldest_update_age(), 119)
+            app.tick_header()
+            self.assertIn("updated 2m ago", str(app.query_one("#hdr").render()))
+
+    async def test_a_source_error_still_shows(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        a.run = lambda now, show_all: [
+            sources.SourceResult("a", [], False, None, "exit 3: boom")]
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("a: exit 3: boom", app.source_problems())
+
+    async def test_a_raising_unit_becomes_a_source_error(self):
+        a = CountingUnit("a", [])
+
+        def boom(now, show_all):
+            raise RuntimeError("bug")
+
+        a.run = boom
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(any("poll failed" in p for p in app.source_problems()))
+            self.assertEqual([i.key for i in app.items], ["b:1"])
+
+    async def test_a_toggle_re_runs_only_sources_that_support_all(self):
+        plain = CountingUnit("plain", [])
+        wide = CountingUnit("wide", [], uses_all=True)
+        app = unit_app([plain, wide])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("A")
+            self.assertTrue(await until(pilot, lambda: wide.runs == 2))
+            await pilot.pause(0.2)
+            self.assertEqual((plain.runs, wide.alls), (1, [False, True]))
+
+    async def test_duplicate_ids_across_units_are_flagged_after_a_partial_refresh(self):
+        shared = [item(1, "fyi", "calendar", id="dup:1")]
+        a = CountingUnit("a", [self.f("a.txt")], items=shared)
+        b = CountingUnit("b", [], items=list(shared))
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            (self.dir / "a.txt").write_text("changed, longer")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["dup:1"])
+            self.assertTrue(any("duplicate id" in p for p in app.source_problems()))
+
+    async def test_the_saved_view_reloads_when_events_change_and_only_then(self):
+        events_file = self.dir / "events.jsonl"
+        events_file.write_text("one")
+        calls = []
+
+        def saved():
+            calls.append(1)
+            n = len(events_file.read_text())
+            return [{"id": f"s{i}", "source": "slack", "kind": "new",
+                     "ts": time.time() - i, "title": f"Row {i}", "link": None,
+                     "source_id": f"slack:{i}"} for i in range(n)], None
+
+        app = unit_app([CountingUnit("a", [])], saved=saved,
+                       saved_watch=lambda: [str(events_file)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.3)
+            self.assertEqual(calls, [])             # closed: nothing is read
+            await pilot.press("S")
+            await pilot.pause(0.4)
+            self.assertEqual(len(calls), 3 - 2)     # the open itself
+            table = app.screen.query_one("#saved-table")
+            self.assertEqual(table.row_count, 3)
+            events_file.write_text("one two")
+            self.assertTrue(await until(pilot, lambda: table.row_count == 7))
+            await pilot.pause(0.4)
+            reads = len(calls)
+            await pilot.pause(0.5)
+            self.assertEqual(len(calls), reads)     # no change: no reads
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            events_file.write_text("closed again, longer")
+            await pilot.pause(0.5)
+            self.assertEqual(len(calls), reads)     # closed: not watched
+
+
+class WatchOffWithoutUnitsTest(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+    async def test_a_plain_fetch_app_has_no_watcher(self):
+        app, _, _ = make_app([item(1)])
+        self.assertIsNone(app.watcher)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("updated", str(app.query_one("#hdr").render()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -91,7 +91,8 @@ Phase 1 calls only `list` (with `--all` as above), with the configured timeout, 
 own process group (killed whole on timeout). stdout is read in chunks and the
 group is killed as soon as it passes 4 MB; only the last 64 KB of stderr are
 kept, so a chatty source cannot exhaust memory. `timeout_s` must be below
-`poll_interval_s` (the default adapts to short intervals). Output over 4 MB, non-JSON output,
+`poll_interval_s` (the default adapts to short intervals, and no
+source is run more often than that unless its `watch` files change). Output over 4 MB, non-JSON output,
 a wrong `v`, a non-zero exit, a timeout or a program that will not start is a
 **source error**: shown in the header and a toast, items from that source are
 empty, nothing crashes. One bad item (failed validation, duplicate id) is
@@ -108,9 +109,33 @@ otherwise the child dies with the call.
 until phase 2. It has the same limits: its own process group, killed whole on
 timeout or an oversized response.
 
-Polls never overlap: a poll that is still running when the next one is due (or
-when you press `r`) is skipped, and `r` says "Poll already running". Each poll
-first re-reads the state file, so marks made in another pane show up.
+Refreshes never overlap: one that is still running when the next is due (or
+when you press `r`) is skipped, and `r` says "Poll already running". Each
+refresh first re-reads the state file, so marks made in another pane show up.
+
+### Change-driven refresh
+
+The inbox does not poll every source on a timer. Every `watch_interval_s`
+(default 3) it stats (mtime and size, never reading) the files each source
+depends on and re-runs **only** a source whose file changed, appeared or
+vanished. A fallback full refresh runs every `poll_interval_s` (default 600),
+and `r` refreshes everything at once.
+
+- Built-in sources know their files. `events`: `state/events.jsonl`, its `.1`
+  rotation and `state/alerts.json` (resolved alerts), plus `routines/*.yaml`
+  while `email_require_label` is set. `events.invites`: the calendar cache's
+  `state/calendar-snapshot.json`. The Saved view watches `events.jsonl` while
+  it is open and reloads its rows when the file changes.
+- A `command` source lists its files in `watch: [paths]`. Relative paths are
+  relative to the base directory; absolute paths and `~` work. A source with
+  no `watch` list is refreshed by the fallback timer and `r` only.
+- Debounce: a source is re-run at most once per 2 s, however often its files
+  change; the change is kept and fires when the 2 s are over. A change that
+  lands while a refresh is running is picked up right after it.
+- A stat failure counts as a stable state, never an error; a file that does
+  not exist yet is watched, and its appearing is a change.
+- The header shows `updated Ns ago` for the least recently refreshed source;
+  per-source errors show as before.
 
 ## Built-in `events` source
 
@@ -270,7 +295,8 @@ defaults; a broken one prints every problem and exits 2.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `poll_interval_s` | `60` | 5 to 3600 |
+| `poll_interval_s` | `600` | 30 to 3600: the fallback full refresh (see "Change-driven refresh") |
+| `watch_interval_s` | `3` | 1 to 30: how often the watched files are stat-checked |
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
@@ -286,7 +312,8 @@ and:
 | `saved_days` | `2` | 1 to 30: how far back the Saved view (`S`) looks |
 | `email_require_label` | `null` | a label name, e.g. `MY_LABEL`: show only mail captured through a routine whose query requires that label (see "Mail label filter"); `null` shows all mail |
 
-A `command` source takes `argv` (list), `timeout_s` (1 to 120) and
+A `command` source takes `argv` (list), `timeout_s` (1 to 120),
+`watch` (list of paths, default none; see "Change-driven refresh") and
 `supports_all` (`true` or `false`, default `false`): declare it only if
 `<argv> list --all` works.
 
@@ -309,7 +336,7 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` poll now,
+`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` refresh everything now,
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view
 (read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,

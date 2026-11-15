@@ -237,10 +237,14 @@ class SavedScreen(ModalScreen):
             yield DataTable(id="saved-table", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self):
-        pal = palette(self.app)
-        now = time.time()
         tb = self.query_one("#saved-table", DataTable)
         tb.add_columns("", "Title", "Time", "Kind")
+        self._fill(tb)
+        tb.focus()
+
+    def _fill(self, tb):
+        pal = palette(self.app)
+        now = time.time()
         for row in self.rows:
             glyph, color, _label = SOURCES.get(row["source"], SOURCES["other"])
             when = dt.datetime.fromtimestamp(row["ts"]).strftime("%a %H:%M")
@@ -251,7 +255,21 @@ class SavedScreen(ModalScreen):
         if not self.rows:
             msg = self.error or "nothing saved in this period"
             tb.add_row("", Text(msg, Style(italic=True)), "", "")
-        tb.focus()
+
+    def reload(self, rows, error=None):
+        """Replace the rows (the daemon saved something new), keeping the
+        cursor on the same row when it is still listed."""
+        tb = self.query_one("#saved-table", DataTable)
+        current = self._current_row()
+        keep = current["id"] if current else None
+        self.rows, self.error = rows, error
+        tb.clear()
+        self._fill(tb)
+        if keep is not None:
+            for n, row in enumerate(self.rows):
+                if row["id"] == keep:
+                    tb.move_cursor(row=n)
+                    break
 
     def _current_row(self):
         tb = self.query_one("#saved-table", DataTable)

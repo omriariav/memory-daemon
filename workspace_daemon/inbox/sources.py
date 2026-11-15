@@ -3,6 +3,7 @@
 Phase 1 only calls `list`. A source never raises into the UI: every failure
 becomes a `SourceResult.error` string.
 """
+import glob
 import json
 import os
 import re
@@ -508,8 +509,18 @@ def run_command_act(argv, request, timeout_s=20.0):
 
 # --- aggregate --------------------------------------------------------------
 
-def _events_results(src, settings, base_dir, now):
-    """The built-in events source, plus its pending-invite source."""
+class Unit:
+    """One independently refreshable source: `run(now, show_all)` returns a
+    list of SourceResult (possibly empty), `watch()` the paths whose change
+    makes it stale (stat-checked by `watch.Watcher`). `uses_all` marks a
+    command source that declared `supports_all`."""
+
+    def __init__(self, name, run, watch=lambda: [], uses_all=False):
+        self.name, self.run, self.watch, self.uses_all = name, run, watch, uses_all
+
+
+def _events_result(src, settings, base_dir, now):
+    """The built-in events source."""
     email_routines, note = None, None
     label = src.get("email_require_label")
     if label:
@@ -525,33 +536,83 @@ def _events_results(src, settings, base_dir, now):
                       email_routines=email_routines)
     if note:
         res = res._replace(error=f"{res.error}; {note}" if res.error else note)
-    out = [res]
-    days = src.get("invites_days", invites.DEFAULT_DAYS)
-    if days and days > 0:
-        rows, stale, age, error = invites.load(base_dir, now, days)
-        if age is not None or error:  # no cache at all: nothing to report
-            out.append(SourceResult(f"{src['name']}.invites", rows, stale,
-                                    age, error))
+    return res
+
+
+def _invites_results(src, base_dir, now):
+    """The pending-invite source of an events source: `[]` when there is no
+    calendar cache at all (nothing to report)."""
+    rows, stale, age, error = invites.load(
+        base_dir, now, src.get("invites_days", invites.DEFAULT_DAYS))
+    if age is None and not error:
+        return []
+    return [SourceResult(f"{src['name']}.invites", rows, stale, age, error)]
+
+
+def events_files(base_dir):
+    state = os.path.join(str(base_dir), "state")
+    return [os.path.join(state, EVENTS_FILE),
+            os.path.join(state, EVENTS_FILE + ".1")]
+
+
+def expand_watch(base_dir, paths):
+    """Watch paths of a command source: `~` expands, relative paths are
+    relative to the base directory."""
+    out = []
+    for path in paths:
+        path = os.path.expanduser(path)
+        out.append(path if os.path.isabs(path)
+                   else os.path.join(str(base_dir), path))
     return out
 
 
-def collect(settings, base_dir, now=None, show_all=False):
-    """Poll every configured source. Returns a list of SourceResult.
-
-    `show_all` adds `--all` to `list` for the command sources that declared
-    `supports_all`; no other source ever receives it. Duplicate ids across
-    sources keep the first and flag the later source.
-    """
-    now = time.time() if now is None else now
-    results = []
-    seen = set()
+def make_units(settings, base_dir):
+    """The refreshable units of the configured sources, in order."""
+    units = []
     for src in settings["sources"]:
         if src["type"] == "events":
-            batch = _events_results(src, settings, base_dir, now)
+            def watch(src=src):
+                files = events_files(base_dir) + [os.path.join(
+                    str(base_dir), "state", "alerts.json")]
+                if src.get("email_require_label"):
+                    files += sorted(glob.glob(os.path.join(
+                        str(base_dir), "routines", "*.yaml")))
+                return files
+
+            units.append(Unit(
+                src["name"],
+                lambda now, show_all, src=src: [
+                    _events_result(src, settings, base_dir, now)],
+                watch))
+            if src.get("invites_days", invites.DEFAULT_DAYS) > 0:
+                units.append(Unit(
+                    f"{src['name']}.invites",
+                    lambda now, show_all, src=src: _invites_results(
+                        src, base_dir, now),
+                    lambda: [os.path.join(str(base_dir), "state",
+                                          invites.SNAPSHOT_FILE)]))
         else:
-            batch = [run_command_source(
-                src["name"], src["argv"], src["timeout_s"],
-                show_all=bool(show_all and src.get("supports_all")))]
+            units.append(Unit(
+                src["name"],
+                lambda now, show_all, src=src: [run_command_source(
+                    src["name"], src["argv"], src["timeout_s"],
+                    show_all=bool(show_all and src.get("supports_all")))],
+                lambda src=src: expand_watch(base_dir, src.get("watch", [])),
+                uses_all=bool(src.get("supports_all"))))
+    return units
+
+
+def saved_watch(base_dir):
+    """The files the Saved view depends on."""
+    return lambda: events_files(base_dir)
+
+
+def merge(batches):
+    """Flatten per-unit results (in source order). A duplicate item id across
+    sources keeps the first and flags the later source."""
+    results = []
+    seen = set()
+    for batch in batches:
         for res in batch:
             kept = [i for i in res.items if i["id"] not in seen]
             dropped = len(res.items) - len(kept)
@@ -562,3 +623,14 @@ def collect(settings, base_dir, now=None, show_all=False):
                 error = f"{error}; {note}" if error else note
             results.append(res._replace(items=kept, error=error))
     return results
+
+
+def collect(settings, base_dir, now=None, show_all=False):
+    """Poll every configured source. Returns a list of SourceResult.
+
+    `show_all` adds `--all` to `list` for the command sources that declared
+    `supports_all`; no other source ever receives it. Duplicate ids across
+    sources keep the first and flag the later source.
+    """
+    now = time.time() if now is None else now
+    return merge(u.run(now, show_all) for u in make_units(settings, base_dir))

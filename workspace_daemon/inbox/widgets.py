@@ -251,13 +251,11 @@ class StatusHeader(Static):
         mid = Text(no_wrap=True)
         if app.busy:
             mid.append(SPINNER[int(now * 10) % len(SPINNER)] + " ", Style(color=pal["accent"]))
-        left_in = app.countdown_s()
-        mid.append(f"next poll {int(left_in) // 60}:{int(left_in) % 60:02d}", Style(color=pal["muted"]))
-        if app.last_poll_at is None:
-            mid.append("  ·  polling…", Style(color=pal["muted"]))
+        age = app.oldest_update_age()
+        if age is None:
+            mid.append("polling…", Style(color=pal["muted"]))
         else:
-            age = now - app.last_poll_at
-            mid.append(f"  ·  polled {fmt_age(age) if age >= 60 else f'{int(age)}s'} ago", Style(color=pal["muted"]))
+            mid.append(f"updated {fmt_age(age) if age >= 60 else f'{int(age)}s'} ago", Style(color=pal["muted"]))
         for line in app.source_problems()[:1]:
             mid.append("  ⚠ " + fit(line, 48), Style(color=pal["warn"], bold=True))
         right = Text(no_wrap=True)

@@ -3,7 +3,12 @@
 # Run: python daemon.py inbox          (needs: pip install 'textual>=8.2,<9')
 #      python daemon.py inbox --demo   (invented data, reads and writes nothing)
 
-poll_interval_s: 60        # 5 to 3600
+# Sources are refreshed when their files change: every watch_interval_s the
+# files each source depends on are stat-checked and only a source whose file
+# changed is re-run. poll_interval_s is the fallback full refresh (the r key
+# refreshes everything at once). See docs/inbox.md.
+poll_interval_s: 600       # 30 to 3600
+watch_interval_s: 3        # 1 to 30
 theme: dark                # dark | light   (ctrl+t flips it at runtime)
 
 # Hebrew / RTL display. logical = pass text through (the terminal does bidi),
@@ -56,4 +61,7 @@ sources:
   #   type: command
   #   argv: ["python3", "~/bin/my-inbox-source.py"]
   #   timeout_s: 20        # 1 to 120
+  #   # Re-run this source when one of these files changes (relative to the
+  #   # base dir, or absolute / ~). No watch list: fallback timer and `r` only.
+  #   watch: ["state/comms-inbox.jsonl"]
   #   supports_all: true   # `<argv> list --all` works: the A key uses it

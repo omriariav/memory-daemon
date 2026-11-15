@@ -15,16 +15,19 @@ FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
-TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "gmail_account",
+TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
             "alert_urgent_max_age_h", "sources")
 SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent", "invites_days",
                "saved_days", "email_require_label"),
-    "command": ("name", "type", "argv", "timeout_s", "supports_all"),
+    "command": ("name", "type", "argv", "timeout_s", "supports_all",
+                "watch"),
 }
 DEFAULT_TIMEOUT_S = 20
+MAX_WATCH = 50
 DEFAULTS = {
-    "poll_interval_s": 60.0,
+    "poll_interval_s": 600.0,
+    "watch_interval_s": 3.0,
     "theme": themes.DEFAULT,
     "bidi_mode": "auto",
     "gmail_account": 0,
@@ -72,10 +75,16 @@ def validate(raw):
     out = dict(DEFAULTS)
 
     poll = raw.get("poll_interval_s", DEFAULTS["poll_interval_s"])
-    if not _num(poll) or not 5 <= poll <= 3600:
-        problems.append("poll_interval_s must be a number from 5 to 3600")
+    if not _num(poll) or not 30 <= poll <= 3600:
+        problems.append("poll_interval_s must be a number from 30 to 3600")
     else:
         out["poll_interval_s"] = float(poll)
+
+    watch_s = raw.get("watch_interval_s", DEFAULTS["watch_interval_s"])
+    if not _num(watch_s) or not 1 <= watch_s <= 30:
+        problems.append("watch_interval_s must be a number from 1 to 30")
+    else:
+        out["watch_interval_s"] = float(watch_s)
 
     theme = raw.get("theme", DEFAULTS["theme"])
     if theme not in themes.NAMES:
@@ -181,9 +190,18 @@ def validate(raw):
             if not isinstance(supports_all, bool):
                 problems.append(f"{label}.supports_all must be true or false")
                 supports_all = False
+            watch = src.get("watch", [])
+            if (not isinstance(watch, list) or len(watch) > MAX_WATCH
+                    or not all(isinstance(w, str) and w.strip()
+                               and not re.search(r"[\x00-\x1f\x7f]", w)
+                               for w in watch)):
+                problems.append(f"{label}.watch must be a list of up to "
+                                f"{MAX_WATCH} paths (strings)")
+                watch = []
             built.append({"name": name, "type": "command",
                           "argv": list(argv), "timeout_s": float(timeout),
-                          "supports_all": supports_all})
+                          "supports_all": supports_all,
+                          "watch": [w.strip() for w in watch]})
     out["sources"] = built
     if problems:
         raise SettingsError(problems)

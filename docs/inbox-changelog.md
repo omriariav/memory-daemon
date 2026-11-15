@@ -36,6 +36,22 @@ calendar ids such an action needs.
   title, time and kind; `o` opens a link, `esc` returns. New setting
   `saved_days` on the events source (default 2). Saved rows are not inbox
   items and cannot be acted on.
+- Change-driven refresh: every `watch_interval_s` (default 3, 1 to 30) the
+  inbox stat-checks the files each source depends on and re-runs only a source
+  whose file changed (mtime and size; a file that appears counts), debounced
+  to one refresh per source per 2 s and never overlapping. The built-in
+  sources know their files (events, the alert state, the calendar cache, and
+  the Saved view while it is open); a `command` source declares
+  `watch: [paths]` (relative to the base dir, absolute or `~`) and without it
+  is refreshed by the fallback timer and `r` only.
+
+### Changed
+
+- `poll_interval_s` is now the fallback full refresh: default 600 (was 60),
+  range 30 to 3600 (was 5 to 3600). A config that set a value below 30 must
+  raise it.
+- The header shows `updated Ns ago` for the least recently refreshed source
+  instead of the next-poll countdown.
 
 ## [0.1.0] - 2026-11-15
 
