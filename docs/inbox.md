@@ -4,6 +4,9 @@
 sources. This page is the contract: the item format, the source-command
 protocol, the built-in `events` source, local state and settings.
 
+Version: see [docs/inbox-changelog.md](inbox-changelog.md); `python daemon.py
+inbox --version` prints it.
+
 Phase 1a (this version) reads and triages. Nothing is sent: `reply` and
 `nudge` are part of the format but the UI refuses them until phase 2.
 
@@ -246,6 +249,31 @@ strings, never from the bidi-reordered display and never with markup.
   does not support selection (it draws lines without text offsets), so use
   `y`/`Y` there. In visual bidi mode mouse selection is off in both panes
   (the screen text is already reordered); `y`/`Y` still copy logical text.
+
+## Versioning
+
+The inbox has its own version, separate from the rest of the daemon, in
+`workspace_daemon/inbox/__init__.py` (`__version__`). It follows
+[SemVer](https://semver.org) and covers the inbox UI and its source protocol.
+
+- PATCH: fixes.
+- MINOR: new features, keys or settings.
+- MAJOR: breaking changes to the item format, the source protocol or the config.
+
+Every PR that changes `workspace_daemon/inbox/` adds an entry to
+[inbox-changelog.md](inbox-changelog.md) under `[Unreleased]`, or bumps
+`__version__` with a matching new heading. At release time the version is
+bumped and `[Unreleased]` is moved under the new heading. Releases are tagged
+`inbox-vX.Y.Z` on main after the merge.
+
+CI enforces this on pull requests: `tools/check_inbox_version.py BASE_REF`
+fails when any file under `workspace_daemon/inbox/` changed since the merge
+base but neither `__version__` nor `docs/inbox-changelog.md` did.
+
+The Item format has its own `v` field (currently 1), independent of the app
+version. `workspace_daemon/__init__.py` has a `__version__` too: that is the
+daemon's version, separate from the inbox's. `daemon.py inbox --version`, the
+header and the help overlay show the inbox version.
 
 ## Safety model
 

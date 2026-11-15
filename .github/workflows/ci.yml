@@ -65,6 +65,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python tools/privacy_check.py --commits "$BASE_SHA..$HEAD_SHA"
 
+      - name: Inbox version bump
+        # A PR that touches workspace_daemon/inbox/ must bump __version__ or
+        # add a docs/inbox-changelog.md entry (docs/inbox.md, "Versioning").
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python tools/check_inbox_version.py "$BASE_SHA"
+
   inbox-ui:
     # The inbox UI is an optional extra: the job above runs without Textual
     # (UI tests skip). This one installs it and runs the UI tests for real.

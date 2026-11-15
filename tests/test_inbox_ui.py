@@ -14,7 +14,7 @@ HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 
 if HAVE_TEXTUAL:
     from workspace_daemon import events
-    from workspace_daemon.inbox import items as itm, settings, sources
+    from workspace_daemon.inbox import __version__, items as itm, settings, sources
     from workspace_daemon.inbox.actions import FakeActions, LocalActions
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.demo import DemoSource
@@ -336,6 +336,8 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("question_mark")
             await pilot.pause(0.1)
             self.assertIsInstance(app.screen, HelpScreen)
+            self.assertIn(f"v{__version__}", str(app.screen.query_one("#help-title").render()))
+            self.assertIn(f"v{__version__}", str(app.query_one("#hdr").render()))
             await pilot.press("escape")
             await pilot.press("L")
             await pilot.pause(0.1)
