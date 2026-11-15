@@ -193,6 +193,13 @@ class SettingsTest(unittest.TestCase):
                        "argv", "title_regex", "type"):
             self.assertIn(needle, text)
 
+    def test_gmail_account(self):
+        self.assertEqual(settings.default_settings()["gmail_account"], 0)
+        self.assertEqual(settings.validate({"gmail_account": 3})["gmail_account"], 3)
+        for bad in (-1, 1.5, "0", True, None):
+            with self.assertRaises(settings.SettingsError, msg=repr(bad)):
+                settings.validate({"gmail_account": bad})
+
     def test_duplicate_source_names_rejected(self):
         with self.assertRaises(settings.SettingsError):
             settings.validate({"sources": [

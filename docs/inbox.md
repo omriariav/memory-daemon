@@ -51,8 +51,8 @@ One item is one JSON object:
 All fields are required. Unknown extra keys are ignored and dropped.
 
 How the UI uses `actions`: `ack` enables `a` (acknowledge), `reply` enables the
-draft and `a`/`e`, `nudge` (in `waiting`) enables `n`, `open` enables `o` (an
-item with a null `link` says so). `done` and `snooze` always work, because
+draft and `a`/`e`, `nudge` (in `waiting`) enables `n`, `open` enables `o` (hidden for an
+item with a null `link`). `done` and `snooze` always work, because
 they are local marks; listing them only tells phase 2 that the source wants an
 `act` call as well.
 
@@ -99,12 +99,18 @@ event that was created, then updated, appears once.
 | Event | Item `source` | `where` | `actions` |
 | --- | --- | --- | --- |
 | `gmail` | `email` | `mail` | `open` (reply arrives in phase 2) |
-| `gcal` kinds `new`, `update`, `cancel`, `rsvp` | `calendar` | `calendar` | `ack`, `open` |
-| `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack`, `open` |
-| `daemon` kind `alert` | `alert` | `daemon` | `ack`, `open` |
+| `gcal` kinds `new`, `update`, `cancel`, `rsvp` | `calendar` | `calendar` | `ack` |
+| `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack` |
+| `daemon` kind `alert` | `alert` | `daemon` | `ack` |
+
+`open` is listed only when the item has a link (the UI also hides it for any
+item with a null `link`, whatever a source says). Today only Gmail events have
+one, so the other rows are `ack` only.
 
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
-lines. A Gmail thread id becomes a mail link; other events have no link yet.
+lines. A Gmail thread id becomes a link
+`https://mail.google.com/mail/u/<gmail_account>/#all/<thread id>`; other
+events have no link yet.
 Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
@@ -135,6 +141,7 @@ defaults; a broken one prints every problem and exits 2.
 | `poll_interval_s` | `60` | 5 to 3600 |
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
+| `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `sources` | the `events` source | list of `type: events` (`window_h`, `urgent` rules) and `type: command` (`argv` list, `timeout_s` 1 to 120) |
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event

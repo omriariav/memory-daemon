@@ -77,6 +77,9 @@ def from_v1(raw):
         messages=[Msg(m["who"], float(m["ts"]), m["text"],
                       mine=m["who"] in ("You", "you", "me"))
                   for m in raw["thread"]],
-        draft=raw["draft"] or "", actions=list(raw["actions"]),
+        draft=raw["draft"] or "",
+        # `open` needs somewhere to go: hide it for an item with no link.
+        actions=[a for a in raw["actions"]
+                 if a != "open" or raw["link"] is not None],
         link=raw["link"], meta=raw["meta"],
     )

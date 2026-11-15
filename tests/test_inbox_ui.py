@@ -253,6 +253,19 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["status"] for r in app.audit if r["action"] == "open"],
                          ["ok", "failed"])
 
+    async def test_open_is_hidden_without_a_link(self):
+        rows = [item(1, link="https://example.com/a"), item(2, link=None)]
+        app, _, _ = make_app(rows)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            by_key = {i.key: i for i in app.items}
+            self.assertIn("open", by_key["t:1"].actions)
+            self.assertNotIn("open", by_key["t:2"].actions)
+            app.current_key = "t:2"
+            self.assertNotIn(("o", "open"), app.hints())
+            app.current_key = "t:1"
+            self.assertIn(("o", "open"), app.hints())
+
     async def test_source_filter_and_text_filter(self):
         app, _, _ = make_app(self.rows())
         async with app.run_test(size=SIZE) as pilot:

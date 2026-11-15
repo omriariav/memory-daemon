@@ -62,6 +62,14 @@ class EventsMappingTest(unittest.TestCase):
                                     "new", "Follow up")])
         (item,) = self.load().items
         self.assertIsNone(item["link"])
+        self.assertEqual(item["actions"], [])  # nothing to open, nothing to ack
+
+    def test_gmail_account_index_is_configurable(self):
+        write_events(self.base, [ev("gmail:18c0ffee12345678", "new", "Hi")])
+        (item,) = sources.load_events(self.base, now=NOW, gmail_account=2).items
+        self.assertIn("/mail/u/2/#all/18c0ffee12345678", item["link"])
+        (item,) = self.load().items
+        self.assertIn("/mail/u/0/", item["link"])
 
     def test_calendar_kinds_and_details(self):
         write_events(self.base, [
@@ -79,7 +87,7 @@ class EventsMappingTest(unittest.TestCase):
         self.assertEqual(set(by_title), {"Weekly sync", "Offsite", "Review", "Lunch"})
         sync = by_title["Weekly sync"]
         self.assertEqual(sync["source"], "calendar")
-        self.assertEqual(sync["actions"], ["ack", "open"])
+        self.assertEqual(sync["actions"], ["ack"])  # no link, so no open
         self.assertTrue(sync["gist"].startswith("Updated: "))
         texts = [m["text"] for m in sync["thread"]]
         self.assertIn("09:00 -> 10:00", texts)
@@ -99,7 +107,8 @@ class EventsMappingTest(unittest.TestCase):
         self.assertEqual({i["source"] for i in rows}, {"recording"})
         self.assertEqual({i["where"] for i in rows}, {"mila", "zoom"})
         for i in rows:
-            self.assertEqual(i["actions"], ["ack", "open"])
+            self.assertEqual(i["actions"], ["ack"])
+            self.assertIsNone(i["link"])
 
     def test_alert_urgency_by_key(self):
         def alert(key, ago):
@@ -115,7 +124,7 @@ class EventsMappingTest(unittest.TestCase):
         low = by_key["budget-80:2023-11-15"]
         self.assertEqual((low["section"], low["urgency"]), ("fyi", "digest"))
         self.assertEqual(low["source"], "alert")
-        self.assertEqual(low["actions"], ["ack", "open"])
+        self.assertEqual(low["actions"], ["ack"])
 
     def test_non_alert_daemon_events_are_skipped(self):
         write_events(self.base, [ev("daemon:x", "note", "nope")])

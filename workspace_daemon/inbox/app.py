@@ -332,16 +332,17 @@ class InboxApp(App):
         if it is None:
             return [("r", "poll"), ("/", "filter"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
+        opn = [("o", "open")] if it.link else []
         if f is not None and f.id in ("thread", "draft-pane"):
             return base + [("tab", "next pane"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
         if it.kind == "ack":
-            return base + [("a", "ack"), ("o", "open"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
+            return base + [("a", "ack")] + opn + [("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
         if it.kind == "fyi":
-            return base + [("d", "dismiss"), ("o", "open"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
+            return base + [("d", "dismiss")] + opn + [("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
         if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze"), ("o", "open"), ("u", "undo"), ("?", "help")]
-        return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze"), ("o", "open"), ("u", "undo"),
-                       ("/", "filter"), ("f", "source"), ("?", "help")]
+            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("u", "undo"), ("?", "help")]
+        return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
+            ("u", "undo"), ("/", "filter"), ("f", "source"), ("?", "help")]
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -366,7 +367,7 @@ class InboxApp(App):
         if not text and not streaming:
             t = Text(style=Style(color=p["muted"], italic=True))
             label = SOURCES.get(it.source, SOURCES["other"])[2].lower()
-            t.append("No draft. " + (f"Nothing to send for a {label} item: a acknowledges, o opens." if it.kind == "ack"
+            t.append("No draft. " + (f"Nothing to send for a {label} item: a acknowledges{', o opens' if it.link else ''}." if it.kind == "ack"
                                        else "FYI items need no reply." if it.kind == "fyi"
                                        else "Not due for a nudge yet." if it.kind == "nudge"
                                        else "Press e to write one."))

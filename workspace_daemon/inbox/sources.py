@@ -132,12 +132,12 @@ def _map_source(event):
     return None
 
 
-def _event_link(event, source):
+def _event_link(event, source, gmail_account=0):
     if source == "email":
         sid = _text(event.get("source_id"))
         thread = sid.partition(":")[2]
         if _THREAD_ID.match(thread):
-            return f"https://mail.google.com/mail/u/0/#all/{thread}"
+            return f"https://mail.google.com/mail/u/{int(gmail_account)}/#all/{thread}"
     return None
 
 
@@ -163,7 +163,7 @@ def _calendar_parts(event, kind, ts):
     return gist, thread, start
 
 
-def event_to_item(event, now, rules=DEFAULT_URGENT_RULES):
+def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     """One event line to an item, or None if the event is not shown."""
     if not isinstance(event, dict):
         return None
@@ -196,20 +196,23 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES):
     sender = ", ".join(people[:3]) if people else where
     urgent = any(_rule_matches(r, event, kind, key, start_ts, now)
                  for r in rules)
-    actions = ["ack", "open"] if source != "email" else ["open"]
+    link = _event_link(event, source, gmail_account)
+    actions = ["ack"] if source != "email" else []
+    if link is not None:
+        actions.append("open")  # nothing to open without a link
     return itm.make_item(
         id=f"events:{eid}", source=source,
         section="urgent" if urgent else "fyi",
         urgency="urgent" if urgent else "digest",
         sender=sender, where=where, gist=gist, ts=ts,
-        link=_event_link(event, source), thread=thread, draft=None,
+        link=link, thread=thread, draft=None,
         actions=actions,
         meta={"source_id": _text(event.get("source_id")), "kind": _text(kind)},
     )
 
 
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
-                rules=DEFAULT_URGENT_RULES, name="events"):
+                rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0):
     """The built-in source: recent events as items. Never raises."""
     now = time.time() if now is None else now
     try:
@@ -221,7 +224,7 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     latest = {}  # one row per source_id: the newest event wins
     for event in events:
         try:
-            item = event_to_item(event, now, rules)
+            item = event_to_item(event, now, rules, gmail_account)
         except (itm.ItemError, TypeError, ValueError):
             continue
         if item is None or item["ts"] < cutoff:
@@ -330,7 +333,8 @@ def collect(settings, base_dir, now=None):
     for src in settings["sources"]:
         if src["type"] == "events":
             res = load_events(base_dir, now=now, window_h=src["window_h"],
-                              rules=src["urgent"], name=src["name"])
+                              rules=src["urgent"], name=src["name"],
+                              gmail_account=settings["gmail_account"])
         else:
             res = run_command_source(src["name"], src["argv"], src["timeout_s"])
         kept = [i for i in res.items if i["id"] not in seen]

@@ -15,7 +15,8 @@ FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
-TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "sources")
+TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "gmail_account",
+            "sources")
 SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent"),
     "command": ("name", "type", "argv", "timeout_s"),
@@ -24,6 +25,7 @@ DEFAULTS = {
     "poll_interval_s": 60.0,
     "theme": themes.DEFAULT,
     "bidi_mode": "auto",
+    "gmail_account": 0,
 }
 
 
@@ -83,6 +85,12 @@ def validate(raw):
         problems.append(f"bidi_mode must be one of {', '.join(BIDI_MODES)}")
     else:
         out["bidi_mode"] = bidi
+
+    account = raw.get("gmail_account", DEFAULTS["gmail_account"])
+    if not isinstance(account, int) or isinstance(account, bool) or account < 0:
+        problems.append("gmail_account must be an integer >= 0")
+    else:
+        out["gmail_account"] = account
 
     raw_sources = raw.get("sources")
     if raw_sources is None:

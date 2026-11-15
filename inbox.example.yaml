@@ -12,6 +12,10 @@ theme: dark                # dark | light   (ctrl+t flips it at runtime)
 # $INBOX_BIDI overrides this; the `b` key toggles at runtime.
 bidi_mode: auto
 
+# Gmail links open /mail/u/<N>/: set N to your account's position when it is
+# not the first one signed in to your browser.
+gmail_account: 0
+
 sources:
   # Built-in: state/events.jsonl (plus the .1 rotation), read-only.
   - name: events
