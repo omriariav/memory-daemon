@@ -49,6 +49,12 @@ class Item:
     streamed: bool = False         # UI-only: the draft animation already ran
 
     @property
+    def resolved(self):
+        """A daemon alert whose condition has ended (hidden unless R is on).
+        Only alerts: another source's `meta.resolved` means nothing here."""
+        return self.source == "alert" and self.meta.get("resolved") is True
+
+    @property
     def kind(self):
         """What the main action key does: nudge | reply | ack | fyi."""
         if self.section == "waiting" and "nudge" in self.actions:
@@ -90,7 +96,7 @@ def from_v1(raw):
 # text) and never from markup, so what is copied is what the source sent.
 
 COPY_SEP = " — "
-_MD_SPECIAL = "\\*[]`<"
+_MD_SPECIAL = "\\*_~&[]`<"
 
 
 def item_line(item):

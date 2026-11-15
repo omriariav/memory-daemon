@@ -235,16 +235,14 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     )
 
 
-def _alert_state(item, event, now, max_age_h, recovery):
+def _alert_state(item, now, max_age_h, recovery):
     """Apply the alert rules to one alert item (see docs/inbox.md).
 
-    Resolved (a later success is recorded): fyi, flagged `meta.resolved` so
+    Resolved (the daemon no longer lists the key as active): fyi, flagged `meta.resolved` so
     the UI hides it unless asked. Older than `max_age_h`: fyi, not urgent.
     """
     key = item["meta"].get("key", "")
-    details = event.get("details") if isinstance(event.get("details"), dict) \
-        else {}
-    if key and recovery.resolved(key, details, item["ts"]):
+    if key and recovery.resolved(key, item["ts"]):
         item = dict(item, section="fyi", urgency="digest",
                     meta=dict(item["meta"], resolved=True))
     elif (item["section"] == "urgent"
@@ -274,23 +272,23 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
             continue
         sid = item["meta"].get("source_id") or item["id"]
         prev = latest.get(sid)
-        if prev is None or item["ts"] >= prev[0]["ts"]:
-            latest[sid] = (item, event)
-    recovery = Recovery(base_dir, now)
+        if prev is None or item["ts"] >= prev["ts"]:
+            latest[sid] = item
+    recovery = Recovery(base_dir)
     rows, alerts = [], {}
-    for item, event in latest.values():
+    for item in latest.values():
         if item["source"] == "alert":
             # The newest alert per key wins, whatever its source_id.
             key = item["meta"].get("key")
             if key:
                 prev = alerts.get(key)
-                if prev is None or item["ts"] >= prev[0]["ts"]:
-                    alerts[key] = (item, event)
+                if prev is None or item["ts"] >= prev["ts"]:
+                    alerts[key] = item
                 continue
-            item = _alert_state(item, event, now, alert_max_age_h, recovery)
+            item = _alert_state(item, now, alert_max_age_h, recovery)
         rows.append(item)
-    rows.extend(_alert_state(item, event, now, alert_max_age_h, recovery)
-                for item, event in alerts.values())
+    rows.extend(_alert_state(item, now, alert_max_age_h, recovery)
+                for item in alerts.values())
     rows.sort(key=lambda i: i["ts"], reverse=True)
     newest = max((i["ts"] for i in rows), default=None)
     age = None if newest is None else max((now - newest) / 60.0, 0.0)

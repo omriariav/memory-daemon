@@ -202,11 +202,11 @@ class CopyTextTest(unittest.TestCase):
 
     def test_markdown_escapes_specials_and_encodes_parentheses_in_links(self):
         rows = [self.item(who="*A*", gist="see [x] `y` <b>", link="https://x.test/a_(1)"),
-                self.item(who="Bo", gist="plain_name")]
+                self.item(who="Bo", gist="plain_name ~x~ a&b")]
         self.assertEqual(
             models.copy_section_markdown(rows),
             "- **\\*A\\*** (#ops): see \\[x\\] \\`y\\` \\<b> [link](https://x.test/a_%281%29)\n"
-            "- **Bo** (#ops): plain_name")
+            "- **Bo** (#ops): plain\\_name \\~x\\~ a\\&b")
 
 
 class SettingsTest(unittest.TestCase):

@@ -215,7 +215,7 @@ class InboxApp(App):
         now = time.time()
         shown = [i for i in self.all_rows
                  if i.key not in busy_keys and not self.store.is_hidden(i.key, now)
-                 and (self.show_resolved or not i.meta.get("resolved"))]
+                 and (self.show_resolved or not i.resolved)]
         changed = [i.key for i in shown] != [i.key for i in self.items]
         self.items = shown
         if redraw and changed:
@@ -233,7 +233,7 @@ class InboxApp(App):
         busy_keys = {p.item.key for p in self.pending if not p.done}
         now = time.time()
         return sum(1 for i in self.all_rows
-                   if i.meta.get("resolved") and i.key not in busy_keys
+                   if i.resolved and i.key not in busy_keys
                    and not self.store.is_hidden(i.key, now))
 
     @property
@@ -802,6 +802,7 @@ class InboxApp(App):
                         timeout=3, severity="warning", markup=False)
             return
         self.bidi_mode = "logical" if self.bidi else "visual"
+        self.screen.clear_selection()  # it was made on the other text order
         self.notify(f"Hebrew order: {self.bidi_mode}", timeout=2, markup=False)
         self.items_redraw_all()
 

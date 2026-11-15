@@ -432,6 +432,44 @@ class CopyTest(unittest.IsolatedAsyncioTestCase):
                 cmds["Copy section"].callback()
                 self.assertEqual(clip.call_args[0][0].count("\n"), 1)
 
+    async def test_y_sends_the_osc52_clipboard_escape(self):
+        import base64
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            writes = []
+            if app._driver is not None:
+                real = app._driver.write
+                app._driver.write = lambda data: (writes.append(data), real(data))[1]
+            await pilot.press("j", "y")
+            await pilot.pause(0.1)
+            want = ("\u05e0\u05d5\u05e2\u05d4 \u2014 #\u05db\u05dc\u05dc\u05d9 \u2014 "
+                    "\u05d1\u05d3\u05d9\u05e7\u05d4 [x] *y*")
+            self.assertEqual(app._clipboard, want)
+            osc = [w for w in writes if w.startswith("\x1b]52;c;")]
+            if app._driver is not None:
+                self.assertEqual(len(osc), 1)
+                payload = osc[0][len("\x1b]52;c;"):-1]
+                self.assertEqual(base64.b64decode(payload).decode("utf-8"), want)
+
+    async def test_toggling_bidi_clears_a_mouse_selection(self):
+        thread = [{"who": "Ann", "ts": time.time(), "text": "hello world"}]
+        app, _, _ = make_app([item(1, "urgent", "slack", thread=thread)],
+                             settings=dict(DEFAULTS))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.mouse_down("#thread-body", offset=(0, 2))
+            await pilot.hover("#thread-body", offset=(8, 2))
+            await pilot.mouse_up("#thread-body", offset=(8, 2))
+            await pilot.pause(0.1)
+            self.assertTrue(app.screen.get_selected_text())
+            with mock.patch("workspace_daemon.inbox.app.bidi.available",
+                            return_value=True):
+                await pilot.press("b")
+            await pilot.pause(0.1)
+            self.assertEqual(app.bidi_mode, "visual")
+            self.assertFalse(app.screen.get_selected_text())
+
     async def test_copy_is_logical_text_even_in_visual_bidi_mode(self):
         cfg = dict(DEFAULTS, bidi_mode="visual")
         app, _, _ = make_app(self.rows(), settings=cfg)
@@ -515,6 +553,30 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("R")
             await pilot.pause(0.1)
             self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:3"])
+
+    async def test_header_counts_hidden_resolved_alerts(self):
+        app, _, _ = make_app(self.rows())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            header = lambda: str(app.query_one("#hdr").render())
+            self.assertIn("\u2713 1 resolved (R)", header())
+            await pilot.press("R")
+            await pilot.pause(0.1)
+            self.assertNotIn("resolved (R)", header())
+            rows = app.query_one("#queue", Queue).rows
+            line = app.query_one("#queue", Queue)._row(
+                rows[1], 60, app.pal, time.time(), False)   # t:2, resolved
+            self.assertIn(" \u2713 ", line.plain)
+
+    async def test_only_alert_items_can_be_resolved(self):
+        rows = [item(1, "fyi", "alert", meta={"resolved": True}),
+                item(2, "fyi", "calendar", meta={"resolved": True}),
+                item(3, "fyi", "alert", meta={"resolved": "yes"})]
+        app, _, _ = make_app(rows)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(sorted(i.key for i in app.items), ["t:2", "t:3"])
+            self.assertEqual(app.resolved_hidden, 1)
 
     async def test_a_resolved_alert_never_counts_as_urgent(self):
         app, _, _ = make_app(self.rows())

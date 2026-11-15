@@ -143,13 +143,14 @@ class SnoozePicker(ModalScreen):
 
 
 HELP = [
-    ("Move", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
-              ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"), ("esc", "clear filters / back")]),
+    ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
+              ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"),
+              ("R", "show / hide resolved alerts"), ("esc", "clear filters / back")]),
     ("Act", [("a", "approve draft (confirm first) / ack"), ("e", "edit draft  (esc / ctrl+s done)"),
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
     ("Copy", [("y", "copy this item (sender, where, gist, link)"), ("Y", "copy every item in this section"),
-              ("R", "show / hide resolved alerts"), ("ctrl+p", "palette: copy section as Markdown"),
+              ("ctrl+p", "palette: copy section as Markdown"),
               ("mouse drag", "select text in the thread or draft pane")]),
     ("App", [("ctrl+p", "command palette"), ("ctrl+t", "dark / light theme"), ("L", "audit log"),
              ("b", "toggle Hebrew order (logical/visual)"), ("?", "this help"), ("q", "quit")]),

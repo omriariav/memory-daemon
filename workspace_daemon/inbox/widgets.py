@@ -152,7 +152,7 @@ class Queue(OptionList):
         if it.kind == "nudge" and it.draft:
             age = "⏰ " + age
         mark = "●" if urgent else ("↻" if it.kind == "nudge" else ("·" if it.kind == "fyi" else "○"))
-        resolved = bool(it.meta.get("resolved"))
+        resolved = it.resolved
         if resolved:
             mark = "✓"
         t = Text(no_wrap=True, overflow="ellipsis")

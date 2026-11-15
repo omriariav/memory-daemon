@@ -144,31 +144,28 @@ alert (`daemon` kind `alert`), after the urgent rules above:
    shows beside it.
 2. **Age.** An alert older than `alert_urgent_max_age_h` (default 6, range 1
    to 168) drops to `fyi`/`digest`. It stays listed until `window_h` passes.
-3. **Recovery.** An alert whose condition has since ended is *resolved*: it is
+3. **Recovery.** An alert whose condition has ended is *resolved*: it is
    `fyi`, carries `meta.resolved: true`, and is hidden unless `R` is on
    (`R` toggles "show resolved"; the header counts the hidden ones). Resolved
-   rows show a green check.
-   - `attention:<routine>`: resolved when the run log (`logs/run.log`, read
-     the way `status` reads it) shows the routine's latest result as `ok` and
-     later than the alert. This record exists for every routine kind,
-     maintenance routines (calendar-cache, sheet-watch) included, because it
-     comes from the scheduler tick and not from the capture ledger. Only
-     alerts whose `details.issues` are tick-derived (`last run`, `N last-run
-     errors`, `incomplete`, `overlap`) resolve this way; an alert about the
-     ledger (`memory sink`, `source expansion`, `Gmail triage`, `meeting
-     match`) is not proven fixed by a clean tick, so it only ages out.
-   - `connector:<server>`: resolved when `state/claude-usage.jsonl` holds a
-     successful call that used that connector, later than the alert.
-   - Every other key (`budget-*`, `hold:*`, `usage-unreadable`) has no
-     recovery signal: age rule only.
+   rows show a green check. Only `alert` items can be resolved; a command
+   source's own `meta.resolved` hides nothing.
 
-Recovery is read-only and best effort. A missing file, an unfamiliar shape (a
-different daemon version) or any read error means "unknown", and the alert
-keeps only the age rule. Limits: a routine whose latest tick result is
-something other than `ok` (a later `skipped`, `paused`, `incomplete` or
-`error`) is not resolved, because only the latest result per routine is
-kept; and both logs are read in full on each poll that has an alert needing
-them.
+   The signal is the daemon's own record of active alerts,
+   `state/alerts.json` (key to time sent, or `{"pending": time}`).
+   `alerts.check` drops a key on the first tick that finds its condition
+   cleared, for every key kind (`attention:`, `interrupted:`, `connector:`,
+   `budget-*`, `hold:`, ...) and every routine kind, maintenance routines
+   such as calendar-cache and sheet-watch included. An alert is resolved only
+   when its key is **no longer listed** there. A key that is still listed is
+   active even if the problem changed (a last-run error that became a memory
+   sink issue keeps its key), so it is never resolved early. The run log and
+   the usage log are not consulted.
+
+Recovery is read-only and best effort. A missing, unreadable, oversized or
+unfamiliar `alerts.json` (a different daemon version), or one last written
+before the alert (a copied file, a clock jump), means "unknown", and the alert
+keeps only the age rule. Limit: an alert is resolved on the poll after the
+daemon's next tick that drops the key, so it can lag by a tick.
 
 ## Local state
 
