@@ -10,7 +10,7 @@ from workspace_daemon import config, llm, memory_sink, runner, state, whisper_so
 
 
 MEET_BASE = (
-    "2026-08-03-15-25-36-Value-reflection-product-strategy-brief"
+    "2026-08-03-15-25-36-Weekly-planning-sync-notes"
     "---2026_02_18-13_03-IST---Recording-9abaf3"
 )
 LEGACY_MEET_BASE = (
@@ -74,10 +74,10 @@ class WhisperSourceTest(unittest.TestCase):
         self.assertEqual(
             raw["source_id"],
             "whisper:meet:2026-02-18T13-03:"
-            "value-reflection-product-strategy-brief",
+            "weekly-planning-sync-notes",
         )
         self.assertEqual(
-            found[0]["title"], "Value reflection product strategy brief"
+            found[0]["title"], "Weekly planning sync notes"
         )
 
     def test_meet_name_variants_converge_on_one_identity(self):
@@ -141,7 +141,7 @@ class WhisperSourceTest(unittest.TestCase):
     def test_rerun_of_same_recording_keeps_one_candidate_same_memory(self):
         self.write(f"{MEET_BASE}-he.txt")
         rerun_base = (
-            "2026-08-05-10-00-00-Value-reflection-product-strategy-brief"
+            "2026-08-05-10-00-00-Weekly-planning-sync-notes"
             "---2026_02_18-13_03-IST---Recording-0aa9fe"
         )
         self.write(f"{rerun_base}-he.txt", "תמלול מתוקן ומלא יותר.")
@@ -221,7 +221,7 @@ class WhisperSourceTest(unittest.TestCase):
             },
             {
                 "id": "covering",
-                "summary": "Value Reflection - product strategy brief",
+                "summary": "Weekly Planning - sync notes",
                 "start": "2026-02-18T13:00:00+02:00",
                 "end": "2026-02-18T13:30:00+02:00",
                 "attendees": [{"email": "owner@example.com"}],
@@ -248,7 +248,7 @@ class WhisperSourceTest(unittest.TestCase):
         candidate = whisper_source.candidates(src)[0]
         events = [{
             "id": "EVENT",
-            "summary": "Value Reflection",
+            "summary": "Weekly Planning",
             "start": "2026-02-18T13:00:00+02:00",
             "end": "2026-02-18T13:30:00+02:00",
             "organizer": {"email": "owner@example.com"},
@@ -295,7 +295,7 @@ class WhisperSourceTest(unittest.TestCase):
              ):
             accepted, match = whisper_source.match_calendar(rt, src, item)
         self.assertTrue(accepted)
-        self.assertEqual(item["title"], "Value Reflection")
+        self.assertEqual(item["title"], "Weekly Planning")
         meta = item["frontmatter"]
         self.assertEqual(meta["calendar_event_id"], "EVENT")
         self.assertEqual(
