@@ -468,7 +468,12 @@ HUB_DOC_LEAD_SECONDS = 60 * 60
 
 _DOC_URL = re.compile(r"https?://[\w.-]*zoom[\w.-]*/doc/([A-Za-z0-9_-]{10,40})")
 _TIME_KEY = re.compile(r"time|date|modified|created|updated", re.IGNORECASE)
-_CREATED_KEY = re.compile(r"creat", re.IGNORECASE)
+# A created-time key: created, create_time, created_at, creation_date, ...
+# Not `creator` or `created_by`, whose values are names.
+_CREATED_KEY = re.compile(
+    r"creat(?:e|ed|ion)?[_-]?(?:time|date|at|datetime|timestamp)?",
+    re.IGNORECASE)
+_DATE_SHAPED = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PY_STR = (
     r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
 )
@@ -496,8 +501,9 @@ def hub_doc_matches(text, title, start, end, grace, skipped=None):
     `title` is compared by exact case-folded name. A hit must carry a
     timezone-aware ISO timestamp inside
     [start - HUB_DOC_LEAD_SECONDS, end + grace] (`grace` in seconds). When the
-    hit has a created-type key, only its timestamp counts; modified/updated
-    times are the fallback when there is none. A title match without a usable
+    hit has a created-time key (see `_CREATED_KEY`) holding a date-shaped
+    value, only that counts; modified/updated times are the fallback when
+    there is none. Name-valued keys such as `creator` are ignored. A title match without a usable
     timestamp is never accepted; its doc id is appended to `skipped` (when
     given) and logged.
     """
@@ -524,20 +530,18 @@ def hub_doc_matches(text, title, start, end, grace, skipped=None):
         if not any(_norm_title(n) == wanted for n in names):
             continue
         created = [
-            _epoch(v) for k, v in row.items()
-            if isinstance(v, str) and _CREATED_KEY.search(k)
+            v for k, v in row.items()
+            if isinstance(v, str) and _CREATED_KEY.fullmatch(k)
+            and _DATE_SHAPED.match(v)
         ]
-        if any(
-            isinstance(v, str) and _CREATED_KEY.search(k)
-            for k, v in row.items()
-        ):
-            stamps = [t for t in created if t is not None]
+        if created:
+            stamps = [_epoch(v) for v in created]
         else:
             stamps = [
                 _epoch(v) for k, v in row.items()
                 if isinstance(v, str) and _TIME_KEY.search(k)
             ]
-            stamps = [t for t in stamps if t is not None]
+        stamps = [t for t in stamps if t is not None]
         if not stamps:
             log(f"zoom hub: skipping doc {doc_id}: title matches but it has "
                 "no usable timestamp")

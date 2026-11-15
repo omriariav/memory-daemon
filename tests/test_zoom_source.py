@@ -482,6 +482,29 @@ class HubParsingTest(unittest.TestCase):
         self.assertEqual(self.match(naive, skipped=skipped), [])
         self.assertEqual(skipped, [DOC_ID])
 
+    def test_name_valued_creator_keys_are_not_created_times(self):
+        inside = iso(T0 + datetime.timedelta(minutes=10))
+        last_week = iso(T0 - datetime.timedelta(days=7))
+        base = {"name": "Weekly sync",
+                "url": f"https://docs.example.zoom.us/doc/{DOC_ID}"}
+
+        def hit(**extra):
+            return json.dumps({"data": [dict(base, **extra)]})
+        self.assertEqual(self.match(hit(
+            creator="Ann Example", creator_name="Ann Example",
+            modified_time=inside)), [DOC_ID])
+        self.assertEqual(self.match(hit(
+            created_by="Ann Example", created_time=last_week,
+            modified_time=inside)), [])
+        self.assertEqual(self.match(hit(
+            created_by="Ann Example", created_time=inside)), [DOC_ID])
+        for key in ("created_at", "createTime", "creation_date", "created"):
+            self.assertEqual(self.match(hit(
+                **{key: last_week, "modified_time": inside})), [], key)
+        # A temporal key holding a non-date value is ignored.
+        self.assertEqual(self.match(hit(
+            created="yesterday", modified_time=inside)), [DOC_ID])
+
     def test_other_titles_and_bad_json_never_match(self):
         when = iso(T0 + datetime.timedelta(minutes=10))
         self.assertEqual(self.match(search_result("Other", when)), [])
