@@ -1,0 +1,29 @@
+# Known false positives for tools/privacy_check.py. Every entry here must be
+# clearly fake, generic or public; a real address or id never belongs here.
+# Syntax: TOKEN | re:REGEX (whole match) | path-glob :: TOKEN-or-re:REGEX
+
+# Invented Slack-style ids used by fixtures and docs (C0EXAMPLE01, U0EXAMPLEA...)
+re:[CUGW]0EXAMPLE[A-Z0-9]*
+re:[CUGW]0(?:123|234|456|789)[A-Z0-9]*
+CSECRET123
+# An emoji code point and plain uppercase words that fit the id shape
+U0001F44D
+CANDIDATE
+CEXTERNAL
+CONNECTOR
+GUARDRAILS
+UNCONFIRMED
+USLACKBOT
+
+# Public service senders and invented addresses in docs and fixtures, scoped
+# to the files that use them so a real address elsewhere is still flagged.
+gemini-notes@google.com
+re:[\w.+-]*@(?:[\w-]+\.)*calendar\.google\.com
+tests/test_calendar_cache.py :: re:[\w.+-]+@(?:google\.com|evil\.org|evil-example\.com|notexample\.com|example\.com\.evil\.org)
+tests/test_calendar_cache.py :: c@d.example.org
+tests/test_first_names.py :: re:(?:me|owner|ada\.lovelace)@gmail\.com
+tests/test_gmail_mcp.py :: re:ann@(?:example\.co|example-com\.net)
+tests/test_gmail_mcp.py :: re:token="05464679278938702803".*
+tests/test_identity.py :: re:(?:a@b\.co|alice\.smith@example\.com\.org)
+README.md :: re:alice@(?:acme|corp)\.com
+daemon.py :: x@y.com

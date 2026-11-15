@@ -2972,6 +2972,7 @@ workspace_daemon/
   runner.py                the run loop
 routines/                  one YAML per routine (yours are gitignored)
 launchd/                   capture, maintenance + calendar LaunchAgent templates
+tools/                     validate_examples.py, privacy_check.py (+ privacy_allowlist.txt)
 state/  logs/              runtime, gitignored
 ```
 
@@ -3026,6 +3027,17 @@ lock files while their work is running.
 python3 -m unittest discover -s tests   # no gws/yoetz needed
 python3 -m pyflakes daemon.py workspace_daemon/ tests/ tools/
 python3 tools/validate_examples.py      # the shipped template and examples
+python3 tools/privacy_check.py          # tracked files: emails, Slack-style ids, secrets
+```
+
+`tools/privacy_check.py` keeps real data out of this public repo. Besides the
+generic scan (false positives go in `tools/privacy_allowlist.txt`) it reads an
+optional **local** denylist at `~/.config/memory-daemon/private-denylist.txt`
+(one term per line, or `re:<regex>`; never committed) and fails on any match
+without printing the term. Install it as a pre-commit hook once per clone:
+
+```sh
+printf '#!/bin/sh\nexec python3 tools/privacy_check.py --staged\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 ```
 
 Every case in the suite is a bug that actually shipped and was caught in review:

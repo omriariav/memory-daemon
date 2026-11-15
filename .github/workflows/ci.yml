@@ -49,3 +49,8 @@ jobs:
         # Check them directly, or the documented examples silently rot out of
         # sync with the schema whenever validation changes.
         run: python tools/validate_examples.py
+
+      - name: Privacy scan
+        # Real-looking emails, Slack-style ids and secrets in tracked files.
+        # False positives go in tools/privacy_allowlist.txt, never real data.
+        run: python tools/privacy_check.py
