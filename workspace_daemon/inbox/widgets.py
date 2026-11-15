@@ -241,6 +241,8 @@ class StatusHeader(Static):
         if app.demo:
             left.append(" demo ", Style(color=pal["bg"], bgcolor=pal["warn"], bold=True))
         left.append(f"  {n_open} open", Style(color=pal["fg"]))
+        if getattr(app, "show_all", False):
+            left.append(" all ", Style(color=pal["bg"], bgcolor=pal["accent"], bold=True))
         if n_urg:
             left.append(f"  ● {n_urg} urgent", Style(color=pal["urgent"], bold=True))
         hidden = app.resolved_hidden

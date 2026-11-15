@@ -7,6 +7,36 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+Read-side features only: nothing new is written or sent. RSVP and save
+actions are planned for 0.3.0; pending invites already carry the event and
+calendar ids such an action needs.
+
+### Added
+
+- Show all (`A`): a `command` source that declares `supports_all: true` is
+  called as `<argv> list --all` while the toggle is on. Sources that do not
+  declare it never receive `--all`. The header shows `all`; off by default,
+  per session, never saved. In the footer, help overlay and palette.
+- Pending calendar invites: upcoming events whose RSVP is `needsAction` appear
+  under Needs reply (source `calendar`) with the title, the time in local time
+  and the organizer, read from the calendar cache's snapshot
+  (`state/calendar-snapshot.json`) without touching the network. Declined,
+  accepted, tentative and cancelled events never show. `meta` carries
+  `event_id` and `calendar_id`. Actions: `ack` (hide locally) and `open`
+  (the meeting link, when the cache has a safe http(s) one). New setting
+  `invites_days` on the events source (default 7, 0 turns it off).
+- Mail label filter: new events-source setting `email_require_label`
+  (default off). When set, only mail captured by a Gmail routine whose search
+  query requires that label becomes an email item. See docs/inbox.md for what
+  this does and does not prove.
+- Saved view (`S`): a read-only list of what the daemon saved to memory
+  recently (capture events of kind `new` or `update`), with the source glyph,
+  title, time and kind; `o` opens a link, `esc` returns. New setting
+  `saved_days` on the events source (default 2). Saved rows are not inbox
+  items and cannot be acted on.
+
 ## [0.1.0] - 2026-11-15
 
 First versioned release: the inbox as merged in PR #128, plus the copy keys

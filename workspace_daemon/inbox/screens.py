@@ -18,6 +18,8 @@ from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi
+from .models import SOURCES
+from .widgets import fit, fmt_age, palette, vis
 
 
 class ConfirmSend(ModalScreen):
@@ -145,7 +147,10 @@ class SnoozePicker(ModalScreen):
 HELP = [
     ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
               ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"),
-              ("R", "show / hide resolved alerts"), ("esc", "clear filters / back")]),
+              ("R", "show / hide resolved alerts"),
+              ("A", "show all: ask sources that support it for everything"),
+              ("S", "saved: what the daemon saved to memory (read-only)"),
+              ("esc", "clear filters / back")]),
     ("Act", [("a", "approve draft (confirm first) / ack"), ("e", "edit draft  (esc / ctrl+s done)"),
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
@@ -205,6 +210,67 @@ class AuditScreen(ModalScreen):
         if not self.rows:
             tb.add_row("", Text("no actions yet"), "", "", "")
         tb.focus()
+
+    def action_close(self):
+        self.dismiss(None)
+
+
+class SavedScreen(ModalScreen):
+    """What the daemon saved to memory recently. Read-only: these rows are not
+    inbox items, so nothing here can be acted on except opening a link."""
+
+    BINDINGS = [Binding("escape,S,q", "close", "Close"), Binding("o", "open", "Open"),
+                Binding("j", "cursor(1)", show=False), Binding("k", "cursor(-1)", show=False)]
+
+    def __init__(self, rows, error=None, days=None, visual=False, opener=None):
+        super().__init__()
+        self.rows, self.error, self.days = rows, error, days
+        self.visual, self.opener = visual, opener
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append("Saved to memory", Style(bold=True))
+        span = f"  last {self.days:g} days" if self.days else ""
+        head.append(f"{span}  ·  o open  ·  esc back  (read-only)", Style(dim=True))
+        with Vertical(id="saved"):
+            yield Static(head, id="saved-title")
+            yield DataTable(id="saved-table", cursor_type="row", zebra_stripes=True)
+
+    def on_mount(self):
+        pal = palette(self.app)
+        now = time.time()
+        tb = self.query_one("#saved-table", DataTable)
+        tb.add_columns("", "Title", "Time", "Kind")
+        for row in self.rows:
+            glyph, color, _label = SOURCES.get(row["source"], SOURCES["other"])
+            when = dt.datetime.fromtimestamp(row["ts"]).strftime("%a %H:%M")
+            tb.add_row(Text(glyph, Style(color=pal[color], bold=True)),
+                       Text(fit(vis(row["title"], self.visual), 90)),
+                       Text(f"{when}  {fmt_age(now - row['ts'])} ago"),
+                       Text(row["kind"]), key=row["id"])
+        if not self.rows:
+            msg = self.error or "nothing saved in this period"
+            tb.add_row("", Text(msg, Style(italic=True)), "", "")
+        tb.focus()
+
+    def _current_row(self):
+        tb = self.query_one("#saved-table", DataTable)
+        if not self.rows or tb.row_count == 0:
+            return None
+        index = tb.cursor_row
+        return self.rows[index] if 0 <= index < len(self.rows) else None
+
+    def action_cursor(self, step):
+        tb = self.query_one("#saved-table", DataTable)
+        tb.action_cursor_down() if step > 0 else tb.action_cursor_up()
+
+    def action_open(self):
+        row = self._current_row()
+        if row is None or not row.get("link"):
+            self.notify("This row has no link", timeout=2, markup=False)
+            return
+        if self.opener is not None:
+            self.opener(row)
 
     def action_close(self):
         self.dismiss(None)

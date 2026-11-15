@@ -19,7 +19,8 @@ if HAVE_TEXTUAL:
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.demo import DemoSource
     from workspace_daemon.inbox.screens import (ConfirmSend, HelpScreen,
-                                                SnoozePicker, parse_snooze)
+                                                SavedScreen, SnoozePicker,
+                                                parse_snooze)
     from workspace_daemon.inbox.store import InboxStore
     from workspace_daemon.inbox.widgets import Queue
 
@@ -712,6 +713,266 @@ class SnoozeParseTest(unittest.TestCase):
         self.assertGreater(parse_snooze("17:30", now), now)
         for bad in ("", "soon", "25:00", "12:99", "-5m"):
             self.assertIsNone(parse_snooze(bad, now), bad)
+
+
+
+class AllAwareFetch:
+    """A fetch() that takes `show_all`; records each call and adds one item
+    only while the toggle is on."""
+
+    def __init__(self, extra=None):
+        self.calls = []
+        self.extra = extra or []
+
+    def __call__(self, show_all=False):
+        self.calls.append(show_all)
+        rows = [item(1, "fyi", "calendar")] + (self.extra if show_all else [])
+        return [sources.SourceResult("t", rows, False, None, None)]
+
+
+SAVED_ROWS = [
+    {"id": "s1", "source": "slack", "kind": "update", "ts": time.time() - 600,
+     "title": "Launch checklist thread", "link": None, "source_id": "slack:C1:1"},
+    {"id": "s2", "source": "email", "kind": "new", "ts": time.time() - 3600,
+     "title": "Contract terms [b]x[/b]", "link": "https://example.com/mail/1",
+     "source_id": "gmail:abcdef0123456789"},
+]
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ShowAllKeyTest(unittest.IsolatedAsyncioTestCase):
+    def make(self, fetch):
+        store = InboxStore(None)
+        return InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
+                        dict(DEFAULTS), undo_s=0.15, leave_s=0, stream_delay=0), store
+
+    async def wait_polls(self, pilot, fetch, n):
+        for _ in range(200):
+            if len(fetch.calls) >= n and not pilot.app.polling:
+                break
+            await pilot.pause(0.02)
+        await pilot.pause(0.2)
+
+    async def test_off_by_default_then_a_toggles_and_repolls(self):
+        fetch = AllAwareFetch(extra=[item(2, "urgent", "slack", actions=("ack",))])
+        app, _ = self.make(fetch)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual((fetch.calls, app.show_all), ([False], False))
+            self.assertNotIn(" all ", str(app.query_one("#hdr").render()))
+            await pilot.press("A")
+            await self.wait_polls(pilot, fetch, 2)
+            self.assertEqual((fetch.calls, app.show_all), ([False, True], True))
+            self.assertIn(" all ", str(app.query_one("#hdr").render()))
+            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:2"])
+            await pilot.press("A")
+            await self.wait_polls(pilot, fetch, 3)
+            self.assertEqual(fetch.calls, [False, True, False])
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+            self.assertNotIn(" all ", str(app.query_one("#hdr").render()))
+
+    async def test_items_revealed_by_all_do_not_raise_urgent_alerts(self):
+        fetch = AllAwareFetch(extra=[item(2, "urgent", "slack", actions=("ack",))])
+        app, _ = self.make(fetch)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(app, "bell") as bell:
+                await pilot.press("A")
+                await self.wait_polls(pilot, fetch, 2)
+                bell.assert_not_called()
+
+    async def test_toggle_during_a_poll_polls_again_with_the_new_state(self):
+        gate = threading.Event()
+        calls = []
+
+        def slow(show_all=False):
+            calls.append(show_all)
+            if len(calls) == 1:
+                gate.wait(5)
+            return [sources.SourceResult("t", [item(1)], False, None, None)]
+
+        app, _ = self.make(slow)
+        async with app.run_test(size=SIZE) as pilot:
+            for _ in range(100):
+                if calls:
+                    break
+                await pilot.pause(0.02)
+            await pilot.press("A")      # first poll is still running
+            gate.set()
+            for _ in range(200):
+                if len(calls) >= 2 and not app.polling:
+                    break
+                await pilot.pause(0.02)
+            self.assertEqual(calls, [False, True])
+
+    async def test_a_plain_fetch_without_show_all_still_works(self):
+        app, _, _ = make_app([item(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("A")
+            await pilot.pause(0.4)
+            self.assertTrue(app.show_all)
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+
+    async def test_real_collect_passes_all_only_to_declaring_sources(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "calls.log"
+            script = Path(tmp) / "src.py"
+            script.write_text(
+                "import json, sys\n"
+                f"open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "print(json.dumps({'v': 1, 'items': []}))\n")
+            argv = [sys.executable, str(script)]
+            cfg = settings.validate({"sources": [
+                {"name": "p", "type": "command", "argv": argv + ["p"]},
+                {"name": "w", "type": "command", "argv": argv + ["w"],
+                 "supports_all": True}]})
+
+            def fetch(show_all=False):
+                return sources.collect(cfg, Path(tmp), show_all=show_all)
+
+            app, _ = self.make(fetch)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("A")
+                for _ in range(200):
+                    if log.read_text().count("\n") >= 4 and not app.polling:
+                        break
+                    await pilot.pause(0.05)
+            lines = log.read_text().split("\n")
+            self.assertCountEqual([l for l in lines if l], [
+                "p list", "w list", "p list", "w list --all"])
+
+    async def test_footer_help_and_palette_list_the_new_keys(self):
+        app, _, _ = make_app([item(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn(("A", "all"), app.hints())
+            self.assertIn(("S", "saved"), app.hints())
+            await pilot.press("question_mark")
+            await pilot.pause(0.1)
+            body = str(app.screen.query_one("#help-body").render())
+            self.assertIn("show all", body)
+            self.assertIn("saved", body)
+            await pilot.press("escape")
+            cmds = [c.title for c in app.get_system_commands(app.screen)]
+            self.assertIn("Show all (toggle)", cmds)
+            self.assertIn("Saved to memory", cmds)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
+    def make(self, rows=None, error=None):
+        store = InboxStore(None)
+        actions = FakeActions(store=store, draft_delay=0)
+        saved = None if rows is None and error is None else (lambda: (rows or [], error))
+        app = InboxApp(Fixed([item(1, "fyi", "calendar")]), store, actions,
+                       dict(DEFAULTS), undo_s=0.15, leave_s=0, stream_delay=0,
+                       saved=saved, saved_days=2)
+        return app, store, actions
+
+    async def test_s_lists_rows_and_esc_returns(self):
+        app, _, _ = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, SavedScreen)
+            table = app.screen.query_one("#saved-table")
+            self.assertEqual(table.row_count, 2)
+            cells = [[str(c) for c in table.get_row_at(n)] for n in range(2)]
+            self.assertEqual(cells[0][0], "#")                 # Slack glyph
+            self.assertEqual(cells[0][1], "Launch checklist thread")
+            self.assertEqual(cells[0][3], "update")
+            self.assertEqual(cells[1][0], "✉")
+            self.assertEqual(cells[1][1], "Contract terms [b]x[/b]")  # literal
+            self.assertEqual(cells[1][3], "new")
+            self.assertRegex(cells[0][2], r"\d\d:\d\d")
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertNotIsInstance(app.screen, SavedScreen)
+            self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_o_opens_the_link_and_a_row_without_one_says_so(self):
+        app, _, actions = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            await pilot.press("o")            # first row: no link
+            await pilot.pause(0.1)
+            self.assertEqual([c for c in actions.calls if c[0] == "open"], [])
+            await pilot.press("j", "o")       # second row: has a link
+            await pilot.pause(0.1)
+            self.assertEqual([c[0] for c in actions.calls if c[0] == "open"], ["open"])
+            self.assertIn("open", [r["action"] for r in app.audit])
+
+    async def test_saved_rows_are_never_actionable(self):
+        app, store, actions = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            before = app.current_key
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            await pilot.press("a", "d", "s", "n", "e", "y", "u")
+            await pilot.pause(0.2)
+            self.assertIsInstance(app.screen, SavedScreen)   # nothing dismissed it
+            self.assertEqual(app.pending, [])
+            self.assertEqual(store.marks, {})
+            self.assertEqual([c for c in actions.calls
+                              if c[0] not in ("draft",)], [])
+            await pilot.press("S")            # S closes it too
+            await pilot.pause(0.2)
+            self.assertEqual(len(app.screen_stack), 1)
+            self.assertEqual(app.current_key, before)
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+
+    async def test_empty_and_error_states(self):
+        app, _, _ = self.make([], None)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            table = app.screen.query_one("#saved-table")
+            self.assertIn("nothing saved", str(table.get_row_at(0)[1]))
+            await pilot.press("o")            # nothing to open: no crash
+            await pilot.pause(0.1)
+            await pilot.press("escape")
+        app, _, _ = self.make([], "cannot read events: denied")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIn("denied", str(app.screen.query_one("#saved-table").get_row_at(0)[1]))
+
+    async def test_a_failing_reader_does_not_end_the_session(self):
+        store = InboxStore(None)
+
+        def boom():
+            raise RuntimeError("nope")
+
+        app = InboxApp(Fixed([item(1)]), store, FakeActions(store=store),
+                       dict(DEFAULTS), leave_s=0, stream_delay=0, saved=boom)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, SavedScreen)
+
+    async def test_without_a_reader_s_only_says_so(self):
+        app, _, _ = self.make()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.2)
+            self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_demo_has_saved_rows(self):
+        from workspace_daemon.inbox.demo import demo_saved
+        rows, err = demo_saved()
+        self.assertIsNone(err)
+        self.assertGreaterEqual(len(rows), 3)
 
 
 if __name__ == "__main__":

@@ -78,10 +78,16 @@ argument is expanded):
   `{"v": 1, "items": [...], "stale": bool, "age_min": number|null, "error": str|null}`.
   `stale` says the source's own data is old; `age_min` is how old; `error` is
   a message the UI shows without hiding the items.
+- `<argv...> list --all` is the same call with one optional flag: "list
+  everything, not just what is open" (handled and older items too). The inbox
+  sends `--all` only while the `A` toggle is on **and** the source declares
+  `supports_all: true` in `inbox.yaml`. A source that does not declare it
+  never receives `--all`, so existing sources need no change. A source that
+  declares it must accept the flag and print the same JSON.
 - `<argv...> act` reads `{"v": 1, "action": str, "id": str, "meta": object, "text"?: str}`
   on stdin and prints `{"ok": bool, "message": str}`.
 
-Phase 1 calls only `list`, with the configured timeout, stdin closed, in its
+Phase 1 calls only `list` (with `--all` as above), with the configured timeout, stdin closed, in its
 own process group (killed whole on timeout). stdout is read in chunks and the
 group is killed as soon as it passes 4 MB; only the last 64 KB of stderr are
 kept, so a chatty source cannot exhaust memory. `timeout_s` must be below
@@ -127,6 +133,39 @@ event that was created, then updated, appears once.
 item with a null `link`, whatever a source says). Today only Gmail events have
 one, so the other rows are `ack` only.
 
+### Pending calendar invites
+
+Upcoming events whose RSVP is not yet answered (`needsAction`) are listed under
+**Needs reply** as `calendar` items, one row per invite (a recurring series is
+one row, at its next instance). They are read from the calendar cache, never
+from the network:
+
+- `<base>/state/calendar-snapshot.json` (written by the `calendar_cache`
+  routine, `{"v": 1, "fetched_at", "window_hours", "events": {id: row}}`):
+  `my_rsvp`, `status`, `start`, `end`, `title` and `conference` of each event.
+- The cache's JSON twin (the routine's `output` path with a `.json` suffix),
+  for the organizer's name, which the snapshot lacks. It covers only the
+  shorter output window (`window_hours`, 48 by default), so an invite further
+  out shows without an organizer.
+- The `calendar_cache` routine's config under `<base>/routines/` for its
+  `calendar_id` (default `primary`).
+
+An invite is shown when `my_rsvp` is `needsAction`, its status is not
+`cancelled`, it has not ended and it starts before now plus `invites_days`
+(default 7). Accepted, tentative, declined and organizer rows never show. The
+window cannot reach past what the snapshot covers (`events_window_days` of the
+routine, 7 by default); asking for more adds a note to the source's status.
+Times are shown in the machine's local time zone. The row is `sender` = the
+organizer (or "calendar invite"), `where` = "invite", and a gist of
+`<title> - <when> - from <organizer>`. `meta` is
+`{"kind": "invite", "event_id", "calendar_id", "series", "my_rsvp", "start",
+"source_id"}` so a later RSVP action has what it needs. Actions: `ack` (hides
+the row locally) and `open` (the meeting link from the cache, only when it is a
+plain http(s) URL; otherwise there is no `open`). Titles and organizers are
+untrusted display text. A missing cache means no invites and no error; an
+unreadable or unfamiliar one is a source error (`events.invites`) and a cache
+older than 6 hours marks the source stale.
+
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
 `gmail:<thread>`, `gmail:<thread>:followup-open` or `gmail:<thread>@<message>`)
@@ -136,6 +175,38 @@ events have no link yet.
 Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
+
+### Mail label filter
+
+`email_require_label: MY_LABEL` (events source, default off) keeps only the
+Gmail events that were captured through that label.
+
+The event stream does not record a thread's labels, nor whether a capture came
+from a `saved_request` routine (`details` is empty for Gmail events), and the
+inbox never calls Gmail. So the filter works from what the daemon *does* keep:
+each event names its `routine`, and the routine's config holds its search
+query. The inbox reads `<base>/routines/*.yaml` and accepts a Gmail event only
+when its routine is a `gmail_mcp` routine whose `query` is a plain conjunction
+with a positive `label:MY_LABEL` term (case-insensitive; no `OR`, braces or
+parentheses, and `-label:MY_LABEL` does not count). Every thread such a routine
+captured matched the query, so it carried the label when it was captured.
+
+What it does not prove: the label is checked at capture time, not now (removing
+the label later changes nothing), and a routine whose query selects the label
+in another way (a label id, a union) does not match. If no routine matches,
+no mail is shown and the source's status says why. Showing the live labels, or
+the `saved_request` flag, per event would need the capture to record them in
+`details`.
+
+### Saved view
+
+`S` opens a read-only list of what the daemon saved to memory in the last
+`saved_days` days (default 2): capture events (kind `new` or `update` with a
+memory id) from `events.jsonl`, newest first, one row per saved item (the
+newest capture of a `source_id` wins). Each row shows the source glyph, title,
+time and kind. `o` opens the link when the row has one (Gmail threads);
+`esc` (or `S`) returns to the inbox. Saved rows are not inbox items: no
+marks, no actions, nothing is written.
 
 ### Stale and recovered alerts
 
@@ -204,7 +275,20 @@ defaults; a broken one prints every problem and exits 2.
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
-| `sources` | the `events` source | list of `type: events` (`window_h`, `urgent` rules) and `type: command` (`argv` list, `timeout_s` 1 to 120) |
+| `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
+
+The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
+and:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `invites_days` | `7` | 0 to 60: show unanswered calendar invites starting within this many days (0 turns them off; see "Pending calendar invites") |
+| `saved_days` | `2` | 1 to 30: how far back the Saved view (`S`) looks |
+| `email_require_label` | `null` | a label name, e.g. `MY_LABEL`: show only mail captured through a routine whose query requires that label (see "Mail label filter"); `null` shows all mail |
+
+A `command` source takes `argv` (list), `timeout_s` (1 to 120) and
+`supports_all` (`true` or `false`, default `false`): declare it only if
+`<argv> list --all` works.
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
 urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
@@ -226,9 +310,17 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` poll now,
-`R` show or hide resolved alerts, `y` copy the item, `Y` copy its section,
+`R` show or hide resolved alerts, `A` show all (see below), `S` saved view
+(read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
+
+### Show all (`A`)
+
+`A` toggles "show all": while on, the header shows `all` and every `command`
+source with `supports_all: true` is polled as `<argv> list --all`; other
+sources are unaffected. It polls at once, is off at every start and is never
+saved. Items revealed by the toggle do not raise "new urgent" alerts.
 
 ### Copying
 

@@ -1,5 +1,6 @@
 """The inbox TUI app. Needs Textual; import it only through `cli.run`."""
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass, field
 
@@ -18,12 +19,22 @@ from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
-from .screens import AuditScreen, ConfirmSend, HelpScreen, SnoozePicker
+from .screens import AuditScreen, ConfirmSend, HelpScreen, SavedScreen, SnoozePicker
 from .sources import SourceResult
 from .widgets import (ITEM_PREFIX, DraftPane, HintBar, Queue, StatusHeader,
                       ThreadView, fmt_age, fuzzy, palette, vis)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
+
+
+def _takes_show_all(fetch):
+    """True when `fetch` accepts a `show_all` keyword argument."""
+    try:
+        params = inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "show_all" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 @dataclass
@@ -57,6 +68,7 @@ class InboxApp(App):
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
         Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
         Binding("R", "toggle_resolved", show=False),
+        Binding("A", "toggle_all", show=False), Binding("S", "saved", show=False),
         Binding("question_mark", "help", show=False),
         Binding("ctrl+t", "toggle_theme", show=False),
         Binding("ctrl+s", "save_edit", show=False),
@@ -90,7 +102,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, SnoozePicker, HelpScreen, AuditScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, SnoozePicker, HelpScreen, AuditScreen, SavedScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-text { border: round $panel; padding: 0 1; margin: 1 0; background: $background; }
@@ -103,12 +115,19 @@ class InboxApp(App):
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
+    #saved { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #saved-title { margin-bottom: 1; }
+    #saved-table { height: 1fr; }
     """
 
     def __init__(self, fetch, store, actions, settings=None, demo=False,
-                 undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None):
+                 undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None,
+                 saved=None, saved_days=None):
         """`fetch()` blocks and returns a list of SourceResult (it runs in a
-        worker thread). `store` holds done/ack/snooze marks."""
+        worker thread). `store` holds done/ack/snooze marks. A `fetch` that
+        takes a `show_all` argument gets the state of the A toggle.
+        `saved()` returns `(rows, error)` for the Saved view (S); None
+        disables the view."""
         super().__init__()
         settings = settings or {"poll_interval_s": 60.0, "theme": themes.DEFAULT,
                                 "bidi_mode": "auto"}
@@ -122,6 +141,11 @@ class InboxApp(App):
         self.filter_text = ""
         self.source_filter = None
         self.show_resolved = False         # R: list resolved alerts under fyi
+        self.show_all = False              # A: ask `supports_all` sources for everything
+        self.saved, self.saved_days = saved, saved_days
+        self._saved_loading = False
+        self._repoll = False               # a toggle landed while a poll ran
+        self._fetch_takes_all = _takes_show_all(fetch)
         self.editing = False
         self.busy = 0
         self.polling = False
@@ -347,19 +371,19 @@ class InboxApp(App):
             return [("enter", "keep filter"), ("esc", "clear"), ("", "type to fuzzy-match")]
         it = self.current
         if it is None:
-            return [("r", "poll"), ("/", "filter"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
+            return [("r", "poll"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
         if f is not None and f.id in ("thread", "draft-pane"):
             return base + [("tab", "next pane"), ("y", "copy"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
         if it.kind == "ack":
-            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
+            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "fyi":
-            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
+            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("?", "help")]
+            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
-            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("?", "help")]
+            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("A", "all"), ("S", "saved"), ("?", "help")]
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -786,6 +810,45 @@ class InboxApp(App):
         self.notify("Resolved alerts: " + ("shown" if self.show_resolved else "hidden"),
                     timeout=2, markup=False)
 
+    def action_toggle_all(self):
+        """A: ask the sources that declared `supports_all` for everything, not
+        just what is open. Per session; nothing is saved."""
+        self.show_all = not self.show_all
+        self.notify("Show all: " + ("on (sources that support it)" if self.show_all else "off"),
+                    timeout=2, markup=False)
+        self.tick_header()
+        if self.polling:
+            self._repoll = True   # the poll in flight asked with the old state
+        else:
+            self.poll(quiet=True)
+
+    async def action_saved(self):
+        """S: the read-only Saved view."""
+        if self.saved is None:
+            self.notify("The saved view is not available here", timeout=2, markup=False)
+            return
+        if self._saved_loading:
+            return
+        self._saved_loading = True
+        try:
+            rows, error = await asyncio.to_thread(self.saved)
+        except Exception as exc:  # never let a reader bug end the session
+            rows, error = [], f"cannot read saved items: {type(exc).__name__}"
+        finally:
+            self._saved_loading = False
+        if not self.main_active:
+            return
+        self.push_screen(SavedScreen(rows, error, self.saved_days, self.bidi,
+                                     opener=self._open_saved))
+
+    def _open_saved(self, row):
+        it = Item(key=f"saved:{row['id']}", section="fyi", who=row["title"], where="saved",
+                  ts=row["ts"], gist=row["title"], source=row["source"], link=row["link"])
+        res = self.actions.open_link(it)
+        self.record("open", it, res.detail, "ok" if res.ok else "failed")
+        self.notify(res.detail if res.ok else f"Not opened: {res.detail}", timeout=3,
+                    severity="information" if res.ok else "warning", markup=False)
+
     def action_audit(self):
         self.push_screen(AuditScreen(self.audit))
 
@@ -834,15 +897,17 @@ class InboxApp(App):
         self.exit(message=f"Nothing sent: {cancelled} pending send(s) cancelled on quit." if cancelled else None)
 
     # ---------- poll ----------
-    def _safe_fetch(self):
+    def _safe_fetch(self, show_all=None):
         """Runs in a worker thread: pick up other panes' marks, fetch, and
         stamp the marks of items that are still listed."""
+        show_all = self.show_all if show_all is None else show_all
         try:
             self.store.load()
         except OSError:
             pass
         try:
-            results = list(self.fetch())
+            results = list(self.fetch(show_all=show_all) if self._fetch_takes_all
+                           else self.fetch())
         except Exception as exc:  # a source bug must never end the session
             return [SourceResult("inbox", [], False, None,
                                  f"poll failed: {type(exc).__name__}: {exc}")]
@@ -855,28 +920,32 @@ class InboxApp(App):
             pass
         return results
 
-    def poll(self, manual=False):
+    def poll(self, manual=False, quiet=False):
         """Start a poll unless one is already running (polls never overlap,
-        so a slow source cannot pile up cancelled fetches)."""
+        so a slow source cannot pile up cancelled fetches). A `quiet` poll
+        (after the A toggle) does not announce the items it reveals."""
         if self.polling:
             if manual:
                 self.notify("Poll already running", timeout=2, markup=False)
             return
         self.polling = True
         self.next_poll_at = time.time() + self.poll_s
-        self._poll_worker(manual)
+        self._poll_worker(manual, quiet, self.show_all)
 
     @work(exclusive=False, group="poll")
-    async def _poll_worker(self, manual):
+    async def _poll_worker(self, manual, quiet=False, show_all=False):
         self.busy += 1
         try:
-            results = await asyncio.to_thread(self._safe_fetch)
+            results = await asyncio.to_thread(self._safe_fetch, show_all)
         finally:
             self.busy -= 1
             self.polling = False
-        self.apply_results(results, manual=manual)
+        self.apply_results(results, manual=manual, quiet=quiet)
+        if self._repoll:
+            self._repoll = False
+            self.poll(quiet=True)
 
-    def apply_results(self, results, manual=False):
+    def apply_results(self, results, manual=False, quiet=False):
         """Merge a poll into the queue. Runs on the UI thread."""
         self.results = list(results)
         self.last_poll_at = time.time()
@@ -903,6 +972,8 @@ class InboxApp(App):
             self.notify("\n".join(problems[:3]), title="Source problem", severity="warning",
                         timeout=8, markup=False)
         self._last_problems = problems
+        if quiet:
+            return
         if first or not fresh:
             if manual and not fresh:
                 self.notify("Polled: nothing new", timeout=2, markup=False)
@@ -930,6 +1001,8 @@ class InboxApp(App):
             ("Copy section", "Y: every item in this section, one per line", self.action_copy_section),
             ("Copy section as Markdown", "A - **sender** (where): gist list", self.action_copy_section_markdown),
             ("Show / hide resolved alerts", "R", self.action_toggle_resolved),
+            ("Show all (toggle)", "A: sources that support it list everything, not just what is open", self.action_toggle_all),
+            ("Saved to memory", "S: what the daemon saved recently (read-only)", self.action_saved),
             ("Undo last action", "Within the 5 s window", self.action_undo),
             ("Poll now", "Poll every source", self.action_refresh),
             ("Toggle dark/light theme", "ctrl+t", self.action_toggle_theme),

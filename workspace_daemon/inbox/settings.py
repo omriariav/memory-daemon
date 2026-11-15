@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from . import sources, themes
+from . import invites, sources, themes
 
 FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
@@ -18,8 +18,9 @@ URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
 TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "gmail_account",
             "alert_urgent_max_age_h", "sources")
 SOURCE_KEYS = {
-    "events": ("name", "type", "window_h", "urgent"),
-    "command": ("name", "type", "argv", "timeout_s"),
+    "events": ("name", "type", "window_h", "urgent", "invites_days",
+               "saved_days", "email_require_label"),
+    "command": ("name", "type", "argv", "timeout_s", "supports_all"),
 }
 DEFAULT_TIMEOUT_S = 20
 DEFAULTS = {
@@ -135,8 +136,28 @@ def validate(raw):
             rules = src.get("urgent")
             rules = (list(sources.DEFAULT_URGENT_RULES) if rules is None
                      else _check_rules(rules, f"{label}.urgent", problems))
+            invites_days = src.get("invites_days", invites.DEFAULT_DAYS)
+            if not _num(invites_days) or not 0 <= invites_days <= 60:
+                problems.append(f"{label}.invites_days must be 0 (off) to 60")
+                invites_days = invites.DEFAULT_DAYS
+            saved_days = src.get("saved_days", sources.DEFAULT_SAVED_DAYS)
+            if not _num(saved_days) or not 1 <= saved_days <= 30:
+                problems.append(f"{label}.saved_days must be 1 to 30")
+                saved_days = sources.DEFAULT_SAVED_DAYS
+            require = src.get("email_require_label")
+            if require is not None and (
+                    not isinstance(require, str) or not require.strip()
+                    or len(require) > 100
+                    or re.search(r"[\x00-\x1f\x7f]", require)):
+                problems.append(f"{label}.email_require_label must be null or "
+                                "a label name (one line, up to 100 chars)")
+                require = None
             built.append({"name": name, "type": "events",
-                          "window_h": float(window), "urgent": rules})
+                          "window_h": float(window), "urgent": rules,
+                          "invites_days": float(invites_days),
+                          "saved_days": float(saved_days),
+                          "email_require_label": (
+                              require.strip() if require else None)})
         else:
             argv = src.get("argv")
             if (not isinstance(argv, list) or not argv
@@ -156,8 +177,13 @@ def validate(raw):
                 problems.append(
                     f"{label}.timeout_s ({timeout:g}) must be below "
                     f"poll_interval_s ({out['poll_interval_s']:g})")
+            supports_all = src.get("supports_all", False)
+            if not isinstance(supports_all, bool):
+                problems.append(f"{label}.supports_all must be true or false")
+                supports_all = False
             built.append({"name": name, "type": "command",
-                          "argv": list(argv), "timeout_s": float(timeout)})
+                          "argv": list(argv), "timeout_s": float(timeout),
+                          "supports_all": supports_all})
     out["sources"] = built
     if problems:
         raise SettingsError(problems)

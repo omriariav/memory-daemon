@@ -28,6 +28,17 @@ sources:
   - name: events
     type: events
     window_h: 48           # only events from the last N hours (1 to 720)
+    # Calendar invites you have not answered, from the calendar cache (never
+    # the network): shown under Needs reply when they start within N days.
+    # 0 turns it off; the cache must cover the range (docs/inbox.md).
+    invites_days: 7
+    # How many days back the Saved view (S key) looks: what the daemon saved
+    # to memory (1 to 30).
+    saved_days: 2
+    # Show only mail captured through a Gmail routine whose search query
+    # requires this label (null = all mail). Checked at capture time, from the
+    # routine's query; see "Mail label filter" in docs/inbox.md.
+    email_require_label: null    # e.g. MY_LABEL
     # Rules that put an event in the Urgent section; an event matching any
     # rule is urgent. All keys inside one rule must match. Omit `urgent` for
     # the default (budget-hit:, connector:, attention: alerts).
@@ -45,3 +56,4 @@ sources:
   #   type: command
   #   argv: ["python3", "~/bin/my-inbox-source.py"]
   #   timeout_s: 20        # 1 to 120
+  #   supports_all: true   # `<argv> list --all` works: the A key uses it
