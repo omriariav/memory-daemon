@@ -569,11 +569,22 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(retry[retry.index("--source-ids") + 1],
                          "slack:C1:1.0:2.5")
 
-    def test_refusal_without_a_distinct_reply_is_not_retried(self):
-        for item_id in ("slack:C1:1.0@1.0", "slack:C1:1.0"):
+    def test_refusal_on_the_root_itself_is_already_captured(self):
+        for item_id in ("slack:C1:1.0@1.0", "slack:C1:1.0",
+                        "slack:C1:1.0@1.0:20260727"):
             out, calls = self._run_refused_capture(item_id)
             self.assertEqual(len(calls), 1, item_id)
-            self.assertIsInstance(out, RuntimeError)
+            self.assertNotIsInstance(out, RuntimeError, item_id)
+            self.assertEqual(out["memory"], "unchanged")
+            self.assertEqual(out["memory_entry_id"], "2026-07-20-open-todo")
+            self.assertEqual(out["memory_source_id"], "slack:C1:1.0")
+            self.assertNotIn("memory_thread_source_id", out)
+
+    def test_root_refusal_for_another_anchor_still_fails(self):
+        out, calls = self._run_refused_capture(
+            "slack:C1:1.0@1.0", refusal_source="slack:C9:9.0")
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(out, RuntimeError)
 
     def test_refusal_for_another_anchor_is_not_retried(self):
         out, calls = self._run_refused_capture(

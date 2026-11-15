@@ -1376,6 +1376,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_valid_block(self):
         self.assertEqual(self.problems(), [])
+        self.assertEqual(self.problems(include_channels=[CHAN]), [])
         self.assertEqual(self.problems(
             people=["U0EXAMPLEC"], include_mentions=True, overlap="2h",
             bootstrap="1d", settle_minutes=0, include_bots=True,
@@ -1383,6 +1384,14 @@ class ConfigTest(unittest.TestCase):
             mention_keywords=["<@{self_user_id}>", "ping"],
             max_queries_per_run=5, min_seconds_between_searches=0,
         ), [])
+
+    def test_exclude_channels_must_be_slack_ids(self):
+        self.assertEqual(self.problems(exclude_channels=["D0EXAMPLE90"]), [])
+        for bad in (["nope"], "D0EXAMPLE90", [5]):
+            self.assertTrue(any(
+                "exclude_channels" in p
+                for p in self.problems(exclude_channels=bad)
+            ), bad)
 
     def test_tool_names_must_be_read_only_slack_tools(self):
         for key, value in (
@@ -1404,6 +1413,9 @@ class ConfigTest(unittest.TestCase):
         for over, fragment in (
             ({"self_user_id": "me"}, "self_user_id"),
             ({"channels": ["nope"]}, "channels"),
+            ({"exclude_channels": CHAN}, "exclude_channels"),
+            ({"include_channels": CHAN}, "include_channels"),
+            ({"include_channels": ["nope"]}, "include_channels"),
             ({"people": [CHAN]}, "people"),
             ({"max_threads_per_run": 0}, "max_threads_per_run"),
             ({"max_search_pages": True}, "max_search_pages"),

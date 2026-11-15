@@ -1140,5 +1140,570 @@ class ChannelTypeTest(unittest.TestCase):
         self.assertFalse(rows[("D0EXAMPLE01", self.ts(2))]["peer_is_bot"])
 
 
+SELFDM = "D0EXAMPLE90"
+
+
+class ExcludeChannelsTest(InboxTestCase):
+    def everything(self):
+        return {f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "ch": SELFDM, "uid": ME, "text": "note to self"},
+            {"ts": ts_at(20), "ch": SELFDM, "uid": ME,
+             "text": "[file_share] report.pdf"},
+            {"ts": ts_at(30), "text": "kept"},
+        ]}
+
+    def test_search_hit_in_excluded_channel_is_dropped(self):
+        self.connector.search = by_filter(self.everything())
+        listing = slack_mcp.candidates(inbox_source(
+            channels=[CHAN, SELFDM], exclude_channels=[SELFDM],
+            inbox={"channels": [CHAN, SELFDM]},
+        ))
+        self.assertEqual(
+            [c["raw"]["channel"] for c in listing], [CHAN]
+        )
+
+    def test_file_share_in_excluded_channel_is_dropped(self):
+        self.connector.search = by_filter(self.everything())
+        listing = slack_mcp.candidates(inbox_source(
+            channels=[CHAN, SELFDM], exclude_channels=[SELFDM],
+        ))
+        self.assertFalse(any(
+            c["raw"]["channel"] == SELFDM for c in listing
+        ))
+
+    def test_comms_inbox_row_for_excluded_channel_is_not_written(self):
+        self.connector.search = by_filter(self.everything())
+        slack_mcp.candidates(inbox_source(
+            channels=[CHAN, SELFDM], exclude_channels=[SELFDM],
+            inbox={"channels": [CHAN, SELFDM]},
+        ))
+        self.assertEqual([r["channel_id"] for r in self.messages()], [CHAN])
+
+    def test_record_purges_stored_rows_of_excluded_channel(self):
+        row = {"type": "message", "channel_id": SELFDM, "ts": ts_at(10),
+               "thread_ts": ts_at(10), "user_id": ME, "text": "x"}
+        comms_inbox.record(self.tmp.name, [row], 90, now=NOW)
+        self.assertEqual(len(self.rows()), 1)
+        comms_inbox.record(
+            self.tmp.name, [], 90, now=NOW, exclude_channels=[SELFDM]
+        )
+        self.assertEqual(self.rows(), [])
+
+    def test_self_dm_is_detected_without_config(self):
+        self.connector.search = by_filter({f"in:<#{CHAN}>": [
+            {"ts": ts_at(10), "ch": SELFDM, "uid": ME, "dm": True,
+             "people": ME, "text": "note to self"},
+            {"ts": ts_at(30), "ch": "D0EXAMPLE03", "uid": BOB, "dm": True,
+             "people": [ME, BOB], "text": "real dm"},
+        ]})
+        listing = slack_mcp.candidates(inbox_source(
+            channels=[CHAN], all_dms=True,
+            inbox={"channels": [CHAN], "all_dms": True},
+        ))
+        self.assertNotIn(SELFDM, {c["raw"]["channel"] for c in listing})
+
+
+READ_CHANNEL = "mcp__example_slack__slack_read_channel"
+GROUP = "G0EXAMPLE05"
+
+
+def history(channel, messages, label="DM"):
+    """Channel history, newest first. Message = (ts, uid, text, file lines)."""
+    blocks = []
+    for ts, uid, text, meta in reversed(messages):
+        blocks.append(
+            f"=== Message from Person ({uid}) at 2026-01-07 09:13:46 IDT ===\n"
+            f"Message TS: {ts}\n" + "".join(f"{line}\n" for line in meta)
+            + text
+        )
+    return json.dumps({
+        "messages": f"Channel: {label} ({channel})\n\n" + "\n\n".join(blocks),
+        "pagination_info": "There are no more messages available.\n",
+    })
+
+
+ZIP = ["Files: report-q3.zip (ID: F0AAAAAAA01, application/zip, 2 KB)"]
+
+
+class FileShareTest(InboxTestCase):
+    def seed_dm(self, channel=DM, kind="im", at=5):
+        comms_inbox.record(self.tmp.name, [{
+            "type": "message", "channel_id": channel, "thread_ts": ts_at(at),
+            "ts": ts_at(at), "user_id": BOB, "is_owner": False,
+            "is_bot": False, "text": "earlier", "channel_type": kind,
+        }], 90, now=NOW)
+
+    def src(self, **over):
+        cfg = dict(
+            {"all_dms": True}, channels=[], all_dms=True,
+            read_channel_tool=READ_CHANNEL,
+        )
+        cfg.update(over)
+        return inbox_source(cfg.pop("inbox", {"all_dms": True}), **cfg)
+
+    def reads(self):
+        return [a for t, a in self.reads_log]
+
+    def setUp(self):
+        super().setUp()
+        self.reads_log = []
+
+        def channel(args):
+            self.reads_log.append((READ_CHANNEL, args))
+            ch = args["channel_id"]
+            return history(ch, self.history.get(ch, []))
+
+        self.history = {}
+        self.connector.channel = channel
+
+    def test_file_only_dm_message_becomes_a_row_with_files(self):
+        self.seed_dm()
+        self.history[DM] = [
+            (ts_at(10), BOB, "", ZIP),
+        ]
+        slack_mcp.candidates(self.src())
+        row = [r for r in self.messages() if r["ts"] == ts_at(10)][0]
+        self.assertEqual(row["text"], "")
+        self.assertEqual(row["user_id"], BOB)
+        self.assertFalse(row["is_owner"])
+        self.assertEqual(row["channel_type"], "im")
+        self.assertEqual(row["files"], [{
+            "name": "report-q3.zip", "filetype": "application/zip",
+            "size": 2048,
+        }])
+
+    def test_hit_this_run_is_read_and_group_dm_keeps_its_type(self):
+        hit = {"ch": GROUP, "label": "Group DM", "people": [BOB, ME],
+               "ts": ts_at(10), "text": "see attached"}
+        self.connector.search = by_filter({f"with:<@{ME}>": [hit]})
+        self.history[GROUP] = [
+            (ts_at(10), BOB, "see attached", []),
+        ]
+        self.history[GROUP] = [
+            (ts_at(10), BOB, "see attached\n" + ZIP[0], []),
+        ]
+        slack_mcp.candidates(self.src())
+        rows = self.messages()
+        self.assertEqual(len(rows), 1)  # same message: search + history
+        self.assertEqual(rows[0]["channel_type"], "mpim")
+        self.assertEqual(rows[0]["text"], "see attached")
+        self.assertEqual(rows[0]["files"][0]["name"], "report-q3.zip")
+
+    def test_messages_without_files_are_not_recorded_by_the_scan(self):
+        self.seed_dm()
+        self.history[DM] = [(ts_at(10), BOB, "just text", [])]
+        slack_mcp.candidates(self.src())
+        self.assertEqual([r["ts"] for r in self.messages()], [ts_at(5)])
+
+    def test_file_share_in_excluded_channel_is_not_read_or_recorded(self):
+        self.seed_dm(SELFDM)
+        self.seed_dm(DM)
+        self.history[SELFDM] = [(ts_at(10), ME, "", ZIP)]
+        self.history[DM] = [(ts_at(11), BOB, "", ZIP)]
+        slack_mcp.candidates(self.src(exclude_channels=[SELFDM]))
+        self.assertEqual(
+            [a["channel_id"] for a in self.reads()], [DM]
+        )
+        self.assertEqual(
+            {r["channel_id"] for r in self.messages()}, {DM}
+        )
+
+    def test_detected_self_dm_file_share_is_dropped(self):
+        hit = {"ch": SELFDM, "dm": True, "people": ME, "uid": ME,
+               "ts": ts_at(10), "text": "note"}
+        self.connector.search = by_filter({f"with:<@{ME}>": [hit]})
+        self.history[SELFDM] = [(ts_at(10), ME, "", ZIP)]
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads(), [])
+        self.assertFalse(self.messages())
+
+    def test_read_cap_and_disable(self):
+        for n in range(3):
+            self.seed_dm(f"D0EXAMPLE1{n}")
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(len(self.reads()), 2)
+        self.reads_log.clear()
+        slack_mcp.candidates(self.src(max_file_reads_per_run=0))
+        self.assertEqual(self.reads(), [])
+
+    def test_channel_is_not_reread_within_the_scan_interval(self):
+        self.seed_dm()
+        slack_mcp.candidates(self.src())
+        self.assertEqual(len(self.reads()), 1)
+        slack_mcp.candidates(self.src())
+        self.assertEqual(len(self.reads()), 1)
+
+    def test_no_read_without_inbox_all_dms_or_read_tool(self):
+        self.seed_dm()
+        slack_mcp.candidates(self.src(inbox={"channels": [CHAN]}))
+        slack_mcp.candidates(self.src(read_channel_tool=None))
+        self.assertEqual(self.reads(), [])
+
+    def test_late_files_are_added_to_a_stored_message(self):
+        comms_inbox.record(self.tmp.name, [{
+            "type": "message", "channel_id": DM, "thread_ts": ts_at(10),
+            "ts": ts_at(10), "user_id": BOB, "text": "x",
+            "channel_type": "im",
+        }], 90, now=NOW)
+        row = {"type": "message", "channel_id": DM, "ts": ts_at(10),
+               "thread_ts": ts_at(10), "user_id": BOB,
+               "files": [{"name": "a.pdf"}]}
+        comms_inbox.record(self.tmp.name, [row], 90, now=NOW)
+        self.assertEqual(self.rows()[0]["files"], [{"name": "a.pdf"}])
+
+    def test_message_row_cleans_and_caps_files(self):
+        hit = {"channel": DM, "root": ts_at(1), "ts": ts_at(1), "user": BOB,
+               "is_bot": False, "text": "", "label": "DM",
+               "files": [{"name": "n" * 500, "size": "3 KB"}]
+               + [{"name": f"f{i}"} for i in range(30)] + ["junk"]}
+        row = comms_inbox.message_row(hit, ME)
+        self.assertEqual(len(row["files"]), comms_inbox.MAX_FILES)
+        self.assertEqual(len(row["files"][0]["name"]), 200)
+        self.assertEqual(row["files"][0]["size"], 3072)
+        plain = comms_inbox.message_row(dict(hit, files=[]), ME)
+        self.assertNotIn("files", plain)
+
+    def parse(self, body_lines, text=""):
+        page = history(DM, [(ts_at(1), BOB, text, body_lines)])
+        return slack_mcp.parse_channel(page, ts_at(0), ts_at(9), DM)[0][0]
+
+    def test_guessed_file_layouts_keep_their_text_and_get_no_files(self):
+        for lines, text in (
+            (["Files:"], "- review the deck"),
+            ([], "Files: see the drive folder"),
+            (["Subtype: file_share"], "ok"),
+            (["Files (2):", "- a.pdf (pdf, 10 KB)"], ""),
+        ):
+            got = self.parse(lines, text)
+            self.assertNotIn("files", got)
+            self.assertEqual(
+                got["text"], "\n".join(lines + ([text] if text else []))
+            )
+
+    def test_partial_files_line_stays_text(self):
+        line = ("Files: a.zip (ID: F0AAAAAAA01, application/zip, 1 KB), "
+                "see the folder")
+        got = self.parse([], line)
+        self.assertNotIn("files", got)
+        self.assertEqual(got["text"], line)
+
+    def test_files_line_without_size_is_accepted(self):
+        got = self.parse([], "hi\nFiles: a.zip (ID: F0AAAAAAA01, application/zip)")
+        self.assertEqual(got["files"], [{
+            "name": "a.zip", "filetype": "application/zip"}])
+        self.assertEqual(got["text"], "hi")
+
+    def test_files_line_must_be_last_or_the_only_content(self):
+        line = "Files: a.zip (ID: F0AAAAAAA01, application/zip, 1 KB)"
+        got = self.parse([], line + "\nand then text")
+        self.assertNotIn("files", got)
+        got = self.parse([], line + "\nReactions: x (1)")
+        self.assertEqual(len(got["files"]), 1)
+        self.assertEqual(got["text"], "")
+
+    def test_malformed_page_does_not_save_the_scan_mark(self):
+        self.seed_dm()
+        self.connector.channel = lambda args: "not json"
+        slack_mcp.candidates(self.src())
+        self.assertEqual(slack_mcp._load_file_marks(), {})
+
+    def test_empty_window_saves_the_scan_mark(self):
+        self.seed_dm()
+        slack_mcp.candidates(self.src())  # history is empty
+        self.assertIn(DM, slack_mcp._load_file_marks())
+
+    MORE = ("There are more messages available. To view the next page, "
+            "use cursor: `abc`\n")
+
+    def paged(self, pages):
+        """Serve `pages` (a list of history texts) in order; record args."""
+        seen = []
+
+        def channel(args):
+            self.reads_log.append((READ_CHANNEL, args))
+            seen.append(args)
+            return pages[min(len(seen) - 1, len(pages) - 1)]
+        self.connector.channel = channel
+        return seen
+
+    def page(self, ts, more, text="x", meta=()):
+        data = json.loads(history(DM, [(ts_at(ts), BOB, text, list(meta))]))
+        if more:
+            data["pagination_info"] = self.MORE
+        return json.dumps(data)
+
+    def test_truncated_read_follows_the_cursor_within_budget(self):
+        self.seed_dm()
+        seen = self.paged([
+            self.page(10, True, "", ZIP), self.page(8, False, "", ZIP),
+        ])
+        slack_mcp.candidates(self.src(max_file_reads_per_run=3))
+        self.assertEqual(len(seen), 2)
+        self.assertNotIn("cursor", seen[0])
+        self.assertEqual(seen[1]["cursor"], "abc")
+        self.assertEqual(seen[1]["oldest"], seen[0]["oldest"])
+        self.assertEqual(seen[1]["latest"], seen[0]["latest"])
+        state = slack_mcp._load_file_state()
+        self.assertEqual(state["backfill"], {})
+        self.assertEqual(state["marks"][DM], slack_mcp._now())
+        self.assertEqual(
+            {r["ts"] for r in self.messages()} - {ts_at(5)},
+            {ts_at(10), ts_at(8)})
+
+    def test_truncated_read_without_budget_keeps_mark_and_backfills(self):
+        self.seed_dm()
+        seen = self.paged([self.page(10, True), self.page(4, False)])
+        first_now = slack_mcp._now()
+        slack_mcp.candidates(self.src(max_file_reads_per_run=1))
+        state = slack_mcp._load_file_state()
+        self.assertNotIn(DM, state["marks"])
+        self.assertEqual(state["backfill"][DM],
+                         {"upto": float(ts_at(10)), "pending": first_now})
+        # Next run reads the older window, bounded above by the oldest seen.
+        slack_mcp.candidates(self.src(max_file_reads_per_run=1))
+        self.assertEqual(float(seen[1]["latest"]), float(ts_at(10)))
+        self.assertNotIn("cursor", seen[1])
+        state = slack_mcp._load_file_state()
+        self.assertEqual(state["backfill"], {})
+        self.assertEqual(state["marks"][DM], first_now)
+
+    def test_text_that_looks_like_metadata_is_kept(self):
+        for text in ("Thread: lets move the launch\nto Monday",
+                     "Replies: 3", "Latest reply: 12.5",
+                     "Replies: none yet", "Reply count: many"):
+            page = history(DM, [(ts_at(1), BOB, text, [])])
+            got = slack_mcp.parse_channel(page, ts_at(0), ts_at(9), DM)[0][0]
+            self.assertEqual(got["text"], text)
+        # No metadata shape is verified for channel history: nothing is
+        # stripped, so these lines stay in the text.
+        got = self.parse(["Reply count: 2"], "hi")
+        self.assertEqual(got["text"], "Reply count: 2\nhi")
+
+    def test_empty_page_is_accepted_only_when_really_empty(self):
+        def page(body, pagination=None):
+            return json.dumps({
+                "messages": f"Channel: DM ({DM})\n\n" + body,
+                "pagination_info": pagination
+                or "There are no more messages available.\n"})
+        ok = slack_mcp.parse_channel(
+            page(""), ts_at(0), ts_at(9), DM, allow_empty=True)
+        self.assertEqual(ok, ([], None))
+        for body, pag in (
+            ("Error: ratelimited, try again later", None),
+            ("No messages found in this range", None),
+            ("=== Message from P (U0X) at someday ===\nMessage TS: "
+             + ts_at(1) + "\nFiles: a (ID: F0AAAAAAA01, a/b, 1 KB)", None),
+            ("", self.MORE),
+        ):
+            with self.assertRaises(slack_mcp.SlackMcpParseError, msg=body):
+                slack_mcp.parse_channel(
+                    page(body, pag), ts_at(0), ts_at(9), DM, allow_empty=True)
+
+    def test_cap_one_alternates_hot_and_quiet_channels(self):
+        quiet = "D0EXAMPLE99"
+        self.seed_dm(quiet, at=1)
+        hit = {"ch": DM, "dm": True, "people": [BOB, ME],
+               "ts": ts_at(10), "text": "hi"}
+        self.connector.search = by_filter({f"with:<@{ME}>": [hit]})
+        for _ in range(2):
+            slack_mcp.candidates(self.src(max_file_reads_per_run=1))
+        self.assertEqual(
+            sorted(a["channel_id"] for a in self.reads()), sorted([DM, quiet]))
+
+    def test_empty_window_exact_live_shape(self):
+        # Verified live (2026-11-05): slack_read_channel on an empty window
+        # returns exactly this; the id here is fake.
+        page = json.dumps({
+            "messages": f"Channel: DM ({DM})\n\n",
+            "pagination_info": "There are no more messages available.\n",
+        })
+        self.assertEqual(
+            slack_mcp.parse_channel(
+                page, ts_at(0), ts_at(9), DM, allow_empty=True),
+            ([], None))
+
+    def test_failing_channel_backs_off_and_does_not_hog_the_quiet_slot(self):
+        bad, good = "D0EXAMPLE01", "D0EXAMPLE02"
+        self.seed_dm(bad, at=1)
+        self.seed_dm(good, at=2)
+
+        def channel(args):
+            self.reads_log.append((READ_CHANNEL, args))
+            ch = args["channel_id"]
+            return "not json" if ch == bad else history(ch, [])
+        self.connector.channel = channel
+        slack_mcp.candidates(self.src(max_file_reads_per_run=1))
+        self.assertEqual([a["channel_id"] for a in self.reads()], [bad])
+        fails = slack_mcp._load_file_state()["fails"]
+        self.assertEqual(fails[bad], {"n": 1, "wait": 2})
+        # Next run: bad is backed off, good is scanned.
+        self.reads_log.clear()
+        with mock.patch.object(slack_mcp, "_now",
+                               return_value=slack_mcp._now() + 7200):
+            slack_mcp.candidates(self.src(max_file_reads_per_run=1))
+        self.assertEqual([a["channel_id"] for a in self.reads()], [good])
+        self.assertEqual(
+            slack_mcp._load_file_state()["fails"][bad]["wait"], 1)
+
+    def test_success_resets_the_failure_count(self):
+        self.seed_dm()
+        path = slack_mcp._file_scan_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(
+            {"marks": {}, "fails": {DM: {"n": 3, "wait": 0}}}))
+        slack_mcp.candidates(self.src())
+        self.assertEqual(slack_mcp._load_file_state()["fails"], {})
+
+    def test_backfill_below_the_lookback_is_dropped_without_a_call(self):
+        self.seed_dm()
+        now = slack_mcp._now()
+        path = slack_mcp._file_scan_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "marks": {}, "backfill": {
+                DM: {"upto": now - 30 * 86400, "pending": now - 10}}}))
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads(), [])
+        state = slack_mcp._load_file_state()
+        self.assertEqual(state["backfill"], {})
+        self.assertEqual(state["marks"][DM], now - 10)
+
+    def test_round_one_list_format_is_read_as_detected_now(self):
+        path = slack_mcp._self_dm_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([SELFDM]))
+        cfg = slack_mcp.settings(self.src())
+        self.assertEqual(slack_mcp.excluded_channels(cfg), {SELFDM})
+
+    def test_corrupt_self_dm_state_is_moved_aside_seeded_and_run_continues(self):
+        self.seed_dm()
+        path = slack_mcp._self_dm_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"%s": 1.0, broken' % SELFDM)
+        cfg = slack_mcp.settings(self.src())
+        self.assertEqual(slack_mcp.excluded_channels(cfg), {SELFDM})
+        self.assertTrue(path.with_name(path.name + ".corrupt").exists())
+        self.assertEqual(list(json.loads(path.read_text())), [SELFDM])
+        # An ordinary DM is still scanned.
+        slack_mcp.candidates(self.src())
+        self.assertEqual([a["channel_id"] for a in self.reads()], [DM])
+
+    def test_session_failure_or_no_result_is_a_retry_without_backoff(self):
+        self.seed_dm()
+        self.connector.channel = lambda args: None
+        slack_mcp.candidates(self.src())
+        state = slack_mcp._load_file_state()
+        self.assertEqual(state["fails"], {})
+        self.assertNotIn(DM, state["marks"])
+
+    def test_spent_failure_entries_are_pruned(self):
+        path = slack_mcp._file_scan_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "marks": {}, "fails": {"D0EXAMPLE77": {"n": 2, "wait": 0}}}))
+        slack_mcp._save_file_state(
+            {}, {}, None, slack_mcp._load_file_state()["fails"],
+            slack_mcp._now(), {"file_scan_lookback_days": 3})
+        self.assertEqual(slack_mcp._load_file_state()["fails"], {})
+
+    def test_self_dm_detection_is_timestamped_and_im_only(self):
+        hit = {"ch": SELFDM, "dm": True, "people": ME, "uid": ME,
+               "ts": ts_at(10), "text": "note"}
+        grp = {"ch": GROUP, "label": "Group DM", "people": [ME],
+               "ts": ts_at(11), "text": "g"}
+        self.connector.search = by_filter({f"with:<@{ME}>": [hit, grp]})
+        slack_mcp.candidates(self.src())
+        saved = json.loads(slack_mcp._self_dm_path().read_text())
+        self.assertEqual(list(saved), [SELFDM])
+        self.assertIsInstance(saved[SELFDM], float)
+
+    def test_include_channels_overrides_a_detected_self_dm(self):
+        path = slack_mcp._self_dm_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({DM: 1.0}))
+        cfg = slack_mcp.settings(self.src())
+        self.assertEqual(slack_mcp.excluded_channels(cfg), {DM})
+        cfg = slack_mcp.settings(self.src(include_channels=[DM]))
+        self.assertEqual(slack_mcp.excluded_channels(cfg), set())
+
+    def test_hot_channels_do_not_starve_the_quiet_one(self):
+        quiet = "D0EXAMPLE99"
+        self.seed_dm(quiet, at=1)
+        hits = [{"ch": f"D0EXAMPLE1{n}", "dm": True, "people": [BOB, ME],
+                 "ts": ts_at(10 + n), "text": "hi"} for n in range(3)]
+        self.connector.search = by_filter({f"with:<@{ME}>": hits})
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertIn(quiet, [a["channel_id"] for a in self.reads()])
+
+    def test_self_dm_is_persisted_and_never_scanned_later(self):
+        hit = {"ch": SELFDM, "dm": True, "people": ME, "uid": ME,
+               "ts": ts_at(10), "text": "note"}
+        self.connector.search = by_filter({f"with:<@{ME}>": [hit]})
+        slack_mcp.candidates(self.src())
+        self.connector.search = by_filter({})
+        self.seed_dm(SELFDM)
+        self.reads_log.clear()
+        slack_mcp.candidates(self.src())
+        self.assertNotIn(SELFDM, [a["channel_id"] for a in self.reads()])
+        self.assertEqual(
+            slack_mcp.excluded_channels(slack_mcp.settings(self.src())),
+            {SELFDM})
+
+    def test_excluded_channel_is_not_searched(self):
+        cfg = slack_mcp.settings(inbox_source(
+            channels=[CHAN, SELFDM], exclude_channels=[SELFDM]))
+        filters = [q["filters"] for q in slack_mcp.search_queries(cfg)]
+        self.assertEqual(filters, [f"in:<#{CHAN}>"])
+
+    def test_clean_files_keeps_a_long_mime_type(self):
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        out = comms_inbox.clean_files([{"name": "a", "filetype": mime}])
+        self.assertEqual(out[0]["filetype"], mime)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealChannelFilesLayoutTest(unittest.TestCase):
+    """The layout slack_read_channel really returns: text, Reactions, Files."""
+
+    BODY = (
+        "Channel: DM (D0EXAMPLE91)\n\n"
+        "=== Message from Some Person <[EMAIL:****]> (U0EXAMPLE91) at 2026-11-03 17:25:08 IST === \n"
+        "Message TS: 1793719508.000100\n"
+        "Files: only.pdf (ID: F0AAAAAAA03, application/pdf, 20 KB)\n\n"
+        "=== Message from Some Person <[EMAIL:****]> (U0EXAMPLE91) at 2026-11-03 17:24:08 IST === \n"
+        "Message TS: 1793719448.858609\n"
+        "Sure thing\n"
+        "Reactions: thankyouwave (1)\n"
+        "Files: a, b.zip (ID: F0AAAAAAA01, application/zip, 1.5 MB), "
+        "c - d .docx (ID: F0AAAAAAA02, application/msword, 861.7 KB)"
+    )
+
+    def test_trailing_and_file_only(self):
+        import json
+        from workspace_daemon import slack_mcp
+        msgs, _ = slack_mcp.parse_channel(json.dumps({
+            "messages": self.BODY,
+            "pagination_info": "There are more messages available. To view the next page, use cursor: `abc`\n",
+        }), 0, 9e9, "D0EXAMPLE91")
+        first, second = msgs
+        self.assertEqual(first["text"], "Sure thing")
+        self.assertEqual([f["name"] for f in first["files"]], ["a, b.zip", "c - d .docx"])
+        self.assertEqual(first["files"][0]["filetype"], "application/zip")
+        self.assertEqual(second["text"], "")
+        self.assertEqual(second["files"], [{"name": "only.pdf", "filetype": "application/pdf", "size": "20 KB"}])
+
+    def test_plain_files_text_stays_body(self):
+        import json
+        from workspace_daemon import slack_mcp
+        body = ("Channel: DM (D0EXAMPLE91)\n\n"
+                "=== Message from Some Person <[EMAIL:****]> (U0EXAMPLE91) at 2026-11-03 17:24:08 IST === \n"
+                "Message TS: 1793719448.858609\n"
+                "hello\nFiles: see the drive folder")
+        msgs, _ = slack_mcp.parse_channel(json.dumps({
+            "messages": body, "pagination_info": "There are more messages available. To view the next page, use cursor: `abc`\n",
+        }), 0, 9e9, "D0EXAMPLE91")
+        self.assertNotIn("files", msgs[0])
+        self.assertIn("Files: see the drive folder", msgs[0]["text"])

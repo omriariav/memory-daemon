@@ -21,6 +21,16 @@ The watch file may also set `all_dms: true`: one more query (`dms`) searches
 `with:<@owner>` over `channel_types=im,mpim`, so every direct and group message
 involving the owner is listed without naming each conversation.
 
+File shares: Slack's text search (`content_types: messages`, pinned) never
+lists a message that only carries a file, and the `## Files` section is never
+requested or parsed. With `comms_inbox.all_dms` and `read_channel_tool` set,
+active DMs and group DMs (a hit this run, or an inbox line within
+`file_scan_lookback_days`) are read through channel history and every message
+with `files` becomes an inbox row with `files: [{name, filetype,
+size}]` (the Files line carries no permalink). Caps: `max_file_reads_per_run` (default 5, 0 = off), one read
+per conversation per `file_scan_minutes` unless it had a hit this run.
+Excluded channels and self-DMs are never read.
+
 The watch file may also list `save_reactions: [<emoji name>, ...]` (at most 3;
 no default, the names are deployment-specific). Reacting to any message with
 one of them marks its thread for capture: one query per emoji searches
@@ -140,12 +150,17 @@ DEFAULTS = {
     "save_reaction_lookback_days": 14,
     "save_reaction_tag": "saved",
     "max_session_pages": 3,
+    # Channel-history reads that look for file shares (0 disables).
+    "max_file_reads_per_run": 5,
+    "file_scan_lookback_days": 3,
+    "file_scan_minutes": 30,
 }
 # Keys only a slack_mcp source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | {
     "search_tool", "read_thread_tool", "self_user_id", "search_args",
     "all_dms", "save_reactions", "dm_sessions", "read_channel_tool",
     "comms_inbox", "reactions_tool", "channels_tool", "channel_info_tool",
+    "exclude_channels", "include_channels",
 }
 CURSOR_SCHEMA = 1
 # Query keys and ledger keys of the reaction-saved path.
@@ -153,7 +168,7 @@ SAVED_PREFIX = "saved:"
 # Query keys of the comms-inbox reaction searches (record only, never capture).
 REACTED_PREFIX = "reacted:"
 # Comms-inbox query kinds: recorded, never captured, no cursor of their own.
-RECORD_ONLY = ("reacted", "track", "tracked", "mine")
+RECORD_ONLY = ("reacted", "track", "tracked", "mine", "watched")
 CHANNELS_PER_QUERY = 15
 SEARCH_LIMIT = 20
 THREADS_PER_SESSION = 8
@@ -186,6 +201,9 @@ CHANNEL_LATEST_ARG = "latest"
 CHANNEL_LIMIT_ARG = "limit"
 CHANNEL_CURSOR_ARG = "cursor"
 CHANNEL_READ_MAX = 100
+# The bot-text read asks for few messages: an app's message is long (about 550
+# characters), and a page the client finds too large comes back as an error.
+BOT_TEXT_READ_LIMIT = 15
 DM_SESSION_DEFAULTS = {
     "enabled": False, "gap_minutes": 120, "max_span_hours": 12,
     "channel_types": ["im", "mpim"],
@@ -245,7 +263,108 @@ def settings(source):
     cfg["reactions_tool"] = source.get("reactions_tool")
     cfg["channels_tool"] = source.get("channels_tool")
     cfg["channel_info_tool"] = source.get("channel_info_tool")
+    # Conversations nothing may be captured or recorded from (the owner's
+    # self-DM). `_self_dms` collects self-DMs detected from search hits.
+    cfg["exclude_channels"] = list(source.get("exclude_channels") or [])
+    cfg["include_channels"] = list(source.get("include_channels") or [])
+    cfg["_self_dms"] = _load_self_dms()
     return cfg
+
+
+def _self_dm_path():
+    return Path(_base_dir) / "state" / "slack-mcp-self-dms.json"
+
+
+_DM_ID = re.compile(r"\bD[A-Z0-9]{8,}\b")
+
+
+def _load_self_dms():
+    """{channel: detection epoch} from earlier runs (best effort).
+
+    A missing file is empty. The round-1 list format is read as detected now.
+    A corrupt file is logged and renamed `.corrupt`; any DM ids readable from
+    it seed (and are saved as) the new state, and the run goes on. The real
+    protection is the explicit `exclude_channels`.
+    """
+    if _base_dir is None:
+        return {}
+    path = _self_dm_path()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        text = None
+    try:
+        if text is None:
+            raise ValueError("unreadable")
+        data = json.loads(text)
+        if isinstance(data, list):
+            return {str(c): _now() for c in data}
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        return {str(c): float(t) for c, t in data.items()}
+    except (ValueError, TypeError) as exc:
+        log(f"slack_mcp: self-DM state unusable ({exc}); moved aside, "
+            "readable ids kept")
+        try:
+            path.rename(path.with_name(path.name + ".corrupt"))
+        except OSError:
+            pass
+        seeded = {c: _now() for c in _DM_ID.findall(text or "")}
+        _save_self_dms(seeded)
+        return seeded
+
+
+def _save_self_dms(found):
+    try:
+        state.write_atomic(
+            _self_dm_path(), json.dumps(found, sort_keys=True), mode=0o600
+        )
+    except OSError:
+        log("slack_mcp: self-DM state not written; detected again next run")
+
+
+def excluded_channels(cfg):
+    """Configured exclusions plus self-DMs detected (this or earlier runs),
+    less any `include_channels` (a false-positive self-DM)."""
+    detected = set(cfg.get("_self_dms") or ()) - set(
+        cfg.get("include_channels") or ()
+    )
+    return set(cfg.get("exclude_channels") or ()) | detected
+
+
+def _is_self_dm(cfg, hit):
+    """An IM whose only participant is the owner (read off the hit itself)."""
+    return (
+        hit["label"] == "DM" and hit["channel"][:1] == "D"
+        and bool(cfg["self_user_id"])
+        and set(hit["participants"]) == {cfg["self_user_id"]}
+    )
+
+
+def _drop_excluded(cfg, hits):
+    """`hits` without those of an excluded channel or a detected self-DM."""
+    new = {
+        h["channel"] for h in hits
+        if _is_self_dm(cfg, h) and h["channel"] not in cfg["_self_dms"]
+    }
+    if new:
+        stamp = _now()
+        cfg["_self_dms"].update({c: stamp for c in new})
+        _save_self_dms(cfg["_self_dms"])
+    skip = excluded_channels(cfg)
+    return [h for h in hits if h["channel"] not in skip]
+
+
+def _record(cfg, rows, now):
+    """comms_inbox.record without rows of an excluded channel."""
+    inbox = cfg["comms_inbox"]
+    return comms_inbox.record(
+        _base_dir, rows, inbox["keep_days"], now,
+        exclude_channels=excluded_channels(cfg),
+        text_users=set(inbox["bot_text_users"]),
+    )
 
 
 def dm_session_cfg(value):
@@ -709,26 +828,103 @@ _CHANNEL_AUTHOR = re.compile(
     r"\((?P<id>[A-Z][A-Z0-9]*)(?:, external: [^\n]*?)?\)[ \t]*"
     r"(?P<bot>\[BOT\])?[ \t]*$"
 )
-# Metadata lines a detailed read may put right after `Message TS:`.
-_CHANNEL_META = re.compile(
-    r"^(?:Thread TS|Reply count|Replies|Latest reply|Thread): [^\n]*$"
-)
 _NO_MORE = re.compile(r"no more messages")
+# File shares in channel history, in the layout slack_read_channel really
+# returns: an optional final line
+# `Files: a.zip (ID: F0.., application/zip, 1.5 MB), b.docx (ID: F0.., <mime>)`
+# (after any `Reactions:` line); a file-only message has that line as its only
+# content. Nothing else is read as a file list: anything else stays body text.
+_REAL_FILE = re.compile(
+    r"(?P<name>.+?) \(ID: (?P<id>F[A-Z0-9]+), (?P<mime>[^,()]+)"
+    r"(?:, (?P<size>[^()]+?))?\)(?=, |$)"
+)
+MAX_FILES_PER_MESSAGE = 10
 
 
-def parse_channel(text, lo, hi, channel):
+def _parse_files_line(line):
+    """(files, complete) for a `Files:` line; complete only when the spans of
+    the matched files cover the whole line (else the caller keeps it as text)."""
+    if not line.startswith("Files: "):
+        return [], False
+    out, pos = [], len("Files: ")
+    while pos < len(line):
+        m = _REAL_FILE.match(line, pos)
+        if not m:
+            return out, False
+        entry = {
+            "name": m.group("name").strip()[:200],
+            "filetype": m.group("mime").strip()[:120],
+        }
+        if m.group("size"):
+            entry["size"] = m.group("size").strip()[:40]
+        out.append(entry)
+        pos = m.end()
+        if pos == len(line):
+            break
+        pos += 2  # the ", " the lookahead guaranteed
+    return out[:MAX_FILES_PER_MESSAGE], bool(out)
+
+
+def _real_files(line):
+    """Files of a `Files:` line; [] unless the whole line has that shape."""
+    files, complete = _parse_files_line(line)
+    return files if complete else []
+
+
+def _take_files(lines):
+    """(files, lines without the file line) from a message's body lines.
+
+    The `Files:` line counts only as the last line, or as the first line when
+    it is the message's only content (a `Reactions:` line may follow it).
+    """
+    tail = [i for i in range(len(lines)) if lines[i].strip()][-1:]
+    candidates = []
+    if tail:
+        candidates.append(tail[0])
+        if lines[tail[0]].startswith("Reactions: "):
+            content = [i for i in range(tail[0]) if lines[i].strip()]
+            if content == [0]:
+                candidates.append(0)
+    for index in candidates:
+        files, complete = _parse_files_line(lines[index])
+        if complete:
+            return files, lines[:index] + lines[index + 1:]
+        if files:
+            log("slack_mcp: partial Files line in channel history; "
+                "kept as text")
+    return [], lines
+
+
+class SlackMcpOversized(SlackMcpParseError):
+    """The client replaced a too large connector result with an error note."""
+
+
+def oversized_result(text):
+    """Whether `text` is Claude Code's note for an MCP result over its size
+    limit (`Error: result (55,315 characters) exceeds maximum allowed
+    tokens. Output has been saved to ...`), not connector output."""
+    head = text.lstrip()[:400] if isinstance(text, str) else ""
+    return not head.startswith("{") and (
+        "exceeds maximum allowed tokens" in head
+    )
+
+
+def parse_channel(text, lo, hi, channel, allow_empty=False):
     """Parse one channel-history page into (messages oldest first, more).
 
     Shape: `Channel: <label> (<id>)`, then blocks
     `=== Message from <author> at <time> ===`, `Message TS: <ts>`, optional
-    known metadata lines, the text and an optional trailing `Reactions:`
-    line; newest first. The channel id must equal the pinned `channel`,
+    the text and an optional trailing `Reactions:` line (then an optional
+    `Files:` line); newest first. The channel id must equal the pinned `channel`,
     the order must be strictly monotonic; a block repeating a ts or lying
     outside [lo, hi] is dropped (logged by count), so a header-looking line in
     a body cannot add a message. `more` is the cursor on `pagination_info`
     (older messages not returned), else None; any other pagination text is
-    rejected (fail closed).
+    rejected (fail closed). With `allow_empty`, a page with the channel head
+    and no blocks at all is a valid empty window: ([], more).
     """
+    if oversized_result(text):
+        raise SlackMcpOversized("channel result exceeds the client size limit")
     data = _json_object(text)
     body = data.get("messages")
     if not isinstance(body, str):
@@ -749,6 +945,8 @@ def parse_channel(text, lo, hi, channel):
         m for m in _CHANNEL_BLOCK.finditer(rest)
         if re.match(r"\nMessage TS: \d+\.\d+(?:\n|\Z)", rest[m.end():m.end() + 60])
     ]
+    if allow_empty and not rest.strip() and not more:
+        return [], None  # a valid page with no message in the window
     if not marks or rest[:marks[0].start()].strip():
         raise SlackMcpParseError("channel result has an unknown shape")
     messages = []
@@ -759,8 +957,10 @@ def parse_channel(text, lo, hi, channel):
         if not stamp:
             raise SlackMcpParseError("channel result is malformed")
         lines = lines[1:]
-        while lines and _CHANNEL_META.match(lines[0]):
-            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        # Real layout: text, then `Reactions:`, then `Files:` (both optional).
+        files, lines = _take_files(lines)
         while lines and not lines[-1].strip():
             lines.pop()
         if lines and lines[-1].startswith("Reactions: "):
@@ -776,6 +976,7 @@ def parse_channel(text, lo, hi, channel):
             "is_bot": bool(who and who.group("bot")) or uid.startswith("B")
             or not who,
             "text": "\n".join(lines).strip(),
+            **({"files": files} if files else {}),
         })
     # A block repeating a ts or lying outside the pinned range cannot be a
     # real message of this read: drop it (a body may quote header lines).
@@ -953,7 +1154,9 @@ def _channel_groups(channels, since):
 def search_queries(cfg, since=None):
     """Planned queries in run order (cursor keys, kind, constraints)."""
     queries = []
-    for group in _channel_groups(cfg["channels"], since):
+    skip = excluded_channels(cfg)
+    channels = [c for c in cfg["channels"] if c not in skip]
+    for group in _channel_groups(channels, since):
         for start in range(0, len(group), CHANNELS_PER_QUERY):
             chunk = group[start:start + CHANNELS_PER_QUERY]
             queries.append({
@@ -1123,9 +1326,9 @@ def _search_all(cfg, queries, afters, now):
                     if id(hit) not in agreed:
                         # Kept for listing, never recorded in the inbox.
                         hit["untrusted"] = True
-            accepted = [
+            accepted = _drop_excluded(cfg, [
                 h for h in usable if _valid_hit(query, h, after, now, cfg)
-            ]
+            ])
             if stamps:
                 # Parsed hits, in validated ascending order, bound the
                 # prefix read even when none passed the cross-checks.
@@ -1534,6 +1737,10 @@ def candidates(source):
     queries += _tracked_queries(
         cfg, tracked, cfg["max_queries_per_run"] - len(queries), now
     )
+    watched = comms_inbox.load_watched(_base_dir) if cfg["comms_inbox"] else {}
+    queries += _watched_queries(
+        cfg, watched, cfg["max_queries_per_run"] - len(queries), now
+    )
     follow = comms_inbox.load_follow(_base_dir) if cfg["comms_inbox"] else None
     if follow is not None:
         # One entry per source (a routine may have several); a changed
@@ -1572,7 +1779,8 @@ def candidates(source):
         else reacted_after if query["kind"] == "reacted"
         else track_after if query["kind"] == "track"
         else mine_after if query["kind"] == "mine"
-        else query["after"] if query["kind"] == "tracked" else min(
+        else query["after"] if query["kind"] in ("tracked", "watched")
+        else min(
             int(slack_source._rfc3339_epoch(since_map[key]))
             if since_map.get(key) else fresh
             for key in query["keys"]
@@ -1613,6 +1821,10 @@ def candidates(source):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
+        elif key.startswith("watched:"):
+            log("slack_mcp: a comms-inbox watched-channel search hit "
+                "max_search_pages; newer posts are recorded next run "
+                "(raise max_search_pages if it persists)")
         elif key.startswith("track:"):
             log("slack_mcp: a comms-inbox track search hit "
                 "max_search_pages; newer track requests are not recorded "
@@ -1625,11 +1837,18 @@ def candidates(source):
         # Before DM sessions re-point `root`: the inbox keeps the real thread.
         inbox = cfg["comms_inbox"]
         rows, started = _inbox_rows(cfg, found, tracked, follow)
-        _mark_scanned(cfg, queries, tracked, follow, capped, inbox_failed, now)
+        # First, so a message search also listed keeps the file details.
+        rows = _file_rows(cfg, found, now) + rows
+        _mark_scanned(
+            cfg, queries, tracked, follow, capped, inbox_failed, now, watched
+        )
         if inbox["follow_threads"]:
             rows += _poll_threads(cfg, follow, now)
-        added = comms_inbox.record(_base_dir, rows, inbox["keep_days"], now)
+        added = _record(cfg, rows, now)
         comms_inbox.save_follow(_base_dir, follow, inbox["keep_days"], now)
+        # After the search rows are stored: a guard stop in this extra bridge
+        # session must not lose them (the scan marks have moved on).
+        added += _record(cfg, _bot_text_rows(cfg, rows, now), now)
         if added or started:
             log(f"slack_mcp: comms inbox recorded {added} new line(s), "
                 f"{started} conversation(s) newly tracked or followed")
@@ -1787,7 +2006,10 @@ def _tracked_queries(cfg, tracked, room, now):
     since = {}
     for item in tracked["conversations"]:
         channel = item["channel_id"]
-        if channel in covered or (cfg["all_dms"] and item["whole"]):
+        if (
+            channel in covered or channel in excluded_channels(cfg)
+            or (cfg["all_dms"] and item["whole"])
+        ):
             continue
         since[channel] = min(
             float(item["since"]), since.get(channel, float("inf"))
@@ -1821,10 +2043,184 @@ def _tracked_queries(cfg, tracked, room, now):
     return queries
 
 
-def _mark_scanned(cfg, queries, tracked, follow, capped, failed, now):
+def _watched_queries(cfg, watched, room, now):
+    """Inbox-only searches for watched channels the routine does not search.
+
+    A watched channel in `channels` is already listed by that query and its
+    hits are kept as they are. The others are listed in chunks from their scan
+    mark minus the overlap (first run: `retention_days` back), at most
+    MAX_WATCHED_QUERIES and within `room`.
+    """
+    inbox = cfg["comms_inbox"]
+    if not inbox or not inbox["watch_channels"] or room <= 0:
+        return []
+    skip = excluded_channels(cfg)
+    own = set(cfg["channels"])
+    channels = [
+        c for c in inbox["watch_channels"] if c not in own and c not in skip
+    ]
+    # A channel with no mark is searched apart (from the retention floor), so
+    # a new one does not send the known channels back that far.
+    chunks = [
+        group[i:i + CHANNELS_PER_QUERY]
+        for group in (
+            [c for c in channels if c in watched],
+            [c for c in channels if c not in watched],
+        )
+        for i in range(0, len(group), CHANNELS_PER_QUERY)
+    ]
+    limit = min(room, comms_inbox.MAX_WATCHED_QUERIES)
+    if len(chunks) > limit:
+        log(f"slack_mcp: {len(chunks) - limit} watched-channel search(es) "
+            "skipped (query cap)")
+    overlap = _seconds(cfg["overlap"])
+    floor = int(now) - inbox["retention_days"] * 86400
+    queries = []
+    for chunk in chunks[:limit]:
+        starts = [
+            max(floor, watched[c] - overlap) if c in watched else floor
+            for c in chunk
+        ]
+        queries.append({
+            "key": f"watched:{chunk[0]}", "kind": "watched",
+            "keys": [f"watched:{c}" for c in chunk],
+            "allowed": set(chunk), "user": None, "keywords": None,
+            "filters": " ".join(f"in:<#{c}>" for c in chunk),
+            "after": int(min(starts)),
+        })
+    return queries
+
+
+def _bot_text_rows(cfg, rows, now):
+    """Rows with the full text of `bot_text_users` messages in their DMs.
+
+    A DM message of such an app can reach the inbox with an empty text (search
+    does not carry its attachments). The DMs holding one (stored, or in
+    `rows`) are read with `read_channel_tool`, oldest such message first, at
+    most MAX_BOT_TEXT_READS DMs in one bridge session, one page each over the
+    window from the DM's oldest to its newest empty message (so the window
+    shrinks as messages are completed). The app's messages become rows
+    (`is_bot` true) with their rendered text. A message still empty after
+    MAX_BOT_TEXT_TRIES reads, or in a page that did not parse, is left alone.
+    A failed session is logged and retried; a budget or pause stop propagates.
+    """
+    inbox = cfg["comms_inbox"]
+    users = set(inbox["bot_text_users"])
+    tool = cfg["read_channel_tool"]
+    if not users:
+        return []
+    if not tool or not inbox["all_dms"]:
+        # A watch-file block is merged after validation, so say it here.
+        if "bot_text" not in _WARNED_UNCOVERED:
+            _WARNED_UNCOVERED.add("bot_text")
+            log("slack_mcp: comms_inbox.bot_text_users needs read_channel_tool "
+                "on the source and comms_inbox.all_dms; bot text not read")
+        return []
+    skip = excluded_channels(cfg)
+    empties = {
+        c: stamps for c, stamps in comms_inbox.empty_bot_messages(
+            _base_dir, users, rows
+        ).items() if c not in skip
+    }
+    if not empties:
+        return []
+    order = sorted(empties, key=lambda c: min(map(float, empties[c])))
+    order = order[:comms_inbox.MAX_BOT_TEXT_READS]
+    window = {
+        c: (min(map(float, empties[c])) - 1, max(map(float, empties[c])) + 1)
+        for c in order
+    }
+    tries = comms_inbox.load_bot_tries(_base_dir)
+    out, bad, large = [], 0, 0
+
+    def count(channel, floor):
+        for ts in empties[channel]:
+            if float(ts) >= floor:
+                key = f"{channel}:{ts}"
+                tries[key] = tries.get(key, 0) + 1
+
+    # An oversized page is retried with half the limit in a fresh session; it
+    # is not a try (nothing about the message was learned).
+    pending, limit, calls = list(order), BOT_TEXT_READ_LIMIT, []
+    for attempt in range(3):
+        calls = [{
+            THREAD_CHANNEL_ARG: channel,
+            CHANNEL_OLDEST_ARG: _ts_bound(f"{window[channel][0]:.6f}", 0),
+            CHANNEL_LATEST_ARG: _ts_bound(f"{window[channel][1]:.6f}", 0),
+            CHANNEL_LIMIT_ARG: limit,
+        } for channel in pending]
+        try:
+            texts = _session(cfg, tool, {}, calls, "bot text read", [])
+        except claude_bridge.GUARD_STOPS:
+            raise
+        except claude_bridge.BridgeError as exc:
+            log(f"slack_mcp: comms inbox bot text reads failed: {exc}")
+            break
+        retry = []
+        for call, text in zip(calls, texts):
+            channel = call[THREAD_CHANNEL_ARG]
+            lo, hi = window[channel]
+            try:
+                if text is None:
+                    raise SlackMcpParseError("no result")
+                messages, more = parse_channel(
+                    text, f"{lo:.6f}", f"{hi:.6f}", channel, allow_empty=True,
+                )
+            except SlackMcpOversized:
+                log(f"slack_mcp: bot text page of {limit} message(s) exceeds "
+                    "the client size limit"
+                    + ("; retrying smaller" if limit > 1 and attempt < 2
+                       else "; left for the next run"))
+                if limit > 1 and attempt < 2:
+                    retry.append(channel)
+                else:
+                    large += 1
+                    count(channel, window[channel][0])  # one try each
+                continue
+            except SlackMcpParseError as exc:
+                log(f"slack_mcp: bot text page not parsed ({exc})")
+                bad += 1
+                count(channel, lo)  # every empty message of the window
+                continue
+            filled = set()
+            for message in messages:
+                if message["user"] not in users or not message["text"]:
+                    continue
+                filled.add(message["ts"])
+                out.append(comms_inbox.message_row({
+                    "channel": channel, "root": message["ts"],
+                    "ts": message["ts"], "user": message["user"],
+                    "is_bot": True, "text": message["text"], "label": "DM",
+                }, cfg["self_user_id"]))
+            # Messages this page fully covers that still read empty (or are
+            # gone) count a try; an older, unread part of the window does not.
+            oldest = float(messages[0]["ts"]) if messages and more else lo
+            empties[channel] = [t for t in empties[channel] if t not in filled]
+            count(channel, oldest)
+        pending, limit = retry, max(1, limit // 2)
+        if not pending:
+            break
+    comms_inbox.save_bot_tries(_base_dir, tries, inbox["keep_days"], now)
+    log(f"slack_mcp: comms inbox read {len(order)} DM page(s) for bot text, "
+        f"{len(out)} message(s) with text"
+        + (f", {bad} without a usable result" if bad else "")
+        + (f", {large} too large" if large else ""))
+    return out
+
+
+def _mark_scanned(cfg, queries, tracked, follow, capped, failed, now,
+                  watched=None):
     """Advance the inbox scan marks and save the tracked set."""
     overlap = _seconds(cfg["overlap"])
     for query in queries:
+        if query["kind"] == "watched" and watched is not None:
+            for key in query["keys"]:
+                if key not in failed:
+                    watched[key.split(":", 1)[1]] = (
+                        int(capped[key]) + overlap if key in capped
+                        else int(now)
+                    )
+            continue
         if query["kind"] == "mine" and follow is not None and (
             "mine" not in failed
         ):
@@ -1844,6 +2240,10 @@ def _mark_scanned(cfg, queries, tracked, follow, capped, failed, now):
     comms_inbox.save_tracked(
         _base_dir, tracked, cfg["comms_inbox"]["keep_days"], now
     )
+    if watched is not None:
+        comms_inbox.save_watched(
+            _base_dir, watched, cfg["comms_inbox"]["keep_days"], now
+        )
 
 
 def _poll_threads(cfg, follow, now):
@@ -1860,6 +2260,8 @@ def _poll_threads(cfg, follow, now):
         set(cfg["channels"]) | comms_inbox.covered_channels(follow, now),
         inbox["thread_polls"], now,
     )
+    skip = excluded_channels(cfg)
+    due = [(c, r) for c, r in due if c not in skip]
     if not due:
         return []
     calls = [
@@ -1902,6 +2304,251 @@ def _poll_threads(cfg, follow, now):
     return rows
 
 
+def _file_scan_path():
+    return Path(_base_dir) / "state" / "slack-mcp-file-scan.json"
+
+
+def _load_file_state():
+    """{"marks": {channel: epoch}, "backfill": {channel: {"upto", "pending"}},
+    "alt": last cap-1 pick}; unreadable counts as empty. The older flat
+    {channel: epoch} file is read as marks."""
+    out = {"marks": {}, "backfill": {}, "alt": None, "fails": {}}
+    try:
+        data = json.loads(_file_scan_path().read_text())
+    except (OSError, ValueError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    if "marks" not in data:
+        data = {"marks": data}
+    for channel, mark in (data.get("marks") or {}).items():
+        try:
+            out["marks"][str(channel)] = float(mark)
+        except (TypeError, ValueError):
+            continue
+    for channel, item in (data.get("backfill") or {}).items():
+        try:
+            out["backfill"][str(channel)] = {
+                "upto": float(item["upto"]), "pending": float(item["pending"]),
+            }
+        except (TypeError, ValueError, KeyError):
+            continue
+    for channel, item in (data.get("fails") or {}).items():
+        try:
+            out["fails"][str(channel)] = {
+                "n": int(item["n"]), "wait": int(item["wait"]),
+            }
+        except (TypeError, ValueError, KeyError):
+            continue
+    if data.get("alt") in ("hot", "cold"):
+        out["alt"] = data["alt"]
+    return out
+
+
+def _save_file_state(marks, backfill, alt, fails, now, cfg):
+    keep = now - 2 * cfg["file_scan_lookback_days"] * 86400
+    marks = {c: m for c, m in marks.items() if m >= keep}
+    backfill = {c: b for c, b in backfill.items() if b["pending"] >= keep}
+    fails = {c: f for c, f in fails.items()
+             if f["wait"] > 0 or c in marks or c in backfill}
+    try:
+        state.write_atomic(
+            _file_scan_path(),
+            json.dumps({"marks": marks, "backfill": backfill, "alt": alt,
+                        "fails": fails}, sort_keys=True),
+            mode=0o600,
+        )
+    except OSError:
+        log("slack_mcp: file scan state not written; channels are re-read")
+
+
+def _load_file_marks():
+    """{channel: epoch of its last complete file scan}."""
+    return _load_file_state()["marks"]
+
+
+def _file_rows(cfg, found, now):
+    """Inbox rows for file shares in direct conversations with activity.
+
+    A file-only message has no text, so Slack's text search (content type
+    `messages`, pinned) does not list it. Channel history does, so each DM or
+    group DM that is active (a hit this run, or an inbox line within
+    `file_scan_lookback_days`) is read with `read_channel_tool`, and the
+    messages that carry files become rows. A conversation with a hit this run
+    is read every run; the rest at most every `file_scan_minutes`. Excluded
+    channels are never read.
+
+    At most `max_file_reads_per_run` pages are read per run; a truncated page
+    is followed by its cursor while budget is left. A read still truncated
+    when the budget ends does not advance the scan mark: the unread window
+    is kept as a backfill bound (`upto`, with the mark to set once done) and
+    read first next time. A failed session is logged and retried later; a
+    budget or pause stop propagates.
+    """
+    cap = cfg["max_file_reads_per_run"]
+    inbox = cfg["comms_inbox"]
+    if not (cap and cfg["read_channel_tool"] and inbox and inbox["all_dms"]):
+        return []
+    lookback = now - cfg["file_scan_lookback_days"] * 86400
+    labels, hot = {}, set()
+    for _query, hit in found:
+        if hit["label"] in DM_LABELS and not hit.get("untrusted"):
+            labels[hit["channel"]] = hit["label"]
+            hot.add(hit["channel"])
+    for channel, (kind, _ts) in comms_inbox.dm_channels(
+        _base_dir, lookback
+    ).items():
+        labels.setdefault(channel, "DM" if kind == "im" else "Group DM")
+    saved = _load_file_state()
+    marks, backfill, fails = saved["marks"], saved["backfill"], saved["fails"]
+    skip = excluded_channels(cfg)
+    # A failing channel backs off for min(2**n, 48) runs and ranks after
+    # healthy ones, so it cannot hold the quiet slot every run.
+    waiting = {c for c, f in fails.items() if f["wait"] > 0}
+    for channel in waiting:
+        fails[channel]["wait"] -= 1
+    gap = cfg["file_scan_minutes"] * 60
+    ranked = sorted(
+        (channel not in hot, channel in fails, marks.get(channel, 0.0),
+         channel)
+        for channel in labels
+        if channel not in skip and channel not in waiting
+        and (channel in hot or channel in backfill
+             or now - marks.get(channel, 0.0) >= gap)
+    )
+    ranked = [(r[0], r[2], r[3]) for r in ranked]
+    hot_due = [r for r in ranked if not r[0]]
+    cold_due = [r for r in ranked if r[0]]
+    alt = saved["alt"]
+    if hot_due and cold_due and cap == 1:
+        # One slot: alternate between busy and quiet channels across runs.
+        alt = "hot" if alt == "cold" else "cold"
+        due = (hot_due if alt == "hot" else cold_due)[:1]
+    elif cap >= 2 and cold_due and len(hot_due) >= cap:
+        # Busy channels must not starve the quiet ones: one slot per run goes
+        # to the quiet channel scanned longest ago.
+        due = hot_due[:cap - 1] + cold_due[:1]
+    else:
+        due = (hot_due + cold_due)[:cap]
+    if not due:
+        if waiting:
+            _save_file_state(marks, backfill, alt, fails, now, cfg)
+        return []
+    # Per channel: window (lo, hi), the mark to set when fully read, cursor,
+    # oldest message seen, whether any page was read.
+    plan = {}
+    for _cold, mark, channel in due:
+        lo = max(mark - 300, lookback)
+        if channel in backfill:
+            hi, done_mark = backfill[channel]["upto"], backfill[channel]["pending"]
+        else:
+            hi, done_mark = now + 60, now
+        if hi <= lo:
+            # The backfill fell below the lookback: nothing left to read.
+            marks[channel] = done_mark
+            backfill.pop(channel, None)
+            continue
+        plan[channel] = {
+            "lo": lo, "hi": hi, "done": done_mark, "cursor": None,
+            "oldest": None,
+        }
+    size = cfg["calls_per_session"]
+    budget = cap - len(plan)
+    rows, read, bad, truncated = [], 0, 0, 0
+    active = list(plan)
+    while active:
+        calls = []
+        for channel in active:
+            w = plan[channel]
+            call = {
+                THREAD_CHANNEL_ARG: channel,
+                CHANNEL_OLDEST_ARG: _ts_bound(f"{w['lo']:.6f}", 0),
+                CHANNEL_LATEST_ARG: _ts_bound(f"{w['hi']:.6f}", 0),
+                CHANNEL_LIMIT_ARG: CHANNEL_READ_MAX,
+            }
+            if w["cursor"]:
+                call[CHANNEL_CURSOR_ARG] = w["cursor"]
+            calls.append(call)
+        following = []
+        for start in range(0, len(calls), size):
+            part = calls[start:start + size]
+            try:
+                texts = _session(
+                    cfg, cfg["read_channel_tool"], {}, part,
+                    "channel history read", [],
+                )
+            except claude_bridge.GUARD_STOPS:
+                raise
+            except claude_bridge.BridgeError as exc:
+                log(f"slack_mcp: comms inbox file reads failed: {exc}")
+                texts = [None] * len(part)  # a plain retry, no backoff
+            for call, text in zip(part, texts):
+                channel = call[THREAD_CHANNEL_ARG]
+                w = plan[channel]
+                messages, more = None, None
+                if text is None:
+                    bad += 1
+                else:
+                    try:
+                        messages, more = parse_channel(
+                            text, f"{w['lo']:.6f}", f"{w['hi']:.6f}",
+                            channel, allow_empty=True,
+                        )
+                    except SlackMcpParseError as exc:
+                        # Malformed: logged, mark not advanced, re-read.
+                        log(f"slack_mcp: file scan page not parsed ({exc}); "
+                            "channel is re-read")  # incl. size limit
+                        bad += 1
+                        w["failed"] = "parse"
+                if messages is None:
+                    w.setdefault("failed", "retry")
+                    continue
+                read += 1
+                for message in messages:
+                    if message.get("files"):
+                        hit = dict(
+                            message, channel=channel, root=message["ts"],
+                            label=labels[channel],
+                        )
+                        rows.append(comms_inbox.message_row(
+                            hit, cfg["self_user_id"]
+                        ))
+                if messages:
+                    first = float(messages[0]["ts"])
+                    w["oldest"] = first if w["oldest"] is None \
+                        else min(w["oldest"], first)
+                w["cursor"] = more
+                if more:
+                    following.append(channel)
+        active = []
+        for channel in following:
+            if budget > 0:
+                budget -= 1
+                active.append(channel)
+            else:
+                truncated += 1
+    for channel, w in plan.items():
+        if w.get("failed") == "parse":
+            n = fails.get(channel, {"n": 0})["n"] + 1
+            fails[channel] = {"n": n, "wait": min(2 ** n, 48)}
+        elif not w.get("failed"):
+            fails.pop(channel, None)
+        if w.get("failed") or w["cursor"]:
+            # Not fully read: keep the mark; what was read is not read again.
+            if w["oldest"] is not None:
+                backfill[channel] = {"upto": w["oldest"], "pending": w["done"]}
+        else:
+            marks[channel] = w["done"]
+            backfill.pop(channel, None)
+    _save_file_state(marks, backfill, alt, fails, now, cfg)
+    log(f"slack_mcp: comms inbox read {read} DM history page(s) of "
+        f"{len(due)} channel(s) for files, {len(rows)} file message(s)"
+        + (f", {bad} without a usable result" if bad else "")
+        + (f", {truncated} still truncated (backfill next run)"
+           if truncated else ""))
+    return rows
+
+
 def _inbox_rows(cfg, found, tracked, follow):
     """Inbox rows for this run's hits; (rows, conversations newly tracked).
 
@@ -1915,6 +2562,7 @@ def _inbox_rows(cfg, found, tracked, follow):
     inbox = cfg["comms_inbox"]
     channels = set(inbox["channels"])
     reactions = set(inbox["reactions"])
+    watch = set(inbox["watch_channels"])
     rows = []
     started = 0
     for query, hit in found:
@@ -1938,6 +2586,7 @@ def _inbox_rows(cfg, found, tracked, follow):
             or (inbox["all_dms"] and hit["label"] in DM_LABELS)
             or comms_inbox.is_tracked(tracked, hit)
             or followed
+            or comms_inbox.is_watched_post(hit, watch, cfg["include_bots"])
         ):
             continue
         if followed:
@@ -1984,7 +2633,11 @@ def _check_reactions(cfg, now):
         return
     due = comms_inbox.due_checks(
         _base_dir, inbox["reaction_checks"], inbox["reaction_check_hours"], now,
+        seen=set(inbox["seen_reactions"]),
+        bot_users=set(inbox["bot_text_users"]),
     )
+    skip = excluded_channels(cfg)
+    due = [d for d in due if d["channel_id"] not in skip]
     if not due:
         return
     calls = [
@@ -2030,7 +2683,7 @@ def _check_reactions(cfg, now):
                 comms_inbox.reaction_row(hit, name) for name, users in reactors
                 if owner in users and name not in not_handled
             )
-    added = comms_inbox.record(_base_dir, rows, inbox["keep_days"], now)
+    added = _record(cfg, rows, now)
     comms_inbox.mark_checked(
         _base_dir, checked, inbox["reaction_check_hours"], now
     )
@@ -2072,9 +2725,10 @@ def _check_joined(cfg, now, lane):
         _base_dir, lane, inbox,
         run(tool, dict(comms_joined.LIST_PINS), "channel listing"),
         run(info_tool, {}, "channel lookup") if info_tool else None,
-        lambda rows: comms_inbox.record(_base_dir, rows, inbox["keep_days"], now),
+        lambda rows: _record(cfg, rows, now),
         now,
         (lambda rows: watch_joins.suggest(target, rows)) if target else None,
+        exclude=excluded_channels(cfg),
     )
 
 
@@ -2278,7 +2932,10 @@ def _read_dm_sessions(batch, wanted):
                     continue
                 try:
                     messages, more = parse_channel(text, first, last, key[0])
-                except SlackMcpParseError:
+                except SlackMcpParseError as exc:
+                    if isinstance(exc, SlackMcpOversized):
+                        log("slack_mcp: a DM session history page exceeds the "
+                            "client size limit; the session is not read")
                     batch["threads"][key] = {"status": "invalid"}
                     continue
                 pages[key].extend(messages)

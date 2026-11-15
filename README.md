@@ -2265,6 +2265,8 @@ comms_inbox:
   ignore_reactors: [U0EXAMPLE09]   # user ids never recorded as peer reactions, at most 20
   follow_threads: true   # follow every channel thread the owner posted in
   thread_polls: 10       # followed-thread reads per run, 0 to 30
+  watch_channels: [C0EXAMPLE02]   # every top-level post by anyone, at most 30
+  bot_text_users: [U0EXAMPLED]    # apps whose DM text is read in full, at most 10
   joined_channels: true  # a line per newly joined channel (needs channels_tool)
   joined_check_minutes: 60   # how often channels are listed, 15 to 1440
   suggest_watch: ~/path/slack-watch.yaml   # optional: suggest new joins for this watch
@@ -2344,6 +2346,38 @@ One JSON object per line, oldest message first:
   cursor. The tracked set and marks live in `state/comms-inbox-tracked.json`.
   A track emoji is independent of `save_reactions`: one message can carry
   both, and an emoji cannot be in both `reactions` and `track_reactions`.
+- Watched channels (`watch_channels`): every top-level message (`thread_ts`
+  equal to `ts`) of anyone in those channels becomes a `message` line with
+  `channel_type` `"channel"`, whether or not the owner took part. Bots are
+  skipped unless the source sets `include_bots`; thread replies are not
+  recorded. A watched channel in the routine's `channels` is already searched,
+  so its hits are kept. One the routine does not search gets an inbox-only
+  search (`in:<#C...>`, chunks of 15, at most 2 per run, within
+  `max_queries_per_run`) from a per-channel scan mark in
+  `state/comms-inbox-watched.json` (first run: `retention_days` back). Those
+  hits are recorded only, never captured or analysed: one search, no model
+  call. A routine records only its own searches' hits, so a channel another
+  routine searches still needs its own `watch_channels` entry or search.
+- Bot text (`bot_text_users`): some apps (for example a document-comment
+  notifier) post attachments that a search result carries with an empty
+  `text`. For a DM whose stored or just-listed line from a listed user has no
+  text, each run reads one history page of it with `read_channel_tool` (at most
+  4 DMs per run, one extra bridge session) and records the app's messages with
+  their rendered text (redacted, at most 4000 characters, `is_bot` true). A
+  stored line of such a user with `text` `""` gains the text read later, the
+  one case where a line changes: that is the backfill of older lines. A
+  message that still reads empty is tried 3 times, then left
+  (`state/comms-inbox-bottext.json`). Needs `read_channel_tool` and
+  `comms_inbox.all_dms`.
+- Seen reactions (`seen_reactions: [eyes]`, at most 5, not a track emoji):
+  owner emoji that mean "seen", not "handled". They are still recorded as
+  `owner_reaction` lines, but do not stop a message's reaction polling, which
+  goes on (same back-off and age limit) until an owner reaction outside the
+  list is recorded. Messages of a `bot_text_users` app are polled too, one by
+  one, within `reaction_checks`. Needs `reactions_tool`. Reactor lists are
+  parsed fail-closed: ids are taken only at the end of each `Name (ID)` entry,
+  and a list whose entry count, id-like tokens and `x N` disagree (a name such
+  as `Dana (U...)`, or a truncated list) records nothing.
 - Followed threads (`follow_threads: true`): one more record-only search,
   `from:<@owner>`, lists every channel message of the owner (root or reply,
   any channel; DMs are left to `all_dms`) from its own scan mark (first run:
@@ -2381,6 +2415,20 @@ One JSON object per line, oldest message first:
   track, tracked-channel or owner search) costs only the inbox: it never marks
   the capture listing partial. A read with no usable result (deleted message,
   lost access) backs off like a successful one.
+- Exclusions: `exclude_channels: [C0EXAMPLE01]` on the `slack_mcp` source (a
+  list of channel ids) keeps those conversations out of capture and out of the
+  inbox; rows already stored for them are dropped. Self-DMs (an IM whose only
+  participant is the owner) are detected from the hits and excluded the same
+  way; `include_channels: [D0EXAMPLE03]` (also a list of ids; a bare string is
+  a config error) lifts the exclusion for a false-positive self-DM.
+- File shares: with `comms_inbox.all_dms` and `read_channel_tool` set, active DMs
+  and group DMs are read through channel history and every message with files
+  becomes a `message` row carrying `files: [{"name", "filetype", "size"}]`
+  (what the `Files:` line shows; no permalink). Source keys bound the scan:
+  `max_file_reads_per_run` (default 5, 0 turns it off, max 50),
+  `file_scan_lookback_days` (default 3, 1 to 30) and `file_scan_minutes`
+  (default 30, 1 to 1440; one read per conversation per interval unless it had
+  a hit this run). Excluded channels and self-DMs are never read.
 - Shared state: every routine with `comms_inbox` writes the same files, pruned
   by the longest `retention_days` of the lanes active in the last day. Writers
   must not overlap; capture routines all run under the daemon's `run` lock.

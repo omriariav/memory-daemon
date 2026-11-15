@@ -24,6 +24,9 @@ Watch file (or source) block:
       track_reactions: [track-example]   # "watch this conversation" (at most 3)
       track_lookback_days: 7   # track emoji count on messages this recent
                                # (default retention_days)
+      watch_channels: [C0EXAMPLE02]   # every top-level post by anyone (at most 30)
+      bot_text_users: [U0EXAMPLED]    # apps whose DM text is read in full (at most 10)
+      seen_reactions: [eyes]   # owner emoji that mean "seen", not "handled" (at most 5)
       follow_threads: true     # every channel thread the owner posted in
       thread_polls: 10         # thread reads per run for followed threads
       joined_channels: true    # a line per newly joined channel (needs
@@ -77,6 +80,45 @@ recorded like those of `channels`, until the track request is older than
 no other query lists is searched by an extra `tracked` query (channels in
 chunks, at most MAX_TRACKED_QUERIES), from a per-channel scan mark kept with
 the tracked set in `state/comms-inbox-tracked.json`.
+
+`watch_channels` records every TOP-LEVEL message (`thread_ts == ts`) of anyone
+in those public or private channels as an ordinary "message" line (channel_type
+"channel"), whether or not the owner took part. Bots are left out unless the
+source sets `include_bots`; thread replies are not recorded (the owner's own
+threads are covered by `follow_threads`, and `channels` still records
+everything it lists). Hits come from the routine's own searches: a watched
+channel in the routine's `channels` list (the watch file's, discovered ones
+included) is already searched, so its hits are simply kept. A watched channel
+the routine does not search gets an inbox-only `watched` query (`in:<#C...>`,
+channels in chunks of 15, at most MAX_WATCHED_QUERIES per run and within
+`max_queries_per_run`) from a per-channel scan mark kept in
+`state/comms-inbox-watched.json` (first run: `retention_days` back; the mark
+advances like a cursor and rewinds by the source's `overlap`). Its hits are
+recorded only: they never reach capture or analysis, so they cost one search
+each and no model call. Another routine searching the same channel does not
+help, because a routine records only the hits of its own searches.
+
+`bot_text_users` names apps (user ids) whose messages arrive in a DM with an
+empty search text (the Google Drive app posts its comment notifications as
+attachments, which the search result's `Text:` does not carry). A DM line of
+such a user with no text is completed from `read_channel_tool`: each run reads
+one history page (newest first) of up to MAX_BOT_TEXT_READS DMs, from the
+oldest empty line of the app in that DM, and records the app's messages with
+their full rendered text (secret-redacted, cut at MAX_TEXT) and `is_bot` true.
+Lines are otherwise never changed, with one exception: a stored line of a
+`bot_text_users` user whose text is "" gains the text read later (that is also
+the one-time backfill of lines written before the option existed). A message
+whose text still reads empty is tried MAX_BOT_TEXT_TRIES times
+(`state/comms-inbox-bottext.json`) and then left. Needs `read_channel_tool`
+and `all_dms` (inbox and source). Other apps stay as they were.
+
+`seen_reactions` lists owner emoji that mean "seen", not "handled". Such a
+reaction is still recorded as an `owner_reaction`, but it does not stop the
+reaction polling of its message (which continues, with the usual back-off and
+age limit, until an owner reaction outside the list is recorded). Messages of
+a `bot_text_users` app are polled too, although they are bot messages, and each
+of them separately (not only the newest of the DM), within `reaction_checks`.
+Both need `reactions_tool`. The default (empty list) is the earlier behaviour.
 
 An empty block (`comms_inbox: {}`) is valid: that routine records only the
 tracked and followed conversations its own searches list, and publishes its
@@ -138,6 +180,7 @@ KEYS = {
     "reaction_check_hours", "track_reactions", "follow_threads",
     "thread_polls", "ignore_reactors", "joined_channels",
     "joined_check_minutes", "track_lookback_days", "suggest_watch",
+    "watch_channels", "bot_text_users", "seen_reactions",
 }
 DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "retention_days": 14, "reaction_checks": 10,
@@ -145,26 +188,39 @@ DEFAULTS = {"channels": [], "all_dms": False, "reactions": [],
             "follow_threads": False, "thread_polls": 10,
             "ignore_reactors": [], "joined_channels": False,
             "joined_check_minutes": 60, "track_lookback_days": None,
-            "suggest_watch": None}
+            "suggest_watch": None, "watch_channels": [],
+            "bot_text_users": [], "seen_reactions": []}
 FOLLOW_FILE = "comms-inbox-follow.json"
 MAX_FOLLOWED = 500
 COVERED_TTL = 86400
 TRACKED_FILE = "comms-inbox-tracked.json"
 MAX_TRACK_REACTIONS = 3
 MAX_TRACKED_QUERIES = 2
+WATCHED_FILE = "comms-inbox-watched.json"
+MAX_WATCH_CHANNELS = 30
+MAX_WATCHED_QUERIES = 2
+BOT_TEXT_FILE = "comms-inbox-bottext.json"
+MAX_BOT_TEXT_USERS = 10
+MAX_BOT_TEXT_READS = 4
+MAX_BOT_TEXT_TRIES = 3
 CHECKS_FILE = "comms-inbox-checks.json"
 MAX_CHECK_GAP = 6 * 3600
 MAX_REACTIONS = 5
 MAX_IGNORE_REACTORS = 20
 MAX_RETENTION_DAYS = 90
 MAX_TEXT = 4000
+MAX_FILES = 10
 SLACKBOT = "USLACKBOT"
 _REACTION_LINE = re.compile(
     # Skin tones arrive as `:+1::skin-tone-2:`.
-    r"^:(?P<emoji>[^\s:][^\s]{0,120}?): \u00d7 \d+ \u2014 (?P<who>.*)$"
+    r"^:(?P<emoji>[^\s:][^\s]{0,120}?): \u00d7 (?P<count>\d+) \u2014 "
+    r"(?P<who>.*)$"
 )
 _REACTOR = re.compile(r"\(([UW][A-Z0-9]+)\)")
+# One reactor entry: a display name, then the id in parentheses at its END.
+_REACTOR_ENTRY = re.compile(r"[^\n]*? \(([UW][A-Z0-9]+)\)")
 CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
+WATCH_CHANNEL_ID = re.compile(r"^[CG][A-Z0-9]{8,}$")
 USER_ID = re.compile(r"^[UW][A-Z0-9]{6,}$")
 EMOJI = re.compile(r"^[a-z0-9][a-z0-9_+'-]{0,99}$")
 
@@ -186,6 +242,7 @@ def problem(value):
             return f"`{key}` must be true or false"
     for key, most in (
         ("reactions", MAX_REACTIONS), ("track_reactions", MAX_TRACK_REACTIONS),
+        ("seen_reactions", MAX_REACTIONS),
     ):
         names = value.get(key, [])
         if (
@@ -197,6 +254,27 @@ def problem(value):
                 f"`{key}` must be a list of at most {most} distinct emoji "
                 "names (no colons)"
             )
+    watch = value.get("watch_channels", [])
+    if (
+        not isinstance(watch, list) or len(watch) > MAX_WATCH_CHANNELS
+        or not all(isinstance(c, str) and WATCH_CHANNEL_ID.match(c)
+                   for c in watch)
+        or len(set(watch)) != len(watch)
+    ):
+        return (
+            f"`watch_channels` must be a list of at most {MAX_WATCH_CHANNELS}"
+            " distinct channel ids (C... or G...)"
+        )
+    bots = value.get("bot_text_users", [])
+    if (
+        not isinstance(bots, list) or len(bots) > MAX_BOT_TEXT_USERS
+        or not all(isinstance(u, str) and USER_ID.match(u) for u in bots)
+        or len(set(bots)) != len(bots)
+    ):
+        return (
+            f"`bot_text_users` must be a list of at most {MAX_BOT_TEXT_USERS}"
+            " distinct Slack user ids"
+        )
     ignore = value.get("ignore_reactors", [])
     if (
         not isinstance(ignore, list) or len(ignore) > MAX_IGNORE_REACTORS
@@ -209,6 +287,10 @@ def problem(value):
         )
     if set(value.get("reactions", [])) & set(value.get("track_reactions", [])):
         return "an emoji cannot be in both `reactions` and `track_reactions`"
+    if set(value.get("seen_reactions", [])) & set(
+        value.get("track_reactions", [])
+    ):
+        return "an emoji cannot be in both `seen_reactions` and `track_reactions`"
     suggest = value.get("suggest_watch")
     if suggest is not None and not (
         isinstance(suggest, str) and suggest
@@ -249,6 +331,9 @@ def settings(value):
     cfg["reactions"] = list(cfg["reactions"])
     cfg["track_reactions"] = list(cfg["track_reactions"])
     cfg["ignore_reactors"] = list(cfg["ignore_reactors"])
+    cfg["watch_channels"] = list(cfg["watch_channels"])
+    cfg["bot_text_users"] = list(cfg["bot_text_users"])
+    cfg["seen_reactions"] = list(cfg["seen_reactions"])
     return cfg
 
 
@@ -308,6 +393,50 @@ def channel_type(hit):
     return dm_kind(hit) or "channel"
 
 
+def _size(value):
+    """A byte count from an int or text such as `12345`, `3.4 MB`; else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value >= 0 else None
+    found = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*(bytes?|b|kb|mb|gb)?\s*", str(value or ""),
+        re.I,
+    )
+    if not found:
+        return None
+    unit = (found.group(2) or "b").lower()
+    scale = {"kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3}.get(unit, 1)
+    return int(float(found.group(1)) * scale)
+
+
+def clean_files(files):
+    """`files` as [{name, filetype, size, permalink}] (what is known), capped.
+
+    `permalink` is kept only when the source supplies one; slack_mcp does not.
+
+    At most MAX_FILES entries; each text field is secret-redacted and cut.
+    Entries without any usable field are dropped.
+    """
+    out = []
+    for item in files if isinstance(files, (list, tuple)) else ():
+        if not isinstance(item, dict):
+            continue
+        entry = {}
+        for key, limit in (("name", 200), ("filetype", 120), ("permalink", 300)):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                entry[key] = redact_secrets(value.strip())[:limit]
+        size = _size(item.get("size"))
+        if size is not None:
+            entry["size"] = size
+        if entry:
+            out.append(entry)
+        if len(out) >= MAX_FILES:
+            break
+    return out
+
+
 def message_row(hit, self_user_id):
     row = {
         "type": "message",
@@ -322,7 +451,26 @@ def message_row(hit, self_user_id):
     kind = channel_type(hit)
     if kind:
         row["channel_type"] = kind
+    files = clean_files(hit.get("files"))
+    if files:
+        row["files"] = files
     return row
+
+
+def dm_channels(base_dir, since):
+    """{channel: (channel_type, newest ts)} of IM/group-DM channels with an
+    inbox line at or after epoch `since`."""
+    out = {}
+    for row in _load(path(base_dir)):
+        if row.get("channel_type") not in ("im", "mpim"):
+            continue
+        ts = float(row["ts"])
+        if ts < since:
+            continue
+        old = out.get(row["channel_id"])
+        if old is None or ts > old[1]:
+            out[row["channel_id"]] = (row["channel_type"], ts)
+    return out
 
 
 def reaction_row(hit, emoji):
@@ -373,10 +521,15 @@ def _annotate(added, rows):
             row["peer_is_bot"] = peers[row["channel_id"]] == {True}
 
 
-def record(base_dir, rows, retention_days, now=None):
+def record(base_dir, rows, retention_days, now=None, exclude_channels=(),
+           text_users=()):
     """Add `rows` (deduped) and drop expired lines; returns lines added.
 
-    Rewrites the file only when something changed. A write failure is logged
+    A stored message of a `text_users` user with no text gains the text of a
+    row that has some (the only change a stored message text ever gets).
+
+    Rows of `exclude_channels` are never added, and any already stored are
+    dropped. Rewrites the file only when something changed. A write failure is logged
     and swallowed: the inbox is a convenience, never a reason to fail a run.
     """
     if base_dir is None:
@@ -384,18 +537,42 @@ def record(base_dir, rows, retention_days, now=None):
     file = path(base_dir)
     floor = (time.time() if now is None else now) - retention_days * 86400
     existing = _load(file)
-    kept = [row for row in existing if float(row["ts"]) >= floor]
+    skip = set(exclude_channels or ())
+    kept = [
+        row for row in existing
+        if float(row["ts"]) >= floor and row.get("channel_id") not in skip
+    ]
     known = {_key(row) for row in kept}
     stamp = utc_now_iso()
     added = []
+    patched = False
+    by_key = {_key(row): row for row in kept}
     for row in rows:
-        if float(row["ts"]) < floor or _key(row) in known:
+        if float(row["ts"]) < floor or row.get("channel_id") in skip:
+            continue
+        if _key(row) in known:
+            # A message first stored without its files (seen by search)
+            # gains them when a channel read later reports them.
+            old = by_key.get(_key(row))
+            if old is not None and row.get("files") and not old.get("files"):
+                old["files"] = row["files"]
+                patched = True
+            if (
+                old is not None and row.get("type", "message") == "message"
+                and row.get("text") and not old.get("text")
+                and old.get("user_id") in text_users
+            ):
+                old["text"] = row["text"]
+                patched = True
             continue
         known.add(_key(row))
         added.append(dict(row, seen_at=stamp))
     if added:
         _annotate(added, kept + added)
-    if not added and len(kept) == len(existing) and file.exists():
+    if (
+        not added and not patched and len(kept) == len(existing)
+        and file.exists()
+    ):
         return 0
     merged = sorted(kept + added, key=lambda r: float(r["ts"]))
     text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in merged)
@@ -424,7 +601,7 @@ def _load_checks(base_dir):
     }
 
 
-def due_checks(base_dir, limit, hours, now=None):
+def due_checks(base_dir, limit, hours, now=None, seen=(), bot_users=()):
     """Open messages whose reactions are due a read, newest first.
 
     Each is {"channel_id", "ts", "thread_ts", "own"}. Open: the newest
@@ -434,6 +611,9 @@ def due_checks(base_dir, limit, hours, now=None):
     least a quarter of its age ago (capped at MAX_CHECK_GAP). The owner's
     messages take at most limit // 2 slots; slots either side leaves unused go
     to the other.
+
+    An owner reaction in `seen` does not close a message. A message of a
+    `bot_users` user is pollable although a bot's, one conversation each.
     """
     if base_dir is None or not limit:
         return []
@@ -441,7 +621,7 @@ def due_checks(base_dir, limit, hours, now=None):
     rows = _load(path(base_dir))
     reacted = {
         (r["channel_id"], r["ts"]) for r in rows
-        if r.get("type") == "owner_reaction"
+        if r.get("type") == "owner_reaction" and r.get("emoji") not in seen
     }
     peer_reacted = {
         (r["channel_id"], r["ts"]) for r in rows
@@ -455,6 +635,8 @@ def due_checks(base_dir, limit, hours, now=None):
         conversation = (
             row["channel_id"], thread if thread and thread != row["ts"] else ""
         )
+        if row.get("user_id") in bot_users and conversation[1] == "":
+            conversation = (row["channel_id"], row["ts"])
         if (
             conversation not in newest
             or float(row["ts"]) > float(newest[conversation]["ts"])
@@ -466,7 +648,8 @@ def due_checks(base_dir, limit, hours, now=None):
         age = now - float(row["ts"])
         mine = bool(row.get("is_owner"))
         if (
-            row.get("is_bot") or age > hours * 3600
+            (row.get("is_bot") and row.get("user_id") not in bot_users)
+            or age > hours * 3600
             or (row["channel_id"], row["ts"]) in (
                 peer_reacted if mine else reacted
             )
@@ -507,6 +690,25 @@ def mark_checked(base_dir, keys, hours, now=None):
         log("comms inbox: reaction check state could not be written")
 
 
+def _reactor_ids(who, count):
+    """Ids at the end of each `Name (ID)` entry of a reactor list.
+
+    Fail closed: a display name may hold text like `(U...)`, so every id-like
+    token must be accounted for: the number of such tokens, the entries and
+    the stated `\u00d7 N` must agree, else ValueError (a truncated list too).
+    """
+    entries = re.split(r"(?<=\)), ", who)
+    ids = []
+    for entry in entries:
+        match = _REACTOR_ENTRY.fullmatch(entry)
+        if not match:
+            raise ValueError("reaction result has an unknown reactor list")
+        ids.append(match.group(1))
+    if not (len(_REACTOR.findall(who)) == len(ids) == count):
+        raise ValueError("reaction result has an ambiguous reactor list")
+    return ids
+
+
 def parse_reactors(text):
     """[(emoji, [user ids])] from one slack_get_reactions result.
 
@@ -533,7 +735,9 @@ def parse_reactors(text):
         match = _REACTION_LINE.match(line)
         if not match:
             raise ValueError("reaction result has an unknown line")
-        found.append((match.group("emoji"), _REACTOR.findall(match.group("who"))))
+        found.append((match.group("emoji"), _reactor_ids(
+            match.group("who"), int(match.group("count"))
+        )))
     return found
 
 
@@ -787,3 +991,105 @@ def due_polls(follow, covered, limit, now=None):
         due.append((float(entry["last"]), channel, root))
     due.sort(reverse=True)
     return [(channel, root) for _last, channel, root in due[:limit]]
+
+
+# --- watched channels and bot text -------------------------------------------
+
+def _json_state(file):
+    try:
+        data = json.loads(file.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_watched(base_dir):
+    """{channel: epoch of its last complete inbox-only scan}."""
+    if base_dir is None:
+        return {}
+    scanned = _json_state(Path(base_dir) / "state" / WATCHED_FILE).get("scanned")
+    if not isinstance(scanned, dict):
+        return {}
+    return {
+        str(k): v for k, v in scanned.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
+def save_watched(base_dir, scanned, retention_days, now=None):
+    """Write the scan marks, dropping those older than retention."""
+    if base_dir is None:
+        return
+    floor = (time.time() if now is None else now) - retention_days * 86400
+    data = {"scanned": {k: v for k, v in scanned.items() if v >= floor}}
+    if data["scanned"] == load_watched(base_dir):
+        return
+    try:
+        state.write_atomic(
+            Path(base_dir) / "state" / WATCHED_FILE,
+            json.dumps(data, sort_keys=True), mode=0o600,
+        )
+    except OSError:
+        log("comms inbox: watched-channel state could not be written")
+
+
+def is_watched_post(hit, watch_channels, include_bots):
+    """Whether `hit` is a top-level message of a watched channel."""
+    return (
+        hit["channel"] in watch_channels and hit["root"] == hit["ts"]
+        and (include_bots or not hit["is_bot"])
+    )
+
+
+def load_bot_tries(base_dir):
+    """{"<channel>:<ts>": reads that still found no text}."""
+    if base_dir is None:
+        return {}
+    data = _json_state(Path(base_dir) / "state" / BOT_TEXT_FILE)
+    return {
+        str(k): v for k, v in data.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+
+
+def save_bot_tries(base_dir, tries, retention_days, now=None):
+    """Write the try counts, dropping messages older than retention."""
+    if base_dir is None:
+        return
+    floor = (time.time() if now is None else now) - retention_days * 86400
+    keep = {
+        k: v for k, v in tries.items() if float(k.rsplit(":", 1)[1]) >= floor
+    }
+    try:
+        state.write_atomic(
+            Path(base_dir) / "state" / BOT_TEXT_FILE,
+            json.dumps(keep, sort_keys=True), mode=0o600,
+        )
+    except OSError:
+        log("comms inbox: bot text state could not be written")
+
+
+def empty_bot_messages(base_dir, users, extra_rows=()):
+    """{DM channel: [ts]} of messages by `users` stored with no text.
+
+    `extra_rows` (rows about to be recorded) count like stored ones. Only DM
+    channels (`D...`) are listed, and a message already tried
+    MAX_BOT_TEXT_TRIES times is left out.
+    """
+    if base_dir is None or not users:
+        return {}
+    tries = load_bot_tries(base_dir)
+    out = {}
+    for row in _load(path(base_dir)) + list(extra_rows):
+        if (
+            row.get("type", "message") != "message"
+            or row.get("user_id") not in users or row.get("text")
+            or not str(row.get("channel_id", "")).startswith("D")
+            or tries.get(f"{row['channel_id']}:{row['ts']}", 0)
+            >= MAX_BOT_TEXT_TRIES
+        ):
+            continue
+        stamps = out.setdefault(row["channel_id"], [])
+        if row["ts"] not in stamps:
+            stamps.append(row["ts"])
+    return out

@@ -26,6 +26,8 @@ candidate ids.
       channels: [C0EXAMPLE01] # (see comms_inbox.py for the file format)
       all_dms: true
       reactions: [eyes]
+      watch_channels: [C0EXAMPLE02]  # every top-level post by anyone
+      bot_text_users: [U0EXAMPLED]   # an app whose DM text search leaves empty
     bootstrap: 3d             # first-run look-back when no cursor exists
     discover_from: ~/path/slack-discovered.yaml   # channels found by discovery
     joined_from: ~/path/slack-joined.yaml         # joined channels approved

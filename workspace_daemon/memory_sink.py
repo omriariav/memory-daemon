@@ -1648,8 +1648,18 @@ def capture(routine, item, summary, dry_run=False):
     # any such write before deciding whether the result is an error.
     _commit_store(store, f"memory: {rid} auto-capture")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
+    anchored_todo = None if retry else _open_todo_root_refusal(r, item, source_id)
     if r.returncode == 0 and m:
         verdict, entry_id = m.group(1), m.group(2)
+    elif anchored_todo:
+        # The root message itself already anchors an open todo (for example
+        # one logged by hand before the daemon saw the message). The store
+        # holds it, so this is a capture already done, not an error.
+        verdict, entry_id = "unchanged", anchored_todo
+        log(
+            f"routine={rid} memory: {anchored_todo} is an open todo already "
+            f"anchored on {source_id}; nothing new to capture"
+        )
     else:
         entry_id = _verify_written_entry(
             store, source_id, etype, title, people,
@@ -1747,6 +1757,27 @@ def _open_todo_outcome_retry(args, result, item, source_id):
     else:
         retry += ["--follows", todo_id]
     return retry, reply_source_id, todo_id
+
+
+def _open_todo_root_refusal(result, item, source_id):
+    """Return the open todo id when the store refused this exact root message.
+
+    The refusal is "already captured" only when it names this candidate's own
+    source id and the candidate has no reply distinct from the root (a reply
+    goes through _open_todo_outcome_retry instead). Returns None otherwise.
+    """
+    if result.returncode == 0 or not str(source_id or "").startswith("slack:"):
+        return None
+    refusal = _OPEN_ANCHOR_RE.search((result.stdout or "") + (result.stderr or ""))
+    if not refusal or refusal.group(1) != source_id:
+        return None
+    todo_id = refusal.group(2)
+    if not SOURCE_FOLLOWS_RE.fullmatch(todo_id):
+        return None
+    reply = _REPLY_TS_RE.search(str(item.get("id", "")))
+    if reply and reply.group(1) != source_id.rsplit(":", 1)[-1]:
+        return None
+    return todo_id
 
 
 def _emit_capture_event(rid, kind, entry_id, source_id, title, people,
