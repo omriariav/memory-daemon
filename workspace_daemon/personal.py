@@ -14,7 +14,8 @@ PERSONAL_REASONS = {
 ID_PLACEHOLDER = "[ID]"
 
 DEFAULT_PERSONAL_KEYWORDS = [
-    # English (first-person / HR phrasing; insurance vocabulary is work content)
+    # English (first-person / HR phrasing; general business vocabulary is
+    # work content)
     "my salary", "my pension", "payslip", "pay slip", "sick leave",
     "divorce", "passport",
     # Hebrew
