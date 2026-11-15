@@ -8,6 +8,10 @@ routines/*.yaml
 !routines/_template.yaml
 !routines/_example-*.yaml
 
+# The inbox UI settings are personal (sources, command paths).
+# Only inbox.example.yaml ships with the repo.
+inbox.yaml
+
 # The rendered LaunchAgent contains absolute paths and an API key.
 launchd/*.plist
 

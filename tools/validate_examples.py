@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Validate routines/_template.yaml and routines/_example-*.yaml.
+"""Validate routines/_template.yaml, routines/_example-*.yaml and
+inbox.example.yaml.
 
 The loader deliberately skips files starting with "_", and real routines are
 gitignored as personal config — so without this nothing shipped in the repo is
@@ -17,6 +18,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from workspace_daemon import config  # noqa: E402
+from workspace_daemon.inbox import settings as inbox_settings  # noqa: E402
+
+
+def _inbox_problems(path):
+    try:
+        inbox_settings.load(ROOT, path)
+    except inbox_settings.SettingsError as exc:
+        return exc.problems
+    return []
 
 
 def main():
@@ -41,7 +51,16 @@ def main():
             print(f"    {problem}")
         failed += bool(problems)
 
-    print(f"\n{len(paths) - failed}/{len(paths)} valid")
+    total = len(paths) + 1
+    example = ROOT / "inbox.example.yaml"
+    problems = (["file is missing"] if not example.exists()
+                else _inbox_problems(example))
+    print(f"{'✗' if problems else '✓'} inbox.example.yaml")
+    for problem in problems:
+        print(f"    {problem}")
+    failed += bool(problems)
+
+    print(f"\n{total - failed}/{total} valid")
     return 1 if failed else 0
 
 

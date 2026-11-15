@@ -54,3 +54,20 @@ jobs:
         # Real-looking emails, Slack-style ids and secrets in tracked files.
         # False positives go in tools/privacy_allowlist.txt, never real data.
         run: python tools/privacy_check.py
+
+  inbox-ui:
+    # The inbox UI is an optional extra: the job above runs without Textual
+    # (UI tests skip). This one installs it and runs the UI tests for real.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml 'textual>=8.2,<9' python-bidi
+
+      - name: Inbox tests with Textual
+        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli -v

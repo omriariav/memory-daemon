@@ -11,6 +11,7 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py new                        interactive scaffold for a new routine
   daemon.py tui                        live terminal UI: status, pause, run, tick
   daemon.py ctl pause|resume|state     non-interactive kill switch and summary
+  daemon.py inbox [--demo]             unified keyboard-first inbox (needs the optional Textual extra)
   daemon.py backfill-owner-todos --routine ID --entry ENTRY [-n]
                                        file a stored meeting's owner actions as todos
 """
@@ -102,6 +103,25 @@ def cmd_tui(args):
         Path(args.base_dir).expanduser() if args.base_dir else BASE_DIR,
         interval=args.interval, label_prefix=args.label_prefix,
         explicit=explicit)
+
+
+def cmd_inbox(args):
+    """Unified terminal inbox. Textual is an optional extra: imported lazily."""
+    from workspace_daemon.inbox import cli  # stdlib only; no Textual yet
+    if args.empty and not args.demo:
+        print("--empty only applies to --demo", file=sys.stderr)
+        return 2
+    if not cli.textual_available():
+        print(cli.INSTALL_HINT, file=sys.stderr)
+        return 2
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("inbox needs a terminal", file=sys.stderr)
+        return 2
+    base = Path(args.base_dir).expanduser() if args.base_dir else BASE_DIR
+    if not base.is_dir():
+        print(f"--base-dir {base} is not a directory", file=sys.stderr)
+        return 2
+    return cli.run(base, demo=args.demo, empty=args.empty)
 
 
 def cmd_ctl(args):
@@ -715,6 +735,17 @@ def main(argv=None):
                        "the one launchd runs (the UI then refuses to act "
                        "if they differ)")
     p_tui.set_defaults(func=cmd_tui)
+    p_in = sub.add_parser(
+        "inbox",
+        help="unified keyboard-first inbox (pip install 'textual>=8.2,<9')",
+    )
+    p_in.add_argument("--base-dir", help="read state and inbox.yaml from this "
+                      "directory (default: this checkout)")
+    p_in.add_argument("--demo", action="store_true",
+                      help="run on invented data: nothing is read or written")
+    p_in.add_argument("--empty", action="store_true",
+                      help="with --demo, start with an empty inbox")
+    p_in.set_defaults(func=cmd_inbox)
     p_ctl = sub.add_parser("ctl", help="pause, resume, or summarize state")
     p_ctl.add_argument("action", choices=("pause", "resume", "state"))
     p_ctl.add_argument("--reason", default="paused from the command line",

@@ -1,0 +1,36 @@
+# Copy to inbox.yaml (gitignored) and edit. Every key is optional; with no
+# file at all the inbox shows the built-in events source with these defaults.
+# Run: python daemon.py inbox          (needs: pip install 'textual>=8.2,<9')
+#      python daemon.py inbox --demo   (invented data, reads and writes nothing)
+
+poll_interval_s: 60        # 5 to 3600
+theme: dark                # dark | light   (ctrl+t flips it at runtime)
+
+# Hebrew / RTL display. logical = pass text through (the terminal does bidi),
+# visual = reorder with python-bidi (the terminal does not), auto = pick by
+# $TERM_PROGRAM (iTerm2 -> logical, anything unknown -> visual).
+# $INBOX_BIDI overrides this; the `b` key toggles at runtime.
+bidi_mode: auto
+
+sources:
+  # Built-in: state/events.jsonl (plus the .1 rotation), read-only.
+  - name: events
+    type: events
+    window_h: 48           # only events from the last N hours (1 to 720)
+    # Rules that put an event in the Urgent section; an event matching any
+    # rule is urgent. All keys inside one rule must match. Omit `urgent` for
+    # the default (budget-hit:, connector:, attention: alerts).
+    urgent:
+      - {source: daemon, key_prefix: "budget-hit:"}
+      - {source: daemon, key_prefix: "connector:"}
+      - {source: daemon, key_prefix: "attention:"}
+      - {source: gcal, kind: cancel, starts_within_h: 24}
+      # - {source: gmail, title_regex: "(?i)\\burgent\\b"}
+    # Rule keys: source, kind, key_prefix (alerts), title_regex, starts_within_h
+
+  # Any program that prints item format v1 JSON for `<argv> list`
+  # (see docs/inbox.md). argv is a list, never a shell string.
+  # - name: mail
+  #   type: command
+  #   argv: ["python3", "~/bin/my-inbox-source.py"]
+  #   timeout_s: 20        # 1 to 120
