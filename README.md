@@ -2134,6 +2134,22 @@ cursor. It lists a fixed look-back, `save_reaction_lookback_days` (default 14,
 deduplication. If a saved query hits `max_search_pages` the run logs it; shorten
 the look-back or raise the cap.
 
+In a `slack_mcp` run, page 0 of each saved query shares the first search
+session with the other searches (no extra session on a normal run). The comms
+inbox is then written at once; only a saved query's follow-up pages (page 1
+and later) run after that, so a long saved backlog never holds the inbox back.
+Their inbox rows follow in the same run. Owner reactions never wait on them:
+every inbox reaction emoji has its own `reacted` search, a save emoji's search
+is never reused for it (one more call in the shared session when an emoji is
+both).
+
+The follow-up pages have a wall-clock budget, `save_reaction_budget_s`
+(default 300, 0 = no limit, up to 3600): once spent, no new search session
+starts and the rest of the look-back is left for the next run, with a log line
+naming the setting. Nothing is lost: a saved query has no cursor or watermark,
+the look-back lists everything again and the processed ledger skips what was
+captured. A session already running finishes.
+
 Cost: each emoji is one search (plus follow-up pages) on every run, whether or
 not anything new was reacted, so keep the look-back short. Setting
 `save_reactions` also widens the failure scope: a saved thread can sit in any
@@ -2544,6 +2560,13 @@ Optional keys (defaults): `model` (haiku), `max_threads_per_run` (15),
 `estimate_analyze_usd` (0.12), `verified_sender_domains` (unset),
 `auth_servers` (`[mx.google.com]`; needs `verified_sender_domains`).
 
+**Saved requests.** `saved_request: true` (default false) is for a `query` that
+lists only threads the owner labeled to be saved (for example
+`label:save-to-memory`). Every listed thread is then an explicit save request,
+handled like a Slack save reaction: it is never dropped as small talk, and
+neither the analysis nor the extraction step may judge it "not memory-worthy".
+Leave it off for a general query.
+
 **Verified senders only.** Mail text is untrusted, and anyone can write it. With
 `verified_sender_domains` set, only mail from those exact domains is read:
 
@@ -2796,7 +2819,13 @@ polling the store:
   conference, title), or `changed: {attendee: [old, new]}` on `rsvp`, plus
   `instances` (in `details`) when one event stands for several instances of
   a series, and `untrusted: true`: titles and names are data written by
-  others. `details` is omitted when empty and never present on captures.
+  others. `details` is omitted when empty.
+- Captures matched to a calendar event (`new` and `update`) carry `details`
+  `{"calendar_event_id": "<event id>", "attendee_count": N}`: `attendee_count`
+  is the event's human attendees including the owner, with rooms, group
+  calendars and declined guests excluded, and it is omitted when the attendee
+  list is unknown. When it is exactly 2, `other_attendee` is the other
+  person's lower-case email. Malformed values are dropped.
 - Alerts (writer: `alerts.check`, see "Alerts"): `source` is `daemon`, `kind`
   is `alert`, `routine` is `daemon`, `memory_id` is `null`, `source_id` is
   `daemon:<key>`, `title` is the message, and `details` holds `key` plus the

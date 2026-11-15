@@ -166,6 +166,47 @@ def source_people(event):
     return people
 
 
+def attendee_summary(event):
+    """(count, other) for a matched event's human attendees.
+
+    Owner included; rooms, group calendars and declined guests excluded. The
+    owner is the row marked `self`; without one the list is unusable and the
+    result is (None, None). `other` is the lower-case email of the one
+    non-owner attendee when the count is exactly 2, else None.
+    """
+    from . import calendar_cache  # late import: keep this module light
+
+    rows = event.get("attendees")
+    if not isinstance(rows, list):
+        return None, None
+    owner_seen, guests = False, {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        email = str(row.get("email") or "").strip().casefold()
+        if (not email or calendar_cache._is_room(email)
+                or calendar_cache._is_calendar_email(email)):
+            continue
+        if row.get("self") is True:
+            owner_seen = True
+            guests.pop(email, None)
+            continue
+        status = str(
+            row.get("response_status") or row.get("rsvp") or ""
+        ).strip().casefold()
+        if status != "declined":
+            guests[email] = True
+    if not owner_seen:
+        return None, None
+    count = 1 + len(guests)
+    other = next(iter(guests)) if count == 2 else None
+    return count, other
+
+
+def attendee_count(event):
+    return attendee_summary(event)[0]
+
+
 def accept_event(item, event, confidence, reason):
     """Adopt the matched event's identity onto the fetched item."""
     item["title"] = event.get("summary") or item["title"]
@@ -179,6 +220,11 @@ def accept_event(item, event, confidence, reason):
         "calendar_match_reason": reason,
         "source_people": source_people(event),
     })
+    count, other = attendee_summary(event)
+    if count is not None:
+        item["frontmatter"]["calendar_attendee_count"] = count
+    if other:
+        item["frontmatter"]["calendar_other_attendee"] = other
 
 
 def receipt_path(base_dir, status_name, identity):

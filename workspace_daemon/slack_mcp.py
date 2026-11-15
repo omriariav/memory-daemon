@@ -148,6 +148,9 @@ DEFAULTS = {
     "calls_per_session": 15,
     "estimate_analyze_usd": 0.12,
     "save_reaction_lookback_days": 14,
+    # Wall-clock seconds the saved-reaction search may spend per run; the
+    # rest waits for the next run (0 = no limit).
+    "save_reaction_budget_s": 300,
     "save_reaction_tag": "saved",
     "max_session_pages": 3,
     # Channel-history reads that look for file shares (0 disables).
@@ -1210,17 +1213,13 @@ def search_queries(cfg, since=None):
 
 
 def inbox_reactions(cfg):
-    """Inbox emoji that need a search of their own (a save emoji's search
-    already runs, and is reused when it looks back far enough)."""
+    """Inbox emoji, each with a dedicated search. A save emoji's search is
+    never reused for it: that search finishes late in the run (its later
+    pages wait for the inbox write), and owner reactions must not wait."""
     inbox = cfg.get("comms_inbox")
     if not inbox:
         return []
-    reused = (
-        set(cfg["save_reactions"])
-        if cfg["save_reaction_lookback_days"] >= inbox["retention_days"]
-        else set()
-    )
-    return [n for n in inbox["reactions"] if n not in reused]
+    return list(inbox["reactions"])
 
 
 def _pace(cfg):
@@ -1255,22 +1254,44 @@ def _valid_hit(query, hit, after, now, cfg):
     return True
 
 
-def _search_all(cfg, queries, afters, now):
+def _search_all(cfg, queries, afters, now, budget_s=None, park=None,
+                resume=None, info=None):
     """Run every query to completion or its page cap.
+
+    With `budget_s`, no new search session starts once that many wall-clock
+    seconds have passed; every query left unread is capped at its fully read
+    prefix, exactly like a page cap (a session already running finishes);
+    the keys it capped are added to `info["budget"]`.
+
+    With a `park` dict, a saved-reaction query that has a next page after
+    page 0 is not followed: its cursor and read prefix are stored as
+    `park[index] = (args, newest)` for a later call. That call passes the same
+    queries with `resume=park`, runs only those queries from page 1, and (with
+    `budget_s`) stops when the budget is spent.
 
     Returns ([(query, hit)], {cursor key: epoch of the newest hit read by a
     capped query}, {cursor keys whose query failed}). A page that cannot be
     parsed fails only its own query; a failed bridge session fails the run.
     """
-    pending = {
-        index: _search_args(cfg, query, afters[index])
-        for index, query in enumerate(queries)
-    }
+    if resume is None:
+        pending = {
+            index: _search_args(cfg, query, afters[index])
+            for index, query in enumerate(queries)
+        }
+        newest = {}
+        first_page = 0
+    else:
+        pending = {index: args for index, (args, _n) in resume.items()}
+        newest = {
+            index: n for index, (_a, n) in resume.items() if n is not None
+        }
+        first_page = 1
     found = []
     capped = {}
-    newest = {}
     failed = set()
-    for page in range(cfg["max_search_pages"]):
+    deadline = _now() + budget_s if budget_s else None
+    out_of_time = False
+    for page in range(first_page, cfg["max_search_pages"]):
         order = sorted(pending)
         following = {}
         # The calls of a page round do not depend on each other, so they share
@@ -1279,6 +1300,18 @@ def _search_all(cfg, queries, afters, now):
         parts = [order[i:i + size] for i in range(0, len(order), size)]
         results = []
         for part in parts:
+            if deadline is not None and _now() >= deadline:
+                if not out_of_time:
+                    out_of_time = True
+                    log(f"slack_mcp: a search budget of {budget_s}s ran out; "
+                        "the unread rest waits for the next run")
+                for index in part:
+                    mark = newest.get(index, float(afters[index]))
+                    for key in queries[index]["keys"]:
+                        capped[key] = min(capped.get(key, mark), mark)
+                        if info is not None:
+                            info.setdefault("budget", set()).add(key)
+                continue
             calls = [pending[i] for i in part]
             _pace(cfg)
             results.extend(zip(part, _session(
@@ -1341,6 +1374,11 @@ def _search_all(cfg, queries, afters, now):
                 mark = newest.get(index, float(after))
                 for key in query["keys"]:
                     capped[key] = min(capped.get(key, mark), mark)
+            elif cursor and park is not None and query["kind"] == "saved":
+                park[index] = (
+                    _search_args(cfg, query, after, cursor),
+                    newest.get(index),
+                )
             elif cursor:
                 following[index] = _search_args(
                     cfg, query, after, cursor
@@ -1803,21 +1841,72 @@ def candidates(source):
         raise SlackMcpError(
             "DM session state cannot be written; nothing was searched"
         )
-    found, capped, failed = _search_all(cfg, queries, afters, now)
-    # A failed inbox search costs only the inbox; it never marks the capture
-    # listing partial or counts toward "every search failed".
+    # Search in two groups so the comms inbox is written before the slow
+    # part runs (after a long gap the saved-reaction search once held the
+    # whole inbox back for over an hour):
+    #   0. every search, saved-reaction page 0 included, in the usual shared
+    #      sessions (no extra session) -- but a saved query's follow-up pages
+    #      are parked, not read. The whole inbox phase is then written at
+    #      once (search rows first, scan marks after them, then the slow
+    #      reads).
+    #   1. the parked saved-reaction pages, under `save_reaction_budget_s`;
+    #      their inbox rows (and the follow refresh) are stored afterwards in
+    #      the same run. Owner reactions never depend on this group: every
+    #      inbox emoji has its own query in group 0.
+    # Capture is unchanged: every hit joins one `found` list.
+    found, capped, failed = [], {}, set()
+    info = {}
+    inbox = cfg["comms_inbox"]
+    inbox_on = bool(inbox) and not source.get("_count_only")
     inbox_keys = {
         k for q in queries if q["kind"] in RECORD_ONLY for k in q["keys"]
     }
+    parked = {}
+    hits, cap, fail = _search_all(
+        cfg, queries, afters, now, park=parked, info=info
+    )
+    found.extend(hits)
+    capped.update(cap)
+    failed |= fail
+    if inbox_on:
+        # Before DM sessions re-point `root`: the inbox keeps the real thread.
+        _inbox_phase(
+            cfg, hits, queries, tracked, follow, watched,
+            cap, fail & inbox_keys, now,
+        )
+    if parked:
+        hits, cap, fail = _search_all(
+            cfg, queries, afters, now,
+            budget_s=cfg["save_reaction_budget_s"], resume=parked, info=info,
+        )
+        found.extend(hits)
+        capped.update(cap)
+        failed |= fail
+        if inbox_on:
+            rows, _started = _inbox_rows(cfg, hits, tracked, follow)
+            added = _record(cfg, rows, now)
+            comms_inbox.save_follow(
+                _base_dir, follow, inbox["keep_days"], now
+            )
+            if added:
+                log(f"slack_mcp: comms inbox recorded {added} more new "
+                    "line(s)")
+    # A failed inbox search costs only the inbox; it never marks the capture
+    # listing partial or counts toward "every search failed".
     if failed & inbox_keys:
         log(f"slack_mcp: {len(failed & inbox_keys)} comms-inbox search "
             "key(s) failed")
-    inbox_failed, failed = failed, failed - inbox_keys
+    failed = failed - inbox_keys
     capture_keys = {k for q in queries for k in q["keys"]} - inbox_keys
     if failed and failed >= capture_keys:
         raise SlackMcpError("every search query failed")
     for key in sorted(capped):
-        if key.startswith(SAVED_PREFIX):
+        if key.startswith(SAVED_PREFIX) and key in info.get("budget", ()):
+            log("slack_mcp: a saved-reaction search stopped at "
+                "save_reaction_budget_s; newer reacted messages wait for the "
+                "next run (raise save_reaction_budget_s, or shorten "
+                "save_reaction_lookback_days)")
+        elif key.startswith(SAVED_PREFIX):
             log("slack_mcp: a saved-reaction search hit max_search_pages; "
                 "newer reacted messages may wait (shorten "
                 "save_reaction_lookback_days or raise max_search_pages)")
@@ -1833,30 +1922,6 @@ def candidates(source):
             log("slack_mcp: a comms-inbox reaction search hit "
                 "max_search_pages; newer reactions are not recorded (shorten "
                 "retention_days or raise max_search_pages)")
-    if cfg["comms_inbox"] and not source.get("_count_only"):
-        # Before DM sessions re-point `root`: the inbox keeps the real thread.
-        inbox = cfg["comms_inbox"]
-        rows, started = _inbox_rows(cfg, found, tracked, follow)
-        # First, so a message search also listed keeps the file details.
-        rows = _file_rows(cfg, found, now) + rows
-        _mark_scanned(
-            cfg, queries, tracked, follow, capped, inbox_failed, now, watched
-        )
-        if inbox["follow_threads"]:
-            rows += _poll_threads(cfg, follow, now)
-        added = _record(cfg, rows, now)
-        comms_inbox.save_follow(_base_dir, follow, inbox["keep_days"], now)
-        # After the search rows are stored: a guard stop in this extra bridge
-        # session must not lose them (the scan marks have moved on).
-        added += _record(cfg, _bot_text_rows(cfg, rows, now), now)
-        if added or started:
-            log(f"slack_mcp: comms inbox recorded {added} new line(s), "
-                f"{started} conversation(s) newly tracked or followed")
-        _check_reactions(cfg, now)
-        # One state per connector and owner, shared across routines.
-        _check_joined(
-            cfg, now, f"{cfg['channels_tool']}:{cfg['self_user_id']}"
-        )
     # Inbox-only hits never become candidates.
     found = [
         (query, hit) for query, hit in found
@@ -2547,6 +2612,41 @@ def _file_rows(cfg, found, now):
         + (f", {truncated} still truncated (backfill next run)"
            if truncated else ""))
     return rows
+
+
+def _inbox_phase(cfg, found, queries, tracked, follow, watched, capped,
+                 inbox_failed, now):
+    """The comms-inbox write for the searches that feed it, in the order that
+    gets the inbox current fastest: the search rows are stored first (and the
+    scan marks only after them), then the slow reads (file history, followed
+    threads, bot text, reactions, joined channels), each stored as it lands.
+    """
+    inbox = cfg["comms_inbox"]
+    rows, started = _inbox_rows(cfg, found, tracked, follow)
+    added = _record(cfg, rows, now)
+    _mark_scanned(
+        cfg, queries, tracked, follow, capped, inbox_failed, now, watched
+    )
+    comms_inbox.save_follow(_base_dir, follow, inbox["keep_days"], now)
+    if added or started:
+        log(f"slack_mcp: comms inbox recorded {added} new line(s), "
+            f"{started} conversation(s) newly tracked or followed")
+    # A later file read patches the files onto a message stored above.
+    more = _file_rows(cfg, found, now)
+    if inbox["follow_threads"]:
+        more += _poll_threads(cfg, follow, now)
+    added = _record(cfg, more, now)
+    comms_inbox.save_follow(_base_dir, follow, inbox["keep_days"], now)
+    # After the search rows are stored: a guard stop in this extra bridge
+    # session must not lose them (the scan marks have moved on).
+    added += _record(cfg, _bot_text_rows(cfg, rows + more, now), now)
+    if added:
+        log(f"slack_mcp: comms inbox recorded {added} more new line(s)")
+    _check_reactions(cfg, now)
+    # One state per connector and owner, shared across routines.
+    _check_joined(
+        cfg, now, f"{cfg['channels_tool']}:{cfg['self_user_id']}"
+    )
 
 
 def _inbox_rows(cfg, found, tracked, follow):

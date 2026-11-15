@@ -1340,6 +1340,8 @@ def _gmail_mcp_fetch(routine, source, candidate):
             "gmail_thread_messages_included": included,
             "gmail_thread_truncated": thread_truncated,
         })
+    if source.get("saved_request") is True:
+        item["frontmatter"]["saved_request"] = True
     if not item["body"].strip():
         raise RuntimeError("no content: empty message body")
     return item
@@ -2552,8 +2554,8 @@ def _trivial_verdict(routine, item):
         return None
     if memory_sink.is_operator_confirmed(routine, item):
         return None
-    if (item.get("frontmatter") or {}).get("slack_saved") is True:
-        # The owner reacted to save this thread: never small talk.
+    if memory_sink.is_saved_request(item.get("frontmatter")):
+        # The owner asked to save this item: never small talk.
         return None
     max_chars = cfg.get("trivial_max_chars")
     if type(max_chars) is not int or max_chars < 1:

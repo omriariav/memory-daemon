@@ -92,6 +92,16 @@ class QueryPlanTest(BridgeTestCase):
         ]
         self.assertEqual(planned, [2, 1])
 
+    def test_three_emoji_split_into_real_sessions(self):
+        slack_mcp.candidates(source(
+            save_reactions=[EMOJI, EMOJI2, "third-example"],
+            calls_per_session=2,
+        ))
+        planned = [
+            len(re.findall(r"^\d+\. ", p, re.M)) for p in self.connector.prompts
+        ]
+        self.assertEqual(planned, [2, 2])
+
     def test_pagination_stays_within_the_page_cap(self):
         self.connector.search = saved_search(
             [{"ts": ts_at(10 * n)} for n in range(1, 4)]

@@ -1055,6 +1055,26 @@ class ConfigTest(unittest.TestCase):
                 problems = self.problems(**over)
                 self.assertTrue(any(fragment in p for p in problems), problems)
 
+    def test_saved_request_is_a_bool(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.assertEqual(self.problems(saved_request=value), [])
+        for value in ("yes", 1, None, []):
+            with self.subTest(value=value):
+                problems = self.problems(saved_request=value)
+                self.assertTrue(
+                    any("saved_request must be true or false" in p
+                        for p in problems), problems)
+
+    def test_saved_request_setting_defaults_off(self):
+        self.assertIs(gmail_mcp.settings(source())["saved_request"], False)
+        self.assertIs(
+            gmail_mcp.settings(source(saved_request=True))["saved_request"],
+            True)
+        self.assertIs(
+            gmail_mcp.settings(source(saved_request="yes"))["saved_request"],
+            False)
+
     def test_connector_keys_are_rejected_on_other_kinds(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = routine(tmp)
@@ -1310,6 +1330,36 @@ class RunnerTest(unittest.TestCase):
         with mock.patch("workspace_daemon.count_only.log", lambda m: None):
             totals = runner.run(self.base, [spec], dry_run=True, count_only=True)
         self.assertEqual((totals["processed"], totals["skipped"]), (1, 0))
+
+    def _captured_items(self, **over):
+        spec = routine(self.base / "vault", **over)
+        captured = []
+        real = runner._process
+
+        def spy(effective, src, candidate, fetch, *args, **kw):
+            item = fetch(effective, src, candidate)
+            captured.append(item)
+            return real(effective, src, candidate, lambda *_: item, *args, **kw)
+
+        with mock.patch.object(runner, "_process", spy):
+            runner.run(self.base, [spec])
+        return captured
+
+    def test_items_carry_saved_request_only_when_set(self):
+        items = self._captured_items(saved_request=True)
+        self.assertEqual(len(items), 1)
+        self.assertIs(items[0]["frontmatter"]["saved_request"], True)
+        self.assertTrue(memory_sink.is_saved_request(items[0]["frontmatter"]))
+
+    def test_items_have_no_flag_by_default_or_when_false(self):
+        for over in ({}, {"saved_request": False}):
+            with self.subTest(over=over):
+                self.setUp()
+                items = self._captured_items(**over)
+                self.assertEqual(len(items), 1)
+                self.assertNotIn("saved_request", items[0]["frontmatter"])
+                self.assertFalse(
+                    memory_sink.is_saved_request(items[0]["frontmatter"]))
 
     def test_read_thread_false_item_is_the_newest_message_only(self):
         spec = routine(self.base / "vault", read_thread=False)

@@ -24,6 +24,12 @@ instance id) when one event stands for several instances of a series, and
 `kind` "diff" (source of the captured entry, e.g. zoom) means a capture of the
 same meeting disagrees with an earlier one: `details` is
 `{"entry_ids": [new, earlier], "differs": [one line each], "untrusted": true}`.
+A capture of a meeting matched to a calendar event adds `details`
+`{"calendar_event_id": str, "attendee_count": int}` on "new" and "update":
+the event's human attendees including the owner, rooms excluded. The count is
+omitted when the attendee list is unknown. Declined guests are not counted.
+When the count is exactly 2, `other_attendee` is the other person's
+lower-case email (never 0 for unknown).
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
 `state/events.lock`. The file is rotated to `events.jsonl.1` (one
@@ -41,6 +47,31 @@ FILE_NAME = "events.jsonl"
 LOCK_NAME = "events.lock"
 MAX_BYTES = 5 * 1024 * 1024
 SCHEMA_VERSION = 1
+EVENT_ID_MAX = 256
+
+
+def _clean_details(details):
+    """Drop malformed calendar_event_id / attendee_count; keep other keys."""
+    if not isinstance(details, dict):
+        return None
+    out = dict(details)
+    event_id = out.get("calendar_event_id")
+    if "calendar_event_id" in out and not (
+        isinstance(event_id, str) and event_id.strip()
+        and len(event_id) <= EVENT_ID_MAX
+    ):
+        del out["calendar_event_id"]
+    count = out.get("attendee_count")
+    if "attendee_count" in out and not (
+        isinstance(count, int) and not isinstance(count, bool) and count >= 0
+    ):
+        del out["attendee_count"]
+    other = out.get("other_attendee")
+    if "other_attendee" in out and not (
+        isinstance(other, str) and "@" in other and len(other) <= 254
+    ):
+        del out["other_attendee"]
+    return out or None
 
 
 def source_of(source_id):
@@ -70,6 +101,7 @@ def build(routine_id, kind, memory_id, source_id, title, people, ts=None,
         "title": title,
         "people": list(people or []),
     }
+    details = _clean_details(details)
     if details:
         event["details"] = details
     return event

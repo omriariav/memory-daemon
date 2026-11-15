@@ -78,6 +78,11 @@ class ProtectionTest(Base):
         item["frontmatter"]["slack_saved"] = True
         self.check_protected(item)
 
+    def test_saved_request(self):
+        item = talk()
+        item["frontmatter"]["saved_request"] = True
+        self.check_protected(item)
+
     def test_owner_evidence(self):
         for ev in ("mentioned", "channel-rule", "saved"):
             item = talk()

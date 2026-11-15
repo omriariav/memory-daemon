@@ -155,6 +155,8 @@ def protected_reason(item, cfg):
     meta = item.get("frontmatter") or {}
     if meta.get("slack_saved") is True:
         return "saved by reaction"
+    if meta.get("saved_request") is True:
+        return "saved request"
     evidence = meta.get("slack_owner_evidence") or []
     for value in PROTECTED_EVIDENCE:
         if value in evidence:

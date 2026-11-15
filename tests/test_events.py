@@ -49,6 +49,27 @@ class BuildTest(unittest.TestCase):
         self.assertNotEqual(base, make(source_id="slack:C1:2.0")["id"])
         self.assertNotEqual(base, make(ts="2026-10-26T10:00:01Z")["id"])
 
+    def test_calendar_details_are_kept_when_valid(self):
+        event = make(details={"calendar_event_id": "e1", "attendee_count": 2})
+        self.assertEqual(
+            event["details"], {"calendar_event_id": "e1", "attendee_count": 2})
+        two = make(details={"attendee_count": 2,
+                            "other_attendee": "a@example.com"})
+        self.assertEqual(two["details"]["other_attendee"], "a@example.com")
+        zero = make(details={"attendee_count": 0})
+        self.assertEqual(zero["details"], {"attendee_count": 0})
+
+    def test_invalid_calendar_details_are_dropped(self):
+        for bad in ({"attendee_count": -1}, {"attendee_count": "3"},
+                    {"attendee_count": True}, {"attendee_count": 2.0},
+                    {"calendar_event_id": 5}, {"calendar_event_id": ""},
+                    {"calendar_event_id": "x" * 300},
+                    {"other_attendee": 5}, {"other_attendee": "no-at-sign"},
+                    {"other_attendee": "a@" + "x" * 260}):
+            self.assertNotIn("details", make(details=bad), bad)
+        mixed = make(details={"calendar_event_id": "e1", "attendee_count": -4})
+        self.assertEqual(mixed["details"], {"calendar_event_id": "e1"})
+
     def test_null_memory_id_is_kept(self):
         self.assertIsNone(make(memory_id=None)["memory_id"])
 
