@@ -344,7 +344,9 @@ opens an item's http(s) link. The built-in `events` source turns
 items, read-only and without taking its lock. Any other program can feed the
 inbox by printing JSON for `<argv> list`. Settings live in `inbox.yaml`
 (gitignored; copy `inbox.example.yaml`). The item format, the source command
-protocol and the safety model are in [docs/inbox.md](docs/inbox.md).
+protocol and the safety model are in [docs/inbox.md](docs/inbox.md). The inbox
+is versioned on its own: `python daemon.py inbox --version`, and
+[docs/inbox-changelog.md](docs/inbox-changelog.md) lists what changed.
 
 ## Codex and Claude Code plugin
 

@@ -17,7 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import bidi
+from . import __version__, bidi
 
 
 class ConfirmSend(ModalScreen):
@@ -171,6 +171,7 @@ class HelpScreen(ModalScreen):
         t.rstrip()
         head = Text()
         head.append("inbox", Style(bold=True))
+        head.append(f" v{__version__}", Style(dim=True))
         head.append("  keyboard reference  (esc to close)", Style(dim=True))
         with Vertical(id="help"):
             yield Static(head, id="help-title")

@@ -10,7 +10,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from . import bidi, slackfmt
+from . import __version__, bidi, slackfmt
 from .models import SECTIONS, SOURCES
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -237,6 +237,7 @@ class StatusHeader(Static):
         n_urg = sum(1 for i in app.items if i.section == "urgent")
         left = Text(no_wrap=True)
         left.append(" inbox ", Style(color=pal["bg"], bgcolor=pal["primary"], bold=True))
+        left.append(f" v{__version__}", Style(color=pal["muted"], dim=True))
         if app.demo:
             left.append(" demo ", Style(color=pal["bg"], bgcolor=pal["warn"], bold=True))
         left.append(f"  {n_open} open", Style(color=pal["fg"]))

@@ -11,7 +11,7 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py new                        interactive scaffold for a new routine
   daemon.py tui                        live terminal UI: status, pause, run, tick
   daemon.py ctl pause|resume|state     non-interactive kill switch and summary
-  daemon.py inbox [--demo]             unified keyboard-first inbox (needs the optional Textual extra)
+  daemon.py inbox [--demo|--version]   unified keyboard-first inbox (needs the optional Textual extra)
   daemon.py backfill-owner-todos --routine ID --entry ENTRY [-n]
                                        file a stored meeting's owner actions as todos
 """
@@ -107,7 +107,10 @@ def cmd_tui(args):
 
 def cmd_inbox(args):
     """Unified terminal inbox. Textual is an optional extra: imported lazily."""
-    from workspace_daemon.inbox import cli  # stdlib only; no Textual yet
+    from workspace_daemon.inbox import __version__, cli  # stdlib only; no Textual yet
+    if args.version:
+        print(f"memory-daemon inbox {__version__}")
+        return 0
     if args.empty and not args.demo:
         print("--empty only applies to --demo", file=sys.stderr)
         return 2
@@ -748,6 +751,8 @@ def main(argv=None):
         "inbox",
         help="unified keyboard-first inbox (pip install 'textual>=8.2,<9')",
     )
+    p_in.add_argument("--version", action="store_true",
+                      help="print the inbox version and exit")
     p_in.add_argument("--base-dir", help="read state and inbox.yaml from this "
                       "directory (default: this checkout)")
     p_in.add_argument("--demo", action="store_true",
