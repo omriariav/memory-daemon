@@ -1870,7 +1870,7 @@ memory:
   small first-person/HR list in English and Hebrew by default; Hebrew terms
   match whole words with one attached prefix letter; `[]` turns it off) only
   backstops a missing or malformed verdict. A personal ID number in the source
-  or summary always forces the flag. Insurance vocabulary is deliberately not
+  or summary always forces the flag. General business vocabulary is deliberately not
   in the defaults. The flag becomes the `personal_tag` on the entry. Only the
   reason category is ever logged.
 - **Redaction.** With `redact_ids`, ID-like numbers become `[ID]` before any

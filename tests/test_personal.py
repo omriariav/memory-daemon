@@ -154,9 +154,9 @@ class KeywordTest(unittest.TestCase):
     def test_work_vocabulary_not_flagged(self):
         kws = personal.DEFAULT_PERSONAL_KEYWORDS
         for text in (
-            "Roadmap review for Q3", "insurance policy renewal flow",
-            "medical claims triage", "our lawyer reviewed the filing",
-            "פוליסת ביטוח חדשה", "תביעת ביטוח רפואי", "ביטוח דירה ללקוחות",
+            "Roadmap review for Q3", "car loan renewal flow",
+            "vendor invoice triage", "our lawyer reviewed the filing",
+            "חידוש הלוואת רכב חדשה", "טיפול בחשבוניות ספקים", "הלוואה לרכב ללקוחות",
         ):
             self.assertFalse(personal.keyword_hit(text, kws), text)
 
@@ -279,8 +279,8 @@ class CaptureTest(unittest.TestCase):
 
     def test_valid_model_false_beats_keywords(self):
         for summary, body in (
-            ("insurance policy renewal and medical claims", "x"),
-            ("תביעת ביטוח רפואי של לקוח", "פוליסת ביטוח"),
+            ("car loan renewal and vendor invoices", "x"),
+            ("חשבונית ספק של לקוח", "הלוואת רכב"),
             ("my payslip", "תלוש שכר"),
         ):
             tags, _, _ = self.capture(
