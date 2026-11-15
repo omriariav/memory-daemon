@@ -1691,9 +1691,15 @@ charges no check.
 With `hub_docs: true` (plus `hub_search_tool` and `hub_content_tool`, exact
 read-only MCP tool names), a meeting whose assets carry no readable summary is
 searched by its calendar title, and a Zoom Hub Doc (`docs.zoom.us/doc/<id>`)
-whose name matches exactly (and whose time, when the hit carries one, falls in
-the meeting window) is used as the summary, under source id `zoom:doc-<id>`.
-Several matches are refused. The content tool's output-schema error (missing
+whose name matches exactly is used as the summary, under source id
+`zoom:doc-<id>`. The hit must carry a timezone-aware timestamp inside the
+meeting window: 60 minutes before the start to `hub_grace_minutes` (default
+120) after the end. A created time decides when the hit has one; a
+modified/updated time counts only when it has none, so an old doc edited during
+today's meeting is not taken for it. A doc with no usable timestamp is skipped
+(logged, counted in the run summary), because a recurring meeting reuses its
+title and an older session's doc must not be captured as today's. Several
+matches are refused. The content tool's output-schema error (missing
 `file_link`) still carries the content, which is read from it.
 
 The memory source id is `zoom:<meeting uuid>`; the candidate id adds a hash of

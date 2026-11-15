@@ -53,6 +53,7 @@ DEFAULTS = {
     "match_tolerance_minutes": 120,
     "skip_declined": True,
     "hub_docs": False,
+    "hub_grace_minutes": 120,
     "hub_search_tool": None,
     "hub_content_tool": None,
     "stale_calendar_hours": 6,
@@ -450,12 +451,29 @@ def summary_of(assets, record, cfg):
 # instead of the meeting-summary asset. With `hub_docs: true`, a meeting whose
 # assets carry no readable summary is looked up in the workspace search by its
 # title, and a matching doc's markdown is used as the summary. The doc is
-# matched by exact (case-folded) name and, when the search result carries a
-# time, by that time lying in the meeting's window. Two or more matches are
-# refused, never guessed.
+# matched by exact (case-folded) name, and only when its search hit carries a
+# timestamp lying in the meeting's window. A created time decides when the hit
+# has one; modified/updated times count only when it has none, so an old doc
+# edited during today's meeting is not taken for today's. Two or more matches
+# are refused, never guessed. A hit with no usable timestamp is never matched:
+# a recurring meeting reuses its title, so a title alone cannot tell today's
+# doc from a previous session's.
+
+# A doc counts when its timestamp is in
+# [start - HUB_DOC_LEAD_SECONDS, end + grace]: a lead for notes opened as the
+# meeting starts (hosts start early), and a grace after the end for notes saved
+# late (`hub_grace_minutes`, default 120), short enough that the next session
+# of a daily meeting stays out.
+HUB_DOC_LEAD_SECONDS = 60 * 60
 
 _DOC_URL = re.compile(r"https?://[\w.-]*zoom[\w.-]*/doc/([A-Za-z0-9_-]{10,40})")
 _TIME_KEY = re.compile(r"time|date|modified|created|updated", re.IGNORECASE)
+# A created-time key: created, create_time, created_at, creation_date, ...
+# Not `creator` or `created_by`, whose values are names.
+_CREATED_KEY = re.compile(
+    r"creat(?:e|ed|ion)?[_-]?(?:time|date|at|datetime|timestamp)?",
+    re.IGNORECASE)
+_DATE_SHAPED = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PY_STR = (
     r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
 )
@@ -477,11 +495,17 @@ def _walk(value):
             yield from _walk(child)
 
 
-def hub_doc_matches(text, title, start, end, tolerance):
+def hub_doc_matches(text, title, start, end, grace, skipped=None):
     """Doc ids in a search result that plausibly are this meeting's summary.
 
-    `title` is compared by exact case-folded name. A hit that carries any ISO
-    timestamp must have one inside [start - tolerance, end + one day].
+    `title` is compared by exact case-folded name. A hit must carry a
+    timezone-aware ISO timestamp inside
+    [start - HUB_DOC_LEAD_SECONDS, end + grace] (`grace` in seconds). When the
+    hit has a created-time key (see `_CREATED_KEY`) holding a date-shaped
+    value, only that counts; modified/updated times are the fallback when
+    there is none. Name-valued keys such as `creator` are ignored. A title match without a usable
+    timestamp is never accepted; its doc id is appended to `skipped` (when
+    given) and logged.
     """
     wanted = _norm_title(title)
     if not wanted or not isinstance(text, str):
@@ -505,13 +529,27 @@ def hub_doc_matches(text, title, start, end, tolerance):
         ]
         if not any(_norm_title(n) == wanted for n in names):
             continue
-        stamps = [
-            _epoch(v) for k, v in row.items()
-            if isinstance(v, str) and _TIME_KEY.search(k)
+        created = [
+            v for k, v in row.items()
+            if isinstance(v, str) and _CREATED_KEY.fullmatch(k)
+            and _DATE_SHAPED.match(v)
         ]
+        if created:
+            stamps = [_epoch(v) for v in created]
+        else:
+            stamps = [
+                _epoch(v) for k, v in row.items()
+                if isinstance(v, str) and _TIME_KEY.search(k)
+            ]
         stamps = [t for t in stamps if t is not None]
-        if stamps and not any(
-            start - tolerance <= t <= end + 86400 for t in stamps
+        if not stamps:
+            log(f"zoom hub: skipping doc {doc_id}: title matches but it has "
+                "no usable timestamp")
+            if skipped is not None:
+                skipped.append(doc_id)
+            continue
+        if not any(
+            start - HUB_DOC_LEAD_SECONDS <= t <= end + grace for t in stamps
         ):
             continue
         if doc_id not in found:
@@ -581,11 +619,12 @@ def hub_summary(cfg, record):
     result = _call_one(cfg, search_tool, {"query": title})
     if result is None or result.get("is_error"):
         return None, "hub_search_failed"
+    untimed = []
     ids = hub_doc_matches(
         result["text"], title, start, end,
-        cfg["match_tolerance_minutes"] * 60)
+        cfg["hub_grace_minutes"] * 60, untimed)
     if not ids:
-        return None, "hub_no_match"
+        return None, "hub_untimed" if untimed else "hub_no_match"
     if len(ids) > 1:
         return None, "hub_ambiguous"
     doc = _call_one(
@@ -659,6 +698,7 @@ def candidates(source):
         save_state(meetings)
         raise
     ready = 0
+    untimed = 0
     for _, event_id in due:
         record = meetings[event_id]
         record["checks"] = int(record.get("checks", 0)) + 1
@@ -686,6 +726,7 @@ def candidates(source):
             text, doc_id = hub_summary(cfg, record)
             if text is None:
                 record["last_result"] = f"{record['last_result']}+{doc_id}"
+                untimed += doc_id == "hub_untimed"
             else:
                 uuid = f"doc-{doc_id}"
                 assets = dict(assets, topic=assets.get("topic") or record.get("title"))
@@ -719,7 +760,9 @@ def candidates(source):
         })
     save_state(meetings)
     log(f"zoom: {tracking} meeting(s) tracked ({added} new), {len(due)} "
-        f"checked, {ready} summary(ies) ready")
+        f"checked, {ready} summary(ies) ready"
+        + (f", {untimed} meeting(s) with a hub doc skipped for no timestamp"
+           if untimed else ""))
     return out
 
 

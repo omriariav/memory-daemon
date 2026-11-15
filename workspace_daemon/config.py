@@ -2121,7 +2121,8 @@ def _validate_zoom(prefix, source):
         ("first_check_minutes", 1, 720), ("max_interval_minutes", 5, 1440),
         ("retry_hours", 1, 168), ("max_checks_per_run", 1, 20),
         ("max_summary_chars", 1000, 200000),
-        ("match_tolerance_minutes", 0, 720), ("stale_calendar_hours", 1, 168),
+        ("match_tolerance_minutes", 0, 720), ("hub_grace_minutes", 0, 720),
+        ("stale_calendar_hours", 1, 168),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(

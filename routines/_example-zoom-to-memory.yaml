@@ -36,8 +36,11 @@ source:
   skip_declined: true
   # Optional: when the assets carry no summary, look for a Zoom Hub Doc
   # (docs.zoom.us/doc/<id>) with the meeting's exact title and use it instead.
-  # The source id is then zoom:doc-<doc id>.
+  # The source id is then zoom:doc-<doc id>. A doc is used only when its
+  # created time (else modified time) is from 60 min before the meeting starts
+  # to hub_grace_minutes after it ends; a doc with no timestamp is skipped.
   hub_docs: false
+  # hub_grace_minutes: 120
   # hub_search_tool: mcp__<server>__search
   # hub_content_tool: mcp__<server>__hub_get_file_content
 
