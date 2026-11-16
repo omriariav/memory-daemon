@@ -779,6 +779,23 @@ class FindListUnderHeadingTest(unittest.TestCase):
                          "Plan the offsite\nsecond line")
         self.assertEqual(found["items"][2]["text"], 'Say "hi" \u2014 ok')
 
+    def test_result_has_exactly_the_documented_keys(self):
+        roots, blocks = self.parse(self.agenda_doc())
+        found = fti.find_list_under_heading(blocks, "agenda")
+        self.assertEqual(set(found), {"heading_id", "list_id", "items"})
+        for item in found["items"]:
+            self.assertEqual(set(item), {"id", "text"})
+
+    def test_raw_tool_text_in_both_shapes(self):
+        doc = self.agenda_doc()
+        for wrap in (False, True):
+            found = fti.find_list_in_document(doc.text(wrap=wrap), "Agenda")
+            self.assertEqual([i["id"] for i in found["items"]],
+                             [bid(2), bid(3), bid(4)])
+        self.assertIsNone(fti.find_list_in_document(doc.text(), "nothing"))
+        with self.assertRaises(fti.FiberyParseError):
+            fti.find_list_in_document("not a document", "Agenda")
+
     def test_same_result_with_and_without_roots(self):
         roots, blocks = self.parse(self.agenda_doc())
         self.assertEqual(fti.find_list_under_heading(blocks, "Agenda"),

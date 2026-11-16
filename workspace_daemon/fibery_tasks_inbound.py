@@ -340,6 +340,15 @@ def _item_text(blocks, item):
     return "\n".join(pieces)
 
 
+def find_list_in_document(text, heading_prefix):
+    """`find_list_under_heading` on the raw ``read_document`` tool text (the
+    TOON document, or the JSON wrapper around it). The one call a caller
+    holding only the tool result needs. Raises FiberyParseError when the text
+    is not a document."""
+    roots, blocks, _suggestions = parse_document(text)
+    return find_list_under_heading(blocks, heading_prefix, roots)
+
+
 def find_list_under_heading(blocks, heading_prefix, roots=None):
     """The bullet list under the first heading that starts with a prefix.
 

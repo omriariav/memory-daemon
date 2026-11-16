@@ -36,7 +36,6 @@ SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 READ_TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__read_document$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ANY_EMAIL_RE = re.compile(r"[^@\s,;:<>()\[\]\"']+@[^@\s,;:<>()\[\]\"']+")
-DOC_KEYS = ("key", "document_secret", "match_emails")
 MAX_DOCS = 50
 MAX_EMAILS = 50
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -54,7 +53,9 @@ def _num(value):
 
 def check_docs(docs, label="docs"):
     """`(clean docs, problems)` for a list of ``{key, document_secret,
-    match_emails}``. Problem texts never include a secret or an email."""
+    match_emails}``. Only those three keys are read and validated; any other
+    key of an entry (a display name, a link) is ignored and dropped from the
+    clean entry. Problem texts never include a secret or an email."""
     problems = []
     if not isinstance(docs, list) or not docs:
         return [], [f"{label} must be a non-empty list"]
@@ -67,9 +68,6 @@ def check_docs(docs, label="docs"):
         if not isinstance(doc, dict):
             problems.append(f"{where} must be a mapping")
             continue
-        extra = sorted(str(k) for k in doc if k not in DOC_KEYS)
-        if extra:
-            problems.append(f"{where} has unknown key(s) {', '.join(extra)}")
         key = doc.get("key")
         if not isinstance(key, str) or not KEY_RE.fullmatch(key):
             problems.append(f"{where}.key must be 1-64 chars of a-z, 0-9, _ "

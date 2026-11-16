@@ -153,6 +153,13 @@ class CheckDocsTest(unittest.TestCase):
         self.assertEqual(clean[0]["match_emails"],
                          ["alex.w@example.com", "alex@example.com"])
 
+    def test_unknown_keys_of_an_entry_are_ignored_and_dropped(self):
+        docs = [dict(DOCS[0], name="Alex", doc_url="https://example.com/d")]
+        clean, problems = fdc.check_docs(docs)
+        self.assertEqual(problems, [])
+        self.assertEqual(set(clean[0]),
+                         {"key", "document_secret", "match_emails"})
+
     def test_bad_entries_are_reported_without_echoing_values(self):
         bad = [
             {"key": "Bad Key", "document_secret": SECRET_A,
@@ -162,13 +169,11 @@ class CheckDocsTest(unittest.TestCase):
             {"key": "k2", "document_secret": SECRET_A, "match_emails": []},
             {"key": "k3", "document_secret": SECRET_A,
              "match_emails": ["not-an-email"]},
-            {"key": "k4", "document_secret": SECRET_A,
-             "match_emails": ["a@example.com"], "extra": 1},
             "text",
         ]
         clean, problems = fdc.check_docs(bad)
         self.assertEqual(clean, [])
-        self.assertEqual(len(problems), 6)
+        self.assertEqual(len(problems), 5)
         text = " ".join(problems)
         for leaked in (SECRET_A, "not-an-email", "short", "Bad Key"):
             self.assertNotIn(leaked, text)
@@ -458,6 +463,11 @@ class DocsFileTest(Base):
         text = str(ctx.exception)
         self.assertIn("docs_file[0].match_emails", text)
         self.assertNotIn(SECRET_A, text)
+
+    def test_extra_keys_in_the_file_are_ignored(self):
+        path = self.write([dict(DOCS[0], name="Alex",
+                                doc_url="https://example.com/d")])
+        self.assertEqual(len(fdc.load_docs(self.cfg_file(path), self.dir)), 1)
 
     def test_a_directory_is_not_a_docs_file(self):
         with self.assertRaises(fdc.DocsFileError):

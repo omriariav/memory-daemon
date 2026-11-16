@@ -1020,8 +1020,9 @@ in local files, so a local tool (the inbox's Context pane, a prompt hook) can
 read them without a call. It never writes to Fibery. Config: `read_tool` (exact
 MCP name ending `__read_document`), the documents as `docs: [{key,
 document_secret, match_emails: [...]}]` or `docs_file: <path>` (a JSON list of
-the same entries; it must be readable by its owner only, so the secrets live in
-one private file; use exactly one of the two), `lookahead_h` (default 24),
+the same entries, any extra key of an entry (a name, a link) is ignored; it must
+be readable by its owner only, so the secrets live in one private file; use
+exactly one of the two), `lookahead_h` (default 24),
 `max_age_h` (default 12), `only_upcoming` (default `true`) and `out_dir`
 (default `state/fibery-docs`), plus the usual `schedule` and `budget`.
 
