@@ -7,6 +7,85 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-16
+
+Real Slack writes and a polish step, all opt-in. Without `send:`, `react:` and
+`polish:` in `inbox.yaml` nothing changes, except that `E` and `P` are now the
+inbox's own keys (an `actions:` entry that used one of them is refused; pick
+another letter, the free ones are `h l p t w x z` and `B D F H J K M N O Q U V
+W Z`).
+
+### Added
+
+- `send:` (no default): `{tool, args: {channel, thread_ts, text}, timeout_s
+  (30 to 300, default 90), model (default haiku), precheck}`. `a` (reply) and
+  `n` (nudge) now send for real when it is set; without it they behave as
+  before (a refusal on a real item, a pretend send in `--demo`). The same flow
+  as RSVP: confirm modal (Cancel focused), the 5 s undo window (quitting
+  inside it cancels), then one worker call, never retried, a row in the audit
+  log, a running send counted in the quit guard, results back through the
+  non-blocking `_post`. One headless call through the bridge whose only
+  allowed tool is `send.tool`, pinned to exactly `{channel, text}` plus
+  `thread_ts` when there is one (`exact_args=True`, `attempts=1`). Success is
+  a real non-error result (a JSON `ok: false` or an error is a failure); a
+  timeout or a run cut off by a sleep says "the message may have been sent,
+  check Slack"; a guard stop or a tool error says "not sent". A sent item is
+  marked done. Only one send runs at a time. The text is exactly the current
+  draft (also after `e` edits) with trailing whitespace removed and cut at 4000
+  characters (the modal says so); an empty draft is refused. The confirm modal
+  shows the destination (`<where> (thread)`, `(DM)` or `(channel)`) and the
+  full text, scrollable and line by line as it will be sent (the old modal
+  joined lines). Spend is logged as `inbox-send`.
+- `meta.reply_to = {channel, thread_ts?, message_ts?}`: the documented source of
+  a send's destination (`channel` `^[CDG][A-Z0-9]{8,12}$`, timestamps
+  `^\d{9,11}\.\d{6}$`, a wrong format makes it invalid; never read from item
+  text). An item without a valid one says so and cannot be sent to.
+- `send.precheck: {argv, timeout_s (1 to 30, default 10)}`: an optional
+  read-only command run just before the confirm modal (behind a "checking"
+  modal, `esc` cancels). Stdin `{"v": 1, "action": "precheck", "item", "text"}`
+  only, never argv; stdout `{"v": 1, "ok": true, "warn": str|null}`. A `warn`
+  shows prominently in the modal (Cancel stays the default); a failure or timeout
+  shows "couldn't check for a newer reply" and never blocks the send.
+- `react:` (no default) and `E`: `{tool, args: {channel, timestamp, name},
+  emojis (1 to 9 names, `^[a-z0-9_+\-]{1,64}$`, default `eyes`,
+  `white_check_mark`, `+1`, `pray`), timeout_s, model, mark_done (default
+  true)}`. Emoji picker, confirm, undo, then one pinned call (`exact_args`,
+  never retried) on `meta.reply_to.message_ts`, else `thread_ts`. A valid
+  `meta.suggested_reaction` is preselected in the picker (still confirmed).
+  Spend is logged as `inbox-react`.
+- `polish:` (no default) and `P`: `{mcp_config, tone_tool, tone_args, model
+  (default sonnet), timeout_s, max_budget_usd (default 0.05), cache_h (default
+  24)}`. One read-only tone call pinned to `tone_tool` and `tone_args` on the MCP
+  servers of `mcp_config`, cached on disk in `state/inbox-polish/tone.json`
+  (0600 in a 0700 directory), then a no-tools, one-turn rewrite
+  (`claude_bridge.complete`, usage tag `inbox-polish`) that keeps meaning,
+  facts, names, numbers and language. The draft, up to the last 10 thread
+  messages and the tone text are data between random-token markers. A modal
+  shows old and new; accept replaces the draft, edit opens the editor with the
+  new text, cancel (the default) changes nothing. Polish never sends.
+- Bridge: `call_tools(..., mcp_config=None)`. A path (absolute, an existing
+  regular file you own with no group or other access, opened with `O_NOFOLLOW`
+  and judged with `fstat`) adds `--mcp-config <path> --strict-mcp-config`; the
+  allowlist hook and the stream re-check still restrict the run to the pinned
+  tools. The default leaves the argv unchanged.
+- Mail items from the `events` source show more. The daemon records, for Gmail
+  captures, `details.mail_from` (display name only, never an address, 80
+  characters), `mail_subject` (200), `mail_snippet` (300; only when the source
+  gives one: the `gws` path does when its read has it, the connector path
+  does not) and `mail_thread_id`, all cleaned plain text and never a body. The
+  item gets `sender` = `mail_from`, `where` = the subject, a one-message thread
+  from the snippet and a Gmail thread link from `mail_thread_id` and
+  `gmail_account`; the gist is unchanged and an event without these fields
+  looks as before.
+- `meta.memory_id`: the `events` source copies an event's `memory_id` (when it
+  matches `^[a-z0-9][a-z0-9-]{0,200}$`) into the item's meta, so a context
+  command can link the captured entry.
+
+### Changed
+
+- `E` and `P` are reserved keys (see above). `ConfirmSend` scrolls and shows
+  the text line by line.
+
 ## [0.5.0] - 2026-11-16
 
 Custom actions, and a handled item leaves the queue. Everything new is off

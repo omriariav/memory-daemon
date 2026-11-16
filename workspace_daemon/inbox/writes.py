@@ -11,6 +11,15 @@ starts. The prompt carries only the tool name from `inbox.yaml` and those
 three values, never item text. A run is never retried: a write is not safe to
 repeat blindly.
 
+Send and react (inbox 0.6.0, `run_send`, `run_react`). The same pattern as
+RSVP, for two Slack writes through connector tools named in `inbox.yaml`. The
+destination is never taken from item text: it is the item's `meta.reply_to`
+(`reply_target`), validated by format. The pins are exactly the destination and
+the text (send) or the target and the emoji name (react), the call carries
+nothing else (`exact_args=True`), and a run is never retried (`attempts=1`).
+Success is a real non-error tool result for the pinned call; a timeout, or a
+run cut off by a sleep, is reported as "may have been sent, check Slack".
+
 Save (`run_save`). The configured argv runs without a shell, with the item as
 JSON on stdin and nothing else (item text is never put in argv). It is bound
 by the same process-group, timeout and output-cap handling as a command
@@ -18,6 +27,7 @@ source, except that a timeout asks the group to stop (SIGTERM, then SIGKILL
 after SAVE_TERM_GRACE_S) so the command can clean up.
 """
 import json
+import re
 from collections import namedtuple
 
 from .. import claude_bridge
@@ -36,6 +46,18 @@ MAX_TURNS = 4
 MAX_BUDGET_USD = 0.10
 DETAIL_MAX = 200
 SAVE_TERM_GRACE_S = 5
+SEND_USAGE_TAG = "inbox-send"
+REACT_USAGE_TAG = "inbox-react"
+SEND_TEXT_MAX = 4000
+# The `meta.reply_to` contract: a Slack conversation id (public/private
+# channel C, DM D, group G) and message timestamps.
+CHANNEL_ID = re.compile(r"\A[CDG][A-Z0-9]{8,12}\Z")
+SLACK_TS = re.compile(r"\A\d{9,11}\.\d{6}\Z")
+EMOJI_NAME = re.compile(r"\A[a-z0-9_+\-]{1,64}\Z")
+
+ReplyTo = namedtuple("ReplyTo", "channel thread_ts message_ts")
+Sendable = namedtuple("Sendable", "ok text target kind cut error destination",
+                      defaults=("", None, "", False, "", ""))
 
 
 def rsvp_pins(cfg, event_id, calendar_id, response):
@@ -131,3 +153,244 @@ def run_save(cfg, item, force=False):
         "Saved" if res["ok"] else "the save command reported a failure")
     return Outcome(res["ok"], detail, res["memory_id"], res["duplicate"],
                    res["candidate"])
+
+
+# --- Slack send and react (inbox 0.6.0) -------------------------------------
+
+NO_REPLY_TO = ("this item has no valid meta.reply_to (a Slack channel id and "
+               "timestamps), so it cannot be sent to")
+
+
+def reply_to(meta):
+    """The validated `meta.reply_to` as a `ReplyTo`, or None.
+
+    `{channel, thread_ts?, message_ts?}`: `channel` is required and matches
+    `^[CDG][A-Z0-9]{8,12}$`; `thread_ts` and `message_ts` are optional (absent
+    or null) and match `^\\d{9,11}\\.\\d{6}$`. A present value in the wrong
+    format makes the whole thing invalid; unknown keys are ignored and never
+    used."""
+    raw = meta.get("reply_to") if isinstance(meta, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    channel = raw.get("channel")
+    if not isinstance(channel, str) or not CHANNEL_ID.match(channel):
+        return None
+    stamps = []
+    for key in ("thread_ts", "message_ts"):
+        value = raw.get(key)
+        if value is None:
+            stamps.append(None)
+        elif isinstance(value, str) and SLACK_TS.match(value):
+            stamps.append(value)
+        else:
+            return None
+    return ReplyTo(channel, stamps[0], stamps[1])
+
+
+def target_kind(target):
+    """What a send to `target` is: a reply in a thread, a DM, or a post in a
+    channel (outside a thread)."""
+    if target.thread_ts:
+        return "thread"
+    return "DM" if target.channel.startswith("D") else "channel"
+
+
+def send_text(draft):
+    """`(text, cut, error)` for a draft: only trailing whitespace is removed,
+    the text is cut at SEND_TEXT_MAX characters (`cut` says so), and an empty
+    one is refused (`error`)."""
+    text = draft.rstrip() if isinstance(draft, str) else ""
+    if not text:
+        return "", False, "there is no text to send"
+    if len(text) > SEND_TEXT_MAX:
+        return text[:SEND_TEXT_MAX], True, ""
+    return text, False, ""
+
+
+def send_plan(meta, draft):
+    """Everything a send needs, checked: the destination, the exact text and
+    what to tell the user. `ok` False carries `error`."""
+    target = reply_to(meta)
+    if target is None:
+        return Sendable(False, error=NO_REPLY_TO[0].upper() + NO_REPLY_TO[1:])
+    text, cut, error = send_text(draft)
+    if error:
+        return Sendable(False, error=error[0].upper() + error[1:])
+    return Sendable(True, text, target, target_kind(target), cut)
+
+
+def send_pins(cfg, target, text):
+    """`{tool: {param: value}}` for call_tools: exactly the channel and the
+    text, plus the thread timestamp when the destination has one."""
+    names = cfg["args"]
+    pins = {names["channel"]: target.channel, names["text"]: text}
+    if target.thread_ts:
+        pins[names["thread_ts"]] = target.thread_ts
+    return {cfg["tool"]: pins}
+
+
+def react_target(meta):
+    """`(channel, timestamp)` to react to, or None: `reply_to.message_ts`,
+    else `reply_to.thread_ts`."""
+    target = reply_to(meta)
+    if target is None:
+        return None
+    ts = target.message_ts or target.thread_ts
+    return (target.channel, ts) if ts else None
+
+
+def valid_emoji(name):
+    return isinstance(name, str) and bool(EMOJI_NAME.match(name))
+
+
+def react_pins(cfg, channel, timestamp, emoji):
+    names = cfg["args"]
+    return {cfg["tool"]: {names["channel"]: channel,
+                          names["timestamp"]: timestamp,
+                          names["name"]: emoji}}
+
+
+def pinned_prompt(cfg, pins):
+    """One instruction: a single call with exactly the pinned values (the
+    JSON keeps non-ASCII text as it is, so the model copies it verbatim)."""
+    args = pins[cfg["tool"]]
+    return (
+        f"Call the tool {cfg['tool']} exactly once, with exactly these "
+        "arguments and no others, each value copied verbatim:\n"
+        f"{json.dumps(args, sort_keys=True, ensure_ascii=False)}\n"
+        "Do not call any other tool, do not retry and do not change a "
+        "value. When the call returns, reply with the single word done."
+    )
+
+
+def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
+    """One pinned write through the bridge. Never raises; returns an Outcome.
+
+    `what` names the write ("message", "reaction") for the messages. The
+    reasons carry only fixed kinds, never prompts or tool output. A failure
+    that leaves it unknown whether the write happened (a timeout, a run cut
+    off by a sleep, a crashed run) says "check Slack"."""
+    call = call_tools or claude_bridge.call_tools
+    tool = cfg["tool"]
+    try:
+        with claude_bridge.usage_scope(tag):
+            results = call(
+                pinned_prompt(cfg, pins), pins,
+                model=cfg.get("model", "haiku"), base_dir=base_dir,
+                max_turns=MAX_TURNS, max_budget_usd=MAX_BUDGET_USD,
+                timeout=cfg["timeout_s"], attempts=1, exact_args=True,
+                accept_partial=True)
+    except claude_bridge.GUARD_STOPS + (claude_bridge.BridgeDryRun,) as exc:
+        return Outcome(False, "not sent: " + itm.truncate(
+            itm.clean_line(exc), DETAIL_MAX))
+    except claude_bridge.BridgeOutage:
+        return Outcome(False, f"the run was cut off (sleep or outage); the "
+                              f"{what} may have been sent, check Slack")
+    except claude_bridge.BridgeError as exc:
+        text = itm.truncate(itm.clean_line(exc), DETAIL_MAX)
+        if "timed out" in text:
+            return Outcome(False, f"timed out after {cfg['timeout_s']:g}s; "
+                                  f"the {what} may have been sent, check Slack")
+        if text.startswith("tool returned an error"):
+            return Outcome(False, f"not sent: {text}")
+        return Outcome(False, f"{text}; the {what} may have been sent, "
+                              "check Slack")
+    except Exception as exc:  # a missing claude binary, a bad config
+        return Outcome(False, f"cannot run: {type(exc).__name__}")
+    rows = [r for r in results
+            if r.get("name") == tool and not r.get("is_error")
+            and r.get("input") == pins[tool]]
+    if not rows:
+        return Outcome(False, f"no confirmed result for the pinned call; the "
+                              f"{what} may not have been sent, check Slack")
+    if any(_tool_failure(r.get("text")) for r in rows):
+        return Outcome(False, f"the Slack tool reported a failure; {failed}")
+    if len(rows) > 1:
+        return Outcome(True, f"the tool ran {len(rows)} times; check Slack "
+                             f"for a duplicate {what}")
+    return Outcome(True, "")
+
+
+def run_send(cfg, base_dir, target, text, call_tools=None):
+    """Post `text` to the destination `target` (a `ReplyTo`). Never raises;
+    returns an Outcome (`detail` "" on a plain success)."""
+    if not isinstance(target, ReplyTo) or not text or not text.strip():
+        return Outcome(False, "nothing to send")
+    pins = send_pins(cfg, target, text)
+    return _run_pinned(cfg, base_dir, pins, SEND_USAGE_TAG, call_tools,
+                       "message", "not sent")
+
+
+def run_react(cfg, base_dir, channel, timestamp, emoji, call_tools=None):
+    """Add the reaction `emoji` to the message at `timestamp`. Never raises;
+    returns an Outcome."""
+    if not (isinstance(channel, str) and CHANNEL_ID.match(channel)
+            and isinstance(timestamp, str) and SLACK_TS.match(timestamp)
+            and valid_emoji(emoji)):
+        return Outcome(False, "invalid reaction target")
+    pins = react_pins(cfg, channel, timestamp, emoji)
+    return _run_pinned(cfg, base_dir, pins, REACT_USAGE_TAG, call_tools,
+                       "reaction", "no reaction added")
+
+
+# --- the optional send precheck ---------------------------------------------
+
+PRECHECK_TERM_GRACE_S = 2
+PRECHECK_WARN_MAX = 200
+PRECHECK_MAX_BYTES = 64 * 1024
+PRECHECK_FAILED = "couldn't check for a newer reply"
+# warn: a line to show prominently in the confirm modal ("" = none);
+# failed: the check itself did not work (the send is never blocked by it).
+Precheck = namedtuple("Precheck", "warn failed", defaults=("", False))
+
+
+def precheck_request(item, text):
+    """The stdin of the precheck command: the item and the exact text."""
+    return {"v": 1, "action": "precheck", "item": item, "text": text}
+
+
+def parse_precheck(out):
+    """The command's stdout as a `Precheck`: `{"v": 1, "ok": bool, "warn":
+    str|null}`. `ok` true with a `warn` shows it; `ok` true without one
+    shows nothing; anything else (not JSON, wrong `v`, `ok` not true) counts
+    as a failed check."""
+    try:
+        doc = json.loads(out)
+    except (TypeError, ValueError):
+        return Precheck(failed=True)
+    if (not isinstance(doc, dict) or doc.get("v") != 1
+            or isinstance(doc.get("v"), bool) or doc.get("ok") is not True):
+        return Precheck(failed=True)
+    warn = doc.get("warn")
+    if warn is None or warn is False:
+        return Precheck()
+    if not isinstance(warn, str):
+        return Precheck(failed=True)
+    return Precheck(itm.truncate(itm.clean_line(warn), PRECHECK_WARN_MAX))
+
+
+def run_precheck(cfg, item, text, cancel=None):
+    """Run the `send.precheck` command for one v1 item dict and the exact
+    text (both on stdin only; nothing in argv). Never raises; any failure or
+    timeout is `Precheck(failed=True)`. `cancel` (a `threading.Event`) stops
+    the command."""
+    pre = cfg.get("precheck")
+    if pre is None:
+        return Precheck()
+    try:
+        payload = json.dumps(precheck_request(item, text)).encode("utf-8")
+        status, code, out, _err = sources._run_capped(
+            sources._expand(pre["argv"]), pre["timeout_s"],
+            stdin_bytes=payload, term_grace_s=PRECHECK_TERM_GRACE_S,
+            max_bytes=PRECHECK_MAX_BYTES, cancel=cancel)
+    except (OSError, ValueError, TypeError):
+        return Precheck(failed=True)
+    if status != "ok" or code != 0:
+        return Precheck(failed=True)
+    return parse_precheck(out.decode("utf-8", "replace"))
+
+
+def suggested_reaction(meta):
+    """`meta.suggested_reaction` when it is a valid emoji name, else None."""
+    name = meta.get("suggested_reaction") if isinstance(meta, dict) else None
+    return name if valid_emoji(name) else None

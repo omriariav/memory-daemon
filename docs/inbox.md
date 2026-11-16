@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act`. One optional key is read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note) |
+| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act`. Four optional keys are read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry an `events` item was captured as (`^[a-z0-9][a-z0-9-]{0,200}$`; the built-in `events` source copies it from the event when present and well-formed, so a context command can link the entry; a command source may set it too) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -326,10 +326,26 @@ event that was created, then updated, appears once.
 
 | Event | Item `source` | `where` | `actions` |
 | --- | --- | --- | --- |
-| `gmail` | `email` | `mail` | `open` (reply arrives in phase 2) |
+| `gmail` | `email` | the mail subject (`details.mail_subject`), else `mail` | `open` (reply arrives in phase 2) |
 | `gcal` kinds `new`, `update`, `cancel`, `rsvp` | `calendar` | `calendar` | `ack` |
 | `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack` |
 | `daemon` kind `alert` | `alert` | `daemon` | `ack` |
+
+A Gmail capture event carries plain-text display fields in `details` (none of
+them a body; each is cleaned to one line and capped when it is written and read
+again): `mail_from` (the sender's display name only, never an address; `<...@...>`
+is stripped and a value that still holds an `@` is dropped; 80 characters),
+`mail_subject` (200), `mail_snippet` (Gmail's own snippet, 300) and
+`mail_thread_id`. The daemon records a field only when its Gmail source
+provides it: the `gws` path reports the snippet when its read has one, the
+connector (`gmail_mcp`) path does not, so there it is left out. The `email`
+item then shows `sender` = `mail_from` (else the people list, else `mail`),
+`where` = the subject, a one-message thread `{who: mail_from, text: snippet}`
+when there is a snippet, and a link to the Gmail thread built from
+`mail_thread_id` (else from the event's `source_id`) and `gmail_account`. The
+`gist` stays the memory title. The event's `memory_id`, when it matches
+`^[a-z0-9][a-z0-9-]{0,200}$`, is copied to `meta.memory_id` so a context
+command can link the captured entry.
 
 `open` is listed only when the item has a link (the UI also hides it for any
 item with a null `link`, whatever a source says). Today only Gmail events have
@@ -452,11 +468,175 @@ Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
 
+### The `reply_to` contract
+
+A source that wants its items to be answerable from the inbox puts the Slack
+destination in `meta.reply_to`:
+
+```json
+"meta": {"reply_to": {"channel": "C0EXAMPLE01", "thread_ts": "1893492000.000100",
+                      "message_ts": "1893492060.000200"}}
+```
+
+| Key | Rule |
+| --- | --- |
+| `channel` | required; a Slack conversation id matching `^[CDG][A-Z0-9]{8,12}$` (`C` channel, `D` DM, `G` group) |
+| `thread_ts` | optional (absent or null); matching `^\d{9,11}\.\d{6}$`. When present the reply goes into that thread; without it the post is a top-level message in the conversation (a DM, or the channel itself) |
+| `message_ts` | optional; same format. The message a reaction goes on |
+
+A value in the wrong format makes the whole `reply_to` invalid; unknown keys
+inside it are ignored and never used. The destination is never read from
+`gist`, `thread` text, `where` or any other item text: only from here. An item
+without a valid `reply_to` cannot be sent to, and `a` or `n` say so instead of
+opening the confirm modal. `where` is only the label shown in the modal.
+
+### Slack send (reply and nudge)
+
+`a` on a reply and `n` on a nudge send the draft to Slack when the `send:`
+block is set (no default). Without `send:` the confirm flow exists only in
+`--demo` (nothing is sent) and `a` / `e` / `n` on a real item say "Replying is
+not available yet", as in 0.5.0.
+
+1. **Checks.** The item needs a valid `meta.reply_to` (above). The text is the
+   current draft, including any `e` edits (an open edit is saved first), with
+   only trailing whitespace removed and cut at 4000 characters (the modal says
+   so); an empty draft is refused. Only one send runs at a time: while one
+   waits out its undo window or runs, another is refused with a message.
+2. **Precheck (optional).** With `send.precheck` the command runs first, in a
+   background thread behind a "checking" modal (`esc` cancels the whole send and
+   stops the command). See below.
+3. **Confirm.** The modal shows the destination (`<where> (thread)`,
+   `(DM)` or `(channel)`) and the full text, scrollable (`j`/`k`, the arrows
+   and the page keys), laid out line by line exactly as it will be sent.
+   Cancel is focused; `y` confirms, `esc` cancels (the audit log says so).
+4. **Undo window.** The row leaves the queue and the 5 s undo window opens (`u`
+   restores it; `q` inside the window cancels the send). Once the call has
+   started `q` says "N write(s) still running; q again to quit (they finish
+   first)".
+5. **The call.** A worker makes one headless Claude call through the bridge
+   (`call_tools`) whose only allowed tool is `send.tool`. Its arguments are
+   pinned to exactly `{<args.channel>: <channel>, <args.text>: <text>}` plus
+   `<args.thread_ts>: <thread_ts>` when the destination has one, and the call
+   must carry exactly those arguments (`exact_args=True`: the PreToolUse hook
+   denies a call that differs by a byte or adds an argument, and the run fails
+   if one ran anyway). `attempts=1`: a send is never retried. The prompt
+   carries the tool name and the pinned values only. The bridge guards apply
+   first (`state/PAUSED`, the daily budget); spend is logged as `inbox-send`.
+6. **Result.** Success needs a real, non-error result of the pinned call
+   (never the model's words); a JSON answer with `error` or `ok`/`success`
+   false is a failure. A timeout, or a run cut off by a sleep, is reported as
+   "the message may have been sent, check Slack" and the row comes back; a
+   guard stop or a tool error says "not sent". If the tool ran more than once
+   the toast says so, so a duplicate can be spotted. On success the item is
+   marked done (local mark, so it stays gone) and the toast says "Sent to
+   Slack". Every send is a row in the audit log.
+
+A nudge is the same path with the nudge text.
+
+**`send.precheck`.** An optional read-only command that can warn about
+something that changed (for example a reply you already sent from another
+device). Right before the confirm modal opens it runs with the capped runner
+(its own process group; `SIGTERM`, then `SIGKILL` 2 s later on a timeout or
+`esc`). Stdin is one JSON line, never argv:
+`{"v": 1, "action": "precheck", "item": {...}, "text": "<the exact text>"}`;
+stdout is `{"v": 1, "ok": true, "warn": "<one line>" | null}` (up to 64 KB).
+A `warn` is shown prominently in the confirm modal (for example "⚠ You already
+replied at 16:40") and added to the audit log; Cancel stays the default.
+A failure of any kind (exit code, timeout, bad JSON, `ok` not `true`) shows
+"⚠ couldn't check for a newer reply" in the modal. A precheck only advises: it
+never blocks a send, and nothing it prints is sent anywhere. If the draft or
+the selection changes while it runs, nothing is sent and the toast says so.
+
+`send:`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tool` | required | the Slack connector tool as Claude Code lists it, `mcp__<server>__<tool>` |
+| `args` | required | the tool's parameter names for `channel`, `thread_ts` and `text` (three different names) |
+| `timeout_s` | `90` | 30 to 300 for the whole bridge call |
+| `model` | `haiku` | the model of the one-call run |
+| `precheck` | off | `{argv, timeout_s}`: the optional precheck command (above); `argv` is a list (no shell), `timeout_s` 1 to 30, default 10 |
+
+### Slack reactions (`E`)
+
+`E` adds an emoji reaction to the item's message when `react:` is set (no
+default). The target is `meta.reply_to.message_ts`, else `thread_ts`; without
+either the key says so. The flow is the RSVP pattern: an emoji picker (the
+configured names as `:name:`, `1`-`9` quick pick, `esc` cancels; a valid
+`meta.suggested_reaction` is highlighted and marked "suggested", and is added
+in front when it is not in your list, for that item only; `enter` still picks
+it, nothing is sent until the confirm), the confirm
+modal (Cancel focused), the 5 s undo window (`u` undoes, `q` inside it
+cancels), then one pinned call with exactly `{<args.channel>: <channel>,
+<args.timestamp>: <timestamp>, <args.name>: <emoji>}` (`exact_args=True`,
+`attempts=1`, never retried), spend logged as `inbox-react`. Success is a real
+non-error result; a success marks the item done unless `mark_done: false`. A
+failure leaves the row and says why (a timeout says "check Slack").
+
+`react:`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tool` | required | the reaction connector tool, `mcp__<server>__<tool>` |
+| `args` | required | the tool's parameter names for `channel`, `timestamp` and `name` |
+| `emojis` | `eyes`, `white_check_mark`, `+1`, `pray` | 1 to 9 emoji names matching `^[a-z0-9_+\-]{1,64}$` (no colons), no repeats |
+| `timeout_s` | `60` | 30 to 300 |
+| `model` | `haiku` | the model of the one-call run |
+| `mark_done` | `true` | a successful reaction marks the item done |
+
+### Polish a draft (`P`)
+
+`P` rewrites the draft in your tone when `polish:` is set (no default). It
+**never sends anything**.
+
+1. **Tone guidance.** One read-only `call_tools` run whose only allowed tool is
+   `polish.tone_tool`, pinned to exactly `polish.tone_args`
+   (`exact_args=True`, `attempts=1`). The MCP server comes from the separate
+   file `polish.mcp_config` (see below), so it need not be one of your
+   everyday connectors. The tool's text is cached on disk in
+   `state/inbox-polish/tone.json` (mode 0600 in a 0700 directory of its own),
+   keyed by the tool and its arguments, for `cache_h` hours, so most polishes
+   make one call, not two.
+2. **Rewrite.** `claude_bridge.complete`: no tools at all, `max_turns=1`, the
+   bridge guards apply, spend is logged as `inbox-polish`. The prompt asks for
+   the same meaning, facts, names, numbers and language (Hebrew stays Hebrew),
+   in the guided tone, and for the message only. The draft, up to the last 10
+   thread messages and the tone guidance are data: each sits between markers
+   with a random per-call token, after an instruction to ignore anything in
+   them that reads as an instruction.
+3. **Review.** A modal shows the old and the new text. `a` accepts (the draft
+   is replaced here, nothing else), `e` opens the editor with the new text,
+   `esc` cancels (focused by default). A result is dropped if the draft or the
+   selection changed while it ran. A polish counts in the quit guard like a
+   summary.
+
+The `mcp_config` file is JSON in Claude Code's MCP config format, for example
+`{"mcpServers": {"tone_connector": {"type": "http", "url":
+"https://tone.example.com/mcp"}}}`. It is passed to the run as `--mcp-config
+<file> --strict-mcp-config` (only the servers in it are loaded). It must be an
+absolute path to a regular file you own with no group or other permission
+bits; it is opened without following symlinks and judged on the open file.
+The allowlist hook and the stream re-check still limit the run to the tone
+tool. (`call_tools(..., mcp_config=None)`: the default leaves the bridge's
+argv unchanged for every other caller.)
+
+`polish:`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mcp_config` | required | absolute path (a leading `~` is fine) to the MCP servers JSON file |
+| `tone_tool` | required | the tone connector tool, `mcp__<server>__<tool>` |
+| `tone_args` | `{}` | the tool's pinned arguments (parameter names to JSON values, up to 4000 characters) |
+| `model` | `sonnet` | the model of both calls |
+| `timeout_s` | `120` | 30 to 300, for each of the two calls |
+| `max_budget_usd` | `0.05` | 0.005 to 2, the bridge's spend limit for each call |
+| `cache_h` | `24` | 0 (no cache) to 720 hours |
+
 ### Custom actions
 
 The key of an `actions:` entry (`p` in the example) runs the flow below on the
 selected item. The key must be a letter the inbox does not use itself; the
-free ones are `h l p t w x z` and `B D E F H J K M N O P Q U V W Z`, and
+free ones are `h l p t w x z` and `B D F H J K M N O Q U V W Z`, and
 validation refuses any other (and a key or label used twice).
 
 1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
@@ -681,6 +861,9 @@ defaults; a broken one prints every problem and exits 2.
 | `context` | off | the command the Context pane (`c`) runs (below) |
 | `actions` | none | custom confirmed write actions, one key each (below) |
 | `summary` | off | the AI summary (`i`) through the Claude bridge (below) |
+| `send` | off | real Slack send for replies and nudges (see "Slack send") |
+| `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
+| `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
 
 The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
 and:
@@ -772,7 +955,7 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
 memory (needs `save:`; marks the item done), any key set in `actions:`
-(needs `actions:`), `c` context pane (needs `context:`), `C` fetch its
+(needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack when `send:` is set, `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view
@@ -835,15 +1018,19 @@ header and the help overlay show the inbox version.
 
 ## Safety model
 
-- Nothing is sent as a reply: the confirm modal (destination and exact text,
-  Cancel focused, `y` to send), the undo window and quit-cancels-sends exist so
-  phase 2 sends are safe from day one; real sources cannot reach them yet
-  (`LocalActions` refuses).
-- The two writes, RSVP and save, are off until configured, always confirm
+- Nothing is sent as a reply unless `send:` is configured (0.6.0): without it
+  the confirm modal, undo window and quit-cancels-sends only run in `--demo`
+  and `LocalActions` refuses. With it the send follows the RSVP pattern (see
+  "Slack send").
+- The writes (RSVP, save, send, react, custom actions) are off until configured, always confirm
   first (Cancel focused), wait out the undo window, are cancelled by quitting
-  inside it, and run in a worker. RSVP can only make the one pinned tool call
-  with exactly the pinned arguments; save passes the item as JSON on stdin,
-  never in argv or in a prompt.
+  inside it, and run in a worker. RSVP, send and react can only make the one pinned tool call
+  with exactly the pinned arguments, once and never retried (a send's
+  destination comes only from the validated `meta.reply_to`); save passes the
+  item as JSON on stdin, never in argv or in a prompt. A running write counts in
+  the quit guard and results reach the UI without blocking it.
+- Polish never sends: its tone call is read-only and pinned, its rewrite has no
+  tools, and the result is only text you accept, edit or cancel.
 - The Context pane and the summary are read-only and never ask for
   confirmation. The context command is yours and must be read-only; the summary
   runs the bridge with no tools at all and treats item text as data.

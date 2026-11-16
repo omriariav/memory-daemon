@@ -81,6 +81,72 @@ alert_urgent_max_age_h: 6
 #   timeout_s: 90            # 30 to 300
 #   max_budget_usd: 0.05     # 0.005 to 2: the per-call spend limit
 
+# Slack send for replies and nudges (a approves a reply, n sends a nudge). Off
+# until set; there is no default. Without it a reply or nudge works only in
+# --demo and nothing is ever sent. One headless Claude call through the
+# daemon's bridge whose ONLY allowed tool is the one below. Its arguments are
+# pinned to the destination and the exact text of the draft (after your edits;
+# trailing whitespace removed, cut at 4000 characters): channel, text and, for
+# a thread, thread_ts; any other argument is denied. The destination is the
+# item's meta.reply_to ({channel, thread_ts?, message_ts?}, validated), never
+# taken from item text; an item without one cannot be sent to. The confirm
+# modal shows the destination and the full text, then the 5 s undo window
+# opens (q inside it cancels); the run is never retried, and a timeout is
+# reported as "may have been sent, check Slack". A sent item is marked done.
+# `args` maps the three values to YOUR tool's parameter names. Tool names here
+# are placeholders. The bridge's pause file and daily budget apply. See
+# "Slack send" in docs/inbox.md.
+# send:
+#   tool: "mcp__slack_connector__send_message"
+#   args:
+#     channel: "channel_id"
+#     thread_ts: "thread_ts"
+#     text: "text"
+#   timeout_s: 90            # 30 to 300
+#   # model: haiku
+#   # Optional read-only check right before the confirm modal: it gets
+#   # {"v": 1, "action": "precheck", "item": {...}, "text": "..."} on stdin (never
+#   # argv) and prints {"v": 1, "ok": true, "warn": "You already replied at 16:40"}.
+#   # A warn is shown in the modal; a failure shows "couldn't check for a newer
+#   # reply"; it never blocks the send.
+#   precheck:
+#     argv: ["python3", "~/bin/my-inbox-precheck.py"]
+#     timeout_s: 10          # 1 to 30
+
+# Slack reaction (E key). Off until set; there is no default. Pick an emoji
+# (1-9 quick keys), confirm, 5 s undo, then one pinned call with exactly the
+# channel, the message timestamp and the emoji name. The target is
+# meta.reply_to.message_ts, else thread_ts; a valid meta.suggested_reaction is
+# preselected (still confirmed). A successful reaction marks the
+# item done (mark_done: false keeps it). See "Slack reactions" in docs/inbox.md.
+# react:
+#   tool: "mcp__slack_connector__add_reaction"
+#   args:
+#     channel: "channel_id"
+#     timestamp: "timestamp"
+#     name: "name"
+#   emojis: ["eyes", "white_check_mark", "+1", "pray"]   # 1 to 9 names, no colons
+#   timeout_s: 60            # 30 to 300
+#   mark_done: true
+#   # model: haiku
+
+# Polish the draft in your tone (P key). Off until set; there is no default.
+# Never sends anything. Step 1: one read-only call of tone_tool with exactly
+# tone_args, on the MCP servers of the JSON file mcp_config (mode 0600, yours,
+# not a symlink; it is the only place these servers are loaded from); the text
+# it returns is cached for cache_h hours in state/inbox-polish/tone.json.
+# Step 2: a rewrite with NO tools; the draft and the last 10 thread messages
+# are data. You then accept, edit or cancel. Spend is logged as inbox-polish.
+# See "Polish a draft" in docs/inbox.md.
+# polish:
+#   mcp_config: "~/.config/inbox/polish-mcp.json"
+#   tone_tool: "mcp__tone_connector__get_tone"
+#   tone_args: {profile: "work-chat"}
+#   model: sonnet
+#   timeout_s: 120           # 30 to 300, for each of the two calls
+#   max_budget_usd: 0.05     # 0.005 to 2, for each of the two calls
+#   cache_h: 24              # 0 (no cache) to 720
+
 sources:
   # Built-in: state/events.jsonl (plus the .1 rotation), read-only.
   - name: events
@@ -124,7 +190,7 @@ sources:
 # (read-only, pick one), prepare (read-only, shows what will happen; may say
 # duplicate), then, after the confirm and the 5 s undo window, run (once, never
 # retried). The key must be one the inbox does not use: h l p t w x z or one
-# of B D E F H J K M N O P Q U V W Z. A successful run marks the item done
+# of B D F H J K M N O Q U V W Z. A successful run marks the item done
 # (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
 # actions:
 #   - key: "p"

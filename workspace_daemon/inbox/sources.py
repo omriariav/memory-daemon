@@ -159,9 +159,13 @@ def _map_source(event):
 
 def _event_link(event, source, gmail_account=0):
     if source == "email":
-        # gmail:<thread>, gmail:<thread>:followup-open, gmail:<thread>@<msg>
-        parts = _text(event.get("source_id")).split(":")
-        thread = parts[1].split("@")[0] if len(parts) > 1 else ""
+        details = event.get("details") if isinstance(event.get("details"), dict) \
+            else {}
+        thread = _text(details.get("mail_thread_id"))
+        if not _THREAD_ID.match(thread):
+            # gmail:<thread>, gmail:<thread>:followup-open, gmail:<thread>@<msg>
+            parts = _text(event.get("source_id")).split(":")
+            thread = parts[1].split("@")[0] if len(parts) > 1 else ""
         if _THREAD_ID.match(thread):
             return f"https://mail.google.com/mail/u/{int(gmail_account)}/#all/{thread}"
     return None
@@ -189,6 +193,22 @@ def _calendar_parts(event, kind, ts):
     return gist, thread, start
 
 
+MAIL_FROM_MAX, MAIL_SUBJECT_MAX, MAIL_SNIPPET_MAX = 80, 200, 300
+_ANGLE_ADDRESS = re.compile(r"<[^<>]*@[^<>]*>")
+
+
+def _mail_from(value):
+    """A display name only: any <...@...> is removed and a value that still
+    holds an address is dropped (an old or hand-written event may carry one)."""
+    text = _text(_ANGLE_ADDRESS.sub("", value if isinstance(value, str) else ""))
+    text = text.strip(" \"'")
+    return "" if "@" in text else itm.truncate(text, MAIL_FROM_MAX)
+
+
+# A memory entry id as a context command may link it (`meta.memory_id`).
+MEMORY_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,200}\Z")
+
+
 def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     """One event line to an item, or None if the event is not shown."""
     if not isinstance(event, dict):
@@ -212,7 +232,10 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         where = "calendar"
     elif source == "email":
         gist = title
-        where = "mail"
+        where = itm.truncate(_text(details.get("mail_subject")),
+                             MAIL_SUBJECT_MAX) or "mail"
+        snippet = itm.truncate(_text(details.get("mail_snippet")),
+                               MAIL_SNIPPET_MAX)
     elif source == "recording":
         gist = title
         where = _text(event.get("source")) or "recording"
@@ -220,9 +243,17 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         gist = title
         where = "daemon"
     sender = ", ".join(people[:3]) if people else where
+    if source == "email":
+        mail_from = _mail_from(details.get("mail_from"))
+        sender = mail_from or (", ".join(people[:3]) if people else "mail")
+        if snippet:
+            thread = [{"who": mail_from or "mail", "ts": ts, "text": snippet}]
     urgent = any(_rule_matches(r, event, kind, key, start_ts, now)
                  for r in rules)
     link = _event_link(event, source, gmail_account)
+    raw_memory_id = event.get("memory_id")
+    memory_id = raw_memory_id if (isinstance(raw_memory_id, str)
+                                  and MEMORY_ID.match(raw_memory_id)) else ""
     actions = ["ack"] if source != "email" else []
     if link is not None:
         actions.append("open")  # nothing to open without a link
@@ -235,7 +266,8 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         actions=actions,
         meta=dict({"source_id": _text(event.get("source_id")),
                    "kind": _text(kind)},
-                  **({"key": key} if key else {})),
+                  **({"key": key} if key else {}),
+                  **({"memory_id": memory_id} if memory_id else {})),
     )
 
 

@@ -4,6 +4,8 @@ A missing file means defaults (the built-in events source only). A broken
 file raises SettingsError with every problem listed, so the CLI can print it
 and exit instead of silently ignoring a typo.
 """
+import json
+import os
 import re
 from pathlib import Path
 
@@ -19,16 +21,23 @@ URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
 TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread_order",
             "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
-            "summary", "actions")
+            "summary", "actions", "send", "react", "polish")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s", "mark_done")
+SEND_KEYS = ("tool", "args", "timeout_s", "model", "precheck")
+PRECHECK_KEYS = ("argv", "timeout_s")
+SEND_ARG_KEYS = ("channel", "thread_ts", "text")
+REACT_KEYS = ("tool", "args", "emojis", "timeout_s", "model", "mark_done")
+REACT_ARG_KEYS = ("channel", "timestamp", "name")
+POLISH_KEYS = ("mcp_config", "tone_tool", "tone_args", "model", "timeout_s",
+               "max_budget_usd", "cache_h")
 ACTION_KEYS = ("key", "label", "argv", "timeout_s", "mark_done")
 CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquv")
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEP")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))
@@ -41,6 +50,17 @@ PARAM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 # No leading "-": a model name must never read as a command-line flag.
 MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]][A-Za-z0-9_.:\[\]-]{0,63}$")
 DEFAULT_RSVP_TIMEOUT_S = 60
+DEFAULT_SEND_TIMEOUT_S = 90
+DEFAULT_PRECHECK_TIMEOUT_S = 10
+DEFAULT_REACT_TIMEOUT_S = 60
+DEFAULT_REACT_EMOJIS = ("eyes", "white_check_mark", "+1", "pray")
+MAX_REACT_EMOJIS = 9          # the picker's quick keys are 1-9
+# A Slack emoji name as the react call may carry it (no colons, no skin tone).
+EMOJI_NAME = re.compile(r"\A[a-z0-9_+\-]{1,64}\Z")
+DEFAULT_POLISH_TIMEOUT_S = 120
+DEFAULT_POLISH_BUDGET_USD = 0.05
+DEFAULT_POLISH_CACHE_H = 24
+MAX_TONE_ARGS_CHARS = 4000
 DEFAULT_SAVE_TIMEOUT_S = 30
 DEFAULT_CONTEXT_TIMEOUT_S = 20
 DEFAULT_ACTION_TIMEOUT_S = 60
@@ -67,6 +87,9 @@ DEFAULTS = {
     "context": None,   # no default: the Context pane needs a command
     "summary": None,   # no default: the AI summary stays off until configured
     "actions": [],     # no default: no custom action until configured
+    "send": None,      # no default: replies and nudges are demo-only until set
+    "react": None,     # no default: no emoji reaction until configured
+    "polish": None,    # no default: no draft polishing until configured
 }
 
 
@@ -158,6 +181,9 @@ def validate(raw):
     out["context"] = _check_context(raw.get("context"), problems)
     out["summary"] = _check_summary(raw.get("summary"), problems)
     out["actions"] = _check_actions(raw.get("actions"), problems)
+    out["send"] = _check_send(raw.get("send"), problems)
+    out["react"] = _check_react(raw.get("react"), problems)
+    out["polish"] = _check_polish(raw.get("polish"), problems)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:
@@ -381,6 +407,184 @@ def _check_summary(raw, problems):
         return None
     return {"model": model, "timeout_s": float(timeout),
             "max_budget_usd": float(budget)}
+
+
+def _check_tool_args(raw, label, keys, problems):
+    """`{key: parameter name}` for a pinned connector call, or None. Every
+    one of `keys` is required; the names must differ and nothing else may
+    be there."""
+    if not isinstance(raw, dict):
+        problems.append(f"{label} must be a mapping of "
+                        f"{', '.join(keys)} to the tool's parameter names")
+        return None
+    start = len(problems)
+    names = {}
+    for key in raw:
+        if key not in keys:
+            problems.append(f"{label}: unknown key '{key}'")
+    for key in keys:
+        val = raw.get(key)
+        if not isinstance(val, str) or not PARAM_NAME.match(val):
+            problems.append(f"{label}.{key} must be a parameter name "
+                            "(letters, digits, _ . -)")
+        else:
+            names[key] = val
+    if len(set(names.values())) != len(names):
+        problems.append(f"{label} must name {len(keys)} different parameters")
+    return names if len(problems) == start else None
+
+
+def _check_send(raw, problems):
+    """The `send:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("send must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in SEND_KEYS:
+            problems.append(f"send: unknown key '{key}'")
+    tool = raw.get("tool")
+    if not isinstance(tool, str) or not TOOL_NAME.match(tool):
+        problems.append("send.tool must be a connector tool name "
+                        "(mcp__<server>__<tool>, letters, digits, _ . -)")
+    names = _check_tool_args(raw.get("args"), "send.args", SEND_ARG_KEYS,
+                             problems)
+    timeout = raw.get("timeout_s", DEFAULT_SEND_TIMEOUT_S)
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("send.timeout_s must be 30 to 300")
+    model = raw.get("model", "haiku")
+    if not isinstance(model, str) or not MODEL_NAME.match(model):
+        problems.append("send.model must be a model name (default haiku)")
+    precheck = _check_precheck(raw.get("precheck"), problems)
+    if len(problems) > start:
+        return None
+    return {"tool": tool, "args": names, "timeout_s": float(timeout),
+            "model": model, "precheck": precheck}
+
+
+def _check_precheck(raw, problems):
+    """The optional `send.precheck:` block as a clean dict, or None."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("send.precheck must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in PRECHECK_KEYS:
+            problems.append(f"send.precheck: unknown key '{key}'")
+    argv = raw.get("argv")
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(a, str) and a for a in argv)):
+        problems.append("send.precheck.argv must be a non-empty list of "
+                        "strings (no shell)")
+    timeout = raw.get("timeout_s", DEFAULT_PRECHECK_TIMEOUT_S)
+    if not _num(timeout) or not 1 <= timeout <= 30:
+        problems.append("send.precheck.timeout_s must be 1 to 30")
+    if len(problems) > start:
+        return None
+    return {"argv": list(argv), "timeout_s": float(timeout)}
+
+
+def _check_react(raw, problems):
+    """The `react:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("react must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in REACT_KEYS:
+            problems.append(f"react: unknown key '{key}'")
+    tool = raw.get("tool")
+    if not isinstance(tool, str) or not TOOL_NAME.match(tool):
+        problems.append("react.tool must be a connector tool name "
+                        "(mcp__<server>__<tool>, letters, digits, _ . -)")
+    names = _check_tool_args(raw.get("args"), "react.args", REACT_ARG_KEYS,
+                             problems)
+    emojis = raw.get("emojis", list(DEFAULT_REACT_EMOJIS))
+    if (not isinstance(emojis, list) or not 1 <= len(emojis) <= MAX_REACT_EMOJIS
+            or not all(isinstance(e, str) and EMOJI_NAME.match(e)
+                       for e in emojis)):
+        problems.append(
+            f"react.emojis must be a list of 1 to {MAX_REACT_EMOJIS} emoji "
+            "names (a-z, 0-9, _ + -, no colons, up to 64 characters)")
+    elif len(set(emojis)) != len(emojis):
+        problems.append("react.emojis has a name twice")
+    timeout = raw.get("timeout_s", DEFAULT_REACT_TIMEOUT_S)
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("react.timeout_s must be 30 to 300")
+    model = raw.get("model", "haiku")
+    if not isinstance(model, str) or not MODEL_NAME.match(model):
+        problems.append("react.model must be a model name (default haiku)")
+    mark_done = raw.get("mark_done", True)
+    if not isinstance(mark_done, bool):
+        problems.append("react.mark_done must be true or false")
+    if len(problems) > start:
+        return None
+    return {"tool": tool, "args": names, "emojis": list(emojis),
+            "timeout_s": float(timeout), "model": model,
+            "mark_done": mark_done}
+
+
+def _check_polish(raw, problems):
+    """The `polish:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("polish must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in POLISH_KEYS:
+            problems.append(f"polish: unknown key '{key}'")
+    path = raw.get("mcp_config")
+    if (not isinstance(path, str) or not path.strip() or "\0" in path
+            or not os.path.isabs(os.path.expanduser(path.strip()))):
+        problems.append("polish.mcp_config must be an absolute path to a "
+                        "JSON file of MCP servers (a leading ~ is fine)")
+        path = None
+    else:
+        path = os.path.expanduser(path.strip())
+    tool = raw.get("tone_tool")
+    if not isinstance(tool, str) or not TOOL_NAME.match(tool):
+        problems.append("polish.tone_tool must be a connector tool name "
+                        "(mcp__<server>__<tool>, letters, digits, _ . -)")
+    args = raw.get("tone_args", {})
+    try:
+        size = len(json.dumps(args, sort_keys=True)) \
+            if isinstance(args, dict) else None
+    except (TypeError, ValueError):
+        size = None
+    if (size is None or size > MAX_TONE_ARGS_CHARS
+            or not all(isinstance(k, str) and PARAM_NAME.match(k)
+                       for k in args)):
+        problems.append(
+            "polish.tone_args must be a mapping of parameter names to JSON "
+            f"values (up to {MAX_TONE_ARGS_CHARS} characters)")
+        args = {}
+    model = raw.get("model", "sonnet")
+    if not isinstance(model, str) or not MODEL_NAME.match(model):
+        problems.append("polish.model must be a model name (default sonnet)")
+    timeout = raw.get("timeout_s", DEFAULT_POLISH_TIMEOUT_S)
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("polish.timeout_s must be 30 to 300")
+    budget = raw.get("max_budget_usd", DEFAULT_POLISH_BUDGET_USD)
+    if not _num(budget) or not 0.005 <= budget <= 2:
+        problems.append("polish.max_budget_usd must be a number from "
+                        "0.005 to 2")
+    cache_h = raw.get("cache_h", DEFAULT_POLISH_CACHE_H)
+    if not _num(cache_h) or not 0 <= cache_h <= 720:
+        problems.append("polish.cache_h must be a number from 0 (no cache) "
+                        "to 720")
+    if len(problems) > start:
+        return None
+    return {"mcp_config": path, "tone_tool": tool, "tone_args": dict(args),
+            "model": model, "timeout_s": float(timeout),
+            "max_budget_usd": float(budget), "cache_h": float(cache_h)}
 
 
 def _check_actions(raw, problems):
