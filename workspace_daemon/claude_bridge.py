@@ -24,6 +24,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -425,9 +426,51 @@ NO_TOOLS_NOTE = (
 )
 
 
+def check_mcp_config(path):
+    """The MCP config file `path`, checked: an absolute path to an existing
+    regular file that you own and that nobody else can read or write (no
+    group or other bits). Opened with O_NOFOLLOW (never through a symlink)
+    and judged on the open descriptor, so what is checked is the file that
+    exists at that moment. Returns the path as a string; raises BridgeError
+    (a message with no file content) otherwise."""
+    if not isinstance(path, (str, os.PathLike)) or not str(path):
+        raise BridgeError("mcp_config must be a path")
+    path = os.fspath(path)
+    if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+        raise BridgeError("mcp_config must be an absolute path")
+    try:
+        # O_NONBLOCK: opening a FIFO must not wait for a writer; the type is
+        # judged below, and a regular file is unaffected.
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_CLOEXEC", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise BridgeError(
+            f"cannot open the mcp_config file: {exc.strerror or 'error'}"
+        ) from None
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        raise BridgeError(
+            f"cannot read the mcp_config file: {exc.strerror or 'error'}"
+        ) from None
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise BridgeError("the mcp_config file is not a regular file")
+    if info.st_uid != os.getuid():
+        raise BridgeError("the mcp_config file is not owned by you")
+    if info.st_mode & 0o077:
+        raise BridgeError(
+            "the mcp_config file is accessible to others; chmod 600 it")
+    return path
+
+
 def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
-                   disallowed):
+                   disallowed, mcp_config=None):
     no_tools = [] if allowed else ["--append-system-prompt", NO_TOOLS_NOTE]
+    servers = ([] if mcp_config is None
+               else ["--mcp-config", str(mcp_config), "--strict-mcp-config"])
     return [
         claude_bin(), "-p",
         "--model", model,
@@ -443,7 +486,7 @@ def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
         "--max-turns", str(max_turns),
         "--max-budget-usd", str(max_budget_usd),
         "--allowedTools", ",".join(allowed),
-    ] + no_tools
+    ] + no_tools + servers
 
 
 def _spawn(cmd, prompt, cwd, timeout, connect_delay):
@@ -606,7 +649,7 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
              timeout, attempt, disallowed, connect_delay, required=None,
-             accept_partial=False, exact_args=False):
+             accept_partial=False, exact_args=False, mcp_config=None):
     """One claude run. Returns (results, final result event, partial).
 
     Raises BridgeError. partial is True only when accept_partial let a
@@ -614,6 +657,8 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     """
     # Refused before any run dir or process exists; nothing is logged.
     _check_guards(base_dir)
+    if mcp_config is not None:
+        mcp_config = check_mcp_config(mcp_config)
     started = time.monotonic()
     span = sleepclock.Span()
     result_event = None
@@ -635,7 +680,8 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         }]}}))
         allowed = ([SEARCH_TOOL] + sorted(tools)) if tools else []
         cmd = _build_command(
-            model, settings, allowed, max_turns, max_budget_usd, disallowed
+            model, settings, allowed, max_turns, max_budget_usd, disallowed,
+            mcp_config,
         )
         returncode, stdout = _spawn(cmd, prompt, run_dir, timeout, connect_delay)
         events, parsed_ok = _parse_stream(stdout)
@@ -757,7 +803,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
                connect_delay=CONNECT_DELAY_SECONDS, required=None,
-               accept_partial=False, exact_args=False):
+               accept_partial=False, exact_args=False, mcp_config=None):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -780,6 +826,14 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     deny extras). Default False: extra arguments are allowed, as every
     existing caller relies on. Use it for writes.
 
+    mcp_config: None (default: the argv is unchanged and the run sees the
+    connectors of the user's own Claude setup). Otherwise an absolute path to
+    an existing regular file you own with no group or other access (checked
+    through O_NOFOLLOW and fstat, see check_mcp_config), passed as
+    `--mcp-config <path> --strict-mcp-config`: only the servers in that file
+    are loaded. The allowlist hook and the stream re-check still restrict the
+    run to the pinned tools. A bad file raises BridgeError before any run.
+
     Hook-denied calls (e.g. Read) never produce results and do not fail the
     run; only a count is recorded in the usage log.
 
@@ -791,6 +845,8 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
         raise BridgeError("call_tools needs at least one tool")
     if dry_run:
         raise BridgeDryRun("dry-run: claude bridge not invoked")
+    if mcp_config is not None:
+        mcp_config = check_mcp_config(mcp_config)
     needed = list(tools) if required is None else list(required)
     unknown = [name for name in needed if name not in tools]
     if unknown:
@@ -806,6 +862,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
             connect_delay=connect_delay, required=needed,
             accept_partial=accept_partial, exact_args=exact_args,
+            mcp_config=mcp_config,
         )
         if all(any(r["name"] == name and not r["is_error"] for r in results)
                for name in needed):

@@ -640,6 +640,146 @@ class CallToolsTest(BridgeBase):
         self.assertFalse((self.base / "state").exists())
 
 
+class McpConfigTest(BridgeBase):
+    """`call_tools(..., mcp_config=<file>)`: the argv, the file checks and the
+    unchanged default."""
+
+    def call(self, tools=None, **kw):
+        kw.setdefault("base_dir", self.base)
+        kw.setdefault("connect_delay", 0)
+        return claude_bridge.call_tools(
+            SECRET_PROMPT, tools if tools is not None else {TOOL_A: {}}, **kw
+        )
+
+    def make(self, mode=0o600, name="mcp.json"):
+        path = self.root / name
+        path.write_text('{"mcpServers": {}}')
+        os.chmod(path, mode)
+        return path
+
+    def test_the_default_leaves_the_argv_unchanged(self):
+        self.stream(good_stream())
+        self.call()
+        argv = self.argv()
+        self.assertNotIn("--mcp-config", argv)
+        self.assertNotIn("--strict-mcp-config", argv)
+        # the same list the builder produced before the option existed
+        built = claude_bridge._build_command(
+            "haiku", "s.json", ["ToolSearch", TOOL_A], 6, 0.25,
+            claude_bridge.DEFAULT_DISALLOWED_TOOLS)
+        self.assertEqual(built, claude_bridge._build_command(
+            "haiku", "s.json", ["ToolSearch", TOOL_A], 6, 0.25,
+            claude_bridge.DEFAULT_DISALLOWED_TOOLS, None))
+        self.assertEqual(built[-2:], ["--allowedTools", f"ToolSearch,{TOOL_A}"])
+        self.assertNotIn("--strict-mcp-config", built)
+
+    def test_a_file_adds_the_two_flags_and_keeps_the_restrictions(self):
+        path = self.make()
+        self.stream(good_stream())
+        out = self.call(mcp_config=str(path))
+        self.assertEqual(out[0]["name"], TOOL_A)
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--mcp-config") + 1], str(path))
+        self.assertEqual(argv.count("--strict-mcp-config"), 1)
+        self.assertEqual(argv.index("--strict-mcp-config"),
+                         argv.index("--mcp-config") + 2)
+        self.assertEqual(argv[argv.index("--allowedTools") + 1],
+                         f"ToolSearch,{TOOL_A}")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertIn("Bash", argv[argv.index("--disallowedTools") + 1].split(","))
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        settings_doc = json.loads((self.stub_dir / "settings-1.json").read_text())
+        self.assertIn("claude_bridge_hook.py",
+                      settings_doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+
+    def test_the_stream_recheck_still_limits_the_run_to_the_pinned_tool(self):
+        path = self.make()
+        self.stream(good_stream(extra=tool_use(
+            "t9", "mcp__other_server__do_thing", {"x": 1})))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(mcp_config=str(path))
+        self.assertIn("outside allowlist", str(ctx.exception))
+
+    def test_the_path_is_not_in_errors_or_the_prompt(self):
+        path = self.make()
+        self.stream(good_stream())
+        self.call(mcp_config=str(path))
+        stdin = (self.stub_dir / "stdin-1.txt").read_text()
+        self.assertNotIn(str(path), stdin)
+
+    def refuses(self, path, fragment):
+        before = self.invocations()
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(mcp_config=path)
+        self.assertIn(fragment, str(ctx.exception))
+        self.assertEqual(self.invocations(), before)       # nothing was spawned
+        self.assertFalse((self.base / "state").exists())    # and nothing logged
+
+    def test_relative_and_odd_paths_are_refused(self):
+        self.make()
+        for bad in ("mcp.json", "./mcp.json", "", "~/mcp.json"):
+            self.refuses(bad, "mcp_config")
+        for bad in (5, None.__class__, ["a"]):
+            self.refuses(bad, "mcp_config")
+
+    def test_a_missing_file_a_directory_and_a_fifo_are_refused(self):
+        self.refuses(str(self.root / "missing.json"), "cannot open")
+        self.refuses(str(self.root), "not a regular file")
+        fifo = self.root / "fifo.json"
+        os.mkfifo(fifo, 0o600)
+        self.refuses(str(fifo), "not a regular file")
+
+    def test_a_symlink_is_refused_even_to_a_good_file(self):
+        target = self.make()
+        link = self.root / "link.json"
+        link.symlink_to(target)
+        self.refuses(str(link), "cannot open")
+
+    def test_a_file_anyone_else_can_reach_is_refused(self):
+        for mode in (0o644, 0o640, 0o660, 0o604, 0o606, 0o666, 0o610):
+            path = self.make(mode, name=f"m{mode:o}.json")
+            self.refuses(str(path), "accessible to others")
+        for mode in (0o600, 0o400):
+            path = self.make(mode, name=f"ok{mode:o}.json")
+            self.assertEqual(claude_bridge.check_mcp_config(path), str(path))
+
+    def test_a_file_of_another_owner_is_refused(self):
+        path = self.make()
+        with mock.patch.object(claude_bridge.os, "getuid",
+                               return_value=os.getuid() + 1):
+            self.refuses(str(path), "not owned by you")
+
+    def test_the_check_judges_the_open_file(self):
+        path = self.make()
+        real_fstat = os.fstat
+        seen = []
+
+        def spy(fd):
+            seen.append(fd)
+            return real_fstat(fd)
+        with mock.patch.object(claude_bridge.os, "fstat", spy):
+            claude_bridge.check_mcp_config(str(path))
+        self.assertEqual(len(seen), 1)
+
+    def test_dry_run_and_empty_tools_still_refuse_first(self):
+        path = self.make()
+        with self.assertRaises(claude_bridge.BridgeDryRun):
+            self.call(mcp_config=str(path), dry_run=True)
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.call_tools("p", {}, base_dir=self.base,
+                                     mcp_config=str(path))
+        self.assertEqual(self.invocations(), 0)
+
+    def test_the_file_is_rechecked_on_every_attempt(self):
+        path = self.make()
+        self.stream(init() + result())
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(mcp_config=str(path), attempts=2)       # no tool result
+        self.assertEqual(self.invocations(), 2)
+        for argv_n in (1, 2):
+            self.assertIn("--mcp-config", self.argv(argv_n))
+
+
 class CompleteTest(BridgeBase):
     def test_returns_result_text_with_no_allowed_tools(self):
         self.stream(init() + result(text="the summary"))
