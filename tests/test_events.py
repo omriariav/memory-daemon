@@ -91,6 +91,42 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(event["details"]["gmail_labels"],
                          ["a", "b label", "x" * 100])
 
+    def test_mail_display_details_are_kept_cleaned_and_capped(self):
+        event = make(details={
+            "mail_from": "Ann  Example <ann@example.com>",
+            "mail_subject": "Plan\nfor  May " + "x" * 300,
+            "mail_snippet": "Short\tsnippet " + "y" * 400,
+            "mail_thread_id": "18c0ffee12345678"})
+        d = event["details"]
+        self.assertEqual(d["mail_from"], "Ann Example")
+        self.assertNotIn("\n", d["mail_subject"])
+        self.assertEqual((len(d["mail_subject"]), len(d["mail_snippet"])),
+                         (200, 300))
+        self.assertTrue(d["mail_snippet"].startswith("Short snippet yyy"))
+        self.assertEqual(d["mail_thread_id"], "18c0ffee12345678")
+
+    def test_mail_from_is_a_display_name_never_an_address(self):
+        for raw, want in (("Ann Example <ann@example.com>", "Ann Example"),
+                          ('"Ann, Example" <ann@example.com>', "Ann, Example"),
+                          ("x" * 120, "x" * 80)):
+            self.assertEqual(
+                make(details={"mail_from": raw})["details"]["mail_from"], want)
+        for bad in ("annexample.com\uff20", "Ann \uff20 Example", "x\ufe6by",
+                    "ann@example.com", "<ann@example.com>", "Ann ann@example.com",
+                    "", "  ", 5, None, ["a"]):
+            self.assertNotIn("details", make(details={"mail_from": bad}), bad)
+
+    def test_a_fullwidth_at_inside_angle_brackets_is_stripped(self):
+        self.assertEqual(make(details={"mail_from": "Ann <ann\uff20example.com>"})
+                         ["details"]["mail_from"], "Ann")
+
+    def test_bad_mail_fields_are_dropped(self):
+        for bad in ({"mail_subject": ""}, {"mail_subject": 4},
+                    {"mail_snippet": "\x00\x01"}, {"mail_thread_id": "a b"},
+                    {"mail_thread_id": "x" * 101}, {"mail_thread_id": 7},
+                    {"mail_thread_id": "bad\n"}):
+            self.assertNotIn("details", make(details=bad), bad)
+
     def test_null_memory_id_is_kept(self):
         self.assertIsNone(make(memory_id=None)["memory_id"])
 

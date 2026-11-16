@@ -59,6 +59,92 @@ class EventsMappingTest(unittest.TestCase):
         self.assertEqual(itm.validate_item(item), [])
         self.assertTrue(item["link"].startswith("https://mail.google.com/"))
 
+    def test_a_well_formed_memory_id_is_copied_into_meta(self):
+        write_events(self.base, [ev("gmail:18c0ffee12345678", "new", "Mail",
+                                    memory_id="2030-01-08-invoice-3f9a")])
+        (item,) = self.load().items
+        self.assertEqual(item["meta"]["memory_id"], "2030-01-08-invoice-3f9a")
+
+    def test_a_missing_or_malformed_memory_id_is_left_out(self):
+        bad = ["", "-leading-dash", "UPPER", "has space", "a/b", "x" * 202,
+               "ok\n", 5, ["a"]]
+        rows = [ev("gmail:18c0ffee1234567a", "new", "None")]
+        for n, mid in enumerate(bad):
+            row = ev(f"gmail:18c0ffee1234567{n}", "new", f"Bad {n}")
+            row["memory_id"] = mid
+            rows.append(row)
+        write_events(self.base, rows)
+        items = self.load().items
+        self.assertEqual(len(items), len(bad) + 1)
+        for item in items:
+            self.assertNotIn("memory_id", item["meta"])
+        edge = ev("gmail:18c0ffee12345670", "new", "Long", memory_id="a" * 201)
+        write_events(self.base, [edge])
+        got = {i["gist"]: i for i in self.load().items}
+        self.assertEqual(got["Long"]["meta"]["memory_id"], "a" * 201)
+
+    def mail_event(self, details, source_id="gmail:18c0ffee12345678", **kw):
+        return ev(source_id, "new", "Memory title", ["Bo Sample"],
+                  details=details, **kw)
+
+    def test_mail_event_shows_sender_subject_snippet_and_thread_link(self):
+        write_events(self.base, [self.mail_event({
+            "mail_from": "Ann Example", "mail_subject": "Plan for May",
+            "mail_snippet": "Can we move the review?",
+            "mail_thread_id": "18c0ffee12345679"}, memory_id="2030-01-08-plan")])
+        (item,) = self.load(gmail_account=2).items
+        self.assertEqual((item["sender"], item["where"]),
+                         ("Ann Example", "Plan for May"))
+        self.assertEqual(item["gist"], "Memory title")      # unchanged
+        self.assertEqual([(m["who"], m["text"]) for m in item["thread"]],
+                         [("Ann Example", "Can we move the review?")])
+        self.assertEqual(item["thread"][0]["ts"], item["ts"])
+        self.assertEqual(item["link"],
+                         "https://mail.google.com/mail/u/2/#all/18c0ffee12345679")
+        self.assertEqual(item["actions"], ["open"])
+        self.assertEqual(item["meta"]["memory_id"], "2030-01-08-plan")
+        self.assertEqual(itm.validate_item(item), [])
+
+    def test_mail_event_without_the_new_fields_looks_as_before(self):
+        write_events(self.base, [self.mail_event(None)])
+        (item,) = self.load().items
+        self.assertEqual((item["sender"], item["where"], item["thread"]),
+                         ("Bo Sample", "mail", []))
+        self.assertTrue(item["link"].endswith("/#all/18c0ffee12345678"))
+
+    def test_mail_fields_are_partial_capped_and_never_an_address(self):
+        write_events(self.base, [self.mail_event({"mail_subject": "Only this"},
+                                                 "gmail:abcdef0123456789")])
+        (item,) = self.load().items
+        self.assertEqual((item["sender"], item["where"], item["thread"]),
+                         ("Bo Sample", "Only this", []))
+        # An old or hand-written event: the reader enforces the same rules.
+        bad = self.mail_event({
+            "mail_from": "Ann <ann@example.com>", "mail_subject": "s" * 300,
+            "mail_snippet": "t" * 500}, "gmail:abcdef0123456780")
+        bad["details"]["mail_from"] = "Ann <ann@example.com>"
+        addr = self.mail_event({"mail_from": "x"}, "gmail:abcdef0123456781")
+        addr["details"]["mail_from"] = "ann\uff20example.com"
+        write_events(self.base, [bad, addr])
+        got = {i["id"]: i for i in self.load().items}
+        shown = [i for i in got.values() if i["where"] != "Only this"]
+        self.assertEqual(len(shown), 2)
+        for i in shown:
+            self.assertNotIn("@", i["sender"])
+        capped = next(i for i in shown if i["thread"])
+        self.assertEqual(capped["sender"], "Ann")
+        self.assertEqual(len(capped["where"]), 200)
+        self.assertEqual(len(capped["thread"][0]["text"]), 300)
+        fallback = next(i for i in shown if not i["thread"])
+        self.assertEqual(fallback["sender"], "Bo Sample")
+
+    def test_a_mail_thread_id_gives_a_link_when_the_source_id_has_none(self):
+        write_events(self.base, [self.mail_event(
+            {"mail_thread_id": "18c0ffee12345678"}, "gmail:not-a-thread")])
+        (item,) = self.load().items
+        self.assertTrue(item["link"].endswith("/#all/18c0ffee12345678"))
+        self.assertEqual(item["actions"], ["open"])
+
     def test_gmail_followup_id_uses_the_thread_segment(self):
         write_events(self.base, [ev("gmail:abcdef0123456789:followup-open",
                                     "new", "Follow up")])

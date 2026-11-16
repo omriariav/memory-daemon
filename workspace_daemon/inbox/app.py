@@ -1,6 +1,7 @@
 """The inbox TUI app. Needs Textual; import it only through `cli.run`."""
 import asyncio
 import inspect
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,13 +18,17 @@ from textual.widgets import Input, Static, TextArea
 
 from . import bidi, customactions, invites, themes
 from . import context as ctxmod
+from . import items as itm_items
+from . import polish as polishmod
+from . import writes as writes_mod
 from . import summary as summod
 from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
-                      ConfirmWrite, HelpScreen, SavedScreen, SnoozePicker)
+                      ConfirmWrite, HelpScreen, PolishScreen, SavedScreen,
+                      SnoozePicker)
 from .sources import SourceResult, merge
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HintBar, Queue,
@@ -34,6 +39,9 @@ RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
 SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
 CONTEXT_OFF = "Context not configured (set context: in inbox.yaml)"
 SUMMARY_OFF = "Summary not configured (set summary: in inbox.yaml)"
+REACT_OFF = "React not configured (set react: in inbox.yaml)"
+POLISH_OFF = "Polish not configured (set polish: in inbox.yaml)"
+SEND_KINDS = ("send", "nudge")
 CONTEXT_DEBOUNCE_S = 0.4      # a new selection waits this long before fetching
 CONTEXT_MAX_FETCHES = 2       # context commands running at once
 NOT_CONFIRMED = "RSVP not confirmed by calendar"
@@ -45,7 +53,7 @@ RSVP_KEYS = {
 }
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
-EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save", "action")
+EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save", "action", "react")
 
 
 class _SavedUnit:
@@ -68,7 +76,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | done | ack | snooze | rsvp | save | action
+    kind: str                 # send | nudge | done | ack | snooze | rsvp | save | action | react
     item: Item
     text: str = ""
     until: float = 0.0
@@ -80,7 +88,7 @@ class Pending:
     force: bool = False       # save: "save anyway" after a duplicate answer
     hide: bool = True         # False: the item stays listed while it waits (save)
     name: str = ""            # action: the label of the actions: entry
-    choice: str = ""          # action: the id of the chosen choice
+    choice: str = ""          # action: the id of the chosen choice; react: the emoji name
     state: str = ""           # action: the opaque state prepare returned
     mark_done: bool = False   # action: a successful run marks the item done
 
@@ -107,6 +115,7 @@ class InboxApp(App):
         Binding("R", "toggle_resolved", show=False),
         Binding("X", "rsvp_decline", show=False), Binding("T", "rsvp_tentative", show=False),
         Binding("m", "save_memory", show=False),
+        Binding("E", "react", show=False), Binding("P", "polish", show=False),
         Binding("c", "context", show=False), Binding("C", "context_refresh", show=False),
         Binding("i", "summary(False)", show=False), Binding("I", "summary(True)", show=False),
         Binding("A", "toggle_all", show=False), Binding("S", "saved", show=False),
@@ -145,12 +154,19 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen, ActionBusy, ChoicePicker { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen, ActionBusy, ChoicePicker, PolishScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
+    #confirm-warn { margin: 1 0 0 0; }
     #confirm-scroll { height: auto; max-height: 16; margin: 1 0; border: round $panel; background: $background; scrollbar-size-vertical: 1; }
     #confirm-text { border: none; padding: 0 1; margin: 0; background: $background; height: auto; }
-    ConfirmSend #confirm-text { border: round $panel; margin: 1 0; }
+    #polish { width: 80; max-width: 96%; height: auto; max-height: 96%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #polish-title { text-style: bold; margin-bottom: 1; }
+    #polish-old-scroll, #polish-new-scroll { height: auto; max-height: 8; border: round $panel; background: $background; scrollbar-size-vertical: 1; }
+    #polish-old, #polish-new { padding: 0 1; height: auto; background: $background; }
+    #polish-note { margin: 1 0; }
+    #polish-buttons { height: 3; align-horizontal: right; }
+    #polish-buttons Button { margin-left: 2; min-width: 16; }
     #confirm-buttons { height: 3; align-horizontal: right; }
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
@@ -259,6 +275,13 @@ class InboxApp(App):
         self._act_op = None                # the running choices/prepare lookup
         self._act_gen = 0                  # bumped on every lookup
         self._act_screen = None            # the "looking up" modal
+        self._polish_op = None             # the polish the user is waiting for
+        self._polish_gen = 0               # bumped on every polish
+        self._polish_screen = None         # its "polishing" modal
+        self._polish_running = False       # a polish thread is still alive
+        self._pre_op = None                # the send precheck being waited for
+        self._pre_gen = 0                  # bumped on every precheck
+        self._pre_screen = None            # its "checking" modal
         for n, cfg in enumerate(self._custom):
             self.bind(cfg["key"], f"custom_action({n})", show=False)
 
@@ -501,6 +524,10 @@ class InboxApp(App):
             extra.append(("i", "summary"))
         if self.current is not None:
             extra.append(("v", "order"))
+            if self._react_on(self.current):
+                extra.append(("E", "react"))
+            if self._polish_on(self.current):
+                extra.append(("P", "polish"))
             extra.extend((c["key"], c["label"][:16]) for c in self._custom)
         if extra and hints and hints[-1] == ("?", "help"):
             return hints[:-1] + extra + hints[-1:]
@@ -544,6 +571,17 @@ class InboxApp(App):
         """True for a pending invite when RSVP is configured: a/X/T answer it."""
         return (bool(getattr(self.actions, "rsvp_configured", False))
                 and invites.rsvp_target(it) is not None)
+
+    def _react_on(self, it):
+        """True when `react:` is configured and the item has a message to
+        react to."""
+        return (bool(getattr(self.actions, "react_configured", False))
+                and self.actions.react_plan(it) is not None)
+
+    def _polish_on(self, it):
+        """True when `polish:` is configured and the item has a draft."""
+        return (bool(getattr(self.actions, "polish_configured", False))
+                and bool(it.draft and it.draft.strip()))
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -732,8 +770,12 @@ class InboxApp(App):
         if not self.actions.supports_send:
             self.notify(NOT_YET, timeout=3, markup=False)
             return
+        self._open_editor(it.draft)
+
+    def _open_editor(self, text):
+        """Open the draft editor on `text` (the current item's draft)."""
         ta = self.query_one("#draft-edit", TextArea)
-        ta.text = it.draft
+        ta.text = text
         ta.read_only = False
         ta.add_class("on")
         self.query_one("#draft-scroll").display = False
@@ -745,9 +787,12 @@ class InboxApp(App):
     def end_edit(self, save):
         it = self.current
         ta = self.query_one("#draft-edit", TextArea)
-        if save and it is not None and ta.text != it.draft:
-            it.draft, it.streamed = ta.text, True
-            self.record("edit", it, f"{len(ta.text)} chars", "saved")
+        # Editor text is cleaned the way drafts are (controls and bidi
+        # overrides removed), so what is shown is what can be sent.
+        text = itm_items.clean_text(ta.text)
+        if save and it is not None and text != it.draft:
+            it.draft, it.streamed = text, True
+            self.record("edit", it, f"{len(text)} chars", "saved")
         ta.read_only = True
         ta.remove_class("on")
         self.query_one("#draft-scroll").display = True
@@ -833,6 +878,8 @@ class InboxApp(App):
             return a.save(it, force=True) if p.force else a.save(it)
         if p.kind == "action":
             return a.run_action(p.name, it, p.choice, p.state)
+        if p.kind == "react":
+            return a.react(it, p.choice)
         return a.snooze(it, p.until)
 
     def _run_in_thread(self, p):
@@ -841,14 +888,32 @@ class InboxApp(App):
         except Exception as exc:  # a failing store must not kill the app
             res = Result(False, f"{type(exc).__name__}: {exc}")
         if self._quitting:
-            return  # the app is gone; the mark (if any) is already written
-        if p.kind == "action":
-            # An action may run for a long time: never wait on the UI loop.
+            # The app is gone; the mark (if any) is already written. A Slack
+            # write that was still running says how it ended.
+            self._late_report(p, res)
+            return
+        if p.kind in ("action", "send", "nudge", "react"):
+            # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
             return
         try:
             self.call_from_thread(self._committed, p, res)
         except Exception:  # the app quit between the check and the call
+            pass
+
+    def _late_report(self, p, res):
+        """A send, nudge or reaction that finished after the app began to
+        quit: close its audit row and print one line to stderr."""
+        if p.kind not in SEND_KINDS and p.kind != "react":
+            return
+        p.audit["status"] = "committed" if res.ok else "failed"
+        p.audit["detail"] = (p.audit["detail"] + " · " + (res.detail or "done")
+                             ).strip(" ·")
+        try:
+            print(f"inbox: {p.label}: "
+                  f"{'done' if res.ok else 'failed'}"
+                  f"{': ' + res.detail if res.detail else ''}", file=sys.stderr)
+        except (OSError, ValueError):
             pass
 
     def _committed(self, p, res):
@@ -870,7 +935,8 @@ class InboxApp(App):
         elif not res.ok:
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
-            self.notify(f"{p.name or p.kind} failed: {res.detail}", severity="error", timeout=6, markup=False)
+            self.notify(f"{p.name or p.kind} failed: {res.detail}", severity="error",
+                        timeout=10 if p.kind in SEND_KINDS else 6, markup=False)
         elif p.kind == "rsvp":
             self.refilter()
             self.notify(f"{res.detail}: {p.item.gist}", title="RSVP sent", timeout=5, markup=False)
@@ -888,7 +954,19 @@ class InboxApp(App):
                         timeout=5, markup=False)
             if p.mark_done:
                 self._auto_done(p.item, f"after {p.name}")
-        elif p.kind in ("send", "nudge"):
+        elif p.kind == "react":
+            self.refilter(redraw=False)
+            self.redraw()
+            self.notify(f"{res.detail}: {p.item.who}", title="Reaction sent",
+                        timeout=5, markup=False)
+            if p.mark_done:
+                self._auto_done(p.item, "after react")
+        elif p.kind in SEND_KINDS and self._real_send():
+            self.refilter(redraw=False)
+            self.redraw()
+            self.notify(f"{p.label}\n{res.detail}", title="Sent to Slack",
+                        timeout=6, markup=False)
+        elif p.kind in SEND_KINDS:
             self.notify(f"{res.detail or 'would send'}  ->  {p.item.destination}",
                         title="Demo", timeout=4, markup=False)
 
@@ -959,19 +1037,282 @@ class InboxApp(App):
             return
         self._confirm_send("nudge", it, "Send nudge")
 
+    def _real_send(self):
+        """True when sends go to Slack (`send:` is configured), False in the
+        demo, where they are only pretended."""
+        return bool(getattr(self.actions, "send_configured", False))
+
+    def _send_busy(self):
+        """A send or nudge is waiting out its undo window or running."""
+        return (any(p.kind in SEND_KINDS and not p.done for p in self.pending)
+                or any(p.kind in SEND_KINDS for p in self.running))
+
     def _confirm_send(self, kind, it, verb):
+        if self.editing:
+            self.end_edit(save=True)      # send what the draft pane holds
         text = it.draft
         if not text.strip():
             self.notify("No draft to send. Press e to write one.", timeout=3, severity="warning", markup=False)
             return
+        dest, note, route = it.destination, "", ""
+        if self._real_send():
+            if self._send_busy():
+                self.notify("A send is already in progress; wait for it "
+                            "(only one send runs at a time).", timeout=4,
+                            severity="warning", markup=False)
+                return
+            plan = self.actions.send_plan(it, text)
+            if not plan.ok:
+                self.record(kind, it, plan.error, "refused")
+                self.notify(plan.error, timeout=6, severity="warning", markup=False)
+                return
+            text, dest, route = plan.text, plan.destination, plan.route
 
+        if self._real_send() and getattr(self.actions, "precheck_configured", False):
+            self._precheck_begin(kind, it, verb, text, dest, note, route)
+            return
+        self._open_confirm_send(kind, it, verb, text, dest, note, "", route)
+
+    def _open_confirm_send(self, kind, it, verb, text, dest, note, warn="",
+                           route=""):
         def after(ok):
             if ok:
-                self._enqueue(kind, it, f"{verb}: {it.destination}", text=text, detail=text[:60])
+                self._enqueue(kind, it, f"{verb}: {dest}", text=text,
+                              detail=f"{dest}: {text[:60]}")
             else:
                 self.record(kind, it, "cancelled at confirm", "cancelled")
                 self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
-        self.push_screen(ConfirmSend(verb, it.destination, text, self.bidi), after)
+        self.push_screen(ConfirmSend(verb, dest, text, self.bidi, note, warn,
+                                     route), after)
+
+    # ---------- the optional send precheck (read-only advice) ----------
+    def _precheck_begin(self, kind, it, verb, text, dest, note, route=""):
+        """Run `send.precheck` in a thread (modal "checking", esc cancels the
+        whole send), then open the confirm modal with its warning."""
+        self._pre_gen += 1
+        gen = self._pre_gen
+        cancel = threading.Event()
+        self._pre_op = {"gen": gen, "cancel": cancel}
+        self._pre_screen = ActionBusy(
+            verb, "Checking for a newer reply…",
+            lambda: self._precheck_cancel(gen, kind, it))
+        self.push_screen(self._pre_screen)
+        self.busy += 1
+        # Not a daemon thread: the command is stopped (SIGTERM, then SIGKILL)
+        # when the check is cancelled or the app quits, so it ends.
+        threading.Thread(
+            target=self._precheck_thread,
+            args=(kind, it, verb, text, dest, note, route, it.draft, gen,
+                  cancel),
+            name="inbox-precheck").start()
+
+    def _precheck_cancel(self, gen, kind, it):
+        op = self._pre_op
+        if op is not None and op["gen"] == gen:
+            op["cancel"].set()
+            self._pre_op = None
+            self._pre_screen = None
+            self.record(kind, it, "cancelled at precheck", "cancelled")
+            self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+
+    def _precheck_thread(self, kind, it, verb, text, dest, note, route, draft,
+                         gen, cancel):
+        try:
+            out = self.actions.send_precheck(it, text, cancel=cancel)
+        except Exception:  # a backend bug must not end the session
+            out = writes_mod.Precheck(failed=True)
+        if self._quitting:
+            return
+        self._post(self._precheck_done, kind, it, verb, text, dest, note,
+                   route, draft, gen, out)
+
+    def _precheck_done(self, kind, it, verb, text, dest, note, route, draft,
+                       gen, out):
+        """UI thread: the check finished (a failed one never blocks the
+        send). A cancelled one is dropped."""
+        self.busy = max(0, self.busy - 1)
+        if self._pre_op is None or self._pre_op["gen"] != gen:
+            return
+        self._pre_op = None
+        screen, self._pre_screen = self._pre_screen, None
+        if screen is not None and self.screen is screen:
+            self.pop_screen()
+        live = self._live_item(it.key)
+        if live is None or live is not self.current or live.draft != draft:
+            self.record(kind, it, "draft or selection changed", "discarded")
+            self.notify("The draft or the selection changed while checking; "
+                        "nothing was sent.", severity="warning", timeout=5,
+                        markup=False)
+            return
+        if self._send_busy():
+            self.notify("A send is already in progress; wait for it.",
+                        timeout=4, severity="warning", markup=False)
+            return
+        warn = out.warn or (writes_mod.PRECHECK_FAILED if out.failed else "")
+        if warn:
+            self.record(kind, it, f"precheck: {warn}",
+                        "check failed" if out.failed and not out.warn else "warned")
+        self._open_confirm_send(kind, it, verb, text, dest, note, warn, route)
+
+    # ---------- react and polish (0.6.0, opt-in) ----------
+    def action_react(self):
+        """E: pick an emoji, confirm, wait out the undo window, then add the
+        reaction to the item's message through the configured tool."""
+        it = self.current
+        if it is None:
+            return
+        if not getattr(self.actions, "react_configured", False):
+            self.notify(REACT_OFF, timeout=3, severity="warning", markup=False)
+            return
+        target = self.actions.react_plan(it)
+        if target is None:
+            self.notify("This item has no message to react to "
+                        "(meta.reply_to.message_ts or thread_ts)", timeout=4,
+                        severity="warning", markup=False)
+            return
+        if any(p.kind == "react" and p.item.key == it.key and not p.done
+               for p in self.pending) or any(
+                p.kind == "react" and p.item.key == it.key for p in self.running):
+            self.notify("react already in progress", timeout=2, markup=False)
+            return
+        emojis, suggested = self.actions.react_choices(it)
+        choices = [{"id": e, "label": f":{e}:",
+                    "detail": "suggested" if e == suggested else ""}
+                   for e in emojis]
+
+        def picked(chosen):
+            if chosen is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+                return
+            self._confirm_react(it, chosen["id"], target)
+        self.push_screen(ChoicePicker("React to message", choices, self.bidi,
+                                      selected=suggested), picked)
+
+    def _confirm_react(self, it, emoji, target):
+        rows = [("Where", it.where), ("From", it.who),
+                ("Message", it.gist), ("Time stamp", target[1]),
+                ("Reaction", f":{emoji}:")]
+
+        def after(ok):
+            if ok:
+                self._enqueue("react", it, f"React :{emoji}: {it.who}",
+                              hide=False, detail=f":{emoji}:", name="React",
+                              choice=emoji,
+                              mark_done=bool(self.actions.react_mark_done))
+            else:
+                self.record("react", it, "cancelled at confirm", "cancelled")
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+        self.push_screen(ConfirmWrite(
+            "React to message", rows, "React",
+            "Adds the reaction as you. Nothing else is posted.",
+            self.bidi), after)
+
+    def action_polish(self):
+        """P: rewrite the draft in your tone (tone guidance from the
+        configured tool, then a no-tools rewrite). Shows old and new text:
+        accept, edit or cancel. Never sends anything."""
+        it = self.current
+        if it is None:
+            return
+        if not getattr(self.actions, "polish_configured", False):
+            self.notify(POLISH_OFF, timeout=3, severity="warning", markup=False)
+            return
+        if self._polish_running:
+            self.notify("A polish is already running", timeout=2, markup=False)
+            return
+        if self.editing:
+            self.end_edit(save=True)
+        draft = it.draft
+        if not draft or not draft.strip():
+            self.notify("No draft to polish", timeout=3, severity="warning",
+                        markup=False)
+            return
+        self._polish_gen += 1
+        gen = self._polish_gen
+        self._polish_op = {"gen": gen}
+        self._polish_running = True
+        self._polish_screen = ActionBusy(
+            "Polish draft", "Fetching the tone, then rewriting…",
+            lambda: self._polish_cancel(gen))
+        self.push_screen(self._polish_screen)
+        self.busy += 1
+        # Not a daemon thread: the bridge calls must reach their `finally` so
+        # the spend is logged. Quitting while it runs asks first (see
+        # action_quit) and waits, for at most polish.timeout_s per call.
+        threading.Thread(target=self._polish_thread, args=(it, draft, gen),
+                         name="inbox-polish").start()
+
+    def _polish_cancel(self, gen):
+        op = self._polish_op
+        if op is not None and op["gen"] == gen:
+            self._polish_op = None
+            self._polish_screen = None
+            self.notify("Cancelled. The draft is unchanged.", timeout=2,
+                        markup=False)
+
+    def _polish_thread(self, it, draft, gen):
+        try:
+            out = self.actions.polish(it, draft)
+        except Exception as exc:  # a backend bug must not end the session
+            out = polishmod.Outcome(False, "", f"cannot run: {type(exc).__name__}")
+        if self._quitting:
+            return
+        self._post(self._polish_done, it, draft, gen, out)
+
+    def _live_item(self, key):
+        return next((i for i in self.items if i.key == key), None)
+
+    def _polish_done(self, it, draft, gen, out):
+        """UI thread: the polish finished. A cancelled one is dropped."""
+        self.busy = max(0, self.busy - 1)
+        self._polish_running = False
+        if self._polish_op is None or self._polish_op["gen"] != gen:
+            return
+        self._polish_op = None
+        screen, self._polish_screen = self._polish_screen, None
+        if screen is not None and self.screen is screen:
+            self.pop_screen()
+        if not out.ok:
+            self.record("polish", it, out.detail, "failed")
+            self.notify(f"Polish failed: {out.detail}", severity="warning",
+                        timeout=6, markup=False)
+            return
+        live = self._live_item(it.key)
+        if live is None or live is not self.current or live.draft != draft:
+            self.record("polish", it, "draft or selection changed", "discarded")
+            self.notify("The draft or the selection changed while polishing; "
+                        "the result was discarded.", severity="warning",
+                        timeout=5, markup=False)
+            return
+
+        def chosen(choice):
+            now = self._live_item(it.key)
+            if choice is None:
+                self.record("polish", it, "cancelled at review", "cancelled")
+                self.notify("Cancelled. The draft is unchanged.", timeout=2,
+                            markup=False)
+                return
+            if now is None or now is not self.current or now.draft != draft:
+                self.record("polish", it, "draft or selection changed",
+                            "discarded")
+                self.notify("The draft or the selection changed; the result "
+                            "was discarded.", severity="warning", timeout=4,
+                            markup=False)
+                return
+            if choice == "accept":
+                now.draft, now.streamed = out.text, True
+                self.record("polish", now, f"{len(out.text)} chars", "accepted")
+                self.query_one("#draft-view", Static).update(
+                    self.draft_text(now, now.draft, False))
+                self.set_badge(now, "polished")
+                self.update_hints()
+                self.notify("Draft replaced. Nothing was sent.", timeout=3,
+                            markup=False)
+            else:
+                self.record("polish", now, f"{len(out.text)} chars", "edit")
+                self._open_editor(out.text)
+        self.push_screen(PolishScreen(draft, out.text, self.bidi,
+                                      out.tone_cached), chosen)
 
     # ---------- RSVP and save (the first writes) ----------
     def action_rsvp_decline(self):
@@ -1697,10 +2038,12 @@ class InboxApp(App):
             busy.append(f"{len(self.running)} write(s) still running")
         if self._sum_running is not None:
             busy.append("summary still running")
+        if self._polish_running:
+            busy.append("polish still running")
         if busy and not self._quit_armed:
             self._quit_armed = True
             self.set_timer(8, self._disarm_quit)
-            tail = ("it finishes first" if busy == ["summary still running"]
+            tail = ("it finishes first" if len(busy) == 1 and not self.running
                     else "they finish first")
             self.notify("; ".join(busy) + f"; q again to quit ({tail})",
                         severity="warning", timeout=6, markup=False)
@@ -1724,6 +2067,8 @@ class InboxApp(App):
         self._cancel.set()      # context commands get SIGTERM and wind down
         if self._act_op is not None:   # a choices/prepare lookup: read-only
             self._act_op["cancel"].set()
+        if self._pre_op is not None:   # the send precheck: read-only
+            self._pre_op["cancel"].set()
         self._ctx_pending = []
         parts = []
         if cancelled:
@@ -1731,8 +2076,18 @@ class InboxApp(App):
         if self.running:
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
+        for p in self.running:
+            if p.kind in SEND_KINDS or p.kind == "react":
+                p.audit["status"] = "running at quit"
+                p.audit["detail"] = (p.audit["detail"]
+                                     + " · may have been sent").strip(" ·")
+                parts.append(f"{p.label}: still running; it may have been "
+                             "sent, check Slack.")
         if self._sum_running is not None:
             parts.append("The summary is still finishing; the process exits "
+                         "when it ends.")
+        if self._polish_running:
+            parts.append("The polish is still finishing; the process exits "
                          "when it ends.")
         self.exit(message=" ".join(parts) or None)
 
@@ -1934,6 +2289,8 @@ class InboxApp(App):
             ("Decline invite", "X (needs rsvp: in inbox.yaml)", self.action_rsvp_decline),
             ("Tentative", "T: answer an invite tentatively (needs rsvp: in inbox.yaml)", self.action_rsvp_tentative),
             ("Save item to memory", "m: save this item (needs save: in inbox.yaml)", self.action_save_memory),
+            ("React to message", "E: add an emoji reaction (needs react: in inbox.yaml)", self.action_react),
+            ("Polish draft", "P: rewrite the draft in your tone, never sends (needs polish: in inbox.yaml)", self.action_polish),
             ("Toggle context pane", "c: context for the selected item (needs context: in inbox.yaml)", self.action_context),
             ("Refresh context", "C (or r inside the pane): fetch the context again", self.action_context_refresh),
             ("Summarize item", "i: AI summary in the context pane (needs summary: in inbox.yaml)", lambda: self.action_summary(False)),

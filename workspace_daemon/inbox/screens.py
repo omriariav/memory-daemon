@@ -23,20 +23,35 @@ from .widgets import fit, fmt_age, palette, vis
 
 
 class ConfirmSend(ModalScreen):
-    """Shows the exact destination and text. Cancel is focused by default."""
+    """Shows the exact destination and text. Cancel is focused by default.
+
+    The text is shown line by line as it will be sent (only wrapped to the
+    box, never joined), in a scroll pane: down / up (j / k) and the page keys
+    scroll it, the buttons never move. `note` is one extra line (for example
+    that the text was cut)."""
 
     AUTO_FOCUS = "#cancel"
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "send", "Send"),
-                Binding("left,right", "toggle_focus", show=False)]
+                Binding("left,right", "toggle_focus", show=False),
+                Binding("down,j", "scroll(1)", show=False),
+                Binding("up,k", "scroll(-1)", show=False),
+                Binding("pagedown", "scroll(10)", show=False),
+                Binding("pageup", "scroll(-10)", show=False)]
+    INNER = 64
 
-    def __init__(self, verb, destination, text, visual=False):
+    def __init__(self, verb, destination, text, visual=False, note="",
+                 warn="", route=""):
+        """`route` is the real destination (channel id and thread timestamp),
+        shown under the `destination` label."""
         super().__init__()
         self.verb, self.destination, self.text, self.visual = verb, destination, text, visual
+        self.note, self.warn, self.route = note, warn, route
 
     def compose(self) -> ComposeResult:
         body = Text()
-        for ln in bidi.visual_lines(self.text, 64, self.visual):
-            body.append(ln + "\n")
+        for para in self.text.split("\n"):
+            for ln in bidi.visual_lines(para, self.INNER, self.visual) or [""]:
+                body.append(ln + "\n")
         body.rstrip()
         dest = Text()
         dest.append("To  ", Style(dim=True))
@@ -44,9 +59,18 @@ class ConfirmSend(ModalScreen):
         with Vertical(id="confirm"):
             yield Static(Text(self.verb, Style(bold=True)), id="confirm-title")
             yield Static(dest, id="confirm-dest")
-            yield Static(body, id="confirm-text")
+            if self.route:
+                yield Static(Text("Slack  " + self.route, Style(dim=True)),
+                             id="confirm-route")
+            if self.warn:
+                yield Static(Text("⚠ " + self.warn, Style(bold=True, color="yellow")),
+                             id="confirm-warn")
+            with VerticalScroll(id="confirm-scroll"):
+                yield Static(body, id="confirm-text")
+            if self.note:
+                yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
             yield Static(Text("Nothing is sent until you confirm. Undo stays open for the grace period.", Style(dim=True)),
-                         id="confirm-note")
+                         id="confirm-fixed")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Cancel  esc", id="cancel", variant="default")
                 yield Button(f"{self.verb}  y", id="send", variant="error")
@@ -62,6 +86,13 @@ class ConfirmSend(ModalScreen):
 
     def action_toggle_focus(self):
         self.focus_next()
+
+    def action_scroll(self, step):
+        pane = self.query_one("#confirm-scroll")
+        if step > 0:
+            pane.scroll_down(animate=False) if step == 1 else pane.scroll_page_down(animate=False)
+        else:
+            pane.scroll_up(animate=False) if step == -1 else pane.scroll_page_up(animate=False)
 
 
 class ConfirmWrite(ModalScreen):
@@ -260,9 +291,12 @@ class ChoicePicker(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")] + [
         Binding(str(n), f"pick({n - 1})", show=False) for n in range(1, 10)]
 
-    def __init__(self, title, choices, visual=False):
+    def __init__(self, title, choices, visual=False, selected=None):
+        """`selected` is the id of the choice that starts highlighted (enter
+        picks it); it is never picked without a key press."""
         super().__init__()
         self.title_text, self.choices, self.visual = title, choices, visual
+        self.selected = selected
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker"):
@@ -285,7 +319,11 @@ class ChoicePicker(ModalScreen):
         return Option(prompt, id=str(n))
 
     def on_mount(self):
-        self.query_one("#picker-list", OptionList).focus()
+        pick = self.query_one("#picker-list", OptionList)
+        pick.focus()
+        for n, choice in enumerate(self.choices):
+            if self.selected is not None and choice["id"] == self.selected:
+                pick.highlighted = n
 
     def action_cancel(self):
         self.dismiss(None)
@@ -296,6 +334,70 @@ class ChoicePicker(ModalScreen):
 
     def on_option_list_option_selected(self, e):
         self.dismiss(self.choices[int(e.option.id)])
+
+
+class PolishScreen(ModalScreen):
+    """The old and the new text of a polished draft, and three choices:
+    accept (replace the draft), edit (open the editor with the new text) or
+    cancel. Cancel is focused by default. Nothing is sent from here.
+    Dismisses with "accept", "edit" or None."""
+
+    AUTO_FOCUS = "#cancel"
+    BINDINGS = [Binding("escape", "cancel", "Cancel"),
+                Binding("a", "accept", "Accept"), Binding("e", "edit", "Edit"),
+                Binding("left,right", "toggle_focus", show=False),
+                Binding("down,j", "scroll(1)", show=False),
+                Binding("up,k", "scroll(-1)", show=False)]
+    INNER = 66
+
+    def __init__(self, old, new, visual=False, cached_tone=False):
+        super().__init__()
+        self.old, self.new, self.visual = old, new, visual
+        self.cached_tone = cached_tone
+
+    def _body(self, text):
+        out = Text()
+        for para in text.split("\n"):
+            for ln in bidi.visual_lines(para, self.INNER, self.visual) or [""]:
+                out.append(ln + "\n")
+        out.rstrip()
+        return out
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="polish"):
+            yield Static(Text("Polish draft", Style(bold=True)), id="polish-title")
+            yield Static(Text("Old", Style(dim=True)), id="polish-old-label")
+            with VerticalScroll(id="polish-old-scroll"):
+                yield Static(self._body(self.old), id="polish-old")
+            yield Static(Text("New", Style(bold=True)), id="polish-new-label")
+            with VerticalScroll(id="polish-new-scroll"):
+                yield Static(self._body(self.new), id="polish-new")
+            yield Static(Text("Nothing is sent. Accept replaces the draft here; "
+                              "edit opens it in the editor.", Style(dim=True)),
+                         id="polish-note")
+            with Horizontal(id="polish-buttons"):
+                yield Button("Cancel  esc", id="cancel", variant="default")
+                yield Button("Edit  e", id="edit", variant="primary")
+                yield Button("Accept  a", id="accept", variant="success")
+
+    def on_button_pressed(self, e):
+        self.dismiss({"accept": "accept", "edit": "edit"}.get(e.button.id))
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_accept(self):
+        self.dismiss("accept")
+
+    def action_edit(self):
+        self.dismiss("edit")
+
+    def action_toggle_focus(self):
+        self.focus_next()
+
+    def action_scroll(self, step):
+        pane = self.query_one("#polish-new-scroll")
+        pane.scroll_down(animate=False) if step > 0 else pane.scroll_up(animate=False)
 
 
 HELP = [
@@ -311,6 +413,11 @@ HELP = [
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
                      ("m", "save the item to memory (save: in inbox.yaml); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
+    ("Slack send / react / polish", [
+        ("a / n", "send the reply or nudge to Slack (send: in inbox.yaml)"),
+        ("E", "react to the message with an emoji (react: in inbox.yaml)"),
+        ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
+        ("", "send and react confirm first, then wait out the 5 s undo window")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
                            ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),

@@ -1709,7 +1709,7 @@ def capture(routine, item, summary, dry_run=False):
         _emit_capture_event(
             rid, "new" if verdict == "created" else "update",
             entry_id, source_id, title, people,
-            details=_capture_details(meta),
+            details=_capture_details(meta, item.get("gmail_snippet")),
         )
         if differs and entry_id:
             _emit_capture_event(
@@ -1854,7 +1854,7 @@ def _gmail_label_names(raw):
     return (user + system)[:events.GMAIL_LABELS_MAX]
 
 
-def _gmail_details(meta):
+def _gmail_details(meta, snippet=None):
     """Gmail label names and the saved-request flag of a mail capture.
 
     `gmail_labels` holds names (see _gmail_label_names), never ids or text.
@@ -1867,13 +1867,40 @@ def _gmail_details(meta):
         details["gmail_labels"] = names
     if meta.get("gmail_message_id") and meta.get("saved_request") is True:
         details["saved_request"] = True
+    if meta.get("gmail_message_id"):
+        details.update(_mail_display_details(meta, snippet))
     return details
 
 
-def _capture_details(meta):
+def _mail_display_details(meta, snippet=None):
+    """What the inbox shows for a mail capture, all plain text: the sender's
+    display name (never an address), the subject, Gmail's own snippet (a
+    short excerpt of the body) when the source reported one, and the thread
+    id. A field the source did not provide is left out. The values are
+    cleaned and capped again by events.build."""
+    from . import events  # late import to avoid cycles
+
+    out = {}
+    name = events.display_name(meta.get("email_from"))
+    if name:
+        out["mail_from"] = name
+    subject = events.one_line(meta.get("email_subject"),
+                              events.MAIL_SUBJECT_CHARS)
+    if subject:
+        out["mail_subject"] = subject
+    snippet = events.one_line(snippet, events.MAIL_SNIPPET_CHARS)
+    if snippet:
+        out["mail_snippet"] = snippet
+    thread = meta.get("gmail_thread_id")
+    if isinstance(thread, str) and events._MAIL_THREAD_ID.match(thread):
+        out["mail_thread_id"] = thread
+    return out
+
+
+def _capture_details(meta, snippet=None):
     meta = meta or {}
     details = dict(_calendar_details(meta) or {})
-    details.update(_gmail_details(meta))
+    details.update(_gmail_details(meta, snippet))
     return details or None
 
 

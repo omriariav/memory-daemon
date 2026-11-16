@@ -1129,6 +1129,12 @@ def _gmail_fetch(routine, source, candidate):
             "source_people_truncated": source_people_truncated,
         },
     }
+    snippet = msg.get("snippet")
+    if isinstance(snippet, str) and snippet.strip():
+        # Gmail's own snippet (a short excerpt of the body) for the inbox row,
+        # redacted like the subject. It rides beside the item, never in the
+        # note frontmatter, and only the capture event reads it.
+        item["gmail_snippet"] = chat_text.redact_secrets(snippet)
     if thread_messages is not None:
         item["frontmatter"].update({
             "gmail_thread_message_count": len(thread_messages),

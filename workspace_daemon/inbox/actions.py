@@ -13,15 +13,23 @@ after the confirm modal and the undo window, in a worker thread.
 `run_action`; see customactions.py) and lets a successful save or action run
 mark the item done (`save_mark_done`, `action_mark_done`).
 
+0.6.0 adds three opt-in writes (`send:`, `react:`, `polish:`; see writes.py and
+polish.py). `send` posts the draft to Slack for a reply or a nudge; `react`
+adds an emoji reaction; `polish` rewrites the draft in a configured tone and
+never sends. Without `send:` a reply or nudge still only works in `--demo`
+(`LocalActions.supports_send` is False and `FakeActions` pretends).
+
 0.4.0 adds two read-only calls: `fetch_context` (the configured context
 command) and `summarize` (one no-tools bridge call, cached on disk). Neither
 changes anything outside the inbox's own state files, so neither confirms.
 """
+import threading
 import time
 import webbrowser
 from dataclasses import dataclass, field
 
 from . import context, customactions, invites, items, writes
+from . import polish as polish_mod
 from . import summary as summary_mod
 from .models import to_v1
 
@@ -54,12 +62,17 @@ class LocalActions:
 
     def __init__(self, store, opener=None, rsvp=None, save=None,
                  base_dir=None, call_tools=None, context=None, summary=None,
-                 complete=None, actions=None):
-        """`rsvp`, `save`, `context` and `summary` are the validated settings
-        blocks (None: not configured); `actions` the validated list.
-        `call_tools` and `complete` replace the Claude bridge's two entry
-        points (tests)."""
+                 complete=None, actions=None, send=None, react=None,
+                 polish=None):
+        """`rsvp`, `save`, `context`, `summary`, `send`, `react` and `polish`
+        are the validated settings blocks (None: not configured); `actions`
+        the validated list. `call_tools` and `complete` replace the Claude
+        bridge's two entry points (tests)."""
         self.store = store
+        self.send_cfg, self.react_cfg, self.polish_cfg = send, react, polish
+        # Replies and nudges reach the confirm flow only with `send:`.
+        self.supports_send = send is not None and base_dir is not None
+        self._send_lock = threading.Lock()   # one send runs at a time
         self.custom_actions = list(actions or [])
         self._open = opener or webbrowser.open
         self.rsvp_cfg, self.save_cfg = rsvp, save
@@ -211,11 +224,131 @@ class LocalActions:
     def draft(self, item):
         return item.draft
 
+    # ---- send, react and polish (0.6.0) ----
+    @property
+    def send_configured(self):
+        return self.send_cfg is not None and self.base_dir is not None
+
+    @property
+    def react_configured(self):
+        return self.react_cfg is not None and self.base_dir is not None
+
+    @property
+    def polish_configured(self):
+        return self.polish_cfg is not None and self.base_dir is not None
+
+    @property
+    def react_mark_done(self):
+        """A successful reaction marks the item done (`react: {mark_done}`)."""
+        return bool(self.react_cfg is None
+                    or self.react_cfg.get("mark_done", True))
+
+    @property
+    def react_emojis(self):
+        return list(self.react_cfg["emojis"]) if self.react_cfg else []
+
+    @property
+    def precheck_configured(self):
+        return bool(self.send_configured and self.send_cfg.get("precheck"))
+
+    def send_precheck(self, item, text, cancel=None):
+        """Run the optional `send.precheck` command (read-only advice): a
+        `writes.Precheck`. Blocks: call from a worker. Item text goes on
+        stdin only."""
+        if not self.precheck_configured:
+            return writes.Precheck()
+        return writes.run_precheck(self.send_cfg, to_v1(item), text,
+                                   cancel=cancel)
+
+    def send_plan(self, item, text):
+        """What a send of `text` to `item` would do, checked (read-only): a
+        `writes.Sendable` with the exact text, the destination label and
+        whether the text was cut, or `ok` False with the reason."""
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
+        if not plan.ok:
+            return plan
+        return plan._replace(destination=f"{item.where} ({plan.kind})")
+
+    def _allow_channel_posts(self):
+        return bool(self.send_cfg and self.send_cfg.get("allow_channel_posts"))
+
+    def _send(self, item, text, what):
+        if not self.supports_send or self.send_cfg is None:
+            return Result(False, f"{what} not configured")
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
+        if not plan.ok:
+            return Result(False, plan.error)
+        if not self._send_lock.acquire(blocking=False):
+            return Result(False, "another send is still running; not sent")
+        try:
+            out = writes.run_send(self.send_cfg, self.base_dir, plan.target,
+                                  plan.text, call_tools=self._call_tools)
+        finally:
+            self._send_lock.release()
+        if not out.ok:
+            return Result(False, out.detail)
+        detail = out.detail or "Sent"
+        try:
+            self.store.done(item.key)
+        except OSError as exc:
+            return Result(True, f"{detail}; local mark failed: "
+                                f"{exc.strerror or exc}")
+        return Result(True, detail)
+
     def send(self, item, text):
-        return Result(False, "sending is not available yet; nothing was sent")
+        """Post the reply to Slack through the configured connector tool,
+        then mark the item done. Blocks: call from a worker."""
+        return self._send(item, text, "Send")
 
     def nudge(self, item, text):
-        return Result(False, "nudging is not available yet; nothing was sent")
+        """A nudge is the same write with the nudge text."""
+        return self._send(item, text, "Nudge")
+
+    def react_plan(self, item):
+        """`(channel, timestamp)` a reaction to `item` would go to, or None."""
+        return writes.react_target(item.meta)
+
+    def react_choices(self, item):
+        """`(emojis, preselected)` for the picker: the configured names, with
+        the item's valid `meta.suggested_reaction` preselected when it is one
+        of them. A suggestion outside the list is ignored, unless
+        `react.allow_suggested` is true (then it is added in front and
+        allowed for that item)."""
+        emojis = list(self.react_emojis)
+        suggested = writes.suggested_reaction(item.meta)
+        if suggested is not None and suggested not in emojis:
+            if self.react_cfg and self.react_cfg.get("allow_suggested"):
+                emojis.insert(0, suggested)
+            else:
+                suggested = None
+        return emojis, suggested
+
+    def react(self, item, emoji):
+        """Add the reaction `emoji` (one of `react.emojis`) to the item's
+        message. Blocks: call from a worker. A `Result`."""
+        if not self.react_configured:
+            return Result(False, "React not configured")
+        target = writes.react_target(item.meta)
+        if target is None:
+            return Result(False, "this item has no message to react to "
+                                 "(meta.reply_to.message_ts or thread_ts)")
+        allowed = self.react_choices(item)[0]
+        if emoji not in allowed or not writes.valid_emoji(emoji):
+            return Result(False, "not one of the configured emojis")
+        out = writes.run_react(self.react_cfg, self.base_dir, target[0],
+                               target[1], emoji, call_tools=self._call_tools)
+        if not out.ok:
+            return Result(False, out.detail)
+        return Result(True, out.detail or f"Reacted :{emoji}:")
+
+    def polish(self, item, draft):
+        """Rewrite `draft` in the configured tone: a `polish.Outcome`. Never
+        sends. Blocks: call from a worker."""
+        if not self.polish_configured:
+            return polish_mod.Outcome(False, "", "Polish not configured")
+        return polish_mod.run_polish(
+            self.polish_cfg, self.base_dir, to_v1(item), draft,
+            call_tools=self._call_tools, complete=self._complete)
 
     def mark_done(self, item):
         self.store.done(item.key)

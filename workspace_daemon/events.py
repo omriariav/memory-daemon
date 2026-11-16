@@ -31,6 +31,13 @@ the event's human attendees including the owner, rooms excluded. The count is
 omitted when the attendee list is unknown. Declined guests are not counted.
 When the count is exactly 2, `other_attendee` is the other person's
 lower-case email (never 0 for unknown).
+A mail capture also adds plain-text fields for the inbox to show: `mail_from` (the sender's display name only, never an email address:
+`<...@...>` is stripped and a value that still holds an `@` (or its
+fullwidth form) is dropped; at
+most 80 characters), `mail_subject` (at most 200), `mail_snippet` (Gmail's own
+snippet, a short excerpt of the body, at most 300; only when the source
+reports one) and `mail_thread_id`.
+Each is cleaned to one line and left out when missing or malformed.
 A mail capture adds `gmail_labels` to the same `details`: the message's Gmail
 label names (resolved from label ids; sorted, at most 20, each cut to 100
 characters; never ids that do not resolve, or text) when the source reports
@@ -45,6 +52,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 
 from .shell import log, utc_now_iso
 from .state import ensure_private_dir
@@ -56,6 +64,31 @@ SCHEMA_VERSION = 1
 EVENT_ID_MAX = 256
 GMAIL_LABELS_MAX = 20
 GMAIL_LABEL_CHARS = 100
+MAIL_FROM_CHARS = 80
+MAIL_SUBJECT_CHARS = 200
+MAIL_SNIPPET_CHARS = 300
+_MAIL_THREAD_ID = re.compile(r"\A[A-Za-z0-9_-]{1,100}\Z")
+_ANGLE_ADDRESS = re.compile(r"<[^<>]*[@\uff20\ufe6b][^<>]*>")
+_AT_SIGNS = ("@", "\uff20", "\ufe6b")     # ASCII, fullwidth, small commercial at
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def one_line(value, limit):
+    """`value` as one cleaned line of at most `limit` characters, or ""."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(_CONTROL.sub(" ", value).split())
+    return text[:limit].rstrip()
+
+
+def display_name(value):
+    """The display name of a From header, never an address: `<...@...>` is
+    stripped, and a value that still holds an `@` gives ""."""
+    if not isinstance(value, str):
+        return ""
+    text = one_line(_ANGLE_ADDRESS.sub("", value), 400).strip(" \"'")
+    return "" if any(a in text for a in _AT_SIGNS) \
+        else text[:MAIL_FROM_CHARS].rstrip()
 
 
 def _clean_details(details):
@@ -92,6 +125,21 @@ def _clean_details(details):
             del out["gmail_labels"]
     if "saved_request" in out and out["saved_request"] is not True:
         del out["saved_request"]
+    for key, clean in (
+            ("mail_from", display_name),
+            ("mail_subject", lambda v: one_line(v, MAIL_SUBJECT_CHARS)),
+            ("mail_snippet", lambda v: one_line(v, MAIL_SNIPPET_CHARS))):
+        if key in out:
+            value = clean(out[key])
+            if value:
+                out[key] = value
+            else:
+                del out[key]
+    if "mail_thread_id" in out and not (
+        isinstance(out["mail_thread_id"], str)
+        and _MAIL_THREAD_ID.match(out["mail_thread_id"])
+    ):
+        del out["mail_thread_id"]
     return out or None
 
 
