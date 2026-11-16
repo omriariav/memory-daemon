@@ -207,9 +207,12 @@ the answer as one JSON line on stdout. `name` is the action's `label`; the item
 | `run` | `{"v": 1, "action": "run", "name", "item", "choice": "<id>", "state": "<opaque string>"}` | `{"ok": true, "message": "..."}` | the only call that changes anything |
 
 Answer fields. `v` may be left out of an answer; if present it must be 1.
-`choices`: at most 50, each with a string `id` (up to 200 chars; a repeated id
-keeps its first row), a `label` (80) and an optional `detail` (200); text is
-cleaned to one line. `ok: false`, or no choice, shows `message`. `prepare`:
+`choices`: at most 50, each with a string `id`, a `label` (80 chars) and an
+optional `detail` (200). The `id` is an opaque handle and comes back to
+`prepare` and `run` byte for byte (never cleaned or cut); a row whose `id` is
+not a string of 1 to 200 characters or holds a control character is skipped,
+and a repeated `id` keeps its first row. `label` and `detail` are shown, so
+they are cleaned to one line. `ok: false`, or no choice, shows `message`. `prepare`:
 `rows` (at most 20 `[label, value]` string pairs, value up to 1000 chars,
 newlines kept) are what the user is asked to confirm; `state` is an opaque
 string of at most 64 KB that the inbox hands back to `run` unchanged (use it to
@@ -740,7 +743,8 @@ The thread pane lists the **newest** message first by default, so a long
 thread opens on the latest reply, with the pane scrolled to the top. `v`
 flips it to oldest first and back. In newest-first order a dim "thread start"
 marker closes the list under the first (parent) message of a thread of two or
-more messages. The item header, the `meta.thread_note` line and the "RSVP not
+more messages (left out when the item has a `thread_note`, which may be saying
+that the thread is cut). The item header, the `meta.thread_note` line and the "RSVP not
 confirmed" hint stay on top in both orders. The queue is not affected: this
 only changes how the thread pane draws the item's `thread` (which an item
 always carries oldest first).

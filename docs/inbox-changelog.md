@@ -47,10 +47,10 @@ not to).
   to call repeatedly, `choices` and `prepare` read-only, `run` idempotent where
   possible) and "Custom actions"; a commented `actions:` example in
   `inbox.example.yaml`.
-
 - Thread order: the thread pane now lists the **newest message first** (it was
   oldest first), scrolled to the top, with a dim "thread start" marker under
-  the first message of a thread of two or more. `v` toggles to oldest first and
+  the first message of a thread of two or more (not when the item has a
+  `thread_note`). `v` toggles to oldest first and
   back (the queue is not touched); a new `thread_order: newest | oldest`
   setting (default `newest`) is the starting order, and the toggle is saved in
   `state/inbox-state.json` (`prefs`), so a restart keeps it (the saved choice
@@ -60,6 +60,15 @@ not to).
 
 ### Changed
 
+- A choice `id` of an `actions:` command is an opaque handle: it is handed back
+  to `prepare` and `run` byte for byte (never cleaned or cut). A row whose id is
+  not a string of 1 to 200 characters, or holds a control character, is skipped;
+  only `label` and `detail` are cleaned for display.
+- The confirmation modal of the write actions (RSVP, save, actions) keeps its
+  label column to a width (8 to 16 cells, a longer label is cut with an
+  ellipsis), wraps each line of a multi-line value, and scrolls when the rows
+  are taller than the box (`down`/`up`, `j`/`k`, `pagedown`/`pageup`; Cancel
+  stays the default).
 - A successful save no longer leaves the row in the queue (see `mark_done`
   above; set `save: {mark_done: false}` to keep it).
 - `save.mark_done` is part of the validated `save` block.

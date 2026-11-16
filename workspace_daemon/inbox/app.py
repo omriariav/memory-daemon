@@ -148,7 +148,9 @@ class InboxApp(App):
     ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen, ActionBusy, ChoicePicker { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
-    #confirm-text { border: round $panel; padding: 0 1; margin: 1 0; background: $background; }
+    #confirm-scroll { height: auto; max-height: 16; margin: 1 0; border: round $panel; background: $background; scrollbar-size-vertical: 1; }
+    #confirm-text { border: none; padding: 0 1; margin: 0; background: $background; height: auto; }
+    ConfirmSend #confirm-text { border: round $panel; margin: 1 0; }
     #confirm-buttons { height: 3; align-horizontal: right; }
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }

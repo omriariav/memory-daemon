@@ -12,7 +12,7 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
@@ -71,7 +71,12 @@ class ConfirmWrite(ModalScreen):
 
     AUTO_FOCUS = "#cancel"
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "confirm", "Confirm"),
-                Binding("left,right", "toggle_focus", show=False)]
+                Binding("left,right", "toggle_focus", show=False),
+                Binding("down,j", "scroll(1)", show=False),
+                Binding("up,k", "scroll(-1)", show=False),
+                Binding("pagedown", "scroll(10)", show=False),
+                Binding("pageup", "scroll(-10)", show=False)]
+    LABEL_MIN, LABEL_MAX = 8, 16      # the label column, in cells
 
     def __init__(self, title, rows, verb, note="", visual=False):
         super().__init__()
@@ -79,19 +84,29 @@ class ConfirmWrite(ModalScreen):
         self.note, self.visual = note, visual
 
     def compose(self) -> ComposeResult:
+        shown = [(label, value) for label, value in self.rows if value]
+        # The label column fits the longest label, within LABEL_MIN..LABEL_MAX;
+        # a longer label is cut to it (with an ellipsis), never overflowing
+        # into the value.
+        col = min(self.LABEL_MAX, max(
+            self.LABEL_MIN, *(len(label) + 1 for label, _ in shown))) \
+            if shown else self.LABEL_MIN
         body = Text()
-        for label, value in self.rows:
-            if not value:
-                continue
-            body.append(f"{label:<8}", Style(dim=True))
-            lines = bidi.visual_lines(value, 56, self.visual) or [""]
+        for label, value in shown:
+            label = label if len(label) < col else label[:col - 2] + "…"
+            body.append(f"{label:<{col}}", Style(dim=True))
+            lines = []
+            for para in value.split("\n"):    # a value may have several lines
+                lines.extend(bidi.visual_lines(para, 64 - col, self.visual)
+                             or [""])
             body.append(lines[0] + "\n", Style(bold=True))
             for ln in lines[1:]:
-                body.append(" " * 8 + ln + "\n", Style(bold=True))
+                body.append(" " * col + ln + "\n", Style(bold=True))
         body.rstrip()
         with Vertical(id="confirm"):
             yield Static(Text(self.title_text, Style(bold=True)), id="confirm-title")
-            yield Static(body, id="confirm-text")
+            with VerticalScroll(id="confirm-scroll"):
+                yield Static(body, id="confirm-text")
             if self.note:
                 yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
             yield Static(Text("Nothing happens until you confirm. Undo stays open for the grace period.",
@@ -111,6 +126,15 @@ class ConfirmWrite(ModalScreen):
 
     def action_toggle_focus(self):
         self.focus_next()
+
+    def action_scroll(self, step):
+        """The rows may be longer than the box: down / up (j / k) and the page
+        keys scroll them; the buttons never move."""
+        pane = self.query_one("#confirm-scroll")
+        if step > 0:
+            pane.scroll_down(animate=False) if step == 1 else pane.scroll_page_down(animate=False)
+        else:
+            pane.scroll_up(animate=False) if step == -1 else pane.scroll_page_up(animate=False)
 
 
 def parse_snooze(s, now):

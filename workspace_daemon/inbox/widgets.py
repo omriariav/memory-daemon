@@ -236,7 +236,9 @@ class ThreadView(VerticalScroll):
             out.append(f"  {when}  {rel(now, m.ts)}\n", Style(color=pal["muted"]))
             out.append_text(body_text(item, m.text, pal, width, visual))
             out.append("\n\n")
-        if newest_first and len(messages) > 1:
+        if newest_first and len(messages) > 1 and not note:
+            # With a thread note the list may be a cut one (the note says so):
+            # the last message drawn is then not known to be the first.
             out.append("─ thread start ─\n", Style(color=pal["muted"], dim=True))
         body.update(out)
         self.scroll_home(animate=False)

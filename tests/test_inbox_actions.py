@@ -185,19 +185,64 @@ class ChoicesProtocolTest(unittest.TestCase):
             {"id": "a", "label": "first"}, {"id": "a", "label": "second"}]}))
         self.assertEqual([c["label"] for c in dup.choices], ["first"])
 
-    def test_caps_on_label_detail_and_id(self):
+    def test_caps_on_label_and_detail(self):
         res = customactions.parse_choices(j({"ok": True, "choices": [
-            {"id": "x" * 500, "label": "l" * 500, "detail": "d" * 500}]}))
+            {"id": "x", "label": "l" * 500, "detail": "d" * 500}]}))
         row = res.choices[0]
-        self.assertLessEqual(len(row["id"]), customactions.CHOICE_ID_MAX)
         self.assertLessEqual(len(row["label"]), customactions.CHOICE_LABEL_MAX)
         self.assertLessEqual(len(row["detail"]), customactions.CHOICE_DETAIL_MAX)
+
+    def test_the_id_is_passed_through_byte_for_byte(self):
+        ids = ["  padded id  ", "doc/ünï-1?x=y&z", "[b]markup[/b]",
+               "x" * customactions.CHOICE_ID_MAX, "a b", "‏rtl-mark"]
+        res = customactions.parse_choices(j({"ok": True, "choices": [
+            {"id": i, "label": f"L{n}"} for n, i in enumerate(ids)]}))
+        self.assertEqual([c["id"] for c in res.choices], ids)
+
+    def test_a_row_with_an_unusable_id_is_skipped_not_repaired(self):
+        bad = ["", "x" * (customactions.CHOICE_ID_MAX + 1), "a\nb", "a\tb",
+               "a\x1b[31mb", "a\x00b", "a\x7fb", "a\x85b", "a\u202eb", 5,
+               None, ["x"]]
+        rows = [{"id": i, "label": "bad"} for i in bad]
+        rows.append({"id": "good", "label": "kept"})
+        res = customactions.parse_choices(j({"ok": True, "choices": rows}))
+        self.assertEqual([c["id"] for c in res.choices], ["good"])
+
+    def test_a_label_may_be_empty_and_falls_back_to_the_shown_id(self):
+        res = customactions.parse_choices(j({"ok": True, "choices": [
+            {"id": "id-1", "label": "\x1b[0m"}]}))
+        self.assertEqual(res.choices[0]["label"], "id-1")
+
+    def test_the_raw_id_reaches_prepare_and_run(self):
+        # end to end through the runner: what choices returned is what comes back
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log"
+            script = Path(tmp) / "act.py"
+            script.write_text(textwrap.dedent(f"""
+                import json, sys
+                req = json.load(sys.stdin)
+                open({str(log)!r}, "a").write(json.dumps(req.get("choice")) + "\\n")
+                if req["action"] == "choices":
+                    print(json.dumps({{"ok": True, "choices": [
+                        {{"id": "  Doc 1/é  ", "label": "x"}}]}}))
+                elif req["action"] == "prepare":
+                    print(json.dumps({{"ok": True, "rows": [], "state": "s"}}))
+                else:
+                    print(json.dumps({{"ok": True, "message": "ok"}}))
+            """))
+            cfg = {"key": "p", "label": "A", "timeout_s": 10.0,
+                   "argv": [sys.executable, str(script)], "mark_done": True}
+            got = customactions.run_choices(cfg, v1())
+            cid = got.choices[0]["id"]
+            customactions.run_prepare(cfg, v1(), cid)
+            customactions.run_run(cfg, v1(), cid, "s")
+            sent = [json.loads(x) for x in log.read_text().splitlines()]
+        self.assertEqual(sent, [None, "  Doc 1/é  ", "  Doc 1/é  "])
 
     def test_bad_answers_raise(self):
         for text in ("nope", "[]", j({"ok": "yes"}), j({"v": 2, "ok": True}),
                      j({"v": True, "ok": True}), j({"ok": True, "choices": {}}),
                      j({"ok": True, "choices": ["x"]}),
-                     j({"ok": True, "choices": [{"id": 1, "label": "x"}]}),
                      j({"ok": True, "choices": [{"id": "a", "label": 2}]}),
                      j({"ok": True, "choices": [{"id": "a", "label": "x",
                                                   "detail": 3}]}),
@@ -650,6 +695,57 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("Added", audit["action"]["detail"])
             self.assertEqual(audit["done"]["detail"], "after Add to agenda")
             self.assertTrue(any("Added" in t for t in toasts(app)))
+
+    async def test_a_long_confirmation_scrolls_and_labels_are_capped(self):
+        acts = Scripted(None)
+        acts.prepared = customactions.Prepared(True, [
+            ("Agenda", "Example Person"),
+            ("A label that is far too long for its column", "short value"),
+            ("Body", "\n".join(f"line {n}" for n in range(60)))],
+            "S", None, False)
+        app = make_app([make_item(1)], acts, InboxStore(None))
+        async with app.run_test(size=SIZE) as pilot:
+            await self.to_confirm(pilot, app)
+            modal = app.screen
+            pane = modal.query_one("#confirm-scroll")
+            await pilot.pause(0.3)
+            self.assertGreater(pane.max_scroll_y, 0)
+            self.assertLessEqual(pane.size.height, 18)
+            text = str(modal.query_one("#confirm-text").render())
+            long_row = next(l for l in text.splitlines() if "short value" in l)
+            self.assertIn("…", long_row)
+            col = long_row.index("short value")
+            self.assertLessEqual(col, modal.LABEL_MAX)
+            for line in text.splitlines():
+                if line.startswith("Agenda"):
+                    self.assertEqual(line.index("Example Person"), col)
+            self.assertEqual(pane.scroll_y, 0)
+            await pilot.press("down")
+            await pilot.press("j")
+            await pilot.pause(0.1)
+            self.assertGreater(pane.scroll_y, 0)
+            await pilot.press("pagedown")
+            await pilot.pause(0.1)
+            self.assertGreater(pane.scroll_y, 2)
+            await pilot.press("up")
+            await pilot.pause(0.1)
+            self.assertEqual(modal.focused.id, "cancel")      # buttons stay put
+            self.assertTrue(modal.query_one("#send").display)
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertEqual(acts.ran_calls(), [])
+
+    async def test_a_short_confirmation_keeps_the_narrow_label_column(self):
+        modal = ConfirmWrite("T", [("From", "Ann"), ("Gist", "g")], "Go")
+        self.assertEqual((modal.LABEL_MIN, modal.LABEL_MAX), (8, 16))
+        acts = Scripted(None)
+        acts.prepared = customactions.Prepared(
+            True, [("From", "Ann Example")], "S", None, False)
+        app = make_app([make_item(1)], acts, InboxStore(None))
+        async with app.run_test(size=SIZE) as pilot:
+            await self.to_confirm(pilot, app)
+            text = str(app.screen.query_one("#confirm-text").render())
+            self.assertEqual(text.index("Ann Example"), 8)
 
     async def test_undo_inside_the_window_runs_nothing(self):
         store = InboxStore(None)

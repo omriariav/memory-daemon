@@ -21,6 +21,7 @@ TERM_GRACE_S on a timeout, a cap on the raw output). `choices` and `prepare`
 can be cancelled; `run` never is, and is never retried.
 """
 import json
+import re
 from collections import namedtuple
 
 from . import items as itm
@@ -38,6 +39,8 @@ STATE_MAX_BYTES = 64 * 1024
 MESSAGE_MAX = 300
 MAX_RAW_BYTES = 512 * 1024
 TERM_GRACE_S = 5
+
+_ID_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 Choices = namedtuple("Choices", "ok choices message")
 Prepared = namedtuple("Prepared", "ok rows state message duplicate")
@@ -78,8 +81,14 @@ def _message(doc):
 
 def parse_choices(text):
     """`{"ok": bool, "choices": [{"id": str, "label": str, "detail"?: str}],
-    "message"?: str|null}` -> `Choices` (cleaned, at most MAX_CHOICES, a
-    repeated id keeps its first row). Raises `ItemError`."""
+    "message"?: str|null}` -> `Choices` (at most MAX_CHOICES, a repeated id
+    keeps its first row). Raises `ItemError`.
+
+    The `id` is an opaque handle the command gets back in `prepare` and `run`,
+    so it is passed through byte for byte, never cleaned or cut: a row whose id
+    is not a string of 1 to CHOICE_ID_MAX characters, or holds a control
+    character, is skipped. Only `label` and `detail`, which are shown, are
+    cleaned and cut."""
     doc = _load(text)
     ok = doc.get("ok")
     if not isinstance(ok, bool):
@@ -92,14 +101,15 @@ def parse_choices(text):
         raise itm.ItemError("response choices must be a list")
     choices, seen = [], set()
     for n, row in enumerate(raw):
-        if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
-                or not isinstance(row.get("label"), str)):
+        if not isinstance(row, dict) or not isinstance(row.get("label"), str):
             raise itm.ItemError(f"choices[{n}] needs id (str) and label (str)")
         detail = row.get("detail")
         if detail is not None and not isinstance(detail, str):
             raise itm.ItemError(f"choices[{n}].detail must be a string")
-        cid = itm.truncate(itm.clean_line(row["id"]), CHOICE_ID_MAX)
-        if not cid or cid in seen:
+        cid = row.get("id")
+        if (not isinstance(cid, str) or not 1 <= len(cid) <= CHOICE_ID_MAX
+                or _ID_CONTROLS.search(cid) or itm._CONTROLS.search(cid)
+                or cid in seen):
             continue
         if len(choices) >= MAX_CHOICES:
             break
@@ -107,7 +117,8 @@ def parse_choices(text):
         choices.append({
             "id": cid,
             "label": itm.truncate(itm.clean_line(row["label"]),
-                                  CHOICE_LABEL_MAX) or cid,
+                                  CHOICE_LABEL_MAX)
+            or itm.truncate(itm.clean_line(cid), CHOICE_LABEL_MAX) or "(choice)",
             "detail": itm.truncate(itm.clean_line(detail or ""),
                                    CHOICE_DETAIL_MAX)})
     return Choices(ok, choices if ok else [], message)

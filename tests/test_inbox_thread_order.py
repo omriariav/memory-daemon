@@ -148,8 +148,16 @@ class WorkerCleanup:
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
+    async def test_a_thread_note_means_no_start_marker(self):
+        app = make_app([thread_item()], InboxStore(None))   # carries a note
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            text = thread_text(app)
+            self.assertEqual(order_of(text), ["THIRD", "SECOND", "FIRST"])
+            self.assertNotIn("thread start", text)          # may be a cut thread
+
     async def test_default_is_newest_first_with_the_start_marker_last(self):
-        app = make_app([thread_item()], InboxStore(None))
+        app = make_app([thread_item(meta={})], InboxStore(None))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             text = thread_text(app)
@@ -190,8 +198,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
 
     async def test_a_single_message_has_no_start_marker_and_a_note_only_item_works(self):
-        one = thread_item(thread=[{"who": "Ann", "ts": 1893491000.0,
-                                   "text": "FIRST message"}])
+        one = thread_item(meta={}, thread=[
+            {"who": "Ann", "ts": 1893491000.0, "text": "FIRST message"}])
         app = make_app([one], InboxStore(None))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
