@@ -1247,6 +1247,7 @@ class DemoActionsTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: any(c[0] == "run" for c in acts.calls)))
+            await pilot.pause(0.4)
 
 
 if __name__ == "__main__":

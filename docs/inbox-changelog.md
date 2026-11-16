@@ -55,6 +55,8 @@ not to).
 - `save.mark_done` is part of the validated `save` block.
 - A mark applied after a background save or action never moves the cursor off
   the item the user is on.
+- A queue highlight message that arrives after the screen is gone no longer
+  raises `NoMatches` while the app exits.
 
 ## [0.4.0] - 2026-11-16
 

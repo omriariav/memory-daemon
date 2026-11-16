@@ -548,8 +548,11 @@ class InboxApp(App):
     # ---------- queue events ----------
     def on_option_list_option_highlighted(self, e):
         if e.option_list.id == "queue":
-            self.sync_current()
-            self.update_hints()
+            try:
+                self.sync_current()
+                self.update_hints()
+            except NoMatches:   # a highlight message that outlived the screen
+                pass
 
     # ---------- draft pane ----------
     def draft_text(self, it, text, streaming):
