@@ -1709,7 +1709,7 @@ def capture(routine, item, summary, dry_run=False):
         _emit_capture_event(
             rid, "new" if verdict == "created" else "update",
             entry_id, source_id, title, people,
-            details=_calendar_details(meta),
+            details=_capture_details(meta),
         )
         if differs and entry_id:
             _emit_capture_event(
@@ -1813,6 +1813,67 @@ def _calendar_details(meta):
             other = meta.get("calendar_other_attendee")
             if count == 2 and isinstance(other, str) and other:
                 details["other_attendee"] = other
+    return details or None
+
+
+def _gmail_label_names(raw):
+    """Label names for the ids (or system names) a Gmail source reported.
+
+    User labels (`Label_<n>`) are named through the label catalog cache, and
+    one that does not resolve is dropped; system labels stay as they are. User
+    labels come before system ones, so the cap never drops a user label for
+    INBOX or the like.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    ids = [x for x in raw if isinstance(x, str) and x.strip()]
+    from . import events, labels  # late imports to avoid cycles
+    from . import llm
+
+    base_dir = llm.base_dir()
+    # A user label is told by its raw id (`Label_<n>`), not by its name: a user
+    # label may be named in capitals like a system one.
+    user_ids = [x for x in ids if x.strip().startswith("Label_")]
+    other_ids = [x for x in ids if not x.strip().startswith("Label_")]
+    if base_dir is not None:
+        catalog = labels.Catalog(base_dir)
+        user = catalog.names_for_ids(user_ids)
+        system = catalog.names_for_ids(other_ids)
+    else:
+        user = []
+        system = [x.strip() for x in other_ids
+                  if labels._SYSTEM_ID.match(x.strip())]
+
+    def tidy(names):
+        clean = {" ".join(n.split())[:events.GMAIL_LABEL_CHARS] for n in names}
+        clean.discard("")
+        return sorted(clean)
+
+    user = tidy(user)
+    system = [n for n in tidy(system) if n not in user]
+    return (user + system)[:events.GMAIL_LABELS_MAX]
+
+
+def _gmail_details(meta):
+    """Gmail label names and the saved-request flag of a mail capture.
+
+    `gmail_labels` holds names (see _gmail_label_names), never ids or text.
+    `saved_request` appears only when true. A connector that reports no
+    labels leaves the key out.
+    """
+    details = {}
+    names = _gmail_label_names(meta.get("gmail_labels"))
+    if names:
+        details["gmail_labels"] = names
+    if meta.get("gmail_message_id") and meta.get("saved_request") is True:
+        details["saved_request"] = True
+    return details
+
+
+def _capture_details(meta):
+    meta = meta or {}
+    details = dict(_calendar_details(meta) or {})
+    details.update(_gmail_details(meta))
     return details or None
 
 

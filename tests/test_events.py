@@ -70,6 +70,27 @@ class BuildTest(unittest.TestCase):
         mixed = make(details={"calendar_event_id": "e1", "attendee_count": -4})
         self.assertEqual(mixed["details"], {"calendar_event_id": "e1"})
 
+    def test_gmail_details_are_kept_when_valid(self):
+        event = make(details={"gmail_labels": ["Save", "Reports"],
+                              "saved_request": True})
+        self.assertEqual(event["details"], {
+            "gmail_labels": ["Reports", "Save"], "saved_request": True})
+
+    def test_invalid_gmail_details_are_dropped_or_capped(self):
+        for bad in ({"gmail_labels": []}, {"gmail_labels": "Save"},
+                    {"gmail_labels": [5, ""]}, {"saved_request": False},
+                    {"saved_request": "yes"}):
+            self.assertNotIn("details", make(details=bad), bad)
+        many = make(details={"gmail_labels": [f"L{i:02d}" for i in range(40)]})
+        self.assertEqual(len(many["details"]["gmail_labels"]), 20)
+        self.assertNotIn("details", make(details={"gmail_labels": [" ", "\n"]}))
+
+    def test_gmail_labels_are_cleaned_deduped_and_sorted(self):
+        event = make(details={"gmail_labels": [
+            "b  label", "a", "a", "  ", "x" * 150, "b label"]})
+        self.assertEqual(event["details"]["gmail_labels"],
+                         ["a", "b label", "x" * 100])
+
     def test_null_memory_id_is_kept(self):
         self.assertIsNone(make(memory_id=None)["memory_id"])
 

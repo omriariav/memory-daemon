@@ -31,6 +31,11 @@ the event's human attendees including the owner, rooms excluded. The count is
 omitted when the attendee list is unknown. Declined guests are not counted.
 When the count is exactly 2, `other_attendee` is the other person's
 lower-case email (never 0 for unknown).
+A mail capture adds `gmail_labels` to the same `details`: the message's Gmail
+label names (resolved from label ids; sorted, at most 20, each cut to 100
+characters; never ids that do not resolve, or text) when the source reports
+them, and `saved_request: true` when its routine lists
+only threads the owner asked to save. Both are omitted when empty or false.
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
 `state/events.lock`. The file is rotated to `events.jsonl.1` (one
@@ -49,10 +54,12 @@ LOCK_NAME = "events.lock"
 MAX_BYTES = 5 * 1024 * 1024
 SCHEMA_VERSION = 1
 EVENT_ID_MAX = 256
+GMAIL_LABELS_MAX = 20
+GMAIL_LABEL_CHARS = 100
 
 
 def _clean_details(details):
-    """Drop malformed calendar_event_id / attendee_count; keep other keys."""
+    """Drop malformed calendar, gmail_labels and saved_request values; keep other keys."""
     if not isinstance(details, dict):
         return None
     out = dict(details)
@@ -72,6 +79,19 @@ def _clean_details(details):
         isinstance(other, str) and "@" in other and len(other) <= 254
     ):
         del out["other_attendee"]
+    if "gmail_labels" in out:
+        labels = out["gmail_labels"]
+        if isinstance(labels, list):
+            labels = sorted({
+                " ".join(x.split())[:GMAIL_LABEL_CHARS].strip()
+                for x in labels if isinstance(x, str)
+            } - {""})[:GMAIL_LABELS_MAX]
+        if labels and isinstance(labels, list):
+            out["gmail_labels"] = labels
+        else:
+            del out["gmail_labels"]
+    if "saved_request" in out and out["saved_request"] is not True:
+        del out["saved_request"]
     return out or None
 
 

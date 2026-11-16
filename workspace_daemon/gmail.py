@@ -8,6 +8,15 @@ def user_labels():
     return sorted(l["name"] for l in result["labels"] if l.get("type") == "user")
 
 
+def user_label_ids():
+    """{label id: name} of the user-created labels (`Label_<n>` ids)."""
+    result = run_json([gws_bin(), "gmail", "labels", "--format", "json"])
+    return {
+        l["id"]: l["name"] for l in result["labels"]
+        if l.get("type") == "user" and l.get("id") and l.get("name")
+    }
+
+
 def search(query, max_results=20):
     limit = int(max_results)
     args = [gws_bin(), "gmail", "list", "--query", query]

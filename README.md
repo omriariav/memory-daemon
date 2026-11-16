@@ -793,7 +793,24 @@ Calendar events: the same single list call asks for `events_window_days`
 twin still hold only the next `window_hours`. Each successful run diffs that
 listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
 `{event_id: {start, end, location, conference, status, my_rsvp, title,
-list_title, rsvps}}` (`list_title` is the title as listed, cut to 100
+list_title, organizer, attendee_count, attendees_known, attendees,
+rsvps}}` (`organizer` is `{name, email, self}` or `null`; `attendees` is
+`[{name, email, response, self, optional, group}]` for people only (rooms and
+group or resource calendars are left out; declined guests stay, with their
+`response`), at most 50; a known organizer the listing omits is added with
+`response` `accepted`. `response` is `accepted`, `tentative`, `declined` or
+`needsAction`; `self` is true for the owner; `optional` is true when the
+connector marks the guest optional; `group` is true for a mailing-list style
+address (a local-part word such as `team`, `all`, `staff`, `list`; a heuristic,
+so a person with such a name is flagged too). `attendee_count` is every such
+person (uncapped) except declined guests, the same rule as a capture event's
+`attendee_count`; the owner is always counted and is added when the listing
+does not name them. `attendees_known` is `false` when the count is only a floor:
+an event I do not organize (including one with no organizer address, such as a
+group calendar's) has no Attendees line, lists only me (a hidden guest list), or
+has no entry for me, or a group address is among the attendees. Names are read from the address, and emails
+stay in this local file, never in the log;
+`list_title` is the title as listed, cut to 100
 characters for every event, so a detail lookup never changes it and a change
 past 100 characters is not reported; `rsvps`, `{email: [name, rsvp]}` without the owner, an attendee the
 connector marks as `self`, and the organizer, is kept only for events I
@@ -2845,6 +2862,16 @@ polling the store:
   calendars and declined guests excluded, and it is omitted when the attendee
   list is unknown. When it is exactly 2, `other_attendee` is the other
   person's lower-case email. Malformed values are dropped.
+- Mail captures (`new` and `update`) add to `details`: `gmail_labels`, the
+  message's Gmail label names (the connector reports label ids, which are
+  mapped to names through the label catalog in `state/labels.json`; system
+  labels such as `INBOX` are their own names and an id that does not resolve is
+  dropped; user labels are kept before system ones when more than 20 apply;
+  sorted, at most 20, each cut to 100 characters; names only, no message text), and `saved_request: true` when the
+  routine's source lists only threads the owner asked to save
+  (`saved_request: true` in its config). A source whose connector does not
+  expose labels (`gmail_mcp`) leaves `gmail_labels` out. Both keys are omitted
+  when empty or false.
 - Alerts (writer: `alerts.check`, see "Alerts"): `source` is `daemon`, `kind`
   is `alert`, `routine` is `daemon`, `memory_id` is `null`, `source_id` is
   `daemon:<key>`, `title` is the message, and `details` holds `key` plus the
