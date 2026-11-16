@@ -5,7 +5,9 @@ so it must stay stdlib-only with no package imports. Claude Code pipes the tool
 call as JSON on stdin; this prints a PreToolUse permission decision. Anything
 unexpected denies: a hook that errors open would defeat the allowlist.
 """
+import hashlib
 import json
+import os
 import sys
 
 SELECT_PREFIX = "select:"
@@ -59,6 +61,26 @@ def decide(payload, tools, exact_args=False):
     return True, "allowlisted tool call"
 
 
+def _claim_call(run_dir, name, limit):
+    """True when this call of `name` is within `limit` allowed calls in this
+    run. Each allowed call claims one marker file with O_EXCL in the 0700 run
+    directory, so separate hook processes (parallel tool calls) cannot both
+    take the last slot. Raises OSError on anything unexpected (the caller
+    denies)."""
+    claims = os.path.join(run_dir, "calls")
+    os.makedirs(claims, mode=0o700, exist_ok=True)
+    tag = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    for slot in range(limit):
+        try:
+            fd = os.open(os.path.join(claims, f"{tag}-{slot}"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return True
+    return False
+
+
 def _emit(allowed, reason):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -73,7 +95,20 @@ def main(argv, stdin):
             doc = json.load(handle)
         tools = doc["tools"]
         exact_args = doc.get("exact_args", False) is True
-        allowed, reason = decide(json.load(stdin), tools, exact_args)
+        max_calls = doc.get("max_calls")
+        if max_calls is not None and (not isinstance(max_calls, int)
+                                      or isinstance(max_calls, bool)
+                                      or max_calls < 1):
+            raise ValueError("malformed allowlist")
+        payload = json.load(stdin)
+        allowed, reason = decide(payload, tools, exact_args)
+        if (allowed and max_calls is not None
+                and payload["tool_name"] in tools
+                and not _claim_call(os.path.dirname(os.path.abspath(argv[1])),
+                                    payload["tool_name"], max_calls)):
+            allowed, reason = False, (
+                f"tool {payload['tool_name']} may be called at most "
+                f"{max_calls} time(s) in this run")
         _emit(allowed, reason)
         return 0
     except Exception:  # fail closed on anything, including a bad allowlist

@@ -426,13 +426,16 @@ NO_TOOLS_NOTE = (
 )
 
 
-def check_mcp_config(path):
-    """The MCP config file `path`, checked: an absolute path to an existing
-    regular file that you own and that nobody else can read or write (no
-    group or other bits). Opened with O_NOFOLLOW (never through a symlink)
-    and judged on the open descriptor, so what is checked is the file that
-    exists at that moment. Returns the path as a string; raises BridgeError
-    (a message with no file content) otherwise."""
+MCP_CONFIG_MAX_BYTES = 1024 * 1024
+
+
+def read_mcp_config(path):
+    """The bytes of the MCP config file `path`, checked: an absolute path to
+    an existing regular file that you own and that nobody else can read or
+    write (no group or other bits). Opened with O_NOFOLLOW (never through a
+    symlink), judged on the open descriptor and read from that same
+    descriptor, so what is checked is exactly what is read. Raises
+    BridgeError (a message with no file content) otherwise."""
     if not isinstance(path, (str, os.PathLike)) or not str(path):
         raise BridgeError("mcp_config must be a path")
     path = os.fspath(path)
@@ -450,27 +453,48 @@ def check_mcp_config(path):
         ) from None
     try:
         info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise BridgeError("the mcp_config file is not a regular file")
+        if info.st_uid != os.getuid():
+            raise BridgeError("the mcp_config file is not owned by you")
+        if info.st_mode & 0o077:
+            raise BridgeError(
+                "the mcp_config file is accessible to others; chmod 600 it")
+        if info.st_size > MCP_CONFIG_MAX_BYTES:
+            raise BridgeError("the mcp_config file is too large")
+        os.set_blocking(fd, True)
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MCP_CONFIG_MAX_BYTES:
+                raise BridgeError("the mcp_config file is too large")
+            chunks.append(chunk)
     except OSError as exc:
         raise BridgeError(
             f"cannot read the mcp_config file: {exc.strerror or 'error'}"
         ) from None
     finally:
         os.close(fd)
-    if not stat.S_ISREG(info.st_mode):
-        raise BridgeError("the mcp_config file is not a regular file")
-    if info.st_uid != os.getuid():
-        raise BridgeError("the mcp_config file is not owned by you")
-    if info.st_mode & 0o077:
-        raise BridgeError(
-            "the mcp_config file is accessible to others; chmod 600 it")
-    return path
+    return b"".join(chunks)
+
+
+def check_mcp_config(path):
+    """Check `path` as `read_mcp_config` does and return it as a string."""
+    read_mcp_config(path)
+    return os.fspath(path)
 
 
 def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
-                   disallowed, mcp_config=None):
+                   disallowed, mcp_config=None, strict_mcp=False):
     no_tools = [] if allowed else ["--append-system-prompt", NO_TOOLS_NOTE]
-    servers = ([] if mcp_config is None
-               else ["--mcp-config", str(mcp_config), "--strict-mcp-config"])
+    servers = []
+    if mcp_config is not None:
+        servers = ["--mcp-config", str(mcp_config), "--strict-mcp-config"]
+    elif strict_mcp:       # no config file and strict: no MCP server at all
+        servers = ["--strict-mcp-config"]
     return [
         claude_bin(), "-p",
         "--model", model,
@@ -649,7 +673,8 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
              timeout, attempt, disallowed, connect_delay, required=None,
-             accept_partial=False, exact_args=False, mcp_config=None):
+             accept_partial=False, exact_args=False, mcp_config=None,
+             max_calls=None, strict_mcp=False):
     """One claude run. Returns (results, final result event, partial).
 
     Raises BridgeError. partial is True only when accept_partial let a
@@ -657,8 +682,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     """
     # Refused before any run dir or process exists; nothing is logged.
     _check_guards(base_dir)
-    if mcp_config is not None:
-        mcp_config = check_mcp_config(mcp_config)
+    mcp_bytes = read_mcp_config(mcp_config) if mcp_config is not None else None
     started = time.monotonic()
     span = sleepclock.Span()
     result_event = None
@@ -673,15 +697,24 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         allowlist = run_dir / "allowlist.json"
         settings = run_dir / "settings.json"
         _write_private(allowlist, json.dumps(
-            {"tools": tools, "exact_args": bool(exact_args)}))
+            {"tools": tools, "exact_args": bool(exact_args),
+             "max_calls": max_calls}))
         _write_private(settings, json.dumps({"hooks": {"PreToolUse": [{
             "matcher": ".*",
             "hooks": [{"type": "command", "command": _hook_command(allowlist)}],
         }]}}))
         allowed = ([SEARCH_TOOL] + sorted(tools)) if tools else []
+        mcp_copy = None
+        if mcp_bytes is not None:
+            # The run reads a private copy of the bytes that were checked, so
+            # the file cannot change between the check and claude's read.
+            mcp_copy = run_dir / "mcp-config.json"
+            fd = os.open(mcp_copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(mcp_bytes)
         cmd = _build_command(
             model, settings, allowed, max_turns, max_budget_usd, disallowed,
-            mcp_config,
+            mcp_copy, strict_mcp,
         )
         returncode, stdout = _spawn(cmd, prompt, run_dir, timeout, connect_delay)
         events, parsed_ok = _parse_stream(stdout)
@@ -705,6 +738,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
 
         known = set(tools) | ALLOWED_BUILTINS | set(disallowed.split(","))
         issued = {}  # tool_use id -> (name, input, allowed), calls actually made
+        allowed_calls = {}  # tool name -> allowed calls seen (for max_calls)
         results = []
         saw_init = False
         streamed_denials = 0
@@ -736,6 +770,10 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     tool_input = block.get("input")
                     tool_input = tool_input if isinstance(tool_input, dict) else {}
                     ok = _call_allowed(name, tool_input, tools, exact_args)
+                    if ok and max_calls is not None and name in tools:
+                        allowed_calls[name] = allowed_calls.get(name, 0) + 1
+                        if allowed_calls[name] > max_calls:
+                            ok = False   # beyond the cap: the hook must deny it
                     streamed_denials += not ok
                     issued[block.get("id")] = (name, tool_input, ok)
             elif kind == "user":
@@ -803,7 +841,8 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
                connect_delay=CONNECT_DELAY_SECONDS, required=None,
-               accept_partial=False, exact_args=False, mcp_config=None):
+               accept_partial=False, exact_args=False, mcp_config=None,
+               max_calls=None):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -834,6 +873,13 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     are loaded. The allowlist hook and the stream re-check still restrict the
     run to the pinned tools. A bad file raises BridgeError before any run.
 
+    max_calls: None (default, unchanged: the model may call an allowlisted
+    tool as often as it likes). A positive integer caps the ALLOWED calls of
+    each pinned tool in one run: the hook claims one marker file per allowed
+    call in the 0700 run directory and denies the next, and the stream
+    re-check fails the run if a call beyond the cap ran anyway. Use 1 for a
+    write that must not happen twice.
+
     Hook-denied calls (e.g. Read) never produce results and do not fail the
     run; only a count is recorded in the usage log.
 
@@ -847,6 +893,10 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
         raise BridgeDryRun("dry-run: claude bridge not invoked")
     if mcp_config is not None:
         mcp_config = check_mcp_config(mcp_config)
+    if max_calls is not None and (not isinstance(max_calls, int)
+                                  or isinstance(max_calls, bool)
+                                  or max_calls < 1):
+        raise BridgeError("max_calls must be a positive integer")
     needed = list(tools) if required is None else list(required)
     unknown = [name for name in needed if name not in tools]
     if unknown:
@@ -862,7 +912,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
             connect_delay=connect_delay, required=needed,
             accept_partial=accept_partial, exact_args=exact_args,
-            mcp_config=mcp_config,
+            mcp_config=mcp_config, max_calls=max_calls,
         )
         if all(any(r["name"] == name and not r["is_error"] for r in results)
                for name in needed):
@@ -876,12 +926,16 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
 
 
 def complete(prompt, *, model, base_dir, max_turns=1, max_budget_usd=0.25,
-             timeout=300, disallowed_tools=DEFAULT_DISALLOWED_TOOLS):
-    """No-tools completion: returns the model's final text, fails on any tool use."""
+             timeout=300, disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
+             strict_mcp=False):
+    """No-tools completion: returns the model's final text, fails on any tool use.
+
+    strict_mcp: False (default, unchanged). True adds `--strict-mcp-config`
+    with no config file, so the run loads no MCP server at all."""
     _, result_event, _ = _attempt(
         prompt, {}, model=model, base_dir=base_dir, max_turns=max_turns,
         max_budget_usd=max_budget_usd, timeout=timeout, attempt=1,
-        disallowed=disallowed_tools, connect_delay=0,
+        disallowed=disallowed_tools, connect_delay=0, strict_mcp=strict_mcp,
     )
     text = result_event.get("result")
     if not isinstance(text, str) or not text.strip():

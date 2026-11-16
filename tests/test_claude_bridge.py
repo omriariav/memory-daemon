@@ -679,7 +679,10 @@ class McpConfigTest(BridgeBase):
         out = self.call(mcp_config=str(path))
         self.assertEqual(out[0]["name"], TOOL_A)
         argv = self.argv()
-        self.assertEqual(argv[argv.index("--mcp-config") + 1], str(path))
+        # claude reads a private copy of the checked bytes, not the original
+        copy = argv[argv.index("--mcp-config") + 1]
+        self.assertTrue(copy.endswith("/mcp-config.json"))
+        self.assertNotEqual(copy, str(path))
         self.assertEqual(argv.count("--strict-mcp-config"), 1)
         self.assertEqual(argv.index("--strict-mcp-config"),
                          argv.index("--mcp-config") + 2)
@@ -761,6 +764,39 @@ class McpConfigTest(BridgeBase):
             claude_bridge.check_mcp_config(str(path))
         self.assertEqual(len(seen), 1)
 
+    def test_claude_gets_a_private_copy_of_the_checked_bytes(self):
+        path = self.make()
+        original = path.read_bytes()
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            copy = Path(cmd[cmd.index("--mcp-config") + 1])
+            seen["copy"] = copy
+            seen["bytes"] = copy.read_bytes()
+            seen["mode"] = stat.S_IMODE(copy.stat().st_mode)
+            seen["dir_mode"] = stat.S_IMODE(copy.parent.stat().st_mode)
+            path.write_text('{"mcpServers": {"evil": {}}}')   # swapped after the check
+            seen["after"] = copy.read_bytes()
+            return 0, good_stream()
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            self.call(mcp_config=str(path))
+        self.assertEqual(seen["bytes"], original)
+        self.assertEqual(seen["after"], original)           # the copy is unaffected
+        self.assertEqual((seen["mode"], seen["dir_mode"]), (0o600, 0o700))
+        self.assertNotEqual(seen["copy"], path)
+        self.assertFalse(seen["copy"].exists())             # removed with the run dir
+
+    def test_read_mcp_config_returns_the_bytes_and_caps_the_size(self):
+        path = self.make()
+        self.assertEqual(claude_bridge.read_mcp_config(path),
+                         b'{"mcpServers": {}}')
+        big = self.root / "big.json"
+        big.write_bytes(b"x" * (claude_bridge.MCP_CONFIG_MAX_BYTES + 1))
+        os.chmod(big, 0o600)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_config(big)
+        self.assertIn("too large", str(ctx.exception))
+
     def test_dry_run_and_empty_tools_still_refuse_first(self):
         path = self.make()
         with self.assertRaises(claude_bridge.BridgeDryRun):
@@ -778,6 +814,195 @@ class McpConfigTest(BridgeBase):
         self.assertEqual(self.invocations(), 2)
         for argv_n in (1, 2):
             self.assertIn("--mcp-config", self.argv(argv_n))
+
+
+class MaxCallsTest(BridgeBase):
+    """`call_tools(..., max_calls=N)`: the hook allows N calls of a pinned
+    tool and denies the next; the stream re-check fails a run in which a call
+    beyond the cap ran anyway. The default (None) is unchanged."""
+
+    def call(self, tools=None, **kw):
+        kw.setdefault("base_dir", self.base)
+        kw.setdefault("connect_delay", 0)
+        return claude_bridge.call_tools(
+            SECRET_PROMPT, tools if tools is not None else {TOOL_A: {"q": "x"}},
+            **kw)
+
+    def twice(self, second_error=False):
+        return (init()
+                + tool_use("t1", "ToolSearch", {"query": f"select:{TOOL_A}"})
+                + tool_result("t1", "ok")
+                + tool_use("t2", TOOL_A, {"q": "x"}) + tool_result("t2", "sent")
+                + tool_use("t3", TOOL_A, {"q": "x"})
+                + tool_result("t3", "denied" if second_error else "sent again",
+                              is_error=second_error)
+                + result())
+
+    def test_the_default_allows_repeated_calls_as_before(self):
+        self.stream(self.twice())
+        out = self.call()
+        self.assertEqual([r["text"] for r in out], ["sent", "sent again"])
+
+    def test_a_second_call_that_ran_anyway_fails_the_run(self):
+        self.stream(self.twice())
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(max_calls=1)
+        self.assertIn("ran despite allowlist check", str(ctx.exception))
+
+    def test_a_second_call_the_hook_denied_is_ignored(self):
+        self.stream(self.twice(second_error=True))
+        out = self.call(max_calls=1)
+        self.assertEqual([r["text"] for r in out], ["sent"])    # one result only
+
+    def test_two_allowed_calls_pass_with_a_cap_of_two(self):
+        self.stream(self.twice())
+        self.assertEqual(len(self.call(max_calls=2)), 2)
+
+    def test_a_call_with_other_pins_does_not_use_the_slot(self):
+        stream = (init()
+                  + tool_use("t2", TOOL_A, {"q": "other"}) + tool_result(
+                      "t2", "denied", is_error=True)
+                  + tool_use("t3", TOOL_A, {"q": "x"}) + tool_result("t3", "sent")
+                  + result())
+        self.stream(stream)
+        out = self.call(max_calls=1)
+        self.assertEqual([r["text"] for r in out], ["sent"])
+
+    def test_bad_values_are_refused_before_any_run(self):
+        for bad in (0, -1, True, 1.5, "1"):
+            with self.assertRaises(claude_bridge.BridgeError):
+                self.call(max_calls=bad)
+        self.assertEqual(self.invocations(), 0)
+
+    def test_the_cap_travels_in_the_allowlist_file(self):
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            settings_path = Path(cmd[cmd.index("--settings") + 1])
+            seen["doc"] = json.loads((settings_path.parent / "allowlist.json")
+                                     .read_text())
+            return 0, good_stream()
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            self.call(max_calls=1, exact_args=True)
+            self.call()
+        self.assertEqual(seen["doc"]["max_calls"], None)       # the last (default) call
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            self.call(max_calls=1, exact_args=True)
+        self.assertEqual(seen["doc"], {"tools": {TOOL_A: {"q": "x"}},
+                                       "exact_args": True, "max_calls": 1})
+
+
+class HookMaxCallsTest(unittest.TestCase):
+    """claude_bridge_hook.main: with `max_calls` in the allowlist file the
+    hook claims one marker per allowed call in the run directory."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        os.chmod(self.dir, 0o700)
+        self.path = self.dir / "allowlist.json"
+
+    def run_hook(self, name, tool_input, max_calls=1, tools=None):
+        self.path.write_text(json.dumps({
+            "tools": tools or {TOOL_A: {"q": "x"}, TOOL_B: {}},
+            "exact_args": True, "max_calls": max_calls}))
+        out = io.StringIO()
+        payload = io.StringIO(json.dumps({"tool_name": name,
+                                          "tool_input": tool_input}))
+        with redirect_stdout(out):
+            code = claude_bridge_hook.main(["hook", str(self.path)], payload)
+        decision = json.loads(out.getvalue())["hookSpecificOutput"]
+        return code, decision["permissionDecision"], decision["permissionDecisionReason"]
+
+    def test_the_second_identical_call_is_denied(self):
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x"})[:2], (0, "allow"))
+        code, decision, reason = self.run_hook(TOOL_A, {"q": "x"})
+        self.assertEqual((code, decision), (0, "deny"))
+        self.assertIn("at most 1 time(s)", reason)
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x"})[1], "deny")
+
+    def test_a_denied_call_does_not_use_a_slot_and_slots_are_per_tool(self):
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "other"})[1], "deny")   # pin
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x", "extra": 1})[1], "deny")
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x"})[1], "allow")      # still free
+        self.assertEqual(self.run_hook(TOOL_B, {})[1], "allow")              # own slot
+        self.assertEqual(self.run_hook(TOOL_B, {})[1], "deny")
+
+    def test_a_cap_of_three_allows_three(self):
+        got = [self.run_hook(TOOL_A, {"q": "x"}, max_calls=3)[1] for _ in range(4)]
+        self.assertEqual(got, ["allow", "allow", "allow", "deny"])
+
+    def test_tool_search_is_not_counted(self):
+        for _ in range(3):
+            self.assertEqual(self.run_hook(
+                "ToolSearch", {"query": f"select:{TOOL_A}"})[1], "allow")
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x"})[1], "allow")
+
+    def test_without_max_calls_nothing_is_counted_and_no_marker_is_written(self):
+        self.path.write_text(json.dumps({"tools": {TOOL_A: {}}, "exact_args": False}))
+        for _ in range(3):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                claude_bridge_hook.main(["hook", str(self.path)], io.StringIO(
+                    json.dumps({"tool_name": TOOL_A, "tool_input": {}})))
+            self.assertEqual(json.loads(out.getvalue())["hookSpecificOutput"]
+                             ["permissionDecision"], "allow")
+        self.assertFalse((self.dir / "calls").exists())
+
+    def test_a_bad_cap_in_the_file_denies_everything(self):
+        for bad in (0, -2, True, "1", 1.5):
+            self.assertEqual(self.run_hook(TOOL_A, {"q": "x"}, max_calls=bad)[:2],
+                             (2, "deny"), repr(bad))
+
+    def test_markers_are_private_and_unreadable_dir_fails_closed(self):
+        self.run_hook(TOOL_A, {"q": "x"})
+        marks = list((self.dir / "calls").iterdir())
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(stat.S_IMODE(marks[0].stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.dir / "calls").stat().st_mode), 0o700)
+        blocker = self.dir / "calls"
+        for m in marks:
+            m.unlink()
+        blocker.rmdir()
+        blocker.write_text("not a directory")                 # cannot claim
+        self.assertEqual(self.run_hook(TOOL_A, {"q": "x"})[:2], (2, "deny"))
+
+    def test_the_real_bridge_denies_a_second_call_through_the_hook(self):
+        # end to end with the hook as claude would run it: two processes
+        import subprocess
+        tools = {TOOL_A: {"q": "x"}}
+        self.path.write_text(json.dumps(
+            {"tools": tools, "exact_args": True, "max_calls": 1}))
+        payload = json.dumps({"tool_name": TOOL_A, "tool_input": {"q": "x"}})
+        got = []
+        for _ in range(2):
+            proc = subprocess.run(
+                [sys.executable, "-I", str(claude_bridge.HOOK_PATH), str(self.path)],
+                input=payload, capture_output=True, text=True)
+            got.append(json.loads(proc.stdout)["hookSpecificOutput"]
+                       ["permissionDecision"])
+        self.assertEqual(got, ["allow", "deny"])
+
+
+class StrictMcpCompleteTest(BridgeBase):
+    def test_default_complete_argv_is_unchanged(self):
+        self.stream(init() + result(text="x"))
+        claude_bridge.complete("p", model="sonnet", base_dir=self.base)
+        argv = self.argv()
+        self.assertNotIn("--strict-mcp-config", argv)
+        self.assertNotIn("--mcp-config", argv)
+
+    def test_strict_mcp_loads_no_server_and_stays_a_no_tools_run(self):
+        self.stream(init() + result(text="rewritten"))
+        out = claude_bridge.complete("p", model="sonnet", base_dir=self.base,
+                                     strict_mcp=True)
+        self.assertEqual(out, "rewritten")
+        argv = self.argv()
+        self.assertEqual(argv.count("--strict-mcp-config"), 1)
+        self.assertNotIn("--mcp-config", argv)
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "")
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "1")
 
 
 class CompleteTest(BridgeBase):
