@@ -507,6 +507,7 @@ class RunRsvpTest(unittest.TestCase):
         self.assertEqual(tools, {TOOL: {"eid": EVENT, "cid": CAL, "resp": "declined"}})
         self.assertEqual(kw["attempts"], 1)          # a write is never retried
         self.assertIs(kw["exact_args"], True)        # no argument beyond the pins
+        self.assertEqual(kw["max_calls"], 1)         # the model cannot answer twice
         self.assertEqual(kw["base_dir"], "/base")
         self.assertEqual(kw["model"], "haiku")
         self.assertEqual(kw["timeout"], 60.0)

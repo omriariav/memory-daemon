@@ -738,7 +738,14 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
 
         known = set(tools) | ALLOWED_BUILTINS | set(disallowed.split(","))
         issued = {}  # tool_use id -> (name, input, allowed), calls actually made
-        allowed_calls = {}  # tool name -> allowed calls seen (for max_calls)
+        # max_calls bookkeeping, per capped tool (a pinned tool whose call
+        # passed its pins). The hook gives a slot to whichever process asks
+        # first, which need not be the first call in the stream, so the cap is
+        # judged on RESULTS, never on stream order.
+        issued_counts = {}   # name -> calls issued that passed their pins
+        good_counts = {}     # name -> non-error results
+        first_error = {}     # name -> content of the first error result
+        error_rows = {}      # name -> its error rows (dropped on a denial)
         results = []
         saw_init = False
         streamed_denials = 0
@@ -770,18 +777,18 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     tool_input = block.get("input")
                     tool_input = tool_input if isinstance(tool_input, dict) else {}
                     ok = _call_allowed(name, tool_input, tools, exact_args)
-                    if ok and max_calls is not None and name in tools:
-                        allowed_calls[name] = allowed_calls.get(name, 0) + 1
-                        if allowed_calls[name] > max_calls:
-                            ok = False   # beyond the cap: the hook must deny it
+                    counted = bool(ok and max_calls is not None
+                                   and name in tools)
+                    if counted:
+                        issued_counts[name] = issued_counts.get(name, 0) + 1
                     streamed_denials += not ok
-                    issued[block.get("id")] = (name, tool_input, ok)
+                    issued[block.get("id")] = (name, tool_input, ok, counted)
             elif kind == "user":
                 for block in _content_blocks(event):
                     if block.get("type") != "tool_result":
                         continue
-                    name, tool_input, ok = issued.get(
-                        block.get("tool_use_id"), (None, None, True)
+                    name, tool_input, ok, counted = issued.get(
+                        block.get("tool_use_id"), (None, None, True, False)
                     )
                     if name is None:
                         continue
@@ -796,6 +803,19 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                             )
                         continue
                     if name == SEARCH_TOOL:
+                        continue
+                    if counted:
+                        row = {
+                            "name": name, "input": tool_input,
+                            "text": _result_text(block.get("content")),
+                            "is_error": is_error,
+                        }
+                        results.append(row)
+                        if is_error:
+                            first_error.setdefault(name, row["text"])
+                            error_rows.setdefault(name, []).append(row)
+                        else:
+                            good_counts[name] = good_counts.get(name, 0) + 1
                         continue
                     # A failed required call fails the run; a failed optional
                     # one (e.g. one detail lookup) is returned marked is_error.
@@ -813,6 +833,30 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                     })
         if not saw_init:
             raise BridgeError("claude stream had no init event")
+        for name, issued_n in issued_counts.items():
+            good = good_counts.get(name, 0)
+            if good > max_calls:
+                raise BridgeError(
+                    f"tool call ran despite allowlist check: "
+                    f"{_safe_name(name, known)}")
+            streamed_denials += max(0, issued_n - max_calls)
+            errors = error_rows.get(name, [])
+            if issued_n > max_calls and good:
+                # The hook denied the extra call(s): those error results are
+                # denials, not tool errors, and the run is judged on the call
+                # that ran.
+                results[:] = [r for r in results
+                              if not any(r is e for e in errors)]
+            elif errors and not good and name in needed:
+                if issued_n > max_calls:
+                    # Some of these were denials and nothing confirms the
+                    # rest: whether the tool ran is unknown.
+                    raise BridgeError(
+                        f"tool results unclear after {issued_n} calls: "
+                        f"{_safe_name(name, known)}")
+                raise BridgeError(
+                    f"tool returned an error: {name}"
+                    + _error_category(first_error[name]))
         denials = max(denials, streamed_denials)
         complete_run = all(
             any(r["name"] == n and not r["is_error"] for r in results)

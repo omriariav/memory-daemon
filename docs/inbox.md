@@ -533,8 +533,10 @@ not available yet", as in 0.5.0.
    if one ran anyway). `attempts=1`: a send is never retried, and
    `max_calls=1` allows ONE call of the tool in the run: the hook claims a
    marker file per allowed call in the 0700 run directory and denies the next,
-   and the stream re-check fails the run if a second call ran anyway, so the
-   model cannot post twice. The prompt
+   and the stream re-check fails the run if a second call returned a real
+   result (the cap is judged on results, so a race in which the hook denied the
+   first call and let the second run still reads as one send), so the model
+   cannot post twice. The prompt
    carries the tool name and the pinned values only. The bridge guards apply
    first (`state/PAUSED`, the daily budget); spend is logged as `inbox-send`.
 6. **Result.** Success needs a real, non-error result of the pinned call

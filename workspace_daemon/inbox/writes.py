@@ -288,7 +288,10 @@ def pinned_prompt(cfg, pins):
     )
 
 
-_POSITIVE_TS = re.compile(r"\b\d{9,11}\.\d{6}\b")
+# Generic signs that a message was posted: a Slack timestamp, or a permalink
+# (/archives/<channel>/p<16 digits>).
+_POSITIVE_TS = re.compile(
+    r"\b\d{9,11}\.\d{6}\b|/archives/[A-Z0-9]{9,13}/p\d{16}\b")
 _ERRORISH = re.compile(
     r"\b(errors?|failed|failure|denied|forbidden|unauthori[sz]ed|exception"
     r"|traceback|not[_ ]in[_ ]channel|channel[_ ]not[_ ]found|invalid[_ ]auth"
@@ -298,8 +301,8 @@ _ERRORISH = re.compile(
 def reply_state(text):
     """How much a write tool's reply confirms: `failed` (a JSON object with an
     error or ok/success false), `unconfirmed` (plain text that reads like an
-    error and carries no Slack timestamp, the one generic sign of a posted
-    message) or `ok`. Config-agnostic: a JSON object without a failure
+    error and carries no Slack timestamp or permalink, the generic signs of a
+    posted message) or `ok`. Config-agnostic: a JSON object without a failure
     marker, and plain text without error words, stay `ok`."""
     if _tool_failure(text):
         return "failed"

@@ -854,6 +854,63 @@ class MaxCallsTest(BridgeBase):
         out = self.call(max_calls=1)
         self.assertEqual([r["text"] for r in out], ["sent"])    # one result only
 
+    def parallel(self, first_error, second_error, texts=("denied", "sent")):
+        """Two identical calls issued together; the results come back in the
+        order given, each one an error or not."""
+        blocks = line({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": TOOL_A, "input": {"q": "x"}},
+            {"type": "tool_use", "id": "t3", "name": TOOL_A, "input": {"q": "x"}}]}})
+        return (init()
+                + tool_use("t1", "ToolSearch", {"query": f"select:{TOOL_A}"})
+                + tool_result("t1", "ok") + blocks
+                + tool_result("t2", texts[0], is_error=first_error)
+                + tool_result("t3", texts[1], is_error=second_error)
+                + result())
+
+    def test_parallel_calls_where_only_the_second_ran_is_a_success(self):
+        # The hook gave the slot to the second process: call #1 was denied
+        # (an error result), call #2 ran. The slot is not decided by stream
+        # order, so this is the one real send, not "tool returned an error".
+        self.stream(self.parallel(True, False))
+        out = self.call(max_calls=1)
+        self.assertEqual([(r["text"], r["is_error"]) for r in out],
+                         [("sent", False)])
+
+    def test_parallel_calls_where_only_the_first_ran_is_a_success(self):
+        self.stream(self.parallel(False, True, texts=("sent", "denied")))
+        out = self.call(max_calls=1)
+        self.assertEqual([(r["text"], r["is_error"]) for r in out],
+                         [("sent", False)])
+
+    def test_parallel_calls_that_both_ran_fail_the_run(self):
+        self.stream(self.parallel(False, False, texts=("sent", "sent again")))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(max_calls=1)
+        self.assertIn("ran despite allowlist check", str(ctx.exception))
+
+    def test_parallel_calls_with_no_result_left_are_unclear_not_an_error(self):
+        self.stream(self.parallel(True, True, texts=("denied", "denied")))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(max_calls=1)
+        message = str(ctx.exception)
+        self.assertIn("unclear after 2 calls", message)
+        self.assertNotIn("tool returned an error", message)
+
+    def test_one_call_that_errors_is_still_a_plain_tool_error(self):
+        stream = (init()
+                  + tool_use("t2", TOOL_A, {"q": "x"})
+                  + tool_result("t2", "invalid_auth", is_error=True) + result())
+        self.stream(stream)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(max_calls=1)
+        self.assertIn("tool returned an error", str(ctx.exception))
+
+    def test_without_a_cap_an_error_result_still_fails_at_once(self):
+        self.stream(self.parallel(True, False))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call()
+        self.assertIn("tool returned an error", str(ctx.exception))
+
     def test_two_allowed_calls_pass_with_a_cap_of_two(self):
         self.stream(self.twice())
         self.assertEqual(len(self.call(max_calls=2)), 2)

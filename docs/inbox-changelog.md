@@ -46,8 +46,12 @@ W Z`).
 - A write can no longer run twice. `call_tools(..., max_calls=None)` caps the
   allowed calls of each pinned tool in a run (default unchanged for the
   daemon); send, react and RSVP pass `1`. The hook claims one marker file per
-  allowed call in the 0700 run directory and denies the next; the stream
-  re-check fails a run in which a call beyond the cap ran. A real send is never
+  allowed call in the 0700 run directory and denies the next (to whichever
+  call asks first, not necessarily the first in the stream); the stream
+  re-check judges the cap on results: it fails a run only when more calls
+  returned a real result than the cap allows, ignores the error results of
+  calls the hook denied, and when nothing confirms the call it raises an
+  "unclear" error that reads "may have been sent, check Slack". A real send is never
   reported as "not sent": when one result confirms it and another does not the
   toast says "sent at least once; check Slack", and a plain-text reply that
   reads like an error (and carries no Slack timestamp) is "unconfirmed: may not

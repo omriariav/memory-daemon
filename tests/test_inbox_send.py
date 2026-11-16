@@ -256,6 +256,44 @@ class RunSendTest(unittest.TestCase):
                         call_tools=good_call(calls))
         self.assertIn("שלום עולם", calls[0][0])
 
+    def test_a_race_where_only_the_second_call_ran_reports_a_sent_message(self):
+        # through the real bridge: call #1 was denied by the hook, call #2 ran
+        pins = writes.send_pins(cfg(), self.target(), "Hello")[TOOL]
+        blocks = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a", "name": TOOL, "input": dict(pins)},
+            {"type": "tool_use", "id": "b", "name": TOOL, "input": dict(pins)}]}}
+
+        def event(kind, content):
+            return {"type": kind, "message": {"content": content}}
+        stream = "\n".join(json.dumps(e) for e in [
+            {"type": "system", "subtype": "init", "tools": ["ToolSearch"]},
+            event("assistant", [{"type": "tool_use", "id": "s", "name": "ToolSearch",
+                                 "input": {"query": f"select:{TOOL}"}}]),
+            event("user", [{"type": "tool_result", "tool_use_id": "s",
+                            "content": "ok"}]),
+            blocks,
+            event("user", [{"type": "tool_result", "tool_use_id": "a",
+                            "is_error": True, "content": "denied by hook"}]),
+            event("user", [{"type": "tool_result", "tool_use_id": "b",
+                            "content": "Message sent"}]),
+            {"type": "result", "subtype": "success", "is_error": False,
+             "num_turns": 3, "permission_denials": [], "result": "done"}]) + "\n"
+        with mock.patch.object(claude_bridge, "_spawn",
+                               lambda *a, **k: (0, stream)), \
+                mock.patch.object(claude_bridge, "claude_bin", lambda: "claude"), \
+                tempfile.TemporaryDirectory() as tmp:
+            out = writes.run_send(cfg(), tmp, self.target(), "Hello")
+        self.assertEqual(out, writes.Outcome(True, ""))
+
+    def test_unclear_results_after_repeated_calls_say_may_have_been_sent(self):
+        def unclear(*a, **k):
+            raise claude_bridge.BridgeError(
+                "tool results unclear after 2 calls: " + TOOL)
+        out = writes.run_send(cfg(), "/b", self.target(), "x", call_tools=unclear)
+        self.assertFalse(out.ok)
+        self.assertIn("may have been sent, check Slack", out.detail)
+        self.assertNotIn("not sent", out.detail)
+
     def test_the_hook_denies_extra_arguments_and_changed_values(self):
         pins = writes.send_pins(cfg(), self.target(), "Hello")
         ok = {"tool_name": TOOL, "tool_input": dict(pins[TOOL])}
@@ -494,6 +532,8 @@ class MaxCallsAndMessagesTest(unittest.TestCase):
             self.assertIn("looks like an error", out.detail)
             self.assertIn("may not have been sent; check Slack", out.detail)
         for text in ("Message sent", "OK", "Done.", "posted",
+                     "Error log updated: https://example.com/archives/"
+                     "C0EXAMPLE01/p1893492000000100",
                      "Sent: ts 1893492000.000100",
                      "error handling doc posted, ts=1893492000.000100",
                      '{"ok": true}', '{"result": "queued"}', ""):
