@@ -1122,11 +1122,6 @@ def _gmail_fetch(routine, source, candidate):
             "email_subject": subject,
             "email_date": headers.get("date", ""),
             "gmail_labels": gmail_labels,
-            # Gmail's own snippet when the read reports one (for the inbox
-            # row); redacted like the subject. Left out when absent.
-            **({"gmail_snippet": chat_text.redact_secrets(msg["snippet"])}
-               if isinstance(msg.get("snippet"), str)
-               and msg["snippet"].strip() else {}),
             "gmail_manual_chat_followup": manual_chat_followup,
             "gmail_chat_followup_managed": managed_chat_followup,
             "gmail_chat_followup_active": chat_followup_active,
@@ -1134,6 +1129,12 @@ def _gmail_fetch(routine, source, candidate):
             "source_people_truncated": source_people_truncated,
         },
     }
+    snippet = msg.get("snippet")
+    if isinstance(snippet, str) and snippet.strip():
+        # Gmail's own snippet (a short excerpt of the body) for the inbox row,
+        # redacted like the subject. It rides beside the item, never in the
+        # note frontmatter, and only the capture event reads it.
+        item["gmail_snippet"] = chat_text.redact_secrets(snippet)
     if thread_messages is not None:
         item["frontmatter"].update({
             "gmail_thread_message_count": len(thread_messages),

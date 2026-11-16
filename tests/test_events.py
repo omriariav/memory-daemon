@@ -111,9 +111,14 @@ class BuildTest(unittest.TestCase):
                           ("x" * 120, "x" * 80)):
             self.assertEqual(
                 make(details={"mail_from": raw})["details"]["mail_from"], want)
-        for bad in ("ann@example.com", "<ann@example.com>", "Ann ann@example.com",
+        for bad in ("annexample.com\uff20", "Ann \uff20 Example", "x\ufe6by",
+                    "ann@example.com", "<ann@example.com>", "Ann ann@example.com",
                     "", "  ", 5, None, ["a"]):
             self.assertNotIn("details", make(details={"mail_from": bad}), bad)
+
+    def test_a_fullwidth_at_inside_angle_brackets_is_stripped(self):
+        self.assertEqual(make(details={"mail_from": "Ann <ann\uff20example.com>"})
+                         ["details"]["mail_from"], "Ann")
 
     def test_bad_mail_fields_are_dropped(self):
         for bad in ({"mail_subject": ""}, {"mail_subject": 4},

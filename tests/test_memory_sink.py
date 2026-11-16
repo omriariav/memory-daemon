@@ -1839,8 +1839,8 @@ class CaptureEventsTest(unittest.TestCase):
         self.item["frontmatter"] = {
             "gmail_message_id": "m1", "gmail_thread_id": "18c0ffee12345678",
             "email_from": "Ann Example <ann@example.com>",
-            "email_subject": "Quarterly plan",
-            "gmail_snippet": "A short snippet from Gmail", "gmail_labels": []}
+            "email_subject": "Quarterly plan", "gmail_labels": []}
+        self.item["gmail_snippet"] = "A short snippet from Gmail"
         row = self._capture()[-1]
         self.assertEqual(row["details"], {
             "mail_from": "Ann Example", "mail_subject": "Quarterly plan",
@@ -1848,6 +1848,15 @@ class CaptureEventsTest(unittest.TestCase):
             "mail_thread_id": "18c0ffee12345678"})
         self.assertNotIn("SECRET BODY", json.dumps(row))
         self.assertNotIn("@", json.dumps(row["details"]))
+
+    def test_a_snippet_in_the_frontmatter_is_not_used(self):
+        # only the item-level snippet (set by the fetch) reaches the event
+        self.item["id"] = "gmail:t1"
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "email_subject": "Only a subject",
+            "gmail_snippet": "must not be read from here"}
+        row = self._capture()[-1]
+        self.assertNotIn("mail_snippet", row["details"])
 
     def test_mail_capture_leaves_out_a_field_the_source_did_not_give(self):
         self.setUp_labels()

@@ -613,7 +613,7 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertTrue(meta["gmail_chat_followup_active"])
         self.assertEqual(meta["gmail_labels"], ["INBOX", "SENT", "STARRED"])
 
-    def test_gmail_frontmatter_carries_the_snippet_when_the_read_has_one(self):
+    def test_the_snippet_rides_beside_the_item_never_in_the_frontmatter(self):
         def read(mid, **extra):
             return dict({
                 "headers": {"subject": "Plan", "from": "Ann <ann@example.com>",
@@ -622,11 +622,14 @@ class RunnerWiringTest(unittest.TestCase):
         r = routine(self.vault)
         cand = {"id": "m3", "raw": {"thread_id": "thread-3"}}
         gmail.read_message = lambda mid: read(mid, snippet="Gmail's own snippet")
-        meta = runner._gmail_fetch(r, r["source"], cand)["frontmatter"]
-        self.assertEqual(meta["gmail_snippet"], "Gmail's own snippet")
+        item = runner._gmail_fetch(r, r["source"], cand)
+        self.assertEqual(item["gmail_snippet"], "Gmail's own snippet")
+        self.assertNotIn("gmail_snippet", item["frontmatter"])
+        self.assertNotIn("snippet", json.dumps(item["frontmatter"]).lower())
         gmail.read_message = lambda mid: read(mid)
-        meta = runner._gmail_fetch(r, r["source"], cand)["frontmatter"]
-        self.assertNotIn("gmail_snippet", meta)
+        item = runner._gmail_fetch(r, r["source"], cand)
+        self.assertNotIn("gmail_snippet", item)
+        self.assertNotIn("gmail_snippet", item["frontmatter"])
 
     def test_managed_followup_queue_is_uncapped_and_deduplicated(self):
         calls = []
