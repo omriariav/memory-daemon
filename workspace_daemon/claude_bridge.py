@@ -537,11 +537,11 @@ def _safe_name(name, known):
     return "<invalid>"
 
 
-def _call_allowed(name, tool_input, tools):
+def _call_allowed(name, tool_input, tools, exact_args=False):
     """Re-run the hook's decision for one tool_use; malformed input is a no."""
     try:
         return claude_bridge_hook.decide(
-            {"tool_name": name, "tool_input": tool_input}, tools
+            {"tool_name": name, "tool_input": tool_input}, tools, exact_args
         )[0]
     except ValueError:
         return False
@@ -606,7 +606,7 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
 
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
              timeout, attempt, disallowed, connect_delay, required=None,
-             accept_partial=False):
+             accept_partial=False, exact_args=False):
     """One claude run. Returns (results, final result event, partial).
 
     Raises BridgeError. partial is True only when accept_partial let a
@@ -627,7 +627,8 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
         os.chmod(run_dir, 0o700)
         allowlist = run_dir / "allowlist.json"
         settings = run_dir / "settings.json"
-        _write_private(allowlist, json.dumps({"tools": tools}))
+        _write_private(allowlist, json.dumps(
+            {"tools": tools, "exact_args": bool(exact_args)}))
         _write_private(settings, json.dumps({"hooks": {"PreToolUse": [{
             "matcher": ".*",
             "hooks": [{"type": "command", "command": _hook_command(allowlist)}],
@@ -688,7 +689,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
                         )
                     tool_input = block.get("input")
                     tool_input = tool_input if isinstance(tool_input, dict) else {}
-                    ok = _call_allowed(name, tool_input, tools)
+                    ok = _call_allowed(name, tool_input, tools, exact_args)
                     streamed_denials += not ok
                     issued[block.get("id")] = (name, tool_input, ok)
             elif kind == "user":
@@ -756,7 +757,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                max_budget_usd=0.25, timeout=180, attempts=3, dry_run=False,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
                connect_delay=CONNECT_DELAY_SECONDS, required=None,
-               accept_partial=False):
+               accept_partial=False, exact_args=False):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -773,6 +774,11 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     what was collected instead of raising. The return is always a list
     subclass (ToolResults) whose `.partial` is True in that case, else False.
     A partial run is not retried. Default False: such a stop raises.
+
+    exact_args: when True a call to an allowlisted tool must carry exactly the
+    pinned arguments and no others (the hook and the stream re-check both
+    deny extras). Default False: extra arguments are allowed, as every
+    existing caller relies on. Use it for writes.
 
     Hook-denied calls (e.g. Read) never produce results and do not fail the
     run; only a count is recorded in the usage log.
@@ -799,7 +805,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             max_turns=max_turns, max_budget_usd=max_budget_usd,
             timeout=timeout, attempt=attempt, disallowed=disallowed_tools,
             connect_delay=connect_delay, required=needed,
-            accept_partial=accept_partial,
+            accept_partial=accept_partial, exact_args=exact_args,
         )
         if all(any(r["name"] == name and not r["is_error"] for r in results)
                for name in needed):

@@ -91,6 +91,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(out["rsvp"]["timeout_s"], 60.0)
         self.assertEqual(out["rsvp"]["model"], "haiku")
         self.assertEqual(out["save"], {"argv": ["x"], "timeout_s": 30.0})
+        self.assertEqual(validated({"rsvp": {**RSVP_CFG, "timeout_s": 30}})["rsvp"]["timeout_s"], 30.0)
+        self.assertEqual(validated({"save": {"argv": ["x"], "timeout_s": 5}})["save"]["timeout_s"], 5.0)
 
     def problems(self, block):
         with self.assertRaises(settings.SettingsError) as ctx:
@@ -112,6 +114,8 @@ class SettingsTest(unittest.TestCase):
             ({**good, "args": {**good["args"], "response": "bad name"}},
              "rsvp.args.response"),
             ({**good, "timeout_s": 1}, "rsvp.timeout_s"),
+            ({**good, "timeout_s": 29}, "rsvp.timeout_s"),   # the bridge waits 6 s for connectors
+            ({**good, "timeout_s": 301}, "rsvp.timeout_s"),
             ({**good, "timeout_s": True}, "rsvp.timeout_s"),
             ({**good, "bogus": 1}, "unknown key 'bogus'"),
             ({**good, "model": ""}, "rsvp.model"),
@@ -127,6 +131,7 @@ class SettingsTest(unittest.TestCase):
             ({"argv": []}, "save.argv"),
             ({"argv": ["x", 3]}, "save.argv"),
             ({"argv": ["x"], "timeout_s": 0}, "save.timeout_s"),
+            ({"argv": ["x"], "timeout_s": 4}, "save.timeout_s"),
             ({"argv": ["x"], "timeout_s": 500}, "save.timeout_s"),
             ({"argv": ["x"], "shell": True}, "unknown key 'shell'"),
             (["x"], "save must be a mapping"),
@@ -224,6 +229,153 @@ class InviteTargetTest(unittest.TestCase):
         self.assertTrue(rows[0]["meta"]["when"])
 
 
+class ExactArgsTest(unittest.TestCase):
+    """The bridge's opt-in exact-arguments mode: a pinned call may carry
+    nothing but its pins. The default stays as the daemon's routines use it."""
+    TOOLS = {TOOL: {"eid": EVENT, "cid": CAL, "resp": "accepted"}}
+    EXACT = {"eid": EVENT, "cid": CAL, "resp": "accepted"}
+
+    def call(self, tool_input, **kw):
+        return claude_bridge_hook.decide(
+            {"tool_name": TOOL, "tool_input": tool_input}, self.TOOLS, **kw)
+
+    def test_hook_denies_an_extra_key_in_exact_mode_only(self):
+        extra = dict(self.EXACT, sendUpdates="all")
+        self.assertTrue(self.call(self.EXACT, exact_args=True)[0])
+        allowed, reason = self.call(extra, exact_args=True)
+        self.assertFalse(allowed)
+        self.assertIn("outside its pins", reason)
+        self.assertTrue(self.call(extra)[0])                  # default unchanged
+        self.assertTrue(self.call(extra, exact_args=False)[0])
+
+    def test_hook_main_reads_the_flag_from_the_allowlist_file(self):
+        import io
+        for flag, expected in ((True, "deny"), (False, "allow"), (None, "allow")):
+            with tempfile.TemporaryDirectory() as tmp:
+                doc = {"tools": self.TOOLS}
+                if flag is not None:
+                    doc["exact_args"] = flag
+                path = Path(tmp) / "allow.json"
+                path.write_text(json.dumps(doc))
+                payload = {"tool_name": TOOL,
+                           "tool_input": dict(self.EXACT, comment="hi")}
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    rc = claude_bridge_hook.main(
+                        ["hook", str(path)], io.StringIO(json.dumps(payload)))
+            with self.subTest(flag=flag):
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out.getvalue())["hookSpecificOutput"]
+                                 ["permissionDecision"], expected)
+
+    def test_the_stream_recheck_uses_the_same_rule(self):
+        extra = dict(self.EXACT, comment="hi")
+        self.assertFalse(claude_bridge._call_allowed(TOOL, extra, self.TOOLS, True))
+        self.assertTrue(claude_bridge._call_allowed(TOOL, extra, self.TOOLS))
+        self.assertTrue(claude_bridge._call_allowed(TOOL, self.EXACT, self.TOOLS, True))
+
+    def stream(self, tool_input):
+        events = [
+            {"type": "system", "subtype": "init", "tools": ["ToolSearch", TOOL]},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": TOOL, "input": tool_input}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "done",
+                 "is_error": False}]}},
+            {"type": "result", "subtype": "success", "is_error": False,
+             "permission_denials": []},
+        ]
+        return "\n".join(json.dumps(e) for e in events) + "\n"
+
+    def run_bridge(self, tool_input, **kw):
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, delay):
+            seen["allowlist"] = json.loads((Path(cwd) / "allowlist.json").read_text())
+            return 0, self.stream(tool_input)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(claude_bridge, "_spawn", side_effect=spawn), \
+                mock.patch.object(claude_bridge, "claude_bin", return_value="claude"):
+            result = claude_bridge.call_tools(
+                "p", self.TOOLS, base_dir=tmp, attempts=1, connect_delay=0, **kw)
+        return result, seen["allowlist"]
+
+    def test_a_call_that_ran_with_an_extra_key_fails_the_run_in_exact_mode(self):
+        extra = dict(self.EXACT, sendUpdates="all")
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.run_bridge(extra, exact_args=True)
+        self.assertIn("ran despite allowlist check", str(ctx.exception))
+
+    def test_default_mode_is_unchanged_and_exact_calls_succeed(self):
+        extra = dict(self.EXACT, sendUpdates="all")
+        result, allow = self.run_bridge(extra)
+        self.assertEqual(result[0]["input"], extra)
+        self.assertIs(allow["exact_args"], False)
+        result, allow = self.run_bridge(self.EXACT, exact_args=True)
+        self.assertEqual(result[0]["name"], TOOL)
+        self.assertIs(allow["exact_args"], True)
+
+
+class TermGraceTest(unittest.TestCase):
+    """A timed-out write is asked to stop (SIGTERM) before it is killed."""
+
+    def stub(self, tmp, marker):
+        path = Path(tmp) / "leader.py"
+        path.write_text(textwrap.dedent(f"""
+            import signal, subprocess, sys, time
+            child = subprocess.Popen([sys.executable, "-c", {GRANDCHILD!r}, {str(marker)!r}])
+            time.sleep(0.5)          # let the grandchild install its handler
+            print("started", flush=True)
+            time.sleep(60)
+        """))
+        return [sys.executable, str(path)]
+
+    def run_it(self, grace):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "marker"
+            argv = self.stub(tmp, marker)
+            started = time.monotonic()
+            status, _code, _out, _err = sources._run_capped(
+                argv, 2, stdin_bytes=b"{}", term_grace_s=grace)
+            took = time.monotonic() - started
+            time.sleep(0.3)
+            return status, marker.exists(), took
+
+    def test_the_group_gets_sigterm_and_time_to_clean_up(self):
+        status, cleaned, took = self.run_it(5)
+        self.assertEqual(status, "timeout")
+        self.assertTrue(cleaned, "the grandchild never saw SIGTERM")
+        self.assertLess(took, 8)
+
+    def test_without_a_grace_period_the_kill_is_immediate(self):
+        status, cleaned, _took = self.run_it(0)
+        self.assertEqual(status, "timeout")
+        self.assertFalse(cleaned)
+
+    def test_a_child_that_ignores_sigterm_is_killed_after_the_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stubborn.py"
+            path.write_text("import signal, time\n"
+                            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                            "time.sleep(60)\n")
+            started = time.monotonic()
+            status, *_ = sources._run_capped([sys.executable, str(path)], 1,
+                                             term_grace_s=1)
+            took = time.monotonic() - started
+        self.assertEqual(status, "timeout")
+        self.assertGreater(took, 1.8)       # 1 s timeout + 1 s grace
+        self.assertLess(took, 6)
+
+
+GRANDCHILD = textwrap.dedent("""
+    import signal, sys, time
+    def done(*_):
+        open(sys.argv[1], "w").write("term")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, done)
+    time.sleep(60)
+""")
+
+
 class StoreMarksTest(unittest.TestCase):
     def test_rsvp_mark_hides_and_persists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,6 +400,39 @@ class StoreMarksTest(unittest.TestCase):
             loaded = InboxStore(tmp)
             self.assertFalse(loaded.is_hidden("a"))
             self.assertTrue(loaded.is_hidden("b"))
+
+    def test_rsvp_hides_only_the_answered_instance_of_a_series(self):
+        store = InboxStore(None)
+        first = {"event_id": "weekly_20301105T100000Z"}
+        nxt = {"event_id": "weekly_20301112T100000Z"}
+        store.rsvp("invites:weekly", "accepted", first["event_id"])
+        self.assertTrue(store.is_hidden("invites:weekly", meta=first))
+        self.assertFalse(store.is_hidden("invites:weekly", meta=nxt))
+        store.rsvp("invites:weekly", "declined", nxt["event_id"])   # the next one
+        self.assertTrue(store.is_hidden("invites:weekly", meta=nxt))
+        self.assertEqual(store.rsvp_answer("invites:weekly"), "declined")
+
+    def test_the_event_id_survives_a_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            InboxStore(tmp).rsvp("invites:w", "accepted", "w_20301105T100000Z")
+            again = InboxStore(tmp)
+        self.assertTrue(again.is_hidden("invites:w", meta={"event_id": "w_20301105T100000Z"}))
+        self.assertFalse(again.is_hidden("invites:w", meta={"event_id": "w_20301112T100000Z"}))
+
+    def test_an_answer_the_calendar_never_confirms_shows_the_row_again(self):
+        clock = [1000.0]
+        store = InboxStore(None, clock=lambda: clock[0])
+        store.rsvp("invites:e1", "accepted", "e1")
+        margin = store_mod.RSVP_CONFIRM_MARGIN_S
+        within = {"event_id": "e1", "cache_fetched": 1000.0 + margin - 5}
+        after = {"event_id": "e1", "cache_fetched": 1000.0 + margin + 5}
+        self.assertTrue(store.is_hidden("invites:e1", meta=within))
+        self.assertFalse(store.rsvp_unconfirmed("invites:e1", within))
+        self.assertFalse(store.is_hidden("invites:e1", meta=after))
+        self.assertTrue(store.rsvp_unconfirmed("invites:e1", after))
+        # another instance is simply a different invite, not "unconfirmed"
+        self.assertFalse(store.rsvp_unconfirmed(
+            "invites:e1", {"event_id": "e2", "cache_fetched": 1000.0 + margin + 5}))
 
     def test_saved_mark_does_not_hide(self):
         store = InboxStore(None)
@@ -317,6 +502,7 @@ class RunRsvpTest(unittest.TestCase):
         (tools, kw), = calls
         self.assertEqual(tools, {TOOL: {"eid": EVENT, "cid": CAL, "resp": "declined"}})
         self.assertEqual(kw["attempts"], 1)          # a write is never retried
+        self.assertIs(kw["exact_args"], True)        # no argument beyond the pins
         self.assertEqual(kw["base_dir"], "/base")
         self.assertEqual(kw["model"], "haiku")
         self.assertEqual(kw["timeout"], 60.0)
@@ -474,6 +660,7 @@ class RunSaveTest(unittest.TestCase):
         (argv, timeout), kw = run.call_args
         self.assertEqual(argv, ["save-cmd", "--flag"])    # no item text in argv
         self.assertEqual(timeout, 30.0)
+        self.assertEqual(kw["term_grace_s"], writes.SAVE_TERM_GRACE_S)
         self.assertEqual(json.loads(kw["stdin_bytes"]),
                          {"v": 1, "action": "save", "item": self.item})
 
@@ -536,7 +723,7 @@ class RunSaveTest(unittest.TestCase):
 
     def test_timeout_overflow_exit_and_start_failure(self):
         res, _ = self.run_with(status="timeout", code=-9)
-        self.assertEqual(res.detail, "timed out after 30s")
+        self.assertEqual(res.detail, "timed out after 30s; the save may still complete")
         res, _ = self.run_with(status="overflow")
         self.assertIn("too large", res.detail)
         res, _ = self.run_with(code=3, err=b"boom\n")
@@ -886,6 +1073,92 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class RsvpLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_recurring_series_comes_back_as_its_next_instance(self):
+        store = InboxStore(None)
+        first = invite_item("weekly_20301105T100000Z")
+        fixed = Fixed([first])
+        app = InboxApp(fixed, store, rsvp_actions(store, good_call()),
+                       settings=dict(DEFAULTS), undo_s=0.1, leave_s=0, stream_delay=0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("a")
+            await pilot.pause(0.1)
+            await pilot.press("y")
+            await pilot.pause(1.0)
+            self.assertEqual(app.items, [])
+            self.assertEqual(store.marks["invites:weekly"]["rsvp_event"],
+                             "weekly_20301105T100000Z")
+            fixed.results = [sources.SourceResult(
+                "t", [invite_item("weekly_20301112T100000Z")], False, None, None)]
+            await pilot.press("r")
+            await pilot.pause(0.6)
+            self.assertEqual([i.key for i in app.items], ["invites:weekly"])
+            self.assertEqual(app.items[0].meta["event_id"], "weekly_20301112T100000Z")
+
+    async def test_an_answer_the_calendar_never_confirmed_unhides_with_a_hint(self):
+        now = time.time()
+        for fetched_after, shown in ((now, True), (now - 3590, False)):
+            store = InboxStore(None, clock=lambda: now - 3600)
+            store.rsvp("invites:ev123abc", "accepted", EVENT)
+            store.clock = time.time
+            row = invite_item(cache_fetched=fetched_after)
+            app = make_app([row], LocalActions(store), store, undo_s=30)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                with self.subTest(fetched_after=fetched_after):
+                    self.assertEqual(bool(app.items), shown)
+                    if shown:
+                        self.assertEqual(app.items[0].hint, "RSVP not confirmed by calendar")
+                        text = str(app.query_one("#thread-body").render())
+                        self.assertIn("RSVP not confirmed by calendar", text)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class QuitWhileWritingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_first_q_warns_second_q_quits_with_an_accurate_message(self):
+        store, release, started = InboxStore(None), threading.Event(), threading.Event()
+
+        def slow(prompt, tools, **kw):
+            started.set()
+            release.wait(10)
+            return good_call()(prompt, tools, **kw)
+        app = make_app([invite_item()], rsvp_actions(store, slow), store)
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("a")
+                await pilot.pause(0.1)
+                await pilot.press("y")
+                for _ in range(100):
+                    if started.is_set():
+                        break
+                    await pilot.pause(0.05)
+                self.assertEqual(len(app.running), 1)
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertFalse(app._exit)                   # still running
+                self.assertTrue(any("1 write(s) still running; q again to quit"
+                                    in t for t in toasts(app)))
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertTrue(app._exit)
+                self.assertTrue(any("1 write(s) still finishing" in str(m)
+                                    for m in app._exit_renderables))
+        finally:
+            release.set()
+
+    async def test_q_with_nothing_running_quits_at_once(self):
+        store = InboxStore(None)
+        app = make_app([plain_item(1)], LocalActions(store), store)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("q")
+            await pilot.pause(0.2)
+            self.assertTrue(app._exit)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
     def save_actions(self, store):
         return LocalActions(store, save=validated({"save": SAVE_CFG})["save"])
@@ -1001,7 +1274,7 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
         self.sent = []
 
     def fake(self, forced=OK, plain=DUP):
-        def run(argv, timeout, stdin_bytes=None):
+        def run(argv, timeout, stdin_bytes=None, term_grace_s=0):
             req = json.loads(stdin_bytes)
             self.sent.append(req)
             return ("ok", 0, forced if req.get("force") else plain, b"")
@@ -1014,11 +1287,19 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
         await pilot.press("y")
         await pilot.pause(1.0)
 
+    async def review(self, pilot, app):
+        """The duplicate answer only toasts; `m` opens the question."""
+        self.assertNotIsInstance(app.screen, ConfirmWrite)
+        self.assertTrue(any("press m to review" in t for t in toasts(app)))
+        await pilot.press("m")
+        await pilot.pause(0.2)
+
     async def test_duplicate_asks_and_cancel_is_the_default(self):
         with mock.patch.object(sources, "_run_capped", side_effect=self.fake()):
             app = make_app([plain_item(1)], self.actions, self.store)
             async with app.run_test(size=SIZE) as pilot:
                 await self.start_save(pilot, app)
+                await self.review(pilot, app)
                 modal = app.screen
                 self.assertIsInstance(modal, ConfirmWrite)
                 self.assertEqual(modal.verb, "Save anyway")
@@ -1042,6 +1323,7 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
             app = make_app([plain_item(1)], self.actions, self.store)
             async with app.run_test(size=SIZE) as pilot:
                 await self.start_save(pilot, app)
+                await self.review(pilot, app)
                 self.assertIsInstance(app.screen, ConfirmWrite)
                 await pilot.press("y")                       # confirm: save anyway
                 await pilot.pause(1.0)
@@ -1058,6 +1340,7 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
             app = make_app([plain_item(1)], self.actions, self.store)
             async with app.run_test(size=SIZE) as pilot:
                 await self.start_save(pilot, app)
+                await self.review(pilot, app)
                 await pilot.press("y")
                 await pilot.pause(1.0)
                 self.assertNotIsInstance(app.screen, ConfirmWrite)
@@ -1085,6 +1368,116 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
                                             for t in toasts(app)))
                         self.assertFalse(any("Saved" in t for t in toasts(app)))
                         self.assertFalse(store.is_saved("t:1"))
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.store = InboxStore(None)
+        self.actions = LocalActions(self.store, save=validated({"save": SAVE_CFG})["save"])
+
+    async def test_a_second_m_only_says_save_already_in_progress(self):
+        release, started, calls = threading.Event(), threading.Event(), []
+
+        def run(argv, timeout, stdin_bytes=None, term_grace_s=0):
+            calls.append(1)
+            started.set()
+            release.wait(10)
+            return ("ok", 0, OK, b"")
+        with mock.patch.object(sources, "_run_capped", side_effect=run):
+            app = make_app([plain_item(1)], self.actions, self.store, undo_s=0.3)
+            try:
+                async with app.run_test(size=SIZE) as pilot:
+                    await settle(pilot, app)
+                    await pilot.press("m")
+                    await pilot.pause(0.1)
+                    await pilot.press("y")
+                    await pilot.pause(0.05)
+                    await pilot.press("m")             # inside the undo window
+                    await pilot.pause(0.1)
+                    self.assertNotIsInstance(app.screen, ConfirmWrite)
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await pilot.pause(0.05)
+                    await pilot.press("m")             # while the command runs
+                    await pilot.pause(0.1)
+                    self.assertNotIsInstance(app.screen, ConfirmWrite)
+                    self.assertGreaterEqual(sum("save already in progress" in t
+                                                for t in toasts(app)), 1)
+                    release.set()
+                    await pilot.pause(1.0)
+            finally:
+                release.set()
+        self.assertEqual(len(calls), 1)
+
+    async def test_the_duplicate_question_never_stacks_on_another_modal(self):
+        release, started = threading.Event(), threading.Event()
+
+        def run(argv, timeout, stdin_bytes=None, term_grace_s=0):
+            req = json.loads(stdin_bytes)
+            if req.get("force"):
+                return ("ok", 0, OK, b"")
+            started.set()
+            release.wait(10)
+            return ("ok", 0, DUP, b"")
+        with mock.patch.object(sources, "_run_capped", side_effect=run) as mocked:
+            app = make_app([plain_item(1)], self.actions, self.store)
+            try:
+                async with app.run_test(size=SIZE) as pilot:
+                    await settle(pilot, app)
+                    await pilot.press("m")
+                    await pilot.pause(0.1)
+                    await pilot.press("y")
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await pilot.pause(0.05)
+                    await pilot.press("question_mark")      # the user is in the help
+                    await pilot.pause(0.1)
+                    self.assertIsInstance(app.screen, HelpScreen)
+                    release.set()
+                    await pilot.pause(0.8)
+                    self.assertIsInstance(app.screen, HelpScreen)   # nothing stacked
+                    await pilot.press("y")                           # a stray key
+                    await pilot.pause(0.3)
+                    self.assertEqual(mocked.call_count, 1)           # nothing resent
+                    self.assertTrue(any("press m to review" in t for t in toasts(app)))
+                    await pilot.press("escape")
+                    await pilot.pause(0.2)
+                    self.assertNotIsInstance(app.screen, ConfirmWrite)
+                    await pilot.press("m")                           # review it now
+                    await pilot.pause(0.2)
+                    modal = app.screen
+                    self.assertIsInstance(modal, ConfirmWrite)
+                    self.assertEqual(modal.verb, "Save anyway")
+                    self.assertEqual(modal.focused.id, "cancel")
+                    await pilot.press("y")                           # confirm
+                    await pilot.pause(1.0)
+                    self.assertEqual(mocked.call_count, 2)
+                    self.assertTrue(self.store.is_saved("t:1"))
+            finally:
+                release.set()
+
+    async def test_cancelling_the_review_forgets_it_and_sends_nothing(self):
+        with mock.patch.object(sources, "_run_capped",
+                               return_value=("ok", 0, DUP, b"")) as mocked:
+            app = make_app([plain_item(1)], self.actions, self.store)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("m")
+                await pilot.pause(0.1)
+                await pilot.press("y")
+                await pilot.pause(1.0)
+                self.assertIn("t:1", app.dups)
+                await pilot.press("m")
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, ConfirmWrite)
+                await pilot.press("escape")
+                await pilot.pause(0.3)
+                self.assertNotIn("t:1", app.dups)
+                self.assertEqual(mocked.call_count, 1)
+                self.assertFalse(self.store.is_saved("t:1"))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")

@@ -3,9 +3,10 @@ configured command. No Textual import; every failure becomes an `Outcome`.
 
 RSVP (`run_rsvp`). One headless Claude call whose only allowed tool is the
 configured connector tool, with its arguments pinned to the event id, the
-calendar id and the answer. The bridge's PreToolUse hook denies any call that
-differs by a byte, its stream re-check fails the run if one slipped through,
-and its guards (state/PAUSED, the daily budget) stop the call before it
+calendar id and the answer, and the call must carry exactly those arguments
+and no others (`exact_args=True`: the bridge's PreToolUse hook denies a call
+that differs by a byte or adds an argument, and its stream re-check fails the
+run if one ran anyway). The bridge's guards (state/PAUSED, the daily budget) stop the call before it
 starts. The prompt carries only the tool name from `inbox.yaml` and those
 three values, never item text. A run is never retried: a write is not safe to
 repeat blindly.
@@ -13,7 +14,8 @@ repeat blindly.
 Save (`run_save`). The configured argv runs without a shell, with the item as
 JSON on stdin and nothing else (item text is never put in argv). It is bound
 by the same process-group, timeout and output-cap handling as a command
-source.
+source, except that a timeout asks the group to stop (SIGTERM, then SIGKILL
+after SAVE_TERM_GRACE_S) so the command can clean up.
 """
 import json
 from collections import namedtuple
@@ -33,6 +35,7 @@ USAGE_TAG = "inbox-rsvp"
 MAX_TURNS = 4
 MAX_BUDGET_USD = 0.10
 DETAIL_MAX = 200
+SAVE_TERM_GRACE_S = 5
 
 
 def rsvp_pins(cfg, event_id, calendar_id, response):
@@ -80,7 +83,7 @@ def run_rsvp(cfg, base_dir, event_id, calendar_id, response, call_tools=None):
                 rsvp_prompt(cfg, pins), pins,
                 model=cfg.get("model", "haiku"), base_dir=base_dir,
                 max_turns=MAX_TURNS, max_budget_usd=MAX_BUDGET_USD,
-                timeout=cfg["timeout_s"], attempts=1)
+                timeout=cfg["timeout_s"], attempts=1, exact_args=True)
     except claude_bridge.BridgeError as exc:
         return Outcome(False, itm.truncate(itm.clean_line(exc), DETAIL_MAX))
     except Exception as exc:  # a missing claude binary, a bad config
@@ -108,11 +111,12 @@ def run_save(cfg, item, force=False):
         payload = json.dumps(itm.save_request(item, force)).encode("utf-8")
         status, code, out, err = sources._run_capped(
             sources._expand(cfg["argv"]), cfg["timeout_s"],
-            stdin_bytes=payload)
+            stdin_bytes=payload, term_grace_s=SAVE_TERM_GRACE_S)
     except (OSError, ValueError, TypeError) as exc:
         return Outcome(False, f"cannot run: {getattr(exc, 'strerror', None) or exc}")
     if status == "timeout":
-        return Outcome(False, f"timed out after {cfg['timeout_s']:g}s")
+        return Outcome(False, f"timed out after {cfg['timeout_s']:g}s; "
+                              "the save may still complete")
     if status == "overflow":
         return Outcome(False, "response is too large")
     if code != 0:

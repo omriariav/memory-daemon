@@ -30,8 +30,9 @@ alert_urgent_max_age_h: 6
 
 # RSVP on pending invites (a accept, X decline, T tentative). Off until set;
 # there is no default. One headless Claude call through the daemon's bridge
-# whose ONLY allowed tool is the one below, with its arguments pinned to the
-# event id, the calendar id and the answer (accepted | declined | tentative).
+# whose ONLY allowed tool is the one below, with exactly three arguments, pinned
+# to the event id, the calendar id and the answer (accepted | declined |
+# tentative): any other argument is denied.
 # `args` maps those three values to YOUR tool's parameter names. Tool names
 # here are placeholders: use the name Claude Code lists for your calendar
 # connector. The bridge's pause file and daily budget apply. See docs/inbox.md.
@@ -41,7 +42,7 @@ alert_urgent_max_age_h: 6
 #     event_id: "event_id"
 #     calendar_id: "calendar_id"
 #     response: "response"
-#   timeout_s: 60            # 5 to 300
+#   timeout_s: 60            # 30 to 300 (the bridge waits ~6 s for connectors)
 #   # model: haiku
 
 # Save to memory (m key, any item). Off until set; there is no default. The
@@ -50,7 +51,7 @@ alert_urgent_max_age_h: 6
 # "duplicate": false}. See "Save protocol" in docs/inbox.md.
 # save:
 #   argv: ["python3", "~/bin/my-inbox-save.py"]
-#   timeout_s: 30            # 1 to 120
+#   timeout_s: 30            # 5 to 120; on a timeout: SIGTERM, then SIGKILL after 5 s
 
 sources:
   # Built-in: state/events.jsonl (plus the .1 rotation), read-only.

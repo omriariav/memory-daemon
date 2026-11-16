@@ -366,14 +366,33 @@ def _expand(argv):
     return [os.path.expanduser(a) if a.startswith("~") else a for a in argv]
 
 
-def _kill_group(proc):
+def _signal_group(proc, sig):
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        os.killpg(proc.pid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         try:
-            proc.kill()
+            proc.send_signal(sig)
         except OSError:
             pass
+
+
+def _kill_group(proc):
+    _signal_group(proc, signal.SIGKILL)
+
+
+def _wait_group_gone(proc, grace_s):
+    """Wait up to `grace_s` for every process of the child's group to exit
+    (the leader alone leaving is not enough: its children may be cleaning up)."""
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        proc.poll()  # reap the leader so it does not keep the group alive
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            return
+        time.sleep(0.05)
 
 
 def _stderr_tail(raw):
@@ -381,7 +400,7 @@ def _stderr_tail(raw):
     return itm.truncate(text[-STDERR_TAIL:], STDERR_TAIL)
 
 
-def _run_capped(argv, timeout_s, stdin_bytes=None):
+def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
     """Run argv in its own process group with bounded memory and time.
 
     stdout is read in chunks and the whole group is killed once it passes
@@ -389,6 +408,11 @@ def _run_capped(argv, timeout_s, stdin_bytes=None):
     drained and dropped so the child never blocks). Returns
     `(status, returncode, out, err)` with status ok, timeout or overflow.
     Raises OSError/ValueError when the program cannot start.
+
+    With `term_grace_s` > 0 a timeout or an overflow first sends SIGTERM to
+    the group and gives it that many seconds to clean up before the SIGKILL
+    (a write should not be cut off mid-way when it can be asked to stop).
+    The default 0 kills at once, as command sources always have.
     """
     proc = subprocess.Popen(
         argv, stdin=subprocess.PIPE if stdin_bytes is not None
@@ -403,11 +427,15 @@ def _run_capped(argv, timeout_s, stdin_bytes=None):
             chunk = os.read(fd, 65536)
             if not chunk:
                 return
+            if flags["overflow"]:
+                continue  # draining while the group winds down
             out.extend(chunk)
             if len(out) > itm.OUTPUT_MAX_BYTES:
                 flags["overflow"] = True
-                _kill_group(proc)
-                return
+                if not term_grace_s:
+                    _kill_group(proc)
+                    return
+                _signal_group(proc, signal.SIGTERM)
 
     def pump_err():
         fd = proc.stderr.fileno()
@@ -441,8 +469,12 @@ def _run_capped(argv, timeout_s, stdin_bytes=None):
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         status = "timeout"
+        if term_grace_s:
+            _signal_group(proc, signal.SIGTERM)
     if flags["overflow"]:
         status = "overflow"
+    if term_grace_s and status != "ok":
+        _wait_group_gone(proc, term_grace_s)
     _kill_group(proc)  # also reaps stragglers that outlive the main process
     try:
         proc.wait(timeout=2)

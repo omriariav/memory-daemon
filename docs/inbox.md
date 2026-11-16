@@ -83,10 +83,6 @@ with **no extra arguments** and receives one JSON object on stdin:
 {"v": 1, "action": "save", "item": { ...the item v1 dict, as listed... }}
 ```
 
-After a duplicate answer (below) and the user's "save anyway", the same payload
-is sent again with `"force": true` added; the command should then save without
-the duplicate check.
-
 and prints one JSON object on stdout:
 
 ```json
@@ -104,18 +100,29 @@ and prints one JSON object on stdout:
 **Likely duplicate.** A reply with `"ok": false, "duplicate": true` is not an
 error. Its `memory_id` is null (nothing was saved); the existing memory's id is
 `candidate.id`. The inbox shows `message` and the candidate in a "Possible duplicate"
-modal (Cancel focused) offering "Save anyway". Cancel saves nothing and adds no
-mark. Confirm waits out the undo window again, then resends the same stdin with
-`"force": true` added. If that forced call still answers `ok: false` it is
+modal (Cancel focused) offering "Save anyway". The modal does not open by
+itself (it could land on top of another one and a stray key would confirm it): a
+toast says "Possible duplicate, press m to review", and `m` on that item opens
+it. Cancel saves nothing and adds no mark. Confirm waits out the undo window
+again, then resends the same stdin with `"force": true` added. If that forced call still answers `ok: false` it is
 shown as an error (the inbox asks once). Any other `ok: false` is an error toast
 with `message`; a failure is never shown as a save.
 
+**Force.** After a duplicate answer and the user's "save anyway", the same
+payload is sent again with `"force": true` added at the top level
+(`{"v": 1, "action": "save", "item": {...}, "force": true}`); the command should
+then save without its duplicate check. The key is absent on a first call.
+
 The whole item travels on stdin only: the argv is exactly the configured list
 and never contains item text. The same limits as command sources apply: the
-configured `timeout_s` (default 30, 1 to 120), stdin written then closed, a
-process group killed whole on timeout, output killed past 4 MB, and the last
-64 KB of stderr kept (its tail is shown when the exit code is not 0). A
-timeout, an oversized or non-JSON answer, a missing `ok` or `message`, a wrong
+configured `timeout_s` (default 30, 5 to 120), stdin written then closed, a
+process group stopped whole on timeout, output stopped past 4 MB, and the last
+64 KB of stderr kept (its tail is shown when the exit code is not 0). Unlike a
+command source's `list`, a save that times out (or overflows) first gets
+`SIGTERM` for the whole group and 5 seconds to clean up before the `SIGKILL`,
+so a command's own child (a CLI it started) is not cut off mid-write. A timeout
+is reported as "timed out after Ns; the save may still complete": the command
+may have finished its work, so check before saving again. A timeout, an oversized or non-JSON answer, a missing `ok` or `message`, a wrong
 type, a non-zero exit or a program that will not start is a failure: a toast
 with the reason, no mark. A save is never retried by the inbox, so a command
 should treat a repeated item as `duplicate`. The `item` is untrusted display
@@ -267,14 +274,20 @@ event or calendar id outside `[A-Za-z0-9_@.+=-]` is refused.
    Cancel is focused; `y` confirms, `esc` cancels (nothing happens, and the
    audit log says so).
 2. The row leaves the queue and the 5 s undo window opens (`u` restores it;
-   `q` inside the window cancels the RSVP).
+   `q` inside the window cancels the RSVP). Once the call has started, `q` says
+   "N write(s) still running; q again to quit (they finish first)"; a second
+   `q` quits and the exit message says how many writes are still finishing (the
+   process ends when they do).
 3. A worker makes one headless Claude call through the bridge
    (`workspace_daemon/claude_bridge.py`, `call_tools`). The only allowed tool is
    `rsvp.tool`; its arguments are pinned to
    `{<args.event_id>: <event id>, <args.calendar_id>: <calendar id>,
-   <args.response>: <answer>}`. The bridge's PreToolUse hook denies a call that
-   differs from the pins by a byte, and the run fails if one ran anyway. The
-   run is never retried (`attempts=1`). The prompt names the tool and prints
+   <args.response>: <answer>}`, and the call must carry exactly those three
+   arguments and no others (the bridge's opt-in `exact_args=True`: its
+   PreToolUse hook denies a call that differs by a byte or adds an argument
+   such as a notification flag, and the run fails if one ran anyway; every
+   other bridge caller keeps the default, where extra arguments are allowed).
+   The run is never retried (`attempts=1`). The prompt names the tool and prints
    the three pinned values as JSON; item text never enters it. The bridge
    guards apply first: `state/PAUSED` stops the call, and so does an exhausted
    or unreadable daily budget (`state/budget.yaml`). Spend is logged in
@@ -282,16 +295,24 @@ event or calendar id outside `[A-Za-z0-9_@.+=-]` is refused.
 4. Success is read from the tool's result (the run needs a real, non-error
    result whose arguments equal the pins; a JSON answer with `error` or
    `ok`/`success` false counts as a failure), never from the model's words.
-   Then the row is hidden by a local mark (`rsvp` in `inbox-state.json`) and
-   the action goes to the audit log. The mark goes away with the row once the
-   calendar cache shows your answer.
+   Then the row is hidden by a local mark and the action goes to the audit
+   log. The mark (`rsvp` with the answer, `rsvp_event`, the event id it was made
+   for, and `rsvp_at`, its time, in `inbox-state.json`) hides only that event:
+   a recurring series is one row whose `event_id` moves on to the next
+   instance, and that instance shows again. The mark stops mattering once the
+   calendar cache reports your answer (the row is then no longer listed and the
+   mark is pruned with the other marks). If a cache snapshot fetched more than
+   10 minutes after the answer still lists the same event as unanswered, the
+   answer did not take: the row comes back with a "RSVP not confirmed by
+   calendar" hint (a `!` in the queue, a line above the thread) so a silent
+   failure cannot hide an invite. The snapshot's fetch time is `meta.cache_fetched`.
 5. Any failure (guard stop, tool error, timeout, no confirmed result) keeps the
    row and shows a toast with the reason; the reason carries only fixed kinds
    (never prompts or tool output).
 
 A recurring series is one row. The answer applies to the instance in
 `meta.event_id` (the next one) only, and the modal says so; the series is not
-answered.
+answered, and the next instance appears as a new invite to answer.
 
 Without `rsvp:`, `X` and `T` say "RSVP not configured", and `a` keeps
 acknowledging the invite as in 0.2.0.
@@ -445,7 +466,7 @@ A `command` source takes `argv` (list), `timeout_s` (1 to 120),
 | --- | --- | --- |
 | `tool` | required | the connector tool's name as Claude Code lists it, `mcp__<server>__<tool>` (a built-in such as `Bash` is refused) |
 | `args` | required | the tool's parameter names: `event_id`, `calendar_id` and `response` (three different names) |
-| `timeout_s` | `60` | 5 to 300 for the whole bridge call |
+| `timeout_s` | `60` | 30 to 300 for the whole bridge call (the bridge waits about 6 s for the connectors to attach inside it) |
 | `model` | `haiku` | the model of the one-call run |
 
 The `response` parameter receives `accepted`, `declined` or `tentative`
@@ -453,7 +474,8 @@ The `response` parameter receives `accepted`, `declined` or `tentative`
 routine (`primary` by default).
 
 `save:` (no default; omit it and saving is off): `argv` (list, no shell) and
-`timeout_s` (1 to 120, default 30).
+`timeout_s` (5 to 120, default 30; a timeout stops the command with `SIGTERM`,
+then `SIGKILL` 5 s later).
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
 urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
@@ -542,8 +564,8 @@ header and the help overlay show the inbox version.
   (`LocalActions` refuses).
 - The two writes, RSVP and save, are off until configured, always confirm
   first (Cancel focused), wait out the undo window, are cancelled by quitting
-  inside it, and run in a worker. RSVP can only ever make the one pinned tool
-  call; save passes the item as JSON on stdin, never in argv or in a prompt.
+  inside it, and run in a worker. RSVP can only make the one pinned tool call
+  with exactly the pinned arguments; save passes the item as JSON on stdin, never in argv or in a prompt.
 - Every action lands in the audit log (`L`).
 - `open` launches only plain `http(s)` links.
 - Sources run with your privileges: only configure commands you trust.

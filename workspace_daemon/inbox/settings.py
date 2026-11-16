@@ -257,8 +257,10 @@ def _check_rsvp(raw, problems):
         if len(set(names.values())) != len(names):
             problems.append("rsvp.args must name three different parameters")
     timeout = raw.get("timeout_s", DEFAULT_RSVP_TIMEOUT_S)
-    if not _num(timeout) or not 5 <= timeout <= 300:
-        problems.append("rsvp.timeout_s must be 5 to 300")
+    # The bridge waits CONNECT_DELAY_SECONDS (6) for connectors inside the
+    # timeout, so anything much lower cannot finish.
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("rsvp.timeout_s must be 30 to 300")
     model = raw.get("model", "haiku")
     if not isinstance(model, str) or not MODEL_NAME.match(model):
         problems.append("rsvp.model must be a model name (default haiku)")
@@ -285,8 +287,8 @@ def _check_save(raw, problems):
         problems.append("save.argv must be a non-empty list of strings "
                         "(no shell)")
     timeout = raw.get("timeout_s", DEFAULT_SAVE_TIMEOUT_S)
-    if not _num(timeout) or not 1 <= timeout <= 120:
-        problems.append("save.timeout_s must be 1 to 120")
+    if not _num(timeout) or not 5 <= timeout <= 120:
+        problems.append("save.timeout_s must be 5 to 120")
     if len(problems) > start:
         return None
     return {"argv": list(argv), "timeout_s": float(timeout)}

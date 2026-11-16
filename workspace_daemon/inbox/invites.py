@@ -237,7 +237,8 @@ def build(data, now, days=DEFAULT_DAYS):
                       "calendar_id": cfg["calendar_id"], "series": key,
                       "my_rsvp": "needsAction", "start": start_ts,
                       "title": itm.truncate(title, itm.FIELD_MAX),
-                      "when": when, "source_id": f"gcal:{event_id}"}))
+                      "when": when, "cache_fetched": fetched_ts,
+                      "source_id": f"gcal:{event_id}"}))
         except itm.ItemError:
             skipped += 1
     notes = []

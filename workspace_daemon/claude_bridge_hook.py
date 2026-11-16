@@ -20,8 +20,13 @@ def _same(left, right):
         return False
 
 
-def decide(payload, tools):
+def decide(payload, tools, exact_args=False):
     """Return (allowed, reason) for one tool call against {name: pins}.
+
+    By default a call must carry every pinned argument with its exact value;
+    extra arguments are allowed. With `exact_args` the call must carry exactly
+    the pinned arguments and nothing else (for writes, where an extra argument
+    such as a notification flag would change what the call does).
 
     Raises ValueError on malformed input; main() turns that into a deny.
     """
@@ -49,6 +54,8 @@ def decide(payload, tools):
     for key, value in pins.items():
         if key not in tool_input or not _same(tool_input[key], value):
             return False, f"tool {name} argument {key} does not match its pin"
+    if exact_args and set(tool_input) != set(pins):
+        return False, f"tool {name} has arguments outside its pins"
     return True, "allowlisted tool call"
 
 
@@ -63,8 +70,10 @@ def _emit(allowed, reason):
 def main(argv, stdin):
     try:
         with open(argv[1], encoding="utf-8") as handle:
-            tools = json.load(handle)["tools"]
-        allowed, reason = decide(json.load(stdin), tools)
+            doc = json.load(handle)
+        tools = doc["tools"]
+        exact_args = doc.get("exact_args", False) is True
+        allowed, reason = decide(json.load(stdin), tools, exact_args)
         _emit(allowed, reason)
         return 0
     except Exception:  # fail closed on anything, including a bad allowlist

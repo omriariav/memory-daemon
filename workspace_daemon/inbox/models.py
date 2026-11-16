@@ -48,6 +48,7 @@ class Item:
     drafted_by: str = "source"
     streamed: bool = False         # UI-only: the draft animation already ran
     saved: bool = False            # UI-only: marked saved to memory (local state)
+    hint: str = ""                 # UI-only: a line shown above the thread (warn colour)
     raw: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property

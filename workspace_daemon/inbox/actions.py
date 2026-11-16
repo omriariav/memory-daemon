@@ -68,7 +68,7 @@ class LocalActions:
         if not out.ok:
             return Result(False, out.detail)
         try:
-            self.store.rsvp(item.key, answer)
+            self.store.rsvp(item.key, answer, event_id)
         except OSError as exc:
             return Result(True, f"{out.detail}; local mark failed: "
                                 f"{exc.strerror or exc}", duplicate=out.duplicate)
@@ -140,7 +140,7 @@ class FakeActions:
     def rsvp(self, item, answer):
         self.calls.append(("rsvp", item.key, answer))
         if self.store is not None:
-            self.store.rsvp(item.key, answer)
+            self.store.rsvp(item.key, answer, item.meta.get("event_id"))
         return Result(True, f"would answer {answer}")
 
     def save(self, item, force=False):

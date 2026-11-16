@@ -29,6 +29,7 @@ from .widgets import (ITEM_PREFIX, DraftPane, HintBar, Queue, StatusHeader,
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
 RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
 SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
+UNCONFIRMED = "RSVP not confirmed by calendar"
 # What each RSVP key answers: key -> (menu word, answer sent, modal title).
 RSVP_KEYS = {
     "accept": ("accept", "accepted", "Accept invite"),
@@ -198,6 +199,8 @@ class InboxApp(App):
         self.bidi_mode = "logical" if self.bidi_fallback else mode
         self.pending = []
         self.running = []                  # committed actions still executing
+        self._quit_armed = False           # first q with writes running was pressed
+        self.dups = {}                     # item key -> (item, result) awaiting "save anyway"
         self.audit = []
         self.stats = {"done": 0, "sent": 0, "snoozed": 0}
         self.known_ids = set()
@@ -297,8 +300,10 @@ class InboxApp(App):
         now = time.time()
         for i in self.all_rows:
             i.saved = self.store.is_saved(i.key)
+            i.hint = (UNCONFIRMED if self.store.rsvp_unconfirmed(i.key, i.meta)
+                      else "")
         shown = [i for i in self.all_rows
-                 if i.key not in busy_keys and not self.store.is_hidden(i.key, now)
+                 if i.key not in busy_keys and not self.store.is_hidden(i.key, now, i.meta)
                  and (self.show_resolved or not i.resolved)]
         changed = [i.key for i in shown] != [i.key for i in self.items]
         self.items = shown
@@ -323,7 +328,7 @@ class InboxApp(App):
         now = time.time()
         return sum(1 for i in self.all_rows
                    if i.resolved and i.key not in busy_keys
-                   and not self.store.is_hidden(i.key, now))
+                   and not self.store.is_hidden(i.key, now, i.meta))
 
     @property
     def current(self):
@@ -746,7 +751,10 @@ class InboxApp(App):
             res = self._run(p)
         except Exception as exc:  # a failing store must not kill the app
             res = Result(False, f"{type(exc).__name__}: {exc}")
-        self.call_from_thread(self._committed, p, res)
+        try:
+            self.call_from_thread(self._committed, p, res)
+        except RuntimeError:
+            pass  # the app already quit; the mark (if any) is written
 
     def _committed(self, p, res):
         self.busy = max(0, self.busy - 1)
@@ -756,10 +764,14 @@ class InboxApp(App):
         p.audit["detail"] = (p.audit["detail"] + " · " + res.detail).strip(" ·")
         self.last_committed = p
         if p.kind == "save" and not res.ok and res.duplicate and not p.force:
-            # Not a failure: the command found a likely duplicate. Ask.
+            # Not a failure: the command found a likely duplicate. A modal
+            # opened here could stack on whatever the user is doing, so tell
+            # them instead; `m` on the item opens the question.
             p.audit["status"] = "duplicate"
+            self.dups[p.item.key] = (p.item, res)
             self.refilter()
-            self._confirm_save_anyway(p.item, res)
+            self.notify(f"Possible duplicate: {p.item.who}\npress m to review",
+                        title="Save", severity="warning", timeout=8, markup=False)
         elif not res.ok:
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
@@ -892,6 +904,7 @@ class InboxApp(App):
                 ("Score", f"{score:g}" if score is not None else "")]
 
         def after(ok):
+            self.dups.pop(it.key, None)
             if ok:
                 self._enqueue("save", it, f"Save anyway: {it.who}", hide=False,
                               detail="save anyway", force=True)
@@ -913,7 +926,10 @@ class InboxApp(App):
         if any(p.kind == "save" and p.item.key == it.key and not p.done
                for p in self.pending) or any(
                 p.kind == "save" and p.item.key == it.key for p in self.running):
-            self.notify("Already queued to save", timeout=2, markup=False)
+            self.notify("save already in progress", timeout=2, markup=False)
+            return
+        if it.key in self.dups:        # the command asked about a duplicate
+            self._confirm_save_anyway(*self.dups[it.key])
             return
         label = SOURCES.get(it.source, SOURCES["other"])[2]
         rows = [("Source", f"{label} · {it.where}"), ("From", it.who),
@@ -1090,6 +1106,13 @@ class InboxApp(App):
     async def action_quit(self):
         """Quitting cancels pending sends, nudges, RSVPs and saves (nothing
         leaves the inbox). Done, ack and snooze are committed."""
+        if self.running and not self._quit_armed:
+            self._quit_armed = True
+            self.set_timer(8, self._disarm_quit)
+            self.notify(f"{len(self.running)} write(s) still running; q again to "
+                        "quit (they finish first)", severity="warning", timeout=6,
+                        markup=False)
+            return
         cancelled = 0
         for p in list(self.pending):
             if p.timer:
@@ -1105,7 +1128,16 @@ class InboxApp(App):
                 except Exception as exc:
                     res = Result(False, str(exc))
                 p.audit["status"] = "committed" if res.ok else "failed"
-        self.exit(message=f"Nothing sent: {cancelled} pending action(s) cancelled on quit." if cancelled else None)
+        parts = []
+        if cancelled:
+            parts.append(f"Nothing sent: {cancelled} pending action(s) cancelled on quit.")
+        if self.running:
+            parts.append(f"{len(self.running)} write(s) still finishing; the process "
+                         "exits when they end.")
+        self.exit(message=" ".join(parts) or None)
+
+    def _disarm_quit(self):
+        self._quit_armed = False
 
     # ---------- poll ----------
     def _run_units(self, names, show_all, reeval=False):
@@ -1264,7 +1296,7 @@ class InboxApp(App):
                 rows.append(it)
         self.all_rows = rows
         fresh = [i for i in rows if i.key not in self.known_ids
-                 and i.section == "urgent" and not self.store.is_hidden(i.key)]
+                 and i.section == "urgent" and not self.store.is_hidden(i.key, meta=i.meta)]
         self.known_ids.update(i.key for i in rows)
         first = not self.polled_once
         self.polled_once = True
