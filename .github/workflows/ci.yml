@@ -90,4 +90,4 @@ jobs:
         run: pip install pyyaml 'textual>=8.2,<9' python-bidi
 
       - name: Inbox tests with Textual
-        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli tests.test_inbox_writes tests.test_inbox_context tests.test_inbox_actions tests.test_inbox_thread_order tests.test_inbox_send tests.test_inbox_react tests.test_inbox_polish -v
+        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli tests.test_inbox_writes tests.test_inbox_context tests.test_inbox_actions tests.test_inbox_thread_order tests.test_inbox_send tests.test_inbox_react tests.test_inbox_polish tests.test_inbox_draft -v

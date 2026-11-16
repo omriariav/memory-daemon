@@ -457,7 +457,11 @@ class ChannelPostTest(unittest.TestCase):
         row = models.from_v1(reply_item(1, reply_to={"channel": CHANNEL}))
         strict = LocalActions(store, send=cfg(), base_dir="/b",
                               call_tools=good_call(calls))
-        self.assertFalse(strict.send_plan(row, "hi").ok)
+        plan = strict.send_plan(row, "hi")
+        # 0.7.0: only Copy for Slack is possible (copy_only), never a send
+        self.assertTrue(plan.ok and plan.copy_only)
+        self.assertIn("Draft and Send need", plan.error)
+        self.assertFalse(writes.send_plan(row.meta, "hi", False).ok)
         res = strict.send(row, "hi")                 # a caller that skipped the plan
         self.assertFalse(res.ok)
         self.assertIn("not a thread", res.detail)
@@ -1105,9 +1109,13 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.1)
                 await pilot.press("n" if key == "t:3" else "a")
                 await pilot.pause(0.2)
-                self.assertNotIsInstance(app.screen, ConfirmSend, key)
-            self.assertTrue(any("would post to the channel, not a thread" in t
-                                for t in toasts(app)))
+                # 0.7.0: never a send or a draft; only Copy for Slack is offered
+                self.assertIsInstance(app.screen, ConfirmSend, key)
+                self.assertEqual(app.screen.options, ("copy",), key)
+                self.assertIn("a channel post without a thread is off",
+                              str(app.screen.query_one("#confirm-warn").render()))
+                await pilot.press("escape")
+                await pilot.pause(0.2)
             self.assertEqual((app.pending, calls), ([], []))
 
     async def test_a_dm_without_a_thread_and_an_opted_in_channel_post_are_allowed(self):
@@ -1131,7 +1139,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 await pilot.pause(0.2)
 
-    async def test_an_item_without_a_valid_reply_to_says_so_and_opens_nothing(self):
+    async def test_an_item_without_a_valid_reply_to_offers_only_copy(self):
         store = InboxStore(None)
         acts = real_actions(store)
         for row in (reply_item(1, reply_to=False),
@@ -1141,10 +1149,14 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await settle(pilot, app)
                 await pilot.press("a")
                 await pilot.pause(0.2)
-                self.assertNotIsInstance(app.screen, ConfirmSend)
-                self.assertTrue(any("meta.reply_to" in t for t in toasts(app)))
+                # 0.7.0: only Copy for Slack is offered, with the reason
+                self.assertIsInstance(app.screen, ConfirmSend)
+                self.assertEqual(app.screen.options, ("copy",))
+                self.assertIn("no valid meta.reply_to", str(
+                    app.screen.query_one("#confirm-warn").render()))
+                await pilot.press("escape")
+                await pilot.pause(0.2)
                 self.assertEqual(app.pending, [])
-                self.assertIn("refused", [r["status"] for r in app.audit])
 
     async def test_an_empty_draft_is_refused(self):
         store = InboxStore(None)

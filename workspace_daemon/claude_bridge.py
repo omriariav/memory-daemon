@@ -99,6 +99,13 @@ class BridgeDryRun(BridgeError):
     """Raised instead of spawning claude when a caller asks for dry_run."""
 
 
+def _absolute(base_dir):
+    """`base_dir` as an absolute path. A relative one would make the
+    `--settings` path (built from the run directory) relative to the run's own
+    cwd, which doubles it, and claude would exit 1."""
+    return Path(os.path.abspath(os.fspath(base_dir)))
+
+
 def _runs_dir(base_dir):
     return Path(base_dir) / "state" / "claude-runs"
 
@@ -579,6 +586,8 @@ def _result_text(content):
 def _error_category(text):
     """A short fixed tag for a tool error body; never the body itself."""
     text = text.casefold()
+    if "attached_draft_exists" in text:
+        return " (attached_draft_exists)"
     if any(m in text for m in (
             "rate limit", "too many requests", "quota exceeded",
             "ratelimited", "rate_limited")):
@@ -680,6 +689,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     Raises BridgeError. partial is True only when accept_partial let a
     max-turns/max-budget stop through with every required tool answered.
     """
+    base_dir = _absolute(base_dir)
     # Refused before any run dir or process exists; nothing is logged.
     _check_guards(base_dir)
     mcp_bytes = read_mcp_config(mcp_config) if mcp_config is not None else None
@@ -933,6 +943,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     """
     if not tools:
         raise BridgeError("call_tools needs at least one tool")
+    base_dir = _absolute(base_dir)
     if dry_run:
         raise BridgeDryRun("dry-run: claude bridge not invoked")
     if mcp_config is not None:
@@ -976,6 +987,7 @@ def complete(prompt, *, model, base_dir, max_turns=1, max_budget_usd=0.25,
 
     strict_mcp: False (default, unchanged). True adds `--strict-mcp-config`
     with no config file, so the run loads no MCP server at all."""
+    base_dir = _absolute(base_dir)
     _, result_event, _ = _attempt(
         prompt, {}, model=model, base_dir=base_dir, max_turns=max_turns,
         max_budget_usd=max_budget_usd, timeout=timeout, attempt=1,

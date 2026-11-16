@@ -22,16 +22,31 @@ from .models import SOURCES
 from .widgets import fit, fmt_age, palette, vis
 
 
+CHOICE_LABELS = {"draft": "Draft in Slack", "send": None,
+                 "copy": "Copy for Slack"}
+CHOICE_KEYS = {"draft": "d", "send": "y", "copy": "c"}
+
+
 class ConfirmSend(ModalScreen):
     """Shows the exact destination and text. Cancel is focused by default.
 
     The text is shown line by line as it will be sent (only wrapped to the
     box, never joined), in a scroll pane: down / up (j / k) and the page keys
     scroll it, the buttons never move. `note` is one extra line (for example
-    that the text was cut)."""
+    that the text was cut).
+
+    0.7.0: `options` is the actions on offer, in order, from `draft`, `send`
+    and `copy` (default just `send`: the old modal). Each has a button and a
+    key (`d`, `y`, `c`); only an offered key does anything. The modal
+    dismisses with the chosen name, or False for Cancel. `open_url` is what
+    `o` will open, shown under the route."""
 
     AUTO_FOCUS = "#cancel"
-    BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "send", "Send"),
+    BINDINGS = [Binding("escape", "cancel", "Cancel"),
+                Binding("y", "choose('send')", "Send"),
+                Binding("d", "choose('draft')", "Draft", show=False),
+                Binding("c", "choose('copy')", "Copy", show=False),
+                Binding("o", "open_url", "Open", show=False),
                 Binding("left,right", "toggle_focus", show=False),
                 Binding("down,j", "scroll(1)", show=False),
                 Binding("up,k", "scroll(-1)", show=False),
@@ -40,12 +55,23 @@ class ConfirmSend(ModalScreen):
     INNER = 64
 
     def __init__(self, verb, destination, text, visual=False, note="",
-                 warn="", route=""):
+                 warn="", route="", options=("send",), open_url="",
+                 title=None, on_open=None):
         """`route` is the real destination (channel id and thread timestamp),
         shown under the `destination` label."""
         super().__init__()
         self.verb, self.destination, self.text, self.visual = verb, destination, text, visual
         self.note, self.warn, self.route = note, warn, route
+        self.options = tuple(o for o in ("draft", "send", "copy")
+                             if o in options)
+        self.open_url = open_url
+        self.on_open = on_open   # opens the item this screen was built for
+        self.title_text = title or verb
+
+    def label(self, name):
+        if name == "send" and self.options != ("send",):
+            return "Send"             # short, so four buttons fit
+        return CHOICE_LABELS[name] or self.verb
 
     def compose(self) -> ComposeResult:
         body = Text()
@@ -56,12 +82,16 @@ class ConfirmSend(ModalScreen):
         dest = Text()
         dest.append("To  ", Style(dim=True))
         dest.append(self.destination, Style(bold=True))
-        with Vertical(id="confirm"):
-            yield Static(Text(self.verb, Style(bold=True)), id="confirm-title")
+        only_send = self.options == ("send",)
+        with Vertical(id="confirm", classes="" if only_send else "multi"):
+            yield Static(Text(self.title_text, Style(bold=True)), id="confirm-title")
             yield Static(dest, id="confirm-dest")
             if self.route:
                 yield Static(Text("Slack  " + self.route, Style(dim=True)),
                              id="confirm-route")
+            if self.open_url:
+                yield Static(Text("Open (o)  " + self.open_url,
+                                  Style(dim=True)), id="confirm-open")
             if self.warn:
                 yield Static(Text("⚠ " + self.warn, Style(bold=True, color="yellow")),
                              id="confirm-warn")
@@ -69,20 +99,80 @@ class ConfirmSend(ModalScreen):
                 yield Static(body, id="confirm-text")
             if self.note:
                 yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
-            yield Static(Text("Nothing is sent until you confirm. Undo stays open for the grace period.", Style(dim=True)),
-                         id="confirm-fixed")
+            if only_send:
+                footer = ("Nothing is sent until you confirm. Undo stays open "
+                          "for the grace period.")
+            elif self.options == ("copy",):
+                footer = "Nothing is sent or drafted. Copy is local."
+            else:
+                footer = ("Nothing happens until you choose. Draft and Send "
+                          "wait out the undo window; Copy is local.")
+            yield Static(Text(footer, Style(dim=True)), id="confirm-fixed")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Cancel  esc", id="cancel", variant="default")
-                yield Button(f"{self.verb}  y", id="send", variant="error")
+                for name in self.options:
+                    yield Button(f"{self.label(name)}  {CHOICE_KEYS[name]}",
+                                 id=name,
+                                 variant="error" if name == "send" else "primary")
 
     def on_button_pressed(self, e):
-        self.dismiss(e.button.id == "send")
+        self.dismiss(e.button.id if e.button.id in self.options else False)
+
+    # Below this terminal width four buttons do not fit in one row: the
+    # button row becomes a two-column grid instead of clipping.
+    NARROW = 100
+
+    def on_mount(self):
+        self._fit()
+
+    def on_resize(self, _event):
+        self._fit()
+
+    def _fit(self):
+        try:
+            box = self.query_one("#confirm")
+        except Exception:
+            return
+        box.set_class(self.app.size.width < self.NARROW, "narrow")
+        self.call_after_refresh(self._cap_scroll)
+
+    def _cap_scroll(self):
+        """Size the text pane to the screen: the title and the destination
+        lines above it, and the buttons below, must stay visible however long
+        the draft is (the pane scrolls)."""
+        try:
+            pane = self.query_one("#confirm-scroll")
+        except Exception:
+            return
+        pane.styles.max_height = 16
+        self.refresh(layout=True)
+        self.call_after_refresh(self._cap_scroll_now)
+
+    def _cap_scroll_now(self):
+        try:
+            box = self.query_one("#confirm")
+            pane = self.query_one("#confirm-scroll")
+        except Exception:
+            return
+        chrome = box.region.height - pane.region.height
+        room = self.app.size.height - chrome
+        pane.styles.max_height = max(3, min(16, room))
+
+    def action_open_url(self):
+        """`o` opens the URL shown (the modal stays). It opens the item this
+        screen was built for, never whatever is selected by now."""
+        if self.open_url and self.on_open is not None:
+            self.on_open()
 
     def action_cancel(self):
         self.dismiss(False)
 
+    def action_choose(self, name):
+        if name in self.options:
+            self.dismiss(name)
+
     def action_send(self):
-        self.dismiss(True)
+        self.action_choose("send")
 
     def action_toggle_focus(self):
         self.focus_next()
@@ -409,15 +499,15 @@ HELP = [
               ("esc", "clear filters / back")]),
     ("Act", [("a", "approve draft (confirm first) / ack / accept an invite"), ("e", "edit draft  (esc / ctrl+s done)"),
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
-             ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
+             ("o", "open the item's link (the Slack thread with slack_open:)"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
                      ("m", "save the item to memory (save: in inbox.yaml); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
     ("Slack send / react / polish", [
-        ("a / n", "send the reply or nudge to Slack (send: in inbox.yaml)"),
+        ("a / n", "reply or nudge: Draft in Slack (d), Send (y) or Copy for Slack (c) (send: / copy: in inbox.yaml)"),
         ("E", "react to the message with an emoji (react: in inbox.yaml)"),
         ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
-        ("", "send and react confirm first, then wait out the 5 s undo window")]),
+        ("", "draft, send and react confirm first, then wait out the 5 s undo window; copy is local")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
                            ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),

@@ -90,7 +90,8 @@ alert_urgent_max_age_h: 6
 # with control or bidi-override characters is refused, never cut): channel,
 # text and, for a thread, thread_ts; any other argument is denied. The destination is the
 # item's meta.reply_to ({channel, thread_ts?, message_ts?}, validated), never
-# taken from item text; an item without one cannot be sent to. The confirm
+# taken from item text; an item without one cannot be sent or drafted to (Copy
+# for Slack still works: it needs no destination). The confirm
 # modal shows the destination, its channel id and thread, and the full text,
 # then the 5 s undo window
 # opens (q inside it cancels); the run is never retried, and a timeout is
@@ -98,8 +99,20 @@ alert_urgent_max_age_h: 6
 # `args` maps the three values to YOUR tool's parameter names. Tool names here
 # are placeholders. The bridge's pause file and daily budget apply. See
 # "Slack send" in docs/inbox.md.
+#
+# 0.7.0: "send" is a choice. Some workplaces block headless Slack SENDS with a
+# managed security hook while a draft tool still works, so after you pick a/n
+# the confirm screen offers up to three actions: "Draft in Slack" (d: puts the
+# text in the conversation's Slack draft box, nothing is sent, the item stays;
+# needs mode draft or both), "Send" (y; needs mode send or both) and "Copy for
+# Slack" (c: converts the markdown to Slack mrkdwn on your clipboard, no tool
+# call; always offered once send: or copy: is set). mode defaults to "send", the
+# 0.6.0 behaviour. draft_tool takes the same `args` mapping as `tool`. See
+# "Draft and copy" in docs/inbox.md.
 # send:
-#   tool: "mcp__slack_connector__send_message"
+#   mode: both               # send (default) | draft | both
+#   tool: "mcp__slack_connector__send_message"          # not needed in mode draft
+#   draft_tool: "mcp__slack_connector__send_message_draft"   # needed in draft and both
 #   args:
 #     channel: "channel_id"
 #     thread_ts: "thread_ts"
@@ -117,6 +130,21 @@ alert_urgent_max_age_h: 6
 #   precheck:
 #     argv: ["python3", "~/bin/my-inbox-precheck.py"]
 #     timeout_s: 10          # 1 to 30
+
+# Copy for Slack without any send tool (a/n then offer only "Copy for Slack").
+# Not needed when send: is set (copy is always on then).
+# copy: true
+
+# Where `o` opens a Slack item: the item's meta.reply_to plus these. `team` is
+# your Slack workspace id (T followed by 6 to 12 capitals or digits); the
+# template must start with slack:// or https:// and may use {channel},
+# {thread_ts}, {message_ts} and {team}. With a thread, {thread_ts} opens the
+# thread. Without this `o` opens the item's own link. After a Draft or a Copy
+# you press o, then Enter or paste. Alternative web form:
+#   https://app.slack.com/client/{team}/{channel}/thread/{channel}-{thread_ts}
+# team: "T0EXAMPLE1"
+# slack_open:
+#   url_template: "slack://channel?team={team}&id={channel}"
 
 # Slack reaction (E key). Off until set; there is no default. Pick an emoji
 # (1-9 quick keys), confirm, 5 s undo, then one pinned call with exactly the

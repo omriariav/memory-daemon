@@ -20,6 +20,13 @@ nothing else (`exact_args=True`), and a run is never retried (`attempts=1`).
 Success is a real non-error tool result for the pinned call; a timeout, or a
 run cut off by a sleep, is reported as "may have been sent, check Slack".
 
+Draft and copy (inbox 0.7.0). Some workplaces block headless Slack sends with a
+managed security hook while a draft tool still works, so "send" is a choice:
+`run_draft` is the same pinned path with `send.draft_tool` and puts the text in
+the conversation's Slack draft box (nothing is sent, the item is not done), and
+`to_slack_mrkdwn` turns a markdown draft into Slack's mrkdwn for a purely local
+copy. `slack_open_url` builds the URL `o` opens from `slack_open.url_template`.
+
 Save (`run_save`). The configured argv runs without a shell, with the item as
 JSON on stdin and nothing else (item text is never put in argv). It is bound
 by the same process-group, timeout and output-cap handling as a command
@@ -47,6 +54,12 @@ MAX_BUDGET_USD = 0.10
 DETAIL_MAX = 200
 SAVE_TERM_GRACE_S = 5
 SEND_USAGE_TAG = "inbox-send"
+DRAFT_USAGE_TAG = "inbox-draft"
+# A draft tool that refuses because the conversation already has a draft says
+# this; claude_bridge keeps it as a fixed tag of a tool error.
+ATTACHED_DRAFT_MARKER = "attached_draft_exists"
+ATTACHED_DRAFT_MSG = ("A draft already waits in that conversation; use Copy "
+                      "instead")
 REACT_USAGE_TAG = "inbox-react"
 SEND_TEXT_MAX = 4000
 # The `meta.reply_to` contract: a Slack conversation id (public/private
@@ -58,8 +71,13 @@ EMOJI_NAME = re.compile(r"\A[a-z0-9_+\-]{1,64}\Z")
 ReplyTo = namedtuple("ReplyTo", "channel thread_ts message_ts")
 # `route` is the real destination (channel id and thread timestamp), shown in
 # the confirm modal next to the `where` label.
-Sendable = namedtuple("Sendable", "ok text target kind error destination route",
-                      defaults=("", None, "", "", "", ""))
+# `copy_only` (0.7.0): the destination is unusable (no valid reply_to, or a
+# channel post without a thread) but the text is fine, so only Copy for Slack
+# is offered; `error` then holds the reason. `dest_refused` marks a refusal
+# that was about the destination only.
+Sendable = namedtuple(
+    "Sendable", "ok text target kind error destination route copy_only "
+    "dest_refused", defaults=("", None, "", "", "", "", False, False))
 # Control characters (tab and newline are fine) and the bidi overrides,
 # embeddings and isolates: text that could hide what it says. LRM, RLM and
 # ALM are kept for Hebrew and Arabic.
@@ -167,6 +185,8 @@ def run_save(cfg, item, force=False):
 
 NO_REPLY_TO = ("this item has no valid meta.reply_to (a Slack channel id and "
                "timestamps), so it cannot be sent to")
+NO_REPLY_TO_DRAFT = ("this item has no valid meta.reply_to (a Slack channel id "
+                     "and timestamps), so no draft can be placed in it")
 
 
 def reply_to(meta):
@@ -203,14 +223,14 @@ def target_kind(target):
     return "DM" if target.channel.startswith("D") else "channel"
 
 
-def send_text(draft):
+def send_text(draft, what="send"):
     """`(text, error)` for a draft: only trailing whitespace is removed. The
     text is refused (`error`, text "") when it is empty, longer than
     SEND_TEXT_MAX characters (never cut: what is sent is what was shown) or
     holds a control or bidi-override character."""
     text = draft.rstrip() if isinstance(draft, str) else ""
     if not text:
-        return "", "there is no text to send"
+        return "", f"there is no text to {what}"
     if len(text) > SEND_TEXT_MAX:
         return "", (f"the text is {len(text)} characters; the limit is "
                     f"{SEND_TEXT_MAX}; edit it first")
@@ -221,22 +241,27 @@ def send_text(draft):
     return text, ""
 
 
-def send_plan(meta, draft, allow_channel_posts=False):
+def send_plan(meta, draft, allow_channel_posts=False, what="send"):
     """Everything a send needs, checked: the destination, the exact text and
     what to tell the user. `ok` False carries `error`.
 
     A reply to a channel or group (C, G) without a `thread_ts` would be a
     top-level post: it is refused unless `allow_channel_posts` (the setting
-    `send.allow_channel_posts`). A DM (D) needs no thread."""
+    `send.allow_channel_posts`). A DM (D) needs no thread. `what` ("send" or
+    "draft") only words the refusals."""
     target = reply_to(meta)
     if target is None:
-        return Sendable(False, error=NO_REPLY_TO[0].upper() + NO_REPLY_TO[1:])
+        msg = NO_REPLY_TO if what == "send" else NO_REPLY_TO_DRAFT
+        return Sendable(False, error=msg[0].upper() + msg[1:],
+                        dest_refused=True)
     if (not allow_channel_posts and not target.thread_ts
             and target.channel[0] in "CG"):
-        return Sendable(False, error=(
-            "This item would post to the channel, not a thread, so it is "
+        what_it_does = ("post to the channel" if what == "send"
+                        else "draft a top-level message in the channel")
+        return Sendable(False, dest_refused=True, error=(
+            f"This item would {what_it_does}, not a thread, so it is "
             "refused (send.allow_channel_posts: true allows channel posts)"))
-    text, error = send_text(draft)
+    text, error = send_text(draft, what)
     if error:
         return Sendable(False, error=error[0].upper() + error[1:])
     route = target.channel + (f" · thread {target.thread_ts}"
@@ -318,13 +343,39 @@ def reply_state(text):
     return "ok"
 
 
-def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
+def _names_marker(row, marker):
+    """True when a tool row names `marker` AND is an error or not clearly ok:
+    an error result, a JSON failure (`error`, `ok`/`success` false) or plain
+    text. A JSON object that says ok/success true is a success, whatever else
+    it mentions."""
+    text = str(row.get("text") or "")
+    if marker not in text.casefold():
+        return False
+    if row.get("is_error"):
+        return True
+    try:
+        doc = json.loads(text)
+    except (TypeError, ValueError):
+        return True
+    if isinstance(doc, dict):
+        clean = (doc.get("ok") is True or doc.get("success") is True) \
+            and not doc.get("error")
+        return not clean
+    return True
+
+
+def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed,
+                did="sent", none="not sent", marker=None):
     """One pinned write through the bridge. Never raises; returns an Outcome.
 
-    `what` names the write ("message", "reaction") for the messages. The
-    reasons carry only fixed kinds, never prompts or tool output. A failure
-    that leaves it unknown whether the write happened (a timeout, a run cut
-    off by a sleep, a crashed run) says "check Slack"."""
+    `what` names the write ("message", "reaction", "draft") for the messages,
+    `did` the past tense ("sent", "placed") and `none` the "nothing happened"
+    prefix ("not sent", "no draft placed"). The reasons carry only fixed
+    kinds, never prompts or tool output. A failure that leaves it unknown
+    whether the write happened (a timeout, a run cut off by a sleep, a
+    crashed run) says "check Slack". `marker`, when given, is a word in the
+    tool's reply (or in the bridge's error tag) that means a specific refusal:
+    the Outcome is then `ATTACHED_DRAFT_MSG`."""
     call = call_tools or claude_bridge.call_tools
     tool = cfg["tool"]
     try:
@@ -336,33 +387,39 @@ def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
                 timeout=cfg["timeout_s"], attempts=1, exact_args=True,
                 accept_partial=True, max_calls=1)
     except claude_bridge.GUARD_STOPS + (claude_bridge.BridgeDryRun,) as exc:
-        return Outcome(False, "not sent: " + itm.truncate(
+        return Outcome(False, f"{none}: " + itm.truncate(
             itm.clean_line(exc), DETAIL_MAX))
     except claude_bridge.BridgeOutage:
         return Outcome(False, f"the run was cut off (sleep or outage); the "
-                              f"{what} may have been sent, check Slack")
+                              f"{what} may have been {did}, check Slack")
     except claude_bridge.BridgeError as exc:
         text = itm.truncate(itm.clean_line(exc), DETAIL_MAX)
+        if marker and marker in text:
+            return Outcome(False, ATTACHED_DRAFT_MSG)
         if "timed out" in text:
             return Outcome(False, f"timed out after {cfg['timeout_s']:g}s; "
-                                  f"the {what} may have been sent, check Slack")
+                                  f"the {what} may have been {did}, check "
+                                  "Slack")
         if text.startswith("tool returned an error"):
-            return Outcome(False, f"not sent: {text}")
-        return Outcome(False, f"{text}; the {what} may have been sent, "
+            return Outcome(False, f"{none}: {text}")
+        return Outcome(False, f"{text}; the {what} may have been {did}, "
                               "check Slack")
     except Exception as exc:  # a missing claude binary, a bad config
         return Outcome(False, f"cannot run: {type(exc).__name__}")
     rows = [r for r in results
             if r.get("name") == tool and not r.get("is_error")
             and r.get("input") == pins[tool]]
+    if marker and any(_names_marker(r, marker) for r in results
+                      if r.get("name") == tool):
+        return Outcome(False, ATTACHED_DRAFT_MSG)
     if not rows:
         return Outcome(False, f"no confirmed result for the pinned call; the "
-                              f"{what} may not have been sent, check Slack")
+                              f"{what} may not have been {did}, check Slack")
     states = [reply_state(r.get("text")) for r in rows]
     if "ok" in states:
-        # A real send happened: never say it did not.
+        # A real write happened: never say it did not.
         if any(s != "ok" for s in states):
-            return Outcome(True, f"the {what} was sent at least once; "
+            return Outcome(True, f"the {what} was {did} at least once; "
                                  "check Slack")
         if len(rows) > 1:
             return Outcome(True, f"the tool ran {len(rows)} times; check Slack "
@@ -371,7 +428,7 @@ def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
     if "failed" in states:
         return Outcome(False, f"the Slack tool reported a failure; {failed}")
     return Outcome(False, f"the tool's reply looks like an error; the {what} "
-                          "may not have been sent; check Slack")
+                          f"may not have been {did}; check Slack")
 
 
 def run_send(cfg, base_dir, target, text, call_tools=None):
@@ -382,6 +439,29 @@ def run_send(cfg, base_dir, target, text, call_tools=None):
     pins = send_pins(cfg, target, text)
     return _run_pinned(cfg, base_dir, pins, SEND_USAGE_TAG, call_tools,
                        "message", "not sent")
+
+
+def draft_pins(cfg, target, text):
+    """`{draft_tool: {param: value}}`: the same pins as a send (channel, text
+    and the thread timestamp when there is one, mapped through `send.args`),
+    on `send.draft_tool`."""
+    return send_pins(dict(cfg, tool=cfg["draft_tool"]), target, text)
+
+
+def run_draft(cfg, base_dir, target, text, call_tools=None):
+    """Place `text` in the Slack draft box of the destination `target` (a
+    `ReplyTo`) with `send.draft_tool`. Nothing is posted. Never raises;
+    returns an Outcome (`detail` "" on a plain success). Pinned, one call,
+    never retried, like a send; the wording never says "sent"."""
+    if not isinstance(target, ReplyTo) or not text or not text.strip():
+        return Outcome(False, "no draft to place")
+    if not cfg.get("draft_tool"):
+        return Outcome(False, "no draft tool configured (send.draft_tool)")
+    pins = draft_pins(cfg, target, text)
+    return _run_pinned(dict(cfg, tool=cfg["draft_tool"]), base_dir, pins,
+                       DRAFT_USAGE_TAG, call_tools, "draft",
+                       "no draft placed", did="placed",
+                       none="no draft placed", marker=ATTACHED_DRAFT_MARKER)
 
 
 def run_react(cfg, base_dir, channel, timestamp, emoji, call_tools=None):
@@ -451,6 +531,44 @@ def run_precheck(cfg, item, text, cancel=None):
     if status != "ok" or code != 0:
         return Precheck(failed=True)
     return parse_precheck(out.decode("utf-8", "replace"))
+
+
+_PLACEHOLDER = re.compile(r"\{(channel|thread_ts|message_ts|team)\}")
+TEAM_ID = re.compile(r"\AT[A-Z0-9]{6,12}\Z")
+
+
+def slack_open_url(template, team, meta):
+    """The URL `o` opens for an item with a `meta.reply_to`, or None.
+
+    `template` is `slack_open.url_template` (slack:// or https://) with the
+    placeholders {channel}, {thread_ts}, {message_ts} and {team}. The values
+    are only the validated `reply_to` ids and the configured team id, so no
+    item text can reach the URL. `{thread_ts}` is the thread's timestamp, else
+    the message's; `{message_ts}` is the message's, else the thread's, so a
+    thread opens at the thread. A template that needs a value the item (or the
+    config) lacks gives None: the caller falls back to `item.link`."""
+    if not isinstance(template, str) or not template.startswith(
+            ("slack://", "https://")):
+        return None
+    target = reply_to(meta)
+    if target is None:
+        return None
+    if team is not None and not (isinstance(team, str) and TEAM_ID.match(team)):
+        return None
+    values = {"channel": target.channel,
+              "thread_ts": target.thread_ts or target.message_ts,
+              "message_ts": target.message_ts or target.thread_ts,
+              "team": team}
+    missing = []
+
+    def sub(m):
+        value = values[m.group(1)]
+        if not value:
+            missing.append(m.group(1))
+            return ""
+        return value
+    url = _PLACEHOLDER.sub(sub, template)
+    return None if missing else url
 
 
 def suggested_reaction(meta):

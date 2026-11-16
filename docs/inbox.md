@@ -488,19 +488,26 @@ destination in `meta.reply_to`:
 A value in the wrong format makes the whole `reply_to` invalid; unknown keys
 inside it are ignored and never used. The destination is never read from
 `gist`, `thread` text, `where` or any other item text: only from here. An item
-without a valid `reply_to` cannot be sent to, and `a` or `n` say so instead of
-opening the confirm modal. `where` is only the label shown in the modal.
+without a valid `reply_to` cannot be sent to or drafted to. With `send:` or
+`copy:` set, `a` or `n` still open the confirm screen with only Copy for Slack
+(see [Draft and copy](#draft-and-copy)); otherwise they say so. `where` is
+only the label shown in the modal.
 
 ### Slack send (reply and nudge)
 
-`a` on a reply and `n` on a nudge send the draft to Slack when the `send:`
-block is set (no default). Without `send:` the confirm flow exists only in
-`--demo` (nothing is sent) and `a` / `e` / `n` on a real item say "Replying is
-not available yet", as in 0.5.0.
+`a` on a reply and `n` on a nudge start the Slack reply flow when the `send:`
+block (or `copy: true`) is set (no default). Since 0.7.0 "send" is a choice:
+the confirm screen offers Draft in Slack, Send and Copy for Slack, depending
+on `send.mode` (see [Draft and copy](#draft-and-copy)). Everything below
+describes the Send path and its checks, which Draft shares. Without `send:` or
+`copy:` the confirm flow exists only in `--demo` (nothing is sent) and `a` /
+`e` / `n` on a real item say "Replying is not available yet", as in 0.5.0.
 
-1. **Checks.** The item needs a valid `meta.reply_to` (above). A reply to a
+1. **Checks.** Send and Draft need a valid `meta.reply_to` (above); without
+   one only Copy for Slack is offered. A reply to a
    channel or group (`C`, `G`) without a `thread_ts` would be a top-level post:
-   it is refused with "would post to the channel, not a thread" unless
+   Send and Draft are refused ("would post to the channel, not a thread"; only
+   Copy is offered) unless
    `send.allow_channel_posts` is `true` (a DM needs no thread; a nudge follows
    the same rule). The text is the current draft, including any `e` edits (an
    open edit is saved first; editor text is cleaned like any draft, so control
@@ -517,7 +524,9 @@ not available yet", as in 0.5.0.
    `(DM)` or `(channel)`), under it the real route (the channel id and the
    thread timestamp, so a wrong `where` label cannot hide it) and the full text, scrollable (`j`/`k`, the arrows
    and the page keys), laid out line by line exactly as it will be sent.
-   Cancel is focused; `y` confirms, `esc` cancels (the audit log says so).
+   Cancel is focused; `y` sends, `esc` cancels (the audit log says so). With
+   more than Send on offer the modal also has `d` (draft) and `c` (copy), and
+   shows the URL `o` will open (see [Draft and copy](#draft-and-copy)).
 4. **Undo window.** The row leaves the queue and the 5 s undo window opens (`u`
    restores it; `q` inside the window cancels the send). Once the call has
    started `q` says "N write(s) still running; q again to quit (they finish
@@ -572,12 +581,109 @@ the selection changes while it runs, nothing is sent and the toast says so.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `tool` | required | the Slack connector tool as Claude Code lists it, `mcp__<server>__<tool>` |
-| `args` | required | the tool's parameter names for `channel`, `thread_ts` and `text` (three different names) |
+| `tool` | required in mode `send` and `both` | the Slack connector tool as Claude Code lists it, `mcp__<server>__<tool>` |
+| `mode` | `send` | `send`, `draft` or `both`: which of Send and Draft in Slack the confirm screen offers (see [Draft and copy](#draft-and-copy)) |
+| `draft_tool` | required in mode `draft` and `both` | the Slack draft connector tool, `mcp__<server>__<tool>`, a different tool from `tool`; it takes the same `args` mapping |
+| `args` | required | the tool's parameter names for `channel`, `thread_ts` and `text` (three different names), for both `tool` and `draft_tool` |
 | `timeout_s` | `90` | 30 to 300 for the whole bridge call |
 | `model` | `haiku` | the model of the one-call run |
 | `precheck` | off | `{argv, timeout_s}`: the optional precheck command (above); `argv` is a list (no shell), `timeout_s` 1 to 30, default 10 |
 | `allow_channel_posts` | `false` | `true` allows a send to a channel or group without a thread (a top-level post) |
+
+### Draft and copy
+
+**Why.** Some workplaces block headless (non-interactive) Claude Slack SENDS
+with a managed security hook (a send is denied in the bridge's `dontAsk`
+mode), while a Slack draft tool and reactions still work. So since 0.7.0 "send"
+is a choice. After you press `a` (reply) or `n` (nudge) and the checks pass
+(the text, the destination, the optional precheck), the confirm screen shows the exact
+text, the destination ids and the URL `o` will open, with Cancel focused, and
+offers up to three actions:
+
+| Action | Key | Offered when | What it does |
+| --- | --- | --- | --- |
+| Draft in Slack | `d` | `send.mode` is `draft` or `both` | places the text in the conversation's Slack draft box; nothing is sent; the item stays |
+| Send | `y` | `send.mode` is `send` (default) or `both` | the send described above; the item is marked done |
+| Copy for Slack | `c` | `send:` or `copy: true` is set, and the text passes the text checks | puts the text on the clipboard as Slack mrkdwn; nothing leaves the inbox; the item stays |
+
+A key that is not offered does nothing; `esc` cancels; `o` in the modal opens
+the URL it shows (the modal stays). The default `send.mode` is `send`, so a
+0.6.0 `inbox.yaml` works as before (plus the Copy button).
+
+**Copy never needs a destination.** It is offered whenever the text passes the
+text checks (not empty, at most 4000 characters, no control or bidi-override
+character). If the item has no valid `meta.reply_to`, or is a reply to a
+channel or group without a thread (and `send.allow_channel_posts` is not
+`true`), Draft and Send are not possible: the modal opens with only Copy for
+Slack (no precheck runs) and, when `send:` is set, a warning line "Draft and
+Send need a valid thread/DM destination (...)". `copy: true` without `send:`
+works for every item that has text. `o` then opens the item's link, as before.
+
+**Draft in Slack.** The same pinned path as a send: one headless call whose
+only allowed tool is `send.draft_tool`, pinned to exactly `{<args.channel>:
+<channel>, <args.text>: <text>}` plus `<args.thread_ts>: <thread_ts>` when the
+destination has one (`exact_args=True`, `attempts=1`, `max_calls=1`), behind
+the precheck and the 5 s undo window (`u` undoes, `q` inside it cancels), one
+Slack write at a time (a draft counts), spend logged as `inbox-draft`, an audit
+row of kind `draft`. It is never retried. On success the item is NOT marked
+done and the toast says "Draft placed in Slack: open it with o and press
+Enter." (when `o` has nothing to open it says "open the conversation"). If the
+tool's reply names `attached_draft_exists` (the conversation already has a
+draft) the toast says "A draft already waits in that conversation; use Copy
+instead". Failures never claim a message was sent: "no draft placed: ...", or
+"the draft may have been placed, check Slack" after a timeout or a run cut off
+by a sleep.
+
+**Copy for Slack.** Purely local: no tool call, no undo window. The draft
+(trailing whitespace removed, the same text the modal showed) is converted from
+standard markdown to Slack mrkdwn and put on the clipboard with the same OSC 52
+helper as `y`. The toast says "Copied for Slack: open it with o and paste". The
+drafts usually come from a session that already writes Slack text, where a
+single `*x*` is bold, so the conversion (`workspace_daemon/inbox/mrkdwn.py`,
+`to_slack_mrkdwn`, a pure function) only touches constructs that mean one thing
+in standard markdown:
+
+| Markdown | Slack mrkdwn |
+| --- | --- |
+| `**bold**`, `__bold__` | `*bold*` |
+| `~~x~~` | `~x~` |
+| `[text](url)` | `<url\|text>` (written `<url|text>`; the label is escaped: `&` `<` `>` become `&amp;` `&lt;` `&gt;`) |
+| `# heading` (1 to 6 `#`) | `*heading*` |
+
+Everything else is left as it is: single `*x*` and `_x_`, `***x***`, lists
+(`-`, `*`, `+`, numbered), `>` quotes, inline code, fenced code (```` ``` ```` and
+`~~~`) and 4-space or tab indented code blocks (nothing inside code changes).
+URLs keep their underscores and tildes and a bare URL does not swallow a
+closing `**` or `~~`. Hebrew and other text pass through unchanged.
+
+**Open Slack at the right place (`slack_open`).** `o` opens the item's own link
+unless `slack_open` is set. With it, and an item that has a valid
+`meta.reply_to`, `o` opens the template URL; `{thread_ts}` is the thread's
+timestamp (else the message's), so a thread opens at the thread. A template
+that needs a value the item lacks falls back to the item's link. The template
+must be printable ASCII on one line, with no spaces, up to 500 characters. The values are
+only the validated `reply_to` ids and your `team`, never item text.
+
+```yaml
+team: "T0EXAMPLE1"            # your workspace id: ^T[A-Z0-9]{6,12}$
+slack_open:
+  url_template: "slack://channel?team={team}&id={channel}"
+  # or the web form, which opens a thread at the thread:
+  # url_template: "https://app.slack.com/client/{team}/{channel}/thread/{channel}-{thread_ts}"
+send:
+  mode: both                  # send | draft | both
+  tool: "mcp__slack_connector__send_message"
+  draft_tool: "mcp__slack_connector__send_message_draft"
+  args: {channel: "channel_id", thread_ts: "thread_ts", text: "text"}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `send.mode` | `send` | `send`, `draft` or `both` |
+| `send.draft_tool` | none | the draft tool (same `args` as `tool`) |
+| `copy` | `false` | `true` offers Copy for Slack without `send:` |
+| `team` | none | the Slack workspace id for `{team}` |
+| `slack_open.url_template` | none | starts with `slack://` or `https://`; placeholders `{channel}`, `{thread_ts}`, `{message_ts}`, `{team}` (`{team}` needs `team:`) |
 
 ### Slack reactions (`E`)
 
@@ -890,7 +996,9 @@ defaults; a broken one prints every problem and exits 2.
 | `context` | off | the command the Context pane (`c`) runs (below) |
 | `actions` | none | custom confirmed write actions, one key each (below) |
 | `summary` | off | the AI summary (`i`) through the Claude bridge (below) |
-| `send` | off | real Slack send for replies and nudges (see "Slack send") |
+| `send` | off | real Slack send for replies and nudges; `mode` send / draft / both (see "Slack send" and "Draft and copy") |
+| `copy` | `false` | "Copy for Slack" without `send:` (see "Draft and copy") |
+| `team`, `slack_open` | off | where `o` opens a Slack item (see "Draft and copy") |
 | `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
 | `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
 
@@ -981,10 +1089,10 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, on a pending invite
+`d` done, `s` snooze, `n` nudge, `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
 memory (needs `save:`; marks the item done), any key set in `actions:`
-(needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack when `send:` is set, `c` context pane (needs `context:`), `C` fetch its
+(needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view
@@ -1051,7 +1159,11 @@ header and the help overlay show the inbox version.
   the confirm modal, undo window and quit-cancels-sends only run in `--demo`
   and `LocalActions` refuses. With it the send follows the RSVP pattern (see
   "Slack send").
-- The writes (RSVP, save, send, react, custom actions) are off until configured, always confirm
+- Draft in Slack is a Slack write like send (pinned, one call, never retried,
+  undo window) but never marks the item done; Copy for Slack makes no tool call
+  at all. `send.mode` decides which of send and draft exist; the send call
+  itself is refused in mode `draft`.
+- The writes (RSVP, save, send, draft, react, custom actions) are off until configured, always confirm
   first (Cancel focused), wait out the undo window, are cancelled by quitting
   inside it, and run in a worker. RSVP, send and react can only make the one pinned tool call
   with exactly the pinned arguments, once and never retried (a send's
@@ -1064,7 +1176,8 @@ header and the help overlay show the inbox version.
   confirmation. The context command is yours and must be read-only; the summary
   runs the bridge with no tools at all and treats item text as data.
 - Every action lands in the audit log (`L`).
-- `open` launches only plain `http(s)` links.
+- `open` launches plain `http(s)` links, and with `slack_open` the template's
+  `slack://` or `https://` URL (built only from validated ids).
 - Sources run with your privileges: only configure commands you trust.
 
 ## Keeping private data out of the repo

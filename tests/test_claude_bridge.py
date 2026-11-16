@@ -509,6 +509,19 @@ class CallToolsTest(BridgeBase):
             self.call()
         self.assertIn("error_max_budget_usd", str(ctx.exception))
 
+    def test_an_attached_draft_error_keeps_only_a_fixed_tag(self):
+        self.stream(
+            init() + tool_use("t1", "ToolSearch", {"query": f"select:{TOOL_A}"})
+            + tool_result("t1", [{"type": "tool_reference", "tool_name": TOOL_A}])
+            + tool_use("t2", TOOL_A, {"q": "x"})
+            + tool_result("t2", "SECRET-BODY attached_draft_exists", is_error=True)
+            + result())
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(attempts=1)
+        self.assertEqual(str(ctx.exception),
+                         f"tool returned an error: {TOOL_A} (attached_draft_exists)")
+        self.assertNotIn("SECRET-BODY", str(ctx.exception))
+
     def test_tool_result_error_fails(self):
         self.stream(
             init() + tool_use("t2", TOOL_A) + tool_result(
@@ -1087,6 +1100,47 @@ class CompleteTest(BridgeBase):
         self.stream(init() + result(text=""))
         with self.assertRaises(claude_bridge.BridgeError):
             claude_bridge.complete("p", model="sonnet", base_dir=self.base)
+
+
+class RelativeBaseDirTest(BridgeBase):
+    """A relative base_dir used to make `--settings` relative to the run's
+    cwd (the run directory), which doubled the path: claude exited 1."""
+
+    def relative_base(self):
+        old = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, old)
+        return os.path.relpath(self.base, self.root)    # "base"
+
+    def test_call_tools_with_a_relative_base_dir_passes_absolute_paths(self):
+        self.stream(good_stream())
+        rel = self.relative_base()
+        self.assertFalse(os.path.isabs(rel))
+        out = claude_bridge.call_tools(
+            "p", {TOOL_A: {}}, base_dir=rel, connect_delay=0)
+        self.assertEqual(out[0]["text"], "item one")
+        argv = self.argv()
+        settings = argv[argv.index("--settings") + 1]
+        self.assertTrue(os.path.isabs(settings))
+        self.assertTrue(settings.startswith(
+            os.path.realpath(self.base) + os.sep)
+            or settings.startswith(str(self.base) + os.sep))
+        # the run directory is under the one real state/ directory
+        self.assertTrue((self.base / "state" / "claude-usage.jsonl").exists())
+        self.assertFalse((self.base / "base").exists())
+
+    def test_complete_with_a_relative_base_dir(self):
+        self.stream(init() + result(text="the summary"))
+        rel = self.relative_base()
+        self.assertEqual(
+            claude_bridge.complete("p", model="sonnet", base_dir=rel),
+            "the summary")
+        argv = self.argv()
+        self.assertTrue(os.path.isabs(argv[argv.index("--settings") + 1]))
+
+    def test_the_helper_leaves_an_absolute_path_alone(self):
+        self.assertEqual(claude_bridge._absolute(self.base), self.base)
+        self.assertTrue(claude_bridge._absolute("x").is_absolute())
 
 
 class HookTest(unittest.TestCase):
