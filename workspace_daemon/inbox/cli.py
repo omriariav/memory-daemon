@@ -68,7 +68,9 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
                                summary=settings["summary"],
                                actions=settings["actions"],
                                send=settings["send"], react=settings["react"],
-                               polish=settings["polish"])
+                               polish=settings["polish"],
+                               copy=settings["copy"], team=settings["team"],
+                               slack_open=settings["slack_open"])
         app = InboxApp(fetch, store, actions, settings,
                        stream_delay=0, saved=saved if events else None,
                        saved_days=days, units=sources.make_units(settings, base),

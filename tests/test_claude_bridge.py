@@ -509,6 +509,19 @@ class CallToolsTest(BridgeBase):
             self.call()
         self.assertIn("error_max_budget_usd", str(ctx.exception))
 
+    def test_an_attached_draft_error_keeps_only_a_fixed_tag(self):
+        self.stream(
+            init() + tool_use("t1", "ToolSearch", {"query": f"select:{TOOL_A}"})
+            + tool_result("t1", [{"type": "tool_reference", "tool_name": TOOL_A}])
+            + tool_use("t2", TOOL_A, {"q": "x"})
+            + tool_result("t2", "SECRET-BODY attached_draft_exists", is_error=True)
+            + result())
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.call(attempts=1)
+        self.assertEqual(str(ctx.exception),
+                         f"tool returned an error: {TOOL_A} (attached_draft_exists)")
+        self.assertNotIn("SECRET-BODY", str(ctx.exception))
+
     def test_tool_result_error_fails(self):
         self.stream(
             init() + tool_use("t2", TOOL_A) + tool_result(

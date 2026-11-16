@@ -19,6 +19,13 @@ adds an emoji reaction; `polish` rewrites the draft in a configured tone and
 never sends. Without `send:` a reply or nudge still only works in `--demo`
 (`LocalActions.supports_send` is False and `FakeActions` pretends).
 
+0.7.0 turns "send" into a choice (some workplaces block headless Slack sends):
+`reply_options` lists what `a` / `n` may do (`draft`: place the text in the
+Slack draft box, `send`, `copy`: a local clipboard copy as Slack mrkdwn),
+gated by `send.mode`; `place_draft` is the pinned draft call (never marks the
+item done); `copy_text` is the pure conversion; `open_target` is the URL `o`
+opens (`slack_open.url_template`, else the item's link).
+
 0.4.0 adds two read-only calls: `fetch_context` (the configured context
 command) and `summarize` (one no-tools bridge call, cached on disk). Neither
 changes anything outside the inbox's own state files, so neither confirms.
@@ -28,7 +35,7 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 
-from . import context, customactions, invites, items, writes
+from . import context, customactions, invites, items, mrkdwn, writes
 from . import polish as polish_mod
 from . import summary as summary_mod
 from .models import to_v1
@@ -63,15 +70,20 @@ class LocalActions:
     def __init__(self, store, opener=None, rsvp=None, save=None,
                  base_dir=None, call_tools=None, context=None, summary=None,
                  complete=None, actions=None, send=None, react=None,
-                 polish=None):
+                 polish=None, copy=False, team=None, slack_open=None):
         """`rsvp`, `save`, `context`, `summary`, `send`, `react` and `polish`
         are the validated settings blocks (None: not configured); `actions`
         the validated list. `call_tools` and `complete` replace the Claude
-        bridge's two entry points (tests)."""
+        bridge's two entry points (tests). `copy` (the top-level `copy:`
+        setting) offers "Copy for Slack" without `send:`; `team` and
+        `slack_open` build the URL `o` opens for a Slack item."""
         self.store = store
         self.send_cfg, self.react_cfg, self.polish_cfg = send, react, polish
-        # Replies and nudges reach the confirm flow only with `send:`.
-        self.supports_send = send is not None and base_dir is not None
+        self.copy_cfg, self.team = bool(copy), team
+        self.slack_open_cfg = slack_open
+        # Replies and nudges reach the confirm flow only with `send:` or `copy:`.
+        self.supports_send = ((send is not None or self.copy_cfg)
+                              and base_dir is not None)
         self._send_lock = threading.Lock()   # one send runs at a time
         self.custom_actions = list(actions or [])
         self._open = opener or webbrowser.open
@@ -230,6 +242,61 @@ class LocalActions:
         return self.send_cfg is not None and self.base_dir is not None
 
     @property
+    def reply_configured(self):
+        """`a` / `n` open the real confirm flow: `send:` or `copy:` is set."""
+        return bool((self.send_cfg is not None or self.copy_cfg)
+                    and self.base_dir is not None)
+
+    @property
+    def send_mode(self):
+        """`send.mode` (send, draft or both), or None without `send:`."""
+        return self.send_cfg.get("mode", "send") if self.send_cfg else None
+
+    @property
+    def copy_enabled(self):
+        """"Copy for Slack" is on: `send:` or `copy: true` is configured."""
+        return self.send_cfg is not None or self.copy_cfg
+
+    def reply_options(self):
+        """What `a` / `n` may do after the confirm screen, in order, from
+        `draft` (mode draft or both), `send` (mode send or both) and `copy`
+        (always, once `send:` or `copy:` is set)."""
+        opts = []
+        cfg = self.send_cfg
+        if cfg is not None:
+            if cfg.get("mode", "send") in ("draft", "both") and cfg.get(
+                    "draft_tool"):
+                opts.append("draft")
+            if cfg.get("mode", "send") in ("send", "both") and cfg.get("tool"):
+                opts.append("send")
+        if self.copy_enabled:
+            opts.append("copy")
+        return tuple(opts)
+
+    def open_target(self, item):
+        """The URL `o` opens for `item`: the `slack_open.url_template` URL
+        when it is set and the item has a usable `meta.reply_to`, else the
+        item's own http(s) link, else None."""
+        if self.slack_open_cfg:
+            url = writes.slack_open_url(self.slack_open_cfg["url_template"],
+                                        self.team, item.meta)
+            if url:
+                return url
+        return safe_link(item.link)
+
+    def copy_text(self, item, text):
+        """`(mrkdwn, error)`: `text` (the checked draft) as Slack mrkdwn for
+        the clipboard. Purely local: no tool call, nothing written."""
+        if "copy" not in self.reply_options():
+            return "", "Copy is not configured"
+        if writes.reply_to(item.meta) is None:
+            return "", writes.NO_REPLY_TO[0].upper() + writes.NO_REPLY_TO[1:]
+        out = mrkdwn.to_slack_mrkdwn(text)
+        if not out.strip():
+            return "", "there is no text to copy"
+        return out, ""
+
+    @property
     def react_configured(self):
         return self.react_cfg is not None and self.base_dir is not None
 
@@ -275,6 +342,9 @@ class LocalActions:
     def _send(self, item, text, what):
         if not self.supports_send or self.send_cfg is None:
             return Result(False, f"{what} not configured")
+        if "send" not in self.reply_options():
+            return Result(False, f"{what} is off (send.mode is "
+                                 f"{self.send_mode}); not sent")
         plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
         if not plan.ok:
             return Result(False, plan.error)
@@ -303,6 +373,28 @@ class LocalActions:
     def nudge(self, item, text):
         """A nudge is the same write with the nudge text."""
         return self._send(item, text, "Nudge")
+
+    def place_draft(self, item, text):
+        """Put the reply in the Slack draft box of the item's conversation
+        through `send.draft_tool` (pinned, one call, never retried). Nothing
+        is posted and the item is NOT marked done. Blocks: call from a
+        worker. A `Result`."""
+        if (not self.supports_send or self.send_cfg is None
+                or "draft" not in self.reply_options()):
+            return Result(False, "Draft in Slack is not configured "
+                                 "(send.mode draft or both, send.draft_tool)")
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
+        if not plan.ok:
+            return Result(False, plan.error)
+        if not self._send_lock.acquire(blocking=False):
+            return Result(False, "another send is still running; no draft "
+                                 "placed")
+        try:
+            out = writes.run_draft(self.send_cfg, self.base_dir, plan.target,
+                                   plan.text, call_tools=self._call_tools)
+        finally:
+            self._send_lock.release()
+        return Result(out.ok, out.detail or ("Draft placed" if out.ok else ""))
 
     def react_plan(self, item):
         """`(channel, timestamp)` a reaction to `item` would go to, or None."""
@@ -366,7 +458,7 @@ class LocalActions:
         self.store.restore(item.key)
 
     def open_link(self, item):
-        link = safe_link(item.link)
+        link = self.open_target(item)
         if link is None:
             return Result(False, "this item has no link")
         try:

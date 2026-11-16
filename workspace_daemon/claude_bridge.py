@@ -586,6 +586,8 @@ def _result_text(content):
 def _error_category(text):
     """A short fixed tag for a tool error body; never the body itself."""
     text = text.casefold()
+    if "attached_draft_exists" in text:
+        return " (attached_draft_exists)"
     if any(m in text for m in (
             "rate limit", "too many requests", "quota exceeded",
             "ratelimited", "rate_limited")):

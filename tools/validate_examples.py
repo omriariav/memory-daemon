@@ -23,7 +23,7 @@ from workspace_daemon.inbox import settings as inbox_settings  # noqa: E402
 
 # Top-level blocks the example ships commented out (they are off by default).
 COMMENTED_BLOCKS = ("rsvp", "save", "context", "summary", "actions", "send",
-                    "react", "polish")
+                    "react", "polish", "copy", "team", "slack_open")
 
 
 def uncomment_blocks(text, keys=COMMENTED_BLOCKS):
@@ -55,12 +55,12 @@ def _inbox_problems(path):
     try:
         inbox_settings.load(ROOT, path)
         # The same file with the commented rsvp:, save:, context:, summary:, actions:,
-        # send:, react: and polish: blocks switched on.
+        # send:, react:, polish:, copy:, team: and slack_open: blocks switched on.
         raw = yaml.safe_load(uncomment_blocks(
             Path(path).read_text(encoding="utf-8")))
         settings = inbox_settings.validate(raw)
         for key in COMMENTED_BLOCKS:
-            if settings.get(key) is None:
+            if settings.get(key) in (None, False):
                 return [f"the commented {key}: example did not validate"]
     except inbox_settings.SettingsError as exc:
         return exc.problems

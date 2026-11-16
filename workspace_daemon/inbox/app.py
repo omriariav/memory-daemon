@@ -30,6 +30,7 @@ from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, HelpScreen, PolishScreen, SavedScreen,
                       SnoozePicker)
 from .sources import SourceResult, merge
+from .mrkdwn import to_slack_mrkdwn
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HintBar, Queue,
                       StatusHeader, ThreadView, fmt_age, fuzzy, palette, vis)
@@ -42,6 +43,15 @@ SUMMARY_OFF = "Summary not configured (set summary: in inbox.yaml)"
 REACT_OFF = "React not configured (set react: in inbox.yaml)"
 POLISH_OFF = "Polish not configured (set polish: in inbox.yaml)"
 SEND_KINDS = ("send", "nudge")
+# Every write that goes to Slack through the bridge's one-call path: only one
+# runs at a time, and quitting reports a running one.
+SLACK_WRITE_KINDS = SEND_KINDS + ("draft",)
+# 0.7.0 toasts (the second form is for an item `o` has nothing to open for).
+DRAFT_TOAST = "Draft placed in Slack: open it with o and press Enter."
+DRAFT_TOAST_NO_OPEN = ("Draft placed in Slack: open the conversation and "
+                       "press Enter.")
+COPY_TOAST = "Copied for Slack: open it with o and paste"
+COPY_TOAST_NO_OPEN = "Copied for Slack: open the conversation and paste"
 CONTEXT_DEBOUNCE_S = 0.4      # a new selection waits this long before fetching
 CONTEXT_MAX_FETCHES = 2       # context commands running at once
 NOT_CONFIRMED = "RSVP not confirmed by calendar"
@@ -53,7 +63,7 @@ RSVP_KEYS = {
 }
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
-EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save", "action", "react")
+EXTERNAL_KINDS = ("send", "nudge", "draft", "rsvp", "save", "action", "react")
 
 
 class _SavedUnit:
@@ -76,7 +86,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | done | ack | snooze | rsvp | save | action | react
+    kind: str                 # send | nudge | draft | done | ack | snooze | rsvp | save | action | react
     item: Item
     text: str = ""
     until: float = 0.0
@@ -169,6 +179,8 @@ class InboxApp(App):
     #polish-buttons Button { margin-left: 2; min-width: 16; }
     #confirm-buttons { height: 3; align-horizontal: right; }
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
+    #confirm.multi { width: 96; }
+    #confirm.multi #confirm-buttons Button { margin-left: 1; min-width: 10; padding: 0 1; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #snooze-list { height: 6; background: transparent; border: none; }
     #snooze-hint { margin-top: 1; color: $text-muted; }
@@ -868,6 +880,8 @@ class InboxApp(App):
             return a.send(it, p.text)
         if p.kind == "nudge":
             return a.nudge(it, p.text)
+        if p.kind == "draft":
+            return a.place_draft(it, p.text)
         if p.kind == "done":
             return a.mark_done(it)
         if p.kind == "ack":
@@ -892,7 +906,7 @@ class InboxApp(App):
             # write that was still running says how it ended.
             self._late_report(p, res)
             return
-        if p.kind in ("action", "send", "nudge", "react"):
+        if p.kind in ("action", "send", "nudge", "draft", "react"):
             # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
             return
@@ -904,7 +918,7 @@ class InboxApp(App):
     def _late_report(self, p, res):
         """A send, nudge or reaction that finished after the app began to
         quit: close its audit row and print one line to stderr."""
-        if p.kind not in SEND_KINDS and p.kind != "react":
+        if p.kind not in SLACK_WRITE_KINDS and p.kind != "react":
             return
         p.audit["status"] = "committed" if res.ok else "failed"
         p.audit["detail"] = (p.audit["detail"] + " · " + (res.detail or "done")
@@ -936,7 +950,8 @@ class InboxApp(App):
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
             self.notify(f"{p.name or p.kind} failed: {res.detail}", severity="error",
-                        timeout=10 if p.kind in SEND_KINDS else 6, markup=False)
+                        timeout=10 if p.kind in SLACK_WRITE_KINDS else 6,
+                        markup=False)
         elif p.kind == "rsvp":
             self.refilter()
             self.notify(f"{res.detail}: {p.item.gist}", title="RSVP sent", timeout=5, markup=False)
@@ -961,6 +976,14 @@ class InboxApp(App):
                         timeout=5, markup=False)
             if p.mark_done:
                 self._auto_done(p.item, "after react")
+        elif p.kind == "draft":
+            # A draft is not a send: the item stays, nothing is marked done.
+            if res.detail:
+                self.notify(res.detail, title="Draft in Slack", timeout=8,
+                            severity="warning", markup=False)
+            self.notify(DRAFT_TOAST if self._open_target(p.item)
+                        else DRAFT_TOAST_NO_OPEN, title="Draft in Slack",
+                        timeout=8, markup=False)
         elif p.kind in SEND_KINDS and self._real_send():
             self.refilter(redraw=False)
             self.redraw()
@@ -1040,12 +1063,30 @@ class InboxApp(App):
     def _real_send(self):
         """True when sends go to Slack (`send:` is configured), False in the
         demo, where they are only pretended."""
-        return bool(getattr(self.actions, "send_configured", False))
+        return bool(getattr(self.actions, "reply_configured",
+                            getattr(self.actions, "send_configured", False)))
 
     def _send_busy(self):
-        """A send or nudge is waiting out its undo window or running."""
-        return (any(p.kind in SEND_KINDS and not p.done for p in self.pending)
-                or any(p.kind in SEND_KINDS for p in self.running))
+        """A send, nudge or draft is waiting out its undo window or running."""
+        return (any(p.kind in SLACK_WRITE_KINDS and not p.done
+                    for p in self.pending)
+                or any(p.kind in SLACK_WRITE_KINDS for p in self.running))
+
+    def _open_target(self, it):
+        """The URL `o` opens for `it` (None when there is none)."""
+        fn = getattr(self.actions, "open_target", None)
+        try:
+            return fn(it) if fn else None
+        except Exception:
+            return None
+
+    def _reply_options(self):
+        """The actions the confirm screen offers: draft, send, copy. The demo
+        (a backend without `reply_options`) only pretends to send."""
+        fn = getattr(self.actions, "reply_options", None)
+        if not self._real_send() or fn is None:
+            return ("send",)
+        return tuple(fn())
 
     def _confirm_send(self, kind, it, verb):
         if self.editing:
@@ -1075,15 +1116,54 @@ class InboxApp(App):
 
     def _open_confirm_send(self, kind, it, verb, text, dest, note, warn="",
                            route=""):
-        def after(ok):
-            if ok:
+        options = self._reply_options()
+        if not options:
+            self.notify("Nothing to do: set send.mode / send.draft_tool or "
+                        "copy: in inbox.yaml", timeout=5, severity="warning",
+                        markup=False)
+            return
+        multi = options != ("send",)
+        open_url = (self._open_target(it) or "") if multi else ""
+
+        def after(choice):
+            if choice == "send":
                 self._enqueue(kind, it, f"{verb}: {dest}", text=text,
                               detail=f"{dest}: {text[:60]}")
+            elif choice == "draft":
+                self._enqueue("draft", it, f"Draft in Slack: {dest}",
+                              text=text, hide=False, name="Draft",
+                              detail=f"{dest}: {text[:60]}")
+            elif choice == "copy":
+                self._copy_for_slack(kind, it, text, dest)
             else:
                 self.record(kind, it, "cancelled at confirm", "cancelled")
-                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+                self.notify(("Cancelled. Nothing sent." if not multi
+                             else "Cancelled. Nothing sent, drafted or copied."),
+                            timeout=2, markup=False)
+        title = verb if not multi else (
+            "Nudge in Slack" if kind == "nudge" else "Reply in Slack")
         self.push_screen(ConfirmSend(verb, dest, text, self.bidi, note, warn,
-                                     route), after)
+                                     route, options=options, open_url=open_url,
+                                     title=title), after)
+
+    def _copy_for_slack(self, kind, it, text, dest):
+        """Copy the draft as Slack mrkdwn (OSC 52). Purely local: no tool
+        call, no undo window; the item stays."""
+        converted, error = ("", "")
+        fn = getattr(self.actions, "copy_text", None)
+        if fn is None:
+            converted = to_slack_mrkdwn(text)
+        else:
+            converted, error = fn(it, text)
+        if error or not converted:
+            self.record("copy", it, error or "nothing to copy", "refused")
+            self.notify(error or "Nothing to copy", severity="warning",
+                        timeout=5, markup=False)
+            return
+        self.copy_to_clipboard(converted)
+        self.record("copy", it, f"{dest}: {converted[:60]}", "ok")
+        self.notify(COPY_TOAST if self._open_target(it) else COPY_TOAST_NO_OPEN,
+                    title="Copied for Slack", timeout=6, markup=False)
 
     # ---------- the optional send precheck (read-only advice) ----------
     def _precheck_begin(self, kind, it, verb, text, dest, note, route=""):
@@ -2077,12 +2157,14 @@ class InboxApp(App):
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
         for p in self.running:
-            if p.kind in SEND_KINDS or p.kind == "react":
+            if p.kind in SLACK_WRITE_KINDS or p.kind == "react":
+                did = "placed in your Slack drafts" if p.kind == "draft" \
+                    else "sent"
                 p.audit["status"] = "running at quit"
                 p.audit["detail"] = (p.audit["detail"]
-                                     + " · may have been sent").strip(" ·")
+                                     + f" · may have been {did}").strip(" ·")
                 parts.append(f"{p.label}: still running; it may have been "
-                             "sent, check Slack.")
+                             f"{did}, check Slack.")
         if self._sum_running is not None:
             parts.append("The summary is still finishing; the process exits "
                          "when it ends.")
@@ -2295,7 +2377,7 @@ class InboxApp(App):
             ("Refresh context", "C (or r inside the pane): fetch the context again", self.action_context_refresh),
             ("Summarize item", "i: AI summary in the context pane (needs summary: in inbox.yaml)", lambda: self.action_summary(False)),
             ("Summarize item (refresh)", "I: ask for a new summary even if one is cached", lambda: self.action_summary(True)),
-            ("Nudge", "Send the nudge draft (confirm first)", self.action_nudge),
+            ("Nudge", "Send, draft or copy the nudge (confirm first)", self.action_nudge),
             ("Open link", "Open the item's link in the browser", self.action_open),
             ("Copy item", "y: sender, where, gist and the link", self.action_copy_item),
             ("Copy section", "Y: every item in this section, one per line", self.action_copy_section),

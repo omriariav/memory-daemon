@@ -21,12 +21,20 @@ URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
 TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread_order",
             "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
-            "summary", "actions", "send", "react", "polish")
+            "summary", "actions", "send", "react", "polish", "copy", "team",
+            "slack_open")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s", "mark_done")
 SEND_KEYS = ("tool", "args", "timeout_s", "model", "precheck",
-             "allow_channel_posts")
+             "allow_channel_posts", "mode", "draft_tool")
+SEND_MODES = ("send", "draft", "both")
+SLACK_OPEN_KEYS = ("url_template",)
+# The placeholders a `slack_open.url_template` may use.
+SLACK_OPEN_FIELDS = ("channel", "thread_ts", "message_ts", "team")
+SLACK_OPEN_SCHEMES = ("slack://", "https://")
+SLACK_OPEN_MAX = 500
+TEAM_ID = re.compile(r"\A[T][A-Z0-9]{6,12}\Z")
 PRECHECK_KEYS = ("argv", "timeout_s")
 SEND_ARG_KEYS = ("channel", "thread_ts", "text")
 REACT_KEYS = ("tool", "args", "emojis", "timeout_s", "model", "mark_done",
@@ -92,6 +100,9 @@ DEFAULTS = {
     "send": None,      # no default: replies and nudges are demo-only until set
     "react": None,     # no default: no emoji reaction until configured
     "polish": None,    # no default: no draft polishing until configured
+    "copy": False,     # true: "Copy for Slack" without `send:`
+    "team": None,      # the Slack workspace id for slack_open (T...)
+    "slack_open": None,   # no default: `o` opens the item's link
 }
 
 
@@ -186,6 +197,20 @@ def validate(raw):
     out["send"] = _check_send(raw.get("send"), problems)
     out["react"] = _check_react(raw.get("react"), problems)
     out["polish"] = _check_polish(raw.get("polish"), problems)
+    copy = raw.get("copy", DEFAULTS["copy"])
+    if not isinstance(copy, bool):
+        problems.append("copy must be true or false")
+    else:
+        out["copy"] = copy
+    team = raw.get("team")
+    if team is not None:
+        if not isinstance(team, str) or not TEAM_ID.match(team):
+            problems.append("team must be a Slack workspace id "
+                            "(T followed by 6 to 12 capital letters or digits)")
+            team = None
+        out["team"] = team
+    out["slack_open"] = _check_slack_open(raw.get("slack_open"), team,
+                                          problems)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:
@@ -436,6 +461,57 @@ def _check_tool_args(raw, label, keys, problems):
     return names if len(problems) == start else None
 
 
+def _check_tool(raw, key, required, problems):
+    """`send.<key>` as a connector tool name, or None when it is absent and
+    not required."""
+    value = raw.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not TOOL_NAME.match(value):
+        problems.append(f"send.{key} must be a connector tool name "
+                        "(mcp__<server>__<tool>, letters, digits, _ . -)"
+                        + ("" if required else " or left out"))
+        return None
+    return value
+
+
+def _check_slack_open(raw, team, problems):
+    """The `slack_open:` block as `{url_template}`, or None. The template
+    starts with slack:// or https://, uses only the known placeholders, and
+    `{team}` needs the top-level `team:`."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("slack_open must be a mapping with url_template")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in SLACK_OPEN_KEYS:
+            problems.append(f"slack_open: unknown key '{key}'")
+    tpl = raw.get("url_template")
+    if not isinstance(tpl, str) or not tpl.startswith(SLACK_OPEN_SCHEMES):
+        problems.append("slack_open.url_template must be a string starting "
+                        "with slack:// or https://")
+    elif len(tpl) > SLACK_OPEN_MAX or re.search(r"[\x00-\x20\x7f-\x9f]", tpl):
+        problems.append(f"slack_open.url_template must be one line without "
+                        f"spaces, up to {SLACK_OPEN_MAX} characters")
+    else:
+        for name in re.findall(r"\{([^{}]*)\}", tpl):
+            if name not in SLACK_OPEN_FIELDS:
+                problems.append(
+                    f"slack_open.url_template: unknown placeholder "
+                    f"{{{name}}} (use {', '.join('{' + f + '}' for f in SLACK_OPEN_FIELDS)})")
+        stripped = re.sub(r"\{(?:%s)\}" % "|".join(SLACK_OPEN_FIELDS), "", tpl)
+        if "{" in stripped or "}" in stripped:
+            problems.append("slack_open.url_template has a stray brace")
+        if "{team}" in tpl and team is None:
+            problems.append("slack_open.url_template uses {team}: set team: "
+                            "to your workspace id (T...)")
+    if len(problems) > start:
+        return None
+    return {"url_template": tpl}
+
+
 def _check_send(raw, problems):
     """The `send:` block as a clean dict, or None (absent or invalid)."""
     if raw is None:
@@ -447,10 +523,17 @@ def _check_send(raw, problems):
     for key in raw:
         if key not in SEND_KEYS:
             problems.append(f"send: unknown key '{key}'")
-    tool = raw.get("tool")
-    if not isinstance(tool, str) or not TOOL_NAME.match(tool):
-        problems.append("send.tool must be a connector tool name "
-                        "(mcp__<server>__<tool>, letters, digits, _ . -)")
+    mode = raw.get("mode", "send")
+    if mode not in SEND_MODES:
+        problems.append(f"send.mode must be one of {', '.join(SEND_MODES)} "
+                        "(default send)")
+        mode = "send"
+    tool = _check_tool(raw, "tool", mode in ("send", "both"), problems)
+    draft_tool = _check_tool(raw, "draft_tool", mode in ("draft", "both"),
+                             problems)
+    if (tool is not None and draft_tool is not None and tool == draft_tool):
+        problems.append("send.tool and send.draft_tool must be different "
+                        "tools")
     names = _check_tool_args(raw.get("args"), "send.args", SEND_ARG_KEYS,
                              problems)
     timeout = raw.get("timeout_s", DEFAULT_SEND_TIMEOUT_S)
@@ -467,7 +550,8 @@ def _check_send(raw, problems):
         return None
     return {"tool": tool, "args": names, "timeout_s": float(timeout),
             "model": model, "precheck": precheck,
-            "allow_channel_posts": allow_channel}
+            "allow_channel_posts": allow_channel, "mode": mode,
+            "draft_tool": draft_tool}
 
 
 def _check_precheck(raw, problems):
