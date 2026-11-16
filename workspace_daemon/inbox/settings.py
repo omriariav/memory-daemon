@@ -9,21 +9,25 @@ from pathlib import Path
 
 import yaml
 
-from . import sources, themes
+from . import invites, sources, themes
 
 FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
-TOP_KEYS = ("poll_interval_s", "theme", "bidi_mode", "gmail_account",
+TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
             "alert_urgent_max_age_h", "sources")
 SOURCE_KEYS = {
-    "events": ("name", "type", "window_h", "urgent"),
-    "command": ("name", "type", "argv", "timeout_s"),
+    "events": ("name", "type", "window_h", "urgent", "invites_days",
+               "saved_days", "email_require_label"),
+    "command": ("name", "type", "argv", "timeout_s", "supports_all",
+                "watch"),
 }
 DEFAULT_TIMEOUT_S = 20
+MAX_WATCH = 50
 DEFAULTS = {
-    "poll_interval_s": 60.0,
+    "poll_interval_s": 600.0,
+    "watch_interval_s": 3.0,
     "theme": themes.DEFAULT,
     "bidi_mode": "auto",
     "gmail_account": 0,
@@ -71,10 +75,16 @@ def validate(raw):
     out = dict(DEFAULTS)
 
     poll = raw.get("poll_interval_s", DEFAULTS["poll_interval_s"])
-    if not _num(poll) or not 5 <= poll <= 3600:
-        problems.append("poll_interval_s must be a number from 5 to 3600")
+    if not _num(poll) or not 30 <= poll <= 3600:
+        problems.append("poll_interval_s must be a number from 30 to 3600")
     else:
         out["poll_interval_s"] = float(poll)
+
+    watch_s = raw.get("watch_interval_s", DEFAULTS["watch_interval_s"])
+    if not _num(watch_s) or not 1 <= watch_s <= 30:
+        problems.append("watch_interval_s must be a number from 1 to 30")
+    else:
+        out["watch_interval_s"] = float(watch_s)
 
     theme = raw.get("theme", DEFAULTS["theme"])
     if theme not in themes.NAMES:
@@ -135,8 +145,28 @@ def validate(raw):
             rules = src.get("urgent")
             rules = (list(sources.DEFAULT_URGENT_RULES) if rules is None
                      else _check_rules(rules, f"{label}.urgent", problems))
+            invites_days = src.get("invites_days", invites.DEFAULT_DAYS)
+            if not _num(invites_days) or not 0 <= invites_days <= 60:
+                problems.append(f"{label}.invites_days must be 0 (off) to 60")
+                invites_days = invites.DEFAULT_DAYS
+            saved_days = src.get("saved_days", sources.DEFAULT_SAVED_DAYS)
+            if not _num(saved_days) or not 1 <= saved_days <= 30:
+                problems.append(f"{label}.saved_days must be 1 to 30")
+                saved_days = sources.DEFAULT_SAVED_DAYS
+            require = src.get("email_require_label")
+            if require is not None and (
+                    not isinstance(require, str) or not require.strip()
+                    or len(require) > 100
+                    or re.search(r"[\x00-\x1f\x7f]", require)):
+                problems.append(f"{label}.email_require_label must be null or "
+                                "a label name (one line, up to 100 chars)")
+                require = None
             built.append({"name": name, "type": "events",
-                          "window_h": float(window), "urgent": rules})
+                          "window_h": float(window), "urgent": rules,
+                          "invites_days": float(invites_days),
+                          "saved_days": float(saved_days),
+                          "email_require_label": (
+                              require.strip() if require else None)})
         else:
             argv = src.get("argv")
             if (not isinstance(argv, list) or not argv
@@ -156,8 +186,22 @@ def validate(raw):
                 problems.append(
                     f"{label}.timeout_s ({timeout:g}) must be below "
                     f"poll_interval_s ({out['poll_interval_s']:g})")
+            supports_all = src.get("supports_all", False)
+            if not isinstance(supports_all, bool):
+                problems.append(f"{label}.supports_all must be true or false")
+                supports_all = False
+            watch = src.get("watch", [])
+            if (not isinstance(watch, list) or len(watch) > MAX_WATCH
+                    or not all(isinstance(w, str) and w.strip()
+                               and not re.search(r"[\x00-\x1f\x7f]", w)
+                               for w in watch)):
+                problems.append(f"{label}.watch must be a list of up to "
+                                f"{MAX_WATCH} paths (strings)")
+                watch = []
             built.append({"name": name, "type": "command",
-                          "argv": list(argv), "timeout_s": float(timeout)})
+                          "argv": list(argv), "timeout_s": float(timeout),
+                          "supports_all": supports_all,
+                          "watch": [w.strip() for w in watch]})
     out["sources"] = built
     if problems:
         raise SettingsError(problems)

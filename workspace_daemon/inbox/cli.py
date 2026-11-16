@@ -37,18 +37,34 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
         return 2
     from .actions import FakeActions, LocalActions
     from .app import InboxApp
-    from .demo import DemoSource
+    from .demo import DemoSource, demo_saved
     from .store import InboxStore
     from . import sources
 
     if demo:
+        # The demo's fake poll brings one arrival per refresh: keep it lively.
+        settings = dict(settings, poll_interval_s=60.0)
         store = InboxStore(None)
         app = InboxApp(DemoSource(empty=empty), store,
-                       FakeActions(store=store), settings, demo=True)
+                       FakeActions(store=store), settings, demo=True,
+                       saved=demo_saved, saved_days=2)
     else:
         base = Path(base_dir)
         store = InboxStore(base)
-        app = InboxApp(lambda: sources.collect(settings, base), store,
-                       LocalActions(store), settings, stream_delay=0)
+        events = next((s for s in settings["sources"]
+                       if s["type"] == "events"), None)
+        days = events["saved_days"] if events is not None else None
+
+        def saved():
+            return sources.load_saved(
+                base, days=days, gmail_account=settings["gmail_account"])
+
+        def fetch(show_all=False):
+            return sources.collect(settings, base, show_all=show_all)
+
+        app = InboxApp(fetch, store, LocalActions(store), settings,
+                       stream_delay=0, saved=saved if events else None,
+                       saved_days=days, units=sources.make_units(settings, base),
+                       saved_watch=sources.saved_watch(base) if events else None)
     app.run()
     return 0

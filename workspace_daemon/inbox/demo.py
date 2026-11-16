@@ -145,10 +145,32 @@ class DemoSource:
         self.arrivals = []
         self.polls = 0
 
-    def __call__(self):
+    def __call__(self, show_all=False):
         if self.latency:
             time.sleep(self.latency)
         if self.polls > 0 and len(self.arrivals) < self.max_arrivals and not self.empty:
             self.arrivals.append(arrival(len(self.arrivals)))
         self.polls += 1
-        return [SourceResult("demo", self.base + self.arrivals, False, 0.0, None)]
+        extra = []
+        if show_all and not self.empty:  # what a `supports_all` source adds
+            extra = [itm.make_item(
+                id="demo:all1", source="slack", section="fyi", urgency="digest",
+                sender="Mei Tanaka", where="#release-notes", gist="Older thread, already answered",
+                ts=self.now - 30 * H, link="https://example.invalid/item/all1",
+                thread=_thread(self.now, [("Mei Tanaka", 30 * 60, "Thanks, all set on my side.")]),
+                draft=None, actions=FYI, meta={"demo": True})]
+        return [SourceResult("demo", self.base + self.arrivals + extra, False, 0.0, None)]
+
+
+def demo_saved(now=None):
+    """Invented rows for the Saved view in `--demo`: `(rows, error)`."""
+    now = now or time.time()
+    spec = [("slack", "update", 25, "Launch checklist thread", None),
+            ("email", "new", 70, "Vendor contract renewal terms",
+             "https://example.invalid/mail/contract"),
+            ("recording", "new", 190, "Design sync (recording)", None),
+            ("slack", "new", 400, "Onboarding flow review", None)]
+    return [{"id": f"demo-saved-{n}", "source": src, "kind": kind,
+             "ts": now - ago * M, "title": title, "link": link,
+             "source_id": f"demo:{n}"}
+            for n, (src, kind, ago, title, link) in enumerate(spec)], None

@@ -249,14 +249,17 @@ class SettingsTest(unittest.TestCase):
                 src["timeout_s"] = timeout
             return settings.validate({"poll_interval_s": poll, "sources": [src]})
         self.assertEqual(cfg(30, 29)["sources"][0]["timeout_s"], 29.0)
-        for poll, timeout in ((30, 30), (30, 45), (10, 60)):
+        for poll, timeout in ((30, 30), (30, 45), (40, 60)):
             with self.assertRaises(settings.SettingsError, msg=(poll, timeout)) as ctx:
                 cfg(poll, timeout)
             self.assertIn("poll_interval_s", str(ctx.exception))
         # the default timeout adapts instead of failing a short interval
-        self.assertEqual(cfg(60)["sources"][0]["timeout_s"], 20.0)
-        self.assertEqual(cfg(10)["sources"][0]["timeout_s"], 9.0)
-        self.assertEqual(cfg(5)["sources"][0]["timeout_s"], 4.0)
+        self.assertEqual(cfg(600)["sources"][0]["timeout_s"], 20.0)
+        self.assertEqual(cfg(30)["sources"][0]["timeout_s"], 20.0)
+        # 0.2.0: the fallback interval starts at 30 s
+        for bad in (5, 29, 3601):
+            with self.assertRaises(settings.SettingsError, msg=bad):
+                cfg(bad)
 
     def test_gmail_account(self):
         self.assertEqual(settings.default_settings()["gmail_account"], 0)

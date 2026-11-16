@@ -7,6 +7,64 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+Read-side features only: nothing new is written or sent. RSVP and save
+actions are planned for 0.3.0; pending invites already carry the event and
+calendar ids such an action needs.
+
+### Added
+
+- Show all (`A`): a `command` source that declares `supports_all: true` is
+  called as `<argv> list --all` while the toggle is on. Sources that do not
+  declare it never receive `--all`. The header shows `all`; off by default,
+  per session, never saved. In the footer, help overlay and palette.
+- Pending calendar invites: upcoming events whose RSVP is `needsAction` appear
+  under Needs reply (source `calendar`) with the title, the time in local time
+  and the organizer, read from the calendar cache's snapshot
+  (`state/calendar-snapshot.json`) without touching the network. Declined,
+  accepted, tentative and cancelled events never show. `meta` carries
+  `event_id` and `calendar_id`; the row's time is the event's start (the
+  cache has no arrival time), so invites list soonest first and show `in 2h`.
+  A `New invite` row from the events stream is dropped when its series has a
+  pending row. Actions: `ack` (hide locally) and `open`
+  (the meeting link, when the cache has a safe http(s) one). New setting
+  `invites_days` on the events source (default 7, 0 turns it off).
+- Mail label filter: new events-source setting `email_require_label`
+  (default off). When set, only mail captured by a Gmail routine whose search
+  query requires that label becomes an email item. A routine counts only when
+  every one of its Gmail blocks requires the label; quoted phrases, `OR`,
+  `NOT`, `|`, braces and parentheses never count as a label term. It uses the
+  routine's current query. See docs/inbox.md for what this does and does not
+  prove.
+- Saved view (`S`): a read-only list of what the daemon saved to memory
+  recently (capture events of kind `new` or `update`), with the source glyph,
+  title, time and kind; `o` opens a link, `esc` returns. New setting
+  `saved_days` on the events source (default 2). Saved rows are not inbox
+  items and cannot be acted on.
+- Change-driven refresh: every `watch_interval_s` (default 3, 1 to 30) the
+  inbox stat-checks the files each source depends on and re-runs only a source
+  whose file changed (mtime and size; a file that appears counts), debounced
+  to one refresh per source per 2 s and never overlapping. The built-in
+  sources know their files (events, the alert state, the calendar cache, and
+  the Saved view while it is open); a `command` source declares
+  `watch: [paths]` (relative to the base dir, absolute or `~`) and without it
+  is refreshed by the fallback timer and `r` only. A fallback refresh that
+  lands on a running one is queued, not dropped. The header's `updated Ns ago`
+  treats a watched source with unchanged files as fresh, and the 30 s timer
+  re-applies the clock (ended invites, the window, alert age, urgent-soon
+  rules) without reading any file. Watched paths are stat-ed on the UI thread:
+  keep them off network mounts. The file signature includes the inode, so an
+  atomic replace that keeps the mtime and size is still seen.
+
+### Changed
+
+- `poll_interval_s` is now the fallback full refresh: default 600 (was 60),
+  range 30 to 3600 (was 5 to 3600). A config that set a value below 30 must
+  raise it.
+- The header shows `updated Ns ago` for the least recently refreshed source
+  instead of the next-poll countdown.
+
 ## [0.1.0] - 2026-11-15
 
 First versioned release: the inbox as merged in PR #128, plus the copy keys

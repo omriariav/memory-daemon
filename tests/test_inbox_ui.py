@@ -19,7 +19,8 @@ if HAVE_TEXTUAL:
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.demo import DemoSource
     from workspace_daemon.inbox.screens import (ConfirmSend, HelpScreen,
-                                                SnoozePicker, parse_snooze)
+                                                SavedScreen, SnoozePicker,
+                                                parse_snooze)
     from workspace_daemon.inbox.store import InboxStore
     from workspace_daemon.inbox.widgets import Queue
 
@@ -288,16 +289,18 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.polling)
                 await pilot.press("r", "r")        # manual: told, not queued
                 await pilot.pause(0.2)
-                app.poll()                         # timer-driven: silent skip
+                app.poll()                         # timer-driven: queued, silent
+                app.poll()                         # ... and merged with the first
                 told = [c.args[0] for c in note.call_args_list]
                 self.assertEqual(told.count("Poll already running"), 2)
                 self.assertEqual(len(calls), 2)    # no extra fetches started
                 gate.set()
-                await pilot.pause(0.5)
+                await pilot.pause(0.6)
             self.assertFalse(app.polling)
+            self.assertEqual(len(calls), 3)        # the queued one ran, once
             await pilot.press("r")
             await pilot.pause(0.4)
-            self.assertEqual(len(calls), 3)        # polling works again
+            self.assertEqual(len(calls), 4)        # polling works again
 
     async def test_each_poll_reloads_marks_written_by_another_pane(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +715,667 @@ class SnoozeParseTest(unittest.TestCase):
         self.assertGreater(parse_snooze("17:30", now), now)
         for bad in ("", "soon", "25:00", "12:99", "-5m"):
             self.assertIsNone(parse_snooze(bad, now), bad)
+
+
+
+class AllAwareFetch:
+    """A fetch() that takes `show_all`; records each call and adds one item
+    only while the toggle is on."""
+
+    def __init__(self, extra=None):
+        self.calls = []
+        self.extra = extra or []
+
+    def __call__(self, show_all=False):
+        self.calls.append(show_all)
+        rows = [item(1, "fyi", "calendar")] + (self.extra if show_all else [])
+        return [sources.SourceResult("t", rows, False, None, None)]
+
+
+SAVED_ROWS = [
+    {"id": "s1", "source": "slack", "kind": "update", "ts": time.time() - 600,
+     "title": "Launch checklist thread", "link": None, "source_id": "slack:C1:1"},
+    {"id": "s2", "source": "email", "kind": "new", "ts": time.time() - 3600,
+     "title": "Contract terms [b]x[/b]", "link": "https://example.com/mail/1",
+     "source_id": "gmail:abcdef0123456789"},
+]
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ShowAllKeyTest(unittest.IsolatedAsyncioTestCase):
+    def make(self, fetch):
+        store = InboxStore(None)
+        return InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
+                        dict(DEFAULTS), undo_s=0.15, leave_s=0, stream_delay=0), store
+
+    async def wait_polls(self, pilot, fetch, n):
+        for _ in range(200):
+            if len(fetch.calls) >= n and not pilot.app.polling:
+                break
+            await pilot.pause(0.02)
+        await pilot.pause(0.2)
+
+    async def test_off_by_default_then_a_toggles_and_repolls(self):
+        fetch = AllAwareFetch(extra=[item(2, "urgent", "slack", actions=("ack",))])
+        app, _ = self.make(fetch)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual((fetch.calls, app.show_all), ([False], False))
+            self.assertNotIn(" all ", str(app.query_one("#hdr").render()))
+            await pilot.press("A")
+            await self.wait_polls(pilot, fetch, 2)
+            self.assertEqual((fetch.calls, app.show_all), ([False, True], True))
+            self.assertIn(" all ", str(app.query_one("#hdr").render()))
+            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:2"])
+            await pilot.press("A")
+            await self.wait_polls(pilot, fetch, 3)
+            self.assertEqual(fetch.calls, [False, True, False])
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+            self.assertNotIn(" all ", str(app.query_one("#hdr").render()))
+
+    async def test_items_revealed_by_all_do_not_raise_urgent_alerts(self):
+        fetch = AllAwareFetch(extra=[item(2, "urgent", "slack", actions=("ack",))])
+        app, _ = self.make(fetch)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(app, "bell") as bell:
+                await pilot.press("A")
+                await self.wait_polls(pilot, fetch, 2)
+                bell.assert_not_called()
+
+    async def test_toggle_during_a_poll_polls_again_with_the_new_state(self):
+        gate = threading.Event()
+        calls = []
+
+        def slow(show_all=False):
+            calls.append(show_all)
+            if len(calls) == 1:
+                gate.wait(5)
+            return [sources.SourceResult("t", [item(1)], False, None, None)]
+
+        app, _ = self.make(slow)
+        async with app.run_test(size=SIZE) as pilot:
+            for _ in range(100):
+                if calls:
+                    break
+                await pilot.pause(0.02)
+            await pilot.press("A")      # first poll is still running
+            gate.set()
+            for _ in range(200):
+                if len(calls) >= 2 and not app.polling:
+                    break
+                await pilot.pause(0.02)
+            self.assertEqual(calls, [False, True])
+
+    async def test_a_plain_fetch_without_show_all_still_works(self):
+        app, _, _ = make_app([item(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("A")
+            await pilot.pause(0.4)
+            self.assertTrue(app.show_all)
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+
+    async def test_real_collect_passes_all_only_to_declaring_sources(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "calls.log"
+            script = Path(tmp) / "src.py"
+            script.write_text(
+                "import json, sys\n"
+                f"open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "print(json.dumps({'v': 1, 'items': []}))\n")
+            argv = [sys.executable, str(script)]
+            cfg = settings.validate({"sources": [
+                {"name": "p", "type": "command", "argv": argv + ["p"]},
+                {"name": "w", "type": "command", "argv": argv + ["w"],
+                 "supports_all": True}]})
+
+            def fetch(show_all=False):
+                return sources.collect(cfg, Path(tmp), show_all=show_all)
+
+            app, _ = self.make(fetch)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("A")
+                for _ in range(200):
+                    if log.read_text().count("\n") >= 4 and not app.polling:
+                        break
+                    await pilot.pause(0.05)
+            lines = log.read_text().split("\n")
+            self.assertCountEqual([l for l in lines if l], [
+                "p list", "w list", "p list", "w list --all"])
+
+    async def test_footer_help_and_palette_list_the_new_keys(self):
+        app, _, _ = make_app([item(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn(("A", "all"), app.hints())
+            self.assertIn(("S", "saved"), app.hints())
+            await pilot.press("question_mark")
+            await pilot.pause(0.1)
+            body = str(app.screen.query_one("#help-body").render())
+            self.assertIn("show all", body)
+            self.assertIn("saved", body)
+            await pilot.press("escape")
+            cmds = [c.title for c in app.get_system_commands(app.screen)]
+            self.assertIn("Show all (toggle)", cmds)
+            self.assertIn("Saved to memory", cmds)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
+    def make(self, rows=None, error=None):
+        store = InboxStore(None)
+        actions = FakeActions(store=store, draft_delay=0)
+        saved = None if rows is None and error is None else (lambda: (rows or [], error))
+        app = InboxApp(Fixed([item(1, "fyi", "calendar")]), store, actions,
+                       dict(DEFAULTS), undo_s=0.15, leave_s=0, stream_delay=0,
+                       saved=saved, saved_days=2)
+        return app, store, actions
+
+    async def test_s_lists_rows_and_esc_returns(self):
+        app, _, _ = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, SavedScreen)
+            table = app.screen.query_one("#saved-table")
+            self.assertEqual(table.row_count, 2)
+            cells = [[str(c) for c in table.get_row_at(n)] for n in range(2)]
+            self.assertEqual(cells[0][0], "#")                 # Slack glyph
+            self.assertEqual(cells[0][1], "Launch checklist thread")
+            self.assertEqual(cells[0][3], "update")
+            self.assertEqual(cells[1][0], "✉")
+            self.assertEqual(cells[1][1], "Contract terms [b]x[/b]")  # literal
+            self.assertEqual(cells[1][3], "new")
+            self.assertRegex(cells[0][2], r"\d\d:\d\d")
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertNotIsInstance(app.screen, SavedScreen)
+            self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_o_opens_the_link_and_a_row_without_one_says_so(self):
+        app, _, actions = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            await pilot.press("o")            # first row: no link
+            await pilot.pause(0.1)
+            self.assertEqual([c for c in actions.calls if c[0] == "open"], [])
+            await pilot.press("j", "o")       # second row: has a link
+            await pilot.pause(0.1)
+            self.assertEqual([c[0] for c in actions.calls if c[0] == "open"], ["open"])
+            self.assertIn("open", [r["action"] for r in app.audit])
+
+    async def test_saved_rows_are_never_actionable(self):
+        app, store, actions = self.make(SAVED_ROWS)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            before = app.current_key
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            await pilot.press("a", "d", "s", "n", "e", "y", "u")
+            await pilot.pause(0.2)
+            self.assertIsInstance(app.screen, SavedScreen)   # nothing dismissed it
+            self.assertEqual(app.pending, [])
+            self.assertEqual(store.marks, {})
+            self.assertEqual([c for c in actions.calls
+                              if c[0] not in ("draft",)], [])
+            await pilot.press("S")            # S closes it too
+            await pilot.pause(0.2)
+            self.assertEqual(len(app.screen_stack), 1)
+            self.assertEqual(app.current_key, before)
+            self.assertEqual([i.key for i in app.items], ["t:1"])
+
+    async def test_empty_and_error_states(self):
+        app, _, _ = self.make([], None)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            table = app.screen.query_one("#saved-table")
+            self.assertIn("nothing saved", str(table.get_row_at(0)[1]))
+            await pilot.press("o")            # nothing to open: no crash
+            await pilot.pause(0.1)
+            await pilot.press("escape")
+        app, _, _ = self.make([], "cannot read events: denied")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIn("denied", str(app.screen.query_one("#saved-table").get_row_at(0)[1]))
+
+    async def test_a_failing_reader_does_not_end_the_session(self):
+        store = InboxStore(None)
+
+        def boom():
+            raise RuntimeError("nope")
+
+        app = InboxApp(Fixed([item(1)]), store, FakeActions(store=store),
+                       dict(DEFAULTS), leave_s=0, stream_delay=0, saved=boom)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, SavedScreen)
+
+    async def test_without_a_reader_s_only_says_so(self):
+        app, _, _ = self.make()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.2)
+            self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_demo_has_saved_rows(self):
+        from workspace_daemon.inbox.demo import demo_saved
+        rows, err = demo_saved()
+        self.assertIsNone(err)
+        self.assertGreaterEqual(len(rows), 3)
+
+
+
+class CountingUnit:
+    """A refreshable unit for the app: counts runs, lists one item, watches
+    the given paths."""
+
+    def __init__(self, name, paths=(), uses_all=False, delay=0.0, items=None):
+        self.name, self.paths, self.uses_all = name, list(paths), uses_all
+        self.delay = delay
+        self.items = items
+        self.runs, self.times, self.alls = 0, [], []
+        self.active = self.peak = 0
+        self.reeval = None          # set to a callable(now) to enable
+
+    def watch(self):
+        return list(self.paths)
+
+    def run(self, now, show_all):
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            self.runs += 1
+            self.times.append(time.monotonic())
+            self.alls.append(show_all)
+            if self.delay:
+                time.sleep(self.delay)
+            rows = self.items if self.items is not None else [
+                item(1, "fyi", "calendar", id=f"{self.name}:1")]
+            return [sources.SourceResult(self.name, rows, False, None, None)]
+        finally:
+            self.active -= 1
+
+
+def unit_app(units, poll_s=300.0, watch_s=0.05, debounce_s=0.0, saved=None,
+             saved_watch=None, **kw):
+    store = InboxStore(None)
+    cfg = dict(DEFAULTS, watch_interval_s=watch_s)
+    app = InboxApp(lambda: [], store, FakeActions(store=store, draft_delay=0),
+                   cfg, undo_s=0.15, leave_s=0, stream_delay=0, poll_s=poll_s,
+                   units=units, saved=saved, saved_watch=saved_watch, **kw)
+    app.watcher.debounce_s = debounce_s
+    return app
+
+
+async def until(pilot, cond, tries=150, step=0.04):
+    for _ in range(tries):
+        if cond():
+            return True
+        await pilot.pause(step)
+    return cond()
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def f(self, name, text="x"):
+        path = self.dir / name
+        path.write_text(text)
+        return str(path)
+
+    async def test_a_changed_file_refreshes_only_its_source(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [self.f("b.txt")])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual((a.runs, b.runs), (1, 1))
+            (self.dir / "a.txt").write_text("changed, and longer")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+            await pilot.pause(0.4)
+            self.assertEqual((a.runs, b.runs), (2, 1))
+            # b's rows are still listed from its cached result
+            self.assertEqual(sorted(i.key for i in app.items), ["a:1", "b:1"])
+
+    async def test_no_change_means_no_re_run(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])           # no watch list: fallback only
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.8)          # ~15 watch ticks
+            self.assertEqual((a.runs, b.runs), (1, 1))
+
+    async def test_the_fallback_timer_refreshes_everything(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b], poll_s=0.5)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: a.runs >= 2 and b.runs >= 2, tries=100))
+
+    async def test_r_refreshes_everything(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")
+            self.assertTrue(await until(pilot, lambda: b.runs == 2))
+            self.assertEqual(a.runs, 2)
+
+    async def test_a_burst_of_changes_is_debounced_per_source(self):
+        class Fake:
+            t = 1000.0
+
+            def __call__(self):
+                return self.t
+
+        clock = Fake()
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a], watch_s=1000.0, debounce_s=0.6)   # ticks are manual
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.watcher.clock = clock
+            app.watcher.commit()                  # baseline at fake t=1000
+            stamps = []
+            for n in range(14):                   # a write every fake 0.1 s
+                clock.t += 0.1
+                (self.dir / "a.txt").write_text("x" * (n + 2))
+                before = a.runs
+                app.watch_tick()
+                await until(pilot, lambda: not app.polling)
+                if a.runs > before:
+                    stamps.append(round(clock.t, 1))
+            self.assertEqual(stamps, [1000.6, 1001.2])
+            clock.t += 1.0                        # quiet now: the held change fires
+            app.watch_tick()
+            await until(pilot, lambda: a.runs == 4 and not app.polling)
+            self.assertEqual(a.runs, 4)           # the first run + three
+
+    async def test_a_watched_file_that_appears_counts_as_a_change(self):
+        later = self.dir / "later.jsonl"
+        a = CountingUnit("a", [str(later)])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.3)
+            self.assertEqual(a.runs, 1)
+            later.write_text("hello")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+
+    async def test_stat_errors_do_not_crash_or_refresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+
+            def boom(path):
+                raise PermissionError("denied")
+
+            app.watcher._stat = boom
+            app.watcher.commit()            # baseline: every path now errors
+            await pilot.pause(0.5)
+            self.assertEqual(a.runs, 1)
+            self.assertTrue(app.is_running)
+
+    async def test_refreshes_never_overlap_and_a_change_is_picked_up_after(self):
+        a = CountingUnit("a", [self.f("a.txt")], delay=0.5)
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            for _ in range(100):
+                if a.runs:
+                    break
+                await pilot.pause(0.02)
+            (self.dir / "a.txt").write_text("changed while the first run is busy")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2, tries=200))
+            self.assertEqual(a.peak, 1)
+
+    async def test_the_header_shows_updated_age_not_a_countdown(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            head = str(app.query_one("#hdr").render())
+            self.assertIn("updated", head)
+            self.assertIn("ago", head)
+            self.assertNotIn("next poll", head)
+
+    async def test_the_oldest_source_sets_the_header_age(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.updated_at["b"] -= 120
+            self.assertGreaterEqual(app.oldest_update_age(), 119)
+            app.tick_header()
+            self.assertIn("updated 2m ago", str(app.query_one("#hdr").render()))
+
+    async def test_a_source_error_still_shows(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        a.run = lambda now, show_all: [
+            sources.SourceResult("a", [], False, None, "exit 3: boom")]
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("a: exit 3: boom", app.source_problems())
+
+    async def test_a_raising_unit_becomes_a_source_error(self):
+        a = CountingUnit("a", [])
+
+        def boom(now, show_all):
+            raise RuntimeError("bug")
+
+        a.run = boom
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(any("poll failed" in p for p in app.source_problems()))
+            self.assertEqual([i.key for i in app.items], ["b:1"])
+
+    async def test_a_toggle_re_runs_only_sources_that_support_all(self):
+        plain = CountingUnit("plain", [])
+        wide = CountingUnit("wide", [], uses_all=True)
+        app = unit_app([plain, wide])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("A")
+            self.assertTrue(await until(pilot, lambda: wide.runs == 2))
+            await pilot.pause(0.2)
+            self.assertEqual((plain.runs, wide.alls), (1, [False, True]))
+
+    async def test_duplicate_ids_across_units_are_flagged_after_a_partial_refresh(self):
+        shared = [item(1, "fyi", "calendar", id="dup:1")]
+        a = CountingUnit("a", [self.f("a.txt")], items=shared)
+        b = CountingUnit("b", [], items=list(shared))
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            (self.dir / "a.txt").write_text("changed, longer")
+            self.assertTrue(await until(pilot, lambda: a.runs == 2))
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["dup:1"])
+            self.assertTrue(any("duplicate id" in p for p in app.source_problems()))
+
+    async def test_the_saved_view_reloads_when_events_change_and_only_then(self):
+        events_file = self.dir / "events.jsonl"
+        events_file.write_text("one")
+        calls = []
+
+        def saved():
+            calls.append(1)
+            n = len(events_file.read_text())
+            return [{"id": f"s{i}", "source": "slack", "kind": "new",
+                     "ts": time.time() - i, "title": f"Row {i}", "link": None,
+                     "source_id": f"slack:{i}"} for i in range(n)], None
+
+        app = unit_app([CountingUnit("a", [])], saved=saved,
+                       saved_watch=lambda: [str(events_file)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.pause(0.3)
+            self.assertEqual(calls, [])             # closed: nothing is read
+            await pilot.press("S")
+            await pilot.pause(0.4)
+            self.assertEqual(len(calls), 3 - 2)     # the open itself
+            table = app.screen.query_one("#saved-table")
+            self.assertEqual(table.row_count, 3)
+            events_file.write_text("one two")
+            self.assertTrue(await until(pilot, lambda: table.row_count == 7))
+            await pilot.pause(0.4)
+            reads = len(calls)
+            await pilot.pause(0.5)
+            self.assertEqual(len(calls), reads)     # no change: no reads
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            events_file.write_text("closed again, longer")
+            await pilot.pause(0.5)
+            self.assertEqual(len(calls), reads)     # closed: not watched
+
+
+    async def test_a_fallback_refresh_that_collides_is_queued_not_dropped(self):
+        a = CountingUnit("a", [], delay=0.4)
+        b = CountingUnit("b", [])
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")                 # a slow full refresh
+            await until(pilot, lambda: app.polling, tries=50)
+            app.poll()                             # the fallback timer fires
+            app.poll()
+            self.assertEqual(a.runs, 2)            # nothing extra started
+            await until(pilot, lambda: a.runs == 3 and not app.polling, tries=200)
+            await pilot.pause(0.6)
+            self.assertEqual((a.runs, b.runs), (3, 3))   # one queued full refresh
+
+    async def test_a_queued_toggle_and_fallback_merge_into_a_full_refresh(self):
+        wide = CountingUnit("wide", [], uses_all=True, delay=0.4)
+        plain = CountingUnit("plain", [])
+        app = unit_app([wide, plain])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("r")
+            await until(pilot, lambda: app.polling, tries=50)
+            await pilot.press("A")                 # subset, queued
+            app.poll()                             # full, merges and wins
+            await until(pilot, lambda: wide.runs == 3 and not app.polling, tries=200)
+            await pilot.pause(0.5)
+            self.assertEqual((wide.runs, plain.runs), (3, 3))
+            self.assertEqual(wide.alls[-1], True)
+
+    async def test_an_unchanged_watched_source_counts_as_fresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        b = CountingUnit("b", [])                  # nothing to watch
+        app = unit_app([a, b])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.updated_at["a"] -= 300
+            app.updated_at["b"] -= 300
+            await until(pilot, lambda: time.time() - app.updated_at["a"] < 5)
+            self.assertLess(time.time() - app.updated_at["a"], 5)
+            self.assertGreaterEqual(time.time() - app.updated_at["b"], 299)
+            self.assertEqual(a.runs, 1)            # fresh without a re-run
+            self.assertGreaterEqual(app.oldest_update_age(), 299)
+
+    async def test_a_changed_but_debounced_source_is_not_called_fresh(self):
+        a = CountingUnit("a", [self.f("a.txt")])
+        app = unit_app([a], debounce_s=3600.0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.watcher.commit()                   # last_run = now
+            app.updated_at["a"] -= 300
+            (self.dir / "a.txt").write_text("changed, longer")
+            await pilot.pause(0.4)
+            self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
+            self.assertEqual(a.runs, 1)
+
+    async def test_the_clock_is_re_applied_without_running_a_source(self):
+        a = CountingUnit("a", [])
+        calls = []
+
+        def reeval(now):
+            calls.append(now)
+            title = "later" if len(calls) > 1 else "first"
+            return [sources.SourceResult("a", [item(1, "fyi", "calendar",
+                                                     id=f"a:{title}")],
+                                         False, None, None)]
+
+        a.reeval = reeval
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual([i.key for i in app.items], ["a:1"])
+            app.updated_at["a"] -= 300
+            app.reeval()
+            await until(pilot, lambda: calls and not app.polling)
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["a:first"])
+            self.assertEqual(a.runs, 1)            # no source was run
+            self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
+            app.reeval()
+            await until(pilot, lambda: len(calls) == 2 and not app.polling)
+            await pilot.pause(0.3)
+            self.assertEqual([i.key for i in app.items], ["a:later"])
+
+    async def test_a_unit_without_reeval_is_left_alone(self):
+        a = CountingUnit("a", [])
+        app = unit_app([a])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.reeval()
+            await pilot.pause(0.3)
+            self.assertEqual((a.runs, [i.key for i in app.items]), (1, ["a:1"]))
+
+    async def test_invites_list_soonest_first_after_the_replies(self):
+        now = time.time()
+        rows = [
+            item(1, "needs_reply", "slack", id="s:1", actions=("ack",)),
+            item(2, "needs_reply", "calendar", id="inv:late", ts=now + 5 * 86400 + 3600,
+                 actions=("ack",), meta={"kind": "invite"}),
+            item(3, "needs_reply", "calendar", id="inv:soon", ts=now + 3700,
+                 actions=("ack",), meta={"kind": "invite"}),
+        ]
+        app, _, _ = make_app(rows)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual([i.key for i in app.visible()],
+                             ["s:1", "inv:soon", "inv:late"])
+            q = app.query_one("#queue", Queue)
+            text = " ".join(str(q.get_option_at_index(n).prompt)
+                            for n in range(q.option_count))
+            self.assertIn("in 1h", text)
+            self.assertIn("in 5d", text)
+
+
+
+class WatchOffWithoutUnitsTest(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+    async def test_a_plain_fetch_app_has_no_watcher(self):
+        app, _, _ = make_app([item(1)])
+        self.assertIsNone(app.watcher)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("updated", str(app.query_one("#hdr").render()))
 
 
 if __name__ == "__main__":

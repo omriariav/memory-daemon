@@ -78,14 +78,21 @@ argument is expanded):
   `{"v": 1, "items": [...], "stale": bool, "age_min": number|null, "error": str|null}`.
   `stale` says the source's own data is old; `age_min` is how old; `error` is
   a message the UI shows without hiding the items.
+- `<argv...> list --all` is the same call with one optional flag: "list
+  everything, not just what is open" (handled and older items too). The inbox
+  sends `--all` only while the `A` toggle is on **and** the source declares
+  `supports_all: true` in `inbox.yaml`. A source that does not declare it
+  never receives `--all`, so existing sources need no change. A source that
+  declares it must accept the flag and print the same JSON.
 - `<argv...> act` reads `{"v": 1, "action": str, "id": str, "meta": object, "text"?: str}`
   on stdin and prints `{"ok": bool, "message": str}`.
 
-Phase 1 calls only `list`, with the configured timeout, stdin closed, in its
+Phase 1 calls only `list` (with `--all` as above), with the configured timeout, stdin closed, in its
 own process group (killed whole on timeout). stdout is read in chunks and the
 group is killed as soon as it passes 4 MB; only the last 64 KB of stderr are
 kept, so a chatty source cannot exhaust memory. `timeout_s` must be below
-`poll_interval_s` (the default adapts to short intervals). Output over 4 MB, non-JSON output,
+`poll_interval_s` (the default adapts to short intervals, and no
+source is run more often than that unless its `watch` files change). Output over 4 MB, non-JSON output,
 a wrong `v`, a non-zero exit, a timeout or a program that will not start is a
 **source error**: shown in the header and a toast, items from that source are
 empty, nothing crashes. One bad item (failed validation, duplicate id) is
@@ -102,9 +109,41 @@ otherwise the child dies with the call.
 until phase 2. It has the same limits: its own process group, killed whole on
 timeout or an oversized response.
 
-Polls never overlap: a poll that is still running when the next one is due (or
-when you press `r`) is skipped, and `r` says "Poll already running". Each poll
-first re-reads the state file, so marks made in another pane show up.
+Refreshes never overlap: one that is still running when the next is due (or
+when you press `r`) is skipped, and `r` says "Poll already running". Each
+refresh first re-reads the state file, so marks made in another pane show up.
+
+### Change-driven refresh
+
+The inbox does not poll every source on a timer. Every `watch_interval_s`
+(default 3) it stats (mtime and size, never reading) the files each source
+depends on and re-runs **only** a source whose file changed, appeared or
+vanished. A fallback full refresh runs every `poll_interval_s` (default 600),
+and `r` refreshes everything at once.
+
+- Built-in sources know their files. `events`: `state/events.jsonl`, its `.1`
+  rotation and `state/alerts.json` (resolved alerts), plus `routines/*.yaml`
+  while `email_require_label` is set. `events.invites`: the calendar cache's
+  `state/calendar-snapshot.json`. The Saved view watches `events.jsonl` while
+  it is open and reloads its rows when the file changes.
+- A `command` source lists its files in `watch: [paths]`. Relative paths are
+  relative to the base directory; absolute paths and `~` work. A source with
+  no `watch` list is refreshed by the fallback timer and `r` only.
+- Debounce: a source is re-run at most once per 2 s, however often its files
+  change; the change is kept and fires when the 2 s are over. A change that
+  lands while a refresh is running is picked up right after it.
+- Watched paths are stat-ed on the UI thread: keep them on local disks, not
+  network mounts, or a slow mount stalls the screen.
+- A stat failure counts as a stable state, never an error; a file that does
+  not exist yet is watched, and its appearing is a change.
+- The header shows `updated Ns ago` for the least recently refreshed source;
+  per-source errors show as before. A watched source whose files were checked
+  and did not change counts as fresh; a source with no `watch` list is as old
+  as its last run.
+- Time-based rules are re-applied every 30 s to what the sources already read,
+  without touching a file: an invite that has ended, the `window_h` cutoff, an
+  alert dropping from urgent after `alert_urgent_max_age_h`, and
+  `starts_within_h` urgent rules.
 
 ## Built-in `events` source
 
@@ -127,6 +166,43 @@ event that was created, then updated, appears once.
 item with a null `link`, whatever a source says). Today only Gmail events have
 one, so the other rows are `ack` only.
 
+### Pending calendar invites
+
+Upcoming events whose RSVP is not yet answered (`needsAction`) are listed under
+**Needs reply** as `calendar` items, one row per invite (a recurring series is
+one row, at its next instance). They are read from the calendar cache, never
+from the network:
+
+- `<base>/state/calendar-snapshot.json` (written by the `calendar_cache`
+  routine, `{"v": 1, "fetched_at", "window_hours", "events": {id: row}}`):
+  `my_rsvp`, `status`, `start`, `end`, `title` and `conference` of each event.
+- The cache's JSON twin (the routine's `output` path with a `.json` suffix),
+  for the organizer's name, which the snapshot lacks. It covers only the
+  shorter output window (`window_hours`, 48 by default), so an invite further
+  out shows without an organizer.
+- The `calendar_cache` routine's config under `<base>/routines/` for its
+  `calendar_id` (default `primary`).
+
+An invite is shown when `my_rsvp` is `needsAction`, its status is not
+`cancelled`, it has not ended and it starts before now plus `invites_days`
+(default 7). Accepted, tentative, declined and organizer rows never show. The
+window cannot reach past what the snapshot covers (`events_window_days` of the
+routine, 7 by default); asking for more adds a note to the source's status.
+Times are shown in the machine's local time zone. The row is `sender` = the
+organizer (or "calendar invite"), `where` = "invite", and a gist of
+`<title> - <when> - from <organizer>`. The item `ts` is the event's start (the
+cache records no arrival time for an invite), so the row's age reads `in 2h`,
+and invites list soonest first, after the replies in the section. `meta` is
+`{"kind": "invite", "event_id", "calendar_id", "series", "my_rsvp", "start",
+"source_id"}` so a later RSVP action has what it needs. Actions: `ack` (hides
+the row locally) and `open` (the meeting link from the cache, only when it is a
+plain http(s) URL; otherwise there is no `open`). A `New invite` calendar row
+from the events stream is dropped when its series has a pending-invite row
+(the same event, now actionable). Titles and organizers are untrusted display
+text. A missing cache means no invites and no error; an
+unreadable or unfamiliar one is a source error (`events.invites`) and a cache
+older than 6 hours marks the source stale.
+
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
 `gmail:<thread>`, `gmail:<thread>:followup-open` or `gmail:<thread>@<message>`)
@@ -136,6 +212,44 @@ events have no link yet.
 Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
+
+### Mail label filter
+
+`email_require_label: MY_LABEL` (events source, default off) keeps only the
+Gmail events that were captured through that label.
+
+The event stream does not record a thread's labels, nor whether a capture came
+from a `saved_request` routine (`details` is empty for Gmail events), and the
+inbox never calls Gmail. So the filter works from what the daemon *does* keep:
+each event names its `routine`, and the routine's config holds its search
+query. The inbox reads `<base>/routines/*.yaml` and accepts a Gmail event only
+when its routine has at least one `gmail_mcp` block and **every** Gmail block
+(`gmail` or `gmail_mcp`) of that routine has a `query` that is a plain
+conjunction with a positive `label:MY_LABEL` term (case-insensitive). Events
+carry the routine id, not the block, so one unlabelled block rejects the whole
+routine. Quoted phrases are inert (`subject:"label:MY_LABEL"` is not a label
+term), `-label:MY_LABEL` does not count, and any `OR`, `NOT`, `|`, brace or
+parenthesis rejects the query. Every thread such a routine captured matched
+its query, so it carried the label when it was captured.
+
+What it does not prove: the label is checked at capture time, not now
+(removing the label later changes nothing), and a routine whose query selects
+the label in another way (a label id, a union) does not match. The filter uses
+the routine's **current** query: editing the query changes which older events
+show, not only new ones. If no routine matches,
+no mail is shown and the source's status says why. Showing the live labels, or
+the `saved_request` flag, per event would need the capture to record them in
+`details`.
+
+### Saved view
+
+`S` opens a read-only list of what the daemon saved to memory in the last
+`saved_days` days (default 2): capture events (kind `new` or `update` with a
+memory id) from `events.jsonl`, newest first, one row per saved item (the
+newest capture of a `source_id` wins). Each row shows the source glyph, title,
+time and kind. `o` opens the link when the row has one (Gmail threads);
+`esc` (or `S`) returns to the inbox. Saved rows are not inbox items: no
+marks, no actions, nothing is written.
 
 ### Stale and recovered alerts
 
@@ -199,12 +313,27 @@ defaults; a broken one prints every problem and exits 2.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `poll_interval_s` | `60` | 5 to 3600 |
+| `poll_interval_s` | `600` | 30 to 3600: the fallback full refresh (see "Change-driven refresh") |
+| `watch_interval_s` | `3` | 1 to 30: how often the watched files are stat-checked |
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
-| `sources` | the `events` source | list of `type: events` (`window_h`, `urgent` rules) and `type: command` (`argv` list, `timeout_s` 1 to 120) |
+| `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
+
+The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
+and:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `invites_days` | `7` | 0 to 60: show unanswered calendar invites starting within this many days (0 turns them off; see "Pending calendar invites") |
+| `saved_days` | `2` | 1 to 30: how far back the Saved view (`S`) looks |
+| `email_require_label` | `null` | a label name, e.g. `MY_LABEL`: show only mail captured through a routine whose query requires that label (see "Mail label filter"); `null` shows all mail |
+
+A `command` source takes `argv` (list), `timeout_s` (1 to 120),
+`watch` (list of paths, default none; see "Change-driven refresh") and
+`supports_all` (`true` or `false`, default `false`): declare it only if
+`<argv> list --all` works.
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
 urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
@@ -225,10 +354,18 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` poll now,
-`R` show or hide resolved alerts, `y` copy the item, `Y` copy its section,
+`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` refresh everything now,
+`R` show or hide resolved alerts, `A` show all (see below), `S` saved view
+(read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
+
+### Show all (`A`)
+
+`A` toggles "show all": while on, the header shows `all` and every `command`
+source with `supports_all: true` is polled as `<argv> list --all`; other
+sources are unaffected. It polls at once, is off at every start and is never
+saved. Items revealed by the toggle do not raise "new urgent" alerts.
 
 ### Copying
 

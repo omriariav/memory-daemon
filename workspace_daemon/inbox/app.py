@@ -1,5 +1,6 @@
 """The inbox TUI app. Needs Textual; import it only through `cli.run`."""
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass, field
 
@@ -18,12 +19,31 @@ from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
-from .screens import AuditScreen, ConfirmSend, HelpScreen, SnoozePicker
-from .sources import SourceResult
+from .screens import AuditScreen, ConfirmSend, HelpScreen, SavedScreen, SnoozePicker
+from .sources import SourceResult, merge
+from .watch import Watcher
 from .widgets import (ITEM_PREFIX, DraftPane, HintBar, Queue, StatusHeader,
                       ThreadView, fmt_age, fuzzy, palette, vis)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
+
+
+class _SavedUnit:
+    """The Saved view as a watched unit (active only while it is open)."""
+    name = "saved"
+
+    def __init__(self, watch):
+        self.watch = watch
+
+
+def _takes_show_all(fetch):
+    """True when `fetch` accepts a `show_all` keyword argument."""
+    try:
+        params = inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "show_all" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 @dataclass
@@ -57,6 +77,7 @@ class InboxApp(App):
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
         Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
         Binding("R", "toggle_resolved", show=False),
+        Binding("A", "toggle_all", show=False), Binding("S", "saved", show=False),
         Binding("question_mark", "help", show=False),
         Binding("ctrl+t", "toggle_theme", show=False),
         Binding("ctrl+s", "save_edit", show=False),
@@ -90,7 +111,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, SnoozePicker, HelpScreen, AuditScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, SnoozePicker, HelpScreen, AuditScreen, SavedScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-text { border: round $panel; padding: 0 1; margin: 1 0; background: $background; }
@@ -103,12 +124,25 @@ class InboxApp(App):
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
+    #saved { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #saved-title { margin-bottom: 1; }
+    #saved-table { height: 1fr; }
     """
 
     def __init__(self, fetch, store, actions, settings=None, demo=False,
-                 undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None):
+                 undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None,
+                 saved=None, saved_days=None, units=None, saved_watch=None):
         """`fetch()` blocks and returns a list of SourceResult (it runs in a
-        worker thread). `store` holds done/ack/snooze marks."""
+        worker thread). `store` holds done/ack/snooze marks. A `fetch` that
+        takes a `show_all` argument gets the state of the A toggle.
+        `saved()` returns `(rows, error)` for the Saved view (S); None
+        disables the view.
+
+        `units` (a list of `sources.Unit`) switches on change-driven refresh:
+        every `watch_interval_s` the files each unit depends on are
+        stat-checked and only a unit with a changed file is re-run; the
+        fallback timer (`poll_interval_s`) and `r` run them all, and `fetch`
+        is then unused. `saved_watch()` lists the files of the Saved view."""
         super().__init__()
         settings = settings or {"poll_interval_s": 60.0, "theme": themes.DEFAULT,
                                 "bidi_mode": "auto"}
@@ -122,6 +156,23 @@ class InboxApp(App):
         self.filter_text = ""
         self.source_filter = None
         self.show_resolved = False         # R: list resolved alerts under fyi
+        self.show_all = False              # A: ask `supports_all` sources for everything
+        self.saved, self.saved_days = saved, saved_days
+        self._saved_loading = False
+        self._queued = None                # a refresh asked for while one ran
+        self._fetch_takes_all = _takes_show_all(fetch)
+        self.units = list(units) if units is not None else None
+        self._unit_results = {}            # unit name -> its latest raw results
+        self.updated_at = {}               # source/unit name -> time of its last refresh
+        self.watch_s = float(settings.get("watch_interval_s", 3.0))
+        self.watcher = None
+        if self.units is not None:
+            watched = list(self.units)
+            if saved_watch is not None:
+                watched.append(_SavedUnit(saved_watch))
+            self.watcher = Watcher(watched)
+            self.watcher.set_active(_SavedUnit.name, False)
+        self.saved_screen = None
         self.editing = False
         self.busy = 0
         self.polling = False
@@ -167,7 +218,10 @@ class InboxApp(App):
         self.query_one("#draft-pane").border_title = "Draft"
         self.set_interval(0.25, self.tick_header)
         self.set_interval(30, self.refilter)
-        self.set_interval(self.poll_s, self.poll)
+        self.set_interval(30, self.reeval)
+        self.set_interval(self.poll_s, self.poll)   # the fallback full refresh
+        if self.watcher is not None:
+            self.set_interval(self.watch_s, self.watch_tick)
         self.query_one("#queue").focus()
         if self.bidi_fallback:
             self.notify("python-bidi is not installed: Hebrew stays in logical order.",
@@ -179,6 +233,13 @@ class InboxApp(App):
     @property
     def pal(self):
         return palette(self)
+
+    def oldest_update_age(self):
+        """Seconds since the least recently refreshed source was refreshed,
+        or None before the first refresh."""
+        if not self.updated_at:
+            return None
+        return max(0.0, time.time() - min(self.updated_at.values()))
 
     def countdown_s(self):
         """Real seconds until the next poll, clamped to [0, poll interval]."""
@@ -205,7 +266,10 @@ class InboxApp(App):
                     continue
             out.append(it)
         order = {k: n for n, k in enumerate(SECTION_KEYS)}
-        out.sort(key=lambda i: (order[i.section], i.ts if i.section == "waiting" else -i.ts))
+        # Waiting items and pending invites (whose ts is the event start) list
+        # the oldest / soonest first; everything else newest first.
+        out.sort(key=lambda i: (order[i.section], i.ts if i.section == "waiting"
+                                or i.meta.get("kind") == "invite" else -i.ts))
         return out
 
     def refilter(self, redraw=True):
@@ -347,19 +411,19 @@ class InboxApp(App):
             return [("enter", "keep filter"), ("esc", "clear"), ("", "type to fuzzy-match")]
         it = self.current
         if it is None:
-            return [("r", "poll"), ("/", "filter"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
+            return [("r", "poll"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
         if f is not None and f.id in ("thread", "draft-pane"):
             return base + [("tab", "next pane"), ("y", "copy"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
         if it.kind == "ack":
-            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("?", "help")]
+            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "fyi":
-            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("?", "help")]
+            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("?", "help")]
+            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
-            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("?", "help")]
+            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("A", "all"), ("S", "saved"), ("?", "help")]
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -786,6 +850,66 @@ class InboxApp(App):
         self.notify("Resolved alerts: " + ("shown" if self.show_resolved else "hidden"),
                     timeout=2, markup=False)
 
+    def action_toggle_all(self):
+        """A: ask the sources that declared `supports_all` for everything, not
+        just what is open. Per session; nothing is saved."""
+        self.show_all = not self.show_all
+        self.notify("Show all: " + ("on (sources that support it)" if self.show_all else "off"),
+                    timeout=2, markup=False)
+        self.tick_header()
+        names = None
+        if self.units is not None:   # only a source that supports it can change
+            names = {u.name for u in self.units if u.uses_all}
+            if not names:
+                return
+        self.poll(quiet=True, names=names)   # queued when one is running
+
+    async def action_saved(self):
+        """S: the read-only Saved view."""
+        if self.saved is None:
+            self.notify("The saved view is not available here", timeout=2, markup=False)
+            return
+        if self._saved_loading:
+            return
+        self._saved_loading = True
+        try:
+            rows, error = await self._load_saved()
+        finally:
+            self._saved_loading = False
+        if not self.main_active:
+            return
+        screen = SavedScreen(rows, error, self.saved_days, self.bidi,
+                             opener=self._open_saved)
+        self.saved_screen = screen
+        if self.watcher is not None:
+            self.watcher.set_active(_SavedUnit.name, True)
+        self.push_screen(screen, self._saved_closed)
+
+    async def _load_saved(self):
+        try:
+            return await asyncio.to_thread(self.saved)
+        except Exception as exc:  # never let a reader bug end the session
+            return [], f"cannot read saved items: {type(exc).__name__}"
+
+    def _saved_closed(self, _result):
+        self.saved_screen = None
+        if self.watcher is not None:
+            self.watcher.set_active(_SavedUnit.name, False)
+
+    @work(exclusive=True, group="saved-reload")
+    async def _saved_reload(self):
+        rows, error = await self._load_saved()
+        if self.saved_screen is not None:
+            self.saved_screen.reload(rows, error)
+
+    def _open_saved(self, row):
+        it = Item(key=f"saved:{row['id']}", section="fyi", who=row["title"], where="saved",
+                  ts=row["ts"], gist=row["title"], source=row["source"], link=row["link"])
+        res = self.actions.open_link(it)
+        self.record("open", it, res.detail, "ok" if res.ok else "failed")
+        self.notify(res.detail if res.ok else f"Not opened: {res.detail}", timeout=3,
+                    severity="information" if res.ok else "warning", markup=False)
+
     def action_audit(self):
         self.push_screen(AuditScreen(self.audit))
 
@@ -834,49 +958,147 @@ class InboxApp(App):
         self.exit(message=f"Nothing sent: {cancelled} pending send(s) cancelled on quit." if cancelled else None)
 
     # ---------- poll ----------
-    def _safe_fetch(self):
+    def _run_units(self, names, show_all, reeval=False):
+        """Run the named units (all when `names` is None) and merge them with
+        the cached results of the others. Worker thread. With `reeval`, a unit
+        rebuilds its results for the current time from what it already read
+        (no file is touched) and one that cannot is left as it was."""
+        now = time.time()
+        for unit in self.units:
+            if names is not None and unit.name not in names:
+                continue
+            try:
+                if reeval:
+                    batch = unit.reeval(now) if unit.reeval else None
+                    batch = list(batch) if batch is not None else None
+                else:
+                    batch = list(unit.run(now, show_all))
+            except Exception as exc:  # a source bug must never end the session
+                batch = [SourceResult(unit.name, [], False, None,
+                                      f"poll failed: {type(exc).__name__}: {exc}")]
+            if batch is not None:
+                self._unit_results[unit.name] = batch
+        return merge(self._unit_results[u.name] for u in self.units
+                     if u.name in self._unit_results)
+
+    def _safe_fetch(self, show_all=None, names=None, reeval=False):
         """Runs in a worker thread: pick up other panes' marks, fetch, and
         stamp the marks of items that are still listed."""
+        show_all = self.show_all if show_all is None else show_all
         try:
             self.store.load()
         except OSError:
             pass
         try:
-            results = list(self.fetch())
+            if self.units is not None:
+                results = self._run_units(names, show_all, reeval)
+            else:
+                results = list(self.fetch(show_all=show_all) if self._fetch_takes_all
+                               else self.fetch())
         except Exception as exc:  # a source bug must never end the session
             return [SourceResult("inbox", [], False, None,
                                  f"poll failed: {type(exc).__name__}: {exc}")]
         try:
-            # Age-prune marks only when every source answered cleanly.
+            # Age-prune marks only after a full refresh in which every source
+            # answered cleanly.
             self.store.note_listed(
                 (i["id"] for r in results for i in r.items),
-                prune=all(r.error is None for r in results))
+                prune=names is None and all(r.error is None for r in results))
         except OSError:
             pass
         return results
 
-    def poll(self, manual=False):
-        """Start a poll unless one is already running (polls never overlap,
-        so a slow source cannot pile up cancelled fetches)."""
+    def _queue(self, names, quiet):
+        """Remember a refresh asked for while another one runs; it starts as
+        soon as that one ends. Requests merge: everything beats a subset."""
+        old = self._queued
+        if old is None:
+            self._queued = {"names": None if names is None else set(names),
+                            "quiet": quiet}
+            return
+        old["quiet"] = old["quiet"] and quiet
+        if old["names"] is not None:
+            old["names"] = None if names is None else old["names"] | set(names)
+
+    def poll(self, manual=False, quiet=False, names=None, reeval=False):
+        """Start a refresh unless one is already running (they never overlap,
+        so a slow source cannot pile up cancelled fetches). `names` limits it
+        to those units (None: everything). A `quiet` refresh (after the A
+        toggle) does not announce the items it reveals. A refresh asked for
+        while one runs is queued to run right after it (a manual `r` is told
+        instead); a `reeval` pass, which only re-applies the clock, is not."""
         if self.polling:
             if manual:
                 self.notify("Poll already running", timeout=2, markup=False)
+            elif not reeval:
+                self._queue(names, quiet)
             return
         self.polling = True
-        self.next_poll_at = time.time() + self.poll_s
-        self._poll_worker(manual)
+        if names is None and not reeval:
+            self.next_poll_at = time.time() + self.poll_s
+            if self.watcher is not None:   # baseline: later changes are due again
+                self.watcher.commit()
+        self._poll_worker(manual, quiet, self.show_all, names, reeval)
+
+    def reeval(self):
+        """Every 30 s: re-apply the clock (invites that ended, the window,
+        alert age, urgent-soon rules) to what the sources already read,
+        without reading any file."""
+        if self.units is None or self.polling or not self.polled_once:
+            return
+        names = {u.name for u in self.units if u.reeval}
+        if names:
+            self.poll(quiet=True, names=names, reeval=True)
+
+    def watch_tick(self):
+        """Every `watch_interval_s`: stat the watched files and refresh only
+        the units whose files changed. A tick that finds a refresh running
+        leaves the change uncommitted, so the next tick picks it up."""
+        if self.watcher is None:
+            return
+        try:
+            due = self.watcher.due()
+        except Exception:  # stat-only and tolerant, but never end the session
+            return
+        # A watched source whose files did not change is as fresh as its files.
+        now = time.time()
+        for name in self.watcher.unchanged:
+            if name in self.updated_at:
+                self.updated_at[name] = now
+        reload_saved = _SavedUnit.name in due
+        names = {n for n in due if n != _SavedUnit.name}
+        if reload_saved and self.saved_screen is not None:
+            self.watcher.commit([_SavedUnit.name])
+            self._saved_reload()
+        if names and not self.polling:
+            self.watcher.commit(names)
+            self.poll(names=names)
 
     @work(exclusive=False, group="poll")
-    async def _poll_worker(self, manual):
+    async def _poll_worker(self, manual, quiet=False, show_all=False, names=None,
+                           reeval=False):
         self.busy += 1
         try:
-            results = await asyncio.to_thread(self._safe_fetch)
+            results = await asyncio.to_thread(self._safe_fetch, show_all, names, reeval)
         finally:
             self.busy -= 1
             self.polling = False
-        self.apply_results(results, manual=manual)
+        stamp = time.time()
+        if reeval:
+            pass                    # no file was read: nothing became fresher
+        elif self.units is not None:
+            for unit in self.units:
+                if names is None or unit.name in names:
+                    self.updated_at[unit.name] = stamp
+        else:
+            for res in results:
+                self.updated_at[res.name] = stamp
+        self.apply_results(results, manual=manual, quiet=quiet)
+        queued, self._queued = self._queued, None
+        if queued:
+            self.poll(quiet=queued["quiet"], names=queued["names"])
 
-    def apply_results(self, results, manual=False):
+    def apply_results(self, results, manual=False, quiet=False):
         """Merge a poll into the queue. Runs on the UI thread."""
         self.results = list(results)
         self.last_poll_at = time.time()
@@ -903,6 +1125,8 @@ class InboxApp(App):
             self.notify("\n".join(problems[:3]), title="Source problem", severity="warning",
                         timeout=8, markup=False)
         self._last_problems = problems
+        if quiet:
+            return
         if first or not fresh:
             if manual and not fresh:
                 self.notify("Polled: nothing new", timeout=2, markup=False)
@@ -930,6 +1154,8 @@ class InboxApp(App):
             ("Copy section", "Y: every item in this section, one per line", self.action_copy_section),
             ("Copy section as Markdown", "A - **sender** (where): gist list", self.action_copy_section_markdown),
             ("Show / hide resolved alerts", "R", self.action_toggle_resolved),
+            ("Show all (toggle)", "A: sources that support it list everything, not just what is open", self.action_toggle_all),
+            ("Saved to memory", "S: what the daemon saved recently (read-only)", self.action_saved),
             ("Undo last action", "Within the 5 s window", self.action_undo),
             ("Poll now", "Poll every source", self.action_refresh),
             ("Toggle dark/light theme", "ctrl+t", self.action_toggle_theme),
