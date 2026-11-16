@@ -62,7 +62,9 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
         def fetch(show_all=False):
             return sources.collect(settings, base, show_all=show_all)
 
-        app = InboxApp(fetch, store, LocalActions(store), settings,
+        actions = LocalActions(store, rsvp=settings["rsvp"],
+                               save=settings["save"], base_dir=base)
+        app = InboxApp(fetch, store, actions, settings,
                        stream_delay=0, saved=saved if events else None,
                        saved_days=days, units=sources.make_units(settings, base),
                        saved_watch=sources.saved_watch(base) if events else None)

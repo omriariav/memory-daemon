@@ -1,4 +1,4 @@
-"""Modal screens: confirm-send, snooze picker, help, audit log.
+"""Modal screens: confirm-send, confirm-write, snooze picker, help, audit log.
 
 Anything that came from a source (names, text) is shown through Rich `Text`
 objects, never markup strings, so a title like "[b]x[/]" cannot restyle or
@@ -58,6 +58,55 @@ class ConfirmSend(ModalScreen):
         self.dismiss(False)
 
     def action_send(self):
+        self.dismiss(True)
+
+    def action_toggle_focus(self):
+        self.focus_next()
+
+
+class ConfirmWrite(ModalScreen):
+    """Confirm an action that leaves the inbox (an RSVP, a save). Shows what
+    will happen as label/value rows, in plain Text so item text can never
+    restyle the screen. Cancel is focused by default; `y` confirms."""
+
+    AUTO_FOCUS = "#cancel"
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "confirm", "Confirm"),
+                Binding("left,right", "toggle_focus", show=False)]
+
+    def __init__(self, title, rows, verb, note="", visual=False):
+        super().__init__()
+        self.title_text, self.rows, self.verb = title, rows, verb
+        self.note, self.visual = note, visual
+
+    def compose(self) -> ComposeResult:
+        body = Text()
+        for label, value in self.rows:
+            if not value:
+                continue
+            body.append(f"{label:<8}", Style(dim=True))
+            lines = bidi.visual_lines(value, 56, self.visual) or [""]
+            body.append(lines[0] + "\n", Style(bold=True))
+            for ln in lines[1:]:
+                body.append(" " * 8 + ln + "\n", Style(bold=True))
+        body.rstrip()
+        with Vertical(id="confirm"):
+            yield Static(Text(self.title_text, Style(bold=True)), id="confirm-title")
+            yield Static(body, id="confirm-text")
+            if self.note:
+                yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
+            yield Static(Text("Nothing happens until you confirm. Undo stays open for the grace period.",
+                              Style(dim=True)), id="confirm-fixed")
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Cancel  esc", id="cancel", variant="default")
+                yield Button(f"{self.verb}  y", id="send", variant="error")
+
+    def on_button_pressed(self, e):
+        self.dismiss(e.button.id == "send")
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+    def action_confirm(self):
         self.dismiss(True)
 
     def action_toggle_focus(self):
@@ -151,9 +200,12 @@ HELP = [
               ("A", "show all: ask sources that support it for everything"),
               ("S", "saved: what the daemon saved to memory (read-only)"),
               ("esc", "clear filters / back")]),
-    ("Act", [("a", "approve draft (confirm first) / ack"), ("e", "edit draft  (esc / ctrl+s done)"),
+    ("Act", [("a", "approve draft (confirm first) / ack / accept an invite"), ("e", "edit draft  (esc / ctrl+s done)"),
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
+    ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
+                     ("m", "save the item to memory (save: in inbox.yaml); ◆ marks a saved item"),
+                     ("", "both confirm first, then wait out the 5 s undo window")]),
     ("Copy", [("y", "copy this item (sender, where, gist, link)"), ("Y", "copy every item in this section"),
               ("ctrl+p", "palette: copy section as Markdown"),
               ("mouse drag", "select text in the thread or draft pane")]),

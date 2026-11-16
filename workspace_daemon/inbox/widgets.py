@@ -11,9 +11,10 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
-from .models import SECTIONS, SOURCES
+from .models import SECTIONS, SOURCES, thread_note
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SAVED_GLYPH = "◆"  # an item saved to memory
 ITEM_PREFIX = "i:"  # Option id of an item row; item ids are arbitrary text
 
 
@@ -168,7 +169,12 @@ class Queue(OptionList):
         t.append(glyph + " ", Style(color=pal[scol], bold=True))
         who = fit(vis(it.who, visual), max(8, width // 2 - 2))
         t.append(who, Style(bold=True, color=pal["urgent"] if urgent else None))
-        where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9))
+        if it.hint:
+            t.append(" !", Style(color=pal["warn"], bold=True))
+        if it.saved:  # saved to memory (m): a small glyph, the row stays
+            t.append(" " + SAVED_GLYPH, Style(color=pal["ok"]))
+        where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9
+                                  - (2 if it.saved else 0) - (2 if it.hint else 0)))
         if where:
             t.append("  " + where, Style(color=pal["muted"]))
         pad = max(1, width - t.cell_len - cell_len(age))
@@ -204,7 +210,14 @@ class ThreadView(VerticalScroll):
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
         out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
-        if not item.messages:
+        if item.hint:  # e.g. an RSVP the calendar never confirmed
+            out.append("! " + item.hint + "\n", Style(color=pal["warn"], bold=True))
+        note = thread_note(item)
+        if note:  # one dim line above the thread; alone when the thread is empty
+            out.append(vis(note, visual) + "\n", Style(color=pal["muted"], dim=True))
+            if item.messages:
+                out.append("\n")
+        elif not item.messages:
             out.append(vis(item.gist, visual) + "\n", Style(color=pal["fg"]))
         for m in item.messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")

@@ -37,6 +37,27 @@ def series_of(event_id):
     return _RECURRING_ID.sub("", event_id)
 
 
+# What an id may contain before it is allowed into an RSVP call: Google event
+# ids are base32hex plus a `_<timestamp>` suffix, calendar ids are `primary`
+# or an address. Anything else is refused rather than passed on.
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_@.+=-]{1,200}$")
+
+
+def rsvp_target(item):
+    """`(event_id, calendar_id, recurring)` for a pending invite the inbox
+    built itself, else None. A command source's item never qualifies, whatever
+    its `meta` says: only the `invites:` ids of this module do."""
+    meta = getattr(item, "meta", None)
+    if (not str(getattr(item, "key", "")).startswith("invites:")
+            or not isinstance(meta, dict) or meta.get("kind") != "invite"):
+        return None
+    event_id, calendar_id = meta.get("event_id"), meta.get("calendar_id")
+    if not (isinstance(event_id, str) and isinstance(calendar_id, str)
+            and _SAFE_ID.match(event_id) and _SAFE_ID.match(calendar_id)):
+        return None
+    return event_id, calendar_id, series_of(event_id) != event_id
+
+
 def _read_json(path, limit):
     """`(document, error)`; `(None, None)` when the file does not exist."""
     try:
@@ -215,6 +236,8 @@ def build(data, now, days=DEFAULT_DAYS):
                 meta={"kind": "invite", "event_id": event_id,
                       "calendar_id": cfg["calendar_id"], "series": key,
                       "my_rsvp": "needsAction", "start": start_ts,
+                      "title": itm.truncate(title, itm.FIELD_MAX),
+                      "when": when, "cache_fetched": fetched_ts,
                       "source_id": f"gcal:{event_id}"}))
         except itm.ItemError:
             skipped += 1

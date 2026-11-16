@@ -103,6 +103,20 @@ def demo_items(now=None):
         "Moved to Thu 11:00 (was Wed 15:00)",
         [("Calendar", 40, "Weekly planning moved: Wed 15:00 -> Thu 11:00. Organizer: Dana Levi.")],
         actions=ACK, source="calendar")
+    # A pending invite for the RSVP keys (a / X / T); the demo answers nothing.
+    out.append(itm.make_item(
+        id="invites:demo-sync", source="calendar", section="needs_reply",
+        urgency="digest", sender="Dana Levi", where="invite",
+        gist="Launch retro - Thu 14:00-14:45 - from Dana Levi",
+        ts=now + 20 * H, link="https://example.invalid/meet/retro",
+        thread=[{"who": "when", "ts": now + 20 * H, "text": "Thu 14:00-14:45"},
+                {"who": "from", "ts": now + 20 * H, "text": "Dana Levi"}],
+        draft=None, actions=["ack", "open"],
+        meta={"kind": "invite", "event_id": "demoevent_20300101T140000Z",
+              "calendar_id": "primary", "series": "demoevent",
+              "my_rsvp": "needsAction", "start": now + 20 * H,
+              "title": "Launch retro", "when": "Thu 14:00-14:45",
+              "source_id": "gcal:demoevent_20300101T140000Z", "demo": True}))
     add("rec1", "fyi", "Recorder", "meeting notes", 150,
         "Design sync notes are ready",
         [("Recorder", 150, "Notes and action items for the design sync are ready.")],

@@ -7,8 +7,11 @@ protocol, the built-in `events` source, local state and settings.
 Version: see [docs/inbox-changelog.md](inbox-changelog.md); `python daemon.py
 inbox --version` prints it.
 
-Phase 1a (this version) reads and triages. Nothing is sent: `reply` and
-`nudge` are part of the format but the UI refuses them until phase 2.
+The inbox reads and triages. Replies are not sent: `reply` and `nudge` are part
+of the format but the UI refuses them until phase 2. Version 0.3.0 adds the
+first two writes, both opt-in: [RSVP on pending
+invites](#rsvp-on-pending-invites) and [save to memory](#save-to-memory).
+Everything else is a local mark.
 
 ## Install and run
 
@@ -49,7 +52,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act` |
+| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act`. One optional key is read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -68,6 +71,68 @@ longer than 120 characters instead of rejecting it. Text is drawn as plain
 text, never as markup, so a title such as `[b]x[/b]` stays literal. Sources
 should still send clean data; `validate_item` in `workspace_daemon/inbox/items.py`
 is the strict check and `parse_item` is sanitise-then-validate.
+
+## Save protocol
+
+`m` on any item saves it to memory by running the command configured as
+`save:` in `inbox.yaml` (see [Save to memory](#save-to-memory)). There is no
+default: the inbox never saves anything by itself. The command is any program,
+run without a shell (`~` at the start of an argument is expanded). It is called
+with **no extra arguments** and receives one JSON object on stdin:
+
+```json
+{"v": 1, "action": "save", "item": { ...the item v1 dict, as listed... }}
+```
+
+and prints one JSON object on stdout:
+
+```json
+{"ok": true, "message": "Saved to your memory", "memory_id": "m-123", "duplicate": false}
+```
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `ok` | bool | required; `false` is a failure and the inbox shows `message` |
+| `message` | string | required; shown in the toast and the audit log (one line, cleaned) |
+| `memory_id` | string or null | optional (null when left out), up to 200 chars |
+| `duplicate` | bool | optional (false when left out). `ok: true` with `true`: already in memory, unchanged; this is a success (the toast says "Already in memory", the row gets the saved mark). `ok: false` with `true`: a likely duplicate, see below |
+| `candidate` | object or null | optional, only read with `ok: false` and `duplicate: true`: `{"id": str, "title": str, "score": number}` (any part may be left out), the memory the item looks like |
+
+**Likely duplicate.** A reply with `"ok": false, "duplicate": true` is not an
+error. Its `memory_id` is null (nothing was saved); the existing memory's id is
+`candidate.id`. The inbox shows `message` and the candidate in a "Possible
+duplicate" modal (Cancel focused) offering "Save anyway". The modal does not
+open by itself (it could land on top of another one and a stray key would
+confirm it): a toast says "Possible duplicate, press m to review", and `m` on
+that item opens it. Cancel saves nothing and adds no mark. Confirm waits out
+the undo window again, then resends the same stdin with `"force": true` added.
+If that forced call still answers `ok: false` it is shown as an error (the
+inbox asks once). Any other `ok: false` is an error toast with `message`; a
+failure is never shown as a save.
+
+**Force.** After a duplicate answer and the user's "save anyway", the same
+payload is sent again with `"force": true` added at the top level
+(`{"v": 1, "action": "save", "item": {...}, "force": true}`); the command should
+then save without its duplicate check. The key is absent on a first call.
+
+The whole item travels on stdin only: the argv is exactly the configured list
+and never contains item text. The same limits as command sources apply: the
+configured `timeout_s` (default 30, 5 to 120), stdin written then closed, a
+process group stopped whole on timeout, output stopped past 4 MB, and the last
+64 KB of stderr kept (its tail is shown when the exit code is not 0). Unlike a
+command source's `list`, a save that times out (or overflows) first gets
+`SIGTERM` for the whole group and 5 seconds to clean up before the `SIGKILL`,
+so a command's own child (a CLI it started) is not cut off mid-write. On
+`SIGTERM` the command must stop and wait for any child processes it started
+before it exits: the inbox sends `SIGKILL` to the whole group after the 5 s
+grace, whatever is still running. A timeout is reported as "timed out after Ns;
+the save may still complete": the command may have finished its work, so check
+before saving again. A timeout, an oversized or non-JSON answer, a missing `ok`
+or `message`, a wrong type, a non-zero exit or a program that will not start is
+a failure: a toast with the reason, no mark. A save is never retried by the
+inbox, so a command should treat a repeated item as `duplicate`. The `item` is
+untrusted display text (see above); a command that writes it anywhere must
+treat it as data.
 
 ## Source-command protocol
 
@@ -203,6 +268,72 @@ text. A missing cache means no invites and no error; an
 unreadable or unfamiliar one is a source error (`events.invites`) and a cache
 older than 6 hours marks the source stale.
 
+### RSVP on pending invites
+
+On a pending-invite row `a` accepts, `X` declines and `T` answers tentative
+(the answers sent are `accepted`, `declined`, `tentative`). It needs the
+`rsvp:` block in `inbox.yaml` (no default). Only the rows the inbox builds
+itself (`invites:` ids) qualify; a command source's item never does, and an
+event or calendar id outside `[A-Za-z0-9_@.+=-]` is refused.
+
+1. A modal shows the event title, the time, the organizer and the exact answer.
+   Cancel is focused; `y` confirms, `esc` cancels (nothing happens, and the
+   audit log says so).
+2. The row leaves the queue and the 5 s undo window opens (`u` restores it;
+   `q` inside the window cancels the RSVP). Once the call has started, `q` says
+   "N write(s) still running; q again to quit (they finish first)"; a second
+   `q` quits and the exit message says how many writes are still finishing (the
+   process ends when they do).
+3. A worker makes one headless Claude call through the bridge
+   (`workspace_daemon/claude_bridge.py`, `call_tools`). The only allowed tool is
+   `rsvp.tool`; its arguments are pinned to
+   `{<args.event_id>: <event id>, <args.calendar_id>: <calendar id>,
+   <args.response>: <answer>}`, and the call must carry exactly those three
+   arguments and no others (the bridge's opt-in `exact_args=True`: its
+   PreToolUse hook denies a call that differs by a byte or adds an argument
+   such as a notification flag, and the run fails if one ran anyway; every
+   other bridge caller keeps the default, where extra arguments are allowed).
+   The run is never retried (`attempts=1`). The prompt names the tool and prints
+   the three pinned values as JSON; item text never enters it. The bridge
+   guards apply first: `state/PAUSED` stops the call, and so does an exhausted
+   or unreadable daily budget (`state/budget.yaml`). Spend is logged in
+   `state/claude-usage.jsonl` under the tag `inbox-rsvp`.
+4. Success is read from the tool's result (the run needs a real, non-error
+   result whose arguments equal the pins; a JSON answer with `error` or
+   `ok`/`success` false counts as a failure), never from the model's words.
+   Then the row is hidden by a local mark and the action goes to the audit log.
+   The mark (`rsvp` with the answer, `rsvp_event`, the event id it was made
+   for, and `rsvp_at`, its time, in `inbox-state.json`) hides only that event:
+   a recurring series is one row whose `event_id` moves on to the next
+   instance, and that instance shows again. The mark stops mattering once the
+   calendar cache reports your answer (the row is then no longer listed and the
+   mark is pruned with the other marks). If a cache snapshot fetched more than
+   10 minutes after the answer still lists the same event as unanswered, the
+   answer did not take: the row comes back with a "RSVP not confirmed by
+   calendar" hint (a `!` in the queue, a line above the thread) so a silent
+   failure cannot hide an invite. The snapshot's fetch time is
+   `meta.cache_fetched`.
+5. Any failure (guard stop, tool error, timeout, no confirmed result) keeps the
+   row and shows a toast with the reason; the reason carries only fixed kinds
+   (never prompts or tool output).
+
+A recurring series is one row. The answer applies to the instance in
+`meta.event_id` (the next one) only, and the modal says so; the series is not
+answered, and the next instance appears as a new invite to answer.
+
+Without `rsvp:`, `X` and `T` say "RSVP not configured", and `a` keeps
+acknowledging the invite as in 0.2.0.
+
+### Save to memory
+
+`m` on any item shows a modal with the source, sender, gist and link, then the
+5 s undo window (`q` inside it cancels), then runs the `save:` command (see
+[Save protocol](#save-protocol)). On success the toast shows the command's
+message (or says it was already saved), the action goes to the audit log and
+the row stays, with a `◆` and a local `saved` mark. Failures toast the reason
+and add no mark; a likely duplicate asks "Save anyway" first (see the
+protocol). Without `save:`, `m` says "Save not configured".
+
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
 `gmail:<thread>`, `gmail:<thread>:followup-open` or `gmail:<thread>@<message>`)
@@ -320,6 +451,8 @@ defaults; a broken one prints every problem and exits 2.
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
+| `rsvp` | off | calendar RSVP through the Claude bridge (below) |
+| `save` | off | the command `m` runs to save an item (below) |
 
 The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
 and:
@@ -334,6 +467,23 @@ A `command` source takes `argv` (list), `timeout_s` (1 to 120),
 `watch` (list of paths, default none; see "Change-driven refresh") and
 `supports_all` (`true` or `false`, default `false`): declare it only if
 `<argv> list --all` works.
+
+`rsvp:` (no default; omit it and RSVP is off):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tool` | required | the connector tool's name as Claude Code lists it, `mcp__<server>__<tool>` (a built-in such as `Bash` is refused) |
+| `args` | required | the tool's parameter names: `event_id`, `calendar_id` and `response` (three different names) |
+| `timeout_s` | `60` | 30 to 300 for the whole bridge call (the bridge waits about 6 s for the connectors to attach inside it) |
+| `model` | `haiku` | the model of the one-call run |
+
+The `response` parameter receives `accepted`, `declined` or `tentative`
+(Google Calendar's wording). The calendar id comes from the `calendar_cache`
+routine (`primary` by default).
+
+`save:` (no default; omit it and saving is off): `argv` (list, no shell) and
+`timeout_s` (5 to 120, default 30; a timeout stops the command with `SIGTERM`,
+then `SIGKILL` 5 s later).
 
 Urgent rule keys (all keys of one rule must match; any rule makes an event
 urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
@@ -354,7 +504,9 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 
 `j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, `r` refresh everything now,
+`d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, on a pending invite
+`a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
+memory (needs `save:`), `r` refresh everything now,
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view
 (read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
 `L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
@@ -414,10 +566,15 @@ header and the help overlay show the inbox version.
 
 ## Safety model
 
-- Nothing leaves the machine in phase 1a. The confirm modal (destination and
-  exact text, Cancel focused, `y` to send), the undo window and
-  quit-cancels-sends exist so phase 2 sends are safe from day one; real
-  sources cannot reach them yet (`LocalActions` refuses).
+- Nothing is sent as a reply: the confirm modal (destination and exact text,
+  Cancel focused, `y` to send), the undo window and quit-cancels-sends exist so
+  phase 2 sends are safe from day one; real sources cannot reach them yet
+  (`LocalActions` refuses).
+- The two writes, RSVP and save, are off until configured, always confirm
+  first (Cancel focused), wait out the undo window, are cancelled by quitting
+  inside it, and run in a worker. RSVP can only make the one pinned tool call
+  with exactly the pinned arguments; save passes the item as JSON on stdin,
+  never in argv or in a prompt.
 - Every action lands in the audit log (`L`).
 - `open` launches only plain `http(s)` links.
 - Sources run with your privileges: only configure commands you trust.

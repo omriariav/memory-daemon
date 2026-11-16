@@ -1,4 +1,4 @@
-"""Local inbox state: done, snooze-until and ack per item id.
+"""Local inbox state: done, snooze-until, ack, RSVP answer and saved per item id.
 
 `<base>/state/inbox-state.json`, written atomically with mode 0600. Several
 inbox panes (processes) and several threads of one pane may write at once, so
@@ -21,6 +21,12 @@ from .. import state as daemon_state
 FILE_NAME = "inbox-state.json"
 LOCK_NAME = "inbox-state.lock"
 SCHEMA_VERSION = 1
+# RSVP answers a mark may hold (the word the bridge sent).
+RSVP_ANSWERS = ("accepted", "declined", "tentative")
+# An RSVP mark hides the invite until the calendar cache shows the answer. A
+# snapshot fetched this long after the answer that still lists the same event
+# as unanswered means the answer did not take: the row comes back.
+RSVP_CONFIRM_MARGIN_S = 600
 # A mark is kept while its item is still listed by some source, and for this
 # long after the item was last listed (or the mark was last changed). Active
 # snoozes are never pruned by age. Age pruning happens only in `note_listed`
@@ -61,10 +67,15 @@ class InboxStore:
                 continue
             clean = {}
             for field in ("done", "ack", "snooze_until", "updated",
-                          "last_listed"):
+                          "last_listed", "saved", "rsvp_at"):
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
+            if mark.get("rsvp") in RSVP_ANSWERS:
+                clean["rsvp"] = mark["rsvp"]
+                event = mark.get("rsvp_event")
+                if isinstance(event, str) and 0 < len(event) <= 200:
+                    clean["rsvp_event"] = event
             if clean:
                 marks[key] = clean
         return marks, False
@@ -149,6 +160,29 @@ class InboxStore:
     def snooze(self, item_id, until):
         self._mark(item_id, snooze_until=float(until))
 
+    def rsvp(self, item_id, answer, event_id=None):
+        """The invite was answered (`accepted`, `declined`, `tentative`) for
+        this event id. A recurring series is one item whose event id moves on
+        to the next instance, so the mark hides only that instance."""
+        if answer not in RSVP_ANSWERS:
+            raise ValueError(f"unknown RSVP answer {answer!r}")
+        fields = {"rsvp": answer, "rsvp_at": self.clock()}
+        if isinstance(event_id, str) and event_id:
+            fields["rsvp_event"] = event_id
+
+        def change(marks):
+            mark = {k: v for k, v in marks.get(item_id, {}).items()
+                    if k not in ("rsvp", "rsvp_at", "rsvp_event")}
+            mark.update(fields)
+            mark["updated"] = self.clock()
+            marks[item_id] = mark
+            return True
+        self._transaction(change)
+
+    def mark_saved(self, item_id):
+        """The item was saved to memory. It stays listed, with a glyph."""
+        self._mark(item_id, saved=self.clock())
+
     def restore(self, item_id):
         """Drop every mark (undo)."""
         self._transaction(lambda marks: marks.pop(item_id, None) is not None)
@@ -188,14 +222,56 @@ class InboxStore:
         self._transaction(change)
 
     # -- queries --
-    def is_hidden(self, item_id, now=None):
+    def is_hidden(self, item_id, now=None, meta=None):
+        """`meta` is the item's meta: an RSVP mark hides only the event it
+        was made for (see `rsvp`)."""
         now = self.clock() if now is None else now
         mark = self.marks.get(item_id)
         if not mark:
             return False
         if "done" in mark or "ack" in mark:
             return True
+        if "rsvp" in mark and self._rsvp_hides(mark, meta):
+            return True
         return mark.get("snooze_until", 0) > now
+
+    @staticmethod
+    def _meta_ids(meta):
+        """`(event id, snapshot fetch time)` from an invite's meta, or Nones."""
+        meta = meta if isinstance(meta, dict) else {}
+        event = meta.get("event_id")
+        fetched = meta.get("cache_fetched")
+        return (event if isinstance(event, str) else None,
+                float(fetched) if isinstance(fetched, (int, float))
+                and not isinstance(fetched, bool) else None)
+
+    def _rsvp_state(self, mark, meta):
+        """`hidden` | `moved` (another instance) | `unconfirmed` (a later
+        snapshot still lists this event as unanswered)."""
+        event, fetched = self._meta_ids(meta)
+        answered = mark.get("rsvp_event")
+        if answered is not None and event is not None and answered != event:
+            return "moved"
+        if (fetched is not None and "rsvp_at" in mark
+                and fetched > mark["rsvp_at"] + RSVP_CONFIRM_MARGIN_S):
+            return "unconfirmed"
+        return "hidden"
+
+    def _rsvp_hides(self, mark, meta):
+        return self._rsvp_state(mark, meta) == "hidden"
+
+    def rsvp_unconfirmed(self, item_id, meta=None):
+        """True when this event was answered here, but a calendar snapshot
+        fetched well after that still lists it as unanswered."""
+        mark = self.marks.get(item_id)
+        return bool(mark and "rsvp" in mark
+                    and self._rsvp_state(mark, meta) == "unconfirmed")
+
+    def is_saved(self, item_id):
+        return "saved" in (self.marks.get(item_id) or {})
+
+    def rsvp_answer(self, item_id):
+        return (self.marks.get(item_id) or {}).get("rsvp")
 
     def snoozed_until(self, item_id, now=None):
         now = self.clock() if now is None else now
@@ -205,7 +281,8 @@ class InboxStore:
     def visible(self, rows, now=None):
         """Items that are not done, acked or still snoozed."""
         now = self.clock() if now is None else now
-        return [r for r in rows if not self.is_hidden(r["id"], now)]
+        return [r for r in rows
+                if not self.is_hidden(r["id"], now, r.get("meta"))]
 
     # -- housekeeping --
     def _cap(self):

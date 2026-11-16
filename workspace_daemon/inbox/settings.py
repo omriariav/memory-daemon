@@ -16,7 +16,17 @@ BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
 TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
-            "alert_urgent_max_age_h", "sources")
+            "alert_urgent_max_age_h", "sources", "rsvp", "save")
+RSVP_KEYS = ("tool", "args", "timeout_s", "model")
+RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
+SAVE_KEYS = ("argv", "timeout_s")
+# A connector tool as Claude Code names it. The mcp__ prefix keeps a built-in
+# (Bash, Write, ...) from ever being configured as the RSVP tool.
+TOOL_NAME = re.compile(r"^mcp__[A-Za-z0-9_.-]{1,120}$")
+PARAM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,64}$")
+DEFAULT_RSVP_TIMEOUT_S = 60
+DEFAULT_SAVE_TIMEOUT_S = 30
 SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent", "invites_days",
                "saved_days", "email_require_label"),
@@ -32,6 +42,8 @@ DEFAULTS = {
     "bidi_mode": "auto",
     "gmail_account": 0,
     "alert_urgent_max_age_h": sources.DEFAULT_ALERT_MAX_AGE_H,
+    "rsvp": None,   # no default: RSVP stays off until configured
+    "save": None,   # no default: save stays off until configured
 }
 
 
@@ -110,6 +122,9 @@ def validate(raw):
         problems.append("alert_urgent_max_age_h must be a number from 1 to 168")
     else:
         out["alert_urgent_max_age_h"] = float(max_age)
+
+    out["rsvp"] = _check_rsvp(raw.get("rsvp"), problems)
+    out["save"] = _check_save(raw.get("save"), problems)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:
@@ -206,6 +221,77 @@ def validate(raw):
     if problems:
         raise SettingsError(problems)
     return out
+
+
+def _check_rsvp(raw, problems):
+    """The `rsvp:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("rsvp must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in RSVP_KEYS:
+            problems.append(f"rsvp: unknown key '{key}'")
+    tool = raw.get("tool")
+    if not isinstance(tool, str) or not TOOL_NAME.match(tool):
+        problems.append("rsvp.tool must be a connector tool name "
+                        "(mcp__<server>__<tool>, letters, digits, _ . -)")
+    args = raw.get("args")
+    names = {}
+    if not isinstance(args, dict):
+        problems.append("rsvp.args must be a mapping of event_id, "
+                        "calendar_id and response to the tool's parameter names")
+    else:
+        for key in args:
+            if key not in RSVP_ARG_KEYS:
+                problems.append(f"rsvp.args: unknown key '{key}'")
+        for key in RSVP_ARG_KEYS:
+            val = args.get(key)
+            if not isinstance(val, str) or not PARAM_NAME.match(val):
+                problems.append(f"rsvp.args.{key} must be a parameter name "
+                                "(letters, digits, _ . -)")
+            else:
+                names[key] = val
+        if len(set(names.values())) != len(names):
+            problems.append("rsvp.args must name three different parameters")
+    timeout = raw.get("timeout_s", DEFAULT_RSVP_TIMEOUT_S)
+    # The bridge waits CONNECT_DELAY_SECONDS (6) for connectors inside the
+    # timeout, so anything much lower cannot finish.
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("rsvp.timeout_s must be 30 to 300")
+    model = raw.get("model", "haiku")
+    if not isinstance(model, str) or not MODEL_NAME.match(model):
+        problems.append("rsvp.model must be a model name (default haiku)")
+    if len(problems) > start:
+        return None
+    return {"tool": tool, "args": names, "timeout_s": float(timeout),
+            "model": model}
+
+
+def _check_save(raw, problems):
+    """The `save:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("save must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in SAVE_KEYS:
+            problems.append(f"save: unknown key '{key}'")
+    argv = raw.get("argv")
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(a, str) and a for a in argv)):
+        problems.append("save.argv must be a non-empty list of strings "
+                        "(no shell)")
+    timeout = raw.get("timeout_s", DEFAULT_SAVE_TIMEOUT_S)
+    if not _num(timeout) or not 5 <= timeout <= 120:
+        problems.append("save.timeout_s must be 5 to 120")
+    if len(problems) > start:
+        return None
+    return {"argv": list(argv), "timeout_s": float(timeout)}
 
 
 def _check_rules(rules, label, problems):
