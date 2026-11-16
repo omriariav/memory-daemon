@@ -1311,6 +1311,50 @@ def _iso(value, all_day):
     return value.astimezone(datetime.timezone.utc).isoformat()
 
 
+_GROUP_WORDS = frozenset((
+    "all", "everyone", "team", "teams", "staff", "group", "list", "dl",
+    "alias", "announce", "announcements", "office",
+))
+
+
+def _is_group(email):
+    """A mailing-list style address: a local-part word like team, all, staff.
+
+    A heuristic (the connector does not say): `eng-team@` and `all@` match,
+    `alice.smith@` does not. A person whose name is such a word is flagged too.
+    """
+    local = (email or "").split("@", 1)[0].split("+", 1)[0].lower()
+    return any(word in _GROUP_WORDS for word in re.split(r"[._\-]+", local))
+
+
+def _snapshot_people(event, owner):
+    """(people for the snapshot, whether their number is known).
+
+    `people` is the event's attendee list, with a known organizer the listing
+    omits added; the list is only a floor (`known` False) without an Attendees
+    line for an event I do not organize, when it shows only me for an event
+    someone else organizes, or when it holds a group address.
+    """
+    people = list(event["attendees"])
+    org = event["organizer"] or {}
+    org_email = org.get("email")
+    organized_by_me = event["my_rsvp"] == "organizer"
+    mine = [p for p in people if p["self"] or p["email"] == owner]
+    known = organized_by_me or bool(people)
+    if people and len(mine) == len(people) and not organized_by_me \
+            and org_email and org_email != owner:
+        known = False  # only me listed, yet someone else organizes: hidden list
+    if org_email and not any(p["email"] == org_email for p in people):
+        people.append({
+            "email": org_email, "name": org.get("name") or "",
+            "rsvp": "accepted", "organizer": True,
+            "self": org_email == owner, "optional": False,
+        })
+    if any(_is_group(p["email"]) for p in people):
+        known = False
+    return people, known
+
+
 def snapshot_rows(wide, details, cfg, tz):
     """{event_id: {start, end, location, conference, status, my_rsvp, title,
     list_title, organizer, attendee_count, attendees[, rsvps]}}.
@@ -1322,18 +1366,26 @@ def snapshot_rows(wide, details, cfg, tz):
     the only ones whose answers are reported.
 
     `organizer` is {name, email, self} or None. `attendees` lists people only
-    (rooms and resource calendars are left out), capped at
-    SNAPSHOT_ATTENDEES_MAX, as {name, email, response, self, optional};
-    `attendee_count` is every such person, uncapped, plus the owner when the
-    listing does not name them. Local state: emails are kept, never logged.
+    (rooms and resource calendars are left out; declined guests stay, with
+    their response), capped at SNAPSHOT_ATTENDEES_MAX, as {name, email,
+    response, self, optional, group}. A known organizer the listing omits is
+    added (response accepted, an organizer's implicit answer). `attendee_count`
+    is every such person, uncapped, minus declined guests (the owner is always
+    counted, and added when the listing does not name them), the same rule as
+    a capture event's attendee_count. `attendees_known` is False when the size
+    is only a floor: no Attendees line for an event I do not organize, a list
+    showing only me for an event someone else organizes (a hidden guest list),
+    or a group address (it stands for an unknown number of people). Local
+    state: emails are kept, never logged.
     """
     status = {raw["event_id"]: raw.get("status") or "confirmed" for raw in wide}
     owner = str(cfg.get("owner_email") or "").strip().lower()
     rows = {}
     for event in normalize(wide, details, cfg, tz):
-        people = event["attendees"]
-        mine = [p for p in people if p["self"] or p["email"] == owner]
         org = event["organizer"]
+        people, known = _snapshot_people(event, owner)
+        mine = [p for p in people if p["self"] or p["email"] == owner]
+        counted = [p for p in people if p["rsvp"] != "declined" or p in mine]
         row = {
             "start": _iso(event["start"], event["all_day"]),
             "end": _iso(event["end"], event["all_day"]),
@@ -1351,11 +1403,12 @@ def snapshot_rows(wide, details, cfg, tz):
                     or any(p["email"] == org["email"] for p in mine)
                 ),
             },
-            "attendee_count": len(people) + (0 if mine else 1),
+            "attendee_count": len(counted) + (0 if mine else 1),
+            "attendees_known": known,
             "attendees": [
                 {"name": p["name"], "email": p["email"],
                  "response": p["rsvp"], "self": p in mine,
-                 "optional": p["optional"]}
+                 "optional": p["optional"], "group": _is_group(p["email"])}
                 for p in people[:SNAPSHOT_ATTENDEES_MAX]
             ],
         }

@@ -223,10 +223,13 @@ class EventsTest(unittest.TestCase):
             "attendee_count": 2,
             "attendees": [
                 {"name": "Alice Smith", "email": "alice.smith@example.com",
-                 "response": "accepted", "self": False, "optional": False},
+                 "response": "accepted", "self": False, "optional": False,
+                 "group": False},
                 {"name": "Me", "email": "me@example.com",
-                 "response": "needsAction", "self": True, "optional": False},
+                 "response": "needsAction", "self": True, "optional": False,
+                 "group": False},
             ],
+            "attendees_known": True,
         })
         self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
 
@@ -678,12 +681,16 @@ class SnapshotRowTest(unittest.TestCase):
                        "me@example.com (declined, self)")
         self.assertEqual(row["attendees"], [
             {"name": "Alice Smith", "email": "alice.smith@example.com",
-             "response": "accepted", "self": False, "optional": False},
+             "response": "accepted", "self": False, "optional": False,
+             "group": False},
             {"name": "Bob Jones", "email": "bob.jones@example.com",
-             "response": "tentative", "self": False, "optional": True},
+             "response": "tentative", "self": False, "optional": True,
+             "group": False},
             {"name": "Me", "email": "me@example.com",
-             "response": "declined", "self": True, "optional": False},
+             "response": "declined", "self": True, "optional": False,
+             "group": False},
         ])
+        # the owner counts even when they declined
         self.assertEqual(row["attendee_count"], 3)
 
     def test_owner_matched_by_address_when_not_marked_self(self):
@@ -700,16 +707,82 @@ class SnapshotRowTest(unittest.TestCase):
 
     def test_event_without_guests_counts_the_owner(self):
         text = (f"Found 1 event(s):\n\n- Solo\n  Time: {at(soon())} - "
-                f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n")
+                f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n"
+                "  Organizer: me@example.com\n")
         row = self.rows(text)["e1"]
-        self.assertEqual((row["attendees"], row["attendee_count"]), ([], 1))
+        self.assertEqual([a["email"] for a in row["attendees"]],
+                         ["me@example.com"])
+        self.assertTrue(row["attendees"][0]["self"])
+        self.assertEqual(row["attendee_count"], 1)
+        self.assertTrue(row["attendees_known"])
+
+    def test_declined_guests_are_listed_but_not_counted(self):
+        row = self.one("alice.smith@example.com (accepted), "
+                       "bob.jones@example.com (declined), "
+                       "me@example.com (accepted, self)")
+        self.assertEqual([a["response"] for a in row["attendees"]],
+                         ["accepted", "declined", "accepted"])
+        self.assertEqual(row["attendee_count"], 2)
+        owner_one = self.one("me@example.com (accepted, self), "
+                             "bob.jones@example.com (accepted), "
+                             "dan.lee@example.com (declined)",
+                             organizer="me@example.com")
+        self.assertEqual(owner_one["attendee_count"], 2)
+        self.assertEqual(len(owner_one["attendees"]), 3)
+
+    def test_declined_owner_still_counts(self):
+        row = self.one("alice.smith@example.com (accepted), "
+                       "me@example.com (declined, self)")
+        self.assertEqual(row["attendee_count"], 2)
+
+    def test_missing_organizer_is_added_to_the_attendees(self):
+        row = self.one("bob.jones@example.com (accepted), "
+                       "me@example.com (accepted, self)")
+        self.assertEqual(row["attendee_count"], 3)
+        added = row["attendees"][-1]
+        self.assertEqual(added["email"], "alice.smith@example.com")
+        self.assertFalse(added["self"])
+        self.assertEqual(added["response"], "accepted")
+
+    def test_attendees_known_flags(self):
+        # listed guests: known
+        self.assertTrue(self.one(
+            "alice.smith@example.com (accepted), "
+            "me@example.com (accepted, self)")["attendees_known"])
+        # no Attendees line, someone else organizes: unknown
+        text = (f"Found 1 event(s):\n\n- Sync\n  Time: {at(soon())} - "
+                f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n"
+                "  Organizer: alice.smith@example.com\n")
+        row = self.rows(text)["e1"]
+        self.assertFalse(row["attendees_known"])
+        self.assertEqual(row["attendee_count"], 2)  # organizer and me
+        # only me listed while someone else organizes: a hidden guest list
+        self.assertFalse(self.one(
+            "me@example.com (accepted, self)")["attendees_known"])
+        # no organizer at all and no guests: unknown
+        bare = (f"Found 1 event(s):\n\n- Solo\n  Time: {at(soon())} - "
+                f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n")
+        self.assertFalse(self.rows(bare)["e1"]["attendees_known"])
+
+    def test_group_address_is_flagged_and_makes_the_size_unknown(self):
+        row = self.one("alice.smith@example.com (accepted), "
+                       "eng-team@example.com (needsAction), "
+                       "me@example.com (accepted, self)")
+        flags = {a["email"]: a["group"] for a in row["attendees"]}
+        self.assertEqual(flags, {"alice.smith@example.com": False,
+                                 "eng-team@example.com": True,
+                                 "me@example.com": False})
+        self.assertFalse(row["attendees_known"])
+        self.assertEqual(row["attendee_count"], 3)
+        self.assertTrue(calendar_cache._is_group("all@example.com"))
+        self.assertFalse(calendar_cache._is_group("alice.smith@example.com"))
 
     def test_list_is_capped_but_the_count_is_not(self):
         guests = ", ".join(f"guest{i}@example.com (accepted)" for i in range(60))
         row = self.one(guests + ", me@example.com (accepted, self)")
         self.assertEqual(len(row["attendees"]), calendar_cache.SNAPSHOT_ATTENDEES_MAX)
         self.assertEqual(calendar_cache.SNAPSHOT_ATTENDEES_MAX, 50)
-        self.assertEqual(row["attendee_count"], 61)
+        self.assertEqual(row["attendee_count"], 62)  # + the organizer
 
     def test_written_snapshot_carries_the_fields_and_logs_no_email(self):
         tmp = tempfile.TemporaryDirectory()
