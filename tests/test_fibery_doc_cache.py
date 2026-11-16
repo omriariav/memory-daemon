@@ -6,6 +6,7 @@ synthetic document."""
 import datetime
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -221,7 +222,7 @@ class Base(unittest.TestCase):
                     "model": "haiku"}
         self.calls, self.logs = [], []
         self.text = doc_text()
-        self.fail = {}
+        self.broken = {}
         for patcher in (
             mock.patch.object(claude_bridge, "call_tools", self._call),
             mock.patch.object(fdc, "log", self.logs.append),
@@ -232,8 +233,8 @@ class Base(unittest.TestCase):
     def _call(self, prompt, tools, **kwargs):
         self.calls.append((prompt, tools, kwargs))
         secret = tools[TOOL]["secret"]
-        if secret in self.fail:
-            raise self.fail[secret]
+        if secret in self.broken:
+            raise self.broken[secret]
         return [{"name": TOOL, "input": {"secret": secret},
                  "text": self.text, "is_error": False}]
 
@@ -428,7 +429,7 @@ class FailureTest(Base):
         self.snap(e1=event(), e2=event(other="sam@example.com"))
 
     def test_one_failure_does_not_stop_the_others_and_fails_the_run(self):
-        self.fail[SECRET_A] = claude_bridge.BridgeError("boom")
+        self.broken[SECRET_A] = claude_bridge.BridgeError("boom")
         with self.assertRaises(RuntimeError) as ctx:
             self.run_once()
         self.assertIn("doc-a", str(ctx.exception))
@@ -454,7 +455,7 @@ class FailureTest(Base):
         self.assertFalse(self.out("doc-b").exists())
 
     def test_an_outage_stops_the_run_and_keeps_the_outage_note(self):
-        self.fail[SECRET_A] = claude_bridge.BridgeOutage(
+        self.broken[SECRET_A] = claude_bridge.BridgeOutage(
             f"claude run failed ({sleepclock.OUTAGE_NOTE})")
         with self.assertRaises(claude_bridge.BridgeOutage) as ctx:
             self.run_once()
@@ -465,32 +466,123 @@ class FailureTest(Base):
         self.assertFalse(self.out("doc-b").exists())
 
     def test_the_outage_class_survives_fetch(self):
-        self.fail[SECRET_A] = claude_bridge.BridgeOutage(f"x {SECRET_A} y")
+        self.broken[SECRET_A] = claude_bridge.BridgeOutage(f"x {SECRET_A} y")
         with self.assertRaises(claude_bridge.BridgeOutage) as ctx:
             fti.fetch({"read_tool": TOOL, "document_secret": SECRET_A},
                       self.dir, exact_args=True)
         self.assertNotIn(SECRET_A, str(ctx.exception))
 
     def test_a_network_down_failure_stops_the_run_as_an_outage(self):
-        self.fail[SECRET_A] = RuntimeError("could not resolve host")
+        self.broken[SECRET_A] = RuntimeError("could not resolve host")
         with self.assertRaises(claude_bridge.BridgeOutage):
             self.run_once()
         self.assertEqual(len(self.calls), 1)
 
-    def test_an_auth_or_rate_limit_failure_stops_the_run_but_is_not_an_outage(self):
-        for text in ("Unauthenticated: please log in", "rate limit reached",
-                     "quota exceeded"):
+    SECRET_C = "cccccccc-1111-2222-3333-444444444444"
+
+    def three_docs(self):
+        """doc-a, doc-b and doc-c all qualify (one-to-ones with three people)."""
+        self.cfg["docs"].append({"key": "doc-c", "document_secret": self.SECRET_C,
+                                 "match_emails": ["kim@example.com"]})
+        self.snap(e1=event(), e2=event(other="sam@example.com"),
+                  e3=event(other="kim@example.com"))
+
+    def secrets_called(self):
+        return [call[1][TOOL]["secret"] for call in self.calls]
+
+    def test_a_timeout_a_refused_or_a_reset_connection_never_stops_the_run(self):
+        for text in ("claude timed out after 180s", "connection refused",
+                     "Connection reset by peer", "timed out"):
             self.calls.clear()
-            self.fail[SECRET_A] = claude_bridge.BridgeError(text)
+            shutil.rmtree(self.out().parent, ignore_errors=True)
+            self.broken = {SECRET_A: claude_bridge.BridgeError(text)}
+            if "doc-c" not in [d["key"] for d in self.cfg["docs"]]:
+                self.three_docs()
             with self.assertRaises(RuntimeError) as ctx:
                 self.run_once()
             self.assertNotIsInstance(ctx.exception, claude_bridge.BridgeOutage)
-            self.assertIn("shared dependency", str(ctx.exception))
-            self.assertFalse(sleepclock.text_is_outage(str(ctx.exception)))
-            self.assertEqual(len(self.calls), 1, text)
+            self.assertIn("1 of 3 refresh(es) failed", str(ctx.exception), text)
+            self.assertEqual(len(self.calls), 3, text)      # every doc tried
+            self.assertTrue(self.out("doc-b").exists())
+            self.assertTrue(self.out("doc-c").exists())
+
+    def test_one_auth_failure_continues_and_two_stop(self):
+        self.three_docs()
+        self.broken = {SECRET_A: claude_bridge.BridgeError("Unauthenticated")}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_once()
+        self.assertNotIn("stopped", str(ctx.exception))     # one: no stop
+        self.assertEqual(len(self.calls), 3)
+        self.calls.clear()
+        shutil.rmtree(self.out().parent, ignore_errors=True)
+        self.broken = {SECRET_A: claude_bridge.BridgeError("Unauthenticated"),
+                       SECRET_B: claude_bridge.BridgeError("auth failed")}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_once()
+        self.assertIn("auth failed on two documents", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, claude_bridge.BridgeOutage)
+        self.assertFalse(sleepclock.text_is_outage(str(ctx.exception)))
+        self.assertEqual(len(self.calls), 2)                # doc-c not tried
+
+    def test_two_rate_limits_stop_but_a_rate_limit_and_an_auth_do_not(self):
+        self.three_docs()
+        self.broken = {SECRET_A: claude_bridge.BridgeError("rate limit reached"),
+                       SECRET_B: claude_bridge.BridgeError("Too many requests")}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_once()
+        self.assertIn("rate limit failed on two documents", str(ctx.exception))
+        self.calls.clear()
+        shutil.rmtree(self.out().parent, ignore_errors=True)
+        self.broken = {SECRET_A: claude_bridge.BridgeError("rate limit"),
+                       SECRET_B: claude_bridge.BridgeError("Unauthenticated")}
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_once()
+        self.assertNotIn("stopped", str(ctx.exception))
+        self.assertEqual(len(self.calls), 3)
+
+    def test_the_same_document_failing_twice_in_a_run_is_not_two_documents(self):
+        self.three_docs()
+        self.broken = {SECRET_A: claude_bridge.BridgeError("Unauthenticated")}
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.assertEqual(self.secrets_called().count(SECRET_A), 1)
+
+    def test_documents_are_tried_oldest_cache_first_missing_first(self):
+        self.three_docs()
+        self.write_old_cache("doc-a", 20)
+        self.write_old_cache("doc-b", 30)             # doc-c has no cache
+        self.run_once()
+        self.assertEqual(self.secrets_called(),
+                         [self.SECRET_C, SECRET_B, SECRET_A])
+
+    def test_a_document_that_always_fails_cannot_block_the_others(self):
+        self.three_docs()
+        self.write_old_cache("doc-a", 40)             # the stalest: tried first
+        self.write_old_cache("doc-b", 30)
+        self.write_old_cache("doc-c", 20)
+        self.broken = {SECRET_A: claude_bridge.BridgeError("tool returned an error")}
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.assertTrue(self.out("doc-b").exists())
+        self.assertEqual(json.loads(self.out("doc-b").read_text())["text"],
+                         self.text)
+        # the next run: doc-a is still stalest, but the others are fresh now
+        self.calls.clear()
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.assertEqual(self.secrets_called(), [SECRET_A])
+
+    def test_the_outage_error_still_counts_as_an_error_for_the_runner(self):
+        # the runner logs "maintenance FATAL: ..." and counts an error for any
+        # exception; the outage note in the text is what status reads
+        self.broken[SECRET_A] = claude_bridge.BridgeOutage(
+            f"x ({sleepclock.OUTAGE_NOTE})")
+        with self.assertRaises(RuntimeError) as ctx:   # BridgeOutage is one
+            self.run_once()
+        self.assertTrue(sleepclock.text_is_outage(str(ctx.exception)))
 
     def test_an_ordinary_failure_still_lets_the_next_doc_run(self):
-        self.fail[SECRET_A] = claude_bridge.BridgeError("tool returned an error")
+        self.broken[SECRET_A] = claude_bridge.BridgeError("tool returned an error")
         with self.assertRaises(RuntimeError):
             self.run_once()
         self.assertEqual(len(self.calls), 2)
@@ -498,14 +590,14 @@ class FailureTest(Base):
 
     def test_guard_stops_end_the_run_for_the_runner(self):
         stop = claude_bridge.GUARD_STOPS[0]("paused")
-        self.fail[SECRET_A] = stop
-        self.fail[SECRET_B] = stop
+        self.broken[SECRET_A] = stop
+        self.broken[SECRET_B] = stop
         with self.assertRaises(claude_bridge.GUARD_STOPS):
             self.run_once()
         self.assertEqual(len(self.calls), 1)
 
     def test_no_secret_and_no_email_reaches_the_logs_or_the_error(self):
-        self.fail[SECRET_A] = RuntimeError(
+        self.broken[SECRET_A] = RuntimeError(
             f"failed for {SECRET_A} and {SECRET_B} mailing "
             "Alex.W@Example.com then <sam@example.com>")
         with self.assertRaises(RuntimeError) as ctx:
@@ -525,7 +617,7 @@ class FailureTest(Base):
             self.assertNotIn(needle, blob)
 
     def test_the_bridge_error_text_is_scrubbed_by_fetch_too(self):
-        self.fail[SECRET_A] = RuntimeError(f"secret {SECRET_A} rejected")
+        self.broken[SECRET_A] = RuntimeError(f"secret {SECRET_A} rejected")
         with self.assertRaises(RuntimeError) as ctx:
             fti.fetch({"read_tool": TOOL, "document_secret": SECRET_A},
                       self.dir, exact_args=True)

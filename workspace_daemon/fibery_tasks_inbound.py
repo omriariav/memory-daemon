@@ -160,12 +160,18 @@ def parse_document(text):
                 raise FiberyParseError("unrecognised top-level line")
             key, count, raw = match.groups()
             if key == "version" and count is None:
+                if seen_version:
+                    raise FiberyParseError("repeated document version")
                 if not re.fullmatch(r"[0-9]+", _scalar(raw, "version") or ""):
                     raise FiberyParseError("document version is not an integer")
                 seen_version = True
             elif key == "rootBlockIds" and count is not None:
+                if roots is not None:
+                    raise FiberyParseError("repeated rootBlockIds")
                 roots = _id_list(count, raw, "rootBlockIds")
             elif key == "blocks" and count is not None and not (raw or "").strip():
+                if declared is not None:
+                    raise FiberyParseError("repeated blocks header")
                 declared = int(count)
             elif key == "suggestions" and suggestions_count is None:
                 in_suggestions = True

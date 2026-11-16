@@ -1049,10 +1049,14 @@ bridge call pinned to `{read_tool: {secret}}` with `exact_args` (a call with any
 other argument is refused); the result must parse as a Fibery document (the `comments` and `suggestions` sections of a document with inline comments are accepted, never read), and is
 written atomically as `<out_dir>/<key>.json` (`{"v": 1, "key", "fetched_at",
 "text"}`, mode 0600 in a 0700 directory). A failed document does not stop the
-others; the run then fails, naming the keys. A failure every later call would
-share (the machine slept or is offline, a refused login, a rate limit) stops the
-run at once: after a sleep it fails as an outage (it carries the outage note, so
-`status` reads it as one, not as a broken routine). With `only_upcoming` a
+others; the run then fails, naming the keys. Documents are tried oldest
+cache first, so one that always fails cannot keep the others from being tried. Only
+two things end a run early: a real outage (the machine slept or the network is
+down) stops it at once and fails it as an outage (it carries the outage note, so
+`status` reads it as one; the runner still counts it as an error in its totals),
+and a refused login or a rate limit stops it once a second document fails the
+same way. A timeout, a refused or a reset connection never does: that document
+fails and the next is tried. With `only_upcoming` a
 calendar snapshot older than the smaller of `2 x lookahead_h` and 6 hours is not
 used (logged, nothing refreshed). Logs carry counts and keys only:
 never a secret, an email or text. `--dry-run` makes no call and writes nothing.

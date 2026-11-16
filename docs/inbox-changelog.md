@@ -69,6 +69,9 @@ not to).
   ellipsis), wraps each line of a multi-line value, and scrolls when the rows
   are taller than the box (`down`/`up`, `j`/`k`, `pagedown`/`pageup`; Cancel
   stays the default).
+  The label column plus the value always fit the box's inner width (61 cells).
+- A bad `choices` answer names the field that is wrong (for example
+  `choices[0].label must be a string`).
 - A successful save no longer leaves the row in the queue (see `mark_done`
   above; set `save: {mark_done: false}` to keep it).
 - `save.mark_done` is part of the validated `save` block.

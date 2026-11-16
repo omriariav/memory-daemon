@@ -101,8 +101,10 @@ def parse_choices(text):
         raise itm.ItemError("response choices must be a list")
     choices, seen = [], set()
     for n, row in enumerate(raw):
-        if not isinstance(row, dict) or not isinstance(row.get("label"), str):
-            raise itm.ItemError(f"choices[{n}] needs id (str) and label (str)")
+        if not isinstance(row, dict):
+            raise itm.ItemError(f"choices[{n}] must be an object")
+        if not isinstance(row.get("label"), str):
+            raise itm.ItemError(f"choices[{n}].label must be a string")
         detail = row.get("detail")
         if detail is not None and not isinstance(detail, str):
             raise itm.ItemError(f"choices[{n}].detail must be a string")

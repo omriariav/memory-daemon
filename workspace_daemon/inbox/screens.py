@@ -77,6 +77,7 @@ class ConfirmWrite(ModalScreen):
                 Binding("pagedown", "scroll(10)", show=False),
                 Binding("pageup", "scroll(-10)", show=False)]
     LABEL_MIN, LABEL_MAX = 8, 16      # the label column, in cells
+    INNER = 61                        # label column + value, in cells: fits the box
 
     def __init__(self, title, rows, verb, note="", visual=False):
         super().__init__()
@@ -97,7 +98,7 @@ class ConfirmWrite(ModalScreen):
             body.append(f"{label:<{col}}", Style(dim=True))
             lines = []
             for para in value.split("\n"):    # a value may have several lines
-                lines.extend(bidi.visual_lines(para, 64 - col, self.visual)
+                lines.extend(bidi.visual_lines(para, self.INNER - col, self.visual)
                              or [""])
             body.append(lines[0] + "\n", Style(bold=True))
             for ln in lines[1:]:

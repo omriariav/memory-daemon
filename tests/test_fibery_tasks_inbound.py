@@ -777,6 +777,24 @@ def comments_section(block_id):
     ]
 
 
+class RepeatedHeaderTest(unittest.TestCase):
+    def test_a_repeated_version_root_or_blocks_header_is_refused(self):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "null", ['"x"'])])
+        text = doc.text(wrap=False)
+        lines = text.split("\n")
+        fti.parse_document(text)                          # the plain one is fine
+        for repeat in (lines[0], lines[1], lines[2]):
+            with self.assertRaises(fti.FiberyParseError, msg=repeat):
+                fti.parse_document(text + "\n" + repeat)
+        # a repeat before the blocks is refused too
+        for n in (0, 1):
+            twice = lines[:n + 1] + [lines[n]] + lines[n + 1:]
+            with self.assertRaises(fti.FiberyParseError, msg=twice[n]):
+                fti.parse_document("\n".join(twice))
+
+
 class CommentsSectionTest(unittest.TestCase):
     def doc(self, comments=None, suggest=False):
         doc = Doc()

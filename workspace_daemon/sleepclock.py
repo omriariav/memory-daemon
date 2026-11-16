@@ -59,14 +59,6 @@ def looks_offline(exc):
     return is_outage(exc) or any(m in text for m in _OFFLINE_MARKERS)
 
 
-def is_shared_dependency(exc):
-    """True for a failure that every later call would share: an outage or an
-    offline machine, or the service refusing us (authentication, rate limit,
-    quota). A caller with many calls to make stops at the first one."""
-    text = str(exc).casefold()
-    return looks_offline(exc) or any(m in text for m in _NOT_OUTAGE_MARKERS)
-
-
 def text_is_outage(text):
     """True when a log or error text names a measured sleep or a dead network.
 

@@ -316,6 +316,24 @@ def snapshot_age_h(snapshot, now):
     return (now - when).total_seconds() / 3600
 
 
+# A refused login or a rate limit: stop only when a second document fails the
+# same way (one document's own access problem must not block the others).
+_REFUSAL_MARKERS = {
+    "auth": ("unauthenticated", "invalid api key", "auth failed"),
+    "rate limit": ("rate limit", "too many requests", "quota exceeded"),
+}
+
+
+def _refusal(exc):
+    """The refusal category of a failure ("auth", "rate limit"), or None. A
+    timeout, a refused or reset connection is never one."""
+    text = str(exc).casefold()
+    for category, markers in _REFUSAL_MARKERS.items():
+        if any(m in text for m in markers):
+            return category
+    return None
+
+
 def _redact(message, secrets):
     """A message with every known secret and anything email-shaped removed."""
     text = str(message)
@@ -330,12 +348,18 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
     """Refresh the cache files that need it; returns a report.
 
     Raises RuntimeError after trying every document when any refresh failed
-    (the runner then shows the routine as failing). A bridge guard stop
-    (paused, budget) ends the run at once and is re-raised for the runner. A
-    failure every later call would share (a sleep or no network, a refused
-    login, a rate limit) also ends the run at once: after a sleep it raises a
-    `BridgeOutage` carrying the outage note, so the run reads as an outage and
-    not as a broken routine.
+    (the runner then shows the routine as failing). Documents are tried oldest
+    cache first (a missing cache first), so one that always fails cannot keep
+    the others from being tried. A bridge guard stop (paused, budget) ends the
+    run at once and is re-raised for the runner.
+
+    Only two things end the run early. A real outage (the machine slept, or
+    the network is down: `sleepclock.is_outage` or `text_is_outage`) stops it
+    at once and raises a `BridgeOutage` carrying the outage note, so the run
+    reads as an outage in `status`; the runner still counts it as an error in
+    its totals. A refused login or a rate limit stops it only when a second
+    document fails the same way. A timeout, a refused or a reset connection
+    never stops it: that document fails and the next one is tried.
 
     With `only_upcoming`, a calendar snapshot older than the smaller of
     twice `lookahead_h` and SNAPSHOT_MAX_AGE_H hours is not used: nothing is
@@ -371,11 +395,13 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
         candidates = {d["key"] for d in docs}
     report["qualifying"] = len(candidates)
     secrets = [d["document_secret"] for d in docs]
-    for doc in docs:
+    oldest = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    stamps = {d["key"]: cached_at(out_dir, d["key"]) for d in docs}
+    refusals = {}                 # category -> keys that failed that way
+    for doc in sorted((d for d in docs if d["key"] in candidates),
+                      key=lambda d: stamps[d["key"]] or oldest):
         key = doc["key"]
-        if key not in candidates:
-            continue
-        when = cached_at(out_dir, key)
+        when = stamps[key]
         if when is not None and now - when <= max_age:
             report["fresh"] += 1
             continue
@@ -398,17 +424,24 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
             detail = f"{type(exc).__name__}: {_redact(exc, secrets)}"
             log(f"routine={routine_id} fibery_doc_cache: refresh failed "
                 f"key={key} ({detail})")
-            if sleepclock.is_shared_dependency(exc):
+            if sleepclock.is_outage(exc) or sleepclock.text_is_outage(exc):
                 log(f"routine={routine_id} maintenance=fibery_doc_cache "
-                    f"stopped: a shared dependency failed; the remaining "
-                    f"documents are not tried")
-                if sleepclock.is_outage(exc) or sleepclock.text_is_outage(exc):
-                    raise claude_bridge.BridgeOutage(
-                        f"fibery_doc_cache stopped at key={key} "
-                        f"({sleepclock.OUTAGE_NOTE})") from None
-                raise RuntimeError(
-                    f"fibery_doc_cache stopped at key={key}: a shared "
-                    f"dependency failed ({_redact(exc, secrets)})") from None
+                    "stopped: an outage; the remaining documents are not "
+                    "tried")
+                raise claude_bridge.BridgeOutage(
+                    f"fibery_doc_cache stopped at key={key} "
+                    f"({sleepclock.OUTAGE_NOTE})") from None
+            category = _refusal(exc)
+            if category:
+                refusals.setdefault(category, set()).add(key)
+                if len(refusals[category]) >= 2:
+                    log(f"routine={routine_id} maintenance=fibery_doc_cache "
+                        f"stopped: {category} failed on two documents; the "
+                        "remaining documents are not tried")
+                    raise RuntimeError(
+                        f"fibery_doc_cache stopped at key={key}: "
+                        f"{category} failed on two documents "
+                        f"({_redact(exc, secrets)})") from None
             continue
         report["refreshed"] += 1
         log(f"routine={routine_id} fibery_doc_cache: refreshed key={key}")

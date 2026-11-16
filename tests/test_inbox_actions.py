@@ -192,6 +192,17 @@ class ChoicesProtocolTest(unittest.TestCase):
         self.assertLessEqual(len(row["label"]), customactions.CHOICE_LABEL_MAX)
         self.assertLessEqual(len(row["detail"]), customactions.CHOICE_DETAIL_MAX)
 
+    def test_errors_name_the_field_that_is_wrong(self):
+        for body, field in (
+                ([{"id": "a"}], "choices[0].label must be a string"),
+                ([{"id": "a", "label": 3}], "choices[0].label must be a string"),
+                ([{"id": "a", "label": "x", "detail": 3}],
+                 "choices[0].detail must be a string"),
+                (["x"], "choices[0] must be an object")):
+            with self.assertRaises(itm.ItemError) as ctx:
+                customactions.parse_choices(j({"ok": True, "choices": body}))
+            self.assertIn(field, str(ctx.exception))
+
     def test_the_id_is_passed_through_byte_for_byte(self):
         ids = ["  padded id  ", "doc/ünï-1?x=y&z", "[b]markup[/b]",
                "x" * customactions.CHOICE_ID_MAX, "a b", "‏rtl-mark"]
@@ -734,6 +745,25 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause(0.2)
             self.assertEqual(acts.ran_calls(), [])
+
+    async def test_label_column_and_value_fit_the_box(self):
+        acts = Scripted(None)
+        value = " ".join(["word"] * 60)
+        acts.prepared = customactions.Prepared(True, [
+            ("Agenda", value),
+            ("A label that is far too long for its column", value)],
+            "S", None, False)
+        app = make_app([make_item(1)], acts, InboxStore(None))
+        async with app.run_test(size=SIZE) as pilot:
+            await self.to_confirm(pilot, app)
+            modal = app.screen
+            await pilot.pause(0.2)
+            text = str(modal.query_one("#confirm-text").render())
+            widest = max(len(line) for line in text.splitlines())
+            self.assertLessEqual(widest, modal.INNER)
+            self.assertLessEqual(modal.INNER, 61)
+            inner = modal.query_one("#confirm-text").size.width
+            self.assertLessEqual(modal.INNER, inner)
 
     async def test_a_short_confirmation_keeps_the_narrow_label_column(self):
         modal = ConfirmWrite("T", [("From", "Ann"), ("Gist", "g")], "Go")
