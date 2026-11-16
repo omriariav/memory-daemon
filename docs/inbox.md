@@ -7,10 +7,11 @@ protocol, the built-in `events` source, local state and settings.
 Version: see [docs/inbox-changelog.md](inbox-changelog.md); `python daemon.py
 inbox --version` prints it.
 
-The inbox reads and triages. Replies are not sent: `reply` and `nudge` are
-part of the format but the UI refuses them until phase 2. Version 0.3.0 adds
-the first two writes, both opt-in: [RSVP on pending invites](#rsvp-on-pending-invites)
-and [save to memory](#save-to-memory). Everything else is a local mark.
+The inbox reads and triages. Replies are not sent: `reply` and `nudge` are part
+of the format but the UI refuses them until phase 2. Version 0.3.0 adds the
+first two writes, both opt-in: [RSVP on pending
+invites](#rsvp-on-pending-invites) and [save to memory](#save-to-memory).
+Everything else is a local mark.
 
 ## Install and run
 
@@ -99,14 +100,15 @@ and prints one JSON object on stdout:
 
 **Likely duplicate.** A reply with `"ok": false, "duplicate": true` is not an
 error. Its `memory_id` is null (nothing was saved); the existing memory's id is
-`candidate.id`. The inbox shows `message` and the candidate in a "Possible duplicate"
-modal (Cancel focused) offering "Save anyway". The modal does not open by
-itself (it could land on top of another one and a stray key would confirm it): a
-toast says "Possible duplicate, press m to review", and `m` on that item opens
-it. Cancel saves nothing and adds no mark. Confirm waits out the undo window
-again, then resends the same stdin with `"force": true` added. If that forced call still answers `ok: false` it is
-shown as an error (the inbox asks once). Any other `ok: false` is an error toast
-with `message`; a failure is never shown as a save.
+`candidate.id`. The inbox shows `message` and the candidate in a "Possible
+duplicate" modal (Cancel focused) offering "Save anyway". The modal does not
+open by itself (it could land on top of another one and a stray key would
+confirm it): a toast says "Possible duplicate, press m to review", and `m` on
+that item opens it. Cancel saves nothing and adds no mark. Confirm waits out
+the undo window again, then resends the same stdin with `"force": true` added.
+If that forced call still answers `ok: false` it is shown as an error (the
+inbox asks once). Any other `ok: false` is an error toast with `message`; a
+failure is never shown as a save.
 
 **Force.** After a duplicate answer and the user's "save anyway", the same
 payload is sent again with `"force": true` added at the top level
@@ -120,13 +122,17 @@ process group stopped whole on timeout, output stopped past 4 MB, and the last
 64 KB of stderr kept (its tail is shown when the exit code is not 0). Unlike a
 command source's `list`, a save that times out (or overflows) first gets
 `SIGTERM` for the whole group and 5 seconds to clean up before the `SIGKILL`,
-so a command's own child (a CLI it started) is not cut off mid-write. A timeout
-is reported as "timed out after Ns; the save may still complete": the command
-may have finished its work, so check before saving again. A timeout, an oversized or non-JSON answer, a missing `ok` or `message`, a wrong
-type, a non-zero exit or a program that will not start is a failure: a toast
-with the reason, no mark. A save is never retried by the inbox, so a command
-should treat a repeated item as `duplicate`. The `item` is untrusted display
-text (see above); a command that writes it anywhere must treat it as data.
+so a command's own child (a CLI it started) is not cut off mid-write. On
+`SIGTERM` the command must stop and wait for any child processes it started
+before it exits: the inbox sends `SIGKILL` to the whole group after the 5 s
+grace, whatever is still running. A timeout is reported as "timed out after Ns;
+the save may still complete": the command may have finished its work, so check
+before saving again. A timeout, an oversized or non-JSON answer, a missing `ok`
+or `message`, a wrong type, a non-zero exit or a program that will not start is
+a failure: a toast with the reason, no mark. A save is never retried by the
+inbox, so a command should treat a repeated item as `duplicate`. The `item` is
+untrusted display text (see above); a command that writes it anywhere must
+treat it as data.
 
 ## Source-command protocol
 
@@ -295,8 +301,8 @@ event or calendar id outside `[A-Za-z0-9_@.+=-]` is refused.
 4. Success is read from the tool's result (the run needs a real, non-error
    result whose arguments equal the pins; a JSON answer with `error` or
    `ok`/`success` false counts as a failure), never from the model's words.
-   Then the row is hidden by a local mark and the action goes to the audit
-   log. The mark (`rsvp` with the answer, `rsvp_event`, the event id it was made
+   Then the row is hidden by a local mark and the action goes to the audit log.
+   The mark (`rsvp` with the answer, `rsvp_event`, the event id it was made
    for, and `rsvp_at`, its time, in `inbox-state.json`) hides only that event:
    a recurring series is one row whose `event_id` moves on to the next
    instance, and that instance shows again. The mark stops mattering once the
@@ -305,7 +311,8 @@ event or calendar id outside `[A-Za-z0-9_@.+=-]` is refused.
    10 minutes after the answer still lists the same event as unanswered, the
    answer did not take: the row comes back with a "RSVP not confirmed by
    calendar" hint (a `!` in the queue, a line above the thread) so a silent
-   failure cannot hide an invite. The snapshot's fetch time is `meta.cache_fetched`.
+   failure cannot hide an invite. The snapshot's fetch time is
+   `meta.cache_fetched`.
 5. Any failure (guard stop, tool error, timeout, no confirmed result) keeps the
    row and shows a toast with the reason; the reason carries only fixed kinds
    (never prompts or tool output).
@@ -324,7 +331,8 @@ acknowledging the invite as in 0.2.0.
 [Save protocol](#save-protocol)). On success the toast shows the command's
 message (or says it was already saved), the action goes to the audit log and
 the row stays, with a `◆` and a local `saved` mark. Failures toast the reason
-and add no mark; a likely duplicate asks "Save anyway" first (see the protocol). Without `save:`, `m` says "Save not configured".
+and add no mark; a likely duplicate asks "Save anyway" first (see the
+protocol). Without `save:`, `m` says "Save not configured".
 
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
@@ -565,7 +573,8 @@ header and the help overlay show the inbox version.
 - The two writes, RSVP and save, are off until configured, always confirm
   first (Cancel focused), wait out the undo window, are cancelled by quitting
   inside it, and run in a worker. RSVP can only make the one pinned tool call
-  with exactly the pinned arguments; save passes the item as JSON on stdin, never in argv or in a prompt.
+  with exactly the pinned arguments; save passes the item as JSON on stdin,
+  never in argv or in a prompt.
 - Every action lands in the audit log (`L`).
 - `open` launches only plain `http(s)` links.
 - Sources run with your privileges: only configure commands you trust.

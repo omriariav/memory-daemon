@@ -1148,6 +1148,50 @@ class QuitWhileWritingTest(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
 
+    async def test_a_worker_callback_after_quit_makes_no_call_back_and_no_error(self):
+        store, release, started = InboxStore(None), threading.Event(), threading.Event()
+
+        def slow(prompt, tools, **kw):
+            started.set()
+            release.wait(10)
+            return good_call()(prompt, tools, **kw)
+        app = make_app([invite_item()], rsvp_actions(store, slow), store)
+        callbacks = mock.Mock(side_effect=RuntimeError("app is not running"))
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("a")
+                await pilot.pause(0.1)
+                await pilot.press("y")
+                for _ in range(100):
+                    if started.is_set():
+                        break
+                    await pilot.pause(0.05)
+                app.call_from_thread = callbacks
+                await pilot.press("q", "q")
+                await pilot.pause(0.2)
+                self.assertTrue(app._quitting)
+                release.set()               # the write ends after the quit
+                await pilot.pause(0.6)
+            callbacks.assert_not_called()
+            self.assertEqual(store.rsvp_answer("invites:ev123abc"), "accepted")
+        finally:
+            release.set()
+
+    def test_run_in_thread_swallows_any_callback_error_and_skips_when_quitting(self):
+        store = InboxStore(None)
+        app = make_app([invite_item()], rsvp_actions(store, good_call()), store)
+        pending = mock.Mock()
+        pending.kind, pending.answer = "rsvp", "accepted"
+        pending.item = models.from_v1(invite_item())
+        for quitting, error in ((False, ValueError("boom")), (False, RuntimeError("x")),
+                                (True, None)):
+            app._quitting = quitting
+            app.call_from_thread = mock.Mock(side_effect=error)
+            with self.subTest(quitting=quitting, error=error):
+                app._run_in_thread(pending)          # must neither raise nor hang
+                self.assertEqual(app.call_from_thread.call_count, 0 if quitting else 1)
+
     async def test_q_with_nothing_running_quits_at_once(self):
         store = InboxStore(None)
         app = make_app([plain_item(1)], LocalActions(store), store)

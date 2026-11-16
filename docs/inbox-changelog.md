@@ -22,33 +22,34 @@ window cancels them.
   calendar RSVP tool, called with exactly three arguments, pinned to the event
   id, the calendar id and the answer (any extra argument is denied: the bridge
   gains an opt-in `exact_args` mode, and every existing caller keeps the
-  default). The bridge's guards apply (`state/PAUSED`, the daily budget). The prompt carries only the tool name and those three values. The
-  result is checked, never the model's words: a failure keeps the row and
-  toasts the reason, a success hides it (`rsvp` in `inbox-state.json`) and
-  logs it in the audit log. A recurring series answers its next instance only,
-  and the modal says so; the mark hides that event id only, so the next
-  instance shows again. If a calendar snapshot taken 10 minutes or more after
-  the answer still lists the event as unanswered, the row returns with a "RSVP
-  not confirmed by calendar" hint. New `rsvp:` setting (no default): `tool`, `args`
-  (the tool's parameter names for `event_id`, `calendar_id` and `response`),
-  `timeout_s` (30 to 300), optional `model`. Without it `X` and `T` say "RSVP not
+  default). The bridge's guards apply (`state/PAUSED`, the daily budget). The
+  prompt carries only the tool name and those three values. The result is
+  checked, never the model's words: a failure keeps the row and toasts the
+  reason, a success hides it (`rsvp` in `inbox-state.json`) and logs it in the
+  audit log. A recurring series answers its next instance only, and the modal
+  says so; the mark hides that event id only, so the next instance shows again.
+  If a calendar snapshot taken 10 minutes or more after the answer still lists
+  the event as unanswered, the row returns with a "RSVP not confirmed by
+  calendar" hint. New `rsvp:` setting (no default): `tool`, `args` (the tool's
+  parameter names for `event_id`, `calendar_id` and `response`), `timeout_s`
+  (30 to 300), optional `model`. Without it `X` and `T` say "RSVP not
   configured" and `a` keeps acknowledging an invite as before.
 - Save to memory (`m`, any item): a modal shows the source, sender, gist and
-  link; after the undo window the configured `save` command runs with
-  `{"v": 1, "action": "save", "item": <item>}` on stdin and answers
-  `{"ok", "message", "memory_id", "duplicate"}`. The item stays listed and
-  gets a `◆` (local `saved` mark). New `save:` setting (no default): `argv`,
-  `timeout_s` (5 to 120). Without it `m` says "Save not configured". Same
-  process-group, timeout and output-cap handling as command sources, except a
-  timeout sends `SIGTERM` and kills 5 s later, and says "the save may still
-  complete"; item text reaches the command only as JSON on stdin. A command may answer `ok: false` with
-  `duplicate: true` (and a `candidate`; `memory_id` is null, the existing
-  memory is `candidate.id`): the inbox then asks "Save anyway"
-  (Cancel focused) and, once confirmed, resends the same payload with
-  `"force": true`. `ok: true` with `duplicate: true` is a success, shown as
-  "Already in memory". The duplicate question is a toast ("press m to review"),
-  not a modal that could stack on another one. A second `m` while a save is
-  pending says "save already in progress". The protocol is in docs/inbox.md.
+  link; after the undo window the configured `save` command runs with `{"v": 1,
+  "action": "save", "item": <item>}` on stdin and answers `{"ok", "message",
+  "memory_id", "duplicate"}`. The item stays listed and gets a `◆` (local
+  `saved` mark). New `save:` setting (no default): `argv`, `timeout_s` (5 to
+  120). Without it `m` says "Save not configured". Same process-group, timeout
+  and output-cap handling as command sources, except a timeout sends `SIGTERM`
+  and kills 5 s later, and says "the save may still complete"; item text
+  reaches the command only as JSON on stdin. A command may answer `ok: false`
+  with `duplicate: true` (and a `candidate`; `memory_id` is null, the existing
+  memory is `candidate.id`): the inbox then asks "Save anyway" (Cancel focused)
+  and, once confirmed, resends the same payload with `"force": true`. `ok:
+  true` with `duplicate: true` is a success, shown as "Already in memory". The
+  duplicate question is a toast ("press m to review"), not a modal that could
+  stack on another one. A second `m` while a save is pending says "save already
+  in progress". The protocol is in docs/inbox.md.
 - Optional `meta.thread_note` (string): the thread pane shows it as one dim
   line above the thread (cleaned to one line, cut at 200 characters); with an
   empty thread it is all the pane shows. Documented in the item format.

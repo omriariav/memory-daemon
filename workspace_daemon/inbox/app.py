@@ -200,6 +200,7 @@ class InboxApp(App):
         self.pending = []
         self.running = []                  # committed actions still executing
         self._quit_armed = False           # first q with writes running was pressed
+        self._quitting = False             # the app is exiting: workers must not call back
         self.dups = {}                     # item key -> (item, result) awaiting "save anyway"
         self.audit = []
         self.stats = {"done": 0, "sent": 0, "snoozed": 0}
@@ -751,10 +752,12 @@ class InboxApp(App):
             res = self._run(p)
         except Exception as exc:  # a failing store must not kill the app
             res = Result(False, f"{type(exc).__name__}: {exc}")
+        if self._quitting:
+            return  # the app is gone; the mark (if any) is already written
         try:
             self.call_from_thread(self._committed, p, res)
-        except RuntimeError:
-            pass  # the app already quit; the mark (if any) is written
+        except Exception:  # the app quit between the check and the call
+            pass
 
     def _committed(self, p, res):
         self.busy = max(0, self.busy - 1)
@@ -1128,6 +1131,7 @@ class InboxApp(App):
                 except Exception as exc:
                     res = Result(False, str(exc))
                 p.audit["status"] = "committed" if res.ok else "failed"
+        self._quitting = True
         parts = []
         if cancelled:
             parts.append(f"Nothing sent: {cancelled} pending action(s) cancelled on quit.")
