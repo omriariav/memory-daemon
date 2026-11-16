@@ -322,7 +322,7 @@ class TermGraceTest(unittest.TestCase):
         path = Path(tmp) / "leader.py"
         path.write_text(textwrap.dedent(f"""
             import signal, subprocess, sys, time
-            child = subprocess.Popen([sys.executable, "-c", {GRANDCHILD!r}, {str(marker)!r}])
+            child = subprocess.Popen([sys.executable, "-c", {CHILD_SCRIPT!r}, {str(marker)!r}])
             time.sleep(0.5)          # let the grandchild install its handler
             print("started", flush=True)
             time.sleep(60)
@@ -366,7 +366,7 @@ class TermGraceTest(unittest.TestCase):
         self.assertLess(took, 6)
 
 
-GRANDCHILD = textwrap.dedent("""
+CHILD_SCRIPT = textwrap.dedent("""
     import signal, sys, time
     def done(*_):
         open(sys.argv[1], "w").write("term")

@@ -29,7 +29,7 @@ from .widgets import (ITEM_PREFIX, DraftPane, HintBar, Queue, StatusHeader,
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
 RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
 SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
-UNCONFIRMED = "RSVP not confirmed by calendar"
+NOT_CONFIRMED = "RSVP not confirmed by calendar"
 # What each RSVP key answers: key -> (menu word, answer sent, modal title).
 RSVP_KEYS = {
     "accept": ("accept", "accepted", "Accept invite"),
@@ -300,7 +300,7 @@ class InboxApp(App):
         now = time.time()
         for i in self.all_rows:
             i.saved = self.store.is_saved(i.key)
-            i.hint = (UNCONFIRMED if self.store.rsvp_unconfirmed(i.key, i.meta)
+            i.hint = (NOT_CONFIRMED if self.store.rsvp_unconfirmed(i.key, i.meta)
                       else "")
         shown = [i for i in self.all_rows
                  if i.key not in busy_keys and not self.store.is_hidden(i.key, now, i.meta)
