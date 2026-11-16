@@ -410,16 +410,25 @@ and `j`/`k`, `g`/`G` scroll it.
 - Results are cached in memory per item (its id and its `ts`) for 10 minutes;
   a changed item, with a new `ts`, is fetched again. Failures are cached for 30
   seconds. Nothing is written to disk. The pane shows the age of what it
-  displays ("fetched just now", "cached, fetched 3m ago"). After the TTL the
-  pane says "Context not loaded. C to load it." rather than refetching by
-  itself.
+  displays ("fetched just now", "cached, fetched 3m ago"). When the entry of
+  the item on screen expires, its old rows stay drawn, marked "context stale,
+  fetched 12m ago · refreshing…", and one new fetch starts by itself (checked
+  every second); the rows are replaced when it answers. A failed refetch is a
+  cached error for 30 seconds, so a broken command is retried at most that
+  often while the item stays selected. Only the item on screen is refreshed:
+  there is no prefetching of items you have not selected.
+- At most 2 context commands run at once. A fetch that is still waiting for a
+  slot when you move on to another item never starts.
 - States: `Loading context…` with a spinner, an error (the command's `message`
   for `ok: false`, or a fixed reason such as a timeout) with "C retries", the
   sections, or "No context for this item".
 - `C` (or `r` while the pane has focus, where `r` otherwise polls the
   sources) fetches the selected item again, replacing the cached result.
-- The command runs in a daemon thread: quitting never waits for it (a command
-  that is still running ends at its own timeout).
+- Quitting sends `SIGTERM` to the process group of any context command that is
+  still running, then `SIGKILL` 5 s later (the same path as a timeout), and the
+  process exits when they are gone, within about 5 s. It asks for no
+  confirmation. The pane is only redrawn when what it shows changes (state,
+  data, or the age label each minute), so a mouse selection in it survives.
 
 ### AI summary (`i`)
 
@@ -450,15 +459,21 @@ asks again even when one is cached. It needs `summary:` in `inbox.yaml`
   that call (text in the item cannot close the block), then a reminder. Item
   text is never part of any argv. The answer is cleaned and cut to 6 lines of
   300 characters.
-- Cache: `state/inbox-summary-cache.json` (mode 0600 in a 0700 directory,
-  written atomically, the 200 most recently used entries), keyed by the sha256
-  of the item id, its `ts` and a hash of its thread. `i` on an item that has a
-  cached summary shows it without a call, and the pane shows a cached summary
-  as soon as you select the item. `I` makes a new call and replaces the entry.
-  A failure is shown in the pane (and toasted) and not cached.
+- Cache: `state/inbox-summary/cache.json` (file mode 0600 in
+  `inbox-summary/`, a directory of its own that the inbox creates and sets to
+  0700; written atomically, the 200 most recently used entries), keyed by the
+  sha256 of the item id, its `ts`, a hash of its thread and the model. `i` on
+  an item that has a cached summary shows it without a call, even while
+  another summary runs, and the pane shows a cached summary as soon as you
+  select the item. `I` makes a new call and replaces the entry. A failure is
+  shown in the pane (and toasted) and not cached.
 - One summary runs at a time ("A summary is already running"). Each call is
   recorded in the audit log (`summary`: new, forced or failed; cache hits are
   not).
+- Quitting while a summary runs asks first: "summary still running; q again to
+  quit (it finishes first)". The summary runs in a thread the process waits
+  for, so the exit takes at most `summary.timeout_s` more and the bridge still
+  logs the spend (and its `claude` child is not left running).
 - The summary leaves your machine: the item text goes to the model, like any
   other bridge run. Only configure `summary:` if that is acceptable for the
   items your sources list.
@@ -554,8 +569,9 @@ daemon's next tick that drops the key, so it can lag by a tick.
   panes (and threads) never corrupt the file or lose each other's marks.
 - Done, ack and snooze are queued for 5 seconds so `u` can undo them; quitting
   commits them. A queued send or nudge is never committed on quit.
-- `<base>/state/inbox-summary-cache.json` holds the AI summaries (see
-  [AI summary](#ai-summary-i)): mode 0600, the 200 most recently used entries.
+- `<base>/state/inbox-summary/cache.json` holds the AI summaries (see
+  [AI summary](#ai-summary-i)): mode 0600 in a 0700 directory of its own, the
+  200 most recently used entries.
   Context results are kept in memory only.
 - `--demo` keeps marks in memory only and does not read `inbox.yaml`.
 
