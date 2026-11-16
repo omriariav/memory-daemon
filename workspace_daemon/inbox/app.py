@@ -181,7 +181,9 @@ class InboxApp(App):
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
     #confirm.multi { width: 96; }
     #confirm.multi #confirm-buttons Button { margin-left: 1; min-width: 10; padding: 0 1; }
-    #confirm.multi.narrow { width: 100%; padding: 1 1; }
+    #confirm.multi.narrow { width: 100%; padding: 0 1; }
+    #confirm.multi.narrow #confirm-scroll { margin: 0; }
+    #confirm.multi.narrow #confirm-title { margin-bottom: 0; }
     #confirm.multi.narrow #confirm-buttons { layout: grid; grid-size: 2; grid-gutter: 0 1; grid-rows: 3; height: auto; align-horizontal: left; }
     #confirm.multi.narrow #confirm-buttons Button { width: 1fr; min-width: 0; margin-left: 0; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
@@ -1156,7 +1158,8 @@ class InboxApp(App):
             "Nudge in Slack" if kind == "nudge" else "Reply in Slack")
         self.push_screen(ConfirmSend(verb, dest, text, self.bidi, note, warn,
                                      route, options=options, open_url=open_url,
-                                     title=title), after)
+                                     title=title,
+                                     on_open=lambda: self._open_item(it)), after)
 
     def _copy_for_slack(self, kind, it, text, dest):
         """Copy the draft as Slack mrkdwn (OSC 52). Purely local: no tool
@@ -1639,7 +1642,11 @@ class InboxApp(App):
         self.push_screen(SnoozePicker(it.who), after)
 
     def action_open(self):
-        it = self.current
+        self._open_item(self.current)
+
+    def _open_item(self, it):
+        """Open `it`'s URL (the Slack template URL or its link) and audit it
+        for that item, whatever is selected now."""
         if it is None:
             return
         res = self.actions.open_link(it)

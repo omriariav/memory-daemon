@@ -41,7 +41,8 @@ confirm screen also gains a "Copy for Slack" button next to Send.
   only touches unambiguous standard markdown, because the drafts usually are
   Slack text already (a single `*x*` is bold there): `**x**` and `__x__` to
   `*x*`, `~~x~~` to `~x~`, `[text](url)` to `<url|text>` (label escaped) and
-  `# heading` to `*heading*`. Single `*x*` and `_x_`, lists, quotes, inline,
+  `# heading` to `*heading*` (a `**...**` whose body holds a single `*` is
+  left as it is). Single `*x*` and `_x_`, lists, quotes, inline,
   fenced (backtick and tilde) and indented code are left alone. The result goes
   on the clipboard (OSC 52). The item stays. Toast "Copied for Slack: open it
   with o and paste".
@@ -54,7 +55,11 @@ confirm screen also gains a "Copy for Slack" button next to Send.
   `^T[A-Z0-9]{6,12}$`; `{team}` needs `team:`; the template is printable ASCII
   without spaces. Without the setting, or when the
   template cannot be filled, `o` opens the item's link as before. The confirm
-  screen shows the URL `o` will open, and `o` in the screen opens it. At
+  screen shows the URL `o` will open, and `o` in the screen opens it (the item
+  the screen was built for, and audited for it, even if a poll moved the
+  selection meanwhile). The text pane is sized to the screen height so the
+  title, the destination lines and the buttons stay visible with a long draft;
+  a copy-only screen has its own footer line. At
   terminal widths under 100 the buttons wrap into two columns instead of
   clipping.
 - The confirm screen: Cancel stays the default; the buttons and keys are

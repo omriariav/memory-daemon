@@ -17,7 +17,7 @@ The link label is escaped (`&` `<` `>` become `&amp;` `&lt;` `&gt;`). Single
 inline code, fenced code (``` and ~~~) and indented code blocks are kept
 untouched, and nothing inside code is converted. URLs are never altered (an
 underscore in a link stays), and a bare URL does not swallow a closing `**` or
-`~~`. Hebrew and any other text pass through unchanged; markers are found by
+`~~`. A `**...**` whose body holds a single `*` is left as it is. Hebrew and any other text pass through unchanged; markers are found by
 their neighbours, not by letters.
 """
 import re
@@ -81,6 +81,15 @@ def _bare_url(m, stash):
     return stash.put(url)
 
 
+def _bold(m):
+    """`*body*`, unless the body holds a single `*` (Slack bold or an
+    ambiguous mix): then the outer markers are left as they are."""
+    body = m.group(1)
+    if "*" in body:
+        return m.group(0)
+    return f"{_BOLD}{body}{_BOLD}"
+
+
 def _inline(text, stash):
     """Convert one line's inline markup. Code spans, links, URLs and angle
     tokens are stashed first so no emphasis rule can reach into them."""
@@ -88,8 +97,8 @@ def _inline(text, stash):
     text = _LINK.sub(lambda m: _link(m, stash), text)
     text = _ANGLE.sub(lambda m: stash.put(m.group(0)), text)
     text = _BARE_URL.sub(lambda m: _bare_url(m, stash), text)
-    text = _BOLD_RE.sub(lambda m: f"{_BOLD}{m.group(1)}{_BOLD}", text)
-    text = _UNDER_RE.sub(lambda m: f"{_BOLD}{m.group(1)}{_BOLD}", text)
+    text = _BOLD_RE.sub(_bold, text)
+    text = _UNDER_RE.sub(_bold, text)
     text = _STRIKE_RE.sub(lambda m: f"~{m.group(1)}~", text)
     return text.replace(_BOLD, "*")
 

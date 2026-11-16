@@ -99,6 +99,11 @@ class MrkdwnTest(unittest.TestCase):
         self.assertEqual(self.conv("# Heading"), "*Heading*")
         self.assertEqual(self.conv("###### Deep"), "*Deep*")
 
+    def test_bold_whose_body_holds_a_single_star_is_left_alone(self):
+        for text in ("**a *b* c**", "**x * y**", "__a *b* c__", "**a *b***"):
+            self.assertEqual(self.conv(text), text, text)
+        self.assertEqual(self.conv("**a** and **b**"), "*a* and *b*")
+
     def test_single_star_and_underscore_are_left_alone(self):
         for text in ("*already bold in Slack*", "_italic in Slack_",
                      "*a* and _b_ and *c d*", "x *y* z", "***both***"):
@@ -1396,6 +1401,99 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(modal.query_one("#confirm").has_class("narrow"))
             self.assertEqual(len({b.region.y for b in
                                   modal.query("#confirm-buttons Button")}), 1)
+
+    async def test_o_opens_the_screens_own_item_after_the_selection_changes(self):
+        opened, store = [], InboxStore(None)
+        acts = acts_for(store, boom, send=cfg(mode="both"), opened=opened,
+                        team=TEAM, slack_open={"url_template": SLACK_URL})
+        other = "C0EXAMPLE02"
+        rows = [reply_item(1), reply_item(2, reply_to={
+            "channel": other, "thread_ts": THREAD, "message_ts": MESSAGE})]
+        app = make_app(rows, acts, store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            first = app.current_key
+            modal = await open_confirm(pilot, app)
+            mine = f"slack://channel?team={TEAM}&id={CHANNEL}"
+            # the selection moves under the screen
+            app.current_key = "t:2" if first == "t:1" else "t:1"
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            self.assertIs(app.screen, modal)
+            self.assertEqual(opened, [mine])
+            row = [r for r in app.audit if r["action"] == "open"]
+            self.assertEqual(len(row), 1)
+            self.assertEqual(row[0]["item"], f"Person {first[-1]}")
+
+    async def test_o_opens_the_screens_own_item_after_a_poll_drops_it(self):
+        opened, store = [], InboxStore(None)
+        acts = acts_for(store, boom, send=cfg(mode="both"), opened=opened,
+                        team=TEAM, slack_open={"url_template": SLACK_URL})
+        rows = [reply_item(1), reply_item(2, reply_to={
+            "channel": "C0EXAMPLE02", "thread_ts": THREAD,
+            "message_ts": MESSAGE})]
+        app = make_app(rows, acts, store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            target = app.current_key
+            url = (f"slack://channel?team={TEAM}&id="
+                   f"{CHANNEL if target == 't:1' else 'C0EXAMPLE02'}")
+            modal = await open_confirm(pilot, app)
+            app.all_rows = [r for r in app.all_rows if r.key != target]
+            app.refilter()
+            await pilot.pause(0.1)
+            self.assertNotIn(target, [i.key for i in app.items])
+            # the queue moved on to the other item (the old `o` opened that)
+            self.assertNotEqual(app.current_key, target)
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            self.assertIs(app.screen, modal)
+            self.assertEqual(opened, [url])
+            [row] = [r for r in app.audit if r["action"] == "open"]
+            self.assertEqual(row["item"], f"Person {target[-1]}")
+            self.assertEqual(row["status"], "ok")
+
+    async def test_a_copy_only_screen_has_a_copy_only_footer(self):
+        store = InboxStore(None)
+        app = make_app([reply_item(1)], acts_for(store, boom, copy=True), store,
+                       undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app)
+            footer = str(modal.query_one("#confirm-fixed").render())
+            self.assertEqual(footer, "Nothing is sent or drafted. Copy is local.")
+        store = InboxStore(None)
+        app = make_app([reply_item(1)], acts_for(
+            store, boom, send=cfg(mode="both")), store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app)
+            self.assertIn("Nothing happens until you choose",
+                          str(modal.query_one("#confirm-fixed").render()))
+
+    async def test_a_long_draft_keeps_the_title_and_buttons_on_screen(self):
+        text = "\n".join(f"line {n} of a long draft" for n in range(80))
+        for size in ((80, 24), (80, 30), (150, 24), (150, 42)):
+            for send in (cfg(mode="both"), cfg(mode="send")):
+                store = InboxStore(None)
+                app = make_app([reply_item(1, draft=text)], acts_for(
+                    store, boom, send=send, team=TEAM,
+                    slack_open={"url_template": WEB_URL}), store, undo_s=30)
+                async with app.run_test(size=size) as pilot:
+                    await settle(pilot, app)
+                    modal = await open_confirm(pilot, app)
+                    await pilot.pause(0.4)
+                    w, h = size
+                    for wid in ("#confirm-title", "#confirm-dest"):
+                        r = modal.query_one(wid).region
+                        self.assertGreaterEqual(r.y, 0, (size, wid))
+                        self.assertLess(r.bottom, h, (size, wid))
+                    for b in modal.query("#confirm-buttons Button"):
+                        self.assertLessEqual(b.region.bottom, h, (size, b.id))
+                        self.assertGreaterEqual(b.region.y, 0, (size, b.id))
+                    pane = modal.query_one("#confirm-scroll")
+                    self.assertGreater(pane.max_scroll_y, 0)
+                    self.assertGreaterEqual(pane.region.height, 3)
 
     async def test_every_mode_fits_at_80_columns(self):
         for send in (cfg(mode="send"), cfg(mode="draft"), cfg(mode="both")):

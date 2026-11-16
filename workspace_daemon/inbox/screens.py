@@ -56,7 +56,7 @@ class ConfirmSend(ModalScreen):
 
     def __init__(self, verb, destination, text, visual=False, note="",
                  warn="", route="", options=("send",), open_url="",
-                 title=None):
+                 title=None, on_open=None):
         """`route` is the real destination (channel id and thread timestamp),
         shown under the `destination` label."""
         super().__init__()
@@ -65,6 +65,7 @@ class ConfirmSend(ModalScreen):
         self.options = tuple(o for o in ("draft", "send", "copy")
                              if o in options)
         self.open_url = open_url
+        self.on_open = on_open   # opens the item this screen was built for
         self.title_text = title or verb
 
     def label(self, name):
@@ -98,12 +99,15 @@ class ConfirmSend(ModalScreen):
                 yield Static(body, id="confirm-text")
             if self.note:
                 yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
-            yield Static(Text(
-                "Nothing is sent until you confirm. Undo stays open for the grace period."
-                if only_send else
-                "Nothing happens until you choose. Draft and Send wait out the "
-                "undo window; Copy is local.", Style(dim=True)),
-                id="confirm-fixed")
+            if only_send:
+                footer = ("Nothing is sent until you confirm. Undo stays open "
+                          "for the grace period.")
+            elif self.options == ("copy",):
+                footer = "Nothing is sent or drafted. Copy is local."
+            else:
+                footer = ("Nothing happens until you choose. Draft and Send "
+                          "wait out the undo window; Copy is local.")
+            yield Static(Text(footer, Style(dim=True)), id="confirm-fixed")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Cancel  esc", id="cancel", variant="default")
                 for name in self.options:
@@ -130,11 +134,35 @@ class ConfirmSend(ModalScreen):
         except Exception:
             return
         box.set_class(self.app.size.width < self.NARROW, "narrow")
+        self.call_after_refresh(self._cap_scroll)
+
+    def _cap_scroll(self):
+        """Size the text pane to the screen: the title and the destination
+        lines above it, and the buttons below, must stay visible however long
+        the draft is (the pane scrolls)."""
+        try:
+            pane = self.query_one("#confirm-scroll")
+        except Exception:
+            return
+        pane.styles.max_height = 16
+        self.refresh(layout=True)
+        self.call_after_refresh(self._cap_scroll_now)
+
+    def _cap_scroll_now(self):
+        try:
+            box = self.query_one("#confirm")
+            pane = self.query_one("#confirm-scroll")
+        except Exception:
+            return
+        chrome = box.region.height - pane.region.height
+        room = self.app.size.height - chrome
+        pane.styles.max_height = max(3, min(16, room))
 
     def action_open_url(self):
-        """`o` opens the same URL the queue's `o` would (the modal stays)."""
-        if self.open_url:
-            self.app.action_open()
+        """`o` opens the URL shown (the modal stays). It opens the item this
+        screen was built for, never whatever is selected by now."""
+        if self.open_url and self.on_open is not None:
+            self.on_open()
 
     def action_cancel(self):
         self.dismiss(False)
