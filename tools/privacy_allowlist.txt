@@ -39,3 +39,5 @@ tests/test_gmail_mcp.py :: re:token="05464679278938702803".*
 tests/test_identity.py :: re:(?:a@b\.co|alice\.smith@example\.com\.org)
 README.md :: re:alice@(?:acme|corp)\.com
 daemon.py :: x@y.com
+# Google system calendar domains (rooms, group calendars) in synthetic fixtures
+tests/test_calendar_events.py :: re:[a-z0-9_-]+@(resource|group)\.calendar\.google\.com
