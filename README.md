@@ -793,7 +793,15 @@ Calendar events: the same single list call asks for `events_window_days`
 twin still hold only the next `window_hours`. Each successful run diffs that
 listing against `state/calendar-snapshot.json` (written atomically, mode 0600;
 `{event_id: {start, end, location, conference, status, my_rsvp, title,
-list_title, rsvps}}` (`list_title` is the title as listed, cut to 100
+list_title, organizer, attendee_count, attendees, rsvps}}` (`organizer` is
+`{name, email, self}` or `null`; `attendees` is `[{name, email, response, self,
+optional}]` for people only (rooms and group or resource calendars are left out),
+at most 50; `attendee_count` is every such person, uncapped, plus the owner when
+the listing does not name them (an event with no guests counts 1); `response` is
+`accepted`, `tentative`, `declined` or `needsAction`; `self` is true for the
+owner; `optional` is true when the connector marks the guest optional. Names are
+read from the address, and emails stay in this local file, never in the log;
+`list_title` is the title as listed, cut to 100
 characters for every event, so a detail lookup never changes it and a change
 past 100 characters is not reported; `rsvps`, `{email: [name, rsvp]}` without the owner, an attendee the
 connector marks as `self`, and the organizer, is kept only for events I
