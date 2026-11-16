@@ -123,7 +123,7 @@ sources:
 # default. The command is called with JSON on stdin (never argv): choices
 # (read-only, pick one), prepare (read-only, shows what will happen; may say
 # duplicate), then, after the confirm and the 5 s undo window, run (once, never
-# retried). The key must be one the inbox does not use: h l p t v w x z or one
+# retried). The key must be one the inbox does not use: h l p t w x z or one
 # of B D E F H J K M N O P Q U V W Z. A successful run marks the item done
 # (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
 # actions:

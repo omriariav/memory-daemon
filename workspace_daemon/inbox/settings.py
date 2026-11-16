@@ -13,9 +13,11 @@ from . import invites, sources, themes
 
 FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
+THREAD_ORDERS = ("newest", "oldest")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
-TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
+TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread_order",
+            "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
@@ -26,7 +28,7 @@ CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASqu")
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquv")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))
@@ -57,6 +59,7 @@ DEFAULTS = {
     "watch_interval_s": 3.0,
     "theme": themes.DEFAULT,
     "bidi_mode": "auto",
+    "thread_order": "newest",
     "gmail_account": 0,
     "alert_urgent_max_age_h": sources.DEFAULT_ALERT_MAX_AGE_H,
     "rsvp": None,   # no default: RSVP stays off until configured
@@ -129,6 +132,13 @@ def validate(raw):
         problems.append(f"bidi_mode must be one of {', '.join(BIDI_MODES)}")
     else:
         out["bidi_mode"] = bidi
+
+    order = raw.get("thread_order", DEFAULTS["thread_order"])
+    if order not in THREAD_ORDERS:
+        problems.append(
+            f"thread_order must be one of {', '.join(THREAD_ORDERS)}")
+    else:
+        out["thread_order"] = order
 
     account = raw.get("gmail_account", DEFAULTS["gmail_account"])
     if not isinstance(account, int) or isinstance(account, bool) or account < 0:

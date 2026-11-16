@@ -295,7 +295,8 @@ HELP = [
               ("ctrl+p", "palette: copy section as Markdown"),
               ("mouse drag", "select text in the thread or draft pane")]),
     ("App", [("ctrl+p", "command palette"), ("ctrl+t", "dark / light theme"), ("L", "audit log"),
-             ("b", "toggle Hebrew order (logical/visual)"), ("?", "this help"), ("q", "quit")]),
+             ("b", "toggle Hebrew order (logical/visual)"),
+             ("v", "thread order: newest / oldest message first (saved)"), ("?", "this help"), ("q", "quit")]),
 ]
 
 

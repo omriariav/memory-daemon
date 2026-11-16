@@ -453,7 +453,7 @@ people are untrusted (see above).
 
 The key of an `actions:` entry (`p` in the example) runs the flow below on the
 selected item. The key must be a letter the inbox does not use itself; the
-free ones are `h l p t v w x z` and `B D E F H J K M N O P Q U V W Z`, and
+free ones are `h l p t w x z` and `B D E F H J K M N O P Q U V W Z`, and
 validation refuses any other (and a key or label used twice).
 
 1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
@@ -634,6 +634,8 @@ daemon's next tick that drops the key, so it can lag by a tick.
 
 `<base>/state/inbox-state.json`:
 `{"v": 1, "items": {"<id>": {"done": ts, "ack": ts, "snooze_until": ts, "updated": ts}}}`.
+A `prefs` object may sit beside `items` (`{"thread_order": "newest"}`): display
+choices made with a key, never item data, and not pruned.
 
 - Done and ack hide an item; a snooze hides it until its time, then it
   reappears (checked every 30 s and on each poll).
@@ -667,6 +669,7 @@ defaults; a broken one prints every problem and exits 2.
 | `watch_interval_s` | `3` | 1 to 30: how often the watched files are stat-checked |
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
+| `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
@@ -731,6 +734,22 @@ Urgent rule keys (all keys of one rule must match; any rule makes an event
 urgent): `source` (the event's source, e.g. `gcal`), `kind`, `key_prefix`
 (alerts), `title_regex`, `starts_within_h` (calendar start time).
 
+### Thread order
+
+The thread pane lists the **newest** message first by default, so a long
+thread opens on the latest reply, with the pane scrolled to the top. `v`
+flips it to oldest first and back. In newest-first order a dim "thread start"
+marker closes the list under the first (parent) message of a thread of two or
+more messages. The item header, the `meta.thread_note` line and the "RSVP not
+confirmed" hint stay on top in both orders. The queue is not affected: this
+only changes how the thread pane draws the item's `thread` (which an item
+always carries oldest first).
+
+`thread_order` in `inbox.yaml` is the starting order. The key saves the choice
+in `state/inbox-state.json` (a `prefs` entry beside the marks, 0600), and once
+you have pressed `v` the saved choice wins over `inbox.yaml` after a restart.
+(`b`, the Hebrew toggle, is per session and is not saved.)
+
 ### Hebrew and RTL
 
 `bidi_mode`: `logical` passes text through (the terminal runs bidi),
@@ -754,7 +773,8 @@ context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view
 (read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
-`L` audit log, `b` Hebrew order, `ctrl+t` theme, `ctrl+p` palette, `?` help,
+`L` audit log, `b` Hebrew order, `v` thread order (newest or oldest first;
+saved), `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
 
 ### Show all (`A`)

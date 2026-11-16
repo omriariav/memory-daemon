@@ -23,6 +23,9 @@ LOCK_NAME = "inbox-state.lock"
 SCHEMA_VERSION = 1
 # RSVP answers a mark may hold (the word the bridge sent).
 RSVP_ANSWERS = ("accepted", "declined", "tentative")
+# Display preferences kept beside the marks (`prefs` in the file): name ->
+# the values it may hold. A value outside this table reads as unset.
+PREF_VALUES = {"thread_order": ("newest", "oldest")}
 # An RSVP mark hides the invite until the calendar cache shows the answer. A
 # snapshot fetched this long after the answer that still lists the same event
 # as unanswered means the answer did not take: the row comes back.
@@ -44,6 +47,8 @@ class InboxStore:
                      if base_dir is not None else None)
         self.clock = clock
         self.marks = {}
+        self.prefs = {}
+        self._disk_prefs = {}
         self._corrupt = False
         self._lock = threading.RLock()
         self.load()
@@ -51,7 +56,9 @@ class InboxStore:
     # -- io --
     def _read(self):
         if self.path is None:
+            self._disk_prefs = self.prefs
             return self.marks, False
+        self._disk_prefs = {}
         try:
             doc = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -61,6 +68,10 @@ class InboxStore:
         raw = doc.get("items") if isinstance(doc, dict) else None
         if not isinstance(raw, dict):
             return {}, True
+        prefs = doc.get("prefs")
+        if isinstance(prefs, dict):
+            self._disk_prefs = {k: v for k, v in prefs.items()
+                                if v in PREF_VALUES.get(k, ())}
         marks = {}
         for key, mark in raw.items():
             if not isinstance(key, str) or not isinstance(mark, dict):
@@ -84,6 +95,7 @@ class InboxStore:
         """Re-read the file (another pane may have written)."""
         with self._lock:
             self.marks, self._corrupt = self._read()
+            self.prefs = self._disk_prefs
             return self.marks
 
     def _write(self):
@@ -96,8 +108,10 @@ class InboxStore:
             except OSError:
                 pass
             self._corrupt = False
-        text = json.dumps({"v": SCHEMA_VERSION, "items": self.marks},
-                          indent=1, sort_keys=True)
+        doc = {"v": SCHEMA_VERSION, "items": self.marks}
+        if self.prefs:
+            doc["prefs"] = self.prefs
+        text = json.dumps(doc, indent=1, sort_keys=True)
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent),
                                    prefix=f".{FILE_NAME}.", suffix=".tmp")
         try:
@@ -136,10 +150,29 @@ class InboxStore:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self.marks, self._corrupt = self._read()
+                self.prefs = self._disk_prefs
                 if change(self.marks):
                     self._write()
             finally:
                 os.close(lock_fd)  # closing drops the flock
+
+    # -- display preferences --
+    def get_pref(self, name, default=None):
+        """A saved display preference, or `default` when unset."""
+        return self.prefs.get(name, default)
+
+    def set_pref(self, name, value):
+        """Save a display preference (see PREF_VALUES); written at once, so a
+        restart keeps it. Raises ValueError for an unknown name or value."""
+        if value not in PREF_VALUES.get(name, ()):
+            raise ValueError(f"bad preference {name!r}")
+
+        def change(_marks):
+            if self.prefs.get(name) == value:
+                return False
+            self.prefs = dict(self.prefs, **{name: value})
+            return True
+        self._transaction(change)
 
     # -- marks --
     def _mark(self, item_id, **fields):

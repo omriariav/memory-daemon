@@ -18,7 +18,7 @@ not to).
 - Generic `actions:` hook in `inbox.yaml` (no default; up to 8 entries): `key`,
   `label`, `argv`, `timeout_s` (5 to 300, default 60, per call) and `mark_done`
   (default `true`). The key must be a letter the inbox does not use; the free
-  ones are `h l p t v w x z` and `B D E F H J K M N O P Q U V W Z`, and
+  ones are `h l p t w x z` and `B D E F H J K M N O P Q U V W Z`, and
   validation refuses any other, and a key or label used twice. The command is
   called with JSON on stdin only (item text never in argv) and answers one JSON
   line: `choices` (read-only; at most 50 `{id, label, detail}`, cleaned like
@@ -47,6 +47,16 @@ not to).
   to call repeatedly, `choices` and `prepare` read-only, `run` idempotent where
   possible) and "Custom actions"; a commented `actions:` example in
   `inbox.example.yaml`.
+
+- Thread order: the thread pane now lists the **newest message first** (it was
+  oldest first), scrolled to the top, with a dim "thread start" marker under
+  the first message of a thread of two or more. `v` toggles to oldest first and
+  back (the queue is not touched); a new `thread_order: newest | oldest`
+  setting (default `newest`) is the starting order, and the toggle is saved in
+  `state/inbox-state.json` (`prefs`), so a restart keeps it (the saved choice
+  wins over the setting once made). The item header, `meta.thread_note` and the
+  RSVP hint stay on top. `v` is now a built-in key, so it is not available to
+  `actions:`. Footer, help overlay and command palette list it.
 
 ### Changed
 

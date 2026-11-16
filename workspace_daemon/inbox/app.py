@@ -102,6 +102,7 @@ class InboxApp(App):
         Binding("n", "nudge", show=False), Binding("o", "open", show=False),
         Binding("r", "refresh", show=False), Binding("u", "undo", show=False),
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
+        Binding("v", "toggle_thread_order", show=False),
         Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
         Binding("R", "toggle_resolved", show=False),
         Binding("X", "rsvp_decline", show=False), Binding("T", "rsvp_tentative", show=False),
@@ -220,6 +221,9 @@ class InboxApp(App):
         self.busy = 0
         self.polling = False
         mode = bidi.resolve(bidi.configured_mode(settings["bidi_mode"]))
+        saved_order = store.get_pref("thread_order") \
+            if hasattr(store, "get_pref") else None
+        self.thread_order = saved_order or settings.get("thread_order", "newest")
         self.bidi_fallback = mode == "visual" and not bidi.available()
         self.bidi_mode = "logical" if self.bidi_fallback else mode
         self.pending = []
@@ -466,7 +470,9 @@ class InboxApp(App):
         self.context_sync()
 
     def show_thread_only(self):
-        self.query_one("#thread", ThreadView).show(self.current, self.pal, time.time(), self.bidi)
+        self.query_one("#thread", ThreadView).show(
+            self.current, self.pal, time.time(), self.bidi,
+            self.thread_order == "newest")
 
     def show_item(self):
         self.show_thread_only()
@@ -492,6 +498,7 @@ class InboxApp(App):
         if self._sum_on():
             extra.append(("i", "summary"))
         if self.current is not None:
+            extra.append(("v", "order"))
             extra.extend((c["key"], c["label"][:16]) for c in self._custom)
         if extra and hints and hints[-1] == ("?", "help"):
             return hints[:-1] + extra + hints[-1:]
@@ -1659,6 +1666,20 @@ class InboxApp(App):
         self.notify(f"Hebrew order: {self.bidi_mode}", timeout=2, markup=False)
         self.items_redraw_all()
 
+    def action_toggle_thread_order(self):
+        """v: the thread pane lists the newest message first, or the oldest.
+        Saved in the inbox state, so a restart keeps it. The queue is not
+        affected."""
+        self.thread_order = "oldest" if self.thread_order == "newest" else "newest"
+        try:
+            self.store.set_pref("thread_order", self.thread_order)
+        except (OSError, ValueError) as exc:
+            self.notify(f"Order not saved: {getattr(exc, 'strerror', None) or exc}",
+                        severity="warning", timeout=4, markup=False)
+        self.show_thread_only()
+        self.notify(f"Thread order: {self.thread_order} first", timeout=2,
+                    markup=False)
+
     def items_redraw_all(self):
         """Re-render every widget that shows text (queue, thread, draft, header)."""
         self.redraw()
@@ -1928,6 +1949,7 @@ class InboxApp(App):
             ("Toggle dark/light theme", "ctrl+t", self.action_toggle_theme),
             ("Show audit log", "Every action with its time", self.action_audit),
             ("Toggle Hebrew order", "logical / visual (python-bidi)", self.action_toggle_bidi),
+            ("Toggle thread order", "v: newest or oldest message first in the thread pane", self.action_toggle_thread_order),
             ("Filter queue", "Fuzzy filter", self.action_filter),
             ("Keyboard help", "?", self.action_help),
         ] + [(f"Jump to {t}", f"key {n}", (lambda n=n: self.action_section(n)))

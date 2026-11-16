@@ -203,7 +203,11 @@ class ThreadView(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
 
-    def show(self, item, pal, now, visual):
+    def show(self, item, pal, now, visual, newest_first=False):
+        """Draw the item and its thread. The thread is stored oldest first;
+        with `newest_first` the latest message is drawn first (the note and
+        the item header stay on top) and a dim marker closes the list at the
+        thread's first message."""
         body = self.query_one("#thread-body", Static)
         width = max(30, (self.size.width or 60) - 4)
         if item is None:
@@ -224,12 +228,16 @@ class ThreadView(VerticalScroll):
                 out.append("\n")
         elif not item.messages:
             out.append(vis(item.gist, visual) + "\n", Style(color=pal["fg"]))
-        for m in item.messages:
+        messages = list(reversed(item.messages)) if newest_first \
+            else item.messages
+        for m in messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")
             out.append(f"{vis(m.who, visual)}", Style(bold=True, color=pal["mine"] if m.mine else pal["fg"]))
             out.append(f"  {when}  {rel(now, m.ts)}\n", Style(color=pal["muted"]))
             out.append_text(body_text(item, m.text, pal, width, visual))
             out.append("\n\n")
+        if newest_first and len(messages) > 1:
+            out.append("─ thread start ─\n", Style(color=pal["muted"], dim=True))
         body.update(out)
         self.scroll_home(animate=False)
 
