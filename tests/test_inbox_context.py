@@ -539,6 +539,12 @@ class BridgeNoToolsTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
         self.seen = {}
+        # The bridge looks the binary up before it spawns anything; a host
+        # without `claude` (CI) must not change what these tests see.
+        patcher = mock.patch.object(claude_bridge, "claude_bin",
+                                    return_value="/nonexistent/claude")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def spawn(self, out):
         def fake(cmd, prompt, cwd, timeout, connect_delay):
