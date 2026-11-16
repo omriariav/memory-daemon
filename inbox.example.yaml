@@ -49,9 +49,12 @@ alert_urgent_max_age_h: 6
 # command gets {"v": 1, "action": "save", "item": {...}} on stdin (never in
 # argv) and prints {"ok": true, "message": "...", "memory_id": "...",
 # "duplicate": false}. See "Save protocol" in docs/inbox.md.
+# A successful save (also "already in memory") marks the item done, like d,
+# with the 5 s undo; mark_done: false keeps the row instead.
 # save:
 #   argv: ["python3", "~/bin/my-inbox-save.py"]
 #   timeout_s: 30            # 5 to 120; on a timeout: SIGTERM, then SIGKILL after 5 s
+#   mark_done: true
 
 # Context pane (c key). Off until set; there is no default. While the pane is
 # open, selecting an item runs this command (after a ~400 ms pause, in the
@@ -115,3 +118,17 @@ sources:
   #   # base dir, or absolute / ~). No watch list: fallback timer and `r` only.
   #   watch: ["state/comms-inbox.jsonl"]
   #   supports_all: true   # `<argv> list --all` works: the A key uses it
+
+# Custom actions: your own confirmed write, one key each. Off until set; no
+# default. The command is called with JSON on stdin (never argv): choices
+# (read-only, pick one), prepare (read-only, shows what will happen; may say
+# duplicate), then, after the confirm and the 5 s undo window, run (once, never
+# retried). The key must be one the inbox does not use: h l p t v w x z or one
+# of B D E F H J K M N O P Q U V W Z. A successful run marks the item done
+# (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
+# actions:
+#   - key: "p"
+#     label: "Add to agenda"
+#     argv: ["python3", "~/bin/my-inbox-action.py"]
+#     timeout_s: 120         # 5 to 300 per call
+#     mark_done: true

@@ -17,12 +17,21 @@ URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
 TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
-            "summary")
+            "summary", "actions")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
-SAVE_KEYS = ("argv", "timeout_s")
+SAVE_KEYS = ("argv", "timeout_s", "mark_done")
+ACTION_KEYS = ("key", "label", "argv", "timeout_s", "mark_done")
 CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
+# Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
+# test keeps this list equal to it). An `actions:` key must be another letter.
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASqu")
+ACTION_KEY_CHOICES = tuple(sorted(
+    c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if c not in RESERVED_KEYS))
+MAX_ACTIONS = 8
+ACTION_LABEL_MAX = 40
 # A connector tool as Claude Code names it. The mcp__ prefix keeps a built-in
 # (Bash, Write, ...) from ever being configured as the RSVP tool.
 TOOL_NAME = re.compile(r"^mcp__[A-Za-z0-9_.-]{1,120}$")
@@ -32,6 +41,7 @@ MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]][A-Za-z0-9_.:\[\]-]{0,63}$")
 DEFAULT_RSVP_TIMEOUT_S = 60
 DEFAULT_SAVE_TIMEOUT_S = 30
 DEFAULT_CONTEXT_TIMEOUT_S = 20
+DEFAULT_ACTION_TIMEOUT_S = 60
 DEFAULT_SUMMARY_TIMEOUT_S = 90
 DEFAULT_SUMMARY_BUDGET_USD = 0.05
 SOURCE_KEYS = {
@@ -53,6 +63,7 @@ DEFAULTS = {
     "save": None,   # no default: save stays off until configured
     "context": None,   # no default: the Context pane needs a command
     "summary": None,   # no default: the AI summary stays off until configured
+    "actions": [],     # no default: no custom action until configured
 }
 
 
@@ -136,6 +147,7 @@ def validate(raw):
     out["save"] = _check_save(raw.get("save"), problems)
     out["context"] = _check_context(raw.get("context"), problems)
     out["summary"] = _check_summary(raw.get("summary"), problems)
+    out["actions"] = _check_actions(raw.get("actions"), problems)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:
@@ -300,9 +312,13 @@ def _check_save(raw, problems):
     timeout = raw.get("timeout_s", DEFAULT_SAVE_TIMEOUT_S)
     if not _num(timeout) or not 5 <= timeout <= 120:
         problems.append("save.timeout_s must be 5 to 120")
+    mark_done = raw.get("mark_done", True)
+    if not isinstance(mark_done, bool):
+        problems.append("save.mark_done must be true or false")
     if len(problems) > start:
         return None
-    return {"argv": list(argv), "timeout_s": float(timeout)}
+    return {"argv": list(argv), "timeout_s": float(timeout),
+            "mark_done": mark_done}
 
 
 def _check_context(raw, problems):
@@ -355,6 +371,66 @@ def _check_summary(raw, problems):
         return None
     return {"model": model, "timeout_s": float(timeout),
             "max_budget_usd": float(budget)}
+
+
+def _check_actions(raw, problems):
+    """The `actions:` list as clean dicts (empty when absent or invalid)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        problems.append("actions must be a list")
+        return []
+    if len(raw) > MAX_ACTIONS:
+        problems.append(f"actions has more than {MAX_ACTIONS} entries")
+        return []
+    clean, keys, labels = [], set(), set()
+    for i, entry in enumerate(raw):
+        where = f"actions[{i}]"
+        start = len(problems)
+        if not isinstance(entry, dict):
+            problems.append(f"{where} must be a mapping")
+            continue
+        for k in entry:
+            if k not in ACTION_KEYS:
+                problems.append(f"{where}: unknown key '{k}'")
+        key = entry.get("key")
+        if not isinstance(key, str) or len(key) != 1 \
+                or not key.isascii() or not key.isalpha():
+            problems.append(f"{where}.key must be one letter (a-z, A-Z)")
+        elif key in RESERVED_KEYS:
+            problems.append(
+                f"{where}.key '{key}' is already used by the inbox; free "
+                f"keys are {''.join(ACTION_KEY_CHOICES)}")
+        elif key in keys:
+            problems.append(f"{where}.key '{key}' is used twice")
+        else:
+            keys.add(key)
+        label = entry.get("label")
+        if (not isinstance(label, str) or not label.strip()
+                or len(label.strip()) > ACTION_LABEL_MAX
+                or re.search(r"[\x00-\x1f\x7f]", label)):
+            problems.append(f"{where}.label must be one line of 1 to "
+                            f"{ACTION_LABEL_MAX} characters")
+        elif label.strip() in labels:
+            problems.append(f"{where}.label is used twice")
+        else:
+            labels.add(label.strip())
+        argv = entry.get("argv")
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(a, str) and a for a in argv)):
+            problems.append(f"{where}.argv must be a non-empty list of "
+                            "strings (no shell)")
+        timeout = entry.get("timeout_s", DEFAULT_ACTION_TIMEOUT_S)
+        if not _num(timeout) or not 5 <= timeout <= 300:
+            problems.append(f"{where}.timeout_s must be 5 to 300")
+        mark_done = entry.get("mark_done", True)
+        if not isinstance(mark_done, bool):
+            problems.append(f"{where}.mark_done must be true or false")
+        if len(problems) == start:
+            clean.append({"key": key, "label": label.strip(),
+                          "argv": list(argv), "timeout_s": float(timeout),
+                          "mark_done": mark_done})
+    return clean
 
 
 def _check_rules(rules, label, problems):

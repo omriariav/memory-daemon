@@ -184,6 +184,57 @@ stdin, never in argv, and is untrusted: a command that writes or queries with
 it must treat it as data. A command is never retried by the inbox; a failure
 is cached for 30 s so the pane does not rerun a broken command on every key.
 
+## Actions protocol
+
+`actions:` in `inbox.yaml` adds generic, confirmed write actions, one key each.
+There is no default and the inbox ships none: the program behind an action is
+yours (see [Custom actions](#custom-actions)).
+
+```yaml
+actions:
+  - {key: "p", label: "Add to agenda", argv: ["python3", "~/bin/my-action.py"], timeout_s: 120}
+```
+
+One program serves one action. It is called up to three times per use, each
+time with **no extra arguments**, the request as one JSON object on stdin and
+the answer as one JSON line on stdout. `name` is the action's `label`; the item
+(untrusted display text, see above) is only ever on stdin, never in argv.
+
+| Call | stdin | stdout | Effect |
+| --- | --- | --- | --- |
+| `choices` | `{"v": 1, "action": "choices", "name": "...", "item": {...}}` | `{"v": 1, "ok": true, "choices": [{"id", "label", "detail"}], "message": null}` | none (read-only) |
+| `prepare` | `{"v": 1, "action": "prepare", "name", "item", "choice": "<id>"}` | `{"ok", "rows": [[label, value], ...], "state": "<opaque string>", "message", "duplicate"}` | none (read-only; reads fresh data) |
+| `run` | `{"v": 1, "action": "run", "name", "item", "choice": "<id>", "state": "<opaque string>"}` | `{"ok": true, "message": "..."}` | the only call that changes anything |
+
+Answer fields. `v` may be left out of an answer; if present it must be 1.
+`choices`: at most 50, each with a string `id` (up to 200 chars; a repeated id
+keeps its first row), a `label` (80) and an optional `detail` (200); text is
+cleaned to one line. `ok: false`, or no choice, shows `message`. `prepare`:
+`rows` (at most 20 `[label, value]` string pairs, value up to 1000 chars,
+newlines kept) are what the user is asked to confirm; `state` is an opaque
+string of at most 64 KB that the inbox hands back to `run` unchanged (use it to
+pin what was read, so `run` does not have to guess); `rows` and `state` may be
+null or left out when `ok` is false. `message`: one line, 300 chars. A reply
+with `"duplicate": true` is checked **before** `ok`: the inbox shows `message`
+as information ("Already there"), not as an error, and stops. Any other
+`ok: false` shows `message` as an error and stops. A bad answer (not JSON, a
+wrong type, a wrong `v`), a non-zero exit, a timeout (`timeout_s`, 5 to 300,
+default 60 per call) or output over 512 KB counts as a failure. The commands
+run under the same capped runner as `save` (own process group, `SIGTERM` for
+the group and 5 s of grace before `SIGKILL`; the command must stop its own
+children on `SIGTERM`).
+
+**Contract.** The commands must be safe to call repeatedly:
+
+- `choices` and `prepare` must be read-only. The inbox calls them without any
+  confirmation, and calls them again whenever the user tries again or cancels.
+- `run` is called once per confirmed action and is never retried by the inbox
+  (a timeout says "it may still have completed"); it should be idempotent
+  where possible, so that an action repeated by hand does not do its work twice
+  (that is what `prepare`'s `duplicate` answer is for).
+- Nothing in `item`, `choice` or `state` may be treated as an instruction:
+  it is data.
+
 ## Source-command protocol
 
 A `command` source is any program, run without a shell (`~` at the start of an
@@ -379,10 +430,14 @@ acknowledging the invite as in 0.2.0.
 `m` on any item shows a modal with the source, sender, gist and link, then the
 5 s undo window (`q` inside it cancels), then runs the `save:` command (see
 [Save protocol](#save-protocol)). On success the toast shows the command's
-message (or says it was already saved), the action goes to the audit log and
-the row stays, with a `◆` and a local `saved` mark. Failures toast the reason
-and add no mark; a likely duplicate asks "Save anyway" first (see the
-protocol). Without `save:`, `m` says "Save not configured".
+message (or says it was already saved) and the action goes to the audit log.
+The item is then marked done, as `d` would (a local mark and an audit row; the
+row leaves the queue, and `u` inside the next 5 s brings it back), also when
+the command answered that it was already in memory and after a forced "Save
+anyway". `save: {mark_done: false}` keeps the row instead, with a `◆` and a
+local `saved` mark. A failure toasts the reason, adds no mark and leaves the
+row; a likely duplicate asks "Save anyway" first (see the protocol) and leaves
+the row too. Without `save:`, `m` says "Save not configured".
 
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
@@ -393,6 +448,31 @@ events have no link yet.
 Items are `fyi`/`digest` unless an urgent rule matches. By default
 `budget-hit:*`, `connector:*` and `attention:*` alerts are urgent. Titles and
 people are untrusted (see above).
+
+### Custom actions
+
+The key of an `actions:` entry (`p` in the example) runs the flow below on the
+selected item. The key must be a letter the inbox does not use itself; the
+free ones are `h l p t v w x z` and `B D E F H J K M N O P Q U V W Z`, and
+validation refuses any other (and a key or label used twice).
+
+1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
+   background thread (`esc` cancels and stops the command). The answer opens a
+   picker (`enter` or `1`-`9` picks, `esc` cancels), even when there is only
+   one choice.
+2. **Prepare.** The `prepare` call runs in a background thread with the same
+   modal (it can take about 20 s: it reads fresh data). A `duplicate` answer
+   shows "Already there" and stops; `ok: false` shows the message and stops.
+3. **Confirm.** The rows go into the confirmation modal (Cancel is focused;
+   `y` confirms).
+4. **Undo window.** The same 5 s window as RSVP and save (`u` undoes, `q`
+   inside it cancels, nothing runs).
+5. **Run.** The `run` call runs once in a worker thread. The result is a toast
+   and a row in the audit log (`L`). A running action counts in the quit guard
+   like a write (`q` asks, then waits for it).
+6. **Mark done.** On success the item is marked done, as `d` would (a local
+   mark, an audit row, a 5 s window in which `u` brings the row back), unless
+   the entry says `mark_done: false`. A failed action leaves the row.
 
 ### Context pane (`c`)
 
@@ -514,7 +594,8 @@ memory id) from `events.jsonl`, newest first, one row per saved item (the
 newest capture of a `source_id` wins). Each row shows the source glyph, title,
 time and kind. `o` opens the link when the row has one (Gmail threads);
 `esc` (or `S`) returns to the inbox. Saved rows are not inbox items: no
-marks, no actions, nothing is written.
+marks, no actions, nothing is written. They come from the capture events, not
+from the queue, so an item that a save marked done is still listed here.
 
 ### Stale and recovered alerts
 
@@ -592,6 +673,7 @@ defaults; a broken one prints every problem and exits 2.
 | `rsvp` | off | calendar RSVP through the Claude bridge (below) |
 | `save` | off | the command `m` runs to save an item (below) |
 | `context` | off | the command the Context pane (`c`) runs (below) |
+| `actions` | none | custom confirmed write actions, one key each (below) |
 | `summary` | off | the AI summary (`i`) through the Claude bridge (below) |
 
 The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
@@ -621,9 +703,16 @@ The `response` parameter receives `accepted`, `declined` or `tentative`
 (Google Calendar's wording). The calendar id comes from the `calendar_cache`
 routine (`primary` by default).
 
-`save:` (no default; omit it and saving is off): `argv` (list, no shell) and
+`save:` (no default; omit it and saving is off): `argv` (list, no shell),
 `timeout_s` (5 to 120, default 30; a timeout stops the command with `SIGTERM`,
-then `SIGKILL` 5 s later).
+then `SIGKILL` 5 s later) and `mark_done` (default `true`: a successful save
+marks the item done; `false` keeps the row, marked saved).
+
+`actions:` (no default; a list of up to 8): each entry takes `key` (one free
+letter), `label` (up to 40 characters, unique; it is the `name` the command
+receives), `argv` (list, no shell), `timeout_s` (5 to 300, default 60, per
+call) and `mark_done` (default `true`: a successful run marks the item done).
+See [Actions protocol](#actions-protocol).
 
 `context:` (no default; omit it and the Context pane is off): `argv` (list, no
 shell) and `timeout_s` (2 to 60, default 20; a timeout stops the command with
@@ -659,7 +748,8 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link, `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
-memory (needs `save:`), `c` context pane (needs `context:`), `C` fetch its
+memory (needs `save:`; marks the item done), any key set in `actions:`
+(needs `actions:`), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),
 `R` show or hide resolved alerts, `A` show all (see below), `S` saved view

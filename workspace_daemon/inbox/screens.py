@@ -193,6 +193,86 @@ class SnoozePicker(ModalScreen):
         self.dismiss((t, e.value.strip()))
 
 
+class ActionBusy(ModalScreen):
+    """Shown while an action's command is looking something up (its choices,
+    its confirmation rows). `esc` cancels: the app stops the command."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title, what, on_cancel):
+        super().__init__()
+        self.title_text, self.what, self.on_cancel = title, what, on_cancel
+        self._frame = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="actbusy"):
+            yield Static(Text(self.title_text, Style(bold=True)),
+                         id="actbusy-title")
+            yield Static("", id="actbusy-body")
+            yield Static(Text("esc cancel", Style(dim=True)),
+                         id="actbusy-hint")
+
+    def on_mount(self):
+        self._tick()
+        self.set_interval(0.1, self._tick)
+
+    def _tick(self):
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._frame += 1
+        self.query_one("#actbusy-body", Static).update(
+            Text(f"{frames[self._frame % len(frames)]} {self.what}"))
+
+    def action_cancel(self):
+        self.on_cancel()
+        self.dismiss(None)
+
+
+class ChoicePicker(ModalScreen):
+    """A generic picker over the choices an action command returned. Shown
+    even for one choice. Every string is plain `Text`. Dismisses with the
+    chosen choice dict, or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")] + [
+        Binding(str(n), f"pick({n - 1})", show=False) for n in range(1, 10)]
+
+    def __init__(self, title, choices, visual=False):
+        super().__init__()
+        self.title_text, self.choices, self.visual = title, choices, visual
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Static(Text(self.title_text, Style(bold=True)),
+                         id="picker-title")
+            yield OptionList(*[self._option(n, c)
+                               for n, c in enumerate(self.choices)],
+                             id="picker-list")
+            yield Static(Text("enter pick  ·  1-9 quick pick  ·  esc cancel",
+                              Style(dim=True)), id="picker-hint")
+
+    def _option(self, n, choice):
+        prompt = Text()
+        if n < 9:
+            prompt.append(f"{n + 1}  ", Style(bold=True))
+        prompt.append(vis(choice["label"], self.visual))
+        if choice.get("detail"):
+            prompt.append("  " + vis(choice["detail"], self.visual),
+                          Style(dim=True))
+        return Option(prompt, id=str(n))
+
+    def on_mount(self):
+        self.query_one("#picker-list", OptionList).focus()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_pick(self, index):
+        if 0 <= index < len(self.choices):
+            self.dismiss(self.choices[index])
+
+    def on_option_list_option_selected(self, e):
+        self.dismiss(self.choices[int(e.option.id)])
+
+
 HELP = [
     ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
               ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"),
@@ -204,7 +284,7 @@ HELP = [
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
-                     ("m", "save the item to memory (save: in inbox.yaml); ◆ marks a saved item"),
+                     ("m", "save the item to memory (save: in inbox.yaml); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
@@ -222,9 +302,19 @@ HELP = [
 class HelpScreen(ModalScreen):
     BINDINGS = [Binding("escape,question_mark,q", "close", "Close")]
 
+    def __init__(self, extra=None):
+        """`extra` is a list of (key, label) for the `actions:` of inbox.yaml."""
+        super().__init__()
+        self.extra = list(extra or [])
+
     def compose(self) -> ComposeResult:
         t = Text()
-        for title, rows in HELP:
+        sections = list(HELP)
+        if self.extra:
+            sections.insert(-2, ("Custom actions (actions: in inbox.yaml)", (
+                [(k, f"{label}: pick, confirm, then wait out the 5 s undo window")
+                 for k, label in self.extra])))
+        for title, rows in sections:
             t.append(f"{title}\n", Style(bold=True, underline=True))
             for k, d in rows:
                 t.append(f"  {k:<16}", Style(bold=True))
