@@ -1089,6 +1089,47 @@ class CompleteTest(BridgeBase):
             claude_bridge.complete("p", model="sonnet", base_dir=self.base)
 
 
+class RelativeBaseDirTest(BridgeBase):
+    """A relative base_dir used to make `--settings` relative to the run's
+    cwd (the run directory), which doubled the path: claude exited 1."""
+
+    def relative_base(self):
+        old = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, old)
+        return os.path.relpath(self.base, self.root)    # "base"
+
+    def test_call_tools_with_a_relative_base_dir_passes_absolute_paths(self):
+        self.stream(good_stream())
+        rel = self.relative_base()
+        self.assertFalse(os.path.isabs(rel))
+        out = claude_bridge.call_tools(
+            "p", {TOOL_A: {}}, base_dir=rel, connect_delay=0)
+        self.assertEqual(out[0]["text"], "item one")
+        argv = self.argv()
+        settings = argv[argv.index("--settings") + 1]
+        self.assertTrue(os.path.isabs(settings))
+        self.assertTrue(settings.startswith(
+            os.path.realpath(self.base) + os.sep)
+            or settings.startswith(str(self.base) + os.sep))
+        # the run directory is under the one real state/ directory
+        self.assertTrue((self.base / "state" / "claude-usage.jsonl").exists())
+        self.assertFalse((self.base / "base").exists())
+
+    def test_complete_with_a_relative_base_dir(self):
+        self.stream(init() + result(text="the summary"))
+        rel = self.relative_base()
+        self.assertEqual(
+            claude_bridge.complete("p", model="sonnet", base_dir=rel),
+            "the summary")
+        argv = self.argv()
+        self.assertTrue(os.path.isabs(argv[argv.index("--settings") + 1]))
+
+    def test_the_helper_leaves_an_absolute_path_alone(self):
+        self.assertEqual(claude_bridge._absolute(self.base), self.base)
+        self.assertTrue(claude_bridge._absolute("x").is_absolute())
+
+
 class HookTest(unittest.TestCase):
     TOOLS = {TOOL_A: {"calendar": "primary"}, TOOL_B: {}}
 
