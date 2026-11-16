@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 
 from . import (
-    calendar_cache, external_events, fibery_tasks_inbound, fibery_tasks_outbound,
+    calendar_cache, external_events, fibery_doc_cache, fibery_tasks_inbound,
+    fibery_tasks_outbound,
     google_tasks_sync, slack_census,
     slack_cli, slack_discovery,
 )
@@ -110,6 +111,18 @@ def run(base_dir, routine, dry_run=False):
             f"reopened={report['reopened']} edited={report['edited']} "
             f"gone={report['gone']} pending={report['pending']} "
             f"linked={report.get('linked', 0)} dry_run={report['dry_run']}"
+        )
+        return report
+    if kind == "fibery_doc_cache":
+        mode = "previewing" if dry_run else "caching"
+        log(f"routine={routine_id} maintenance={kind} {mode}")
+        report = fibery_doc_cache.run(
+            cfg, base_dir, dry_run=dry_run, routine_id=routine_id)
+        log(
+            f"routine={routine_id} maintenance={kind} docs={report['docs']} "
+            f"qualifying={report['qualifying']} "
+            f"refreshed={report['refreshed']} fresh={report['fresh']} "
+            f"failed={report['failed']} dry_run={report['dry_run']}"
         )
         return report
     if kind == "fibery_tasks_outbound":

@@ -1,0 +1,42 @@
+# Read-only cache of Fibery documents, model-free in Python.
+#
+# For each document that is about to be needed, one headless Claude bridge call
+# transports a single read_document result (a claude.ai Fibery connector, that
+# one read-only tool, pinned to the document secret and refused if it carries
+# any other argument). Python checks that the text parses as a document and
+# writes it to <out_dir>/<key>.json ({v, key, fetched_at, text}, mode 0600 in a
+# 0700 directory). Nothing is ever written to Fibery.
+#
+# A document is refreshed only when state/calendar-snapshot.json (the
+# calendar_cache routine) has a timed event, not cancelled or declined, that
+# starts within lookahead_h hours, has exactly two attendees, and whose other
+# person has an email listed in that document's match_emails (case-insensitive);
+# and then only when its cache file is missing or older than max_age_h. Set
+# only_upcoming: false to refresh every listed document whenever it is older
+# than max_age_h.
+#
+# Keep the real secrets out of version control (real routines are gitignored).
+# With docs_file the secrets live in one private place instead of this file:
+# a JSON list with the same entries as `docs`, mode 0600 (anything readable by
+# group or others is refused). Use exactly one of docs and docs_file.
+id: fibery-doc-cache
+enabled: false
+description: Cache upcoming one-to-one Fibery documents to local files.
+role: maintenance
+
+schedule:
+  every: 1h
+
+maintenance:
+  kind: fibery_doc_cache
+  read_tool: mcp__claude_ai_Example_Fibery__read_document
+  model: haiku
+  docs:
+    - key: example-person
+      document_secret: 00000000-0000-0000-0000-000000000000
+      match_emails: [person@example.com]
+  # docs_file: ~/private/fibery-docs.json
+  lookahead_h: 24
+  max_age_h: 12
+  only_upcoming: true
+  out_dir: state/fibery-docs

@@ -11,7 +11,7 @@ import yaml
 
 from .actions import VALID_ACTIONS  # single source of truth for action names
 from .notes import FILENAME_FIELDS
-from . import comms_inbox, external_events, slack_watch
+from . import comms_inbox, external_events, fibery_doc_cache, slack_watch
 from .time_utils import is_rfc3339_instant, rfc3339_key
 
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
@@ -24,7 +24,7 @@ VALID_ROUTINE_ROLES = {
 }
 VALID_MAINTENANCE_KINDS = {
     "google_tasks_sync", "slack_conversation_census", "calendar_cache",
-    "fibery_tasks_inbound", "fibery_tasks_outbound",
+    "fibery_tasks_inbound", "fibery_tasks_outbound", "fibery_doc_cache",
     "slack_discovery", "external_events",
 }
 MAINTENANCE_ALLOWED_KEYS = {
@@ -57,6 +57,10 @@ MAINTENANCE_ALLOWED_KEYS = {
         "tags", "checkpoint", "store", "import_done", "max_new_per_run",
         "max_changes_per_run", "outbound_checkpoint",
     },
+    "fibery_doc_cache": {
+        "kind", "read_tool", "docs", "docs_file", "lookahead_h", "out_dir",
+        "only_upcoming", "max_age_h", "model",
+    },
     "fibery_tasks_outbound": {
         "kind", "document_secret", "read_tool", "write_tool", "write_mode",
         "model", "owner_slug", "checkpoint", "store", "outbound_since",
@@ -66,6 +70,7 @@ MAINTENANCE_ALLOWED_KEYS = {
 # Kinds that keep no checkpoint file; every other kind requires one.
 MAINTENANCE_NO_CHECKPOINT = {
     "calendar_cache", "slack_discovery", "external_events",
+    "fibery_doc_cache",
 }
 # Kinds whose checkpoint path has a built-in default.
 MAINTENANCE_DEFAULT_CHECKPOINT = {
@@ -629,7 +634,7 @@ def uses_claude_bridge(routine):
     maintenance = routine.get("maintenance")
     if isinstance(maintenance, dict) and maintenance.get("kind") in (
         "calendar_cache", "fibery_tasks_inbound", "fibery_tasks_outbound",
-        "slack_discovery",
+        "fibery_doc_cache", "slack_discovery",
     ):
         return True
     return any(
@@ -808,6 +813,8 @@ def validate(routine):
                 problems.extend(_validate_fibery_tasks_inbound(rid, maintenance))
             elif kind == "fibery_tasks_outbound":
                 problems.extend(_validate_fibery_tasks_outbound(rid, maintenance))
+            elif kind == "fibery_doc_cache":
+                problems.extend(fibery_doc_cache.config_problems(rid, maintenance))
             elif kind == "calendar_cache":
                 problems.extend(_validate_calendar_cache(rid, maintenance))
             elif kind == "slack_discovery":

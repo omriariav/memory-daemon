@@ -920,7 +920,8 @@ sets `4h` explicitly for new routines.
 
 See `_example-domain-routine.yaml`, `_example-fallback-sweep.yaml`, and
 `_example-google-tasks-sync.yaml`, `_example-calendar-cache.yaml`,
-`_example-fibery-tasks-inbound.yaml`, and `_example-fibery-tasks-outbound.yaml`.
+`_example-fibery-tasks-inbound.yaml`, `_example-fibery-tasks-outbound.yaml`, and
+`_example-fibery-doc-cache.yaml`.
 
 ### Fibery tasks → memory (inbound)
 
@@ -1011,6 +1012,34 @@ imported normally); a linked item adds done/reopened notes to the entry (Fibery
 edits never rewrite it) instead of creating a todo, and unaccepted suggestion blocks are ignored until accepted.
 Disable `google_tasks_sync` for the same todos. See
 `routines/_example-fibery-tasks-outbound.yaml`.
+
+### Fibery documents → local cache
+
+`maintenance.kind: fibery_doc_cache` keeps read-only copies of Fibery documents
+in local files, so a local tool (the inbox's Context pane, a prompt hook) can
+read them without a call. It never writes to Fibery. Config: `read_tool` (exact
+MCP name ending `__read_document`), the documents as `docs: [{key,
+document_secret, match_emails: [...]}]` or `docs_file: <path>` (a JSON list of
+the same entries; it must be readable by its owner only, so the secrets live in
+one private file; use exactly one of the two), `lookahead_h` (default 24),
+`max_age_h` (default 12), `only_upcoming` (default `true`) and `out_dir`
+(default `state/fibery-docs`), plus the usual `schedule` and `budget`.
+
+With `only_upcoming: true` a document is a candidate only while
+`state/calendar-snapshot.json` (the `calendar_cache` routine) holds a timed
+event that is not cancelled or declined, starts within `lookahead_h` hours and
+has exactly two attendees, the other of whom (the one non-self attendee, or the
+organizer when that is not you) has an address in the document's
+`match_emails` (compared case-insensitively). A candidate is fetched when its
+cache file is missing, unreadable or older than `max_age_h`. With
+`only_upcoming: false` every listed document is a candidate. Each fetch is one
+bridge call pinned to `{read_tool: {secret}}` with `exact_args` (a call with any
+other argument is refused); the result must parse as a Fibery document, and is
+written atomically as `<out_dir>/<key>.json` (`{"v": 1, "key", "fetched_at",
+"text"}`, mode 0600 in a 0700 directory). A failed document does not stop the
+others; the run then fails, naming the keys. Logs carry counts and keys only:
+never a secret, an email or text. `--dry-run` makes no call and writes nothing.
+See `routines/_example-fibery-doc-cache.yaml`.
 
 ## Adding a routine
 
