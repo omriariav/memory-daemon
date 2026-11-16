@@ -31,6 +31,7 @@ class Doc:
         self.n = 1000
         self.version = 0
         self.suggestions = []
+        self.comments = None     # raw lines of a top-level comments section
 
     def _id(self):
         self.n += 1
@@ -92,6 +93,8 @@ class Doc:
             lines.extend("    " + ln for ln in block[1:])
         if self.suggestions:
             lines.extend(self._suggestion_lines())
+        if self.comments is not None:
+            lines.extend(self.comments)
         toon = "\n".join(lines)
         return json.dumps({"success": True, "document": toon}) if wrap else toon
 
@@ -744,6 +747,161 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[2],
                          Path(tmp) / "state" / "fibery-tasks.json")
         self.assertTrue(run.call_args.kwargs["dry_run"])
+
+
+def comments_section(block_id):
+    """A top-level `comments` section shaped like read_document's: one thread
+    anchored on a block, with a reply, a nested map and a quoted body that
+    looks like TOON (it must be skipped whole, never parsed)."""
+    return [
+        "comments[2]:",
+        "  - id: cm-1",
+        f"    blockIds[1]: {block_id}",
+        "    authorId: user-1",
+        "    createdAt: 1700000000000",
+        "    resolved: false",
+        '    text: "block-looking: text, version: 9"',
+        "    anchor:",
+        "      start: 3",
+        "      end: 9",
+        "    replies[1]:",
+        "      - id: cm-1-r1",
+        "        authorId: user-2",
+        '        text: "- id: not-a-block"',
+        "  - id: cm-2",
+        f"    blockIds[1]: {block_id}",
+        "    authorId: user-2",
+        "    createdAt: 1700000001000",
+        '    text: "second thread"',
+        "    replies[0]:",
+    ]
+
+
+class CommentsSectionTest(unittest.TestCase):
+    def doc(self, comments=None, suggest=False):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "TODO", ['"first item"']),
+                     (bid(2), "null", ['"second item"'])])
+        if suggest:
+            doc.suggest([bid(2)])
+        if comments is not None:
+            doc.comments = comments
+        return doc
+
+    def test_a_comments_section_is_ignored_in_both_shapes(self):
+        plain = fti.parse_document(self.doc().text(wrap=False))
+        for wrap in (False, True):
+            doc = self.doc(comments_section(bid(1001)))
+            roots, blocks, sugg = fti.parse_document(doc.text(wrap=wrap))
+            self.assertEqual((roots, blocks, sugg), plain)
+
+    def test_comment_text_is_never_returned_or_parsed_as_blocks(self):
+        roots, blocks, _ = fti.parse_document(
+            self.doc(comments_section(bid(1001))).text(wrap=False))
+        self.assertNotIn("cm-1", blocks)
+        self.assertNotIn("not-a-block", blocks)
+        self.assertNotIn("second thread", repr(blocks))
+
+    def test_empty_and_header_only_forms(self):
+        for lines in (["comments[0]:"], ["comments: []"], ["comments:"],
+                      ["comments[0]: []"]):
+            fti.parse_document(self.doc(lines).text(wrap=False))
+
+    def test_comments_and_suggestions_together_in_either_order(self):
+        base = self.doc(suggest=True)
+        plain_sugg = fti.parse_document(base.text(wrap=False))[2]
+        self.assertEqual(len(plain_sugg), 1)
+        after = self.doc(comments_section(bid(1001)), suggest=True)
+        self.assertEqual(fti.parse_document(after.text(wrap=False))[2], plain_sugg)
+        before = self.doc(suggest=True)
+        text = before.text(wrap=False).split("suggestions[")
+        swapped = (text[0] + "\n".join(comments_section(bid(1001))) + "\n"
+                   + "suggestions[" + text[1])
+        self.assertEqual(fti.parse_document(swapped)[2], plain_sugg)
+
+    def test_unknown_top_level_keys_and_a_repeated_comments_still_fail(self):
+        good = self.doc().text(wrap=False)
+        for extra in ("mystery[1]:\n  - x", "mystery: 1",
+                      "comments[0]:\ncomments[0]:"):
+            with self.assertRaises(fti.FiberyParseError, msg=extra):
+                fti.parse_document(good + "\n" + extra)
+
+    def test_a_stray_top_level_line_after_comments_still_fails(self):
+        # comments swallow only the lines indented under them
+        text = self.doc(comments_section(bid(1001))).text(wrap=False)
+        with self.assertRaises(fti.FiberyParseError):
+            fti.parse_document(text + "\nstray: line")
+
+    def test_tasks_parse_through_a_comments_section(self):
+        doc = self.doc(comments_section(bid(1001)))
+        tasks = fti.parse_tasks(doc.text())
+        self.assertEqual([t["text"] for t in tasks], ["first item"])
+
+    def test_find_list_in_document_with_comments(self):
+        doc = self.doc(comments_section(bid(1001)))
+        found = fti.find_list_in_document(doc.text(), "agenda")
+        self.assertEqual([i["text"] for i in found["items"]],
+                         ["first item", "second item"])
+
+
+class FindListPendingTest(unittest.TestCase):
+    def test_a_pending_inserted_list_and_heading_are_skipped(self):
+        doc = Doc()
+        doc.heading("Agenda")                          # pending: suggested
+        pending_heading = doc.roots[0]
+        doc.bullets([(bid(1), "null", ['"in a pending heading section"'])])
+        pending_list = doc.roots[1]
+        doc.suggest([pending_heading, pending_list])
+        doc.heading("Agenda notes")                    # accepted
+        doc.bullets([(bid(2), "null", ['"accepted item"'])])
+        roots, blocks, sugg = fti.parse_document(doc.text(wrap=False))
+        found = fti.find_list_under_heading(blocks, "agenda", roots, sugg)
+        self.assertEqual([i["id"] for i in found["items"]], [bid(2)])
+        self.assertNotEqual(found["heading_id"], pending_heading)
+        # without the suggestions the first heading would have won
+        first = fti.find_list_under_heading(blocks, "agenda", roots)
+        self.assertEqual(first["heading_id"], pending_heading)
+
+    def test_pending_items_and_paragraphs_are_left_out(self):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "null", ['"kept"']),
+                     (bid(2), "null", ['"pending item"'])])
+        item_blocks = [b for b in doc.blocks if b[0] == f"id: {bid(2)}"]
+        self.assertEqual(len(item_blocks), 1)
+        doc.suggest([bid(2)])
+        roots, blocks, sugg = fti.parse_document(doc.text(wrap=False))
+        found = fti.find_list_under_heading(blocks, "Agenda", roots, sugg)
+        self.assertEqual([i["text"] for i in found["items"]], ["kept"])
+
+    def test_a_list_that_is_only_a_pending_suggestion_is_not_the_list(self):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "null", ['"pending only"'])])
+        doc.suggest([doc.roots[1]])
+        roots, blocks, sugg = fti.parse_document(doc.text(wrap=False))
+        found = fti.find_list_under_heading(blocks, "Agenda", roots, sugg)
+        self.assertIsNone(found["list_id"])
+        self.assertEqual(found["items"], [])
+
+    def test_find_list_in_document_applies_the_suggestions(self):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "null", ['"kept"']),
+                     (bid(2), "null", ['"pending item"'])])
+        doc.suggest([bid(2)])
+        found = fti.find_list_in_document(doc.text(), "Agenda")
+        self.assertEqual([i["text"] for i in found["items"]], ["kept"])
+
+    def test_inline_and_deletion_suggestions_leave_the_text_as_accepted(self):
+        doc = Doc()
+        doc.heading("Agenda")
+        doc.bullets([(bid(1), "null", ['"kept"'])])
+        doc.suggest([bid(1)], inline=True)
+        doc.suggest([bid(1)], kind="deleted")
+        found = fti.find_list_in_document(doc.text(), "Agenda")
+        self.assertEqual([i["text"] for i in found["items"]], ["kept"])
 
 
 class FindListUnderHeadingTest(unittest.TestCase):

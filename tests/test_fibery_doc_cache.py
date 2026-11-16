@@ -391,6 +391,16 @@ class FailureTest(Base):
         self.assertTrue(any("ERROR: 1 refresh(es) failed: doc-a" in m
                             for m in self.logs))
 
+    def test_a_document_with_comment_threads_is_cached(self):
+        from test_fibery_tasks_inbound import comments_section
+        doc = Doc()
+        doc.heading("agenda")
+        doc.bullets([(bid(1), "null", ['"an item"'])])
+        doc.comments = comments_section(bid(1001))
+        self.text = doc.text()
+        self.run_once()
+        self.assertEqual(json.loads(self.out().read_text())["text"], self.text)
+
     def test_a_text_that_is_not_a_document_is_never_cached(self):
         self.text = "this is not a document"
         with self.assertRaises(RuntimeError):

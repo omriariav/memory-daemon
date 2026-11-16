@@ -125,6 +125,9 @@ def parse_document(text):
     The optional top-level ``suggestions`` section (pending tracked changes)
     is parsed into dicts and never interpreted as blocks; every block id it
     references must exist. Use ``pending_ids`` to expand block-level inserts.
+    The optional top-level ``comments`` section (inline comment threads, which
+    ``read_document`` adds when a document has any) is skipped whole: comment
+    text is never parsed or returned. Any other top-level key still fails.
     """
     lines = [ln.rstrip("\r") for ln in _document_text(text).split("\n")]
     roots = None
@@ -134,6 +137,8 @@ def parse_document(text):
     suggestion_lines = []
     suggestions_count = None
     in_suggestions = False
+    in_comments = False
+    seen_comments = False
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -145,8 +150,11 @@ def parse_document(text):
         if indent > 0 and in_suggestions:
             suggestion_lines.append((indent, body))
             continue
+        if indent > 0 and in_comments:
+            continue    # an inline comment thread: not blocks, not read
         if indent == 0:
             in_suggestions = False
+            in_comments = False
             match = KEY_RE.match(body)
             if not match:
                 raise FiberyParseError("unrecognised top-level line")
@@ -162,6 +170,8 @@ def parse_document(text):
             elif key == "suggestions" and suggestions_count is None:
                 in_suggestions = True
                 suggestions_count = _suggestions_header(count, raw)
+            elif key == "comments" and not seen_comments:
+                seen_comments = in_comments = True
             else:
                 raise FiberyParseError("unrecognised top-level key")
             continue
@@ -328,12 +338,14 @@ def _plain(text):
     return " ".join(accepted_text(text).split())
 
 
-def _item_text(blocks, item):
-    """The accepted text of one list item: its paragraphs, one per line."""
+def _item_text(blocks, item, pending=frozenset()):
+    """The accepted text of one list item: its paragraphs, one per line
+    (a paragraph that is only a pending suggestion is left out)."""
     pieces = []
     for child_id in item["childIds"]:
         child = blocks.get(child_id)
-        if child is not None and child["type"] == "paragraph":
+        if child is not None and child["type"] == "paragraph" \
+                and child_id not in pending:
             piece = accepted_text(_text_of(child)).strip()
             if piece:
                 pieces.append(piece)
@@ -342,14 +354,15 @@ def _item_text(blocks, item):
 
 def find_list_in_document(text, heading_prefix):
     """`find_list_under_heading` on the raw ``read_document`` tool text (the
-    TOON document, or the JSON wrapper around it). The one call a caller
-    holding only the tool result needs. Raises FiberyParseError when the text
-    is not a document."""
-    roots, blocks, _suggestions = parse_document(text)
-    return find_list_under_heading(blocks, heading_prefix, roots)
+    TOON document, or the JSON wrapper around it), pending suggestions
+    excluded. The one call a caller holding only the tool result needs.
+    Raises FiberyParseError when the text is not a document."""
+    roots, blocks, suggestions = parse_document(text)
+    return find_list_under_heading(blocks, heading_prefix, roots, suggestions)
 
 
-def find_list_under_heading(blocks, heading_prefix, roots=None):
+def find_list_under_heading(blocks, heading_prefix, roots=None,
+                            suggestions=None):
     """The bullet list under the first heading that starts with a prefix.
 
     ``blocks`` is the ``{id: block}`` map of ``parse_document``. The first
@@ -363,8 +376,12 @@ def find_list_under_heading(blocks, heading_prefix, roots=None):
     Returns ``{"heading_id", "list_id", "items": [{"id", "text"}]}``. ``list_id``
     is None (and ``items`` empty) when no list follows the heading; the whole
     result is None when no heading matches. Text is read-only data: nothing in
-    it is interpreted. Pending suggestions are not considered (pass accepted
-    content only if that matters).
+    it is interpreted.
+
+    ``suggestions`` (``parse_document``'s third value) makes pending block
+    insertions invisible, as ``fibery_tasks_outbound.inspect`` treats them: a
+    pending heading is never the anchor, a pending list is never the list, and
+    pending items and paragraphs are left out.
     """
     want = " ".join(str(heading_prefix or "").split()).casefold()
     if not want:
@@ -372,7 +389,8 @@ def find_list_under_heading(blocks, heading_prefix, roots=None):
     order = list(roots) if roots is not None else [
         bid for bid, block in blocks.items()
         if block.get("parentId") in (None, "")]
-    order = [bid for bid in order if bid in blocks]
+    pending = pending_ids(blocks, suggestions) if suggestions else frozenset()
+    order = [bid for bid in order if bid in blocks and bid not in pending]
     heading_id = None
     list_id = None
     for index, bid in enumerate(order):
@@ -395,9 +413,10 @@ def find_list_under_heading(blocks, heading_prefix, roots=None):
     if list_id is not None:
         for child_id in blocks[list_id]["childIds"]:
             child = blocks.get(child_id)
-            if child is not None and child["type"] == "list_item":
+            if child is not None and child["type"] == "list_item" \
+                    and child_id not in pending:
                 items.append({"id": child_id,
-                              "text": _item_text(blocks, child)})
+                              "text": _item_text(blocks, child, pending)})
     return {"heading_id": heading_id, "list_id": list_id, "items": items}
 
 

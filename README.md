@@ -1046,7 +1046,7 @@ no one else and that is not you) has an address in the document's
 cache file is missing, unreadable or older than `max_age_h`. With
 `only_upcoming: false` every listed document is a candidate. Each fetch is one
 bridge call pinned to `{read_tool: {secret}}` with `exact_args` (a call with any
-other argument is refused); the result must parse as a Fibery document, and is
+other argument is refused); the result must parse as a Fibery document (the `comments` and `suggestions` sections of a document with inline comments are accepted, never read), and is
 written atomically as `<out_dir>/<key>.json` (`{"v": 1, "key", "fetched_at",
 "text"}`, mode 0600 in a 0700 directory). A failed document does not stop the
 others; the run then fails, naming the keys. Logs carry counts and keys only:
