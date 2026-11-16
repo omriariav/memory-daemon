@@ -84,13 +84,15 @@ alert_urgent_max_age_h: 6
 # Slack send for replies and nudges (a approves a reply, n sends a nudge). Off
 # until set; there is no default. Without it a reply or nudge works only in
 # --demo and nothing is ever sent. One headless Claude call through the
-# daemon's bridge whose ONLY allowed tool is the one below. Its arguments are
-# pinned to the destination and the exact text of the draft (after your edits;
-# trailing whitespace removed, cut at 4000 characters): channel, text and, for
-# a thread, thread_ts; any other argument is denied. The destination is the
+# daemon's bridge whose ONLY allowed tool is the one below, called at most once.
+# Its arguments are pinned to the destination and the exact text of the draft
+# (after your edits; trailing whitespace removed; a text over 4000 characters or
+# with control or bidi-override characters is refused, never cut): channel,
+# text and, for a thread, thread_ts; any other argument is denied. The destination is the
 # item's meta.reply_to ({channel, thread_ts?, message_ts?}, validated), never
 # taken from item text; an item without one cannot be sent to. The confirm
-# modal shows the destination and the full text, then the 5 s undo window
+# modal shows the destination, its channel id and thread, and the full text,
+# then the 5 s undo window
 # opens (q inside it cancels); the run is never retried, and a timeout is
 # reported as "may have been sent, check Slack". A sent item is marked done.
 # `args` maps the three values to YOUR tool's parameter names. Tool names here
@@ -104,6 +106,9 @@ alert_urgent_max_age_h: 6
 #     text: "text"
 #   timeout_s: 90            # 30 to 300
 #   # model: haiku
+#   # A reply to a channel or group WITHOUT a thread would be a top-level post:
+#   # refused unless this is true (a DM needs no thread; nudges follow it too).
+#   allow_channel_posts: false
 #   # Optional read-only check right before the confirm modal: it gets
 #   # {"v": 1, "action": "precheck", "item": {...}, "text": "..."} on stdin (never
 #   # argv) and prints {"v": 1, "ok": true, "warn": "You already replied at 16:40"}.
@@ -117,8 +122,8 @@ alert_urgent_max_age_h: 6
 # (1-9 quick keys), confirm, 5 s undo, then one pinned call with exactly the
 # channel, the message timestamp and the emoji name. The target is
 # meta.reply_to.message_ts, else thread_ts; a valid meta.suggested_reaction is
-# preselected (still confirmed). A successful reaction marks the
-# item done (mark_done: false keeps it). See "Slack reactions" in docs/inbox.md.
+# preselected when it is one of `emojis` (still confirmed). A successful
+# reaction marks the item done (mark_done: false keeps it). See "Slack reactions" in docs/inbox.md.
 # react:
 #   tool: "mcp__slack_connector__add_reaction"
 #   args:
@@ -128,6 +133,7 @@ alert_urgent_max_age_h: 6
 #   emojis: ["eyes", "white_check_mark", "+1", "pray"]   # 1 to 9 names, no colons
 #   timeout_s: 60            # 30 to 300
 #   mark_done: true
+#   allow_suggested: false   # true: a suggestion outside `emojis` is offered too
 #   # model: haiku
 
 # Polish the draft in your tone (P key). Off until set; there is no default.

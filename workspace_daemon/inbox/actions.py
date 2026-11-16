@@ -264,15 +264,18 @@ class LocalActions:
         """What a send of `text` to `item` would do, checked (read-only): a
         `writes.Sendable` with the exact text, the destination label and
         whether the text was cut, or `ok` False with the reason."""
-        plan = writes.send_plan(item.meta, text)
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
         if not plan.ok:
             return plan
         return plan._replace(destination=f"{item.where} ({plan.kind})")
 
+    def _allow_channel_posts(self):
+        return bool(self.send_cfg and self.send_cfg.get("allow_channel_posts"))
+
     def _send(self, item, text, what):
         if not self.supports_send or self.send_cfg is None:
             return Result(False, f"{what} not configured")
-        plan = writes.send_plan(item.meta, text)
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
         if not plan.ok:
             return Result(False, plan.error)
         if not self._send_lock.acquire(blocking=False):
@@ -306,13 +309,18 @@ class LocalActions:
         return writes.react_target(item.meta)
 
     def react_choices(self, item):
-        """`(emojis, preselected)` for the picker: the configured names, and
-        the item's valid `meta.suggested_reaction` (added in front when it
-        is not already listed) preselected."""
+        """`(emojis, preselected)` for the picker: the configured names, with
+        the item's valid `meta.suggested_reaction` preselected when it is one
+        of them. A suggestion outside the list is ignored, unless
+        `react.allow_suggested` is true (then it is added in front and
+        allowed for that item)."""
         emojis = list(self.react_emojis)
         suggested = writes.suggested_reaction(item.meta)
         if suggested is not None and suggested not in emojis:
-            emojis.insert(0, suggested)
+            if self.react_cfg and self.react_cfg.get("allow_suggested"):
+                emojis.insert(0, suggested)
+            else:
+                suggested = None
         return emojis, suggested
 
     def react(self, item, emoji):

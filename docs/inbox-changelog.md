@@ -31,11 +31,30 @@ W Z`).
   timeout or a run cut off by a sleep says "the message may have been sent,
   check Slack"; a guard stop or a tool error says "not sent". A sent item is
   marked done. Only one send runs at a time. The text is exactly the current
-  draft (also after `e` edits) with trailing whitespace removed and cut at 4000
-  characters (the modal says so); an empty draft is refused. The confirm modal
-  shows the destination (`<where> (thread)`, `(DM)` or `(channel)`) and the
-  full text, scrollable and line by line as it will be sent (the old modal
-  joined lines). Spend is logged as `inbox-send`.
+  draft (also after `e` edits) with trailing whitespace removed; it is refused,
+  never cut, when it is empty, over 4000 characters ("the text is N characters;
+  the limit is 4000; edit it first") or holds a control or bidi-override
+  character (editor text is cleaned like any draft). The confirm modal shows
+  the destination (`<where> (thread)` or `(DM)`), the real channel id and
+  thread timestamp, and the full text, scrollable and line by line as it will
+  be sent (the old modal joined lines). Spend is logged as `inbox-send`.
+- `send.allow_channel_posts` (default `false`): a reply to a channel or group
+  (`C`, `G`) without a `thread_ts` would be a top-level post and is refused
+  ("would post to the channel, not a thread"), for nudges too; a DM (`D`)
+  needs no thread. `true` allows it (labelled `(channel)`). Checked when the
+  modal would open and again when the send runs.
+- A write can no longer run twice. `call_tools(..., max_calls=None)` caps the
+  allowed calls of each pinned tool in a run (default unchanged for the
+  daemon); send, react and RSVP pass `1`. The hook claims one marker file per
+  allowed call in the 0700 run directory and denies the next; the stream
+  re-check fails a run in which a call beyond the cap ran. A real send is never
+  reported as "not sent": when one result confirms it and another does not the
+  toast says "sent at least once; check Slack", and a plain-text reply that
+  reads like an error (and carries no Slack timestamp) is "unconfirmed: may not
+  have been sent; check Slack".
+- Quitting while a send, nudge or reaction runs: the exit message says it "may
+  have been sent, check Slack", the audit row reads "running at quit", and when
+  the call ends one line goes to stderr and the row is closed.
 - `meta.reply_to = {channel, thread_ts?, message_ts?}`: the documented source of
   a send's destination (`channel` `^[CDG][A-Z0-9]{8,12}$`, timestamps
   `^\d{9,11}\.\d{6}$`, a wrong format makes it invalid; never read from item
@@ -51,8 +70,9 @@ W Z`).
   `white_check_mark`, `+1`, `pray`), timeout_s, model, mark_done (default
   true)}`. Emoji picker, confirm, undo, then one pinned call (`exact_args`,
   never retried) on `meta.reply_to.message_ts`, else `thread_ts`. A valid
-  `meta.suggested_reaction` is preselected in the picker (still confirmed).
-  Spend is logged as `inbox-react`.
+  `meta.suggested_reaction` that is one of the `emojis` is preselected in the
+  picker (still confirmed); one outside the list is ignored unless
+  `react.allow_suggested: true`. Spend is logged as `inbox-react`.
 - `polish:` (no default) and `P`: `{mcp_config, tone_tool, tone_args, model
   (default sonnet), timeout_s, max_budget_usd (default 0.05), cache_h (default
   24)}`. One read-only tone call pinned to `tone_tool` and `tone_args` on the MCP
@@ -60,19 +80,27 @@ W Z`).
   (0600 in a 0700 directory), then a no-tools, one-turn rewrite
   (`claude_bridge.complete`, usage tag `inbox-polish`) that keeps meaning,
   facts, names, numbers and language. The draft, up to the last 10 thread
-  messages and the tone text are data between random-token markers. A modal
-  shows old and new; accept replaces the draft, edit opens the editor with the
-  new text, cancel (the default) changes nothing. Polish never sends.
+  messages and the tone text are data between random-token markers. The
+  rewrite also passes `--strict-mcp-config` with no config file (no MCP server
+  loads; `complete(..., strict_mcp=True)`, default off for other callers). A
+  modal shows old and new; accept replaces the draft, edit opens the editor with
+  the new text, cancel (the default) changes nothing; both re-check that the
+  draft did not change while the review was open. Polish never sends.
 - Bridge: `call_tools(..., mcp_config=None)`. A path (absolute, an existing
-  regular file you own with no group or other access, opened with `O_NOFOLLOW`
-  and judged with `fstat`) adds `--mcp-config <path> --strict-mcp-config`; the
-  allowlist hook and the stream re-check still restrict the run to the pinned
-  tools. The default leaves the argv unchanged.
+  regular file you own with no group or other access, up to 1 MB, opened with
+  `O_NOFOLLOW` and judged with `fstat`) adds `--mcp-config <copy>
+  --strict-mcp-config`, where the copy is a 0600 file in the run's private
+  directory written from the bytes read from that same checked descriptor (no
+  check-then-use gap); the allowlist hook and the stream re-check still
+  restrict the run to the pinned tools. The default leaves the argv unchanged.
 - Mail items from the `events` source show more. The daemon records, for Gmail
   captures, `details.mail_from` (display name only, never an address, 80
-  characters), `mail_subject` (200), `mail_snippet` (300; only when the source
-  gives one: the `gws` path does when its read has it, the connector path
-  does not) and `mail_thread_id`, all cleaned plain text and never a body. The
+  characters; a value with an `@`, also the fullwidth one, is dropped),
+  `mail_subject` (200), `mail_snippet` (300; Gmail's own snippet, a short
+  excerpt of the body; only when the source gives one: the `gws` path does
+  when its read has it, the connector path does not; it rides beside the item
+  and is not written to note frontmatter) and `mail_thread_id`, all cleaned
+  plain text. The
   item gets `sender` = `mail_from`, `where` = the subject, a one-message thread
   from the snippet and a Gmail thread link from `mail_thread_id` and
   `gmail_account`; the gist is unchanged and an event without these fields

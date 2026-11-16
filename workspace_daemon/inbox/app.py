@@ -1,6 +1,7 @@
 """The inbox TUI app. Needs Textual; import it only through `cli.run`."""
 import asyncio
 import inspect
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from textual.widgets import Input, Static, TextArea
 
 from . import bidi, customactions, invites, themes
 from . import context as ctxmod
+from . import items as itm_items
 from . import polish as polishmod
 from . import writes as writes_mod
 from . import summary as summod
@@ -785,9 +787,12 @@ class InboxApp(App):
     def end_edit(self, save):
         it = self.current
         ta = self.query_one("#draft-edit", TextArea)
-        if save and it is not None and ta.text != it.draft:
-            it.draft, it.streamed = ta.text, True
-            self.record("edit", it, f"{len(ta.text)} chars", "saved")
+        # Editor text is cleaned the way drafts are (controls and bidi
+        # overrides removed), so what is shown is what can be sent.
+        text = itm_items.clean_text(ta.text)
+        if save and it is not None and text != it.draft:
+            it.draft, it.streamed = text, True
+            self.record("edit", it, f"{len(text)} chars", "saved")
         ta.read_only = True
         ta.remove_class("on")
         self.query_one("#draft-scroll").display = True
@@ -883,7 +888,10 @@ class InboxApp(App):
         except Exception as exc:  # a failing store must not kill the app
             res = Result(False, f"{type(exc).__name__}: {exc}")
         if self._quitting:
-            return  # the app is gone; the mark (if any) is already written
+            # The app is gone; the mark (if any) is already written. A Slack
+            # write that was still running says how it ended.
+            self._late_report(p, res)
+            return
         if p.kind in ("action", "send", "nudge", "react"):
             # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
@@ -891,6 +899,21 @@ class InboxApp(App):
         try:
             self.call_from_thread(self._committed, p, res)
         except Exception:  # the app quit between the check and the call
+            pass
+
+    def _late_report(self, p, res):
+        """A send, nudge or reaction that finished after the app began to
+        quit: close its audit row and print one line to stderr."""
+        if p.kind not in SEND_KINDS and p.kind != "react":
+            return
+        p.audit["status"] = "committed" if res.ok else "failed"
+        p.audit["detail"] = (p.audit["detail"] + " · " + (res.detail or "done")
+                             ).strip(" ·")
+        try:
+            print(f"inbox: {p.label}: "
+                  f"{'done' if res.ok else 'failed'}"
+                  f"{': ' + res.detail if res.detail else ''}", file=sys.stderr)
+        except (OSError, ValueError):
             pass
 
     def _committed(self, p, res):
@@ -1031,7 +1054,7 @@ class InboxApp(App):
         if not text.strip():
             self.notify("No draft to send. Press e to write one.", timeout=3, severity="warning", markup=False)
             return
-        dest, note = it.destination, ""
+        dest, note, route = it.destination, "", ""
         if self._real_send():
             if self._send_busy():
                 self.notify("A send is already in progress; wait for it "
@@ -1043,17 +1066,15 @@ class InboxApp(App):
                 self.record(kind, it, plan.error, "refused")
                 self.notify(plan.error, timeout=6, severity="warning", markup=False)
                 return
-            text, dest = plan.text, plan.destination
-            if plan.cut:
-                note = (f"The text was cut to {len(text)} characters "
-                        "(the limit); only this is sent.")
+            text, dest, route = plan.text, plan.destination, plan.route
 
         if self._real_send() and getattr(self.actions, "precheck_configured", False):
-            self._precheck_begin(kind, it, verb, text, dest, note)
+            self._precheck_begin(kind, it, verb, text, dest, note, route)
             return
-        self._open_confirm_send(kind, it, verb, text, dest, note)
+        self._open_confirm_send(kind, it, verb, text, dest, note, "", route)
 
-    def _open_confirm_send(self, kind, it, verb, text, dest, note, warn=""):
+    def _open_confirm_send(self, kind, it, verb, text, dest, note, warn="",
+                           route=""):
         def after(ok):
             if ok:
                 self._enqueue(kind, it, f"{verb}: {dest}", text=text,
@@ -1061,10 +1082,11 @@ class InboxApp(App):
             else:
                 self.record(kind, it, "cancelled at confirm", "cancelled")
                 self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
-        self.push_screen(ConfirmSend(verb, dest, text, self.bidi, note, warn), after)
+        self.push_screen(ConfirmSend(verb, dest, text, self.bidi, note, warn,
+                                     route), after)
 
     # ---------- the optional send precheck (read-only advice) ----------
-    def _precheck_begin(self, kind, it, verb, text, dest, note):
+    def _precheck_begin(self, kind, it, verb, text, dest, note, route=""):
         """Run `send.precheck` in a thread (modal "checking", esc cancels the
         whole send), then open the confirm modal with its warning."""
         self._pre_gen += 1
@@ -1080,7 +1102,8 @@ class InboxApp(App):
         # when the check is cancelled or the app quits, so it ends.
         threading.Thread(
             target=self._precheck_thread,
-            args=(kind, it, verb, text, dest, note, it.draft, gen, cancel),
+            args=(kind, it, verb, text, dest, note, route, it.draft, gen,
+                  cancel),
             name="inbox-precheck").start()
 
     def _precheck_cancel(self, gen, kind, it):
@@ -1092,8 +1115,8 @@ class InboxApp(App):
             self.record(kind, it, "cancelled at precheck", "cancelled")
             self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
 
-    def _precheck_thread(self, kind, it, verb, text, dest, note, draft, gen,
-                         cancel):
+    def _precheck_thread(self, kind, it, verb, text, dest, note, route, draft,
+                         gen, cancel):
         try:
             out = self.actions.send_precheck(it, text, cancel=cancel)
         except Exception:  # a backend bug must not end the session
@@ -1101,9 +1124,10 @@ class InboxApp(App):
         if self._quitting:
             return
         self._post(self._precheck_done, kind, it, verb, text, dest, note,
-                   draft, gen, out)
+                   route, draft, gen, out)
 
-    def _precheck_done(self, kind, it, verb, text, dest, note, draft, gen, out):
+    def _precheck_done(self, kind, it, verb, text, dest, note, route, draft,
+                       gen, out):
         """UI thread: the check finished (a failed one never blocks the
         send). A cancelled one is dropped."""
         self.busy = max(0, self.busy - 1)
@@ -1128,7 +1152,7 @@ class InboxApp(App):
         if warn:
             self.record(kind, it, f"precheck: {warn}",
                         "check failed" if out.failed and not out.warn else "warned")
-        self._open_confirm_send(kind, it, verb, text, dest, note, warn)
+        self._open_confirm_send(kind, it, verb, text, dest, note, warn, route)
 
     # ---------- react and polish (0.6.0, opt-in) ----------
     def action_react(self):
@@ -1268,10 +1292,12 @@ class InboxApp(App):
                 self.notify("Cancelled. The draft is unchanged.", timeout=2,
                             markup=False)
                 return
-            if now is None or now is not self.current:
-                self.record("polish", it, "selection changed", "discarded")
-                self.notify("The selection changed; the result was discarded.",
-                            severity="warning", timeout=4, markup=False)
+            if now is None or now is not self.current or now.draft != draft:
+                self.record("polish", it, "draft or selection changed",
+                            "discarded")
+                self.notify("The draft or the selection changed; the result "
+                            "was discarded.", severity="warning", timeout=4,
+                            markup=False)
                 return
             if choice == "accept":
                 now.draft, now.streamed = out.text, True
@@ -2050,6 +2076,13 @@ class InboxApp(App):
         if self.running:
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
+        for p in self.running:
+            if p.kind in SEND_KINDS or p.kind == "react":
+                p.audit["status"] = "running at quit"
+                p.audit["detail"] = (p.audit["detail"]
+                                     + " · may have been sent").strip(" ·")
+                parts.append(f"{p.label}: still running; it may have been "
+                             "sent, check Slack.")
         if self._sum_running is not None:
             parts.append("The summary is still finishing; the process exits "
                          "when it ends.")

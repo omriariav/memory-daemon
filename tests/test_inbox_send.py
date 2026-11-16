@@ -37,8 +37,8 @@ SIZE = (150, 42)
 DEFAULTS = {"poll_interval_s": 300.0, "theme": "dark", "bidi_mode": "logical"}
 
 
-def cfg():
-    return settings.validate({"send": SEND_BLOCK})["send"]
+def cfg(**over):
+    return settings.validate({"send": dict(SEND_BLOCK, **over)})["send"]
 
 
 def reply_item(i=1, reply_to=None, draft="Thanks, on it.", kind="reply",
@@ -128,15 +128,32 @@ class SendTextTest(unittest.TestCase):
 
     def test_empty_is_refused(self):
         for bad in ("", "   ", "\n\t\n", None, 5):
-            text, cut, error = writes.send_text(bad)
-            self.assertEqual((text, cut), ("", False), repr(bad))
+            text, error = writes.send_text(bad)
+            self.assertEqual(text, "", repr(bad))
             self.assertTrue(error, repr(bad))
 
-    def test_cap_at_4000(self):
-        text, cut, error = writes.send_text("x" * 4000)
-        self.assertEqual((len(text), cut, error), (4000, False, ""))
-        text, cut, error = writes.send_text("x" * 4001 + "  ")
-        self.assertEqual((len(text), cut, error), (4000, True, ""))
+    def test_the_limit_is_4000_and_a_longer_text_is_refused_never_cut(self):
+        text, error = writes.send_text("x" * 4000 + "   \n")
+        self.assertEqual((len(text), error), (4000, ""))
+        text, error = writes.send_text("x" * 4001 + "  ")
+        self.assertEqual(text, "")
+        self.assertEqual(error, "the text is 4001 characters; the limit is "
+                                "4000; edit it first")
+        plan = writes.send_plan({"reply_to": {"channel": DM}}, "y" * 4500)
+        self.assertFalse(plan.ok)
+        self.assertIn("4500 characters; the limit is 4000; edit it first",
+                      plan.error)
+        self.assertFalse(hasattr(plan, "cut"))
+
+    def test_control_and_bidi_override_characters_are_refused(self):
+        for bad in ("a\x00b", "a\x1bb", "a\x07b", "a\rb", "a\x7fb", "a\x85b",
+                    "a\u202eb", "a\u202ab", "a\u2066b", "a\u2069b"):
+            text, error = writes.send_text(bad)
+            self.assertEqual(text, "", repr(bad))
+            self.assertIn("control or bidi-override character", error)
+            self.assertIn("U+", error)
+        for fine in ("tab\there", "two\nlines", "שלום\u200f עולם", "x\u200ey"):
+            self.assertEqual(writes.send_text(fine)[1], "", repr(fine))
 
     def test_hebrew_and_unicode_pass_through(self):
         self.assertEqual(writes.send_text("שלום עולם 👍 \n")[0], "שלום עולם 👍")
@@ -144,7 +161,8 @@ class SendTextTest(unittest.TestCase):
     def test_plan_needs_destination_and_text(self):
         good = writes.send_plan({"reply_to": {"channel": DM}}, "hi")
         self.assertTrue(good.ok)
-        self.assertEqual((good.text, good.kind, good.cut), ("hi", "DM", False))
+        self.assertEqual((good.text, good.kind), ("hi", "DM"))
+        self.assertEqual(good.route, DM + " · no thread")
         for plan in (writes.send_plan({}, "hi"),
                      writes.send_plan({"reply_to": {"channel": DM}}, " ")):
             self.assertFalse(plan.ok)
@@ -166,6 +184,14 @@ class SendSettingsTest(unittest.TestCase):
                                           if k != "timeout_s"}})["send"]
         self.assertEqual((out["timeout_s"], out["model"]), (90.0, "haiku"))
         self.assertEqual(out["args"], SEND_BLOCK["args"])
+
+    def test_allow_channel_posts_defaults_false_and_is_a_bool(self):
+        self.assertFalse(cfg()["allow_channel_posts"])
+        self.assertTrue(settings.validate({"send": dict(
+            SEND_BLOCK, allow_channel_posts=True)})["send"]["allow_channel_posts"])
+        for bad in ("yes", 1, None, []):
+            self.assertIn("send.allow_channel_posts",
+                          self.problems(dict(SEND_BLOCK, allow_channel_posts=bad)))
 
     def test_timeout_range(self):
         for ok in (30, 300, 90.5):
@@ -360,6 +386,128 @@ class RunSendTest(unittest.TestCase):
         self.assertEqual(seen, ["inbox-send"])
 
 
+class ChannelPostTest(unittest.TestCase):
+    """A reply to a channel or group without a thread would be a top-level
+    post: refused unless send.allow_channel_posts."""
+
+    def plan(self, channel, thread=None, allow=False, text="hi"):
+        rt = {"channel": channel}
+        if thread:
+            rt["thread_ts"] = thread
+        return writes.send_plan({"reply_to": rt}, text, allow)
+
+    def test_refused_by_default_for_channels_and_groups(self):
+        for channel in (CHANNEL, "G0EXAMPLE01"):
+            plan = self.plan(channel)
+            self.assertFalse(plan.ok, channel)
+            self.assertIn("would post to the channel, not a thread", plan.error)
+            self.assertIn("allow_channel_posts", plan.error)
+
+    def test_a_thread_a_dm_and_the_opt_in_are_allowed(self):
+        self.assertTrue(self.plan(CHANNEL, THREAD).ok)
+        self.assertTrue(self.plan("G0EXAMPLE01", THREAD).ok)
+        self.assertTrue(self.plan(DM).ok)                    # a DM needs no thread
+        self.assertEqual(self.plan(DM).kind, "DM")
+        for channel in (CHANNEL, "G0EXAMPLE01"):
+            plan = self.plan(channel, allow=True)
+            self.assertTrue(plan.ok)
+            self.assertEqual(plan.kind, "channel")
+
+    def test_local_actions_checks_it_in_the_plan_and_again_in_send(self):
+        store = InboxStore(None)
+        calls = []
+        row = models.from_v1(reply_item(1, reply_to={"channel": CHANNEL}))
+        strict = LocalActions(store, send=cfg(), base_dir="/b",
+                              call_tools=good_call(calls))
+        self.assertFalse(strict.send_plan(row, "hi").ok)
+        res = strict.send(row, "hi")                 # a caller that skipped the plan
+        self.assertFalse(res.ok)
+        self.assertIn("not a thread", res.detail)
+        self.assertEqual(calls, [])
+        self.assertFalse(store.is_hidden(row.key))
+        nudge = models.from_v1(reply_item(2, reply_to={"channel": CHANNEL},
+                                          kind="nudge"))
+        self.assertFalse(strict.nudge(nudge, "hi").ok)
+        self.assertEqual(calls, [])
+        loose = LocalActions(store, send=cfg(allow_channel_posts=True),
+                             base_dir="/b", call_tools=good_call(calls))
+        self.assertTrue(loose.send_plan(row, "hi").ok)
+        self.assertTrue(loose.send(row, "hi").ok)
+        self.assertEqual(calls[0][1][TOOL], {"ch": CHANNEL, "txt": "hi"})
+
+
+class MaxCallsAndMessagesTest(unittest.TestCase):
+    """A write is capped at one allowed call, and a real send is never
+    reported as "not sent"."""
+
+    def target(self):
+        return writes.reply_to({"reply_to": {"channel": CHANNEL,
+                                             "thread_ts": THREAD}})
+
+    def test_every_pinned_write_asks_the_bridge_for_one_call(self):
+        calls = []
+        writes.run_send(cfg(), "/b", self.target(), "x", call_tools=good_call(calls))
+        self.assertEqual(calls[0][2]["max_calls"], 1)
+        rsvp = settings.validate({"rsvp": {
+            "tool": "mcp__calendar_connector__respond_to_event",
+            "args": {"event_id": "eid", "calendar_id": "cid", "response": "resp"}}})
+        seen = []
+
+        def call(prompt, tools, **kw):
+            seen.append(kw)
+            (name, pins), = tools.items()
+            return [{"name": name, "input": dict(pins), "text": "ok",
+                     "is_error": False}]
+        writes.run_rsvp(rsvp["rsvp"], "/b", "ev1", "me@example.com", "accepted",
+                        call_tools=call)
+        self.assertEqual(seen[0]["max_calls"], 1)
+
+    def rows(self, *texts):
+        pins = writes.send_pins(cfg(), self.target(), "x")
+        return lambda p, t, **k: [{"name": TOOL, "input": dict(pins[TOOL]),
+                                   "text": text, "is_error": False}
+                                  for text in texts]
+
+    def test_a_success_followed_by_a_failure_says_sent_at_least_once(self):
+        for texts in (("Message sent", '{"ok": false}'),
+                      ('{"ok": true, "ts": "1893492000.000100"}', '{"error": "x"}'),
+                      ('{"ok": false}', "Message sent"),
+                      ("Message sent", "Error: not_in_channel")):
+            out = writes.run_send(cfg(), "/b", self.target(), "x",
+                                  call_tools=self.rows(*texts))
+            self.assertTrue(out.ok, texts)
+            self.assertIn("sent at least once; check Slack", out.detail)
+            self.assertNotIn("not sent", out.detail)
+
+    def test_only_failures_still_say_not_sent(self):
+        out = writes.run_send(cfg(), "/b", self.target(), "x",
+                              call_tools=self.rows('{"ok": false}', '{"error": "x"}'))
+        self.assertFalse(out.ok)
+        self.assertTrue(out.detail.endswith("not sent"))
+
+    def test_a_plain_error_reply_is_unconfirmed_not_success(self):
+        for text in ("Error: channel_not_found", "failed to send", "not_in_channel",
+                     "Request denied", "Rate limited, try later"):
+            out = writes.run_send(cfg(), "/b", self.target(), "x",
+                                  call_tools=self.rows(text))
+            self.assertFalse(out.ok, text)
+            self.assertIn("looks like an error", out.detail)
+            self.assertIn("may not have been sent; check Slack", out.detail)
+        for text in ("Message sent", "OK", "Done.", "posted",
+                     "Sent: ts 1893492000.000100",
+                     "error handling doc posted, ts=1893492000.000100",
+                     '{"ok": true}', '{"result": "queued"}', ""):
+            self.assertTrue(writes.run_send(cfg(), "/b", self.target(), "x",
+                                            call_tools=self.rows(text)).ok, text)
+
+    def test_reply_state(self):
+        self.assertEqual(writes.reply_state('{"ok": false}'), "failed")
+        self.assertEqual(writes.reply_state('{"error": "boom"}'), "failed")
+        self.assertEqual(writes.reply_state("Error: nope"), "unconfirmed")
+        self.assertEqual(writes.reply_state('{"ok": true}'), "ok")
+        self.assertEqual(writes.reply_state(None), "ok")
+
+
 class LocalActionsSendTest(unittest.TestCase):
     def setUp(self):
         self.store = InboxStore(None)
@@ -410,10 +558,20 @@ class LocalActionsSendTest(unittest.TestCase):
         self.assertEqual(called, [])
         self.assertFalse(self.store.is_hidden(bare.key))
 
-    def test_a_text_over_the_cap_is_cut_in_the_call(self):
+    def test_a_text_over_the_limit_is_refused_without_a_call(self):
         calls = []
-        self.actions(good_call(calls)).send(self.item, "y" * 5000)
-        self.assertEqual(len(calls[0][1][TOOL]["txt"]), 4000)
+        res = self.actions(good_call(calls)).send(self.item, "y" * 5000)
+        self.assertFalse(res.ok)
+        self.assertIn("5000 characters; the limit is 4000", res.detail)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.store.is_hidden(self.item.key))
+
+    def test_a_control_character_never_reaches_the_bridge(self):
+        calls = []
+        res = self.actions(good_call(calls)).send(self.item, "hi\u202e there")
+        self.assertFalse(res.ok)
+        self.assertIn("bidi-override", res.detail)
+        self.assertEqual(calls, [])
 
     def test_nudge_uses_the_same_path(self):
         calls = []
@@ -454,8 +612,9 @@ class LocalActionsSendTest(unittest.TestCase):
         acts = self.actions()
         plan = acts.send_plan(self.item, "hi  ")
         self.assertTrue(plan.ok)
-        self.assertEqual((plan.text, plan.destination, plan.cut),
-                         ("hi", "#launch (thread)", False))
+        self.assertEqual((plan.text, plan.destination),
+                         ("hi", "#launch (thread)"))
+        self.assertEqual(plan.route, f"{CHANNEL} · thread {THREAD}")
         dm = models.from_v1(reply_item(2, reply_to={"channel": DM}, where="Ann"))
         self.assertEqual(acts.send_plan(dm, "hi").destination, "Ann (DM)")
         # `where` and the thread text say another channel: ignored.
@@ -843,7 +1002,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.2)
             self.assertEqual(app.pending, [])
 
-    async def test_a_text_over_4000_is_cut_and_the_modal_says_so(self):
+    async def test_a_text_over_4000_is_refused_with_the_count_and_opens_no_modal(self):
         store = InboxStore(None)
         calls = []
         app = make_app([reply_item(1, draft="z" * 4300)],
@@ -852,12 +1011,85 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await pilot.press("a")
             await pilot.pause(0.3)
-            self.assertEqual(len(app.screen.text), 4000)
-            self.assertIn("cut to 4000", str(
-                app.screen.query_one("#confirm-note").render()))
-            await pilot.press("y")
-            self.assertTrue(await wait_for(pilot, lambda: calls))
-            self.assertEqual(len(calls[0][1][TOOL]["txt"]), 4000)
+            self.assertNotIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(any(
+                "4300 characters; the limit is 4000; edit it first" in t
+                for t in toasts(app)))
+            self.assertEqual((app.pending, calls), ([], []))
+            self.assertIn("refused", [r["status"] for r in app.audit])
+
+    async def test_the_modal_shows_the_real_destination_not_just_where(self):
+        store = InboxStore(None)
+        app = make_app([reply_item(1)], real_actions(store), store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("a")
+            await pilot.pause(0.3)
+            route = str(app.screen.query_one("#confirm-route").render())
+            self.assertIn(CHANNEL, route)
+            self.assertIn(f"thread {THREAD}", route)
+            self.assertIn("#launch (thread)", str(
+                app.screen.query_one("#confirm-dest").render()))
+
+    async def test_editor_text_is_cleaned_like_a_draft(self):
+        store = InboxStore(None)
+        calls = []
+        app = make_app([reply_item(1, draft="old")],
+                       real_actions(store, good_call(calls)), store, undo_s=0.1)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("e")
+            await pilot.pause(0.1)
+            app.query_one("#draft-edit").text = "safe\u202e text\x07 here\r\nnext"
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.1)
+            self.assertEqual(app.current.draft, "safe text here\nnext")
+            await pilot.press("a")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertEqual(app.screen.text, "safe text here\nnext")
+
+    async def test_a_channel_post_without_a_thread_is_refused_by_default(self):
+        store = InboxStore(None)
+        calls = []
+        rows = [reply_item(1, reply_to={"channel": CHANNEL}),
+                reply_item(2, reply_to={"channel": "G0EXAMPLE01"}),
+                reply_item(3, reply_to={"channel": CHANNEL}, kind="nudge")]
+        app = make_app(rows, real_actions(store, good_call(calls)), store,
+                       undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for key in ("t:1", "t:2", "t:3"):
+                app.current_key = key
+                app.redraw(keep=key)
+                await pilot.pause(0.1)
+                await pilot.press("n" if key == "t:3" else "a")
+                await pilot.pause(0.2)
+                self.assertNotIsInstance(app.screen, ConfirmSend, key)
+            self.assertTrue(any("would post to the channel, not a thread" in t
+                                for t in toasts(app)))
+            self.assertEqual((app.pending, calls), ([], []))
+
+    async def test_a_dm_without_a_thread_and_an_opted_in_channel_post_are_allowed(self):
+        store = InboxStore(None)
+        calls = []
+        acts = LocalActions(store, send=cfg(allow_channel_posts=True),
+                            base_dir="/base", call_tools=good_call(calls))
+        rows = [reply_item(1, reply_to={"channel": DM}, where="Ann"),
+                reply_item(2, reply_to={"channel": CHANNEL})]
+        app = make_app(rows, acts, store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for key, label in (("t:1", "Ann (DM)"), ("t:2", "#launch (channel)")):
+                app.current_key = key
+                app.redraw(keep=key)
+                await pilot.pause(0.1)
+                await pilot.press("a")
+                await pilot.pause(0.3)
+                self.assertIsInstance(app.screen, ConfirmSend, key)
+                self.assertEqual(app.screen.destination, label)
+                await pilot.press("escape")
+                await pilot.pause(0.2)
 
     async def test_an_item_without_a_valid_reply_to_says_so_and_opens_nothing(self):
         store = InboxStore(None)
@@ -964,6 +1196,46 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("q")
                 await pilot.pause(0.2)
                 self.assertTrue(app._exit)
+        finally:
+            gate.set()
+
+    async def test_quitting_during_a_send_says_it_may_have_been_sent_then_reports(self):
+        import contextlib
+        import io
+        store = InboxStore(None)
+        gate, started = threading.Event(), threading.Event()
+        err = io.StringIO()
+
+        def slow(prompt, tools, **kw):
+            started.set()
+            gate.wait(10)
+            return good_call()(prompt, tools, **kw)
+        app = make_app([reply_item(1)], real_actions(store, slow), store,
+                       undo_s=0.15)
+        try:
+            with contextlib.redirect_stderr(err):
+                async with app.run_test(size=SIZE) as pilot:
+                    await settle(pilot, app)
+                    await pilot.press("a")
+                    await pilot.pause(0.2)
+                    await pilot.press("y")
+                    self.assertTrue(await wait_for(pilot, started.is_set))
+                    await pilot.press("q")
+                    await pilot.pause(0.2)
+                    await pilot.press("q")              # quit with the send running
+                    await pilot.pause(0.3)
+                    self.assertTrue(app._exit)
+                    row = next(r for r in app.audit if r["action"] == "send")
+                    self.assertEqual(row["status"], "running at quit")
+                    self.assertIn("may have been sent", row["detail"])
+                    said = " ".join(str(x) for x in app._exit_renderables)
+                    self.assertIn("may have been sent, check Slack", said)
+                    self.assertIn("#launch (thread)", said)
+                    gate.set()
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: row["status"] == "committed", tries=200))
+            self.assertIn("inbox: Send reply: #launch (thread): done", err.getvalue())
+            self.assertIn("committed", row["status"])
         finally:
             gate.set()
 

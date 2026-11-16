@@ -124,7 +124,7 @@ class EventsMappingTest(unittest.TestCase):
             "mail_snippet": "t" * 500}, "gmail:abcdef0123456780")
         bad["details"]["mail_from"] = "Ann <ann@example.com>"
         addr = self.mail_event({"mail_from": "x"}, "gmail:abcdef0123456781")
-        addr["details"]["mail_from"] = "ann@example.com"
+        addr["details"]["mail_from"] = "ann\uff20example.com"
         write_events(self.base, [bad, addr])
         got = {i["id"]: i for i in self.load().items}
         shown = [i for i in got.values() if i["where"] != "Only this"]

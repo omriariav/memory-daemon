@@ -40,10 +40,12 @@ class ConfirmSend(ModalScreen):
     INNER = 64
 
     def __init__(self, verb, destination, text, visual=False, note="",
-                 warn=""):
+                 warn="", route=""):
+        """`route` is the real destination (channel id and thread timestamp),
+        shown under the `destination` label."""
         super().__init__()
         self.verb, self.destination, self.text, self.visual = verb, destination, text, visual
-        self.note, self.warn = note, warn
+        self.note, self.warn, self.route = note, warn, route
 
     def compose(self) -> ComposeResult:
         body = Text()
@@ -57,6 +59,9 @@ class ConfirmSend(ModalScreen):
         with Vertical(id="confirm"):
             yield Static(Text(self.verb, Style(bold=True)), id="confirm-title")
             yield Static(dest, id="confirm-dest")
+            if self.route:
+                yield Static(Text("Slack  " + self.route, Style(dim=True)),
+                             id="confirm-route")
             if self.warn:
                 yield Static(Text("⚠ " + self.warn, Style(bold=True, color="yellow")),
                              id="confirm-warn")

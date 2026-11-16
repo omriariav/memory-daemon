@@ -195,7 +195,7 @@ class FetchToneTest(unittest.TestCase):
         (prompt, tools, kw), = calls
         self.assertEqual(tools, {TONE_TOOL: {"profile": "work-chat"}})
         self.assertIs(kw["exact_args"], True)
-        self.assertEqual(kw["attempts"], 1)
+        self.assertEqual((kw["attempts"], kw["max_calls"]), (1, 1))
         self.assertEqual(kw["mcp_config"], MCP_FILE)
         self.assertEqual((kw["model"], kw["timeout"], kw["max_budget_usd"]),
                          ("sonnet", 120.0, 0.05))
@@ -296,7 +296,9 @@ class FetchToneTest(unittest.TestCase):
         self.assertTrue(tone.ok, tone.detail)
         self.assertEqual(tone.text, TONE_TEXT)
         cmd = seen[0]
-        self.assertEqual(cmd[cmd.index("--mcp-config") + 1], str(path))
+        copy = cmd[cmd.index("--mcp-config") + 1]
+        self.assertTrue(copy.endswith("/mcp-config.json"))   # a private copy
+        self.assertNotEqual(copy, str(path))
         self.assertIn("--strict-mcp-config", cmd)
         self.assertEqual(cmd[cmd.index("--allowedTools") + 1],
                          f"ToolSearch,{TONE_TOOL}")
@@ -390,6 +392,7 @@ class RunPolishTest(unittest.TestCase):
                          ("sonnet", 120.0, 0.05))
         for forbidden in ("tools", "mcp_config", "exact_args", "required"):
             self.assertNotIn(forbidden, kw)
+        self.assertIs(kw["strict_mcp"], True)        # no MCP server loads
         self.assertIn("hey can u send the report", prompt)
         self.assertIn("Where is the report?", prompt)
         self.assertIn(TONE_TEXT, prompt)
@@ -412,6 +415,7 @@ class RunPolishTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--allowedTools") + 1], "")
         self.assertEqual(cmd[cmd.index("--max-turns") + 1], "1")
         self.assertNotIn("--mcp-config", cmd)
+        self.assertEqual(cmd.count("--strict-mcp-config"), 1)
         self.assertIn("hey", prompt)
         self.assertNotIn("hey", " ".join(cmd))
 
@@ -754,6 +758,21 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current.draft, "changed meanwhile")
         finally:
             acts.gate.set()
+
+    async def test_accept_and_edit_recheck_that_the_draft_did_not_change(self):
+        for key in ("a", "e"):
+            acts = Scripted()
+            app = make_app([item(1)], acts)
+            async with app.run_test(size=SIZE) as pilot:
+                await self.to_review(pilot, app)
+                app.current.draft = "changed while the review was open"
+                await pilot.press(key)
+                await pilot.pause(0.3)
+                self.assertEqual(app.current.draft,
+                                 "changed while the review was open", key)
+                self.assertFalse(app.editing, key)
+                self.assertTrue(any("discarded" in t for t in toasts(app)), key)
+                self.assertIn("discarded", [r["status"] for r in app.audit])
 
     async def test_old_and_new_text_are_plain_text(self):
         acts = Scripted()

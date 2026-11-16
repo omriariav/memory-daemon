@@ -7,12 +7,14 @@ Two steps, both through the Claude bridge:
 1. Tone guidance. ONE `call_tools` run, read-only, whose only allowed tool is
    `polish.tone_tool` with its arguments pinned to `polish.tone_args`
    (`exact_args=True`, `attempts=1`). The MCP server comes from the separate
-   `polish.mcp_config` file (`--mcp-config <file> --strict-mcp-config`), so it
+   `polish.mcp_config` file (a private copy of its checked bytes, passed as
+   `--mcp-config <copy> --strict-mcp-config`), so it
    does not have to be one of your everyday connectors. The tool's text result
    is cached on disk (`state/inbox-polish/tone.json`, mode 0600 in a 0700
    directory of its own) keyed by the tool and its arguments, for `cache_h`
    hours.
-2. Rewrite. `claude_bridge.complete`: NO tools, `max_turns=1`; the bridge's
+2. Rewrite. `claude_bridge.complete`: NO tools, `max_turns=1`, and
+   `--strict-mcp-config` with no servers (`strict_mcp=True`); the bridge's
    guards (`state/PAUSED`, the daily budget) apply and spend is logged under
    the usage tag `inbox-polish`. The prompt asks for the same meaning, facts,
    names, numbers and language (Hebrew stays Hebrew) in the guided tone, and
@@ -178,7 +180,8 @@ def fetch_tone(cfg, base_dir, call_tools=None, cache=None, now=None):
                 tone_prompt(cfg), pins, model=cfg["model"], base_dir=base_dir,
                 max_turns=TONE_TURNS, max_budget_usd=cfg["max_budget_usd"],
                 timeout=cfg["timeout_s"], attempts=1, exact_args=True,
-                accept_partial=True, mcp_config=cfg["mcp_config"])
+                accept_partial=True, mcp_config=cfg["mcp_config"],
+                max_calls=1)
     except claude_bridge.BridgeError as exc:
         return Tone(False, "", "tone guidance: " + itm.truncate(
             itm.clean_line(exc), DETAIL_MAX))
@@ -267,7 +270,7 @@ def run_polish(cfg, base_dir, item, draft, call_tools=None, complete=None,
         with claude_bridge.usage_scope(USAGE_TAG):
             raw = call(prompt, model=cfg["model"], base_dir=base_dir,
                        max_turns=1, max_budget_usd=cfg["max_budget_usd"],
-                       timeout=cfg["timeout_s"])
+                       timeout=cfg["timeout_s"], strict_mcp=True)
     except claude_bridge.BridgeError as exc:
         return Outcome(False, "", itm.truncate(itm.clean_line(exc),
                                                DETAIL_MAX), tone.cached)

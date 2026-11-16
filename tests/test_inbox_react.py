@@ -230,9 +230,33 @@ class SuggestedReactionTest(unittest.TestCase):
         self.assertIsNone(writes.suggested_reaction({}))
         self.assertIsNone(writes.suggested_reaction(None))
 
-    def test_choices_list_the_suggestion_once_and_allow_it(self):
+    def test_a_suggestion_outside_the_list_is_ignored_by_default(self):
         acts = LocalActions(InboxStore(None), react=cfg(), base_dir="/b",
                             call_tools=good_call())
+        extra = models.from_v1(row(2, meta={
+            "reply_to": {"channel": CHANNEL, "message_ts": MESSAGE},
+            "suggested_reaction": "tada"}))
+        self.assertEqual(acts.react_choices(extra),
+                         (["eyes", "white_check_mark", "+1", "pray"], None))
+        res = acts.react(extra, "tada")                    # and not allowed
+        self.assertFalse(res.ok)
+        self.assertIn("not one of the configured", res.detail)
+        inlist = models.from_v1(row(1, meta={
+            "reply_to": {"channel": CHANNEL, "message_ts": MESSAGE},
+            "suggested_reaction": "pray"}))
+        self.assertEqual(acts.react_choices(inlist)[1], "pray")  # in the list: kept
+
+    def test_allow_suggested_is_an_opt_in_bool(self):
+        self.assertFalse(cfg()["allow_suggested"])
+        self.assertTrue(cfg(allow_suggested=True)["allow_suggested"])
+        for bad in ("yes", 1, None):
+            with self.assertRaises(settings.SettingsError) as ctx:
+                settings.validate({"react": dict(REACT_BLOCK, allow_suggested=bad)})
+            self.assertIn("react.allow_suggested", str(ctx.exception))
+
+    def test_with_allow_suggested_the_suggestion_is_listed_once_and_allowed(self):
+        acts = LocalActions(InboxStore(None), react=cfg(allow_suggested=True),
+                            base_dir="/b", call_tools=good_call())
         inlist = models.from_v1(row(1, meta={
             "reply_to": {"channel": CHANNEL, "message_ts": MESSAGE},
             "suggested_reaction": "pray"}))
@@ -395,11 +419,28 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await wait_for(pilot, lambda: calls))
             self.assertEqual(calls[0][1][TOOL]["nm"], "white_check_mark")
 
-    async def test_a_suggestion_outside_the_list_is_offered_first(self):
+    async def test_a_suggestion_outside_the_list_is_ignored_by_default(self):
         store = InboxStore(None)
         meta = {"reply_to": {"channel": CHANNEL, "message_ts": MESSAGE},
                 "suggested_reaction": "tada"}
         app = make_app([row(1, meta=meta)], real(store), store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("E")
+            await pilot.pause(0.2)
+            picker = app.screen
+            self.assertEqual([c["id"] for c in picker.choices],
+                             ["eyes", "white_check_mark", "+1", "pray"])
+            self.assertIsNone(picker.selected)
+            self.assertEqual({c["detail"] for c in picker.choices}, {""})
+            await pilot.press("escape")
+
+    async def test_with_allow_suggested_a_suggestion_outside_the_list_is_offered_first(self):
+        store = InboxStore(None)
+        meta = {"reply_to": {"channel": CHANNEL, "message_ts": MESSAGE},
+                "suggested_reaction": "tada"}
+        app = make_app([row(1, meta=meta)], real(store, allow_suggested=True),
+                       store, undo_s=30)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")

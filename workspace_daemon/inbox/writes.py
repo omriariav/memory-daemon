@@ -56,8 +56,15 @@ SLACK_TS = re.compile(r"\A\d{9,11}\.\d{6}\Z")
 EMOJI_NAME = re.compile(r"\A[a-z0-9_+\-]{1,64}\Z")
 
 ReplyTo = namedtuple("ReplyTo", "channel thread_ts message_ts")
-Sendable = namedtuple("Sendable", "ok text target kind cut error destination",
-                      defaults=("", None, "", False, "", ""))
+# `route` is the real destination (channel id and thread timestamp), shown in
+# the confirm modal next to the `where` label.
+Sendable = namedtuple("Sendable", "ok text target kind error destination route",
+                      defaults=("", None, "", "", "", ""))
+# Control characters (tab and newline are fine) and the bidi overrides,
+# embeddings and isolates: text that could hide what it says. LRM, RLM and
+# ALM are kept for Hebrew and Arabic.
+_BAD_TEXT_CHARS = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
 def rsvp_pins(cfg, event_id, calendar_id, response):
@@ -105,7 +112,8 @@ def run_rsvp(cfg, base_dir, event_id, calendar_id, response, call_tools=None):
                 rsvp_prompt(cfg, pins), pins,
                 model=cfg.get("model", "haiku"), base_dir=base_dir,
                 max_turns=MAX_TURNS, max_budget_usd=MAX_BUDGET_USD,
-                timeout=cfg["timeout_s"], attempts=1, exact_args=True)
+                timeout=cfg["timeout_s"], attempts=1, exact_args=True,
+                max_calls=1)
     except claude_bridge.BridgeError as exc:
         return Outcome(False, itm.truncate(itm.clean_line(exc), DETAIL_MAX))
     except Exception as exc:  # a missing claude binary, a bad config
@@ -196,27 +204,44 @@ def target_kind(target):
 
 
 def send_text(draft):
-    """`(text, cut, error)` for a draft: only trailing whitespace is removed,
-    the text is cut at SEND_TEXT_MAX characters (`cut` says so), and an empty
-    one is refused (`error`)."""
+    """`(text, error)` for a draft: only trailing whitespace is removed. The
+    text is refused (`error`, text "") when it is empty, longer than
+    SEND_TEXT_MAX characters (never cut: what is sent is what was shown) or
+    holds a control or bidi-override character."""
     text = draft.rstrip() if isinstance(draft, str) else ""
     if not text:
-        return "", False, "there is no text to send"
+        return "", "there is no text to send"
     if len(text) > SEND_TEXT_MAX:
-        return text[:SEND_TEXT_MAX], True, ""
-    return text, False, ""
+        return "", (f"the text is {len(text)} characters; the limit is "
+                    f"{SEND_TEXT_MAX}; edit it first")
+    bad = _BAD_TEXT_CHARS.search(text)
+    if bad:
+        return "", (f"the text has a control or bidi-override character "
+                    f"(U+{ord(bad.group(0)):04X}); remove it first")
+    return text, ""
 
 
-def send_plan(meta, draft):
+def send_plan(meta, draft, allow_channel_posts=False):
     """Everything a send needs, checked: the destination, the exact text and
-    what to tell the user. `ok` False carries `error`."""
+    what to tell the user. `ok` False carries `error`.
+
+    A reply to a channel or group (C, G) without a `thread_ts` would be a
+    top-level post: it is refused unless `allow_channel_posts` (the setting
+    `send.allow_channel_posts`). A DM (D) needs no thread."""
     target = reply_to(meta)
     if target is None:
         return Sendable(False, error=NO_REPLY_TO[0].upper() + NO_REPLY_TO[1:])
-    text, cut, error = send_text(draft)
+    if (not allow_channel_posts and not target.thread_ts
+            and target.channel[0] in "CG"):
+        return Sendable(False, error=(
+            "This item would post to the channel, not a thread, so it is "
+            "refused (send.allow_channel_posts: true allows channel posts)"))
+    text, error = send_text(draft)
     if error:
         return Sendable(False, error=error[0].upper() + error[1:])
-    return Sendable(True, text, target, target_kind(target), cut)
+    route = target.channel + (f" · thread {target.thread_ts}"
+                              if target.thread_ts else " · no thread")
+    return Sendable(True, text, target, target_kind(target), route=route)
 
 
 def send_pins(cfg, target, text):
@@ -263,6 +288,33 @@ def pinned_prompt(cfg, pins):
     )
 
 
+_POSITIVE_TS = re.compile(r"\b\d{9,11}\.\d{6}\b")
+_ERRORISH = re.compile(
+    r"\b(errors?|failed|failure|denied|forbidden|unauthori[sz]ed|exception"
+    r"|traceback|not[_ ]in[_ ]channel|channel[_ ]not[_ ]found|invalid[_ ]auth"
+    r"|rate[_ ]?limited|missing[_ ]scope)\b", re.IGNORECASE)
+
+
+def reply_state(text):
+    """How much a write tool's reply confirms: `failed` (a JSON object with an
+    error or ok/success false), `unconfirmed` (plain text that reads like an
+    error and carries no Slack timestamp, the one generic sign of a posted
+    message) or `ok`. Config-agnostic: a JSON object without a failure
+    marker, and plain text without error words, stay `ok`."""
+    if _tool_failure(text):
+        return "failed"
+    try:
+        doc = json.loads(text)
+    except (TypeError, ValueError):
+        doc = None
+    if isinstance(doc, dict):
+        return "ok"
+    if (isinstance(text, str) and _ERRORISH.search(text)
+            and not _POSITIVE_TS.search(text)):
+        return "unconfirmed"
+    return "ok"
+
+
 def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
     """One pinned write through the bridge. Never raises; returns an Outcome.
 
@@ -279,7 +331,7 @@ def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
                 model=cfg.get("model", "haiku"), base_dir=base_dir,
                 max_turns=MAX_TURNS, max_budget_usd=MAX_BUDGET_USD,
                 timeout=cfg["timeout_s"], attempts=1, exact_args=True,
-                accept_partial=True)
+                accept_partial=True, max_calls=1)
     except claude_bridge.GUARD_STOPS + (claude_bridge.BridgeDryRun,) as exc:
         return Outcome(False, "not sent: " + itm.truncate(
             itm.clean_line(exc), DETAIL_MAX))
@@ -303,12 +355,20 @@ def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed):
     if not rows:
         return Outcome(False, f"no confirmed result for the pinned call; the "
                               f"{what} may not have been sent, check Slack")
-    if any(_tool_failure(r.get("text")) for r in rows):
+    states = [reply_state(r.get("text")) for r in rows]
+    if "ok" in states:
+        # A real send happened: never say it did not.
+        if any(s != "ok" for s in states):
+            return Outcome(True, f"the {what} was sent at least once; "
+                                 "check Slack")
+        if len(rows) > 1:
+            return Outcome(True, f"the tool ran {len(rows)} times; check Slack "
+                                 f"for a duplicate {what}")
+        return Outcome(True, "")
+    if "failed" in states:
         return Outcome(False, f"the Slack tool reported a failure; {failed}")
-    if len(rows) > 1:
-        return Outcome(True, f"the tool ran {len(rows)} times; check Slack "
-                             f"for a duplicate {what}")
-    return Outcome(True, "")
+    return Outcome(False, f"the tool's reply looks like an error; the {what} "
+                          "may not have been sent; check Slack")
 
 
 def run_send(cfg, base_dir, target, text, call_tools=None):

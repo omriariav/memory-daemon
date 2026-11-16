@@ -25,10 +25,12 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s", "mark_done")
-SEND_KEYS = ("tool", "args", "timeout_s", "model", "precheck")
+SEND_KEYS = ("tool", "args", "timeout_s", "model", "precheck",
+             "allow_channel_posts")
 PRECHECK_KEYS = ("argv", "timeout_s")
 SEND_ARG_KEYS = ("channel", "thread_ts", "text")
-REACT_KEYS = ("tool", "args", "emojis", "timeout_s", "model", "mark_done")
+REACT_KEYS = ("tool", "args", "emojis", "timeout_s", "model", "mark_done",
+              "allow_suggested")
 REACT_ARG_KEYS = ("channel", "timestamp", "name")
 POLISH_KEYS = ("mcp_config", "tone_tool", "tone_args", "model", "timeout_s",
                "max_budget_usd", "cache_h")
@@ -458,10 +460,14 @@ def _check_send(raw, problems):
     if not isinstance(model, str) or not MODEL_NAME.match(model):
         problems.append("send.model must be a model name (default haiku)")
     precheck = _check_precheck(raw.get("precheck"), problems)
+    allow_channel = raw.get("allow_channel_posts", False)
+    if not isinstance(allow_channel, bool):
+        problems.append("send.allow_channel_posts must be true or false")
     if len(problems) > start:
         return None
     return {"tool": tool, "args": names, "timeout_s": float(timeout),
-            "model": model, "precheck": precheck}
+            "model": model, "precheck": precheck,
+            "allow_channel_posts": allow_channel}
 
 
 def _check_precheck(raw, problems):
@@ -523,11 +529,14 @@ def _check_react(raw, problems):
     mark_done = raw.get("mark_done", True)
     if not isinstance(mark_done, bool):
         problems.append("react.mark_done must be true or false")
+    allow_suggested = raw.get("allow_suggested", False)
+    if not isinstance(allow_suggested, bool):
+        problems.append("react.allow_suggested must be true or false")
     if len(problems) > start:
         return None
     return {"tool": tool, "args": names, "emojis": list(emojis),
             "timeout_s": float(timeout), "model": model,
-            "mark_done": mark_done}
+            "mark_done": mark_done, "allow_suggested": allow_suggested}
 
 
 def _check_polish(raw, problems):

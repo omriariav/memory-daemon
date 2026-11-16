@@ -194,7 +194,8 @@ def _calendar_parts(event, kind, ts):
 
 
 MAIL_FROM_MAX, MAIL_SUBJECT_MAX, MAIL_SNIPPET_MAX = 80, 200, 300
-_ANGLE_ADDRESS = re.compile(r"<[^<>]*@[^<>]*>")
+_ANGLE_ADDRESS = re.compile(r"<[^<>]*[@\uff20\ufe6b][^<>]*>")
+_AT_SIGNS = ("@", "\uff20", "\ufe6b")
 
 
 def _mail_from(value):
@@ -202,7 +203,8 @@ def _mail_from(value):
     holds an address is dropped (an old or hand-written event may carry one)."""
     text = _text(_ANGLE_ADDRESS.sub("", value if isinstance(value, str) else ""))
     text = text.strip(" \"'")
-    return "" if "@" in text else itm.truncate(text, MAIL_FROM_MAX)
+    return "" if any(a in text for a in _AT_SIGNS) \
+        else itm.truncate(text, MAIL_FROM_MAX)
 
 
 # A memory entry id as a context command may link it (`meta.memory_id`).
