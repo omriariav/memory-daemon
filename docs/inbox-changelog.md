@@ -7,6 +7,65 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-16
+
+"Send" becomes a choice. Some workplaces block headless (non-interactive)
+Claude Slack SENDS with a managed security hook while a draft tool and
+reactions still work. After you pick `a` (reply) or `n` (nudge) the confirm
+screen now offers up to three actions. Settings are new and optional, so a
+0.6.0 `inbox.yaml` behaves as before (`send.mode` defaults to `send`); the
+confirm screen also gains a "Copy for Slack" button next to Send.
+
+### Added
+
+- `send.mode` (`send` default, `draft` or `both`) and `send.draft_tool` (an
+  `mcp__...` tool, the same `args` mapping as `tool`). `send.tool` is no longer
+  needed in mode `draft`; `draft_tool` is needed in `draft` and `both`; the two
+  tools must differ.
+- **Draft in Slack** (`d`, mode `draft` or `both`): the same pinned path as a
+  send (`exact_args`, `attempts=1`, `max_calls=1`, the precheck, the 5 s undo
+  window) on `send.draft_tool`, pinned to `{channel, text, thread_ts?}` mapped
+  through `send.args`; spend logged as `inbox-draft`, audit kind `draft`. A
+  success does NOT mark the item done and says "Draft placed in Slack: open it
+  with o and press Enter." A reply that contains `attached_draft_exists` says
+  "A draft already waits in that conversation; use Copy instead". Failure
+  wording never says a message was sent ("no draft placed", "the draft may
+  have been placed, check Slack"). Never retried; one Slack write at a time,
+  drafts included.
+- **Copy for Slack** (`c`, always offered once `send:` or `copy: true` is set):
+  purely local (no tool call, no undo window). The draft is converted from
+  standard markdown to Slack mrkdwn (`**bold**` to `*bold*`, `*italic*` and
+  `__x__` to `_x_`, `~~x~~` to `~x~`, `[text](url)` to `<url|text>`, `# heading`
+  to `*heading*`; lists, quotes and code are kept and code is never touched; the
+  pure function is `mrkdwn.to_slack_mrkdwn`) and put on the clipboard (OSC 52).
+  The item stays. Toast "Copied for Slack: open it with o and paste".
+- `copy: true` (top level, default `false`): "Copy for Slack" without `send:`.
+- `slack_open: {url_template}` and `team: "T..."` (top level): `o` opens the
+  template URL for an item with a valid `meta.reply_to`. Placeholders
+  `{channel}`, `{thread_ts}`, `{message_ts}`, `{team}`; `{thread_ts}` is the
+  thread's timestamp, else the message's, so a thread opens at the thread. The
+  template must start with `slack://` or `https://`; `team` must match
+  `^T[A-Z0-9]{6,12}$`; `{team}` needs `team:`. Without the setting, or when the
+  template cannot be filled, `o` opens the item's link as before. The confirm
+  screen shows the URL `o` will open.
+- The confirm screen: Cancel stays the default; the buttons and keys are
+  `d` Draft in Slack, `y` Send, `c` Copy for Slack, `esc` Cancel (a key that
+  is not offered does nothing). No new key in the queue.
+- Commented examples for all of it in `inbox.example.yaml`
+  (`tools/validate_examples.py` checks them).
+
+### Fixed
+
+- `claude_bridge.call_tools` and `complete` resolve `base_dir` to an absolute
+  path. A relative `base_dir` made `--settings` relative to the run's own cwd
+  (the run directory), which doubled the path, so `claude` exited 1.
+
+### Changed
+
+- `claude_bridge` keeps a fixed `(attached_draft_exists)` tag on a tool error
+  whose body names it (never the body), so the draft path can tell.
+- `daemon.py inbox --version`, the header and the help overlay show 0.7.0.
+
 ## [0.6.0] - 2026-11-16
 
 Real Slack writes and a polish step, all opt-in. Without `send:`, `react:` and
