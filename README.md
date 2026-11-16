@@ -2853,6 +2853,13 @@ polling the store:
   calendars and declined guests excluded, and it is omitted when the attendee
   list is unknown. When it is exactly 2, `other_attendee` is the other
   person's lower-case email. Malformed values are dropped.
+- Mail captures (`new` and `update`) add to `details`: `gmail_labels`, the
+  message's Gmail label names (sorted, at most 20, each cut to 100 characters;
+  names only, no ids and no message text), and `saved_request: true` when the
+  routine's source lists only threads the owner asked to save
+  (`saved_request: true` in its config). A source whose connector does not
+  expose labels (`gmail_mcp`) leaves `gmail_labels` out. Both keys are omitted
+  when empty or false.
 - Alerts (writer: `alerts.check`, see "Alerts"): `source` is `daemon`, `kind`
   is `alert`, `routine` is `daemon`, `memory_id` is `null`, `source_id` is
   `daemon:<key>`, `title` is the message, and `details` holds `key` plus the

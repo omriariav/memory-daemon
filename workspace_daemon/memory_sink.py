@@ -1709,7 +1709,7 @@ def capture(routine, item, summary, dry_run=False):
         _emit_capture_event(
             rid, "new" if verdict == "created" else "update",
             entry_id, source_id, title, people,
-            details=_calendar_details(meta),
+            details=_capture_details(meta),
         )
         if differs and entry_id:
             _emit_capture_event(
@@ -1813,6 +1813,38 @@ def _calendar_details(meta):
             other = meta.get("calendar_other_attendee")
             if count == 2 and isinstance(other, str) and other:
                 details["other_attendee"] = other
+    return details or None
+
+
+GMAIL_LABELS_MAX = 20
+GMAIL_LABEL_CHARS = 100
+
+
+def _gmail_details(meta):
+    """Gmail label names and the saved-request flag of a mail capture.
+
+    Names only (no ids, no message text): capped at GMAIL_LABELS_MAX, each cut
+    to GMAIL_LABEL_CHARS, sorted, de-duplicated. `saved_request` appears only
+    when true. A connector that reports no labels leaves the key out.
+    """
+    details = {}
+    raw = meta.get("gmail_labels")
+    if isinstance(raw, (list, tuple)):
+        names = sorted({
+            " ".join(label.split())[:GMAIL_LABEL_CHARS]
+            for label in raw if isinstance(label, str) and label.strip()
+        })
+        if names:
+            details["gmail_labels"] = names[:GMAIL_LABELS_MAX]
+    if meta.get("gmail_message_id") and meta.get("saved_request") is True:
+        details["saved_request"] = True
+    return details
+
+
+def _capture_details(meta):
+    meta = meta or {}
+    details = dict(_calendar_details(meta) or {})
+    details.update(_gmail_details(meta))
     return details or None
 
 

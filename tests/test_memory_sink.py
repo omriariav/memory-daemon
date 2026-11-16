@@ -1799,6 +1799,42 @@ class CaptureEventsTest(unittest.TestCase):
         self.assertNotIn(
             "other_attendee", self._capture()[-1]["details"])
 
+    def test_mail_capture_records_label_names_and_saved_flag(self):
+        self.item["id"] = "gmail:t1"
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "gmail_labels": ["Zeta", "Save", "Save"],
+            "saved_request": True, "email_subject": "Quarterly plan"}
+        for out, kind in (("✓ created 2026-07-27-t\n", "new"),
+                          ("↻ updated 2026-07-27-t\n", "update")):
+            row = self._capture(out)[-1]
+            self.assertEqual(row["kind"], kind)
+            self.assertEqual(row["details"], {
+                "gmail_labels": ["Save", "Zeta"], "saved_request": True})
+
+    def test_mail_labels_are_capped_and_hold_names_only(self):
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1",
+            "gmail_labels": [f"Label{i:02d}" for i in range(30)] + [7, None],
+            "email_from": "a@example.com", "email_subject": "s"}
+        row = self._capture()[0]
+        self.assertEqual(len(row["details"]["gmail_labels"]), 20)
+        self.assertNotIn("saved_request", row["details"])
+        text = json.dumps(row)
+        self.assertNotIn("a@example.com", text)
+
+    def test_mail_without_labels_or_flag_has_no_details(self):
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "gmail_labels": [], "saved_request": False}
+        self.assertNotIn("details", self._capture()[0])
+
+    def test_mail_details_merge_with_a_calendar_match(self):
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "gmail_labels": ["Save"],
+            "calendar_event_id": "evt1", "calendar_attendee_count": 3}
+        self.assertEqual(self._capture()[0]["details"], {
+            "gmail_labels": ["Save"], "calendar_event_id": "evt1",
+            "attendee_count": 3})
+
     def test_no_calendar_match_means_no_details(self):
         rows = self._capture()
         self.assertNotIn("details", rows[0])
