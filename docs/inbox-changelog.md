@@ -71,6 +71,9 @@ inbox's own state files.
   4 MB default and no cancellation.
 - A model name (`summary.model`, `rsvp.model`) may no longer start with `-`.
 - `c` closes an open Context pane even when only `summary:` is configured.
+- The context and summary threads hand their result to the UI without blocking
+  (a call that waited for a UI loop that had already gone would never return and,
+  as these threads are not daemons, would keep the process from exiting).
 
 ## [0.3.0] - 2026-11-16
 

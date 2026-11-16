@@ -1133,7 +1133,33 @@ class InboxApp(App):
         # Not a daemon thread: quitting sets `_cancel` and the command is
         # stopped (SIGTERM, then SIGKILL after the grace), so the exit waits
         # a few seconds at most and no child is left running.
-        threading.Thread(target=self._ctx_thread, args=(it, ident)).start()
+        threading.Thread(target=self._ctx_thread, args=(it, ident),
+                         name="inbox-context-fetch").start()
+
+    def _post(self, fn, *args):
+        """Run `fn(*args)` on the UI thread, from a context or summary thread,
+        without ever blocking. (`call_from_thread` waits for the UI loop to run
+        the call; if the app has already gone, that wait never ends, and these
+        threads are not daemons, so the process would never exit.) Returns
+        False, and does nothing, when the app is quitting or gone."""
+        loop = self._loop
+        if self._quitting or not self.is_running or loop is None \
+                or loop.is_closed():
+            return False
+
+        def run():
+            if self._quitting or not self.is_running:
+                return
+            with self._context():
+                try:
+                    fn(*args)
+                except NoMatches:   # a widget went away during shutdown
+                    pass
+        try:
+            loop.call_soon_threadsafe(run)
+        except RuntimeError:        # the loop closed between the check and now
+            return False
+        return True
 
     def _ctx_thread(self, it, ident):
         try:
@@ -1142,10 +1168,7 @@ class InboxApp(App):
             out = ctxmod.Outcome(False, [], f"cannot run: {type(exc).__name__}")
         if self._quitting:
             return
-        try:
-            self.call_from_thread(self._ctx_done, ident, out)
-        except Exception:  # the app quit between the check and the call
-            pass
+        self._post(self._ctx_done, ident, out)
 
     def _ctx_done(self, ident, out):
         """UI thread. The result is cached under the item it was fetched for;
@@ -1305,7 +1328,8 @@ class InboxApp(App):
         # it runs asks first (see action_quit) and then waits for it, for at
         # most summary.timeout_s.
         threading.Thread(target=self._summary_thread,
-                         args=(it, skey, sections, force)).start()
+                         args=(it, skey, sections, force),
+                         name="inbox-summary").start()
         self.context_render()
 
     def _summary_thread(self, it, skey, sections, force):
@@ -1315,10 +1339,7 @@ class InboxApp(App):
             out = summod.Outcome(False, "", f"cannot run: {type(exc).__name__}")
         if self._quitting:
             return
-        try:
-            self.call_from_thread(self._summary_done, it, skey, out, force)
-        except Exception:  # the app quit between the check and the call
-            pass
+        self._post(self._summary_done, it, skey, out, force)
 
     def _summary_done(self, it, skey, out, force):
         self.busy = max(0, self.busy - 1)

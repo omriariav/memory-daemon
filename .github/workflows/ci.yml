@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04  # ubuntu-latest (26.04) has no Python 3.9 build
+    timeout-minutes: 15    # a hang fails fast instead of holding the runner
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +78,7 @@ jobs:
     # The inbox UI is an optional extra: the job above runs without Textual
     # (UI tests skip). This one installs it and runs the UI tests for real.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

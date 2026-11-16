@@ -904,6 +904,26 @@ def pane_text(app):
     return str(app.query_one("#context-body").render())
 
 
+def worker_threads():
+    """The context and summary threads the app started that are still alive."""
+    return [t for t in threading.enumerate()
+            if t.name in ("inbox-context-fetch", "inbox-summary")]
+
+
+class WorkerCleanup:
+    """Mixin for the Textual tests: a context or summary thread of the app
+    under test must be gone when the test ends. They are not daemon threads
+    (the process waits for them), so one left waiting would hang the whole
+    run at exit; the join is bounded and a leftover fails the test."""
+
+    async def asyncTearDown(self):
+        deadline = time.monotonic() + 15
+        for t in worker_threads():
+            t.join(max(0.1, deadline - time.monotonic()))
+        left = [t.name for t in worker_threads()]
+        self.assertEqual(left, [], "a worker thread outlived its test")
+
+
 async def wait_for(pilot, cond, tries=100, step=0.05):
     for _ in range(tries):
         if cond():
@@ -954,7 +974,7 @@ if HAVE_TEXTUAL:
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class NotConfiguredTest(unittest.IsolatedAsyncioTestCase):
+class NotConfiguredTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     async def test_keys_say_so_and_open_nothing(self):
         acts = LocalActions(InboxStore(None), base_dir="/base")
         app = make_app([make_item(1)], acts)
@@ -994,7 +1014,7 @@ class NotConfiguredTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class ContextPaneTest(unittest.IsolatedAsyncioTestCase):
+class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     def rows(self, n=3):
         return [make_item(i) for i in range(1, n + 1)]
 
@@ -1216,7 +1236,7 @@ class ContextPaneTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class SummaryPaneTest(unittest.IsolatedAsyncioTestCase):
+class SummaryPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -1361,7 +1381,7 @@ class SummaryPaneTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class StaleContextTest(unittest.IsolatedAsyncioTestCase):
+class StaleContextTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     def rows(self):
         return [make_item(1), make_item(2)]
 
@@ -1416,7 +1436,7 @@ class StaleContextTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class PaneBehaviourTest(unittest.IsolatedAsyncioTestCase):
+class PaneBehaviourTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     def rows(self, n=5):
         return [make_item(i) for i in range(1, n + 1)]
 
@@ -1543,7 +1563,7 @@ class PaneBehaviourTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class QuitTest(unittest.IsolatedAsyncioTestCase):
+class QuitTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     async def test_quit_with_a_running_summary_asks_then_waits_for_it(self):
         tmp = Path(tempfile.mkdtemp())
         gate, started, finished = threading.Event(), threading.Event(), threading.Event()
@@ -1642,7 +1662,7 @@ class QuitTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class KeyMapTest(unittest.IsolatedAsyncioTestCase):
+class KeyMapTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     NEW = {"c": "context", "C": "context_refresh", "i": "summary(False)",
            "I": "summary(True)"}
 
@@ -1714,7 +1734,7 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
-class DemoTest(unittest.IsolatedAsyncioTestCase):
+class DemoTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     async def test_demo_has_fake_context_and_summary_and_calls_no_model(self):
         from workspace_daemon.inbox.demo import DemoSource
         acts = FakeActions(store=None, draft_delay=0, context_delay=0,
