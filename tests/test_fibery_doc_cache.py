@@ -48,7 +48,8 @@ def event(start=2, other="alex@example.com", count=2, status="confirmed",
     row = {"start": at(start) if isinstance(start, (int, float)) else start,
            "end": at(3), "location": "", "conference": "", "status": status,
            "my_rsvp": rsvp, "title": "1:1", "list_title": "1:1",
-           "organizer": org, "attendee_count": count, "attendees": people}
+           "organizer": org, "attendee_count": count, "attendees": people,
+           "attendees_known": True}
     row.update(extra)
     return row
 
@@ -95,6 +96,29 @@ class SelectionTest(unittest.TestCase):
     def test_the_non_self_attendee_wins_over_a_self_organizer(self):
         row = event(organizer="me")             # I organized, alex attends
         self.assertEqual(self.keys(snapshot(e1=row)), {"doc-a"})
+
+    def test_a_count_that_is_only_a_floor_does_not_qualify(self):
+        for known in (False, None, "yes"):
+            row = event(attendees_known=known)
+            self.assertEqual(self.keys(snapshot(e1=row)), set(), known)
+        row = event()
+        del row["attendees_known"]               # a row of an older snapshot
+        self.assertEqual(self.keys(snapshot(e1=row)), set())
+
+    def test_declined_guests_are_not_the_other_party(self):
+        row = event(count=2)
+        row["attendees"].append({"name": "Gone", "email": "gone@example.com",
+                                 "response": "declined", "self": False,
+                                 "optional": False})
+        self.assertEqual(self.keys(snapshot(e1=row)), {"doc-a"})
+        gone_only = event(other="sam@example.com")
+        gone_only["attendees"][1]["response"] = "declined"
+        self.assertEqual(self.keys(snapshot(e1=gone_only)), set())
+
+    def test_a_group_address_is_never_the_other_party(self):
+        row = event(count=2)
+        row["attendees"][1]["group"] = True
+        self.assertEqual(self.keys(snapshot(e1=row)), set())
 
     def test_only_exactly_two_attendees_count(self):
         for count in (1, 3, 5, None, True, "2"):

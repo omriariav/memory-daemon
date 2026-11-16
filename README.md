@@ -1038,8 +1038,10 @@ exactly one of the two), `lookahead_h` (default 24),
 With `only_upcoming: true` a document is a candidate only while
 `state/calendar-snapshot.json` (the `calendar_cache` routine) holds a timed
 event that is not cancelled or declined, starts within `lookahead_h` hours and
-has exactly two attendees, the other of whom (the one non-self attendee, or the
-organizer when that is not you) has an address in the document's
+has exactly two attendees (the snapshot's `attendees_known` must be true: a
+count that is only a floor never qualifies), the other of whom (the one
+non-self attendee who has not declined, or the organizer when the list names
+no one else and that is not you) has an address in the document's
 `match_emails` (compared case-insensitively). A candidate is fetched when its
 cache file is missing, unreadable or older than `max_age_h`. With
 `only_upcoming: false` every listed document is a candidate. Each fetch is one

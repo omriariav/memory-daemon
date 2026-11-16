@@ -9,7 +9,7 @@
 #
 # A document is refreshed only when state/calendar-snapshot.json (the
 # calendar_cache routine) has a timed event, not cancelled or declined, that
-# starts within lookahead_h hours, has exactly two attendees, and whose other
+# starts within lookahead_h hours, has exactly two attendees (with a known count), and whose other
 # person has an email listed in that document's match_emails (case-insensitive);
 # and then only when its cache file is missing or older than max_age_h. Set
 # only_upcoming: false to refresh every listed document whenever it is older

@@ -9,7 +9,8 @@ other Fibery routines use) and the text is stored as
 Which documents refresh. With ``only_upcoming`` (the default) a document is a
 candidate only when the calendar snapshot (``state/calendar-snapshot.json``)
 has a timed, non-cancelled, non-declined event that starts within
-``lookahead_h`` hours and has exactly two attendees, the other of whom has an
+``lookahead_h`` hours and has exactly two attendees (and the snapshot says the
+count is known, ``attendees_known``), the other of whom has an
 email listed in that document's ``match_emails`` (compared case-insensitively).
 A candidate is fetched when its cache file is missing, unreadable or older
 than ``max_age_h``. With ``only_upcoming: false`` every document is a
@@ -199,15 +200,19 @@ def _email(person):
 
 def other_party(row):
     """The lower-cased email of the one other person in a two-person event:
-    the single non-self attendee, else the organizer when that is not the
-    owner. None when it cannot be told."""
+    the single non-self attendee who has not declined (the snapshot keeps
+    declined guests but does not count them), else the organizer when the
+    list names no one but the owner and the organizer is not the owner. None
+    when it cannot be told."""
     people = row.get("attendees")
     if isinstance(people, list):
-        others = [p for p in people
-                  if isinstance(p, dict) and not p.get("self") and _email(p)]
-        if len(others) == 1:
-            return _email(others[0])
-        if others:
+        not_me = [p for p in people if isinstance(p, dict) and not p.get("self")]
+        live = [p for p in not_me
+                if p.get("response") != "declined" and not p.get("group")
+                and _email(p)]
+        if len(live) == 1:
+            return _email(live[0])
+        if not_me:
             return None
     org = row.get("organizer")
     if isinstance(org, dict) and not org.get("self"):
@@ -218,7 +223,8 @@ def other_party(row):
 def qualifying_emails(snapshot, now, lookahead_h):
     """The set of other-party emails (lower-cased) of the events that count:
     timed, not cancelled, not declined, starting within `lookahead_h` hours
-    of `now`, with exactly two attendees."""
+    of `now`, with exactly two attendees whose number the snapshot knows
+    (`attendees_known` true; older rows without it are skipped)."""
     found = set()
     events = (snapshot or {}).get("events")
     if not isinstance(events, dict):
@@ -232,6 +238,8 @@ def qualifying_emails(snapshot, now, lookahead_h):
         count = row.get("attendee_count")
         if isinstance(count, bool) or count != 2:
             continue
+        if row.get("attendees_known") is not True:
+            continue    # the count is only a floor (hidden or group guests)
         start = _start(row.get("start"))
         if start is None or not now <= start <= end:
             continue
