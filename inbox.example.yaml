@@ -53,6 +53,31 @@ alert_urgent_max_age_h: 6
 #   argv: ["python3", "~/bin/my-inbox-save.py"]
 #   timeout_s: 30            # 5 to 120; on a timeout: SIGTERM, then SIGKILL after 5 s
 
+# Context pane (c key). Off until set; there is no default. While the pane is
+# open, selecting an item runs this command (after a ~400 ms pause, in the
+# background) and shows the sections it returns; results are cached for 10
+# minutes per item. The command gets {"v": 1, "action": "context", "item":
+# {...}} on stdin (never in argv) and prints ONE JSON line: {"v": 1, "ok":
+# true, "sections": [{"title": "Person", "lines": ["Role: ..."]}], "message":
+# null}. It MUST be read-only (it runs on its own, on every selection) and
+# must exit within timeout_s or, on SIGTERM, stop and wait for its children.
+# At most 6 sections, 40 lines each, 300 characters a line. See "Context
+# protocol" in docs/inbox.md.
+# context:
+#   argv: ["python3", "~/bin/my-inbox-context.py"]
+#   timeout_s: 20            # 2 to 60; on a timeout: SIGTERM, then SIGKILL after 5 s
+
+# AI summary on demand (i key; I asks again). Off until set; there is no
+# default. One headless Claude call through the daemon's bridge with NO tools
+# at all (text only), over the item, its thread and the loaded context. The
+# bridge's pause file and daily budget apply; spend is logged as
+# inbox-summary. Results are cached on disk (state/inbox-summary-cache.json,
+# 200 entries). `summary: {}` turns it on with the defaults below.
+# summary:
+#   model: haiku             # the model of the one-call run
+#   timeout_s: 90            # 30 to 300
+#   max_budget_usd: 0.05     # 0.005 to 2: the per-call spend limit
+
 sources:
   # Built-in: state/events.jsonl (plus the .1 rotation), read-only.
   - name: events

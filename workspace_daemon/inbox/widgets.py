@@ -55,6 +55,11 @@ def rel(now, ts):
     return f"{fmt_age(now - ts)} ago"
 
 
+def ago(now, ts):
+    """`just now` under a minute, else `3m ago`."""
+    return "just now" if now - ts < 60 else f"{fmt_age(now - ts)} ago"
+
+
 def fit(s, width):
     """Truncate to `width` cells with an ellipsis (logical order)."""
     if width <= 0:
@@ -227,6 +232,88 @@ class ThreadView(VerticalScroll):
             out.append("\n\n")
         body.update(out)
         self.scroll_home(animate=False)
+
+
+def _wrapped(out, text, width, visual, style=None, indent=""):
+    """Append `text` wrapped to `width` cells (visual order when `visual`)."""
+    for line in bidi.visual_lines(text, max(10, width - len(indent)), visual) or [""]:
+        out.append(indent + line + "\n", style)
+
+
+class ContextPane(VerticalScroll):
+    """The Context pane: the AI summary on top, then the sections the context
+    command returned. It only draws a view built by the app (see
+    `InboxApp.context_view`); every string in it is source text and goes in as
+    plain `Text`, never markup."""
+
+    can_focus = True
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._ident = None
+
+    def compose(self) -> ComposeResult:
+        yield SelectableText("", id="context-body")
+
+    def show(self, view, pal, now, visual):
+        body = self.query_one("#context-body", Static)
+        width = max(30, (self.size.width or 60) - 4)
+        out = Text()
+        muted = Style(color=pal["muted"])
+        head = Style(bold=True, color=pal["accent"])
+        summ, ctx = view["summary"], view["context"]
+        if summ["state"] != "off":
+            out.append("Summary", head)
+            if summ["state"] == "loading":
+                out.append("  " + SPINNER[int(now * 10) % len(SPINNER)]
+                           + " summarising…\n", muted)
+            elif summ["state"] == "ready":
+                age = ""
+                if summ["at"]:
+                    age = ("cached, " if summ["cached"] else "") + ago(now, summ["at"])
+                out.append(f"  {age}\n", muted)
+                for ln in summ["text"].split("\n"):
+                    _wrapped(out, ln, width, visual, indent="  ")
+                if summ["note"]:
+                    out.append("  " + summ["note"] + "\n", Style(color=pal["warn"], italic=True))
+            elif summ["state"] == "error":
+                out.append("\n")
+                _wrapped(out, "! " + summ["detail"], width, visual,
+                         Style(color=pal["warn"], bold=True), "  ")
+                out.append("  I retries\n", muted)
+            else:
+                out.append("  press i to summarise\n", muted)
+            out.append("\n")
+        if view["item"] is None:
+            out.append("Nothing selected.\n", Style(color=pal["muted"], italic=True))
+        elif ctx["state"] == "off":
+            out.append("Context not configured (set context: in inbox.yaml).\n",
+                       Style(color=pal["muted"], italic=True))
+        elif ctx["state"] == "loading":
+            out.append(SPINNER[int(now * 10) % len(SPINNER)] + " Loading context…\n", muted)
+        elif ctx["state"] == "idle":
+            out.append("Context not loaded. C to load it.\n", muted)
+        elif ctx["state"] == "error":
+            out.append("Context\n", head)
+            _wrapped(out, "! " + ctx["message"], width, visual,
+                     Style(color=pal["warn"], bold=True), "  ")
+            out.append(f"  failed {ago(now, ctx['at'])}  ·  C retries\n", muted)
+        else:
+            for sec in ctx["sections"]:
+                _wrapped(out, sec["title"], width, visual, head)
+                for ln in sec["lines"]:
+                    _wrapped(out, ln, width, visual, indent="  ")
+                out.append("\n")
+            if not ctx["sections"]:
+                out.append("No context for this item.\n", muted)
+                if ctx.get("message"):
+                    _wrapped(out, ctx["message"], width, visual, muted)
+            out.append(f"context {'cached, ' if now - ctx['at'] >= 60 else ''}"
+                       f"fetched {ago(now, ctx['at'])}  ·  C refresh\n", muted)
+        body.update(out)
+        if view["ident"] != self._ident:
+            self._ident = view["ident"]
+            self.scroll_home(animate=False)
 
 
 class DraftPane(Vertical):

@@ -8,12 +8,17 @@ phase 2 `act` call has one place to plug in (see docs/inbox.md).
 0.3.0 adds the first writes that leave the inbox: `rsvp` (a calendar answer
 through the Claude bridge) and `save` (a configured command). Both run only
 after the confirm modal and the undo window, in a worker thread.
+
+0.4.0 adds two read-only calls: `fetch_context` (the configured context
+command) and `summarize` (one no-tools bridge call, cached on disk). Neither
+changes anything outside the inbox's own state files, so neither confirms.
 """
 import time
 import webbrowser
 from dataclasses import dataclass, field
 
-from . import invites, items, writes
+from . import context, invites, items, writes
+from . import summary as summary_mod
 from .models import to_v1
 
 
@@ -24,6 +29,13 @@ class Result:
     # save: with ok False a likely duplicate (ask), with ok True "already in memory"
     duplicate: bool = False
     candidate: dict = None    # save: the memory it looks like
+
+
+def _cached(row):
+    if row is None:
+        return None
+    return summary_mod.Outcome(True, row["text"], "", True, row["at"],
+                               row["ctx"])
 
 
 def safe_link(link):
@@ -37,13 +49,20 @@ class LocalActions:
     supports_send = False
 
     def __init__(self, store, opener=None, rsvp=None, save=None,
-                 base_dir=None, call_tools=None):
-        """`rsvp` and `save` are the validated settings blocks (None: not
-        configured). `call_tools` replaces the Claude bridge (tests)."""
+                 base_dir=None, call_tools=None, context=None, summary=None,
+                 complete=None):
+        """`rsvp`, `save`, `context` and `summary` are the validated settings
+        blocks (None: not configured). `call_tools` and `complete` replace
+        the Claude bridge's two entry points (tests)."""
         self.store = store
         self._open = opener or webbrowser.open
         self.rsvp_cfg, self.save_cfg = rsvp, save
+        self.context_cfg, self.summary_cfg = context, summary
         self.base_dir, self._call_tools = base_dir, call_tools
+        self._complete = complete
+        self._summary_cache = (summary_mod.SummaryCache(base_dir)
+                               if summary is not None and base_dir is not None
+                               else None)
 
     @property
     def rsvp_configured(self):
@@ -52,6 +71,51 @@ class LocalActions:
     @property
     def save_configured(self):
         return self.save_cfg is not None
+
+    @property
+    def context_configured(self):
+        return self.context_cfg is not None
+
+    @property
+    def summary_configured(self):
+        return self.summary_cfg is not None and self.base_dir is not None
+
+    def fetch_context(self, item):
+        """Run the context command for `item`: a `context.Outcome`. Blocks:
+        call from a worker. Read-only."""
+        if not self.context_configured:
+            return context.Outcome(False, [], "Context not configured")
+        return context.run_context(self.context_cfg, to_v1(item))
+
+    def cached_summary(self, item):
+        """The cached summary of `item` as an `Outcome`, or None. Reads the
+        cache without marking the entry as used."""
+        if not self.summary_configured:
+            return None
+        row = self._summary_cache.peek(summary_mod.cache_key(to_v1(item)))
+        return _cached(row)
+
+    def summarize(self, item, sections=(), force=False):
+        """The summary of `item`: from the disk cache unless `force`, else one
+        no-tools bridge call (then cached). Blocks: call from a worker."""
+        if not self.summary_configured:
+            return summary_mod.Outcome(False, "", "Summary not configured")
+        v1 = to_v1(item)
+        key = summary_mod.cache_key(v1)
+        if not force:
+            hit = _cached(self._summary_cache.get(key))
+            if hit is not None:
+                return hit
+        out = summary_mod.run_summary(self.summary_cfg, self.base_dir, v1,
+                                      sections, complete=self._complete)
+        if not out.ok:
+            return out
+        try:
+            self._summary_cache.put(key, out.text, out.with_context,
+                                    self.summary_cfg["model"], now=out.at)
+        except OSError:
+            return out._replace(detail="not cached: cannot write the cache")
+        return out
 
     def rsvp(self, item, answer):
         """Answer a pending invite (`accepted`, `declined`, `tentative`)
@@ -136,6 +200,41 @@ class FakeActions:
     supports_send = True
     rsvp_configured = True
     save_configured = True
+    context_configured = True
+    summary_configured = True
+    context_delay: float = 0.3
+    summary_delay: float = 0.6
+    _summaries: dict = field(default_factory=dict)
+
+    def fetch_context(self, item):
+        time.sleep(self.context_delay)
+        self.calls.append(("context", item.key))
+        return context.Outcome(True, [
+            {"title": "Person", "lines": [
+                f"{item.who}: invented demo profile",
+                "Team: Example Platform", "Timezone: UTC+2"]},
+            {"title": "Related", "lines": [
+                "Ticket EX-101 (open): invented example",
+                "Doc: https://example.com/demo-doc"]}], None)
+
+    def cached_summary(self, item):
+        row = self._summaries.get(item.key)
+        return summary_mod.Outcome(True, row, "", True, time.time() - 120,
+                                   False) if row else None
+
+    def summarize(self, item, sections=(), force=False):
+        if not force and item.key in self._summaries:
+            return self.cached_summary(item)
+        time.sleep(self.summary_delay)
+        self.calls.append(("summary", item.key, "force") if force
+                          else ("summary", item.key))
+        text = ("- Invented demo summary: no model was called.\n"
+                f"- Asked by {item.who}: {item.gist}\n"
+                "- Next step: reply or mark it done.\n"
+                "- Deadline: none stated.")
+        self._summaries[item.key] = text
+        return summary_mod.Outcome(True, text, "", False, time.time(),
+                                   bool(sections))
 
     def rsvp(self, item, answer):
         self.calls.append(("rsvp", item.key, answer))

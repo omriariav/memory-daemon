@@ -400,7 +400,8 @@ def _stderr_tail(raw):
     return itm.truncate(text[-STDERR_TAIL:], STDERR_TAIL)
 
 
-def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
+def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0,
+                max_bytes=None):
     """Run argv in its own process group with bounded memory and time.
 
     stdout is read in chunks and the whole group is killed once it passes
@@ -413,7 +414,10 @@ def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
     the group and gives it that many seconds to clean up before the SIGKILL
     (a write should not be cut off mid-way when it can be asked to stop).
     The default 0 kills at once, as command sources always have.
+
+    `max_bytes` replaces OUTPUT_MAX_BYTES as the stdout cap for this call.
     """
+    cap = itm.OUTPUT_MAX_BYTES if max_bytes is None else max_bytes
     proc = subprocess.Popen(
         argv, stdin=subprocess.PIPE if stdin_bytes is not None
         else subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -430,7 +434,7 @@ def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
             if flags["overflow"]:
                 continue  # draining while the group winds down
             out.extend(chunk)
-            if len(out) > itm.OUTPUT_MAX_BYTES:
+            if len(out) > cap:
                 flags["overflow"] = True
                 if not term_grace_s:
                     _kill_group(proc)
