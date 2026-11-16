@@ -7,6 +7,74 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-16
+
+A Context pane and an AI summary on demand. Both are read-only, off until
+configured in `inbox.yaml`, and neither confirms or writes anything outside the
+inbox's own state files.
+
+### Added
+
+- Context pane (`c`): a generic `context:` hook in `inbox.yaml` (no default):
+  `argv` and `timeout_s` (2 to 60, default 20). The command gets `{"v": 1,
+  "action": "context", "item": <item>}` on stdin and prints one JSON object,
+  `{"v": 1, "ok", "sections": [{"title", "lines"}], "message"}`. It runs under
+  the same capped runner as `save` (own process group, `SIGTERM` then `SIGKILL`
+  5 s later on a timeout, item text only on stdin). Everything it prints is
+  cleaned and capped: at most 6 sections, 40 lines each, 300 characters a line,
+  20000 characters in all, 256 KB of raw output. `ok: false` shows its message
+  in the pane. The command must be read-only and exit within the timeout or
+  stop its children on `SIGTERM`. Without `context:`, `c` says "Context not
+  configured".
+- While the pane is open, selecting an item fetches its context in a
+  background thread after about 400 ms; a newer selection supersedes an older
+  one (a late result is cached, not drawn). At most 2 commands run at once and
+  a fetch still waiting for a slot for an item that is no longer selected never
+  starts. Results are cached in memory per (item id, `ts`) for 10 minutes
+  (errors for 30 s); when the shown item's entry expires its old rows stay
+  drawn, marked stale, and one refetch starts by itself. The pane has loading,
+  error and ready states, shows the age of a cached result, and is redrawn only
+  when its content or an age label changes. `C`, or `r` while the pane has
+  focus, fetches again. Quitting stops a running context command with `SIGTERM`
+  (then `SIGKILL` after the grace period).
+- AI summary (`i`, and `I` to ask again): a new `summary:` setting (no default;
+  `summary: {}` uses the defaults): `model` (default `haiku`), `timeout_s` (30
+  to 300, default 90), `max_budget_usd` (0.005 to 2, default 0.05). One
+  `claude_bridge.complete` call with no tools at all (empty allowlist, every
+  built-in disallowed, an empty hook allowlist, any tool use fails the run),
+  over the item, its thread and the context sections if loaded. The bridge's
+  pause file and daily budget apply; spend is logged as `inbox-summary`. Item
+  text is data: it sits between marker lines with a per-call random token,
+  after rules that say to ignore instructions found in it, and never reaches
+  argv. At most 6 bullet lines (what is asked, the decision or next step,
+  deadlines). Cached on disk in `state/inbox-summary/cache.json` (0600, in a
+  0700 directory of its own, 200 most recently used entries), keyed by a hash of
+  the item id, `ts`, thread and model; `i` on a cached item shows it without a
+  call (even while another summary runs), `I` forces a new one. The summary is
+  the top section of the Context pane. Quitting while one runs asks first and
+  then waits for it (at most `timeout_s`), so the bridge logs the spend. Without `summary:` the keys
+  say "Summary not configured".
+- Footer, help overlay and command palette list the new keys; `--demo` has fake
+  context and summary backends (no command and no model is run).
+- `docs/inbox.md` sections "Context protocol", "Context pane" and "AI
+  summary", and commented `context:` and `summary:` examples in
+  `inbox.example.yaml`.
+
+### Changed
+
+- `r` inside the Context pane re-fetches that item's context instead of polling
+  every source; everywhere else it polls as before.
+- The right column is thread, context (when open), draft; `tab` cycles through
+  the pane too.
+- Internal: the capped command runner takes an optional per-call output cap
+  (`max_bytes`) and an optional `cancel` event; every existing caller keeps the
+  4 MB default and no cancellation.
+- A model name (`summary.model`, `rsvp.model`) may no longer start with `-`.
+- `c` closes an open Context pane even when only `summary:` is configured.
+- The context and summary threads hand their result to the UI without blocking
+  (a call that waited for a UI loop that had already gone would never return and,
+  as these threads are not daemons, would keep the process from exiting).
+
 ## [0.3.0] - 2026-11-16
 
 The first write actions. Both are off until configured in `inbox.yaml`, both

@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04  # ubuntu-latest (26.04) has no Python 3.9 build
+    timeout-minutes: 15    # a hang fails fast instead of holding the runner
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +78,7 @@ jobs:
     # The inbox UI is an optional extra: the job above runs without Textual
     # (UI tests skip). This one installs it and runs the UI tests for real.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -88,4 +90,4 @@ jobs:
         run: pip install pyyaml 'textual>=8.2,<9' python-bidi
 
       - name: Inbox tests with Textual
-        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli tests.test_inbox_writes -v
+        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli tests.test_inbox_writes tests.test_inbox_context -v

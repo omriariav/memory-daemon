@@ -16,17 +16,24 @@ BIDI_MODES = ("logical", "visual", "auto")
 URGENT_RULE_KEYS = ("source", "kind", "key_prefix", "title_regex",
                     "starts_within_h")
 TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "gmail_account",
-            "alert_urgent_max_age_h", "sources", "rsvp", "save")
+            "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
+            "summary")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s")
+CONTEXT_KEYS = ("argv", "timeout_s")
+SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # A connector tool as Claude Code names it. The mcp__ prefix keeps a built-in
 # (Bash, Write, ...) from ever being configured as the RSVP tool.
 TOOL_NAME = re.compile(r"^mcp__[A-Za-z0-9_.-]{1,120}$")
 PARAM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
-MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,64}$")
+# No leading "-": a model name must never read as a command-line flag.
+MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]][A-Za-z0-9_.:\[\]-]{0,63}$")
 DEFAULT_RSVP_TIMEOUT_S = 60
 DEFAULT_SAVE_TIMEOUT_S = 30
+DEFAULT_CONTEXT_TIMEOUT_S = 20
+DEFAULT_SUMMARY_TIMEOUT_S = 90
+DEFAULT_SUMMARY_BUDGET_USD = 0.05
 SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent", "invites_days",
                "saved_days", "email_require_label"),
@@ -44,6 +51,8 @@ DEFAULTS = {
     "alert_urgent_max_age_h": sources.DEFAULT_ALERT_MAX_AGE_H,
     "rsvp": None,   # no default: RSVP stays off until configured
     "save": None,   # no default: save stays off until configured
+    "context": None,   # no default: the Context pane needs a command
+    "summary": None,   # no default: the AI summary stays off until configured
 }
 
 
@@ -125,6 +134,8 @@ def validate(raw):
 
     out["rsvp"] = _check_rsvp(raw.get("rsvp"), problems)
     out["save"] = _check_save(raw.get("save"), problems)
+    out["context"] = _check_context(raw.get("context"), problems)
+    out["summary"] = _check_summary(raw.get("summary"), problems)
 
     raw_sources = raw.get("sources")
     if raw_sources is None:
@@ -292,6 +303,58 @@ def _check_save(raw, problems):
     if len(problems) > start:
         return None
     return {"argv": list(argv), "timeout_s": float(timeout)}
+
+
+def _check_context(raw, problems):
+    """The `context:` block as a clean dict, or None (absent or invalid)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("context must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in CONTEXT_KEYS:
+            problems.append(f"context: unknown key '{key}'")
+    argv = raw.get("argv")
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(a, str) and a for a in argv)):
+        problems.append("context.argv must be a non-empty list of strings "
+                        "(no shell)")
+    timeout = raw.get("timeout_s", DEFAULT_CONTEXT_TIMEOUT_S)
+    if not _num(timeout) or not 2 <= timeout <= 60:
+        problems.append("context.timeout_s must be 2 to 60")
+    if len(problems) > start:
+        return None
+    return {"argv": list(argv), "timeout_s": float(timeout)}
+
+
+def _check_summary(raw, problems):
+    """The `summary:` block as a clean dict, or None (absent or invalid).
+    An empty mapping (`summary: {}`) turns it on with every default."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("summary must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in SUMMARY_KEYS:
+            problems.append(f"summary: unknown key '{key}'")
+    model = raw.get("model", "haiku")
+    if not isinstance(model, str) or not MODEL_NAME.match(model):
+        problems.append("summary.model must be a model name (default haiku)")
+    timeout = raw.get("timeout_s", DEFAULT_SUMMARY_TIMEOUT_S)
+    if not _num(timeout) or not 30 <= timeout <= 300:
+        problems.append("summary.timeout_s must be 30 to 300")
+    budget = raw.get("max_budget_usd", DEFAULT_SUMMARY_BUDGET_USD)
+    if not _num(budget) or not 0.005 <= budget <= 2:
+        problems.append("summary.max_budget_usd must be a number from "
+                        "0.005 to 2")
+    if len(problems) > start:
+        return None
+    return {"model": model, "timeout_s": float(timeout),
+            "max_budget_usd": float(budget)}
 
 
 def _check_rules(rules, label, problems):

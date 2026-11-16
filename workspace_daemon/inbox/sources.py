@@ -400,7 +400,8 @@ def _stderr_tail(raw):
     return itm.truncate(text[-STDERR_TAIL:], STDERR_TAIL)
 
 
-def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
+def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0,
+                max_bytes=None, cancel=None):
     """Run argv in its own process group with bounded memory and time.
 
     stdout is read in chunks and the whole group is killed once it passes
@@ -413,7 +414,14 @@ def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
     the group and gives it that many seconds to clean up before the SIGKILL
     (a write should not be cut off mid-way when it can be asked to stop).
     The default 0 kills at once, as command sources always have.
+
+    `max_bytes` replaces OUTPUT_MAX_BYTES as the stdout cap for this call.
+
+    `cancel` is an optional `threading.Event`: once it is set the group is
+    asked to stop (SIGTERM, then SIGKILL after `term_grace_s`, or 2 s when that
+    is 0) and the status is `cancelled`.
     """
+    cap = itm.OUTPUT_MAX_BYTES if max_bytes is None else max_bytes
     proc = subprocess.Popen(
         argv, stdin=subprocess.PIPE if stdin_bytes is not None
         else subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -430,7 +438,7 @@ def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
             if flags["overflow"]:
                 continue  # draining while the group winds down
             out.extend(chunk)
-            if len(out) > itm.OUTPUT_MAX_BYTES:
+            if len(out) > cap:
                 flags["overflow"] = True
                 if not term_grace_s:
                     _kill_group(proc)
@@ -465,15 +473,28 @@ def _run_capped(argv, timeout_s, stdin_bytes=None, term_grace_s=0):
     for t in threads:
         t.start()
     status = "ok"
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        status = "timeout"
-        if term_grace_s:
-            _signal_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        left = deadline - time.monotonic()
+        try:
+            proc.wait(timeout=max(0.0, min(left, 0.1)) if cancel is not None
+                      else max(0.0, left))
+            break
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                status = "cancelled"
+                _signal_group(proc, signal.SIGTERM)
+                break
+            if time.monotonic() >= deadline:
+                status = "timeout"
+                if term_grace_s:
+                    _signal_group(proc, signal.SIGTERM)
+                break
     if flags["overflow"]:
         status = "overflow"
-    if term_grace_s and status != "ok":
+    if status == "cancelled":
+        _wait_group_gone(proc, term_grace_s or 2)
+    elif term_grace_s and status != "ok":
         _wait_group_gone(proc, term_grace_s)
     _kill_group(proc)  # also reaps stragglers that outlive the main process
     try:
