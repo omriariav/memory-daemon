@@ -21,11 +21,49 @@ from workspace_daemon import config  # noqa: E402
 from workspace_daemon.inbox import settings as inbox_settings  # noqa: E402
 
 
+# Top-level blocks the example ships commented out (they are off by default).
+COMMENTED_BLOCKS = ("rsvp", "save")
+
+
+def uncomment_blocks(text, keys=COMMENTED_BLOCKS):
+    """The example's text with each `# <key>:` block (the line and the `#   `
+    indented lines under it) switched on, so the commented examples are
+    checked like the live ones. Raises ValueError when a block is missing."""
+    lines, out, found = text.splitlines(), [], set()
+    i = 0
+    while i < len(lines):
+        key = next((k for k in keys if lines[i].startswith(f"# {k}:")), None)
+        if key is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        found.add(key)
+        out.append(lines[i][2:])
+        i += 1
+        while i < len(lines) and lines[i].startswith("#   "):
+            out.append(lines[i][2:])
+            i += 1
+    missing = [k for k in keys if k not in found]
+    if missing:
+        raise ValueError("inbox.example.yaml has no commented block for: "
+                         + ", ".join(missing))
+    return "\n".join(out) + "\n"
+
+
 def _inbox_problems(path):
     try:
         inbox_settings.load(ROOT, path)
+        # The same file with the commented rsvp: and save: blocks switched on.
+        raw = yaml.safe_load(uncomment_blocks(
+            Path(path).read_text(encoding="utf-8")))
+        settings = inbox_settings.validate(raw)
+        for key in COMMENTED_BLOCKS:
+            if settings.get(key) is None:
+                return [f"the commented {key}: example did not validate"]
     except inbox_settings.SettingsError as exc:
         return exc.problems
+    except (ValueError, yaml.YAMLError) as exc:
+        return [str(exc)]
     return []
 
 

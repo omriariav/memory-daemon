@@ -7,6 +7,49 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
+The first write actions. Both are off until configured in `inbox.yaml`, both
+confirm first and then wait out the 5 s undo window, and quitting inside the
+window cancels them.
+
+### Added
+
+- RSVP on pending invites: on an invite row `a` accepts, `X` declines and `T`
+  answers tentative. A modal shows the event, the time and the exact answer
+  (Cancel is focused); after the undo window a worker runs one headless Claude
+  call through the daemon's bridge whose only allowed tool is the configured
+  calendar RSVP tool, with its arguments pinned to the event id, the calendar
+  id and the answer. The bridge's guards apply (`state/PAUSED`, the daily
+  budget). The prompt carries only the tool name and those three values. The
+  result is checked, never the model's words: a failure keeps the row and
+  toasts the reason, a success hides it (`rsvp` in `inbox-state.json`) and
+  logs it in the audit log. A recurring series answers its next instance only,
+  and the modal says so. New `rsvp:` setting (no default): `tool`, `args`
+  (the tool's parameter names for `event_id`, `calendar_id` and `response`),
+  `timeout_s`, optional `model`. Without it `X` and `T` say "RSVP not
+  configured" and `a` keeps acknowledging an invite as before.
+- Save to memory (`m`, any item): a modal shows the source, sender, gist and
+  link; after the undo window the configured `save` command runs with
+  `{"v": 1, "action": "save", "item": <item>}` on stdin and answers
+  `{"ok", "message", "memory_id", "duplicate"}`. The item stays listed and
+  gets a `◆` (local `saved` mark). New `save:` setting (no default): `argv`,
+  `timeout_s`. Without it `m` says "Save not configured". Same process-group,
+  timeout and output-cap handling as command sources; item text reaches the
+  command only as JSON on stdin. A command may answer `ok: false` with
+  `duplicate: true` (and a `candidate`): the inbox then asks "Save anyway"
+  (Cancel focused) and, once confirmed, resends the same payload with
+  `"force": true`. The protocol is in docs/inbox.md.
+- Footer, help overlay and command palette list the new keys.
+- `--demo` has an invite row and fake RSVP and save backends.
+
+### Changed
+
+- Pending-invite `meta` also carries `title` and `when` (display text).
+- `quit` cancels a queued RSVP or save, like a queued send.
+- `inbox-state.json` marks may hold `rsvp` (a word) and `saved` (a time);
+  older files read unchanged.
+
 ## [0.2.0] - 2026-11-15
 
 Read-side features only: nothing new is written or sent. RSVP and save

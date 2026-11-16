@@ -14,18 +14,30 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Input, Static, TextArea
 
-from . import bidi, themes
+from . import bidi, invites, themes
 from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
-from .screens import AuditScreen, ConfirmSend, HelpScreen, SavedScreen, SnoozePicker
+from .screens import (AuditScreen, ConfirmSend, ConfirmWrite, HelpScreen,
+                      SavedScreen, SnoozePicker)
 from .sources import SourceResult, merge
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, DraftPane, HintBar, Queue, StatusHeader,
                       ThreadView, fmt_age, fuzzy, palette, vis)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
+RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
+SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
+# What each RSVP key answers: key -> (menu word, answer sent, modal title).
+RSVP_KEYS = {
+    "accept": ("accept", "accepted", "Accept invite"),
+    "decline": ("decline", "declined", "Decline invite"),
+    "tentative": ("tentative", "tentative", "Answer tentative"),
+}
+# Kinds that act outside the inbox: quitting inside the undo window cancels
+# them (nothing is sent), unlike the local marks, which quitting commits.
+EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save")
 
 
 class _SavedUnit:
@@ -48,7 +60,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | done | ack | snooze
+    kind: str                 # send | nudge | done | ack | snooze | rsvp | save
     item: Item
     text: str = ""
     until: float = 0.0
@@ -56,6 +68,9 @@ class Pending:
     audit: dict = field(default_factory=dict)
     timer: object = None
     done: bool = False
+    answer: str = ""          # rsvp: the word sent (accepted, declined, tentative)
+    force: bool = False       # save: "save anyway" after a duplicate answer
+    hide: bool = True         # False: the item stays listed while it waits (save)
 
 
 class InboxApp(App):
@@ -77,6 +92,8 @@ class InboxApp(App):
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
         Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
         Binding("R", "toggle_resolved", show=False),
+        Binding("X", "rsvp_decline", show=False), Binding("T", "rsvp_tentative", show=False),
+        Binding("m", "save_memory", show=False),
         Binding("A", "toggle_all", show=False), Binding("S", "saved", show=False),
         Binding("question_mark", "help", show=False),
         Binding("ctrl+t", "toggle_theme", show=False),
@@ -111,7 +128,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, SnoozePicker, HelpScreen, AuditScreen, SavedScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-text { border: round $panel; padding: 0 1; margin: 1 0; background: $background; }
@@ -180,6 +197,7 @@ class InboxApp(App):
         self.bidi_fallback = mode == "visual" and not bidi.available()
         self.bidi_mode = "logical" if self.bidi_fallback else mode
         self.pending = []
+        self.running = []                  # committed actions still executing
         self.audit = []
         self.stats = {"done": 0, "sent": 0, "snoozed": 0}
         self.known_ids = set()
@@ -275,8 +293,10 @@ class InboxApp(App):
     def refilter(self, redraw=True):
         """Rebuild the queue from the fetched rows: hide marked and pending
         items, wake snoozed ones that are due."""
-        busy_keys = {p.item.key for p in self.pending if not p.done}
+        busy_keys = self._busy_keys()
         now = time.time()
+        for i in self.all_rows:
+            i.saved = self.store.is_saved(i.key)
         shown = [i for i in self.all_rows
                  if i.key not in busy_keys and not self.store.is_hidden(i.key, now)
                  and (self.show_resolved or not i.resolved)]
@@ -289,12 +309,17 @@ class InboxApp(App):
                 pass
         return changed
 
+    def _busy_keys(self):
+        """Items that are queued for, or executing, an action that hides them."""
+        return ({p.item.key for p in self.pending if p.hide and not p.done}
+                | {p.item.key for p in self.running if p.hide})
+
     @property
     def resolved_hidden(self):
         """How many resolved alerts R would reveal."""
         if self.show_resolved:
             return 0
-        busy_keys = {p.item.key for p in self.pending if not p.done}
+        busy_keys = self._busy_keys()
         now = time.time()
         return sum(1 for i in self.all_rows
                    if i.resolved and i.key not in busy_keys
@@ -414,16 +439,30 @@ class InboxApp(App):
             return [("r", "poll"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
+        save = [("m", "save")] if self.actions_save_on else []
+        if self._rsvp_on(it):
+            tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
+                ("u", "undo"), ("S", "saved"), ("?", "help")]
+            return base + [("a", "accept"), ("X", "decline"), ("T", "tentative")] + tail
         if f is not None and f.id in ("thread", "draft-pane"):
             return base + [("tab", "next pane"), ("y", "copy"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
         if it.kind == "ack":
-            return base + [("a", "ack")] + opn + [("y", "copy"), ("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
+            return base + [("a", "ack")] + opn + [("y", "copy")] + save + [("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "fyi":
-            return base + [("d", "dismiss")] + opn + [("y", "copy"), ("s", "snooze"), ("u", "undo"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("?", "help")]
+            return base + [("d", "dismiss")] + opn + [("y", "copy")] + save + [("s", "snooze"), ("u", "undo"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("?", "help")]
         if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
+            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
         return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
-            ("y", "copy"), ("u", "undo"), ("/", "filter"), ("f", "source"), ("A", "all"), ("S", "saved"), ("?", "help")]
+            ("y", "copy")] + save + [("u", "undo"), ("/", "filter"), ("f", "source"), ("A", "all"), ("S", "saved"), ("?", "help")]
+
+    @property
+    def actions_save_on(self):
+        return bool(getattr(self.actions, "save_configured", False))
+
+    def _rsvp_on(self, it):
+        """True for a pending invite when RSVP is configured: a/X/T answer it."""
+        return (bool(getattr(self.actions, "rsvp_configured", False))
+                and invites.rsvp_target(it) is not None)
 
     def update_hints(self):
         self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
@@ -653,21 +692,28 @@ class InboxApp(App):
         else:
             self.redraw(keep=keep)
 
-    def _enqueue(self, kind, it, toast, text="", until=0.0, detail=""):
-        p = Pending(kind=kind, item=it, text=text, until=until, label=toast)
+    def _enqueue(self, kind, it, toast, text="", until=0.0, detail="",
+                 answer="", hide=True, force=False):
+        p = Pending(kind=kind, item=it, text=text, until=until, label=toast,
+                    answer=answer, hide=hide, force=force)
         p.audit = self.record(kind, it, detail, "queued")
         self.pending.append(p)
-        self._remove_optimistic(it)
-        if kind in ("send", "nudge"):
-            self.stats["sent"] += 1
-        elif kind in ("done", "ack"):
-            self.stats["done"] += 1
-        else:
-            self.stats["snoozed"] += 1
+        if hide:
+            self._remove_optimistic(it)
+            self._count(kind, 1)
         p.timer = self.set_timer(self.undo_s, lambda: self._commit(p))
         self.notify(f"{toast}\nu to undo ({int(self.undo_s)}s)", timeout=self.undo_s,
                     title="Queued", markup=False)
         self.redraw()
+
+    def _count(self, kind, step):
+        """Session tallies shown on the empty screen (a save hides nothing)."""
+        if kind in ("send", "nudge"):
+            self.stats["sent"] += step
+        elif kind in ("done", "ack", "rsvp"):
+            self.stats["done"] += step
+        elif kind == "snooze":
+            self.stats["snoozed"] += step
 
     def _commit(self, p):
         if p.done:
@@ -675,6 +721,7 @@ class InboxApp(App):
         p.done = True
         if p in self.pending:
             self.pending.remove(p)
+        self.running.append(p)
         self.busy += 1
         self.run_worker(lambda: self._run_in_thread(p), thread=True, group="commit")
 
@@ -688,6 +735,10 @@ class InboxApp(App):
             return a.mark_done(it)
         if p.kind == "ack":
             return a.ack(it)
+        if p.kind == "rsvp":
+            return a.rsvp(it, p.answer)
+        if p.kind == "save":
+            return a.save(it, force=True) if p.force else a.save(it)
         return a.snooze(it, p.until)
 
     def _run_in_thread(self, p):
@@ -699,13 +750,27 @@ class InboxApp(App):
 
     def _committed(self, p, res):
         self.busy = max(0, self.busy - 1)
+        if p in self.running:
+            self.running.remove(p)
         p.audit["status"] = "committed" if res.ok else "failed"
         p.audit["detail"] = (p.audit["detail"] + " · " + res.detail).strip(" ·")
         self.last_committed = p
-        if not res.ok:
+        if p.kind == "save" and not res.ok and res.duplicate and not p.force:
+            # Not a failure: the command found a likely duplicate. Ask.
+            p.audit["status"] = "duplicate"
+            self.refilter()
+            self._confirm_save_anyway(p.item, res)
+        elif not res.ok:
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
             self.notify(f"{p.kind} failed: {res.detail}", severity="error", timeout=6, markup=False)
+        elif p.kind == "rsvp":
+            self.refilter()
+            self.notify(f"{res.detail}: {p.item.gist}", title="RSVP sent", timeout=5, markup=False)
+        elif p.kind == "save":
+            self.refilter(redraw=False)
+            self.redraw()
+            self.notify(f"{res.detail}: {p.item.who}", title="Saved to memory", timeout=5, markup=False)
         elif p.kind in ("send", "nudge"):
             self.notify(f"{res.detail or 'would send'}  ->  {p.item.destination}",
                         title="Demo", timeout=4, markup=False)
@@ -721,12 +786,8 @@ class InboxApp(App):
         self.pending.remove(p)
         p.done = True
         it = p.item
-        if p.kind in ("send", "nudge"):
-            self.stats["sent"] -= 1
-        elif p.kind in ("done", "ack"):
-            self.stats["done"] -= 1
-        else:
-            self.stats["snoozed"] -= 1
+        if p.hide:
+            self._count(p.kind, -1)
         p.audit["status"] = "undone"
         self.record("undo", it, p.kind, "ok")
         self.current_key = it.key
@@ -738,6 +799,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if self._rsvp_on(it):          # an invite: `a` accepts it
+            return self._rsvp("accept", it)
         if it.kind == "ack":
             self._enqueue("ack", it, f"Acknowledged: {it.who} ({SOURCES.get(it.source, SOURCES['other'])[2]})")
             return
@@ -779,6 +842,92 @@ class InboxApp(App):
                 self.record(kind, it, "cancelled at confirm", "cancelled")
                 self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
         self.push_screen(ConfirmSend(verb, it.destination, text, self.bidi), after)
+
+    # ---------- RSVP and save (the first writes) ----------
+    def action_rsvp_decline(self):
+        self._rsvp("decline")
+
+    def action_rsvp_tentative(self):
+        self._rsvp("tentative")
+
+    def _rsvp(self, key, it=None):
+        """a / X / T on a pending invite: confirm, wait out the undo window,
+        then answer through the bridge."""
+        it = it or self.current
+        if it is None:
+            return
+        if not getattr(self.actions, "rsvp_configured", False):
+            self.notify(RSVP_OFF, timeout=3, severity="warning", markup=False)
+            return
+        target = invites.rsvp_target(it)
+        if target is None:
+            self.notify("Not a pending calendar invite", timeout=2, markup=False)
+            return
+        _event_id, _calendar_id, recurring = target
+        word, answer, title = RSVP_KEYS[key]
+        when = it.meta.get("when")
+        name = it.meta.get("title")
+        rows = [("Event", name if isinstance(name, str) and name else it.gist),
+                ("When", when if isinstance(when, str) else ""),
+                ("From", it.who if it.who != "calendar invite" else ""),
+                ("Answer", f"{word} ({answer})")]
+        note = ("Recurring: answers the next instance only, not the series."
+                if recurring else "")
+
+        def after(ok):
+            if ok:
+                label = f"RSVP {answer}: {it.meta.get('title') or it.who}"
+                self._enqueue("rsvp", it, label, answer=answer, detail=answer)
+            else:
+                self.record("rsvp", it, "cancelled at confirm", "cancelled")
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+        self.push_screen(ConfirmWrite(title, rows, word.capitalize(), note, self.bidi), after)
+
+    def _confirm_save_anyway(self, it, res):
+        cand = res.candidate or {}
+        score = cand.get("score")
+        rows = [("Said", res.detail), ("Match", cand.get("title") or ""),
+                ("Match id", cand.get("id") or ""),
+                ("Score", f"{score:g}" if score is not None else "")]
+
+        def after(ok):
+            if ok:
+                self._enqueue("save", it, f"Save anyway: {it.who}", hide=False,
+                              detail="save anyway", force=True)
+            else:
+                self.record("save", it, "duplicate: not saved", "cancelled")
+                self.notify("Not saved: looks like a duplicate.", timeout=3, markup=False)
+        self.push_screen(ConfirmWrite(
+            "Possible duplicate", rows, "Save anyway",
+            "Saving anyway adds another memory.", self.bidi), after)
+
+    def action_save_memory(self):
+        """m: save the item to memory through the configured command."""
+        it = self.current
+        if it is None:
+            return
+        if not getattr(self.actions, "save_configured", False):
+            self.notify(SAVE_OFF, timeout=3, severity="warning", markup=False)
+            return
+        if any(p.kind == "save" and p.item.key == it.key and not p.done
+               for p in self.pending) or any(
+                p.kind == "save" and p.item.key == it.key for p in self.running):
+            self.notify("Already queued to save", timeout=2, markup=False)
+            return
+        label = SOURCES.get(it.source, SOURCES["other"])[2]
+        rows = [("Source", f"{label} · {it.where}"), ("From", it.who),
+                ("Gist", it.gist), ("Link", it.link or "")]
+
+        def after(ok):
+            if ok:
+                self._enqueue("save", it, f"Save to memory: {it.who}", hide=False,
+                              detail=it.gist[:60])
+            else:
+                self.record("save", it, "cancelled at confirm", "cancelled")
+                self.notify("Cancelled. Nothing saved.", timeout=2, markup=False)
+        self.push_screen(ConfirmWrite("Save to memory", rows, "Save",
+                                      "The item is passed to your save command as JSON on stdin.",
+                                      self.bidi), after)
 
     def action_done(self):
         it = self.current
@@ -938,15 +1087,15 @@ class InboxApp(App):
             self.query_one("#draft-view", Static).update(self.draft_text(it, it.draft, False))
 
     async def action_quit(self):
-        """Quitting cancels pending sends/nudges (nothing is sent). Done, ack
-        and snooze are committed."""
+        """Quitting cancels pending sends, nudges, RSVPs and saves (nothing
+        leaves the inbox). Done, ack and snooze are committed."""
         cancelled = 0
         for p in list(self.pending):
             if p.timer:
                 p.timer.stop()
             p.done = True
             self.pending.remove(p)
-            if p.kind in ("send", "nudge"):
+            if p.kind in EXTERNAL_KINDS:
                 p.audit["status"] = "cancelled on quit"
                 cancelled += 1
             else:
@@ -955,7 +1104,7 @@ class InboxApp(App):
                 except Exception as exc:
                     res = Result(False, str(exc))
                 p.audit["status"] = "committed" if res.ok else "failed"
-        self.exit(message=f"Nothing sent: {cancelled} pending send(s) cancelled on quit." if cancelled else None)
+        self.exit(message=f"Nothing sent: {cancelled} pending action(s) cancelled on quit." if cancelled else None)
 
     # ---------- poll ----------
     def _run_units(self, names, show_all, reeval=False):
@@ -1148,6 +1297,10 @@ class InboxApp(App):
             ("Edit draft", "Edit the draft text", self.action_edit),
             ("Mark done", "Remove from the queue", self.action_done),
             ("Snooze…", "Pick a snooze time", self.action_snooze),
+            ("Accept invite", "a on a calendar invite (needs rsvp: in inbox.yaml)", lambda: self._rsvp("accept")),
+            ("Decline invite", "X (needs rsvp: in inbox.yaml)", self.action_rsvp_decline),
+            ("Tentative", "T: answer an invite tentatively (needs rsvp: in inbox.yaml)", self.action_rsvp_tentative),
+            ("Save item to memory", "m: save this item (needs save: in inbox.yaml)", self.action_save_memory),
             ("Nudge", "Send the nudge draft (confirm first)", self.action_nudge),
             ("Open link", "Open the item's link in the browser", self.action_open),
             ("Copy item", "y: sender, where, gist and the link", self.action_copy_item),

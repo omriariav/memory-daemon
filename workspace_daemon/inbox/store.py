@@ -1,4 +1,4 @@
-"""Local inbox state: done, snooze-until and ack per item id.
+"""Local inbox state: done, snooze-until, ack, RSVP answer and saved per item id.
 
 `<base>/state/inbox-state.json`, written atomically with mode 0600. Several
 inbox panes (processes) and several threads of one pane may write at once, so
@@ -21,6 +21,8 @@ from .. import state as daemon_state
 FILE_NAME = "inbox-state.json"
 LOCK_NAME = "inbox-state.lock"
 SCHEMA_VERSION = 1
+# RSVP answers a mark may hold (the word the bridge sent).
+RSVP_ANSWERS = ("accepted", "declined", "tentative")
 # A mark is kept while its item is still listed by some source, and for this
 # long after the item was last listed (or the mark was last changed). Active
 # snoozes are never pruned by age. Age pruning happens only in `note_listed`
@@ -61,10 +63,12 @@ class InboxStore:
                 continue
             clean = {}
             for field in ("done", "ack", "snooze_until", "updated",
-                          "last_listed"):
+                          "last_listed", "saved"):
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
+            if mark.get("rsvp") in RSVP_ANSWERS:
+                clean["rsvp"] = mark["rsvp"]
             if clean:
                 marks[key] = clean
         return marks, False
@@ -149,6 +153,17 @@ class InboxStore:
     def snooze(self, item_id, until):
         self._mark(item_id, snooze_until=float(until))
 
+    def rsvp(self, item_id, answer):
+        """The invite was answered (`accepted`, `declined`, `tentative`): hide
+        it until the calendar cache shows the answer and the row is gone."""
+        if answer not in RSVP_ANSWERS:
+            raise ValueError(f"unknown RSVP answer {answer!r}")
+        self._mark(item_id, rsvp=answer)
+
+    def mark_saved(self, item_id):
+        """The item was saved to memory. It stays listed, with a glyph."""
+        self._mark(item_id, saved=self.clock())
+
     def restore(self, item_id):
         """Drop every mark (undo)."""
         self._transaction(lambda marks: marks.pop(item_id, None) is not None)
@@ -193,9 +208,15 @@ class InboxStore:
         mark = self.marks.get(item_id)
         if not mark:
             return False
-        if "done" in mark or "ack" in mark:
+        if "done" in mark or "ack" in mark or "rsvp" in mark:
             return True
         return mark.get("snooze_until", 0) > now
+
+    def is_saved(self, item_id):
+        return "saved" in (self.marks.get(item_id) or {})
+
+    def rsvp_answer(self, item_id):
+        return (self.marks.get(item_id) or {}).get("rsvp")
 
     def snoozed_until(self, item_id, now=None):
         now = self.clock() if now is None else now

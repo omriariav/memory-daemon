@@ -311,3 +311,65 @@ def parse_act_response(text):
             or not isinstance(doc.get("message"), str)):
         raise ItemError("response needs ok (bool) and message (str)")
     return {"ok": doc["ok"], "message": clean_line(doc["message"])}
+
+
+MEMORY_ID_MAX = 200
+
+
+def save_request(item, force=False):
+    """The stdin of `save`: `{"v": 1, "action": "save", "item": <v1 item>}`,
+    plus `"force": true` when the user chose "save anyway" after a duplicate."""
+    doc = {"v": SCHEMA_VERSION, "action": "save", "item": item}
+    if force:
+        doc["force"] = True
+    return doc
+
+
+def _candidate(raw):
+    """The `candidate` of a duplicate answer: `{"id", "title", "score"}`, any
+    part may be missing; text is cleaned to one line. None when absent."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ItemError("response candidate must be an object or null")
+    out = {}
+    for key in ("id", "title"):
+        val = raw.get(key)
+        if val is not None and not isinstance(val, str):
+            raise ItemError(f"response candidate.{key} must be a string")
+        out[key] = truncate(clean_line(val), FIELD_MAX) if val else None
+    score = raw.get("score")
+    if score is not None and not _is_number(score):
+        raise ItemError("response candidate.score must be a number")
+    out["score"] = score
+    return out
+
+
+def parse_save_response(text):
+    """Validate the stdout of the save command.
+
+    `{"ok": bool, "message": str, "memory_id": str|null, "duplicate": bool}`
+    and, with `ok: false, duplicate: true`, an optional `candidate`
+    (`{"id", "title", "score"}`, the memory it looks like). `memory_id`,
+    `duplicate` and `candidate` may be left out (null, false, null). Returns
+    those five keys, text cleaned to one line. Raises ItemError.
+    """
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise ItemError(f"response is not JSON ({exc})") from None
+    if (not isinstance(doc, dict) or not isinstance(doc.get("ok"), bool)
+            or not isinstance(doc.get("message"), str)):
+        raise ItemError("response needs ok (bool) and message (str)")
+    memory_id = doc.get("memory_id")
+    if memory_id is not None and not isinstance(memory_id, str):
+        raise ItemError("response memory_id must be a string or null")
+    duplicate = doc.get("duplicate", False)
+    if not isinstance(duplicate, bool):
+        raise ItemError("response duplicate must be a boolean")
+    candidate = _candidate(doc.get("candidate"))
+    return {"ok": doc["ok"], "message": clean_line(doc["message"]),
+            "candidate": candidate,
+            "memory_id": (truncate(clean_line(memory_id), MEMORY_ID_MAX)
+                          if memory_id is not None else None),
+            "duplicate": duplicate}

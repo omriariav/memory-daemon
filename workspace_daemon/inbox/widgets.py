@@ -14,6 +14,7 @@ from . import __version__, bidi, slackfmt
 from .models import SECTIONS, SOURCES
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SAVED_GLYPH = "◆"  # an item saved to memory
 ITEM_PREFIX = "i:"  # Option id of an item row; item ids are arbitrary text
 
 
@@ -168,7 +169,10 @@ class Queue(OptionList):
         t.append(glyph + " ", Style(color=pal[scol], bold=True))
         who = fit(vis(it.who, visual), max(8, width // 2 - 2))
         t.append(who, Style(bold=True, color=pal["urgent"] if urgent else None))
-        where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9))
+        if it.saved:  # saved to memory (m): a small glyph, the row stays
+            t.append(" " + SAVED_GLYPH, Style(color=pal["ok"]))
+        where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9
+                                  - (2 if it.saved else 0)))
         if where:
             t.append("  " + where, Style(color=pal["muted"]))
         pad = max(1, width - t.cell_len - cell_len(age))

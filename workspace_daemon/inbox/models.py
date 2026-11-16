@@ -47,6 +47,8 @@ class Item:
     meta: dict = field(default_factory=dict)
     drafted_by: str = "source"
     streamed: bool = False         # UI-only: the draft animation already ran
+    saved: bool = False            # UI-only: marked saved to memory (local state)
+    raw: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property
     def resolved(self):
@@ -87,8 +89,26 @@ def from_v1(raw):
         # `open` needs somewhere to go: hide it for an item with no link.
         actions=[a for a in raw["actions"]
                  if a != "open" or raw["link"] is not None],
-        link=raw["link"], meta=raw["meta"],
+        link=raw["link"], meta=raw["meta"], raw=raw,
     )
+
+
+def to_v1(item):
+    """The v1 dict of an item: the validated one it was built from, else a
+    rebuild from its fields (an item made by the UI itself)."""
+    if item.raw is not None:
+        return dict(item.raw)
+    return {
+        "v": 1, "id": item.key, "source": item.source,
+        "section": item.section,
+        "urgency": "urgent" if item.section == "urgent" else "digest",
+        "sender": item.who, "where": item.where, "gist": item.gist,
+        "ts": item.ts, "link": item.link,
+        "thread": [{"who": m.who, "ts": m.ts, "text": m.text}
+                   for m in item.messages],
+        "draft": item.draft or None, "actions": list(item.actions),
+        "meta": dict(item.meta),
+    }
 
 
 # --- clipboard text ---------------------------------------------------------
