@@ -806,9 +806,9 @@ so a person with such a name is flagged too). `attendee_count` is every such
 person (uncapped) except declined guests, the same rule as a capture event's
 `attendee_count`; the owner is always counted and is added when the listing
 does not name them. `attendees_known` is `false` when the count is only a floor:
-no Attendees line for an event I do not organize (or with no organizer), a list
-that shows only me for an event someone else organizes (a hidden guest list), or
-a group address among the attendees. Names are read from the address, and emails
+an event I do not organize (including one with no organizer address, such as a
+group calendar's) has no Attendees line, lists only me (a hidden guest list), or
+has no entry for me, or a group address is among the attendees. Names are read from the address, and emails
 stay in this local file, never in the log;
 `list_title` is the title as listed, cut to 100
 characters for every event, so a detail lookup never changes it and a change

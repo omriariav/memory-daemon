@@ -1831,14 +1831,26 @@ def _gmail_label_names(raw):
     from . import llm
 
     base_dir = llm.base_dir()
+    # A user label is told by its raw id (`Label_<n>`), not by its name: a user
+    # label may be named in capitals like a system one.
+    user_ids = [x for x in ids if x.strip().startswith("Label_")]
+    other_ids = [x for x in ids if not x.strip().startswith("Label_")]
     if base_dir is not None:
-        names = labels.Catalog(base_dir).names_for_ids(ids)
+        catalog = labels.Catalog(base_dir)
+        user = catalog.names_for_ids(user_ids)
+        system = catalog.names_for_ids(other_ids)
     else:
-        names = [x.strip() for x in ids if labels._SYSTEM_ID.match(x.strip())]
-    clean = {" ".join(n.split())[:events.GMAIL_LABEL_CHARS] for n in names}
-    clean.discard("")
-    system = sorted(n for n in clean if labels._SYSTEM_ID.match(n))
-    user = sorted(clean.difference(system))
+        user = []
+        system = [x.strip() for x in other_ids
+                  if labels._SYSTEM_ID.match(x.strip())]
+
+    def tidy(names):
+        clean = {" ".join(n.split())[:events.GMAIL_LABEL_CHARS] for n in names}
+        clean.discard("")
+        return sorted(clean)
+
+    user = tidy(user)
+    system = [n for n in tidy(system) if n not in user]
     return (user + system)[:events.GMAIL_LABELS_MAX]
 
 

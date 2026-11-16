@@ -764,6 +764,26 @@ class SnapshotRowTest(unittest.TestCase):
                 f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n")
         self.assertFalse(self.rows(bare)["e1"]["attendees_known"])
 
+    def test_someone_elses_event_listing_only_me_is_unknown_without_an_organizer_address(self):
+        # a group-calendar organizer has no address of its own
+        text = (f"Found 1 event(s):\n\n- Broadcast\n  Time: {at(soon())} - "
+                f"{at(soon() + datetime.timedelta(hours=1))}\n  ID: e1\n"
+                "  Organizer: c_abc123@group.calendar.google.com\n"
+                "  Attendees: me@example.com (needsAction, self)\n")
+        row = self.rows(text)["e1"]
+        self.assertFalse(row["attendees_known"])
+        self.assertEqual(row["attendee_count"], 1)
+
+    def test_someone_elses_event_without_an_entry_for_me_is_unknown(self):
+        row = self.one("alice.smith@example.com (accepted), "
+                       "bob.jones@example.com (accepted)")
+        self.assertFalse(row["attendees_known"])
+        # the same list on an event I organize is complete
+        mine = self.one("alice.smith@example.com (accepted), "
+                        "bob.jones@example.com (accepted)",
+                        organizer="me@example.com")
+        self.assertTrue(mine["attendees_known"])
+
     def test_group_address_is_flagged_and_makes_the_size_unknown(self):
         row = self.one("alice.smith@example.com (accepted), "
                        "eng-team@example.com (needsAction), "

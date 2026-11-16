@@ -1331,9 +1331,9 @@ def _snapshot_people(event, owner):
     """(people for the snapshot, whether their number is known).
 
     `people` is the event's attendee list, with a known organizer the listing
-    omits added; the list is only a floor (`known` False) without an Attendees
-    line for an event I do not organize, when it shows only me for an event
-    someone else organizes, or when it holds a group address.
+    omits added; the list is only a floor (`known` False) for an event I do not
+    organize when it has no Attendees line, shows only me, or has no entry for
+    me, or when it holds a group address.
     """
     people = list(event["attendees"])
     org = event["organizer"] or {}
@@ -1341,9 +1341,11 @@ def _snapshot_people(event, owner):
     organized_by_me = event["my_rsvp"] == "organizer"
     mine = [p for p in people if p["self"] or p["email"] == owner]
     known = organized_by_me or bool(people)
-    if people and len(mine) == len(people) and not organized_by_me \
-            and org_email and org_email != owner:
-        known = False  # only me listed, yet someone else organizes: hidden list
+    if not organized_by_me and (not mine or len(mine) == len(people)):
+        # Someone else's event that lists no one, only me (a hidden guest
+        # list), or no entry for me (so the listing is partial): a floor.
+        # A group-calendar organizer has no address, so this cannot wait for one.
+        known = False
     if org_email and not any(p["email"] == org_email for p in people):
         people.append({
             "email": org_email, "name": org.get("name") or "",

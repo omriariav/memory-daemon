@@ -62,6 +62,16 @@ class LabelCacheTest(unittest.TestCase):
         self.assertEqual(cat.names_for_ids(["Label_9"]), [])
         self.assertEqual(len(calls), 1)
 
+    def test_malformed_id_cache_entries_are_skipped(self):
+        labels._ids_tried.clear()
+        labels.cache_file(self.base).write_text(json.dumps({
+            "fetched_at": time.time(), "labels": ["Save"],
+            "ids": {"Label_1": "Save", "Label_2": None, "Label_3": 5}}))
+        cat = self.cache()
+        self.fake.user_label_ids = lambda: {"Label_1": "Save"}
+        self.assertEqual(cat.names_for_ids(["Label_1", "Label_2"]), ["Save"])
+        self.assertNotIn("None", cat.names_for_ids(["Label_2"]))
+
     def test_id_map_survives_a_names_refresh(self):
         cat = self.ids_cache({"Label_123": "Save"})
         cat.refresh()

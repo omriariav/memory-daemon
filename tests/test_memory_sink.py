@@ -1860,6 +1860,17 @@ class CaptureEventsTest(unittest.TestCase):
             row = self._mail(["Label_5", "INBOX"])
         self.assertEqual(row["details"], {"gmail_labels": ["INBOX"]})
 
+    def test_user_label_named_like_a_system_label_stays_a_user_label(self):
+        self.setUp_labels()
+        ids = {f"Label_{i}": f"USER{i:02d}" for i in range(19)}
+        ids["Label_99"] = "INBOX"  # a user label named like a system one
+        self._catalog(ids)
+        row = self._mail(list(ids) + ["STARRED", "UNREAD"])
+        names = row["details"]["gmail_labels"]
+        self.assertEqual(len(names), 20)
+        self.assertIn("INBOX", names)
+        self.assertNotIn("STARRED", names)
+
     def test_user_labels_win_the_cap_over_system_labels(self):
         self.setUp_labels()
         ids = {f"Label_{i}": f"User{i:02d}" for i in range(20)}

@@ -61,7 +61,10 @@ class Catalog:
         self._names, self._fetched_at = names, fetched_at
         ids = data.get("ids")
         if isinstance(ids, dict):
-            self._ids = {str(k): str(v) for k, v in ids.items()}
+            self._ids = {
+                k: v for k, v in ids.items()
+                if isinstance(k, str) and isinstance(v, str) and v
+            }
 
     def _store(self):
         if self.read_only:
