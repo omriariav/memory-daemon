@@ -86,6 +86,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(validated({"summary": {"timeout_s": 30}})
                          ["summary"]["timeout_s"], 30.0)
 
+    def test_a_model_name_never_starts_with_a_dash(self):
+        out = validated({"summary": {"model": "claude-sonnet-4.5"}})
+        self.assertEqual(out["summary"]["model"], "claude-sonnet-4.5")
+        with self.assertRaises(settings.SettingsError):
+            validated({"rsvp": {"tool": "mcp__x__y", "model": "-m",
+                                "args": {"event_id": "a", "calendar_id": "b",
+                                         "response": "c"}}})
+
     def test_blank_blocks_are_off(self):
         out = validated({"context": None, "summary": None})
         self.assertIsNone(out["context"])
@@ -116,6 +124,8 @@ class SettingsTest(unittest.TestCase):
             ({"max_budget_usd": "a lot"}, "summary.max_budget_usd"),
             ({"model": ""}, "summary.model"),
             ({"model": "bad name"}, "summary.model"),
+            ({"model": "--dangerous"}, "summary.model"),
+            ({"model": "-x"}, "summary.model"),
             ({"tools": ["Bash"]}, "unknown key 'tools'"),
             ("haiku", "summary must be a mapping"),
         ]:
@@ -314,6 +324,40 @@ class RunContextTest(unittest.TestCase):
         self.assertTrue(cleaned, "the command never saw SIGTERM")
 
 
+class CancelTest(unittest.TestCase):
+    def test_a_cancelled_command_gets_sigterm_and_the_call_returns_at_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "marker"
+            script = Path(tmp) / "slow.py"
+            script.write_text(textwrap.dedent(f"""
+                import signal, sys, time
+                def done(*_):
+                    open({str(marker)!r}, "w").write("term")
+                    sys.exit(0)
+                signal.signal(signal.SIGTERM, done)
+                sys.stdin.read()
+                time.sleep(60)
+            """))
+            cancel = threading.Event()
+            threading.Timer(0.6, cancel.set).start()
+            started = time.monotonic()
+            res = context.run_context(
+                {"argv": [sys.executable, str(script)], "timeout_s": 30}, v1(),
+                cancel=cancel)
+            took = time.monotonic() - started
+            time.sleep(0.2)
+            self.assertTrue(marker.exists(), "the command never saw SIGTERM")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.message, "cancelled")
+        self.assertLess(took, 6)
+
+    def test_without_cancel_nothing_changes(self):
+        status, code, out, _err = sources._run_capped(
+            [sys.executable, "-c", "print('hi')"], 10,
+            cancel=threading.Event())
+        self.assertEqual((status, code, out.strip()), ("ok", 0, b"hi"))
+
+
 class ContextCacheTest(unittest.TestCase):
     def setUp(self):
         self.now = [1000.0]
@@ -330,7 +374,12 @@ class ContextCacheTest(unittest.TestCase):
         self.assertEqual(self.cache.get("a", 5.0)["sections"], self.good.sections)
         self.now[0] += 2                    # 601 s after the put
         self.assertIsNone(self.cache.get("a", 5.0))
-        self.assertEqual(len(self.cache), 0)
+        old = self.cache.get("a", 5.0, stale=True)    # kept, marked stale
+        self.assertTrue(old["stale"])
+        self.assertEqual(old["sections"], self.good.sections)
+        self.cache.put("a", 5.0, self.good)           # a refetch makes it fresh
+        self.assertFalse(self.cache.get("a", 5.0, stale=True)["stale"])
+        self.assertIsNotNone(self.cache.get("a", 5.0))
 
     def test_keyed_by_item_id_and_time(self):
         self.cache.put("a", 5.0, self.good)
@@ -626,15 +675,31 @@ class SummaryCacheTest(unittest.TestCase):
             {"who": "Person 1", "ts": 1893491940.0, "text": "edited"}])))
         # a gist change alone does not invalidate it
         self.assertEqual(base, summary.cache_key(v1(gist="reworded")))
+        # the model is part of the key
+        self.assertNotEqual(summary.cache_key(v1(), "haiku"),
+                            summary.cache_key(v1(), "sonnet"))
+        self.assertEqual(summary.cache_key(v1(), "haiku"),
+                         summary.cache_key(v1(), "haiku"))
+
+    def test_the_cache_directory_is_ours_and_is_set_to_0700(self):
+        state = self.base / "state"
+        state.mkdir()
+        os.chmod(state, 0o755)                 # the shared directory is left alone
+        mine = state / "inbox-summary"
+        mine.mkdir()
+        os.chmod(mine, 0o755)                  # a loose one of ours is tightened
+        summary.SummaryCache(self.base).put("k", "- x")
+        self.assertEqual(stat.S_IMODE(mine.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o755)
 
     def test_file_is_private_and_round_trips(self):
         cache = summary.SummaryCache(self.base)
         cache.put("k1", "- one", with_context=True, model="haiku", now=50.0)
-        path = self.base / "state" / "inbox-summary-cache.json"
+        path = self.base / "state" / "inbox-summary" / "cache.json"
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
         self.assertEqual([p.name for p in path.parent.iterdir()],
-                         ["inbox-summary-cache.json"])     # no temp file left
+                         ["cache.json"])                   # no temp file left
         again = summary.SummaryCache(self.base)
         row = again.peek("k1")
         self.assertEqual((row["text"], row["ctx"], row["model"], row["at"]),
@@ -642,8 +707,8 @@ class SummaryCacheTest(unittest.TestCase):
         self.assertIsNone(again.peek("nope"))
 
     def test_an_existing_loose_file_is_replaced_with_a_private_one(self):
-        path = self.base / "state" / "inbox-summary-cache.json"
-        path.parent.mkdir()
+        path = self.base / "state" / "inbox-summary" / "cache.json"
+        path.parent.mkdir(parents=True)
         path.write_text('{"v": 1, "entries": []}')
         os.chmod(path, 0o644)
         summary.SummaryCache(self.base).put("k", "- x")
@@ -661,7 +726,7 @@ class SummaryCacheTest(unittest.TestCase):
         self.assertIsNotNone(cache.peek("k0"))     # survived: it was used
         self.assertIsNone(cache.peek("k1"))        # the least recently used went
         self.assertIsNotNone(cache.peek("k200"))
-        data = json.loads((self.base / "state" / "inbox-summary-cache.json")
+        data = json.loads((self.base / "state" / "inbox-summary" / "cache.json")
                           .read_text())
         self.assertEqual(len(data["entries"]), 200)
         for n in range(205, 260):
@@ -677,8 +742,8 @@ class SummaryCacheTest(unittest.TestCase):
         self.assertIsNone(cache.peek("a"))         # still the oldest: evicted
 
     def test_a_corrupt_file_reads_empty_and_is_replaced(self):
-        path = self.base / "state" / "inbox-summary-cache.json"
-        path.parent.mkdir()
+        path = self.base / "state" / "inbox-summary" / "cache.json"
+        path.parent.mkdir(parents=True)
         for junk in ("{", '[1, 2]', '{"entries": 5}',
                      '{"entries": [1, {"key": "k"}, {"key": "k", "text": "t"}]}'):
             path.write_text(junk)
@@ -755,6 +820,18 @@ class LocalActionsTest(unittest.TestCase):
         self.assertEqual(self.calls[0][1]["max_budget_usd"], 0.05)
         self.assertEqual(self.calls[0][1]["timeout"], 90.0)
 
+    def test_a_different_model_does_not_reuse_the_summary(self):
+        acts = self.actions()
+        acts.summarize(self.item())
+        other = LocalActions(
+            InboxStore(None), base_dir=self.base,
+            summary=validated({"summary": {"model": "sonnet"}})["summary"],
+            complete=lambda p, **kw: self.calls.append((p, kw)) or "- other")
+        self.assertIsNone(other.cached_summary(self.item()))
+        self.assertEqual(other.summarize(self.item()).text, "- other")
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(acts.cached_summary(self.item()).cached)   # still there
+
     def test_a_changed_thread_is_summarised_again(self):
         acts = self.actions()
         acts.summarize(self.item())
@@ -770,7 +847,7 @@ class LocalActionsTest(unittest.TestCase):
         out = acts.summarize(self.item())
         self.assertFalse(out.ok)
         self.assertIsNone(acts.cached_summary(self.item()))
-        self.assertFalse((self.base / "state" / "inbox-summary-cache.json").exists())
+        self.assertFalse((self.base / "state" / "inbox-summary" / "cache.json").exists())
 
     def test_the_summary_remembers_whether_context_was_used(self):
         acts = self.actions()
@@ -842,11 +919,19 @@ if HAVE_TEXTUAL:
         gates = None        # item key -> threading.Event the fetch waits for
         results = None      # item key -> Outcome to return
 
-        def fetch_context(self, item):
+        active = 0
+        max_active = 0
+
+        def fetch_context(self, item, cancel=None):
             self.calls.append(("context", item.key))
-            gate = (self.gates or {}).get(item.key)
-            if gate is not None:
-                gate.wait(10)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                gate = (self.gates or {}).get(item.key)
+                if gate is not None:
+                    gate.wait(10)
+            finally:
+                self.active -= 1
             out = (self.results or {}).get(item.key)
             return out or context.Outcome(True, [
                 {"title": f"About {item.who}", "lines": [f"line for {item.key}"]}],
@@ -1045,7 +1130,7 @@ class ContextPaneTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_crashing_backend_becomes_an_error_state(self):
         acts = ctx_actions()
 
-        def boom(item):
+        def boom(item, cancel=None):
             raise RuntimeError("secret detail")
         acts.fetch_context = boom
         app = make_app(self.rows(), acts)
@@ -1267,6 +1352,287 @@ class SummaryPaneTest(unittest.IsolatedAsyncioTestCase):
                 await wait_for(pilot, lambda: "review the doc" in pane_text(app))
                 await wait_for(pilot, lambda: "Role: tester" in pane_text(app))
                 self.assertIn("without the context above", pane_text(app))
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class StaleContextTest(unittest.IsolatedAsyncioTestCase):
+    def rows(self):
+        return [make_item(1), make_item(2)]
+
+    async def test_an_expired_entry_stays_drawn_as_stale_and_refetches_once(self):
+        clock = [time.time()]
+        cache = context.ContextCache(clock=lambda: clock[0])
+        acts = ctx_actions()
+        app = make_app(self.rows(), acts, context_cache=cache)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("c")
+            await wait_for(pilot, lambda: "line for t:1" in pane_text(app))
+            self.assertEqual(fetched(acts), ["t:1"])
+            gate = threading.Event()
+            acts.gates["t:1"] = gate
+            acts.results["t:1"] = context.Outcome(True, [
+                {"title": "About Person 1", "lines": ["fresh line"]}], None)
+            clock[0] += 601                       # the TTL ends on the same item
+            self.assertTrue(await wait_for(
+                pilot, lambda: fetched(acts) == ["t:1", "t:1"], tries=60))
+            text = pane_text(app)
+            self.assertIn("line for t:1", text)   # the old rows stay drawn
+            self.assertIn("stale", text)
+            self.assertIn("refreshing", text)
+            await pilot.pause(2.3)                # ticks pass: still ONE refetch
+            self.assertEqual(fetched(acts), ["t:1", "t:1"])
+            gate.set()
+            self.assertTrue(await wait_for(
+                pilot, lambda: "fresh line" in pane_text(app)))
+            self.assertNotIn("stale", pane_text(app))
+            await pilot.pause(1.5)
+            self.assertEqual(fetched(acts), ["t:1", "t:1"])
+
+    async def test_a_failing_refetch_is_retried_only_after_the_error_ttl(self):
+        clock = [time.time()]
+        cache = context.ContextCache(clock=lambda: clock[0])
+        acts = ctx_actions()
+        app = make_app(self.rows(), acts, context_cache=cache)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("c")
+            await wait_for(pilot, lambda: "line for t:1" in pane_text(app))
+            acts.results["t:1"] = context.Outcome(False, [], "backend down")
+            clock[0] += 601
+            await wait_for(pilot, lambda: "backend down" in pane_text(app))
+            self.assertEqual(fetched(acts), ["t:1", "t:1"])
+            await pilot.pause(2.3)                # the error entry is fresh: no loop
+            self.assertEqual(fetched(acts), ["t:1", "t:1"])
+            clock[0] += 31                        # 30 s error TTL over: one more try
+            await wait_for(pilot, lambda: len(fetched(acts)) == 3)
+            self.assertEqual(fetched(acts), ["t:1", "t:1", "t:1"])
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class PaneBehaviourTest(unittest.IsolatedAsyncioTestCase):
+    def rows(self, n=5):
+        return [make_item(i) for i in range(1, n + 1)]
+
+    async def test_c_closes_an_open_pane_whatever_is_configured(self):
+        acts = LocalActions(InboxStore(None), base_dir=tempfile.mkdtemp(),
+                            summary=SUMMARY_CFG,
+                            complete=lambda p, **kw: "- a point")
+        app = make_app([make_item(1)], acts)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("i")                   # opens the pane (no context:)
+            await wait_for(pilot, lambda: "a point" in pane_text(app))
+            self.assertTrue(app.context_open)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            self.assertFalse(app.context_open)
+            self.assertFalse(app.query_one("#context").display)
+            await pilot.press("c")                   # opening still needs context:
+            await pilot.pause(0.1)
+            self.assertFalse(app.context_open)
+            self.assertTrue(any("Context not configured" in t for t in toasts(app)))
+
+    async def test_at_most_two_fetches_run_and_a_superseded_one_never_starts(self):
+        acts = ctx_actions()
+        gates = {k: threading.Event() for k in ("t:1", "t:2")}
+        acts.gates.update(gates)
+        app = make_app(self.rows(), acts)
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("c")
+                await wait_for(pilot, lambda: fetched(acts) == ["t:1"])
+                await pilot.press("j")
+                await wait_for(pilot, lambda: fetched(acts) == ["t:1", "t:2"])
+                await pilot.press("j")               # t:3: both slots are taken
+                await pilot.pause(0.4)
+                self.assertEqual(fetched(acts), ["t:1", "t:2"])
+                self.assertEqual([i.key for i in app._ctx_pending], ["t:3"])
+                self.assertIn("Loading context", pane_text(app))
+                await pilot.press("j")               # t:4 supersedes the waiting t:3
+                await pilot.pause(0.4)
+                self.assertEqual([i.key for i in app._ctx_pending], ["t:4"])
+                for g in gates.values():
+                    g.set()
+                self.assertTrue(await wait_for(
+                    pilot, lambda: "line for t:4" in pane_text(app)))
+                self.assertEqual(fetched(acts), ["t:1", "t:2", "t:4"])
+                self.assertLessEqual(acts.max_active, 2)
+        finally:
+            for g in gates.values():
+                g.set()
+
+    async def test_an_unchanged_pane_is_not_rebuilt_every_second(self):
+        acts = ctx_actions()
+        app = make_app(self.rows(2), acts)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("c")
+            await wait_for(pilot, lambda: "line for t:1" in pane_text(app))
+            await pilot.pause(1.6)               # layout done, width known
+            pane = app.query_one("#context")
+            with mock.patch.object(pane, "show", wraps=pane.show) as show:
+                await pilot.pause(2.5)               # two or three ticks
+                self.assertEqual(show.call_count, 0)
+            # a real change still redraws it
+            acts.results["t:2"] = context.Outcome(True, [
+                {"title": "T", "lines": ["second item"]}], None)
+            await pilot.press("j")
+            self.assertTrue(await wait_for(
+                pilot, lambda: "second item" in pane_text(app)))
+
+    async def test_the_age_label_redraws_when_the_minute_changes(self):
+        acts = ctx_actions()
+        app = make_app(self.rows(2), acts)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("c")
+            await wait_for(pilot, lambda: "line for t:1" in pane_text(app))
+            await pilot.pause(0.3)
+            before = app._ctx_sig
+            view = app.context_view()
+            at = view["context"]["at"]
+            self.assertEqual(app._view_signature(view, at + 10),
+                             app._view_signature(view, at + 50))
+            self.assertNotEqual(app._view_signature(view, at + 50),
+                                app._view_signature(view, at + 70))
+            self.assertIsNotNone(before)
+
+    async def test_a_cached_summary_shows_even_while_another_one_runs(self):
+        tmp = Path(tempfile.mkdtemp())
+        gate = threading.Event()
+        calls = []
+
+        def complete(prompt, **kw):
+            calls.append(prompt)
+            if "Person 2" in prompt:
+                gate.wait(10)
+            return "- summary text " + str(len(calls))
+        acts = LocalActions(InboxStore(None), base_dir=tmp, summary=SUMMARY_CFG,
+                            complete=complete)
+        app = make_app([make_item(1), make_item(2)], acts)
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("i")                       # item 1: cached
+                await wait_for(pilot, lambda: "summary text 1" in pane_text(app))
+                await pilot.press("j")
+                await pilot.pause(0.2)
+                await pilot.press("i")                       # item 2: runs, blocked
+                await wait_for(pilot, lambda: "summarising" in pane_text(app))
+                await pilot.press("k")
+                await wait_for(pilot, lambda: "summary text 1" in pane_text(app))
+                app.summaries.clear()                        # force a cache read
+                await pilot.press("i")
+                await pilot.pause(0.3)
+                self.assertFalse(any("already running" in t for t in toasts(app)))
+                self.assertIn("summary text 1", pane_text(app))
+                self.assertEqual(len(calls), 2)
+                await pilot.press("I")                       # forcing still waits its turn
+                await pilot.pause(0.2)
+                self.assertTrue(any("already running" in t for t in toasts(app)))
+        finally:
+            gate.set()
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class QuitTest(unittest.IsolatedAsyncioTestCase):
+    async def test_quit_with_a_running_summary_asks_then_waits_for_it(self):
+        tmp = Path(tempfile.mkdtemp())
+        gate, started, finished = threading.Event(), threading.Event(), threading.Event()
+        flags = {}
+
+        def complete(prompt, **kw):
+            flags["daemon"] = threading.current_thread().daemon
+            started.set()
+            gate.wait(10)
+            finished.set()                      # stands in for the bridge's finally
+            return "- late summary"
+        acts = LocalActions(InboxStore(None), base_dir=tmp, summary=SUMMARY_CFG,
+                            complete=complete)
+        app = make_app([make_item(1)], acts)
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("i")
+                await wait_for(pilot, started.is_set)
+                self.assertFalse(flags["daemon"])        # exit waits for it
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertFalse(app._exit)
+                self.assertTrue(any(
+                    "summary still running; q again to quit (it finishes first)" in t
+                    for t in toasts(app)))
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertTrue(app._exit)
+                self.assertTrue(any("summary is still finishing" in str(m)
+                                    for m in app._exit_renderables))
+                self.assertFalse(finished.is_set())
+                gate.set()
+                self.assertTrue(finished.wait(5))
+        finally:
+            gate.set()
+
+    async def test_writes_and_summary_are_both_named_in_the_warning(self):
+        tmp = Path(tempfile.mkdtemp())
+        gate, started = threading.Event(), threading.Event()
+
+        def complete(prompt, **kw):
+            started.set()
+            gate.wait(10)
+            return "- x"
+        acts = LocalActions(InboxStore(None), base_dir=tmp, summary=SUMMARY_CFG,
+                            complete=complete)
+        app = make_app([make_item(1)], acts)
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                app.running.append(mock.Mock(kind="save", item=app.items[0], hide=False))
+                await pilot.press("i")
+                await wait_for(pilot, started.is_set)
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertTrue(any(
+                    "1 write(s) still running; summary still running; q again to quit"
+                    in t for t in toasts(app)))
+                app.running.clear()
+        finally:
+            gate.set()
+
+    async def test_quit_stops_a_running_context_command_with_sigterm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker, ready = Path(tmp) / "marker", Path(tmp) / "ready"
+            script = Path(tmp) / "slow.py"
+            script.write_text(textwrap.dedent(f"""
+                import signal, sys, time
+                def done(*_):
+                    open({str(marker)!r}, "w").write("term")
+                    sys.exit(0)
+                signal.signal(signal.SIGTERM, done)
+                open({str(ready)!r}, "w").write("up")
+                time.sleep(60)
+            """))
+            acts = LocalActions(InboxStore(None), base_dir=tmp, context={
+                "argv": [sys.executable, str(script)], "timeout_s": 60.0})
+            app = make_app([make_item(1)], acts)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("c")
+                await wait_for(pilot, ready.exists, tries=100)
+                self.assertTrue(ready.exists())
+                started = time.monotonic()
+                await pilot.press("q")                  # no guard: reads only
+                await pilot.pause(0.2)
+                self.assertTrue(app._exit)
+            # leaving the app lets the non-daemon fetch thread finish
+            for _ in range(100):
+                if marker.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), "the command never saw SIGTERM")
+            self.assertLess(time.monotonic() - started, 10)
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")

@@ -71,7 +71,7 @@ alert_urgent_max_age_h: 6
 # default. One headless Claude call through the daemon's bridge with NO tools
 # at all (text only), over the item, its thread and the loaded context. The
 # bridge's pause file and daily budget apply; spend is logged as
-# inbox-summary. Results are cached on disk (state/inbox-summary-cache.json,
+# inbox-summary. Results are cached on disk (state/inbox-summary/cache.json,
 # 200 entries). `summary: {}` turns it on with the defaults below.
 # summary:
 #   model: haiku             # the model of the one-call run

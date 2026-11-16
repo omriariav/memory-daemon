@@ -27,7 +27,8 @@ SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # (Bash, Write, ...) from ever being configured as the RSVP tool.
 TOOL_NAME = re.compile(r"^mcp__[A-Za-z0-9_.-]{1,120}$")
 PARAM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
-MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,64}$")
+# No leading "-": a model name must never read as a command-line flag.
+MODEL_NAME = re.compile(r"^[A-Za-z0-9_.:\[\]][A-Za-z0-9_.:\[\]-]{0,63}$")
 DEFAULT_RSVP_TIMEOUT_S = 60
 DEFAULT_SAVE_TIMEOUT_S = 30
 DEFAULT_CONTEXT_TIMEOUT_S = 20

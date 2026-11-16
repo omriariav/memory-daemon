@@ -297,7 +297,9 @@ class ContextPane(VerticalScroll):
             out.append("Context\n", head)
             _wrapped(out, "! " + ctx["message"], width, visual,
                      Style(color=pal["warn"], bold=True), "  ")
-            out.append(f"  failed {ago(now, ctx['at'])}  ·  C retries\n", muted)
+            out.append(f"  failed {ago(now, ctx['at'])}  ·  "
+                       + ("retrying…" if ctx.get("refreshing") else "C retries")
+                       + "\n", muted)
         else:
             for sec in ctx["sections"]:
                 _wrapped(out, sec["title"], width, visual, head)
@@ -308,8 +310,14 @@ class ContextPane(VerticalScroll):
                 out.append("No context for this item.\n", muted)
                 if ctx.get("message"):
                     _wrapped(out, ctx["message"], width, visual, muted)
-            out.append(f"context {'cached, ' if now - ctx['at'] >= 60 else ''}"
-                       f"fetched {ago(now, ctx['at'])}  ·  C refresh\n", muted)
+            if ctx.get("stale"):
+                out.append(f"context stale, fetched {ago(now, ctx['at'])}"
+                           + ("  ·  refreshing…" if ctx.get("refreshing")
+                              else "  ·  C refresh") + "\n",
+                           Style(color=pal["warn"], italic=True))
+            else:
+                out.append(f"context {'cached, ' if now - ctx['at'] >= 60 else ''}"
+                           f"fetched {ago(now, ctx['at'])}  ·  C refresh\n", muted)
         body.update(out)
         if view["ident"] != self._ident:
             self._ident = view["ident"]

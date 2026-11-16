@@ -98,8 +98,10 @@ def parse_context_response(text):
     return Outcome(ok, sections, message)
 
 
-def run_context(cfg, item):
-    """Run the context command on one v1 item dict. Never raises.
+def run_context(cfg, item, cancel=None):
+    """Run the context command on one v1 item dict. Never raises. `cancel`
+    (a `threading.Event`) asks the command to stop: SIGTERM to its group, then
+    SIGKILL after TERM_GRACE_S.
 
     Returns an `Outcome`: `ok` with the cleaned sections, or not ok with a
     one-line reason in `message` (the command's own message for `ok: false`,
@@ -109,10 +111,12 @@ def run_context(cfg, item):
         status, code, out, err = sources._run_capped(
             sources._expand(cfg["argv"]), cfg["timeout_s"],
             stdin_bytes=payload, term_grace_s=TERM_GRACE_S,
-            max_bytes=MAX_RAW_BYTES)
+            max_bytes=MAX_RAW_BYTES, cancel=cancel)
     except (OSError, ValueError, TypeError) as exc:
         return Outcome(False, [], "cannot run: "
                        f"{getattr(exc, 'strerror', None) or exc}")
+    if status == "cancelled":
+        return Outcome(False, [], "cancelled")
     if status == "timeout":
         return Outcome(False, [], f"timed out after {cfg['timeout_s']:g}s")
     if status == "overflow":
@@ -143,19 +147,21 @@ class ContextCache:
         self._rows = {}
         self._lock = threading.Lock()
 
-    def get(self, key, ts):
-        """The cached entry `{"ok", "sections", "message", "at"}` or None
-        (absent or expired; an expired entry is dropped)."""
+    def get(self, key, ts, stale=False):
+        """The fresh entry `{"ok", "sections", "message", "at"}` or None
+        (absent or expired). An expired entry is kept (until the size cap
+        pushes it out) so the pane can keep drawing it while it refetches;
+        `stale=True` returns it too, with `"stale": True`."""
         with self._lock:
             row = self._rows.get((key, ts))
             if row is None:
                 return None
             ttl = self.ttl_s if row["ok"] else self.error_ttl_s
-            if self.clock() - row["at"] >= ttl:
-                del self._rows[(key, ts)]
+            expired = self.clock() - row["at"] >= ttl
+            if expired and not stale:
                 return None
             self._rows[(key, ts)] = self._rows.pop((key, ts))  # most recent
-            return dict(row)
+            return dict(row, stale=expired)
 
     def put(self, key, ts, outcome):
         row = {"ok": outcome.ok, "sections": outcome.sections,

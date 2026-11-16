@@ -80,19 +80,26 @@ class LocalActions:
     def summary_configured(self):
         return self.summary_cfg is not None and self.base_dir is not None
 
-    def fetch_context(self, item):
+    def fetch_context(self, item, cancel=None):
         """Run the context command for `item`: a `context.Outcome`. Blocks:
-        call from a worker. Read-only."""
+        call from a worker. Read-only. `cancel` (a `threading.Event`) stops
+        the command (SIGTERM, then SIGKILL after the grace period)."""
         if not self.context_configured:
             return context.Outcome(False, [], "Context not configured")
-        return context.run_context(self.context_cfg, to_v1(item))
+        return context.run_context(self.context_cfg, to_v1(item), cancel=cancel)
 
-    def cached_summary(self, item):
-        """The cached summary of `item` as an `Outcome`, or None. Reads the
-        cache without marking the entry as used."""
+    def summary_key(self, item):
+        """The cache key of `item`'s summary (item, time, thread and model)."""
+        return summary_mod.cache_key(to_v1(item), self.summary_cfg["model"])
+
+    def cached_summary(self, item, touch=False):
+        """The cached summary of `item` as an `Outcome`, or None. By default
+        the entry is not marked as used (`touch=True` does)."""
         if not self.summary_configured:
             return None
-        row = self._summary_cache.peek(summary_mod.cache_key(to_v1(item)))
+        key = self.summary_key(item)
+        row = (self._summary_cache.get(key) if touch
+               else self._summary_cache.peek(key))
         return _cached(row)
 
     def summarize(self, item, sections=(), force=False):
@@ -101,7 +108,7 @@ class LocalActions:
         if not self.summary_configured:
             return summary_mod.Outcome(False, "", "Summary not configured")
         v1 = to_v1(item)
-        key = summary_mod.cache_key(v1)
+        key = summary_mod.cache_key(v1, self.summary_cfg["model"])
         if not force:
             hit = _cached(self._summary_cache.get(key))
             if hit is not None:
@@ -206,7 +213,10 @@ class FakeActions:
     summary_delay: float = 0.6
     _summaries: dict = field(default_factory=dict)
 
-    def fetch_context(self, item):
+    def summary_key(self, item):
+        return item.key
+
+    def fetch_context(self, item, cancel=None):
         time.sleep(self.context_delay)
         self.calls.append(("context", item.key))
         return context.Outcome(True, [
@@ -217,7 +227,7 @@ class FakeActions:
                 "Ticket EX-101 (open): invented example",
                 "Doc: https://example.com/demo-doc"]}], None)
 
-    def cached_summary(self, item):
+    def cached_summary(self, item, touch=False):
         row = self._summaries.get(item.key)
         return summary_mod.Outcome(True, row, "", True, time.time() - 120,
                                    False) if row else None

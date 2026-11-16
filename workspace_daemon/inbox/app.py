@@ -21,7 +21,7 @@ from . import summary as summod
 from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
-                     from_v1, to_v1)
+                     from_v1)
 from .screens import (AuditScreen, ConfirmSend, ConfirmWrite, HelpScreen,
                       SavedScreen, SnoozePicker)
 from .sources import SourceResult, merge
@@ -35,6 +35,7 @@ SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
 CONTEXT_OFF = "Context not configured (set context: in inbox.yaml)"
 SUMMARY_OFF = "Summary not configured (set summary: in inbox.yaml)"
 CONTEXT_DEBOUNCE_S = 0.4      # a new selection waits this long before fetching
+CONTEXT_MAX_FETCHES = 2       # context commands running at once
 NOT_CONFIRMED = "RSVP not confirmed by calendar"
 # What each RSVP key answers: key -> (menu word, answer sent, modal title).
 RSVP_KEYS = {
@@ -236,6 +237,9 @@ class InboxApp(App):
         self._ctx_gen = 0                  # bumped on every selection change
         self.summaries = {}                # summary cache key -> view state
         self._sum_running = None           # cache key of the running summary
+        self._ctx_pending = []             # items waiting for a fetch slot
+        self._ctx_sig = None               # what the pane last drew
+        self._cancel = threading.Event()   # set on quit: stops context commands
 
     @property
     def bidi(self):
@@ -268,7 +272,7 @@ class InboxApp(App):
         self.set_interval(0.25, self.tick_header)
         self.set_interval(30, self.refilter)
         self.set_interval(30, self.reeval)
-        self.set_interval(1.0, self.context_render)   # spinner and ages
+        self.set_interval(1.0, self.context_tick)   # expiry, spinner, ages
         self.set_interval(self.poll_s, self.poll)   # the fallback full refresh
         if self.watcher is not None:
             self.set_interval(self.watch_s, self.watch_tick)
@@ -1043,14 +1047,18 @@ class InboxApp(App):
         return (it.key, it.ts) if it is not None else None
 
     def _summary_key(self, it):
-        return summod.cache_key(to_v1(it))
+        return self.actions.summary_key(it)
 
     def action_context(self):
-        """c: show or hide the Context pane."""
+        """c: show or hide the Context pane. An open pane always closes;
+        opening needs `context:`."""
+        if self.context_open:
+            self._set_context_open(False)
+            return
         if not self._ctx_on():
             self.notify(CONTEXT_OFF, timeout=3, severity="warning", markup=False)
             return
-        self._set_context_open(not self.context_open)
+        self._set_context_open(True)
 
     def _set_context_open(self, on):
         if on == self.context_open:
@@ -1061,6 +1069,8 @@ class InboxApp(App):
         self._stop_ctx_timer()
         self._ctx_gen += 1
         self._ctx_shown = None
+        self._ctx_pending = []
+        self._ctx_sig = None
         f = self.focused
         if not on and f is not None and f.id == "context":
             self.query_one("#queue").focus()
@@ -1074,8 +1084,8 @@ class InboxApp(App):
             self._ctx_timer = None
 
     def context_sync(self, immediate=False):
-        """Make the open pane follow the selection. A selection that is not
-        cached starts a fetch after the debounce, and a newer selection
+        """Make the open pane follow the selection. A selection that has no
+        fresh result starts a fetch after the debounce, and a newer selection
         replaces that wait; what is cached shows at once."""
         if not self.context_open:
             return
@@ -1086,6 +1096,10 @@ class InboxApp(App):
         self._ctx_shown = ident
         self._ctx_gen += 1
         self._stop_ctx_timer()
+        # A fetch still waiting for a free slot is for an item that is no
+        # longer selected: it never starts.
+        self._ctx_pending = [p for p in self._ctx_pending
+                             if self._ident(p) == ident]
         if (it is not None and self._ctx_on() and ident not in self._ctx_loading
                 and self.ctx_cache.get(*ident) is None):
             if immediate or self.context_debounce_s <= 0:
@@ -1102,19 +1116,28 @@ class InboxApp(App):
             self._ctx_start(it)
 
     def _ctx_start(self, it):
-        """Fetch the context of `it` in a worker thread (a daemon thread:
-        quitting never waits for a context command)."""
+        """Fetch the context of `it` in a worker thread, at most
+        CONTEXT_MAX_FETCHES at once; the rest wait for a slot."""
         ident = self._ident(it)
-        if ident in self._ctx_loading:
+        if ident in self._ctx_loading or any(
+                self._ident(p) == ident for p in self._ctx_pending):
             return
-        self._ctx_loading.add(ident)
-        threading.Thread(target=self._ctx_thread, args=(it, ident),
-                         daemon=True).start()
+        if len(self._ctx_loading) >= CONTEXT_MAX_FETCHES:
+            self._ctx_pending.append(it)
+        else:
+            self._ctx_spawn(it, ident)
         self.context_render()
+
+    def _ctx_spawn(self, it, ident):
+        self._ctx_loading.add(ident)
+        # Not a daemon thread: quitting sets `_cancel` and the command is
+        # stopped (SIGTERM, then SIGKILL after the grace), so the exit waits
+        # a few seconds at most and no child is left running.
+        threading.Thread(target=self._ctx_thread, args=(it, ident)).start()
 
     def _ctx_thread(self, it, ident):
         try:
-            out = self.actions.fetch_context(it)
+            out = self.actions.fetch_context(it, cancel=self._cancel)
         except Exception as exc:  # a backend bug must not end the session
             out = ctxmod.Outcome(False, [], f"cannot run: {type(exc).__name__}")
         if self._quitting:
@@ -1129,6 +1152,33 @@ class InboxApp(App):
         it is drawn only if that item is still the one shown."""
         self._ctx_loading.discard(ident)
         self.ctx_cache.put(*ident, out)
+        shown = self._ctx_shown
+        while self._ctx_pending and len(self._ctx_loading) < CONTEXT_MAX_FETCHES:
+            nxt = self._ctx_pending.pop(0)
+            nid = self._ident(nxt)
+            if (self.context_open and nid == shown
+                    and self.ctx_cache.get(*nid) is None
+                    and nid not in self._ctx_loading):
+                self._ctx_spawn(nxt, nid)
+        self.context_render()
+
+    def context_tick(self):
+        """Every second: an entry of the shown item that has expired is
+        fetched once more (the old rows stay drawn, marked stale, until the
+        answer arrives); then redraw if the pane's picture changed. A failed
+        fetch is itself cached for 30 s, so a broken command is retried at
+        most that often."""
+        if not self.context_open:
+            return
+        it = self.current
+        if (it is not None and self._ctx_on()
+                and self._ident(it) == self._ctx_shown):
+            ident = self._ident(it)
+            if (self.ctx_cache.get(*ident) is None
+                    and ident not in self._ctx_loading
+                    and self._ctx_timer is None
+                    and not any(self._ident(p) == ident for p in self._ctx_pending)):
+                self._ctx_start(it)
         self.context_render()
 
     def action_context_refresh(self):
@@ -1156,11 +1206,14 @@ class InboxApp(App):
         ident = self._ident(it)
         ctx = {"state": "off"}
         if it is not None and self._ctx_on():
-            entry = self.ctx_cache.get(*ident)
+            entry = self.ctx_cache.get(*ident, stale=True)
+            busy = (ident in self._ctx_loading or self._ctx_timer is not None
+                    or any(self._ident(p) == ident for p in self._ctx_pending))
             if entry is not None:
-                ctx = dict(entry, state="ready" if entry["ok"] else "error")
-                ctx["message"] = entry["message"] or ""
-            elif ident in self._ctx_loading or self._ctx_timer is not None:
+                ctx = dict(entry, state="ready" if entry["ok"] else "error",
+                           message=entry["message"] or "",
+                           refreshing=entry["stale"] and busy)
+            elif busy:
                 ctx = {"state": "loading"}
             else:
                 ctx = {"state": "idle"}
@@ -1184,6 +1237,23 @@ class InboxApp(App):
             view["note"] = "written without the context above (I to redo)"
         return view
 
+    @staticmethod
+    def _view_signature(view, now):
+        """Everything that changes what the pane draws: its state, the data
+        and the age labels (per minute), so an unchanged pane is not rebuilt
+        (a rebuild would drop a mouse selection)."""
+        ctx, summ = view["context"], view["summary"]
+        loading = (ctx["state"] == "loading" or ctx.get("refreshing")
+                   or summ["state"] == "loading")
+        parts = [view["ident"], ctx["state"], ctx.get("at"), ctx.get("stale"),
+                 ctx.get("refreshing"), ctx.get("message"),
+                 summ["state"], summ.get("at"), summ.get("text"),
+                 summ.get("note"), summ.get("detail"), summ.get("cached"),
+                 int(now) if loading else None]
+        for at in (ctx.get("at"), summ.get("at")):
+            parts.append(int((now - at) // 60) if at else None)
+        return tuple(parts)
+
     def context_render(self):
         if not self.context_open:
             return
@@ -1191,7 +1261,14 @@ class InboxApp(App):
             pane = self.query_one("#context", ContextPane)
         except NoMatches:  # a timer fired while the app is shutting down
             return
-        pane.show(self.context_view(), self.pal, time.time(), self.bidi)
+        now = time.time()
+        view = self.context_view()
+        sig = (self._view_signature(view, now), self.theme, self.bidi_mode,
+               pane.size.width)
+        if sig == self._ctx_sig:
+            return
+        self._ctx_sig = sig
+        pane.show(view, self.pal, now, self.bidi)
 
     def action_summary(self, force=False):
         """i: AI summary of the item (cached on disk); I: ask again."""
@@ -1202,19 +1279,33 @@ class InboxApp(App):
         if it is None:
             self.notify("Nothing selected", timeout=2, markup=False)
             return
+        self._set_context_open(True)
+        skey = self._summary_key(it)
+        if not force:
+            # A cached summary needs no call, so it shows even while another
+            # summary is running.
+            cached = self.actions.cached_summary(it, touch=True)
+            if cached is not None:
+                self.summaries[skey] = {
+                    "state": "ready", "text": cached.text, "at": cached.at,
+                    "cached": True, "ctx": cached.with_context, "detail": ""}
+                self.context_render()
+                return
         if self._sum_running is not None:
             self.notify("A summary is already running", timeout=2, markup=False)
             return
-        self._set_context_open(True)
-        skey = self._summary_key(it)
         entry = self.ctx_cache.get(*self._ident(it)) if self._ctx_on() else None
         sections = entry["sections"] if entry and entry["ok"] else []
         self._sum_running = skey
         self.summaries[skey] = {"state": "loading", "text": "", "at": 0,
                                 "cached": False, "ctx": False, "detail": ""}
         self.busy += 1
+        # Not a daemon thread: the bridge call must reach its `finally` so the
+        # spend is logged, and its child must not be orphaned. Quitting while
+        # it runs asks first (see action_quit) and then waits for it, for at
+        # most summary.timeout_s.
         threading.Thread(target=self._summary_thread,
-                         args=(it, skey, sections, force), daemon=True).start()
+                         args=(it, skey, sections, force)).start()
         self.context_render()
 
     def _summary_thread(self, it, skey, sections, force):
@@ -1378,12 +1469,18 @@ class InboxApp(App):
     async def action_quit(self):
         """Quitting cancels pending sends, nudges, RSVPs and saves (nothing
         leaves the inbox). Done, ack and snooze are committed."""
-        if self.running and not self._quit_armed:
+        busy = []
+        if self.running:
+            busy.append(f"{len(self.running)} write(s) still running")
+        if self._sum_running is not None:
+            busy.append("summary still running")
+        if busy and not self._quit_armed:
             self._quit_armed = True
             self.set_timer(8, self._disarm_quit)
-            self.notify(f"{len(self.running)} write(s) still running; q again to "
-                        "quit (they finish first)", severity="warning", timeout=6,
-                        markup=False)
+            tail = ("it finishes first" if busy == ["summary still running"]
+                    else "they finish first")
+            self.notify("; ".join(busy) + f"; q again to quit ({tail})",
+                        severity="warning", timeout=6, markup=False)
             return
         cancelled = 0
         for p in list(self.pending):
@@ -1401,12 +1498,17 @@ class InboxApp(App):
                     res = Result(False, str(exc))
                 p.audit["status"] = "committed" if res.ok else "failed"
         self._quitting = True
+        self._cancel.set()      # context commands get SIGTERM and wind down
+        self._ctx_pending = []
         parts = []
         if cancelled:
             parts.append(f"Nothing sent: {cancelled} pending action(s) cancelled on quit.")
         if self.running:
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
+        if self._sum_running is not None:
+            parts.append("The summary is still finishing; the process exits "
+                         "when it ends.")
         self.exit(message=" ".join(parts) or None)
 
     def _disarm_quit(self):

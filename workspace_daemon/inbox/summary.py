@@ -15,9 +15,10 @@ the prompt between markers that carry a random per-call token (so text inside
 the item cannot close the block), after an instruction to ignore anything in
 them that reads as an instruction. They are never part of any argv.
 
-Summaries are cached on disk (`SummaryCache`, `state/inbox-summary-cache.json`,
-mode 0600, least recently used 200 entries) keyed by a hash of the item id,
-its time and its thread, so an unchanged item is summarised once.
+Summaries are cached on disk (`SummaryCache`, `state/inbox-summary/cache.json`
+in a 0700 directory of its own, file mode 0600, least recently used 200
+entries) keyed by a hash of the item id, its time, its thread and the model,
+so an unchanged item is summarised once per model.
 """
 import datetime as dt
 import hashlib
@@ -34,7 +35,8 @@ from .. import claude_bridge
 from . import items as itm
 
 USAGE_TAG = "inbox-summary"
-CACHE_NAME = "inbox-summary-cache.json"
+CACHE_DIR = "inbox-summary"
+CACHE_NAME = "cache.json"
 CACHE_MAX_ENTRIES = 200
 SCHEMA_VERSION = 1
 MAX_LINES = 6
@@ -72,9 +74,10 @@ def thread_hash(item):
         thread, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def cache_key(item):
-    """sha256 of the item id, its time and its thread hash."""
-    raw = f"{item.get('id')}\0{item.get('ts')}\0{thread_hash(item)}"
+def cache_key(item, model=""):
+    """sha256 of the item id, its time, its thread hash and the model."""
+    raw = (f"{item.get('id')}\0{item.get('ts')}\0{thread_hash(item)}"
+           f"\0{model}")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -170,13 +173,14 @@ def run_summary(cfg, base_dir, item, sections=(), complete=None):
 
 
 class SummaryCache:
-    """`<base>/state/inbox-summary-cache.json`: `{"v": 1, "entries": [...]}`,
+    """`<base>/state/inbox-summary/cache.json`: `{"v": 1, "entries": [...]}`,
     least recently used first, at most `max_entries` (200). Written atomically
-    with mode 0600 in a 0700 directory. `get` marks an entry as used (and
+    with mode 0600 in `inbox-summary/`, a directory of its own that is created
+    and set to 0700 (the shared `state/` directory is left alone). `get` marks an entry as used (and
     saves); `peek` only reads. A corrupt or unreadable file reads as empty."""
 
     def __init__(self, base_dir, max_entries=CACHE_MAX_ENTRIES):
-        self.path = Path(base_dir) / "state" / CACHE_NAME
+        self.path = Path(base_dir) / "state" / CACHE_DIR / CACHE_NAME
         self.max_entries = max_entries
         self._lock = threading.RLock()
         self._rows = []        # least recently used first
@@ -214,6 +218,7 @@ class SummaryCache:
     def _save(self):
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)       # ours: tighten it even if it pre-existed
         text = json.dumps({"v": SCHEMA_VERSION, "entries": self._rows},
                           indent=1)
         fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=f".{CACHE_NAME}.",
