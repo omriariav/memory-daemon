@@ -2863,8 +2863,11 @@ polling the store:
   list is unknown. When it is exactly 2, `other_attendee` is the other
   person's lower-case email. Malformed values are dropped.
 - Mail captures (`new` and `update`) add to `details`: `gmail_labels`, the
-  message's Gmail label names (sorted, at most 20, each cut to 100 characters;
-  names only, no ids and no message text), and `saved_request: true` when the
+  message's Gmail label names (the connector reports label ids, which are
+  mapped to names through the label catalog in `state/labels.json`; system
+  labels such as `INBOX` are their own names and an id that does not resolve is
+  dropped; user labels are kept before system ones when more than 20 apply;
+  sorted, at most 20, each cut to 100 characters; names only, no message text), and `saved_request: true` when the
   routine's source lists only threads the owner asked to save
   (`saved_request: true` in its config). A source whose connector does not
   expose labels (`gmail_mcp`) leaves `gmail_labels` out. Both keys are omitted

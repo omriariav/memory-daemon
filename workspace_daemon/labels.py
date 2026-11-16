@@ -12,6 +12,7 @@ only case that pays the refetch cost is the one where the cache is provably out
 of date.
 """
 import json
+import re
 import time
 from pathlib import Path
 
@@ -19,6 +20,11 @@ from . import gmail, state
 from .shell import log
 
 DEFAULT_TTL_SECONDS = 14 * 24 * 3600
+ID_REFRESH_GAP_SECONDS = 600
+# Gmail's system label ids are their own names (INBOX, STARRED, CATEGORY_UPDATES);
+# a user label's id is Label_<n>.
+_SYSTEM_ID = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+_ids_tried = {}  # cache path -> monotonic time of the last id refetch
 
 
 def cache_file(base_dir):
@@ -36,6 +42,7 @@ class Catalog:
         # run lock, so it must not persist anything.
         self.read_only = read_only
         self._names = None
+        self._ids = None
         self._fetched_at = 0.0
         self._announced = False
         if not force_refresh:
@@ -52,6 +59,9 @@ class Catalog:
         if not isinstance(names, list):
             return
         self._names, self._fetched_at = names, fetched_at
+        ids = data.get("ids")
+        if isinstance(ids, dict):
+            self._ids = {str(k): str(v) for k, v in ids.items()}
 
     def _store(self):
         if self.read_only:
@@ -59,7 +69,9 @@ class Catalog:
         try:
             state.write_atomic(
                 self.path,
-                json.dumps({"fetched_at": self._fetched_at, "labels": self._names},
+                json.dumps({"fetched_at": self._fetched_at,
+                            "labels": self._names,
+                            **({"ids": self._ids} if self._ids else {})},
                            indent=2, sort_keys=True) + "\n",
                 mode=0o600,
             )
@@ -117,3 +129,43 @@ class Catalog:
     @staticmethod
     def _match(name, names):
         return {n.lower(): n for n in names}.get(name.lower())
+
+    # --- label ids ---------------------------------------------------------
+
+    def names_for_ids(self, ids):
+        """Label names for Gmail label ids; ids that do not resolve are dropped.
+
+        System ids map to themselves. A user id (`Label_<n>`) is looked up in
+        the cached id map; a miss refetches the map once (at most every
+        ID_REFRESH_GAP_SECONDS per process), so a label made today resolves
+        and a deleted one is not refetched for every message.
+        """
+        found, missing = [], False
+        for label_id in ids:
+            label_id = str(label_id).strip()
+            if (self._ids or {}).get(label_id):
+                found.append(self._ids[label_id])
+            elif _SYSTEM_ID.match(label_id):
+                found.append(label_id)
+            elif label_id:
+                missing = True
+        if missing and self._refresh_ids():
+            return self.names_for_ids(ids)
+        return found
+
+    def _refresh_ids(self):
+        key = str(self.path)
+        last = _ids_tried.get(key)
+        if last is not None and time.monotonic() - last < ID_REFRESH_GAP_SECONDS:
+            return False
+        _ids_tried[key] = time.monotonic()
+        try:
+            self._ids = gmail.user_label_ids()
+        except Exception as exc:  # noqa: BLE001 - names are best effort
+            log(f"WARN could not fetch the label id map: {type(exc).__name__}")
+            return False
+        if self._names is None:
+            self._names = sorted(self._ids.values())
+            self._fetched_at = time.time()
+        self._store()
+        return True

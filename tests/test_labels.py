@@ -40,6 +40,34 @@ class LabelCacheTest(unittest.TestCase):
         labels.gmail = self.saved
         self.tmp.cleanup()
 
+    def ids_cache(self, ids):
+        labels._ids_tried.clear()
+        labels.cache_file(self.base).write_text(json.dumps({
+            "fetched_at": time.time(), "labels": sorted(ids.values()),
+            "ids": ids}))
+        return self.cache()
+
+    def test_ids_map_to_names_and_system_ids_to_themselves(self):
+        cat = self.ids_cache({"Label_123": "Save"})
+        self.assertEqual(
+            cat.names_for_ids(["Label_123", "INBOX", "CATEGORY_UPDATES"]),
+            ["Save", "INBOX", "CATEGORY_UPDATES"])
+
+    def test_unknown_id_is_dropped_after_one_refetch(self):
+        calls = []
+        self.fake.user_label_ids = lambda: (
+            calls.append(1), {"Label_123": "Save"})[1]
+        cat = self.ids_cache({"Label_123": "Save"})
+        self.assertEqual(cat.names_for_ids(["Label_9", "Label_123"]), ["Save"])
+        self.assertEqual(cat.names_for_ids(["Label_9"]), [])
+        self.assertEqual(len(calls), 1)
+
+    def test_id_map_survives_a_names_refresh(self):
+        cat = self.ids_cache({"Label_123": "Save"})
+        cat.refresh()
+        stored = json.loads(labels.cache_file(self.base).read_text())
+        self.assertEqual(stored["ids"], {"Label_123": "Save"})
+
     def cache(self, **kw):
         return labels.Catalog(self.base, **kw)
 

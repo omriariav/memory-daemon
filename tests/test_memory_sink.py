@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import contacts, drive, llm, memory_sink
+from workspace_daemon import contacts, drive, labels, llm, memory_sink
 
 # Verbatim `slugs list --kind person` output from personal-memory (2026-07).
 # The count column broke the original parser: it returned an empty set, and the
@@ -1799,28 +1799,90 @@ class CaptureEventsTest(unittest.TestCase):
         self.assertNotIn(
             "other_attendee", self._capture()[-1]["details"])
 
-    def test_mail_capture_records_label_names_and_saved_flag(self):
+    def _catalog(self, ids):
+        state = Path(self.tmp.name) / "state"
+        state.mkdir(exist_ok=True)
+        (state / "labels.json").write_text(json.dumps({
+            "fetched_at": 4102444800, "labels": sorted(ids.values()),
+            "ids": ids}))
+
+    def _mail(self, labels, **extra):
         self.item["id"] = "gmail:t1"
-        self.item["frontmatter"] = {
-            "gmail_message_id": "m1", "gmail_labels": ["Zeta", "Save", "Save"],
-            "saved_request": True, "email_subject": "Quarterly plan"}
+        self.item["frontmatter"] = dict(
+            {"gmail_message_id": "m1", "gmail_labels": labels,
+             "email_subject": "Quarterly plan"}, **extra)
+        return self._capture()[0]
+
+    def setUp_labels(self):
+        labels._ids_tried.clear()
+
+    def test_mail_capture_names_user_labels_from_their_ids(self):
+        self.setUp_labels()
+        self._catalog({"Label_123": "Save", "Label_9": "Zeta"})
         for out, kind in (("✓ created 2026-07-27-t\n", "new"),
                           ("↻ updated 2026-07-27-t\n", "update")):
+            self.item["id"] = "gmail:t1"
+            self.item["frontmatter"] = {
+                "gmail_message_id": "m1", "saved_request": True,
+                "gmail_labels": ["Label_9", "INBOX", "Label_123", "Label_123"]}
             row = self._capture(out)[-1]
             self.assertEqual(row["kind"], kind)
+            # ids never leak; the event lists names sorted
             self.assertEqual(row["details"], {
-                "gmail_labels": ["Save", "Zeta"], "saved_request": True})
+                "gmail_labels": ["INBOX", "Save", "Zeta"],
+                "saved_request": True})
 
-    def test_mail_labels_are_capped_and_hold_names_only(self):
-        self.item["frontmatter"] = {
-            "gmail_message_id": "m1",
-            "gmail_labels": [f"Label{i:02d}" for i in range(30)] + [7, None],
-            "email_from": "a@example.com", "email_subject": "s"}
-        row = self._capture()[0]
+    def test_unresolved_label_id_is_dropped(self):
+        self.setUp_labels()
+        self._catalog({"Label_1": "Save"})
+        with mock.patch.object(labels.gmail, "user_label_ids",
+                               return_value={"Label_1": "Save"}) as fetch:
+            row = self._mail(["Label_404", "Label_1", "STARRED"])
+        self.assertEqual(row["details"]["gmail_labels"], ["STARRED", "Save"])
+        fetch.assert_called_once()  # one refetch for the miss, then the gap
+
+    def test_label_id_resolves_after_one_refetch(self):
+        self.setUp_labels()
+        self._catalog({"Label_1": "Save"})
+        with mock.patch.object(
+                labels.gmail, "user_label_ids",
+                return_value={"Label_1": "Save", "Label_2": "New"}):
+            row = self._mail(["Label_2"])
+        self.assertEqual(row["details"]["gmail_labels"], ["New"])
+        cache = json.loads(
+            (Path(self.tmp.name) / "state" / "labels.json").read_text())
+        self.assertEqual(cache["ids"]["Label_2"], "New")
+
+    def test_failed_id_lookup_keeps_system_labels_and_the_capture(self):
+        self.setUp_labels()
+        with mock.patch.object(labels.gmail, "user_label_ids",
+                               side_effect=RuntimeError("boom")):
+            row = self._mail(["Label_5", "INBOX"])
+        self.assertEqual(row["details"], {"gmail_labels": ["INBOX"]})
+
+    def test_user_labels_win_the_cap_over_system_labels(self):
+        self.setUp_labels()
+        ids = {f"Label_{i}": f"User{i:02d}" for i in range(20)}
+        self._catalog(ids)
+        row = self._mail(list(ids) + ["INBOX", "STARRED", "UNREAD"])
+        names = row["details"]["gmail_labels"]
+        self.assertEqual(len(names), 20)
+        self.assertEqual(names, sorted(ids.values()))  # no system label made it
+
+    def test_mail_labels_hold_names_only(self):
+        self.setUp_labels()
+        self._catalog({})
+        row = self._mail(
+            [f"CAT_{i:02d}" for i in range(30)] + [7, None],
+            email_from="a@example.com")
         self.assertEqual(len(row["details"]["gmail_labels"]), 20)
         self.assertNotIn("saved_request", row["details"])
-        text = json.dumps(row)
-        self.assertNotIn("a@example.com", text)
+        self.assertNotIn("a@example.com", json.dumps(row))
+
+    def test_saved_request_without_labels(self):
+        self.assertEqual(
+            self._mail([], saved_request=True)["details"],
+            {"saved_request": True})
 
     def test_mail_without_labels_or_flag_has_no_details(self):
         self.item["frontmatter"] = {
@@ -1828,11 +1890,12 @@ class CaptureEventsTest(unittest.TestCase):
         self.assertNotIn("details", self._capture()[0])
 
     def test_mail_details_merge_with_a_calendar_match(self):
+        self.setUp_labels()
         self.item["frontmatter"] = {
-            "gmail_message_id": "m1", "gmail_labels": ["Save"],
+            "gmail_message_id": "m1", "gmail_labels": ["INBOX"],
             "calendar_event_id": "evt1", "calendar_attendee_count": 3}
         self.assertEqual(self._capture()[0]["details"], {
-            "gmail_labels": ["Save"], "calendar_event_id": "evt1",
+            "gmail_labels": ["INBOX"], "calendar_event_id": "evt1",
             "attendee_count": 3})
 
     def test_no_calendar_match_means_no_details(self):

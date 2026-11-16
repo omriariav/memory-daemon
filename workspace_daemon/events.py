@@ -32,8 +32,9 @@ omitted when the attendee list is unknown. Declined guests are not counted.
 When the count is exactly 2, `other_attendee` is the other person's
 lower-case email (never 0 for unknown).
 A mail capture adds `gmail_labels` to the same `details`: the message's Gmail
-label names (sorted, at most 20, each cut to 100 characters; never ids or text)
-when the source reports them, and `saved_request: true` when its routine lists
+label names (resolved from label ids; sorted, at most 20, each cut to 100
+characters; never ids that do not resolve, or text) when the source reports
+them, and `saved_request: true` when its routine lists
 only threads the owner asked to save. Both are omitted when empty or false.
 `id` is a hash of (source_id, memory_id, kind, ts), so a reader can drop a
 repeated line. Writers in separate process groups serialize on
@@ -54,6 +55,7 @@ MAX_BYTES = 5 * 1024 * 1024
 SCHEMA_VERSION = 1
 EVENT_ID_MAX = 256
 GMAIL_LABELS_MAX = 20
+GMAIL_LABEL_CHARS = 100
 
 
 def _clean_details(details):
@@ -77,11 +79,13 @@ def _clean_details(details):
         isinstance(other, str) and "@" in other and len(other) <= 254
     ):
         del out["other_attendee"]
-    labels = out.get("gmail_labels")
     if "gmail_labels" in out:
+        labels = out["gmail_labels"]
         if isinstance(labels, list):
-            labels = [x for x in labels if isinstance(x, str) and x][
-                :GMAIL_LABELS_MAX]
+            labels = sorted({
+                " ".join(x.split())[:GMAIL_LABEL_CHARS].strip()
+                for x in labels if isinstance(x, str)
+            } - {""})[:GMAIL_LABELS_MAX]
         if labels and isinstance(labels, list):
             out["gmail_labels"] = labels
         else:
