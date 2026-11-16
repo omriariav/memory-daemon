@@ -582,6 +582,11 @@ def fetch(cfg, base_dir, exact_args=False):
         )
     except claude_bridge.GUARD_STOPS:
         raise
+    except claude_bridge.BridgeOutage as exc:
+        # Keep the class: a failure across a sleep is an outage, not an error.
+        raise claude_bridge.BridgeOutage(
+            str(exc).replace(secret, "<secret>")
+        ) from None
     except Exception as exc:
         raise claude_bridge.BridgeError(
             str(exc).replace(secret, "<secret>")

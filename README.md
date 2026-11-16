@@ -1030,7 +1030,7 @@ read them without a call. It never writes to Fibery. Config: `read_tool` (exact
 MCP name ending `__read_document`), the documents as `docs: [{key,
 document_secret, match_emails: [...]}]` or `docs_file: <path>` (a JSON list of
 the same entries, any extra key of an entry (a name, a link) is ignored; it must
-be readable by its owner only, so the secrets live in one private file; use
+be readable by its owner only, so the secrets live in one private file, opened without following a symlink and owned by you; use
 exactly one of the two), `lookahead_h` (default 24),
 `max_age_h` (default 12), `only_upcoming` (default `true`) and `out_dir`
 (default `state/fibery-docs`), plus the usual `schedule` and `budget`.
@@ -1049,7 +1049,12 @@ bridge call pinned to `{read_tool: {secret}}` with `exact_args` (a call with any
 other argument is refused); the result must parse as a Fibery document (the `comments` and `suggestions` sections of a document with inline comments are accepted, never read), and is
 written atomically as `<out_dir>/<key>.json` (`{"v": 1, "key", "fetched_at",
 "text"}`, mode 0600 in a 0700 directory). A failed document does not stop the
-others; the run then fails, naming the keys. Logs carry counts and keys only:
+others; the run then fails, naming the keys. A failure every later call would
+share (the machine slept or is offline, a refused login, a rate limit) stops the
+run at once: after a sleep it fails as an outage (it carries the outage note, so
+`status` reads it as one, not as a broken routine). With `only_upcoming` a
+calendar snapshot older than the smaller of `2 x lookahead_h` and 6 hours is not
+used (logged, nothing refreshed). Logs carry counts and keys only:
 never a secret, an email or text. `--dry-run` makes no call and writes nothing.
 See `routines/_example-fibery-doc-cache.yaml`.
 

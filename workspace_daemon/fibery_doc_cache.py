@@ -23,6 +23,7 @@ import datetime
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 from . import state
@@ -32,6 +33,9 @@ CACHE_VERSION = 1
 DEFAULT_OUT_DIR = "state/fibery-docs"
 DEFAULT_LOOKAHEAD_H = 24
 DEFAULT_MAX_AGE_H = 12
+# A snapshot older than this (hours) is not trusted to say what is upcoming:
+# the smaller of twice the lookahead and this cap.
+SNAPSHOT_MAX_AGE_H = 6
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 READ_TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__read_document$")
@@ -156,21 +160,34 @@ def load_docs(cfg, base_dir):
             raise DocsFileError("docs: " + "; ".join(problems))
         return docs
     path = _resolve(base_dir, cfg["docs_file"])
+    # Open first (never through a symlink), then judge the open file: what is
+    # checked is what is read.
     try:
-        mode = os.stat(path).st_mode
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
         raise DocsFileError(
             f"cannot read the docs file: {exc.strerror or 'error'}") from None
-    if not os.path.isfile(path):
-        raise DocsFileError("the docs file is not a regular file")
-    if mode & 0o077:
-        raise DocsFileError(
-            "the docs file is readable by others; chmod 600 it")
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise DocsFileError("the docs file is not a regular file")
+        if info.st_uid != os.getuid():
+            raise DocsFileError("the docs file is not owned by you")
+        if info.st_mode & 0o077:
+            raise DocsFileError(
+                "the docs file is readable by others; chmod 600 it")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            raw = json.loads(handle.read())
+    except DocsFileError:
+        raise
     except (OSError, ValueError) as exc:
         raise DocsFileError(
             f"cannot read the docs file: {type(exc).__name__}") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
     docs, problems = check_docs(raw, "docs_file")
     if problems:
         raise DocsFileError("; ".join(problems))
@@ -287,6 +304,18 @@ def write_cache(out_dir, key, text, now):
     state.write_atomic(cache_path(out_dir, key), body, mode=0o600)
 
 
+def snapshot_age_h(snapshot, now):
+    """Hours since the snapshot was fetched, or None when it cannot be told."""
+    try:
+        when = datetime.datetime.fromisoformat(
+            str(snapshot["fetched_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return (now - when).total_seconds() / 3600
+
+
 def _redact(message, secrets):
     """A message with every known secret and anything email-shaped removed."""
     text = str(message)
@@ -302,8 +331,17 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
 
     Raises RuntimeError after trying every document when any refresh failed
     (the runner then shows the routine as failing). A bridge guard stop
-    (paused, budget) ends the run at once and is re-raised for the runner."""
-    from . import calendar_cache, claude_bridge, fibery_tasks_inbound as fti
+    (paused, budget) ends the run at once and is re-raised for the runner. A
+    failure every later call would share (a sleep or no network, a refused
+    login, a rate limit) also ends the run at once: after a sleep it raises a
+    `BridgeOutage` carrying the outage note, so the run reads as an outage and
+    not as a broken routine.
+
+    With `only_upcoming`, a calendar snapshot older than the smaller of
+    twice `lookahead_h` and SNAPSHOT_MAX_AGE_H hours is not used: nothing is
+    refreshed (and this is logged) rather than guessing from old events."""
+    from . import calendar_cache, claude_bridge, sleepclock
+    from . import fibery_tasks_inbound as fti
     now = now or datetime.datetime.now(datetime.timezone.utc)
     docs = load_docs(cfg, base_dir)
     out_dir = _resolve(base_dir, cfg.get("out_dir", DEFAULT_OUT_DIR))
@@ -311,15 +349,24 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
     max_age = datetime.timedelta(hours=cfg.get("max_age_h", DEFAULT_MAX_AGE_H))
     report = {"ok": True, "dry_run": bool(dry_run), "docs": len(docs),
               "qualifying": 0, "refreshed": 0, "fresh": 0, "failed": 0,
-              "failed_keys": []}
+              "failed_keys": [], "stale_snapshot": False}
     if only_upcoming:
         snapshot = calendar_cache.load_snapshot(base_dir)
         if snapshot is None:
             log(f"routine={routine_id} fibery_doc_cache: no calendar "
                 "snapshot; nothing to refresh")
             return report
-        candidates = qualifying_keys(
-            docs, snapshot, now, cfg.get("lookahead_h", DEFAULT_LOOKAHEAD_H))
+        lookahead = cfg.get("lookahead_h", DEFAULT_LOOKAHEAD_H)
+        limit = min(2 * lookahead, SNAPSHOT_MAX_AGE_H)
+        age = snapshot_age_h(snapshot, now)
+        if age is None or age > limit:
+            report["stale_snapshot"] = True
+            log(f"routine={routine_id} fibery_doc_cache: the calendar "
+                "snapshot is "
+                + ("unreadable" if age is None else f"{age:.1f}h old")
+                + f" (limit {limit:g}h); not refreshing")
+            return report
+        candidates = qualifying_keys(docs, snapshot, now, lookahead)
     else:
         candidates = {d["key"] for d in docs}
     report["qualifying"] = len(candidates)
@@ -348,9 +395,20 @@ def run(cfg, base_dir, dry_run=False, routine_id="fibery-doc-cache", now=None):
         except Exception as exc:
             report["failed"] += 1
             report["failed_keys"].append(key)
+            detail = f"{type(exc).__name__}: {_redact(exc, secrets)}"
             log(f"routine={routine_id} fibery_doc_cache: refresh failed "
-                f"key={key} ({type(exc).__name__}: "
-                f"{_redact(exc, secrets)})")
+                f"key={key} ({detail})")
+            if sleepclock.is_shared_dependency(exc):
+                log(f"routine={routine_id} maintenance=fibery_doc_cache "
+                    f"stopped: a shared dependency failed; the remaining "
+                    f"documents are not tried")
+                if sleepclock.is_outage(exc) or sleepclock.text_is_outage(exc):
+                    raise claude_bridge.BridgeOutage(
+                        f"fibery_doc_cache stopped at key={key} "
+                        f"({sleepclock.OUTAGE_NOTE})") from None
+                raise RuntimeError(
+                    f"fibery_doc_cache stopped at key={key}: a shared "
+                    f"dependency failed ({_redact(exc, secrets)})") from None
             continue
         report["refreshed"] += 1
         log(f"routine={routine_id} fibery_doc_cache: refreshed key={key}")

@@ -12,8 +12,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from test_fibery_tasks_inbound import Doc, bid
-from workspace_daemon import claude_bridge, config
+try:    # run by discovery (tests/ on sys.path) or by dotted module name
+    from test_fibery_tasks_inbound import Doc, bid, comments_section
+except ImportError:
+    from tests.test_fibery_tasks_inbound import Doc, bid, comments_section
+from workspace_daemon import claude_bridge, config, sleepclock
 from workspace_daemon import fibery_doc_cache as fdc
 from workspace_daemon import fibery_tasks_inbound as fti
 from workspace_daemon import maintenance
@@ -376,6 +379,49 @@ class RunTest(Base):
         self.assertTrue((self.dir / "home-out" / "doc-a.json").exists())
 
 
+class SnapshotAgeTest(Base):
+    def snap_at(self, hours_ago, **rows):
+        path = self.dir / "state" / "calendar-snapshot.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        snap = snapshot(**rows)
+        snap["fetched_at"] = (NOW - datetime.timedelta(
+            hours=hours_ago)).isoformat()
+        path.write_text(json.dumps(snap))
+
+    def test_a_snapshot_older_than_the_cap_is_not_used_and_it_is_logged(self):
+        self.snap_at(7, e1=event())
+        report = self.run_once()
+        self.assertEqual((report["refreshed"], report["qualifying"],
+                          report["stale_snapshot"]), (0, 0, True))
+        self.assertEqual(self.calls, [])
+        self.assertTrue(any("snapshot is 7.0h old (limit 6h)" in m
+                            for m in self.logs))
+
+    def test_a_fresh_enough_snapshot_is_used(self):
+        self.snap_at(5.5, e1=event())
+        report = self.run_once()
+        self.assertEqual((report["refreshed"], report["stale_snapshot"]),
+                         (1, False))
+
+    def test_the_limit_shrinks_with_a_short_lookahead(self):
+        self.snap_at(3, e1=event())
+        self.assertTrue(self.run_once(lookahead_h=1)["stale_snapshot"])
+        self.assertFalse(self.run_once(lookahead_h=2)["stale_snapshot"])
+
+    def test_snapshot_age_helper(self):
+        self.assertAlmostEqual(fdc.snapshot_age_h(
+            {"fetched_at": (NOW - datetime.timedelta(hours=2)).isoformat()},
+            NOW), 2.0)
+        self.assertAlmostEqual(fdc.snapshot_age_h(
+            {"fetched_at": "2026-11-16T07:00:00Z"}, NOW), 2.0)
+        for junk in ({}, {"fetched_at": "nope"}, {"fetched_at": None}):
+            self.assertIsNone(fdc.snapshot_age_h(junk, NOW))
+
+    def test_only_upcoming_false_ignores_the_snapshot_age(self):
+        self.snap_at(500, e1=event())
+        self.assertEqual(self.run_once(only_upcoming=False)["refreshed"], 2)
+
+
 class FailureTest(Base):
     def setUp(self):
         super().setUp()
@@ -392,7 +438,6 @@ class FailureTest(Base):
                             for m in self.logs))
 
     def test_a_document_with_comment_threads_is_cached(self):
-        from test_fibery_tasks_inbound import comments_section
         doc = Doc()
         doc.heading("agenda")
         doc.bullets([(bid(1), "null", ['"an item"'])])
@@ -407,6 +452,49 @@ class FailureTest(Base):
             self.run_once()
         self.assertFalse(self.out().exists())
         self.assertFalse(self.out("doc-b").exists())
+
+    def test_an_outage_stops_the_run_and_keeps_the_outage_note(self):
+        self.fail[SECRET_A] = claude_bridge.BridgeOutage(
+            f"claude run failed ({sleepclock.OUTAGE_NOTE})")
+        with self.assertRaises(claude_bridge.BridgeOutage) as ctx:
+            self.run_once()
+        self.assertIn(sleepclock.OUTAGE_NOTE, str(ctx.exception))
+        self.assertTrue(sleepclock.is_outage(ctx.exception))
+        self.assertTrue(sleepclock.text_is_outage(str(ctx.exception)))
+        self.assertEqual(len(self.calls), 1)            # doc-b never tried
+        self.assertFalse(self.out("doc-b").exists())
+
+    def test_the_outage_class_survives_fetch(self):
+        self.fail[SECRET_A] = claude_bridge.BridgeOutage(f"x {SECRET_A} y")
+        with self.assertRaises(claude_bridge.BridgeOutage) as ctx:
+            fti.fetch({"read_tool": TOOL, "document_secret": SECRET_A},
+                      self.dir, exact_args=True)
+        self.assertNotIn(SECRET_A, str(ctx.exception))
+
+    def test_a_network_down_failure_stops_the_run_as_an_outage(self):
+        self.fail[SECRET_A] = RuntimeError("could not resolve host")
+        with self.assertRaises(claude_bridge.BridgeOutage):
+            self.run_once()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_auth_or_rate_limit_failure_stops_the_run_but_is_not_an_outage(self):
+        for text in ("Unauthenticated: please log in", "rate limit reached",
+                     "quota exceeded"):
+            self.calls.clear()
+            self.fail[SECRET_A] = claude_bridge.BridgeError(text)
+            with self.assertRaises(RuntimeError) as ctx:
+                self.run_once()
+            self.assertNotIsInstance(ctx.exception, claude_bridge.BridgeOutage)
+            self.assertIn("shared dependency", str(ctx.exception))
+            self.assertFalse(sleepclock.text_is_outage(str(ctx.exception)))
+            self.assertEqual(len(self.calls), 1, text)
+
+    def test_an_ordinary_failure_still_lets_the_next_doc_run(self):
+        self.fail[SECRET_A] = claude_bridge.BridgeError("tool returned an error")
+        with self.assertRaises(RuntimeError):
+            self.run_once()
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.out("doc-b").exists())
 
     def test_guard_stops_end_the_run_for_the_runner(self):
         stop = claude_bridge.GUARD_STOPS[0]("paused")
@@ -471,6 +559,33 @@ class DocsFileTest(Base):
         with mock.patch.dict(os.environ, {"HOME": str(self.dir)}):
             cfg = self.cfg_file("~/docs.json")
             self.assertEqual(len(fdc.load_docs(cfg, "/nowhere")), 2)
+
+    def test_a_symlink_is_never_followed(self):
+        target = self.write(name="real.json")
+        link = self.dir / "link.json"
+        link.symlink_to(target)
+        with self.assertRaises(fdc.DocsFileError):
+            fdc.load_docs(self.cfg_file(link), self.dir)
+        self.assertEqual(len(fdc.load_docs(self.cfg_file(target), self.dir)), 2)
+
+    def test_the_open_file_is_judged_not_the_path(self):
+        # the mode and the owner come from the descriptor that is read
+        path = self.write()
+        real = os.fstat
+        seen = []
+
+        def fake(fd):
+            info = real(fd)
+            seen.append(fd)
+            return os.stat_result(
+                (info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                 os.getuid() + 1, info.st_gid, info.st_size, info.st_atime,
+                 info.st_mtime, info.st_ctime))
+        with mock.patch.object(fdc.os, "fstat", side_effect=fake):
+            with self.assertRaises(fdc.DocsFileError) as ctx:
+                fdc.load_docs(self.cfg_file(path), self.dir)
+        self.assertTrue(seen)
+        self.assertIn("not owned by you", str(ctx.exception))
 
     def test_a_group_or_world_readable_file_is_refused(self):
         for mode in (0o640, 0o604, 0o644, 0o660):
