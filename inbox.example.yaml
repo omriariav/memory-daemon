@@ -90,7 +90,8 @@ alert_urgent_max_age_h: 6
 # with control or bidi-override characters is refused, never cut): channel,
 # text and, for a thread, thread_ts; any other argument is denied. The destination is the
 # item's meta.reply_to ({channel, thread_ts?, message_ts?}, validated), never
-# taken from item text; an item without one cannot be sent to. The confirm
+# taken from item text; an item without one cannot be sent or drafted to (Copy
+# for Slack still works: it needs no destination). The confirm
 # modal shows the destination, its channel id and thread, and the full text,
 # then the 5 s undo window
 # opens (q inside it cancels); the run is never retried, and a timeout is

@@ -488,8 +488,10 @@ destination in `meta.reply_to`:
 A value in the wrong format makes the whole `reply_to` invalid; unknown keys
 inside it are ignored and never used. The destination is never read from
 `gist`, `thread` text, `where` or any other item text: only from here. An item
-without a valid `reply_to` cannot be sent to, and `a` or `n` say so instead of
-opening the confirm modal. `where` is only the label shown in the modal.
+without a valid `reply_to` cannot be sent to or drafted to. With `send:` or
+`copy:` set, `a` or `n` still open the confirm screen with only Copy for Slack
+(see [Draft and copy](#draft-and-copy)); otherwise they say so. `where` is
+only the label shown in the modal.
 
 ### Slack send (reply and nudge)
 
@@ -501,9 +503,11 @@ describes the Send path and its checks, which Draft shares. Without `send:` or
 `copy:` the confirm flow exists only in `--demo` (nothing is sent) and `a` /
 `e` / `n` on a real item say "Replying is not available yet", as in 0.5.0.
 
-1. **Checks.** The item needs a valid `meta.reply_to` (above). A reply to a
+1. **Checks.** Send and Draft need a valid `meta.reply_to` (above); without
+   one only Copy for Slack is offered. A reply to a
    channel or group (`C`, `G`) without a `thread_ts` would be a top-level post:
-   it is refused with "would post to the channel, not a thread" unless
+   Send and Draft are refused ("would post to the channel, not a thread"; only
+   Copy is offered) unless
    `send.allow_channel_posts` is `true` (a DM needs no thread; a nudge follows
    the same rule). The text is the current draft, including any `e` edits (an
    open edit is saved first; editor text is cleaned like any draft, so control
@@ -592,7 +596,7 @@ the selection changes while it runs, nothing is sent and the toast says so.
 with a managed security hook (a send is denied in the bridge's `dontAsk`
 mode), while a Slack draft tool and reactions still work. So since 0.7.0 "send"
 is a choice. After you press `a` (reply) or `n` (nudge) and the checks pass
-(destination, text, the optional precheck), the confirm screen shows the exact
+(the text, the destination, the optional precheck), the confirm screen shows the exact
 text, the destination ids and the URL `o` will open, with Cancel focused, and
 offers up to three actions:
 
@@ -600,12 +604,20 @@ offers up to three actions:
 | --- | --- | --- | --- |
 | Draft in Slack | `d` | `send.mode` is `draft` or `both` | places the text in the conversation's Slack draft box; nothing is sent; the item stays |
 | Send | `y` | `send.mode` is `send` (default) or `both` | the send described above; the item is marked done |
-| Copy for Slack | `c` | `send:` or `copy: true` is set | puts the text on the clipboard as Slack mrkdwn; nothing leaves the inbox; the item stays |
+| Copy for Slack | `c` | `send:` or `copy: true` is set, and the text passes the text checks | puts the text on the clipboard as Slack mrkdwn; nothing leaves the inbox; the item stays |
 
-A key that is not offered does nothing; `esc` cancels. The default `send.mode`
-is `send`, so a 0.6.0 `inbox.yaml` works as before (plus the Copy button). A
-reply to a channel or group without a thread is refused for Send and Draft
-alike unless `send.allow_channel_posts: true`.
+A key that is not offered does nothing; `esc` cancels; `o` in the modal opens
+the URL it shows (the modal stays). The default `send.mode` is `send`, so a
+0.6.0 `inbox.yaml` works as before (plus the Copy button).
+
+**Copy never needs a destination.** It is offered whenever the text passes the
+text checks (not empty, at most 4000 characters, no control or bidi-override
+character). If the item has no valid `meta.reply_to`, or is a reply to a
+channel or group without a thread (and `send.allow_channel_posts` is not
+`true`), Draft and Send are not possible: the modal opens with only Copy for
+Slack (no precheck runs) and, when `send:` is set, a warning line "Draft and
+Send need a valid thread/DM destination (...)". `copy: true` without `send:`
+works for every item that has text. `o` then opens the item's link, as before.
 
 **Draft in Slack.** The same pinned path as a send: one headless call whose
 only allowed tool is `send.draft_tool`, pinned to exactly `{<args.channel>:
@@ -626,27 +638,30 @@ by a sleep.
 (trailing whitespace removed, the same text the modal showed) is converted from
 standard markdown to Slack mrkdwn and put on the clipboard with the same OSC 52
 helper as `y`. The toast says "Copied for Slack: open it with o and paste". The
-conversion (`workspace_daemon/inbox/mrkdwn.py`, `to_slack_mrkdwn`, a pure
-function):
+drafts usually come from a session that already writes Slack text, where a
+single `*x*` is bold, so the conversion (`workspace_daemon/inbox/mrkdwn.py`,
+`to_slack_mrkdwn`, a pure function) only touches constructs that mean one thing
+in standard markdown:
 
 | Markdown | Slack mrkdwn |
 | --- | --- |
-| `**bold**` | `*bold*` |
-| `*italic*`, `__x__` | `_italic_`, `_x_` |
-| `***both***` | `*_both_*` |
+| `**bold**`, `__bold__` | `*bold*` |
 | `~~x~~` | `~x~` |
-| `[text](url)` | `<url\|text>` (written `<url|text>`) |
+| `[text](url)` | `<url\|text>` (written `<url|text>`; the label is escaped: `&` `<` `>` become `&amp;` `&lt;` `&gt;`) |
 | `# heading` (1 to 6 `#`) | `*heading*` |
-| `* item`, `+ item` | `- item` (other lists, `>` quotes kept) |
 
-Inline code and fenced code blocks are never touched, URLs keep their
-underscores and tildes, and Hebrew or other text passes through unchanged.
+Everything else is left as it is: single `*x*` and `_x_`, `***x***`, lists
+(`-`, `*`, `+`, numbered), `>` quotes, inline code, fenced code (```` ``` ```` and
+`~~~`) and 4-space or tab indented code blocks (nothing inside code changes).
+URLs keep their underscores and tildes and a bare URL does not swallow a
+closing `**` or `~~`. Hebrew and other text pass through unchanged.
 
 **Open Slack at the right place (`slack_open`).** `o` opens the item's own link
 unless `slack_open` is set. With it, and an item that has a valid
 `meta.reply_to`, `o` opens the template URL; `{thread_ts}` is the thread's
 timestamp (else the message's), so a thread opens at the thread. A template
-that needs a value the item lacks falls back to the item's link. The values are
+that needs a value the item lacks falls back to the item's link. The template
+must be printable ASCII on one line, with no spaces, up to 500 characters. The values are
 only the validated `reply_to` ids and your `team`, never item text.
 
 ```yaml

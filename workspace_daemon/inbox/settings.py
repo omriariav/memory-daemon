@@ -492,9 +492,10 @@ def _check_slack_open(raw, team, problems):
     if not isinstance(tpl, str) or not tpl.startswith(SLACK_OPEN_SCHEMES):
         problems.append("slack_open.url_template must be a string starting "
                         "with slack:// or https://")
-    elif len(tpl) > SLACK_OPEN_MAX or re.search(r"[\x00-\x20\x7f-\x9f]", tpl):
-        problems.append(f"slack_open.url_template must be one line without "
-                        f"spaces, up to {SLACK_OPEN_MAX} characters")
+    elif len(tpl) > SLACK_OPEN_MAX or re.search(r"[^\x21-\x7e]", tpl):
+        problems.append(f"slack_open.url_template must be printable ASCII on "
+                        f"one line, without spaces, up to {SLACK_OPEN_MAX} "
+                        "characters")
     else:
         for name in re.findall(r"\{([^{}]*)\}", tpl):
             if name not in SLACK_OPEN_FIELDS:

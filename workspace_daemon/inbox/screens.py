@@ -46,6 +46,7 @@ class ConfirmSend(ModalScreen):
                 Binding("y", "choose('send')", "Send"),
                 Binding("d", "choose('draft')", "Draft", show=False),
                 Binding("c", "choose('copy')", "Copy", show=False),
+                Binding("o", "open_url", "Open", show=False),
                 Binding("left,right", "toggle_focus", show=False),
                 Binding("down,j", "scroll(1)", show=False),
                 Binding("up,k", "scroll(-1)", show=False),
@@ -88,7 +89,7 @@ class ConfirmSend(ModalScreen):
                 yield Static(Text("Slack  " + self.route, Style(dim=True)),
                              id="confirm-route")
             if self.open_url:
-                yield Static(Text("Open  " + self.open_url + "   (o)",
+                yield Static(Text("Open (o)  " + self.open_url,
                                   Style(dim=True)), id="confirm-open")
             if self.warn:
                 yield Static(Text("⚠ " + self.warn, Style(bold=True, color="yellow")),
@@ -112,6 +113,28 @@ class ConfirmSend(ModalScreen):
 
     def on_button_pressed(self, e):
         self.dismiss(e.button.id if e.button.id in self.options else False)
+
+    # Below this terminal width four buttons do not fit in one row: the
+    # button row becomes a two-column grid instead of clipping.
+    NARROW = 100
+
+    def on_mount(self):
+        self._fit()
+
+    def on_resize(self, _event):
+        self._fit()
+
+    def _fit(self):
+        try:
+            box = self.query_one("#confirm")
+        except Exception:
+            return
+        box.set_class(self.app.size.width < self.NARROW, "narrow")
+
+    def action_open_url(self):
+        """`o` opens the same URL the queue's `o` would (the modal stays)."""
+        if self.open_url:
+            self.app.action_open()
 
     def action_cancel(self):
         self.dismiss(False)

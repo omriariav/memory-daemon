@@ -289,8 +289,9 @@ class LocalActions:
         the clipboard. Purely local: no tool call, nothing written."""
         if "copy" not in self.reply_options():
             return "", "Copy is not configured"
-        if writes.reply_to(item.meta) is None:
-            return "", writes.NO_REPLY_TO[0].upper() + writes.NO_REPLY_TO[1:]
+        text, error = writes.send_text(text, "copy")
+        if error:
+            return "", error[0].upper() + error[1:]
         out = mrkdwn.to_slack_mrkdwn(text)
         if not out.strip():
             return "", "there is no text to copy"
@@ -333,6 +334,20 @@ class LocalActions:
         whether the text was cut, or `ok` False with the reason."""
         plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
         if not plan.ok:
+            if plan.dest_refused and self.copy_enabled:
+                # The destination is unusable but the text may still be
+                # copied: offer only Copy for Slack, with the reason.
+                clean, error = writes.send_text(text, "copy")
+                if error:
+                    return writes.Sendable(False, error=error[0].upper()
+                                           + error[1:])
+                why = ("no valid meta.reply_to" if writes.reply_to(item.meta)
+                       is None else "a channel post without a thread is off "
+                       "(send.allow_channel_posts)")
+                return writes.Sendable(
+                    True, clean, None, "",
+                    f"Draft and Send need a valid thread/DM destination "
+                    f"({why})", item.where, "", copy_only=True)
             return plan
         return plan._replace(destination=f"{item.where} ({plan.kind})")
 
@@ -383,12 +398,13 @@ class LocalActions:
                 or "draft" not in self.reply_options()):
             return Result(False, "Draft in Slack is not configured "
                                  "(send.mode draft or both, send.draft_tool)")
-        plan = writes.send_plan(item.meta, text, self._allow_channel_posts())
+        plan = writes.send_plan(item.meta, text, self._allow_channel_posts(),
+                                what="draft")
         if not plan.ok:
             return Result(False, plan.error)
         if not self._send_lock.acquire(blocking=False):
-            return Result(False, "another send is still running; no draft "
-                                 "placed")
+            return Result(False, "another Slack write is still running; no "
+                                 "draft placed")
         try:
             out = writes.run_draft(self.send_cfg, self.base_dir, plan.target,
                                    plan.text, call_tools=self._call_tools)

@@ -84,32 +84,46 @@ def boom(prompt, tools, **kw):
 # ---------------------------------------------------------------- mrkdwn
 
 class MrkdwnTest(unittest.TestCase):
+    """Only unambiguous standard markdown is converted: the drafts usually
+    already are Slack text, where a single `*x*` is bold."""
+
     def conv(self, text):
         return mrkdwn.to_slack_mrkdwn(text)
 
-    def test_the_spec_conversions(self):
+    def test_the_unambiguous_conversions(self):
         self.assertEqual(self.conv("**bold**"), "*bold*")
-        self.assertEqual(self.conv("__x__"), "_x_")
+        self.assertEqual(self.conv("__bold__"), "*bold*")
         self.assertEqual(self.conv("~~x~~"), "~x~")
         self.assertEqual(self.conv("[text](https://example.com/a)"),
                          "<https://example.com/a|text>")
         self.assertEqual(self.conv("# Heading"), "*Heading*")
         self.assertEqual(self.conv("###### Deep"), "*Deep*")
 
-    def test_italic_and_bold_italic(self):
-        self.assertEqual(self.conv("*it* and **b**"), "_it_ and *b*")
-        self.assertEqual(self.conv("***both***"), "*_both_*")
+    def test_single_star_and_underscore_are_left_alone(self):
+        for text in ("*already bold in Slack*", "_italic in Slack_",
+                     "*a* and _b_ and *c d*", "x *y* z", "***both***"):
+            self.assertEqual(self.conv(text), text, text)
+        self.assertEqual(self.conv("mixed *slack bold* and **md bold**"),
+                         "mixed *slack bold* and *md bold*")
+
+    def test_link_labels_are_escaped(self):
+        self.assertEqual(self.conv("[a & <b>](https://example.com/x)"),
+                         "<https://example.com/x|a &amp; &lt;b&gt;>")
+        self.assertEqual(self.conv("[Q&A](https://example.com)"),
+                         "<https://example.com|Q&amp;A>")
 
     def test_a_heading_with_bold_inside_is_not_double_wrapped(self):
         self.assertEqual(self.conv("## **Big** one ##"), "*Big one*")
         self.assertEqual(self.conv("# [t](https://example.com)"),
                          "*<https://example.com|t>*")
         self.assertEqual(self.conv("#"), "#")           # not a heading
+        self.assertEqual(self.conv("#hashtag"), "#hashtag")
 
-    def test_lists_and_quotes_are_kept(self):
-        self.assertEqual(
-            self.conv("- a\n* b **x**\n+ c\n  * nested\n1. one\n2. two"),
-            "- a\n- b *x*\n- c\n  - nested\n1. one\n2. two")
+    def test_lists_and_quotes_are_kept_as_they_are(self):
+        text = "- a\n* b\n+ c\n  * nested\n1. one\n2. two"
+        self.assertEqual(self.conv(text), text)
+        self.assertEqual(self.conv("- a **x**\n* b __y__"),
+                         "- a *x*\n* b *y*")
         self.assertEqual(self.conv("> quote **b**\n> more"),
                          "> quote *b*\n> more")
         self.assertEqual(self.conv("> - item"), "> - item")
@@ -121,14 +135,48 @@ class MrkdwnTest(unittest.TestCase):
             self.conv("pre **b**\n```\n**code** __x__ # h\n```\nafter **b**"),
             "pre *b*\n```\n**code** __x__ # h\n```\nafter *b*")
 
+    def test_tilde_fences_are_protected(self):
+        self.assertEqual(
+            self.conv("a **b**\n~~~\n**code** ~~x~~\n~~~\nc **d**"),
+            "a *b*\n~~~\n**code** ~~x~~\n~~~\nc *d*")
+        # a backtick fence is not closed by a tilde fence
+        self.assertEqual(self.conv("```\n~~~\n**x**\n```\n**y**"),
+                         "```\n~~~\n**x**\n```\n*y*")
+
+    def test_indented_code_blocks_are_protected(self):
+        self.assertEqual(
+            self.conv("text **a**\n\n    **code** __x__\n    more\n\nafter **b**"),
+            "text *a*\n\n    **code** __x__\n    more\n\nafter *b*")
+        self.assertEqual(self.conv("\t**tab code**"), "\t**tab code**")
+
+    def test_a_nested_list_is_not_a_code_block(self):
+        self.assertEqual(self.conv("- item\n    - nested **b**"),
+                         "- item\n    - nested *b*")
+        self.assertEqual(self.conv("1. one\n\n    continued **b**"),
+                         "1. one\n\n    continued *b*")
+        # an indented line straight after a paragraph is a continuation
+        self.assertEqual(self.conv("para\n    **b**"), "para\n    *b*")
+
     def test_urls_keep_their_underscores_and_tildes(self):
         self.assertEqual(
             self.conv("see https://example.com/a_b_c~x and __bold__"),
-            "see https://example.com/a_b_c~x and _bold_")
+            "see https://example.com/a_b_c~x and *bold*")
         self.assertEqual(self.conv("[a_b](https://example.com/x_y_z)"),
                          "<https://example.com/x_y_z|a_b>")
         self.assertEqual(self.conv("[a](https://example.com/w_(x)_y)"),
                          "<https://example.com/w_(x)_y|a>")
+
+    def test_a_bare_url_does_not_swallow_closing_markup(self):
+        self.assertEqual(self.conv("**https://example.com/a_b**"),
+                         "*https://example.com/a_b*")
+        self.assertEqual(self.conv("~~https://example.com/c~~ x"),
+                         "~https://example.com/c~ x")
+        self.assertEqual(self.conv("__https://example.com/d__"),
+                         "*https://example.com/d*")
+        self.assertEqual(self.conv("*https://example.com/e*"),
+                         "*https://example.com/e*")
+        self.assertEqual(self.conv("see **https://example.com/x/** now"),
+                         "see *https://example.com/x/* now")
 
     def test_links_edge_cases(self):
         self.assertEqual(self.conv("[](https://example.com)"),
@@ -143,17 +191,18 @@ class MrkdwnTest(unittest.TestCase):
     def test_plain_text_and_lookalikes_are_unchanged(self):
         for text in ("Thanks, on it.", "2 * 3 * 4", "snake_case_name",
                      "a*b*c", "---", "* * *", "***", "~ alone", "x __ y",
-                     "", "line one\n\nline two"):
+                     "", "line one\n\nline two", "~~~", "a ~b~ c"):
             self.assertEqual(self.conv(text), text, text)
 
     def test_hebrew_and_bidi_marks_pass_through(self):
         self.assertEqual(
             self.conv("**שלום** עולם __היי__ ~~לא~~ [קישור](https://example.com/he)"),
-            "*שלום* עולם _היי_ ~לא~ <https://example.com/he|קישור>")
+            "*שלום* עולם *היי* ~לא~ <https://example.com/he|קישור>")
         self.assertEqual(self.conv("# כותרת\n- פריט **חשוב**\n> ציטוט"),
                          "*כותרת*\n- פריט *חשוב*\n> ציטוט")
-        self.assertEqual(self.conv("a‏b **x**‏"),
-                         "a‏b *x*‏")
+        self.assertEqual(self.conv("*שלום* _עולם_"), "*שלום* _עולם_")
+        self.assertEqual(self.conv("a\u200fb **x**\u200f"),
+                         "a\u200fb *x*\u200f")
         self.assertEqual(self.conv("שלום, מה שלומך?"), "שלום, מה שלומך?")
 
     def test_multi_line_mixed_draft(self):
@@ -162,12 +211,12 @@ class MrkdwnTest(unittest.TestCase):
                  "- item __new__\n\n```\nkeep **this**\n```\n")
         self.assertEqual(
             self.conv(draft),
-            "*Update*\n\nHi *team*, the _plan_ is in "
+            "*Update*\n\nHi *team*, the *plan* is in "
             "<https://example.com/doc_1|the doc>.\n\n- item ~old~\n"
-            "- item _new_\n\n```\nkeep **this**\n```\n")
+            "- item *new*\n\n```\nkeep **this**\n```\n")
 
     def test_forged_placeholders_are_removed_and_non_strings_are_empty(self):
-        self.assertEqual(self.conv("a" + "0b"), "a0b")
+        self.assertEqual(self.conv("a\ue000" + "0\ue001b"), "a0b")
         self.assertEqual(self.conv(None), "")
         self.assertEqual(self.conv(5), "")
 
@@ -283,8 +332,9 @@ class SlackOpenSettingsTest(unittest.TestCase):
 
     def test_one_line_no_spaces_and_a_cap(self):
         for bad in ("https://example.com/a b", "https://example.com/\n",
-                    "https://example.com/" + "a" * 500):
-            self.assertIn("one line without spaces", self.problems(
+                    "https://example.com/\u00e9", "https://example.com/\u200b",
+                    "https://example.com/\x7f", "https://example.com/" + "a" * 500):
+            self.assertIn("printable ASCII on one line", self.problems(
                 {"slack_open": {"url_template": bad}}))
 
     def test_shape_problems(self):
@@ -484,7 +534,8 @@ class RunDraftTest(unittest.TestCase):
     def test_attached_draft_exists_in_the_tool_reply(self):
         for text in ('{"ok": false, "error": "attached_draft_exists"}',
                      "Error: attached_draft_exists",
-                     '{"ok": true, "note": "ATTACHED_DRAFT_EXISTS"}'):
+                     "ATTACHED_DRAFT_EXISTS",
+                     '{"error": "attached_draft_exists"}'):
             out = writes.run_draft(cfg(), "/b", self.target(), "x",
                                    call_tools=good_call(text=text))
             self.assertEqual((out.ok, out.detail),
@@ -492,6 +543,13 @@ class RunDraftTest(unittest.TestCase):
         self.assertEqual(writes.ATTACHED_DRAFT_MSG,
                          "A draft already waits in that conversation; use "
                          "Copy instead")
+
+    def test_the_marker_in_a_clean_ok_reply_is_a_success(self):
+        for text in ('{"ok": true, "note": "ATTACHED_DRAFT_EXISTS"}',
+                     '{"success": true, "draft": "attached_draft_exists?"}'):
+            out = writes.run_draft(cfg(), "/b", self.target(), "x",
+                                   call_tools=good_call(text=text))
+            self.assertTrue(out.ok, text)
 
     def test_attached_draft_exists_as_a_tool_error(self):
         def call(prompt, tools, **kw):
@@ -645,6 +703,17 @@ class ReplyOptionsTest(unittest.TestCase):
         self.assertTrue(acts.send(obj(1), "hello").ok)
         self.assertTrue(store.is_hidden("t:1"))
 
+    def test_draft_refusals_say_draft_not_send(self):
+        acts = self.acts(cfg(mode="draft"))
+        no_dest = acts.place_draft(obj(1, reply_to=False), "x").detail
+        self.assertIn("no draft can be placed", no_dest)
+        self.assertNotIn("sent", no_dest)
+        top = acts.place_draft(obj(1, reply_to={"channel": CHANNEL}), "x").detail
+        self.assertIn("draft a top-level message in the channel", top)
+        self.assertEqual(acts.place_draft(obj(1), "  ").detail,
+                         "There is no text to draft")
+        self.assertEqual(writes.send_text("  ")[1], "there is no text to send")
+
     def test_place_draft_checks_the_destination_and_text_first(self):
         acts = self.acts(cfg(mode="draft"))
         for item, text in ((obj(1, reply_to=False), "x"),
@@ -669,7 +738,7 @@ class ReplyOptionsTest(unittest.TestCase):
             self.assertTrue(started.wait(5))
             res = acts.place_draft(obj(2), "two")
             self.assertFalse(res.ok)
-            self.assertIn("another send is still running", res.detail)
+            self.assertIn("another Slack write is still running", res.detail)
             self.assertFalse(acts.send(obj(3), "three").ok)
         finally:
             gate.set()
@@ -681,15 +750,44 @@ class ReplyOptionsTest(unittest.TestCase):
         out, err = acts.copy_text(obj(1), "**hi** [x](https://example.com/a_b)")
         self.assertEqual((out, err), ("*hi* <https://example.com/a_b|x>", ""))
 
+    def test_copy_text_needs_no_destination(self):
+        acts = self.acts(copy=True, call=boom)
+        for item in (obj(1, reply_to=False),
+                     obj(1, reply_to={"channel": CHANNEL}),    # no thread
+                     obj(1, reply_to={"channel": "#bad"})):
+            self.assertEqual(acts.copy_text(item, "**x**"), ("*x*", ""))
+
     def test_copy_text_refusals(self):
         acts = self.acts(copy=True, call=boom)
-        self.assertIn("no valid meta.reply_to",
-                      acts.copy_text(obj(1, reply_to=False), "x")[1])
-        self.assertEqual(acts.copy_text(obj(1), "  \n")[0], "")
+        self.assertEqual(acts.copy_text(obj(1), "  \n"),
+                         ("", "There is no text to copy"))
+        self.assertIn("4000", acts.copy_text(obj(1), "z" * 4001)[1])
+        self.assertIn("control or bidi-override",
+                      acts.copy_text(obj(1), "a\x1bb")[1])
         off = self.acts(call=boom)
         self.assertEqual(off.copy_text(obj(1), "x"),
                          ("", "Copy is not configured"))
 
+    def test_send_plan_falls_back_to_copy_only_on_a_bad_destination(self):
+        for acts in (self.acts(cfg(mode="both")), self.acts(copy=True)):
+            for item, why in ((obj(1, reply_to=False), "no valid meta.reply_to"),
+                              (obj(1, reply_to={"channel": CHANNEL}),
+                               "channel post without a thread")):
+                plan = acts.send_plan(item, "hello  ")
+                self.assertTrue(plan.ok and plan.copy_only, why)
+                self.assertEqual(plan.text, "hello")
+                self.assertIn("Draft and Send need a valid thread/DM destination",
+                              plan.error)
+                self.assertIn(why, plan.error)
+        # a bad text still refuses, with the text's reason
+        plan = self.acts(copy=True).send_plan(obj(1, reply_to=False), "z" * 4001)
+        self.assertFalse(plan.ok)
+        self.assertIn("4000", plan.error)
+        # a usable destination is a normal plan, not copy-only
+        ok = self.acts(cfg(mode="both")).send_plan(
+            obj(1, reply_to={"channel": DM}), "x")
+        self.assertTrue(ok.ok)
+        self.assertFalse(ok.copy_only)
 
 # -------------------------------------------------------------------- Textual
 
@@ -1157,6 +1255,181 @@ class CopyFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
+    """Copy is offered whenever the text passes the text checks, even when
+    the item cannot be sent or drafted to."""
+
+    CASES = {
+        "no reply_to": {"reply_to": False},
+        "a channel item without a thread": {"reply_to": {"channel": CHANNEL}},
+        "a group item without a thread": {"reply_to": {"channel": "G0EXAMPLE01"}},
+        "an invalid reply_to": {"reply_to": {"channel": "#launch"}},
+    }
+
+    async def copy_case(self, send, kw, row_kw, draft="**hi** there", nudge=False):
+        store, opened, clip = InboxStore(None), [], []
+        acts = acts_for(store, boom, send=send, opened=opened, **kw)
+        app = make_app([reply_item(1, draft=draft, **row_kw)], acts, store,
+                       undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(app, "copy_to_clipboard",
+                                   side_effect=clip.append):
+                modal = await open_confirm(pilot, app, "a")
+                self.assertEqual(modal.options, ("copy",))
+                self.assertEqual(buttons(modal), ["cancel", "copy"])
+                self.assertEqual(modal.focused.id, "cancel")
+                warn = (str(modal.query_one("#confirm-warn").render())
+                        if modal.query("#confirm-warn") else "")
+                await pilot.press("y")                 # not offered
+                await pilot.press("d")                 # not offered
+                await pilot.pause(0.2)
+                self.assertIs(app.screen, modal)
+                await pilot.press("c")
+                await pilot.pause(0.3)
+            self.assertNotIsInstance(app.screen, ConfirmSend)
+            self.assertEqual((app.pending, app.running), ([], []))
+            self.assertIn("t:1", keys(app))
+            self.assertFalse(store.is_hidden("t:1"))
+            await pilot.press("o")                     # falls back to item.link
+            await pilot.pause(0.1)
+            return clip, warn, opened
+
+    async def test_copy_is_offered_alone_with_the_reason(self):
+        for name, row_kw in self.CASES.items():
+            for send in (cfg(mode="both"), cfg(mode="draft"), cfg(mode="send")):
+                clip, warn, opened = await self.copy_case(send, {}, row_kw)
+                self.assertEqual(clip, ["*hi* there"], name)
+                self.assertIn("Draft and Send need a valid thread/DM destination",
+                              warn, name)
+                self.assertEqual(opened, ["https://example.com/1"], name)
+
+    async def test_copy_only_mode_works_for_every_item_with_text(self):
+        for name, row_kw in self.CASES.items():
+            clip, warn, opened = await self.copy_case(None, {"copy": True}, row_kw)
+            self.assertEqual(clip, ["*hi* there"], name)
+            self.assertEqual(warn, "", name)    # no draft or send to warn about
+            self.assertEqual(opened, ["https://example.com/1"], name)
+
+    async def test_a_valid_destination_in_copy_only_mode_is_the_same(self):
+        clip, warn, _ = await self.copy_case(None, {"copy": True}, {})
+        self.assertEqual((clip, warn), (["*hi* there"], ""))
+
+    async def test_a_nudge_without_a_destination_offers_copy_too(self):
+        store = InboxStore(None)
+        app = make_app([reply_item(1, kind="nudge", reply_to=False)],
+                       acts_for(store, boom, send=cfg(mode="both")), store,
+                       undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app, "n")
+            self.assertEqual(modal.options, ("copy",))
+            self.assertEqual(modal.title_text, "Nudge in Slack")
+
+    async def test_the_text_checks_still_refuse(self):
+        for draft, needle in (("z" * 4001, "4000"),):
+            store = InboxStore(None)
+            app = make_app([reply_item(1, draft=draft, reply_to=False)],
+                           acts_for(store, boom, send=cfg(mode="both")), store,
+                           undo_s=30)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("a")
+                await pilot.pause(0.3)
+                self.assertNotIsInstance(app.screen, ConfirmSend)
+                self.assertTrue(any(needle in t for t in toasts(app)), needle)
+
+    async def test_no_precheck_runs_for_a_copy_only_modal(self):
+        store = InboxStore(None)
+        send = cfg(mode="both", precheck={"argv": ["/bin/false"], "timeout_s": 5})
+        acts = acts_for(store, boom, send=send)
+        app = make_app([reply_item(1, reply_to=False)], acts, store, undo_s=30)
+        with mock.patch.object(acts, "send_precheck",
+                               side_effect=AssertionError("precheck ran")):
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                modal = await open_confirm(pilot, app)
+                self.assertEqual(modal.options, ("copy",))
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
+    async def modal(self, size, send):
+        store = InboxStore(None)
+        app = make_app([reply_item(1)], acts_for(
+            store, boom, send=send, team=TEAM,
+            slack_open={"url_template": WEB_URL}), store, undo_s=30)
+        return app, store
+
+    async def test_at_80_columns_the_buttons_wrap_instead_of_clipping(self):
+        app, _ = await self.modal((80, 40), cfg(mode="both"))
+        async with app.run_test(size=(80, 40)) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app)
+            await pilot.pause(0.2)
+            box = modal.query_one("#confirm").region
+            self.assertLessEqual(box.right, 80)
+            self.assertTrue(modal.query_one("#confirm").has_class("narrow"))
+            regions = {b.id: b.region for b in
+                       modal.query("#confirm-buttons Button")}
+            self.assertEqual(set(regions), {"cancel", "draft", "send", "copy"})
+            for name, r in regions.items():
+                self.assertGreaterEqual(r.x, box.x, name)
+                self.assertLessEqual(r.right, box.right, name)
+                self.assertLessEqual(r.bottom, box.bottom, name)
+                self.assertGreater(r.width, len(name), name)    # not squeezed to nothing
+            # wrapped into two rows, nothing overlaps
+            self.assertEqual(len({r.y for r in regions.values()}), 2)
+            items = list(regions.values())
+            for i, a in enumerate(items):
+                for b in items[i + 1:]:
+                    self.assertFalse(a.intersection(b).area, (a, b))
+            # every label is fully shown
+            for b in modal.query("#confirm-buttons Button"):
+                self.assertGreaterEqual(b.region.width, len(str(b.label)) + 2)
+
+    async def test_wide_terminals_keep_one_row(self):
+        app, _ = await self.modal((150, 42), cfg(mode="both"))
+        async with app.run_test(size=(150, 42)) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app)
+            self.assertFalse(modal.query_one("#confirm").has_class("narrow"))
+            self.assertEqual(len({b.region.y for b in
+                                  modal.query("#confirm-buttons Button")}), 1)
+
+    async def test_every_mode_fits_at_80_columns(self):
+        for send in (cfg(mode="send"), cfg(mode="draft"), cfg(mode="both")):
+            app, _ = await self.modal((80, 40), send)
+            async with app.run_test(size=(80, 40)) as pilot:
+                await settle(pilot, app)
+                modal = await open_confirm(pilot, app)
+                await pilot.pause(0.2)
+                box = modal.query_one("#confirm").region
+                for b in modal.query("#confirm-buttons Button"):
+                    self.assertGreaterEqual(b.region.x, box.x, b.id)
+                    self.assertLessEqual(b.region.right, box.right, b.id)
+                    self.assertGreaterEqual(b.region.width,
+                                            len(str(b.label)) + 2, b.id)
+
+    async def test_o_in_the_modal_opens_what_o_would_open_and_stays(self):
+        opened, store = [], InboxStore(None)
+        acts = acts_for(store, boom, send=cfg(mode="both"), opened=opened,
+                        team=TEAM, slack_open={"url_template": SLACK_URL})
+        app = make_app([reply_item(1)], acts, store, undo_s=30)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            modal = await open_confirm(pilot, app)
+            shown = str(modal.query_one("#confirm-open").render())
+            self.assertIn("Open (o)", shown)
+            self.assertIn(f"slack://channel?team={TEAM}&id={CHANNEL}", shown)
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            self.assertEqual(opened, [f"slack://channel?team={TEAM}&id={CHANNEL}"])
+            self.assertIs(app.screen, modal)
+            self.assertEqual(app.pending, [])
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class KeyMapInvariantTest(unittest.TestCase):
     """0.7.0 adds no key to the inbox: `d`, `y` and `c` keep their meaning in
     the queue, and mean draft / send / copy only inside the confirm screen."""
@@ -1179,6 +1452,7 @@ class KeyMapInvariantTest(unittest.TestCase):
         self.assertEqual(actions["y"], "choose('send')")
         self.assertEqual(actions["d"], "choose('draft')")
         self.assertEqual(actions["c"], "choose('copy')")
+        self.assertEqual(actions["o"], "open_url")
         self.assertEqual(actions["escape"], "cancel")
         # no confirm key collides with another confirm key
         keys_ = [k for b in ConfirmSend.BINDINGS for k in b.key.split(",")]

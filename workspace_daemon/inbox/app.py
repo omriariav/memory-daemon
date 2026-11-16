@@ -181,6 +181,9 @@ class InboxApp(App):
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
     #confirm.multi { width: 96; }
     #confirm.multi #confirm-buttons Button { margin-left: 1; min-width: 10; padding: 0 1; }
+    #confirm.multi.narrow { width: 100%; padding: 1 1; }
+    #confirm.multi.narrow #confirm-buttons { layout: grid; grid-size: 2; grid-gutter: 0 1; grid-rows: 3; height: auto; align-horizontal: left; }
+    #confirm.multi.narrow #confirm-buttons Button { width: 1fr; min-width: 0; margin-left: 0; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #snooze-list { height: 6; background: transparent; border: none; }
     #snooze-hint { margin-top: 1; color: $text-muted; }
@@ -1098,8 +1101,8 @@ class InboxApp(App):
         dest, note, route = it.destination, "", ""
         if self._real_send():
             if self._send_busy():
-                self.notify("A send is already in progress; wait for it "
-                            "(only one send runs at a time).", timeout=4,
+                self.notify("A Slack write is already in progress; wait for "
+                            "it (only one runs at a time).", timeout=4,
                             severity="warning", markup=False)
                 return
             plan = self.actions.send_plan(it, text)
@@ -1108,6 +1111,14 @@ class InboxApp(App):
                 self.notify(plan.error, timeout=6, severity="warning", markup=False)
                 return
             text, dest, route = plan.text, plan.destination, plan.route
+            if getattr(plan, "copy_only", False):
+                # No usable destination, but the text is fine: only Copy for
+                # Slack is offered (no precheck: nothing is sent or drafted).
+                warn = plan.error if any(
+                    o in ("draft", "send") for o in self._reply_options()) else ""
+                self._open_confirm_send(kind, it, verb, text, dest, note, warn,
+                                        route, only=("copy",))
+                return
 
         if self._real_send() and getattr(self.actions, "precheck_configured", False):
             self._precheck_begin(kind, it, verb, text, dest, note, route)
@@ -1115,8 +1126,9 @@ class InboxApp(App):
         self._open_confirm_send(kind, it, verb, text, dest, note, "", route)
 
     def _open_confirm_send(self, kind, it, verb, text, dest, note, warn="",
-                           route=""):
-        options = self._reply_options()
+                           route="", only=None):
+        options = tuple(o for o in self._reply_options()
+                        if only is None or o in only)
         if not options:
             self.notify("Nothing to do: set send.mode / send.draft_tool or "
                         "copy: in inbox.yaml", timeout=5, severity="warning",
@@ -1225,7 +1237,7 @@ class InboxApp(App):
                         markup=False)
             return
         if self._send_busy():
-            self.notify("A send is already in progress; wait for it.",
+            self.notify("A Slack write is already in progress; wait for it.",
                         timeout=4, severity="warning", markup=False)
             return
         warn = out.warn or (writes_mod.PRECHECK_FAILED if out.failed else "")

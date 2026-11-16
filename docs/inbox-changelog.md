@@ -32,22 +32,31 @@ confirm screen also gains a "Copy for Slack" button next to Send.
   wording never says a message was sent ("no draft placed", "the draft may
   have been placed, check Slack"). Never retried; one Slack write at a time,
   drafts included.
-- **Copy for Slack** (`c`, always offered once `send:` or `copy: true` is set):
-  purely local (no tool call, no undo window). The draft is converted from
-  standard markdown to Slack mrkdwn (`**bold**` to `*bold*`, `*italic*` and
-  `__x__` to `_x_`, `~~x~~` to `~x~`, `[text](url)` to `<url|text>`, `# heading`
-  to `*heading*`; lists, quotes and code are kept and code is never touched; the
-  pure function is `mrkdwn.to_slack_mrkdwn`) and put on the clipboard (OSC 52).
-  The item stays. Toast "Copied for Slack: open it with o and paste".
+- **Copy for Slack** (`c`, always offered once `send:` or `copy: true` is set
+  and the text passes the text checks): purely local (no tool call, no undo
+  window), and it needs no destination: with no valid `meta.reply_to`, or a
+  channel or group reply without a thread, the confirm screen opens with only
+  Copy (and a warning "Draft and Send need a valid thread/DM destination").
+  The draft is converted to Slack mrkdwn by `mrkdwn.to_slack_mrkdwn`, which
+  only touches unambiguous standard markdown, because the drafts usually are
+  Slack text already (a single `*x*` is bold there): `**x**` and `__x__` to
+  `*x*`, `~~x~~` to `~x~`, `[text](url)` to `<url|text>` (label escaped) and
+  `# heading` to `*heading*`. Single `*x*` and `_x_`, lists, quotes, inline,
+  fenced (backtick and tilde) and indented code are left alone. The result goes
+  on the clipboard (OSC 52). The item stays. Toast "Copied for Slack: open it
+  with o and paste".
 - `copy: true` (top level, default `false`): "Copy for Slack" without `send:`.
 - `slack_open: {url_template}` and `team: "T..."` (top level): `o` opens the
   template URL for an item with a valid `meta.reply_to`. Placeholders
   `{channel}`, `{thread_ts}`, `{message_ts}`, `{team}`; `{thread_ts}` is the
   thread's timestamp, else the message's, so a thread opens at the thread. The
   template must start with `slack://` or `https://`; `team` must match
-  `^T[A-Z0-9]{6,12}$`; `{team}` needs `team:`. Without the setting, or when the
+  `^T[A-Z0-9]{6,12}$`; `{team}` needs `team:`; the template is printable ASCII
+  without spaces. Without the setting, or when the
   template cannot be filled, `o` opens the item's link as before. The confirm
-  screen shows the URL `o` will open.
+  screen shows the URL `o` will open, and `o` in the screen opens it. At
+  terminal widths under 100 the buttons wrap into two columns instead of
+  clipping.
 - The confirm screen: Cancel stays the default; the buttons and keys are
   `d` Draft in Slack, `y` Send, `c` Copy for Slack, `esc` Cancel (a key that
   is not offered does nothing). No new key in the queue.

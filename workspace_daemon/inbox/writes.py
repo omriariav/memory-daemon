@@ -71,8 +71,13 @@ EMOJI_NAME = re.compile(r"\A[a-z0-9_+\-]{1,64}\Z")
 ReplyTo = namedtuple("ReplyTo", "channel thread_ts message_ts")
 # `route` is the real destination (channel id and thread timestamp), shown in
 # the confirm modal next to the `where` label.
-Sendable = namedtuple("Sendable", "ok text target kind error destination route",
-                      defaults=("", None, "", "", "", ""))
+# `copy_only` (0.7.0): the destination is unusable (no valid reply_to, or a
+# channel post without a thread) but the text is fine, so only Copy for Slack
+# is offered; `error` then holds the reason. `dest_refused` marks a refusal
+# that was about the destination only.
+Sendable = namedtuple(
+    "Sendable", "ok text target kind error destination route copy_only "
+    "dest_refused", defaults=("", None, "", "", "", "", False, False))
 # Control characters (tab and newline are fine) and the bidi overrides,
 # embeddings and isolates: text that could hide what it says. LRM, RLM and
 # ALM are kept for Hebrew and Arabic.
@@ -180,6 +185,8 @@ def run_save(cfg, item, force=False):
 
 NO_REPLY_TO = ("this item has no valid meta.reply_to (a Slack channel id and "
                "timestamps), so it cannot be sent to")
+NO_REPLY_TO_DRAFT = ("this item has no valid meta.reply_to (a Slack channel id "
+                     "and timestamps), so no draft can be placed in it")
 
 
 def reply_to(meta):
@@ -216,14 +223,14 @@ def target_kind(target):
     return "DM" if target.channel.startswith("D") else "channel"
 
 
-def send_text(draft):
+def send_text(draft, what="send"):
     """`(text, error)` for a draft: only trailing whitespace is removed. The
     text is refused (`error`, text "") when it is empty, longer than
     SEND_TEXT_MAX characters (never cut: what is sent is what was shown) or
     holds a control or bidi-override character."""
     text = draft.rstrip() if isinstance(draft, str) else ""
     if not text:
-        return "", "there is no text to send"
+        return "", f"there is no text to {what}"
     if len(text) > SEND_TEXT_MAX:
         return "", (f"the text is {len(text)} characters; the limit is "
                     f"{SEND_TEXT_MAX}; edit it first")
@@ -234,22 +241,27 @@ def send_text(draft):
     return text, ""
 
 
-def send_plan(meta, draft, allow_channel_posts=False):
+def send_plan(meta, draft, allow_channel_posts=False, what="send"):
     """Everything a send needs, checked: the destination, the exact text and
     what to tell the user. `ok` False carries `error`.
 
     A reply to a channel or group (C, G) without a `thread_ts` would be a
     top-level post: it is refused unless `allow_channel_posts` (the setting
-    `send.allow_channel_posts`). A DM (D) needs no thread."""
+    `send.allow_channel_posts`). A DM (D) needs no thread. `what` ("send" or
+    "draft") only words the refusals."""
     target = reply_to(meta)
     if target is None:
-        return Sendable(False, error=NO_REPLY_TO[0].upper() + NO_REPLY_TO[1:])
+        msg = NO_REPLY_TO if what == "send" else NO_REPLY_TO_DRAFT
+        return Sendable(False, error=msg[0].upper() + msg[1:],
+                        dest_refused=True)
     if (not allow_channel_posts and not target.thread_ts
             and target.channel[0] in "CG"):
-        return Sendable(False, error=(
-            "This item would post to the channel, not a thread, so it is "
+        what_it_does = ("post to the channel" if what == "send"
+                        else "draft a top-level message in the channel")
+        return Sendable(False, dest_refused=True, error=(
+            f"This item would {what_it_does}, not a thread, so it is "
             "refused (send.allow_channel_posts: true allows channel posts)"))
-    text, error = send_text(draft)
+    text, error = send_text(draft, what)
     if error:
         return Sendable(False, error=error[0].upper() + error[1:])
     route = target.channel + (f" · thread {target.thread_ts}"
@@ -331,6 +343,27 @@ def reply_state(text):
     return "ok"
 
 
+def _names_marker(row, marker):
+    """True when a tool row names `marker` AND is an error or not clearly ok:
+    an error result, a JSON failure (`error`, `ok`/`success` false) or plain
+    text. A JSON object that says ok/success true is a success, whatever else
+    it mentions."""
+    text = str(row.get("text") or "")
+    if marker not in text.casefold():
+        return False
+    if row.get("is_error"):
+        return True
+    try:
+        doc = json.loads(text)
+    except (TypeError, ValueError):
+        return True
+    if isinstance(doc, dict):
+        clean = (doc.get("ok") is True or doc.get("success") is True) \
+            and not doc.get("error")
+        return not clean
+    return True
+
+
 def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed,
                 did="sent", none="not sent", marker=None):
     """One pinned write through the bridge. Never raises; returns an Outcome.
@@ -376,8 +409,8 @@ def _run_pinned(cfg, base_dir, pins, tag, call_tools, what, failed,
     rows = [r for r in results
             if r.get("name") == tool and not r.get("is_error")
             and r.get("input") == pins[tool]]
-    if marker and any(marker in str(r.get("text") or "").casefold()
-                      for r in results if r.get("name") == tool):
+    if marker and any(_names_marker(r, marker) for r in results
+                      if r.get("name") == tool):
         return Outcome(False, ATTACHED_DRAFT_MSG)
     if not rows:
         return Outcome(False, f"no confirmed result for the pinned call; the "
