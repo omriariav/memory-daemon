@@ -65,7 +65,8 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
         actions = LocalActions(store, rsvp=settings["rsvp"],
                                save=settings["save"], base_dir=base,
                                context=settings["context"],
-                               summary=settings["summary"])
+                               summary=settings["summary"],
+                               actions=settings["actions"])
         app = InboxApp(fetch, store, actions, settings,
                        stream_delay=0, saved=saved if events else None,
                        saved_days=days, units=sources.make_units(settings, base),

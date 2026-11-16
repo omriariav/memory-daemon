@@ -7,6 +7,79 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-16
+
+Custom actions, and a handled item leaves the queue. Everything new is off
+until configured in `inbox.yaml` (a save now marks the item done unless told
+not to).
+
+### Added
+
+- Generic `actions:` hook in `inbox.yaml` (no default; up to 8 entries): `key`,
+  `label`, `argv`, `timeout_s` (5 to 300, default 60, per call) and `mark_done`
+  (default `true`). The key must be a letter the inbox does not use; the free
+  ones are `h l p t w x z` and `B D E F H J K M N O P Q U V W Z`, and
+  validation refuses any other, and a key or label used twice. The command is
+  called with JSON on stdin only (item text never in argv) and answers one JSON
+  line: `choices` (read-only; at most 50 `{id, label, detail}`, cleaned like
+  context text), `prepare` (read-only, may take about 20 s: `{ok, rows:
+  [[label, value]], state, message, duplicate}`, `state` an opaque string of at
+  most 64 KB) and `run` (`{ok, message}`; the only call that writes). The flow:
+  a "looking up" modal (`esc` cancels and stops the command), a picker (shown
+  even for one choice), the same modal while `prepare` runs, the confirm modal
+  with the prepared rows (Cancel is focused), the 5 s undo window (`u` undoes,
+  quitting inside it cancels), then `run` once in a worker thread, never
+  retried, with a row in the audit log. A `duplicate: true` answer is checked
+  before `ok` and shown as information ("Already there"), not an error; any
+  other `ok: false` shows its message and stops. A running action counts in
+  the quit guard like a write. The commands run under the capped runner with the
+  `SIGTERM` grace of `save`. Results reach the UI through the non-blocking
+  `_post`. Footer, help overlay and palette list the configured actions;
+  `--demo` has a fake one.
+- `save: {mark_done: true}` (default) and a per-action `mark_done`: a
+  successful save, including "already in memory" and a forced "Save anyway",
+  and a successful action run mark the item done the way `d` does (a local
+  mark, an audit row, and the 5 s window in which `u` brings the row back). A
+  failed save or run, and the "possible duplicate" question, leave the row.
+  `mark_done: false` keeps the old behaviour (the row stays, marked saved). The
+  Saved view (`S`) still lists the item: it reads capture events, not the queue.
+- `docs/inbox.md`: "Actions protocol" with the contract (commands must be safe
+  to call repeatedly, `choices` and `prepare` read-only, `run` idempotent where
+  possible) and "Custom actions"; a commented `actions:` example in
+  `inbox.example.yaml`.
+- Thread order: the thread pane now lists the **newest message first** (it was
+  oldest first), scrolled to the top, with a dim "thread start" marker under
+  the first message of a thread of two or more (not when the item has a
+  `thread_note`). `v` toggles to oldest first and
+  back (the queue is not touched); a new `thread_order: newest | oldest`
+  setting (default `newest`) is the starting order, and the toggle is saved in
+  `state/inbox-state.json` (`prefs`), so a restart keeps it (the saved choice
+  wins over the setting once made). The item header, `meta.thread_note` and the
+  RSVP hint stay on top. `v` is now a built-in key, so it is not available to
+  `actions:`. Footer, help overlay and command palette list it.
+
+### Changed
+
+- A choice `id` of an `actions:` command is an opaque handle: it is handed back
+  to `prepare` and `run` byte for byte (never cleaned or cut). A row whose id is
+  not a string of 1 to 200 characters, or holds a control character, is skipped;
+  only `label` and `detail` are cleaned for display.
+- The confirmation modal of the write actions (RSVP, save, actions) keeps its
+  label column to a width (8 to 16 cells, a longer label is cut with an
+  ellipsis), wraps each line of a multi-line value, and scrolls when the rows
+  are taller than the box (`down`/`up`, `j`/`k`, `pagedown`/`pageup`; Cancel
+  stays the default).
+  The label column plus the value always fit the box's inner width (61 cells).
+- A bad `choices` answer names the field that is wrong (for example
+  `choices[0].label must be a string`).
+- A successful save no longer leaves the row in the queue (see `mark_done`
+  above; set `save: {mark_done: false}` to keep it).
+- `save.mark_done` is part of the validated `save` block.
+- A mark applied after a background save or action never moves the cursor off
+  the item the user is on.
+- A queue highlight message that arrives after the screen is gone no longer
+  raises `NoMatches` while the app exits.
+
 ## [0.4.0] - 2026-11-16
 
 A Context pane and an AI summary on demand. Both are read-only, off until

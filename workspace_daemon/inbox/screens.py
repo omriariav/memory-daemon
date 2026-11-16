@@ -12,7 +12,7 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
@@ -71,7 +71,13 @@ class ConfirmWrite(ModalScreen):
 
     AUTO_FOCUS = "#cancel"
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "confirm", "Confirm"),
-                Binding("left,right", "toggle_focus", show=False)]
+                Binding("left,right", "toggle_focus", show=False),
+                Binding("down,j", "scroll(1)", show=False),
+                Binding("up,k", "scroll(-1)", show=False),
+                Binding("pagedown", "scroll(10)", show=False),
+                Binding("pageup", "scroll(-10)", show=False)]
+    LABEL_MIN, LABEL_MAX = 8, 16      # the label column, in cells
+    INNER = 61                        # label column + value, in cells: fits the box
 
     def __init__(self, title, rows, verb, note="", visual=False):
         super().__init__()
@@ -79,19 +85,29 @@ class ConfirmWrite(ModalScreen):
         self.note, self.visual = note, visual
 
     def compose(self) -> ComposeResult:
+        shown = [(label, value) for label, value in self.rows if value]
+        # The label column fits the longest label, within LABEL_MIN..LABEL_MAX;
+        # a longer label is cut to it (with an ellipsis), never overflowing
+        # into the value.
+        col = min(self.LABEL_MAX, max(
+            self.LABEL_MIN, *(len(label) + 1 for label, _ in shown))) \
+            if shown else self.LABEL_MIN
         body = Text()
-        for label, value in self.rows:
-            if not value:
-                continue
-            body.append(f"{label:<8}", Style(dim=True))
-            lines = bidi.visual_lines(value, 56, self.visual) or [""]
+        for label, value in shown:
+            label = label if len(label) < col else label[:col - 2] + "…"
+            body.append(f"{label:<{col}}", Style(dim=True))
+            lines = []
+            for para in value.split("\n"):    # a value may have several lines
+                lines.extend(bidi.visual_lines(para, self.INNER - col, self.visual)
+                             or [""])
             body.append(lines[0] + "\n", Style(bold=True))
             for ln in lines[1:]:
-                body.append(" " * 8 + ln + "\n", Style(bold=True))
+                body.append(" " * col + ln + "\n", Style(bold=True))
         body.rstrip()
         with Vertical(id="confirm"):
             yield Static(Text(self.title_text, Style(bold=True)), id="confirm-title")
-            yield Static(body, id="confirm-text")
+            with VerticalScroll(id="confirm-scroll"):
+                yield Static(body, id="confirm-text")
             if self.note:
                 yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
             yield Static(Text("Nothing happens until you confirm. Undo stays open for the grace period.",
@@ -111,6 +127,15 @@ class ConfirmWrite(ModalScreen):
 
     def action_toggle_focus(self):
         self.focus_next()
+
+    def action_scroll(self, step):
+        """The rows may be longer than the box: down / up (j / k) and the page
+        keys scroll them; the buttons never move."""
+        pane = self.query_one("#confirm-scroll")
+        if step > 0:
+            pane.scroll_down(animate=False) if step == 1 else pane.scroll_page_down(animate=False)
+        else:
+            pane.scroll_up(animate=False) if step == -1 else pane.scroll_page_up(animate=False)
 
 
 def parse_snooze(s, now):
@@ -193,6 +218,86 @@ class SnoozePicker(ModalScreen):
         self.dismiss((t, e.value.strip()))
 
 
+class ActionBusy(ModalScreen):
+    """Shown while an action's command is looking something up (its choices,
+    its confirmation rows). `esc` cancels: the app stops the command."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title, what, on_cancel):
+        super().__init__()
+        self.title_text, self.what, self.on_cancel = title, what, on_cancel
+        self._frame = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="actbusy"):
+            yield Static(Text(self.title_text, Style(bold=True)),
+                         id="actbusy-title")
+            yield Static("", id="actbusy-body")
+            yield Static(Text("esc cancel", Style(dim=True)),
+                         id="actbusy-hint")
+
+    def on_mount(self):
+        self._tick()
+        self.set_interval(0.1, self._tick)
+
+    def _tick(self):
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._frame += 1
+        self.query_one("#actbusy-body", Static).update(
+            Text(f"{frames[self._frame % len(frames)]} {self.what}"))
+
+    def action_cancel(self):
+        self.on_cancel()
+        self.dismiss(None)
+
+
+class ChoicePicker(ModalScreen):
+    """A generic picker over the choices an action command returned. Shown
+    even for one choice. Every string is plain `Text`. Dismisses with the
+    chosen choice dict, or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")] + [
+        Binding(str(n), f"pick({n - 1})", show=False) for n in range(1, 10)]
+
+    def __init__(self, title, choices, visual=False):
+        super().__init__()
+        self.title_text, self.choices, self.visual = title, choices, visual
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Static(Text(self.title_text, Style(bold=True)),
+                         id="picker-title")
+            yield OptionList(*[self._option(n, c)
+                               for n, c in enumerate(self.choices)],
+                             id="picker-list")
+            yield Static(Text("enter pick  ·  1-9 quick pick  ·  esc cancel",
+                              Style(dim=True)), id="picker-hint")
+
+    def _option(self, n, choice):
+        prompt = Text()
+        if n < 9:
+            prompt.append(f"{n + 1}  ", Style(bold=True))
+        prompt.append(vis(choice["label"], self.visual))
+        if choice.get("detail"):
+            prompt.append("  " + vis(choice["detail"], self.visual),
+                          Style(dim=True))
+        return Option(prompt, id=str(n))
+
+    def on_mount(self):
+        self.query_one("#picker-list", OptionList).focus()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_pick(self, index):
+        if 0 <= index < len(self.choices):
+            self.dismiss(self.choices[index])
+
+    def on_option_list_option_selected(self, e):
+        self.dismiss(self.choices[int(e.option.id)])
+
+
 HELP = [
     ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
               ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"),
@@ -204,7 +309,7 @@ HELP = [
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
-                     ("m", "save the item to memory (save: in inbox.yaml); ◆ marks a saved item"),
+                     ("m", "save the item to memory (save: in inbox.yaml); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
@@ -215,16 +320,27 @@ HELP = [
               ("ctrl+p", "palette: copy section as Markdown"),
               ("mouse drag", "select text in the thread or draft pane")]),
     ("App", [("ctrl+p", "command palette"), ("ctrl+t", "dark / light theme"), ("L", "audit log"),
-             ("b", "toggle Hebrew order (logical/visual)"), ("?", "this help"), ("q", "quit")]),
+             ("b", "toggle Hebrew order (logical/visual)"),
+             ("v", "thread order: newest / oldest message first (saved)"), ("?", "this help"), ("q", "quit")]),
 ]
 
 
 class HelpScreen(ModalScreen):
     BINDINGS = [Binding("escape,question_mark,q", "close", "Close")]
 
+    def __init__(self, extra=None):
+        """`extra` is a list of (key, label) for the `actions:` of inbox.yaml."""
+        super().__init__()
+        self.extra = list(extra or [])
+
     def compose(self) -> ComposeResult:
         t = Text()
-        for title, rows in HELP:
+        sections = list(HELP)
+        if self.extra:
+            sections.insert(-2, ("Custom actions (actions: in inbox.yaml)", (
+                [(k, f"{label}: pick, confirm, then wait out the 5 s undo window")
+                 for k, label in self.extra])))
+        for title, rows in sections:
             t.append(f"{title}\n", Style(bold=True, underline=True))
             for k, d in rows:
                 t.append(f"  {k:<16}", Style(bold=True))

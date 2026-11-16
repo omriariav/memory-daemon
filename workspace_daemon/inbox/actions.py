@@ -9,6 +9,10 @@ phase 2 `act` call has one place to plug in (see docs/inbox.md).
 through the Claude bridge) and `save` (a configured command). Both run only
 after the confirm modal and the undo window, in a worker thread.
 
+0.5.0 adds the generic `actions:` hook (`action_choices`, `action_prepare`,
+`run_action`; see customactions.py) and lets a successful save or action run
+mark the item done (`save_mark_done`, `action_mark_done`).
+
 0.4.0 adds two read-only calls: `fetch_context` (the configured context
 command) and `summarize` (one no-tools bridge call, cached on disk). Neither
 changes anything outside the inbox's own state files, so neither confirms.
@@ -17,7 +21,7 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 
-from . import context, invites, items, writes
+from . import context, customactions, invites, items, writes
 from . import summary as summary_mod
 from .models import to_v1
 
@@ -50,11 +54,13 @@ class LocalActions:
 
     def __init__(self, store, opener=None, rsvp=None, save=None,
                  base_dir=None, call_tools=None, context=None, summary=None,
-                 complete=None):
+                 complete=None, actions=None):
         """`rsvp`, `save`, `context` and `summary` are the validated settings
-        blocks (None: not configured). `call_tools` and `complete` replace
-        the Claude bridge's two entry points (tests)."""
+        blocks (None: not configured); `actions` the validated list.
+        `call_tools` and `complete` replace the Claude bridge's two entry
+        points (tests)."""
         self.store = store
+        self.custom_actions = list(actions or [])
         self._open = opener or webbrowser.open
         self.rsvp_cfg, self.save_cfg = rsvp, save
         self.context_cfg, self.summary_cfg = context, summary
@@ -73,8 +79,48 @@ class LocalActions:
         return self.save_cfg is not None
 
     @property
+    def save_mark_done(self):
+        """A successful save marks the item done (`save: {mark_done}`)."""
+        return bool(self.save_cfg is None or self.save_cfg.get("mark_done", True))
+
+    @property
     def context_configured(self):
         return self.context_cfg is not None
+
+    def _action(self, name):
+        return next((a for a in self.custom_actions if a["label"] == name),
+                    None)
+
+    def action_mark_done(self, name):
+        """Whether a successful run of the action marks the item done."""
+        cfg = self._action(name)
+        return bool(cfg is None or cfg.get("mark_done", True))
+
+    def action_choices(self, name, item, cancel=None):
+        """The choices of an action for `item` (read-only). Blocks: call from
+        a worker. A `customactions.Choices`."""
+        cfg = self._action(name)
+        if cfg is None:
+            return customactions.Choices(False, [], "Unknown action")
+        return customactions.run_choices(cfg, to_v1(item), cancel=cancel)
+
+    def action_prepare(self, name, item, choice, cancel=None):
+        """The confirmation rows for one choice (read-only; may take a while
+        as the command reads fresh data). A `customactions.Prepared`."""
+        cfg = self._action(name)
+        if cfg is None:
+            return customactions.Prepared(False, [], "", "Unknown action",
+                                          False)
+        return customactions.run_prepare(cfg, to_v1(item), choice,
+                                         cancel=cancel)
+
+    def run_action(self, name, item, choice, state):
+        """Do the action once (never retried). A `Result`."""
+        cfg = self._action(name)
+        if cfg is None:
+            return Result(False, "Unknown action")
+        out = customactions.run_run(cfg, to_v1(item), choice, state)
+        return Result(out.ok, out.message)
 
     @property
     def summary_configured(self):
@@ -211,7 +257,35 @@ class FakeActions:
     summary_configured = True
     context_delay: float = 0.3
     summary_delay: float = 0.6
+    action_delay: float = 0.3
+    save_mark_done = True
+    custom_actions: list = field(default_factory=lambda: [
+        {"key": "p", "label": "Add to agenda", "argv": ["demo"],
+         "timeout_s": 60.0, "mark_done": True}])
     _summaries: dict = field(default_factory=dict)
+
+    def action_mark_done(self, name):
+        return next((a.get("mark_done", True) for a in self.custom_actions
+                     if a["label"] == name), True)
+
+    def action_choices(self, name, item, cancel=None):
+        time.sleep(self.action_delay)
+        self.calls.append(("choices", name, item.key))
+        return customactions.Choices(True, [
+            {"id": "demo-1", "label": "Example Person",
+             "detail": "invented demo agenda"},
+            {"id": "demo-2", "label": "Another Person", "detail": ""}], None)
+
+    def action_prepare(self, name, item, choice, cancel=None):
+        time.sleep(self.action_delay)
+        self.calls.append(("prepare", name, item.key, choice))
+        return customactions.Prepared(True, [
+            ("Agenda", "Example Person"), ("Add", item.gist)],
+            "demo-state", None, False)
+
+    def run_action(self, name, item, choice, state):
+        self.calls.append(("run", name, item.key, choice, state))
+        return Result(True, "would add to the agenda")
 
     def summary_key(self, item):
         return item.key

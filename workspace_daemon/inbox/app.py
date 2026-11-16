@@ -15,15 +15,15 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Input, Static, TextArea
 
-from . import bidi, invites, themes
+from . import bidi, customactions, invites, themes
 from . import context as ctxmod
 from . import summary as summod
 from .actions import Result
 from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
                      copy_item_text, copy_section_markdown, copy_section_text,
                      from_v1)
-from .screens import (AuditScreen, ConfirmSend, ConfirmWrite, HelpScreen,
-                      SavedScreen, SnoozePicker)
+from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
+                      ConfirmWrite, HelpScreen, SavedScreen, SnoozePicker)
 from .sources import SourceResult, merge
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HintBar, Queue,
@@ -45,7 +45,7 @@ RSVP_KEYS = {
 }
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
-EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save")
+EXTERNAL_KINDS = ("send", "nudge", "rsvp", "save", "action")
 
 
 class _SavedUnit:
@@ -68,7 +68,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | done | ack | snooze | rsvp | save
+    kind: str                 # send | nudge | done | ack | snooze | rsvp | save | action
     item: Item
     text: str = ""
     until: float = 0.0
@@ -79,6 +79,10 @@ class Pending:
     answer: str = ""          # rsvp: the word sent (accepted, declined, tentative)
     force: bool = False       # save: "save anyway" after a duplicate answer
     hide: bool = True         # False: the item stays listed while it waits (save)
+    name: str = ""            # action: the label of the actions: entry
+    choice: str = ""          # action: the id of the chosen choice
+    state: str = ""           # action: the opaque state prepare returned
+    mark_done: bool = False   # action: a successful run marks the item done
 
 
 class InboxApp(App):
@@ -98,6 +102,7 @@ class InboxApp(App):
         Binding("n", "nudge", show=False), Binding("o", "open", show=False),
         Binding("r", "refresh", show=False), Binding("u", "undo", show=False),
         Binding("L", "audit", show=False), Binding("b", "toggle_bidi", show=False),
+        Binding("v", "toggle_thread_order", show=False),
         Binding("y", "copy_item", show=False), Binding("Y", "copy_section", show=False),
         Binding("R", "toggle_resolved", show=False),
         Binding("X", "rsvp_decline", show=False), Binding("T", "rsvp_tentative", show=False),
@@ -140,15 +145,22 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen, ActionBusy, ChoicePicker { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
-    #confirm-text { border: round $panel; padding: 0 1; margin: 1 0; background: $background; }
+    #confirm-scroll { height: auto; max-height: 16; margin: 1 0; border: round $panel; background: $background; scrollbar-size-vertical: 1; }
+    #confirm-text { border: none; padding: 0 1; margin: 0; background: $background; height: auto; }
+    ConfirmSend #confirm-text { border: round $panel; margin: 1 0; }
     #confirm-buttons { height: 3; align-horizontal: right; }
     #confirm-buttons Button { margin-left: 2; min-width: 18; }
     #snooze { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #snooze-list { height: 6; background: transparent; border: none; }
     #snooze-hint { margin-top: 1; color: $text-muted; }
+    #picker { width: 70; max-width: 94%; height: auto; max-height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #picker-list { height: auto; max-height: 16; background: transparent; border: none; }
+    #picker-hint { margin-top: 1; color: $text-muted; }
+    #actbusy { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
+    #actbusy-hint { margin-top: 1; color: $text-muted; }
     #help { width: 66; max-width: 94%; height: auto; max-height: 94%; overflow-y: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
@@ -211,6 +223,9 @@ class InboxApp(App):
         self.busy = 0
         self.polling = False
         mode = bidi.resolve(bidi.configured_mode(settings["bidi_mode"]))
+        saved_order = store.get_pref("thread_order") \
+            if hasattr(store, "get_pref") else None
+        self.thread_order = saved_order or settings.get("thread_order", "newest")
         self.bidi_fallback = mode == "visual" and not bidi.available()
         self.bidi_mode = "logical" if self.bidi_fallback else mode
         self.pending = []
@@ -240,6 +255,12 @@ class InboxApp(App):
         self._ctx_pending = []             # items waiting for a fetch slot
         self._ctx_sig = None               # what the pane last drew
         self._cancel = threading.Event()   # set on quit: stops context commands
+        self._custom = list(getattr(actions, "custom_actions", None) or [])
+        self._act_op = None                # the running choices/prepare lookup
+        self._act_gen = 0                  # bumped on every lookup
+        self._act_screen = None            # the "looking up" modal
+        for n, cfg in enumerate(self._custom):
+            self.bind(cfg["key"], f"custom_action({n})", show=False)
 
     @property
     def bidi(self):
@@ -451,7 +472,9 @@ class InboxApp(App):
         self.context_sync()
 
     def show_thread_only(self):
-        self.query_one("#thread", ThreadView).show(self.current, self.pal, time.time(), self.bidi)
+        self.query_one("#thread", ThreadView).show(
+            self.current, self.pal, time.time(), self.bidi,
+            self.thread_order == "newest")
 
     def show_item(self):
         self.show_thread_only()
@@ -476,6 +499,9 @@ class InboxApp(App):
             extra.append(("c", "context"))
         if self._sum_on():
             extra.append(("i", "summary"))
+        if self.current is not None:
+            extra.append(("v", "order"))
+            extra.extend((c["key"], c["label"][:16]) for c in self._custom)
         if extra and hints and hints[-1] == ("?", "help"):
             return hints[:-1] + extra + hints[-1:]
         return hints
@@ -531,8 +557,11 @@ class InboxApp(App):
     # ---------- queue events ----------
     def on_option_list_option_highlighted(self, e):
         if e.option_list.id == "queue":
-            self.sync_current()
-            self.update_hints()
+            try:
+                self.sync_current()
+                self.update_hints()
+            except NoMatches:   # a highlight message that outlived the screen
+                pass
 
     # ---------- draft pane ----------
     def draft_text(self, it, text, streaming):
@@ -743,6 +772,9 @@ class InboxApp(App):
         self.refilter(redraw=False)       # the pending item is already listed
         after = self.visible()
         keep = after[min(pos, len(after) - 1)].key if after else None
+        if (self.current_key not in (None, it.key)
+                and any(i.key == self.current_key for i in after)):
+            keep = self.current_key   # a late mark must not move the cursor
         self.current_key = keep
         if self.leave_s > 0:
             self.redraw(keep=keep, ghost=it, ghost_at=ghost_at)
@@ -751,9 +783,11 @@ class InboxApp(App):
             self.redraw(keep=keep)
 
     def _enqueue(self, kind, it, toast, text="", until=0.0, detail="",
-                 answer="", hide=True, force=False):
+                 answer="", hide=True, force=False, name="", choice="",
+                 state="", mark_done=False):
         p = Pending(kind=kind, item=it, text=text, until=until, label=toast,
-                    answer=answer, hide=hide, force=force)
+                    answer=answer, hide=hide, force=force, name=name,
+                    choice=choice, state=state, mark_done=mark_done)
         p.audit = self.record(kind, it, detail, "queued")
         self.pending.append(p)
         if hide:
@@ -797,6 +831,8 @@ class InboxApp(App):
             return a.rsvp(it, p.answer)
         if p.kind == "save":
             return a.save(it, force=True) if p.force else a.save(it)
+        if p.kind == "action":
+            return a.run_action(p.name, it, p.choice, p.state)
         return a.snooze(it, p.until)
 
     def _run_in_thread(self, p):
@@ -806,6 +842,10 @@ class InboxApp(App):
             res = Result(False, f"{type(exc).__name__}: {exc}")
         if self._quitting:
             return  # the app is gone; the mark (if any) is already written
+        if p.kind == "action":
+            # An action may run for a long time: never wait on the UI loop.
+            self._post(self._committed, p, res)
+            return
         try:
             self.call_from_thread(self._committed, p, res)
         except Exception:  # the app quit between the check and the call
@@ -830,7 +870,7 @@ class InboxApp(App):
         elif not res.ok:
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
-            self.notify(f"{p.kind} failed: {res.detail}", severity="error", timeout=6, markup=False)
+            self.notify(f"{p.name or p.kind} failed: {res.detail}", severity="error", timeout=6, markup=False)
         elif p.kind == "rsvp":
             self.refilter()
             self.notify(f"{res.detail}: {p.item.gist}", title="RSVP sent", timeout=5, markup=False)
@@ -839,9 +879,31 @@ class InboxApp(App):
             self.redraw()
             self.notify(f"{res.detail}: {p.item.who}", timeout=5, markup=False,
                         title="Already in memory" if res.duplicate else "Saved to memory")
+            if getattr(self.actions, "save_mark_done", False):
+                self._auto_done(p.item, "after save")
+        elif p.kind == "action":
+            self.refilter(redraw=False)
+            self.redraw()
+            self.notify(f"{res.detail}: {p.item.who}", title=p.name,
+                        timeout=5, markup=False)
+            if p.mark_done:
+                self._auto_done(p.item, f"after {p.name}")
         elif p.kind in ("send", "nudge"):
             self.notify(f"{res.detail or 'would send'}  ->  {p.item.destination}",
                         title="Demo", timeout=4, markup=False)
+
+    def _auto_done(self, it, why):
+        """Mark a handled item done the way `d` does (store mark, audit, the
+        5 s undo), unless it is already hidden, already being marked, or no
+        longer listed."""
+        if self._quitting or self.store.is_hidden(it.key, time.time(), it.meta):
+            return
+        if any(p.item.key == it.key and p.hide and not p.done
+               for p in self.pending):
+            return
+        if not any(i.key == it.key for i in self.items):
+            return
+        self._enqueue("done", it, f"Done: {it.who}", detail=why)
 
     def action_undo(self):
         p = next((x for x in reversed(self.pending) if not x.done), None)
@@ -1000,6 +1062,131 @@ class InboxApp(App):
         self.push_screen(ConfirmWrite("Save to memory", rows, "Save",
                                       "The item is passed to your save command as JSON on stdin.",
                                       self.bidi), after)
+
+    # ---------- custom actions (the `actions:` of inbox.yaml) ----------
+    def action_custom_action(self, index):
+        """The key of an `actions:` entry: look up the choices (read-only),
+        pick one, prepare (read-only, a fresh read), confirm, wait out the undo
+        window, then run once."""
+        if not 0 <= index < len(self._custom):
+            return
+        cfg = self._custom[index]
+        it = self.current
+        if it is None:
+            self.notify("Nothing selected", timeout=2, markup=False)
+            return
+        if self._act_op is not None:
+            self.notify("An action lookup is already running", timeout=2,
+                        markup=False)
+            return
+        if any(p.kind == "action" and p.item.key == it.key and not p.done
+               for p in self.pending) or any(
+                p.kind == "action" and p.item.key == it.key
+                for p in self.running):
+            self.notify("action already in progress", timeout=2, markup=False)
+            return
+        self._act_begin("choices", cfg, it, None)
+
+    def _act_begin(self, phase, cfg, it, choice):
+        """Start a read-only lookup in a thread and show the busy modal."""
+        self._act_gen += 1
+        gen = self._act_gen
+        cancel = threading.Event()
+        self._act_op = {"gen": gen, "cancel": cancel}
+        what = ("Looking up choices…" if phase == "choices"
+                else "Preparing (reading fresh data)…")
+        self._act_screen = ActionBusy(cfg["label"], what,
+                                      lambda: self._act_cancel(gen))
+        self.push_screen(self._act_screen)
+        self.busy += 1
+        # Not a daemon thread: the command is stopped (SIGTERM, then SIGKILL)
+        # when the lookup is cancelled or the app quits, so it ends.
+        threading.Thread(target=self._act_thread,
+                         args=(phase, cfg, it, choice, gen, cancel),
+                         name=f"inbox-action-{phase}").start()
+
+    def _act_cancel(self, gen):
+        op = self._act_op
+        if op is not None and op["gen"] == gen:
+            op["cancel"].set()
+            self._act_op = None
+            self._act_screen = None
+            self.notify("Cancelled. Nothing changed.", timeout=2, markup=False)
+
+    def _act_thread(self, phase, cfg, it, choice, gen, cancel):
+        name = cfg["label"]
+        try:
+            if phase == "choices":
+                out = self.actions.action_choices(name, it, cancel=cancel)
+            else:
+                out = self.actions.action_prepare(name, it, choice["id"],
+                                                  cancel=cancel)
+        except Exception as exc:  # a backend bug must not end the session
+            why = f"cannot run: {type(exc).__name__}"
+            out = (customactions.Choices(False, [], why) if phase == "choices"
+                   else customactions.Prepared(False, [], "", why, False))
+        if self._quitting:
+            return
+        self._post(self._act_result, phase, cfg, it, choice, gen, out)
+
+    def _act_close_busy(self):
+        screen, self._act_screen = self._act_screen, None
+        if screen is not None and self.screen is screen:
+            self.pop_screen()
+
+    def _act_result(self, phase, cfg, it, choice, gen, out):
+        """UI thread: a lookup finished. A cancelled one is dropped."""
+        self.busy = max(0, self.busy - 1)
+        if self._act_op is None or self._act_op["gen"] != gen:
+            return
+        self._act_op = None
+        self._act_close_busy()
+        name = cfg["label"]
+        if phase == "choices":
+            if not out.ok:
+                self.record("action", it, f"{name}: {out.message}", "failed")
+                self.notify(f"{name}: {out.message}", severity="warning",
+                            timeout=5, markup=False)
+                return
+
+            def picked(chosen):
+                if chosen is None:
+                    self.notify("Cancelled. Nothing changed.", timeout=2,
+                                markup=False)
+                    return
+                self._act_begin("prepare", cfg, it, chosen)
+            self.push_screen(ChoicePicker(name, out.choices, self.bidi), picked)
+            return
+        if out.duplicate:       # checked before ok: not an error
+            msg = out.message or "Nothing to add"
+            self.record("action", it, f"{name}: {msg}", "duplicate")
+            self.notify(msg, title="Already there", timeout=5, markup=False)
+            return
+        if not out.ok:
+            msg = out.message or "failed"
+            self.record("action", it, f"{name}: {msg}", "failed")
+            self.notify(f"{name}: {msg}", severity="error", timeout=6,
+                        markup=False)
+            return
+        rows = list(out.rows) or [("Action", name), ("From", it.who)]
+        detail = f"{name}: {choice['label']}"
+
+        def after(ok):
+            if ok:
+                self._enqueue(
+                    "action", it, f"{name}: {it.who}", hide=False,
+                    detail=detail, name=name, choice=choice["id"],
+                    state=out.state,
+                    mark_done=bool(self.actions.action_mark_done(name)))
+            else:
+                self.record("action", it, f"{detail}: cancelled at confirm",
+                            "cancelled")
+                self.notify("Cancelled. Nothing changed.", timeout=2,
+                            markup=False)
+        self.push_screen(ConfirmWrite(
+            name, rows, "Confirm",
+            "The item is passed to your action command as JSON on stdin.",
+            self.bidi), after)
 
     def action_done(self):
         it = self.current
@@ -1464,7 +1651,8 @@ class InboxApp(App):
         self.push_screen(AuditScreen(self.audit))
 
     def action_help(self):
-        self.push_screen(HelpScreen())
+        self.push_screen(HelpScreen(
+            [(c["key"], c["label"]) for c in self._custom]))
 
     def action_toggle_theme(self):
         dark = self.theme == themes.theme_id("dark")
@@ -1479,6 +1667,20 @@ class InboxApp(App):
         self.screen.clear_selection()  # it was made on the other text order
         self.notify(f"Hebrew order: {self.bidi_mode}", timeout=2, markup=False)
         self.items_redraw_all()
+
+    def action_toggle_thread_order(self):
+        """v: the thread pane lists the newest message first, or the oldest.
+        Saved in the inbox state, so a restart keeps it. The queue is not
+        affected."""
+        self.thread_order = "oldest" if self.thread_order == "newest" else "newest"
+        try:
+            self.store.set_pref("thread_order", self.thread_order)
+        except (OSError, ValueError) as exc:
+            self.notify(f"Order not saved: {getattr(exc, 'strerror', None) or exc}",
+                        severity="warning", timeout=4, markup=False)
+        self.show_thread_only()
+        self.notify(f"Thread order: {self.thread_order} first", timeout=2,
+                    markup=False)
 
     def items_redraw_all(self):
         """Re-render every widget that shows text (queue, thread, draft, header)."""
@@ -1520,6 +1722,8 @@ class InboxApp(App):
                 p.audit["status"] = "committed" if res.ok else "failed"
         self._quitting = True
         self._cancel.set()      # context commands get SIGTERM and wind down
+        if self._act_op is not None:   # a choices/prepare lookup: read-only
+            self._act_op["cancel"].set()
         self._ctx_pending = []
         parts = []
         if cancelled:
@@ -1747,9 +1951,13 @@ class InboxApp(App):
             ("Toggle dark/light theme", "ctrl+t", self.action_toggle_theme),
             ("Show audit log", "Every action with its time", self.action_audit),
             ("Toggle Hebrew order", "logical / visual (python-bidi)", self.action_toggle_bidi),
+            ("Toggle thread order", "v: newest or oldest message first in the thread pane", self.action_toggle_thread_order),
             ("Filter queue", "Fuzzy filter", self.action_filter),
             ("Keyboard help", "?", self.action_help),
         ] + [(f"Jump to {t}", f"key {n}", (lambda n=n: self.action_section(n)))
              for n, (_k, t) in enumerate(SECTIONS, 1)]
+        cmds += [(c["label"], f"{c['key']}: custom action (actions: in inbox.yaml)",
+                  (lambda n=n: self.action_custom_action(n)))
+                 for n, c in enumerate(self._custom)]
         for title, helptext, cb in cmds:
             yield SystemCommand(title, helptext, cb)
