@@ -51,7 +51,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act` |
+| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act`. One optional key is read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -90,7 +90,7 @@ the duplicate check.
 and prints one JSON object on stdout:
 
 ```json
-{"ok": true, "message": "Saved to Personal Memory", "memory_id": "m-123", "duplicate": false}
+{"ok": true, "message": "Saved to your memory", "memory_id": "m-123", "duplicate": false}
 ```
 
 | Field | Type | Rule |
@@ -98,11 +98,12 @@ and prints one JSON object on stdout:
 | `ok` | bool | required; `false` is a failure and the inbox shows `message` |
 | `message` | string | required; shown in the toast and the audit log (one line, cleaned) |
 | `memory_id` | string or null | optional (null when left out), up to 200 chars |
-| `duplicate` | bool | optional (false when left out). `ok: true` with `true`: already saved, the toast says so. `ok: false` with `true`: a likely duplicate, see below |
+| `duplicate` | bool | optional (false when left out). `ok: true` with `true`: already in memory, unchanged; this is a success (the toast says "Already in memory", the row gets the saved mark). `ok: false` with `true`: a likely duplicate, see below |
 | `candidate` | object or null | optional, only read with `ok: false` and `duplicate: true`: `{"id": str, "title": str, "score": number}` (any part may be left out), the memory the item looks like |
 
 **Likely duplicate.** A reply with `"ok": false, "duplicate": true` is not an
-error. The inbox shows `message` and the candidate in a "Possible duplicate"
+error. Its `memory_id` is null (nothing was saved); the existing memory's id is
+`candidate.id`. The inbox shows `message` and the candidate in a "Possible duplicate"
 modal (Cancel focused) offering "Save anyway". Cancel saves nothing and adds no
 mark. Confirm waits out the undo window again, then resends the same stdin with
 `"force": true` added. If that forced call still answers `ok: false` it is

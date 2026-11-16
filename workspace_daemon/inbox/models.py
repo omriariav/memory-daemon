@@ -93,6 +93,19 @@ def from_v1(raw):
     )
 
 
+THREAD_NOTE_MAX = 200
+
+
+def thread_note(item):
+    """The optional `meta.thread_note`: one cleaned line of up to 200
+    characters, or "" (absent, not a string, or blank after cleaning)."""
+    from .items import clean_line, truncate
+    note = item.meta.get("thread_note") if isinstance(item.meta, dict) else None
+    if not isinstance(note, str):
+        return ""
+    return truncate(clean_line(note), THREAD_NOTE_MAX)
+
+
 def to_v1(item):
     """The v1 dict of an item: the validated one it was built from, else a
     rebuild from its fields (an item made by the UI itself)."""

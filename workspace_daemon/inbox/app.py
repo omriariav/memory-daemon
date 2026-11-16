@@ -770,7 +770,8 @@ class InboxApp(App):
         elif p.kind == "save":
             self.refilter(redraw=False)
             self.redraw()
-            self.notify(f"{res.detail}: {p.item.who}", title="Saved to memory", timeout=5, markup=False)
+            self.notify(f"{res.detail}: {p.item.who}", timeout=5, markup=False,
+                        title="Already in memory" if res.duplicate else "Saved to memory")
         elif p.kind in ("send", "nudge"):
             self.notify(f"{res.detail or 'would send'}  ->  {p.item.destination}",
                         title="Demo", timeout=4, markup=False)

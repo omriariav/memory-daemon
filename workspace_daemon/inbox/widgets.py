@@ -11,7 +11,7 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
-from .models import SECTIONS, SOURCES
+from .models import SECTIONS, SOURCES, thread_note
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item saved to memory
@@ -208,7 +208,12 @@ class ThreadView(VerticalScroll):
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
         out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
-        if not item.messages:
+        note = thread_note(item)
+        if note:  # one dim line above the thread; alone when the thread is empty
+            out.append(vis(note, visual) + "\n", Style(color=pal["muted"], dim=True))
+            if item.messages:
+                out.append("\n")
+        elif not item.messages:
             out.append(vis(item.gist, visual) + "\n", Style(color=pal["fg"]))
         for m in item.messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")

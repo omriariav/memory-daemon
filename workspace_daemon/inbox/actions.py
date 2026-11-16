@@ -21,7 +21,8 @@ from .models import to_v1
 class Result:
     ok: bool = True
     detail: str = ""
-    duplicate: bool = False   # save: a likely duplicate, not an error
+    # save: with ok False a likely duplicate (ask), with ok True "already in memory"
+    duplicate: bool = False
     candidate: dict = None    # save: the memory it looks like
 
 
@@ -70,8 +71,8 @@ class LocalActions:
             self.store.rsvp(item.key, answer)
         except OSError as exc:
             return Result(True, f"{out.detail}; local mark failed: "
-                                f"{exc.strerror or exc}")
-        return Result(True, out.detail)
+                                f"{exc.strerror or exc}", duplicate=out.duplicate)
+        return Result(True, out.detail, duplicate=out.duplicate)
 
     def save(self, item, force=False):
         """Save the item to memory through the configured command. The item
@@ -87,8 +88,8 @@ class LocalActions:
             self.store.mark_saved(item.key)
         except OSError as exc:
             return Result(True, f"{out.detail}; local mark failed: "
-                                f"{exc.strerror or exc}")
-        return Result(True, out.detail)
+                                f"{exc.strerror or exc}", duplicate=out.duplicate)
+        return Result(True, out.detail, duplicate=out.duplicate)
 
     def draft(self, item):
         return item.draft

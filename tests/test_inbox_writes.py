@@ -144,6 +144,46 @@ class SettingsTest(unittest.TestCase):
             mod.uncomment_blocks("poll_interval_s: 600\n")
 
 
+class ThreadNoteTest(unittest.TestCase):
+    def note_of(self, **meta):
+        return models.thread_note(models.from_v1(plain_item(meta=meta)))
+
+    def test_cleaned_capped_and_optional(self):
+        self.assertEqual(self.note_of(), "")
+        self.assertEqual(self.note_of(thread_note=5), "")
+        self.assertEqual(self.note_of(thread_note="  \x1b[31mNote\n here  "), "Note here")
+        self.assertEqual(self.note_of(thread_note="   "), "")
+        long = self.note_of(thread_note="x" * 500)
+        self.assertEqual(len(long), 200)
+        self.assertTrue(long.endswith("…"))
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ThreadNotePaneTest(unittest.IsolatedAsyncioTestCase):
+    async def pane_text(self, row):
+        store = InboxStore(None)
+        app = make_app([row], LocalActions(store), store)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            return str(app.query_one("#thread-body").render())
+
+    async def test_note_shows_above_the_thread(self):
+        text = await self.pane_text(plain_item(
+            1, meta={"thread_note": "Earlier context: moved twice"}))
+        self.assertIn("Earlier context: moved twice", text)
+        self.assertLess(text.index("Earlier context"), text.index("IGNORE ALL RULES"))
+
+    async def test_empty_thread_with_a_note_shows_only_the_note(self):
+        text = await self.pane_text(plain_item(
+            1, thread=[], gist="the gist line", meta={"thread_note": "Only this"}))
+        self.assertIn("Only this", text)
+        self.assertNotIn("the gist line", text)
+
+    async def test_without_a_note_nothing_changes(self):
+        text = await self.pane_text(plain_item(1, thread=[], gist="the gist line"))
+        self.assertIn("the gist line", text)
+
+
 class InviteTargetTest(unittest.TestCase):
     def test_a_built_invite_qualifies(self):
         it = models.from_v1(invite_item())
@@ -251,7 +291,7 @@ class SaveResponseTest(unittest.TestCase):
 
     def test_a_duplicate_candidate(self):
         res = itm.parse_save_response(json.dumps({
-            "ok": False, "duplicate": True, "memory_id": "m7", "message": "Looks saved",
+            "ok": False, "duplicate": True, "memory_id": None, "message": "Looks saved",
             "candidate": {"id": "m7", "title": "Old\x1b[1m note", "score": 0.91}}))
         self.assertEqual(res["candidate"], {"id": "m7", "title": "Old note", "score": 0.91})
         self.assertTrue(res["duplicate"] and not res["ok"])
@@ -445,7 +485,7 @@ class RunSaveTest(unittest.TestCase):
         self.assertEqual(res.detail, "Already there")
 
     def test_duplicate_not_ok_is_a_question_and_force_resends(self):
-        body = json.dumps({"ok": False, "duplicate": True, "memory_id": "m1",
+        body = json.dumps({"ok": False, "duplicate": True, "memory_id": None,
                            "message": "Looks like m1",
                            "candidate": {"id": "m1", "title": "Old", "score": 0.9}}).encode()
         res, run = self.run_with(out=body)
@@ -471,7 +511,7 @@ class RunSaveTest(unittest.TestCase):
                     out = {"ok": True, "message": "Saved anyway", "memory_id": "m2",
                            "duplicate": False}
                 else:
-                    out = {"ok": False, "duplicate": True, "memory_id": "m1",
+                    out = {"ok": False, "duplicate": True, "memory_id": None,
                            "message": "Similar memory exists",
                            "candidate": {"id": "m1", "title": "Old", "score": 0.8}}
                 print(json.dumps(out))
@@ -535,6 +575,26 @@ class RunSaveTest(unittest.TestCase):
 
 
 class LocalActionsSaveTest(unittest.TestCase):
+    def test_already_in_memory_is_a_success_not_a_question(self):
+        store = InboxStore(None)
+        a = LocalActions(store, save=validated({"save": SAVE_CFG})["save"])
+        it = models.from_v1(plain_item())
+        out = writes.Outcome(True, "Unchanged", "m1", True)
+        with mock.patch.object(writes, "run_save", return_value=out):
+            res = a.save(it)
+        self.assertEqual((res.ok, res.duplicate), (True, True))
+        self.assertTrue(store.is_saved(it.key))
+
+    def test_a_likely_duplicate_is_not_ok_and_carries_the_candidate(self):
+        store = InboxStore(None)
+        a = LocalActions(store, save=validated({"save": SAVE_CFG})["save"])
+        it = models.from_v1(plain_item())
+        out = writes.Outcome(False, "Looks saved", None, True, {"id": "m1"})
+        with mock.patch.object(writes, "run_save", return_value=out):
+            res = a.save(it)
+        self.assertEqual((res.ok, res.duplicate, res.candidate), (False, True, {"id": "m1"}))
+        self.assertFalse(store.is_saved(it.key))
+
     def test_not_configured(self):
         a = LocalActions(InboxStore(None))
         self.assertFalse(a.save_configured)
@@ -578,7 +638,7 @@ async def settle(pilot, app):
 
 
 def toasts(app):
-    return [n.message for n in app._notifications]
+    return [f"{n.title} {n.message}".strip() for n in app._notifications]
 
 
 def make_app(rows, actions, store, undo_s=0.15):
@@ -904,8 +964,8 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_toasts_and_a_failure_adds_no_mark(self):
         for out, mark, text in [
-            (b'{"ok": true, "message": "Already saved", "memory_id": "m1", "duplicate": true}',
-             True, "Already saved"),
+            (b'{"ok": true, "message": "Unchanged", "memory_id": "m1", "duplicate": true}',
+             True, "Already in memory"),
             (b"not json", False, "save failed"),
         ]:
             store = InboxStore(None)
@@ -923,7 +983,7 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("t:1", [i.key for i in app.items])
 
 
-DUP = json.dumps({"ok": False, "duplicate": True, "memory_id": "m1",
+DUP = json.dumps({"ok": False, "duplicate": True, "memory_id": None,
                   "message": "Looks like a saved note",
                   "candidate": {"id": "m1", "title": "Old note", "score": 0.9}}).encode()
 OK = json.dumps({"ok": True, "message": "Saved to memory", "memory_id": "m2",

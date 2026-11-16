@@ -37,9 +37,14 @@ window cancels them.
   `timeout_s`. Without it `m` says "Save not configured". Same process-group,
   timeout and output-cap handling as command sources; item text reaches the
   command only as JSON on stdin. A command may answer `ok: false` with
-  `duplicate: true` (and a `candidate`): the inbox then asks "Save anyway"
+  `duplicate: true` (and a `candidate`; `memory_id` is null, the existing
+  memory is `candidate.id`): the inbox then asks "Save anyway"
   (Cancel focused) and, once confirmed, resends the same payload with
-  `"force": true`. The protocol is in docs/inbox.md.
+  `"force": true`. `ok: true` with `duplicate: true` is a success, shown as
+  "Already in memory". The protocol is in docs/inbox.md.
+- Optional `meta.thread_note` (string): the thread pane shows it as one dim
+  line above the thread (cleaned to one line, cut at 200 characters); with an
+  empty thread it is all the pane shows. Documented in the item format.
 - Footer, help overlay and command palette list the new keys.
 - `--demo` has an invite row and fake RSVP and save backends.
 

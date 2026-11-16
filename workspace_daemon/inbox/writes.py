@@ -123,7 +123,7 @@ def run_save(cfg, item, force=False):
     except itm.ItemError as exc:
         return Outcome(False, f"bad response: {exc}")
     detail = res["message"] or (
-        "Already saved" if res["duplicate"] else
+        "Already in memory" if res["duplicate"] else
         "Saved" if res["ok"] else "the save command reported a failure")
     return Outcome(res["ok"], detail, res["memory_id"], res["duplicate"],
                    res["candidate"])
