@@ -1832,6 +1832,38 @@ class CaptureEventsTest(unittest.TestCase):
                 "gmail_labels": ["INBOX", "Save", "Zeta"],
                 "saved_request": True})
 
+    def test_mail_capture_records_display_fields_without_a_body_or_address(self):
+        self.setUp_labels()
+        self.item["id"] = "gmail:t1"
+        self.item["body"] = "SECRET BODY TEXT that must never be an event field"
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "gmail_thread_id": "18c0ffee12345678",
+            "email_from": "Ann Example <ann@example.com>",
+            "email_subject": "Quarterly plan",
+            "gmail_snippet": "A short snippet from Gmail", "gmail_labels": []}
+        row = self._capture()[-1]
+        self.assertEqual(row["details"], {
+            "mail_from": "Ann Example", "mail_subject": "Quarterly plan",
+            "mail_snippet": "A short snippet from Gmail",
+            "mail_thread_id": "18c0ffee12345678"})
+        self.assertNotIn("SECRET BODY", json.dumps(row))
+        self.assertNotIn("@", json.dumps(row["details"]))
+
+    def test_mail_capture_leaves_out_a_field_the_source_did_not_give(self):
+        self.setUp_labels()
+        self.item["id"] = "gmail:t1"
+        self.item["frontmatter"] = {
+            "gmail_message_id": "m1", "email_from": "ann@example.com",
+            "email_subject": "Only a subject"}
+        row = self._capture()[-1]
+        self.assertEqual(row["details"], {"mail_subject": "Only a subject"})
+
+    def test_a_non_mail_capture_has_no_mail_fields(self):
+        row = self._capture()[-1]
+        for key in ("mail_from", "mail_subject", "mail_snippet",
+                    "mail_thread_id"):
+            self.assertNotIn(key, row.get("details") or {})
+
     def test_unresolved_label_id_is_dropped(self):
         self.setUp_labels()
         self._catalog({"Label_1": "Save"})
@@ -1858,7 +1890,8 @@ class CaptureEventsTest(unittest.TestCase):
         with mock.patch.object(labels.gmail, "user_label_ids",
                                side_effect=RuntimeError("boom")):
             row = self._mail(["Label_5", "INBOX"])
-        self.assertEqual(row["details"], {"gmail_labels": ["INBOX"]})
+        self.assertEqual(row["details"], {"gmail_labels": ["INBOX"],
+                                          "mail_subject": "Quarterly plan"})
 
     def test_user_label_named_like_a_system_label_stays_a_user_label(self):
         self.setUp_labels()
@@ -1893,7 +1926,7 @@ class CaptureEventsTest(unittest.TestCase):
     def test_saved_request_without_labels(self):
         self.assertEqual(
             self._mail([], saved_request=True)["details"],
-            {"saved_request": True})
+            {"saved_request": True, "mail_subject": "Quarterly plan"})
 
     def test_mail_without_labels_or_flag_has_no_details(self):
         self.item["frontmatter"] = {

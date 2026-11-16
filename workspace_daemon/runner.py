@@ -1122,6 +1122,11 @@ def _gmail_fetch(routine, source, candidate):
             "email_subject": subject,
             "email_date": headers.get("date", ""),
             "gmail_labels": gmail_labels,
+            # Gmail's own snippet when the read reports one (for the inbox
+            # row); redacted like the subject. Left out when absent.
+            **({"gmail_snippet": chat_text.redact_secrets(msg["snippet"])}
+               if isinstance(msg.get("snippet"), str)
+               and msg["snippet"].strip() else {}),
             "gmail_manual_chat_followup": manual_chat_followup,
             "gmail_chat_followup_managed": managed_chat_followup,
             "gmail_chat_followup_active": chat_followup_active,

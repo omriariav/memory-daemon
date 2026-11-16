@@ -613,6 +613,21 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertTrue(meta["gmail_chat_followup_active"])
         self.assertEqual(meta["gmail_labels"], ["INBOX", "SENT", "STARRED"])
 
+    def test_gmail_frontmatter_carries_the_snippet_when_the_read_has_one(self):
+        def read(mid, **extra):
+            return dict({
+                "headers": {"subject": "Plan", "from": "Ann <ann@example.com>",
+                            "date": "Sat, 1 Aug 2026 17:00:00 +0000"},
+                "labels": ["INBOX"], "body": "Body."}, **extra)
+        r = routine(self.vault)
+        cand = {"id": "m3", "raw": {"thread_id": "thread-3"}}
+        gmail.read_message = lambda mid: read(mid, snippet="Gmail's own snippet")
+        meta = runner._gmail_fetch(r, r["source"], cand)["frontmatter"]
+        self.assertEqual(meta["gmail_snippet"], "Gmail's own snippet")
+        gmail.read_message = lambda mid: read(mid)
+        meta = runner._gmail_fetch(r, r["source"], cand)["frontmatter"]
+        self.assertNotIn("gmail_snippet", meta)
+
     def test_managed_followup_queue_is_uncapped_and_deduplicated(self):
         calls = []
 

@@ -1867,7 +1867,35 @@ def _gmail_details(meta):
         details["gmail_labels"] = names
     if meta.get("gmail_message_id") and meta.get("saved_request") is True:
         details["saved_request"] = True
+    if meta.get("gmail_message_id"):
+        details.update(_mail_display_details(meta))
     return details
+
+
+def _mail_display_details(meta):
+    """What the inbox shows for a mail capture, all plain text and none of it
+    a body: the sender's display name (never an address), the subject, Gmail's
+    own snippet when the source reported one, and the thread id. A field the
+    source did not provide is left out. The values are cleaned and capped
+    again by events.build."""
+    from . import events  # late import to avoid cycles
+
+    out = {}
+    name = events.display_name(meta.get("email_from"))
+    if name:
+        out["mail_from"] = name
+    subject = events.one_line(meta.get("email_subject"),
+                              events.MAIL_SUBJECT_CHARS)
+    if subject:
+        out["mail_subject"] = subject
+    snippet = events.one_line(meta.get("gmail_snippet"),
+                              events.MAIL_SNIPPET_CHARS)
+    if snippet:
+        out["mail_snippet"] = snippet
+    thread = meta.get("gmail_thread_id")
+    if isinstance(thread, str) and events._MAIL_THREAD_ID.match(thread):
+        out["mail_thread_id"] = thread
+    return out
 
 
 def _capture_details(meta):
