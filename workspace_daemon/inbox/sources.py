@@ -208,7 +208,116 @@ def _mail_from(value):
 
 
 # A memory entry id as a context command may link it (`meta.memory_id`).
-MEMORY_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,200}\Z")
+MEMORY_ID = itm.MEMORY_ID
+
+# The Slack ids of `meta.reply_to` (same patterns as writes.CHANNEL_ID and
+# writes.SLACK_TS, copied: writes imports this module).
+_SLACK_CHANNEL = re.compile(r"\A[CDG][A-Z0-9]{8,12}\Z")
+_SLACK_TS = re.compile(r"\A\d{9,11}\.\d{6}\Z")
+SOURCE_ID_MAX = 300
+
+
+def memory_index(events):
+    """`{source_id: memory_id}` from the daemon's event rows: the memory entry
+    the daemon saved each source item as. The newest row wins; a row counts
+    only with a clean one-line source id and a well-formed memory id."""
+    best = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        sid, mid = event.get("source_id"), event.get("memory_id")
+        if (not isinstance(sid, str) or not sid or len(sid) > SOURCE_ID_MAX
+                or itm.clean_line(sid) != sid
+                or not isinstance(mid, str) or not MEMORY_ID.match(mid)):
+            continue
+        ts = parse_iso(event.get("ts")) or 0.0
+        prev = best.get(sid)
+        if prev is None or ts >= prev[0]:
+            best[sid] = (ts, mid)
+    return {sid: mid for sid, (_ts, mid) in best.items()}
+
+
+def memory_match(meta, index):
+    """`(exact, thread)`: the memory entry an item is saved as, and the entry
+    its Slack thread was saved as (each "" when unknown; never a claim that
+    the item is not saved). `exact`, in order: `meta.memory_id`;
+    `meta.source_id` in the index; for a Slack item with a valid
+    `meta.reply_to`, `slack:<channel>:<thread_ts>:<message_ts>` (a reply the
+    daemon saved) then `slack:<channel>:<message_ts>`. `thread` is
+    `slack:<channel>:<thread_ts>` (the thread root's entry), reported only
+    when there is no exact match: the thread is in memory, this message may
+    not be."""
+    if not isinstance(meta, dict):
+        return "", ""
+    mid = meta.get("memory_id")
+    if isinstance(mid, str) and MEMORY_ID.match(mid):
+        return mid, ""
+    sid = meta.get("source_id")
+    if isinstance(sid, str) and sid in index:
+        return index[sid], ""
+    raw = meta.get("reply_to")
+    if not isinstance(raw, dict):
+        return "", ""
+    channel = raw.get("channel")
+    if not isinstance(channel, str) or not _SLACK_CHANNEL.match(channel):
+        return "", ""
+    stamps = {}
+    for key in ("thread_ts", "message_ts"):
+        ts = raw.get(key)
+        stamps[key] = ts if isinstance(ts, str) and _SLACK_TS.match(ts) \
+            else None
+    thread, message = stamps["thread_ts"], stamps["message_ts"]
+    tries = []
+    if thread and message:
+        tries.append(f"slack:{channel}:{thread}:{message}")
+    if message:
+        tries.append(f"slack:{channel}:{message}")
+    for sid in tries:
+        if sid in index:
+            return index[sid], ""
+    if thread and f"slack:{channel}:{thread}" in index:
+        return "", index[f"slack:{channel}:{thread}"]
+    return "", ""
+
+
+def memory_id_for(meta, index):
+    """The exact memory entry of an item, or "" (see `memory_match`)."""
+    return memory_match(meta, index)[0]
+
+
+def annotate_memory(results, index):
+    """`results` with `meta.memory_id` (an exact match) or
+    `meta.thread_memory_id` (only the thread is in memory) filled in on every
+    item the index knows (a copy; the cached rows are never changed)."""
+    if not index:
+        return results
+    out = []
+    for res in results:
+        rows = []
+        for item in res.items:
+            meta = item.get("meta")
+            exact, thread = memory_match(meta, index)
+            if isinstance(meta, dict):
+                add = {}
+                if exact and meta.get("memory_id") != exact:
+                    add["memory_id"] = exact
+                if thread and meta.get("thread_memory_id") != thread:
+                    add["thread_memory_id"] = thread
+                if add:
+                    item = dict(item, meta=dict(meta, **add))
+            rows.append(item)
+        out.append(res._replace(items=rows))
+    return out
+
+
+def units_memory_index(units):
+    """The merged memory index of the units that keep one."""
+    index = {}
+    for unit in units:
+        getter = getattr(unit, "memory", None)
+        if getter is not None:
+            index.update(getter())
+    return index
 
 
 def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
@@ -292,8 +401,13 @@ def _alert_state(item, now, max_age_h, recovery):
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0,
                 alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H, email_routines=None,
-                events=None, recovery=None):
+                events=None, recovery=None, show_rsvp_replies=False):
     """The built-in source: recent events as items. Never raises.
+
+    Calendar events of kind `rsvp` (other people answering the owner's
+    invites) are left out unless `show_rsvp_replies` is true. They are dropped
+    before the newest-per-source-id step, so the event's latest non-RSVP change
+    (`new`, `update`, `cancel`) still shows after someone replies.
 
     `email_routines` (a set of routine ids, or None for no filter) keeps only
     the Gmail events written by those routines; see `daemoncfg.label_routines`.
@@ -311,6 +425,10 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     cutoff = now - float(window_h) * 3600
     latest = {}  # one row per source_id: the newest event wins
     for event in events:
+        if (not show_rsvp_replies and isinstance(event, dict)
+                and event.get("source") == "gcal"
+                and event.get("kind") == "rsvp"):
+            continue
         try:
             item = event_to_item(event, now, rules, gmail_account)
         except (itm.ItemError, TypeError, ValueError):
@@ -611,9 +729,11 @@ class Unit:
     nothing to rebuild."""
 
     def __init__(self, name, run, watch=lambda: [], uses_all=False,
-                 reeval=None):
+                 reeval=None, memory=None):
         self.name, self.run, self.watch, self.uses_all = name, run, watch, uses_all
         self.reeval = reeval
+        # `memory()` returns the `{source_id: memory_id}` the unit last read.
+        self.memory = memory
 
 
 def _events_unit_run(src, settings, base_dir):
@@ -622,6 +742,9 @@ def _events_unit_run(src, settings, base_dir):
     (and from the alert state it already loaded)."""
     kept = {}
 
+    def memory():
+        return kept.get("memory", {})
+
     def build(now, events, recovery, note):
         res = load_events(base_dir, now=now, window_h=src["window_h"],
                           rules=src["urgent"], name=src["name"],
@@ -629,7 +752,9 @@ def _events_unit_run(src, settings, base_dir):
                           alert_max_age_h=settings.get(
                               "alert_urgent_max_age_h", DEFAULT_ALERT_MAX_AGE_H),
                           email_routines=kept.get("routines"),
-                          events=events, recovery=recovery)
+                          events=events, recovery=recovery,
+                          show_rsvp_replies=bool(
+                              settings.get("show_rsvp_replies")))
         if note:
             res = res._replace(
                 error=f"{res.error}; {note}" if res.error else note)
@@ -648,9 +773,11 @@ def _events_unit_run(src, settings, base_dir):
             events = read_events(base_dir)
         except OSError as exc:
             kept.pop("events", None)
+            kept.pop("memory", None)
             return [SourceResult(src["name"], [], False, None,
                                  f"cannot read events: {exc.strerror or exc}")]
-        kept.update(events=events, recovery=Recovery(base_dir), note=note)
+        kept.update(events=events, recovery=Recovery(base_dir), note=note,
+                    memory=memory_index(events))
         return [build(now, events, kept["recovery"], note)]
 
     def reeval(now):
@@ -658,7 +785,7 @@ def _events_unit_run(src, settings, base_dir):
             return None
         return [build(now, kept["events"], kept["recovery"], kept["note"])]
 
-    return run, reeval
+    return run, reeval, memory
 
 
 def _invites_unit_run(src, base_dir):
@@ -713,8 +840,9 @@ def make_units(settings, base_dir):
                         str(base_dir), "routines", "*.yaml")))
                 return files
 
-            run, reeval = _events_unit_run(src, settings, base_dir)
-            units.append(Unit(src["name"], run, watch, reeval=reeval))
+            run, reeval, memory = _events_unit_run(src, settings, base_dir)
+            units.append(Unit(src["name"], run, watch, reeval=reeval,
+                              memory=memory))
             if src.get("invites_days", invites.DEFAULT_DAYS) > 0:
                 run, reeval = _invites_unit_run(src, base_dir)
                 units.append(Unit(
@@ -785,4 +913,6 @@ def collect(settings, base_dir, now=None, show_all=False):
     sources keep the first and flag the later source.
     """
     now = time.time() if now is None else now
-    return merge(u.run(now, show_all) for u in make_units(settings, base_dir))
+    units = make_units(settings, base_dir)
+    results = merge(u.run(now, show_all) for u in units)
+    return annotate_memory(results, units_memory_index(units))

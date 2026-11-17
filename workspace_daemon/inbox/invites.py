@@ -26,6 +26,19 @@ MAX_INVITES = 200
 STALE_AFTER_H = 6.0
 DEFAULT_DAYS = 7.0
 ORGANIZER_MAX = 80
+NAME_MAX = 60             # one attendee's name in the attendees line
+ATTENDEES_SHOWN = 8       # names in the attendees thread line
+ATTENDEES_META_MAX = 25   # names in meta.attendees
+LOCATION_MAX = 120
+SUBJECT_MAX = 500
+CONFLICTS_SHOWN = 5
+CONFLICT_TITLE_MAX = 60
+# `@` as typed, full-width and small (sources._AT_SIGNS, copied: that module
+# imports this one). A name holding one is an address, not a name.
+_AT_SIGNS = ("@", "\uff20", "\ufe6b")
+# What a conflict line calls a row, by my_rsvp.
+_CONFLICT_LABEL = {"accepted": "accepted", "tentative": "tentative",
+                   "needsAction": "pending"}
 # A recurring instance id ends in _YYYYMMDD[THHMMSS[Z]]; the daemon announces
 # one invite per series, and so does the inbox. (Same pattern as
 # calendar_cache._RECURRING_ID, copied so the inbox needs no daemon imports.)
@@ -109,6 +122,18 @@ def describe_when(start, end, all_day):
     return text
 
 
+def _name(value, limit=ORGANIZER_MAX):
+    """A person's display name, or "": cleaned, cut, and dropped when it holds
+    an at-sign (a calendar may show the address as the name). Never an
+    address, never a part of one."""
+    if not isinstance(value, str):
+        return ""
+    text = itm.clean_line(value)
+    if any(a in text for a in _AT_SIGNS):
+        return ""
+    return itm.truncate(text, limit)
+
+
 def _organizers(path):
     """`{event id: organizer name}` from the cache's JSON twin, best effort.
 
@@ -124,20 +149,142 @@ def _organizers(path):
         if not isinstance(row, dict) or not isinstance(row.get("event_id"), str):
             continue
         org = row.get("organizer")
-        name = org.get("name") if isinstance(org, dict) else None
-        name = itm.clean_line(name) if isinstance(name, str) else ""
+        name = _name(org.get("name") if isinstance(org, dict) else None)
         if name:
-            out[row["event_id"]] = itm.truncate(name, ORGANIZER_MAX)
+            out[row["event_id"]] = name
     return out
 
 
-def _gist(title, when, organizer):
+def _attendees(row):
+    """`(names, total, known)` from a snapshot row: the named people (rooms
+    and groups skipped, declined guests and the owner left out, a nameless or
+    address-like entry not named), how many people there are, and whether that
+    number is firm. `attendee_count` (the cache already leaves declined guests
+    out of it) is trusted when it is a valid integer; the listed people are
+    counted only when it is missing or invalid. Anything of the wrong type is
+    ignored."""
+    people = row.get("attendees")
+    names, listed = [], 0
+    for person in people if isinstance(people, list) else []:
+        if (not isinstance(person, dict) or person.get("group") is True
+                or person.get("response") == "declined"):
+            continue
+        listed += 1
+        if person.get("self") is True:
+            continue  # the owner is counted, never named
+        name = _name(person.get("name"), NAME_MAX)
+        if name:
+            names.append(name)
+    count = row.get("attendee_count")
+    total = count if (isinstance(count, int) and not isinstance(count, bool)
+                      and count >= 0) else listed
+    return names, total, row.get("attendees_known") is not False
+
+
+def _attendees_line(names, total, known):
+    """The text of the `attendees` thread line, or "" when there is nothing
+    to say."""
+    if not known:
+        return "attendees unknown"
+    if total <= 0:
+        return ""
+    text = f"{total} person" if total == 1 else f"{total} people"
+    shown = names[:ATTENDEES_SHOWN]
+    if shown:
+        text += ": " + ", ".join(shown)
+        if total > len(shown):
+            text += f", +{total - len(shown)} more"
+    return text
+
+
+def _organizer_name(row, fallback):
+    """The organizer's name from the row itself, else the twin's."""
+    org = row.get("organizer")
+    return (_name(org.get("name")) if isinstance(org, dict) else "") \
+        or fallback or ""
+
+
+def _where(row):
+    loc = row.get("location")
+    if not isinstance(loc, str):
+        return ""
+    text = itm.clean_line(loc)
+    if any(a in text for a in _AT_SIGNS):
+        return ""
+    return itm.truncate(text, LOCATION_MAX)
+
+
+def _busy(rows):
+    """The rows the owner is going to, or might go to, as
+    `[(start, end, series, title, label)]` sorted by start: accepted,
+    tentative, pending or organized by them; not cancelled, not all-day, with
+    a start and an end that parse and follow each other."""
+    out = []
+    for event_id, row in rows.items():
+        if (not isinstance(event_id, str) or not isinstance(row, dict)
+                or row.get("status") == "cancelled"):
+            continue
+        org = row.get("organizer")
+        mine = (isinstance(org, dict) and org.get("self") is True) \
+            or row.get("my_rsvp") == "organizer"
+        rsvp = row.get("my_rsvp")
+        label = _CONFLICT_LABEL.get(rsvp) if isinstance(rsvp, str) else None
+        if label is None and mine:
+            label = "organizer"
+        if label is None:
+            continue
+        start, end = _when(row.get("start")), _when(row.get("end"))
+        if start is None or end is None or start[1] or end[0] <= start[0]:
+            continue
+        title = itm.clean_line(row.get("title")) \
+            if isinstance(row.get("title"), str) else ""
+        out.append((start[0], end[0], series_of(event_id),
+                    itm.truncate(title or "(untitled)", CONFLICT_TITLE_MAX),
+                    label))
+    return sorted(out, key=lambda b: b[:2])
+
+
+def _conflicts(busy, key, start_ts, end_ts, all_day):
+    """`(clashes, also_pending)`: the busy rows that overlap
+    `[start_ts, end_ts)` (touching edges do not), leaving out the invite's own
+    series. A clash is with something you are going to or organize; an overlap
+    with another unanswered invite is only "also pending" (information, not a
+    warning, since you can still decline one)."""
+    if all_day or end_ts <= start_ts:
+        return [], []
+    hits = [b for b in busy
+            if b[0] < end_ts and b[1] > start_ts and b[2] != key]
+    return ([b for b in hits if b[4] != "pending"],
+            [b for b in hits if b[4] == "pending"])
+
+
+def _span(b, start_ts):
+    """`10:30-11:00`; with the date when the other event is not on the
+    invite's day."""
+    if (_clock(b[0], "%Y%m%d") == _clock(start_ts, "%Y%m%d")
+            and _clock(b[1], "%Y%m%d") == _clock(b[0], "%Y%m%d")):
+        return _clock(b[0], "%H:%M") + "-" + _clock(b[1], "%H:%M")
+    return describe_when(b[0], b[1], False)
+
+
+def _conflict_line(b, start_ts):
+    """`⚠ Title 10:30-11:00 (label)`."""
+    return f"\u26a0 {b[3]} {_span(b, start_ts)} ({b[4]})"
+
+
+def _pending_line(b, start_ts):
+    """`Title 10:30-11:00`: another unanswered invite at the same time."""
+    return f"{b[3]} {_span(b, start_ts)}"
+
+
+def _gist(title, when, organizer, warn=False):
+    head = "\u26a0 " if warn else ""
     tail = f" - {when}" + (f" - from {organizer}" if organizer else "")
-    room = itm.GIST_MAX - len(tail)
+    room = itm.GIST_MAX - len(head) - len(tail)
     if room < 8:  # a very long organizer: keep the title readable
         tail = f" - {when}"
-        room = itm.GIST_MAX - len(tail)
-    return itm.truncate(title, max(room, 1)) + tail
+        room = itm.GIST_MAX - len(head) - len(tail)
+    return head + itm.truncate(title, max(room, 1)) + tail
 
 
 def read(base_dir):
@@ -213,24 +360,49 @@ def build(data, now, days=DEFAULT_DAYS):
             pending[key] = (start[0], event_id, row, end_ts, start[1])
 
     names = data["names"]
+    busy = _busy(rows)
     built, skipped = [], 0
     for key, (start_ts, event_id, row, end_ts, all_day) in sorted(
             pending.items(), key=lambda kv: kv[1][0])[:MAX_INVITES]:
         title = itm.clean_line(row.get("title")) if isinstance(
             row.get("title"), str) else ""
         title = title or "(untitled)"
-        organizer = names.get(event_id) or ""
+        organizer = _organizer_name(row, names.get(event_id))
         when = describe_when(start_ts, end_ts, all_day)
         link = row.get("conference")
         link = link if itm.valid_link(link) else None
-        thread = [{"who": "when", "ts": start_ts, "text": when}]
+        att_names, att_total, att_known = _attendees(row)
+        clashes, pending_too = _conflicts(busy, key, start_ts, end_ts, all_day)
+        thread = [{"who": "subject", "ts": start_ts,
+                   "text": itm.truncate(title, SUBJECT_MAX)},
+                  {"who": "when", "ts": start_ts, "text": when}]
         if organizer:
             thread.append({"who": "from", "ts": start_ts, "text": organizer})
+        att_line = _attendees_line(att_names, att_total, att_known)
+        if att_line:
+            thread.append({"who": "attendees", "ts": start_ts,
+                           "text": att_line})
+        place = _where(row)
+        if place:
+            thread.append({"who": "where", "ts": start_ts, "text": place})
+        for clash in clashes[:CONFLICTS_SHOWN]:
+            thread.append({"who": "conflict", "ts": start_ts,
+                           "text": _conflict_line(clash, start_ts)})
+        if len(clashes) > CONFLICTS_SHOWN:
+            thread.append({"who": "conflict", "ts": start_ts,
+                           "text": f"+{len(clashes) - CONFLICTS_SHOWN} more"})
+        for other in pending_too[:CONFLICTS_SHOWN]:
+            thread.append({"who": "also pending", "ts": start_ts,
+                           "text": _pending_line(other, start_ts)})
+        if len(pending_too) > CONFLICTS_SHOWN:
+            thread.append({"who": "also pending", "ts": start_ts,
+                           "text": f"+{len(pending_too) - CONFLICTS_SHOWN} more"})
         try:
             built.append(itm.make_item(
                 id=f"invites:{key}", source="calendar", section="needs_reply",
                 urgency="digest", sender=organizer or "calendar invite",
-                where="invite", gist=_gist(title, when, organizer),
+                where="invite",
+                gist=_gist(title, when, organizer, bool(clashes)),
                 ts=start_ts, link=link, thread=thread, draft=None,
                 actions=["ack", "open"] if link else ["ack"],
                 meta={"kind": "invite", "event_id": event_id,
@@ -238,6 +410,12 @@ def build(data, now, days=DEFAULT_DAYS):
                       "my_rsvp": "needsAction", "start": start_ts,
                       "title": itm.truncate(title, itm.FIELD_MAX),
                       "when": when, "cache_fetched": fetched_ts,
+                      "attendees": [itm.truncate(n, ORGANIZER_MAX)
+                                    for n in att_names[:ATTENDEES_META_MAX]],
+                      "attendee_count": att_total if att_known else None,
+                      "attendees_known": att_known,
+                      "conflicts": len(clashes),
+                      "also_pending": len(pending_too),
                       "source_id": f"gcal:{event_id}"}))
         except itm.ItemError:
             skipped += 1

@@ -183,7 +183,7 @@ class EventsMappingTest(unittest.TestCase):
             ev("gcal:e4", "new", "Lunch", ago_h=1),
         ])
         by_title = {i["gist"].split(": ")[1].split(" (")[0]: i
-                    for i in self.load().items}
+                    for i in self.load(show_rsvp_replies=True).items}
         self.assertEqual(set(by_title), {"Weekly sync", "Offsite", "Review", "Lunch"})
         sync = by_title["Weekly sync"]
         self.assertEqual(sync["source"], "calendar")
@@ -195,6 +195,52 @@ class EventsMappingTest(unittest.TestCase):
         self.assertTrue(by_title["Review"]["gist"].startswith("RSVP: "))
         for item in by_title.values():
             self.assertEqual(itm.validate_item(item), [])
+
+    def test_rsvp_replies_are_hidden_unless_asked_for(self):
+        write_events(self.base, [
+            ev("gcal:e1", "rsvp", "Review", ["Di Test"], ago_h=1),
+            ev("gcal:e2", "new", "Lunch", ago_h=1),
+            ev("gcal:e3", "update", "Sync", ago_h=1),
+            ev("gcal:e4", "cancel", "Offsite", ago_h=1)])
+        gists = lambda **kw: sorted(i["gist"].split(":")[0]
+                                    for i in self.load(**kw).items)
+        self.assertEqual(gists(), ["Cancelled", "New invite", "Updated"])
+        self.assertEqual(gists(show_rsvp_replies=False),
+                         ["Cancelled", "New invite", "Updated"])
+        self.assertEqual(gists(show_rsvp_replies=True),
+                         ["Cancelled", "New invite", "RSVP", "Updated"])
+
+    def test_a_newer_rsvp_does_not_hide_the_latest_real_change(self):
+        write_events(self.base, [
+            ev("gcal:e1", "update", "Review", ago_h=3),
+            ev("gcal:e1", "rsvp", "Review", ["Di Test"], ago_h=1),
+            ev("gcal:e2", "rsvp", "Lunch", ago_h=3),
+            ev("gcal:e2", "cancel", "Lunch", ago_h=2)])
+        gists = lambda **kw: sorted(i["gist"].split(":")[0]
+                                    for i in self.load(**kw).items)
+        # the RSVP is dropped first, so each event shows its newest real change
+        self.assertEqual(gists(), ["Cancelled", "Updated"])
+        # shown, the newer RSVP takes the place of the update (as before)
+        self.assertEqual(gists(show_rsvp_replies=True), ["Cancelled", "RSVP"])
+
+    def test_show_rsvp_replies_setting(self):
+        from workspace_daemon.inbox import settings
+        self.assertIs(settings.default_settings()["show_rsvp_replies"], False)
+        self.assertIs(settings.validate(
+            {"show_rsvp_replies": True})["show_rsvp_replies"], True)
+        for bad in ("yes", 1, None, []):
+            with self.assertRaises(settings.SettingsError):
+                settings.validate({"show_rsvp_replies": bad})
+
+    def test_unit_passes_the_setting_through(self):
+        from workspace_daemon.inbox import settings
+        write_events(self.base, [ev("gcal:e1", "rsvp", "Review", ago_h=1)])
+        for flag, count in ((False, 0), (True, 1)):
+            cfg = settings.validate({"show_rsvp_replies": flag})
+            (unit,) = [u for u in sources.make_units(cfg, self.base)
+                       if u.name == "events"]
+            (res,) = unit.run(NOW, False)
+            self.assertEqual(len(res.items), count)
 
     def test_unknown_calendar_kind_is_skipped(self):
         write_events(self.base, [ev("gcal:e9", "teleport", "X")])

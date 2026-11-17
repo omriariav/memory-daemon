@@ -1064,7 +1064,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             hints = dict((k, label) for k, label in app.hints())
             self.assertEqual((hints["a"], hints["X"], hints["T"], hints["m"]),
-                             ("accept", "decline", "tentative", "save"))
+                             ("accept", "decline", "tentative", "save by hand"))
             titles = {c.title for c in app.get_system_commands(app.screen)}
             for name in ("Accept invite", "Decline invite", "Tentative",
                          "Save item to memory"):
@@ -1074,7 +1074,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, HelpScreen)
             text = " ".join(str(w.render()) for w in app.screen.query("Static"))
             self.assertIn("accept / decline / tentative", text)
-            self.assertIn("save the item to memory", text)
+            self.assertIn("save to memory by hand", text)
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")

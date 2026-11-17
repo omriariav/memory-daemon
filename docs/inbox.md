@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox; handed back to the source unchanged by `act`. Four optional keys are read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry an `events` item was captured as (`^[a-z0-9][a-z0-9-]{0,200}$`; the built-in `events` source copies it from the event when present and well-formed, so a context command can link the entry; a command source may set it too) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Four optional keys are read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -327,7 +327,7 @@ event that was created, then updated, appears once.
 | Event | Item `source` | `where` | `actions` |
 | --- | --- | --- | --- |
 | `gmail` | `email` | the mail subject (`details.mail_subject`), else `mail` | `open` (reply arrives in phase 2) |
-| `gcal` kinds `new`, `update`, `cancel`, `rsvp` | `calendar` | `calendar` | `ack` |
+| `gcal` kinds `new`, `update`, `cancel`, `rsvp` (`rsvp` only with `show_rsvp_replies: true`) | `calendar` | `calendar` | `ack` |
 | `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack` |
 | `daemon` kind `alert` | `alert` | `daemon` | `ack` |
 
@@ -376,11 +376,14 @@ window cannot reach past what the snapshot covers (`events_window_days` of the
 routine, 7 by default); asking for more adds a note to the source's status.
 Times are shown in the machine's local time zone. The row is `sender` = the
 organizer (or "calendar invite"), `where` = "invite", and a gist of
-`<title> - <when> - from <organizer>`. The item `ts` is the event's start (the
+`<title> - <when> - from <organizer>`, with a `⚠ ` in front when the invite
+clashes with something else (see below). The item `ts` is the event's start (the
 cache records no arrival time for an invite), so the row's age reads `in 2h`,
 and invites list soonest first, after the replies in the section. `meta` is
 `{"kind": "invite", "event_id", "calendar_id", "series", "my_rsvp", "start",
-"source_id"}` so a later RSVP action has what it needs. Actions: `ack` (hides
+"source_id", "attendees", "attendee_count", "attendees_known", "conflicts",
+"also_pending"}`
+so a later RSVP action has what it needs. Actions: `ack` (hides
 the row locally) and `open` (the meeting link from the cache, only when it is a
 plain http(s) URL; otherwise there is no `open`). A `New invite` calendar row
 from the events stream is dropped when its series has a pending-invite row
@@ -388,6 +391,38 @@ from the events stream is dropped when its series has a pending-invite row
 text. A missing cache means no invites and no error; an
 unreadable or unfamiliar one is a source error (`events.invites`) and a cache
 older than 6 hours marks the source stale.
+
+The thread of an invite has one line per fact, each as its own `who`:
+`subject` (the full title), `when`, `from` (the organizer's name), `attendees`,
+`where`, `conflict` and `also pending`.
+
+- **Organizer**: the snapshot row's `organizer.name` when it has one, else the
+  twin's. Names only: an email address is never shown, and a name that holds an
+  at-sign is dropped.
+- **Attendees**: `5 people: Ann Lee, Bob Ray, +3 more`. Rooms and groups
+  (`group: true`), declined guests and you are skipped when naming (the count is
+  the cache's `attendee_count`, which already leaves declined guests out and
+  includes you; the listed people are counted only when it is missing or
+  invalid); a guest without a usable name is counted but not named (the
+  address is never a fallback); up to 8 names are listed. With
+  `attendees_known: false` the line says `attendees unknown`. `meta.attendees`
+  holds up to 25 names and `meta.attendee_count` the count (null when unknown),
+  so a context command can look people up.
+- **Where**: the `location` text, shortened; left out when empty or when it
+  holds an at-sign.
+- **Conflicts**: other rows in the snapshot that overlap the invite's time
+  (strictly: ending when it starts is not a clash) and that you are going to or
+  organize (`accepted`, `tentative`, or organized by you), not cancelled and
+  not all-day, and not another instance of the same series. Each is one line,
+  `⚠ Weekly sync 10:30-11:00 (accepted)` (the label is `accepted`, `tentative`
+  or `organizer`), up to 5 and then `+N more`; `meta.conflicts` is the full
+  count and the gist starts with `⚠ ` when it is above 0. For a recurring
+  series the clash is checked at the listed (next) instance. A row whose times
+  do not parse never clashes.
+- **Also pending**: an overlap with another unanswered invite is information,
+  not a warning (you can still decline one): a thread line `also pending`
+  (`Other invite 10:30-11:00`, up to 5 and `+N more`) and `meta.also_pending`,
+  with no `⚠`.
 
 ### RSVP on pending invites
 
@@ -457,7 +492,42 @@ the command answered that it was already in memory and after a forced "Save
 anyway". `save: {mark_done: false}` keeps the row instead, with a `◆` and a
 local `saved` mark. A failure toasts the reason, adds no mark and leaves the
 row; a likely duplicate asks "Save anyway" first (see the protocol) and leaves
-the row too. Without `save:`, `m` says "Save not configured".
+the row too. Without `save:`, `m` says "Save not configured" and is left out
+of the footer, the help screen and the palette.
+
+#### Already in memory
+
+The inbox never saves anything on its own; the daemon does, as it captures
+items. `m` is only for saving by hand what the daemon did not. To show the
+outcome, an item the daemon already saved carries a `◆` in its row (the same
+mark `m` leaves with `mark_done: false`, so it always means "this is in
+memory") and a line `In memory: <memory id>` in the detail view. `m` on such an
+item toasts "Already in memory (<id>)" and runs nothing. An item with no match
+gets no mark; that does not say it was not saved (calendar rows, alerts and
+sheet rows are never captured, so they never show one).
+
+The match uses `state/events.jsonl` (already read by the events source): the
+newest row with both a `source_id` and a well-formed `memory_id` wins, and the
+index is rebuilt whenever that file changes. For any item from any source, in
+order:
+
+1. `meta.memory_id`, when it is a well-formed memory id;
+2. `meta.source_id` found in the index;
+3. with a valid `meta.reply_to`: `slack:<channel>:<thread_ts>:<message_ts>`
+   (a reply the daemon saved), then `slack:<channel>:<message_ts>`.
+
+Those are **exact** matches: the `◆`, the `In memory: <id>` line and the `m`
+toast. The daemon saves a thread root as `slack:<channel>:<root_ts>`; when that
+is the only entry found (`slack:<channel>:<thread_ts>`), the match is
+**thread-level**: the thread is in memory, this message may not be. The row
+gets a dim `◇`, the detail view says `Thread in memory: <id>`, and `m` (with
+`save:` configured) asks "Thread already in memory ... Save anyway" instead of
+refusing.
+
+The inbox adds the id it found to the listed item: `meta.memory_id` for an
+exact match, `meta.thread_memory_id` for a thread-level one. It reaches the
+`save`, `context`, precheck and custom-action commands because they receive the
+item (nothing is written to disk).
 
 Calendar `details.start`, `end` and `changed` become the gist suffix and thread
 lines. A Gmail thread id (the second `:`-segment of
@@ -989,6 +1059,7 @@ defaults; a broken one prints every problem and exits 2.
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
+| `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default they are left out before the newest row per event is chosen, so the event shows its latest non-RSVP change (`new`, `update` or `cancel`). New, updated and cancelled invites are not affected |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
 | `rsvp` | off | calendar RSVP through the Claude bridge (below) |
@@ -1091,7 +1162,7 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
-memory (needs `save:`; marks the item done), any key set in `actions:`
+memory by hand (needs `save:`; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),

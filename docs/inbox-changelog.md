@@ -7,6 +7,53 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-17
+
+Pending invites say more, the inbox shows what the daemon already saved to
+memory, and other people's RSVP answers are hidden by default. No setting is
+required: a 0.7.0 `inbox.yaml` works unchanged.
+
+### Added
+
+- **Richer invite items.** The thread of a pending invite now has `subject`
+  (the full title), `when`, `from` (the organizer's name, taken from the
+  snapshot row first, then the JSON twin), `attendees` (`5 people: Ann Lee,
+  Bob Ray, +3 more`; rooms and groups skipped, nameless guests counted but not
+  named, `attendees unknown` when the guest list is hidden), `where` (the
+  location) and one `conflict` line per overlapping event you are going to or
+  organize (accepted, tentative or yours; up to 5, then `+N more`). The gist
+  starts with `⚠ ` when there is such a clash. An overlap with another
+  unanswered invite is not a warning: it is an `also pending` line and
+  `meta.also_pending`. Attendee names and the count leave out declined guests
+  and you. New `meta` keys: `attendees` (up to 25 names), `attendee_count`,
+  `attendees_known`, `conflicts`, `also_pending`. Names only: an email address, or a name that
+  contains an at-sign, never appears in the item.
+- **`show_rsvp_replies`** (top-level, `true` or `false`, default `false`): the
+  calendar events of kind `rsvp` (other people answering your invites) are no
+  longer listed unless it is `true`. They are dropped before the newest row per
+  event is chosen, so the event still shows its latest non-RSVP change (`new`,
+  `update` or `cancel`) after someone replies.
+  New, updated and cancelled invites are not affected.
+- **Already in memory.** An item the daemon saved to memory shows the `◆` mark
+  (the one `m` leaves with `mark_done: false`) and an `In memory: <id>` line in
+  the detail view. The match uses `state/events.jsonl`: `meta.memory_id`, then
+  `meta.source_id`, then for Slack items `slack:<channel>:<thread_ts>:<message_ts>`
+  (a saved reply) and `slack:<channel>:<message_ts>` from a valid
+  `meta.reply_to`; those are exact. When only the thread root
+  (`slack:<channel>:<thread_ts>`) is saved the match is thread-level: a dim `◇`,
+  a `Thread in memory: <id>` line, and `m` offers "Save anyway". The id found is
+  put in `meta.memory_id` (exact) or `meta.thread_memory_id` (thread-level) of
+  the listed item, so it reaches the save, context, precheck and custom-action
+  commands. Items with no match get no mark.
+
+### Changed
+
+- `m` is labelled "save to memory by hand" (the daemon saves on its own); on an
+  item already in memory it toasts "Already in memory (<id>)" and runs nothing.
+- Without `save:`, `m` no longer appears in the footer, the help screen (the
+  "RSVP / save" section becomes "RSVP") or the command palette.
+- Invite thread: the first line is now `subject`, then `when`.
+
 ## [0.7.0] - 2026-11-16
 
 "Send" becomes a choice. Some workplaces block headless (non-interactive)
