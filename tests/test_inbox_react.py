@@ -660,10 +660,10 @@ class KeyMapInvariantTest(unittest.TestCase):
 
     def test_the_free_keys_are_the_documented_ones(self):
         self.assertEqual("".join(settings.ACTION_KEY_CHOICES),
-                         "BDFHJKMNOQUVWZhlptwxz")
+                         "BDFHJKNOQUVWZhlptwz")
         text = (ROOT / "docs" / "inbox.md").read_text()
-        self.assertIn("`h l p t w x z`", text)
-        self.assertIn("`B D F H J K M N O Q U V W Z`", text)
+        self.assertIn("`h l p t w z`", text)
+        self.assertIn("`B D F H J K N O Q U V W Z`", text)
         self.assertNotIn("`B D E F H J K M N O P Q U V W Z`", text)
 
     def test_every_earlier_key_still_does_what_it_did(self):

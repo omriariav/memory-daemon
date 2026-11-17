@@ -298,11 +298,18 @@ async def settle(pilot, app):
     await pilot.pause(0.25)
 
 
+def start_view(rows):
+    """The view a test opens in: the Feed when every row is an FYI row (the
+    Inbox lists only what needs a move), else the Inbox."""
+    rows = list(rows)
+    return "feed" if rows and all(r["section"] == "fyi" for r in rows) else "inbox"
+
+
 def make_app(rows, actions):
     store = InboxStore(None)
     return InboxApp(Fixed(rows), store, actions(store),
                     settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
-                    stream_delay=0)
+                    stream_delay=0, view=start_view(rows))
 
 
 def toasts(app):
@@ -446,7 +453,7 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
         store = InboxStore(None)
         app = InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
                        settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
-                       stream_delay=0)
+                       stream_delay=0, view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             q = app.query_one("#queue", Queue)
@@ -472,7 +479,7 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
         app = InboxApp(Fixed([item(1), item(2)]), store,
                        FakeActions(store=store, draft_delay=0),
                        settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
-                       stream_delay=0)
+                       stream_delay=0, view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             app.query_one("#thread").focus()
@@ -485,7 +492,7 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
         store = InboxStore(None)
         return InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
                         settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
-                        stream_delay=0)
+                        stream_delay=0, view="feed")
 
     async def test_a_poll_redraw_while_blurred_keeps_the_panes_focus(self):
         app = self.make(Fixed([item(1), item(2)]))

@@ -19,8 +19,7 @@ if HAVE_TEXTUAL:
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.demo import DemoSource
     from workspace_daemon.inbox.screens import (ConfirmSend, HelpScreen,
-                                                SavedScreen, SnoozePicker,
-                                                parse_snooze)
+                                                SnoozePicker, parse_snooze)
     from workspace_daemon.inbox.store import InboxStore
     from workspace_daemon.inbox.widgets import Queue
 
@@ -159,7 +158,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
     async def test_snooze_hides_then_wakes(self):
         clock = [time.time()]
         store = InboxStore(None, clock=lambda: clock[0])
-        app, _, _ = make_app([item(1)], store=store, undo_s=0.05)
+        app, _, _ = make_app([item(1)], store=store, undo_s=0.05, view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             key = app.current_key
@@ -208,7 +207,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_quit_cancels_pending_send_but_commits_done(self):
         rows = [item(1, "needs_reply", "slack", actions=("reply",), draft="hi"),
-                item(2, "fyi", "calendar")]
+                item(2, "needs_reply", "slack", actions=("reply",), draft="yo")]
         app, store, actions = make_app(rows, undo_s=30)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
@@ -244,7 +243,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
         store = InboxStore(None)
         actions = LocalActions(store, opener=lambda url: opened.append(url) or True)
         rows = [item(1, link="https://example.com/a"), item(2, link=None)]
-        app, _, _ = make_app(rows, actions=actions, store=store)
+        app, _, _ = make_app(rows, actions=actions, store=store, view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("o")
@@ -318,7 +317,10 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([i.key for i in app.items], ["t:2"])
 
     async def test_source_filter_and_text_filter(self):
-        app, _, _ = make_app(self.rows())
+        rows = [item(1, "urgent", "alert"),
+                item(2, "needs_reply", "slack", actions=("reply",)),
+                item(3, "needs_reply", "email", actions=("open",))]
+        app, _, _ = make_app(rows)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("f")
@@ -340,7 +342,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertIsInstance(app.screen, HelpScreen)
             self.assertIn(f"v{__version__}", str(app.screen.query_one("#help-title").render()))
-            self.assertIn(f"v{__version__}", str(app.query_one("#hdr").render()))
+            self.assertIn(__version__, str(app.query_one("#hdr").render()))
             await pilot.press("escape")
             await pilot.press("L")
             await pilot.pause(0.1)
@@ -402,8 +404,10 @@ class CopyTest(unittest.IsolatedAsyncioTestCase):
                 "\u05e0\u05d5\u05e2\u05d4 \u2014 #\u05db\u05dc\u05dc\u05d9 \u2014 "
                 "\u05d1\u05d3\u05d9\u05e7\u05d4 [x] *y*")
             self.assertEqual(toast.call_args[0][0], "Copied")
-            # focus the fyi item: only its section is copied
-            clip, _ = await self.copied(pilot, app, "j", "j", "Y")
+            # the Feed: only the group of the selected row is copied
+            await pilot.press("4")
+            await pilot.pause(0.1)
+            clip, _ = await self.copied(pilot, app, "Y")
             clip.assert_called_once_with(
                 "Person 3 \u2014 room \u2014 gist 3 \u2014 https://example.com/3")
 
@@ -504,7 +508,7 @@ class CopyTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("question_mark")
             await pilot.pause(0.1)
             body = str(app.screen.query_one("#help-body").render())
-            for needle in ("copy this item", "every item in this section",
+            for needle in ("copy this item", "every item in this group",
                            "show / hide resolved"):
                 self.assertIn(needle, body)
 
@@ -552,8 +556,10 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:2", "t:3"])
             self.assertEqual(app.resolved_hidden, 0)
+            await pilot.press("4")
+            await pilot.pause(0.1)
             self.assertEqual(
-                [i.key for i in app.query_one("#queue", Queue).rows if i.section == "fyi"],
+                [i.key for i in app.query_one("#queue", Queue).rows],
                 ["t:2", "t:3"])
             await pilot.press("R")
             await pilot.pause(0.1)
@@ -568,9 +574,11 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("R")
             await pilot.pause(0.1)
             self.assertNotIn("resolved (R)", header())
+            await pilot.press("4")
+            await pilot.pause(0.1)
             rows = app.query_one("#queue", Queue).rows
             line = app.query_one("#queue", Queue)._row(
-                rows[1], 60, app.pal, time.time(), False)   # t:2, resolved
+                rows[0], 60, app.pal, time.time(), False)   # t:2, resolved
             self.assertIn(" \u2713 ", line.plain)
 
     async def test_only_alert_items_can_be_resolved(self):
@@ -634,7 +642,7 @@ class SafetyTest(unittest.IsolatedAsyncioTestCase):
     async def test_item_ids_cannot_collide_with_internal_option_ids(self):
         rows = [item(1, id="hdr:urgent"), item(2, id="ghost"),
                 item(3, id="empty:fyi")]
-        app, _, _ = make_app(rows)
+        app, _, _ = make_app(rows, view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             self.assertEqual(len(app.query_one("#queue", Queue).rows), 3)
@@ -874,61 +882,66 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
                        saved=saved, saved_days=2)
         return app, store, actions
 
-    async def test_s_lists_rows_and_esc_returns(self):
+    async def test_s_opens_the_feed_filtered_to_saved_and_esc_clears_it(self):
         app, _, _ = self.make(SAVED_ROWS)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
+            self.assertEqual(app.view, "inbox")
             await pilot.press("S")
             await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, SavedScreen)
-            table = app.screen.query_one("#saved-table")
-            self.assertEqual(table.row_count, 2)
-            cells = [[str(c) for c in table.get_row_at(n)] for n in range(2)]
-            self.assertEqual(cells[0][0], "#")                 # Slack glyph
-            self.assertEqual(cells[0][1], "Launch checklist thread")
-            self.assertEqual(cells[0][3], "update")
-            self.assertEqual(cells[1][0], "✉")
-            self.assertEqual(cells[1][1], "Contract terms [b]x[/b]")  # literal
-            self.assertEqual(cells[1][3], "new")
-            self.assertRegex(cells[0][2], r"\d\d:\d\d")
+            self.assertEqual((app.view, app.feed_routine),
+                             ("feed", "saved to memory"))
+            self.assertEqual(len(app.screen_stack), 1)
+            rows = app.query_one("#queue", Queue).rows
+            self.assertEqual([r.gist for r in rows],
+                             ["Launch checklist thread",
+                              "Contract terms [b]x[/b]"])     # literal text
+            self.assertEqual([r.source for r in rows], ["slack", "email"])
+            self.assertTrue(all(r.saved for r in rows))
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 2)
             await pilot.press("escape")
             await pilot.pause(0.2)
-            self.assertNotIsInstance(app.screen, SavedScreen)
-            self.assertEqual(len(app.screen_stack), 1)
+            self.assertIsNone(app.feed_routine)
+            self.assertEqual({r.gist for r in app.query_one("#queue", Queue).rows},
+                             {"gist 1", "Launch checklist thread",
+                              "Contract terms [b]x[/b]"})
 
-    async def test_o_opens_the_link_and_a_row_without_one_says_so(self):
+    async def test_o_opens_the_link_of_a_saved_row(self):
         app, _, actions = self.make(SAVED_ROWS)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
             await pilot.pause(0.3)
-            await pilot.press("o")            # first row: no link
-            await pilot.pause(0.1)
-            self.assertEqual([c for c in actions.calls if c[0] == "open"], [])
+            self.assertNotIn(("o", "open"), app.hints())   # first row: no link
             await pilot.press("j", "o")       # second row: has a link
             await pilot.pause(0.1)
             self.assertEqual([c[0] for c in actions.calls if c[0] == "open"], ["open"])
             self.assertIn("open", [r["action"] for r in app.audit])
 
-    async def test_saved_rows_are_never_actionable(self):
+    async def test_saved_rows_have_no_draft_actions_and_no_rules(self):
         app, store, actions = self.make(SAVED_ROWS)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            before = app.current_key
             await pilot.press("S")
             await pilot.pause(0.3)
-            await pilot.press("a", "d", "s", "n", "e", "y", "u")
+            await pilot.press("a", "n", "e", "x", "minus")
             await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, SavedScreen)   # nothing dismissed it
+            self.assertEqual(len(app.screen_stack), 1)   # no picker opened
             self.assertEqual(app.pending, [])
             self.assertEqual(store.marks, {})
+            self.assertEqual(store.feed_rules(), [])
             self.assertEqual([c for c in actions.calls
                               if c[0] not in ("draft",)], [])
-            await pilot.press("S")            # S closes it too
-            await pilot.pause(0.2)
-            self.assertEqual(len(app.screen_stack), 1)
-            self.assertEqual(app.current_key, before)
-            self.assertEqual([i.key for i in app.items], ["t:1"])
+
+    async def test_a_saved_row_that_the_queue_already_shows_is_not_listed_twice(self):
+        row = item(1, "fyi", "email", meta={"source_id": "gmail:abcdef0123456789"})
+        store = InboxStore(None)
+        app = InboxApp(Fixed([row]), store, FakeActions(store=store),
+                       dict(DEFAULTS), leave_s=0, stream_delay=0,
+                       saved=lambda: (SAVED_ROWS, None), saved_days=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 1)
 
     async def test_empty_and_error_states(self):
         app, _, _ = self.make([], None)
@@ -936,8 +949,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await pilot.press("S")
             await pilot.pause(0.3)
-            table = app.screen.query_one("#saved-table")
-            self.assertIn("nothing saved", str(table.get_row_at(0)[1]))
+            self.assertTrue(app.query_one("#zero").display)
+            self.assertIn("saved to memory", str(app.query_one("#zero").render()))
             await pilot.press("o")            # nothing to open: no crash
             await pilot.pause(0.1)
             await pilot.press("escape")
@@ -946,7 +959,7 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await pilot.press("S")
             await pilot.pause(0.3)
-            self.assertIn("denied", str(app.screen.query_one("#saved-table").get_row_at(0)[1]))
+            self.assertIn("denied", str(app.query_one("#zero").render()))
 
     async def test_a_failing_reader_does_not_end_the_session(self):
         store = InboxStore(None)
@@ -960,7 +973,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await pilot.press("S")
             await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, SavedScreen)
+            self.assertEqual(app.view, "feed")
+            self.assertIn("RuntimeError", str(app.query_one("#zero").render()))
 
     async def test_without_a_reader_s_only_says_so(self):
         app, _, _ = self.make()
@@ -969,6 +983,7 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("S")
             await pilot.pause(0.2)
             self.assertEqual(len(app.screen_stack), 1)
+            self.assertEqual(app.view, "inbox")      # nothing to show: stays
 
     async def test_demo_has_saved_rows(self):
         from workspace_daemon.inbox.demo import demo_saved
@@ -1217,7 +1232,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([i.key for i in app.items], ["dup:1"])
             self.assertTrue(any("duplicate id" in p for p in app.source_problems()))
 
-    async def test_the_saved_view_reloads_when_events_change_and_only_then(self):
+    async def test_the_saved_rows_are_read_with_each_refresh(self):
         events_file = self.dir / "events.jsonl"
         events_file.write_text("one")
         calls = []
@@ -1229,28 +1244,19 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
                      "ts": time.time() - i, "title": f"Row {i}", "link": None,
                      "source_id": f"slack:{i}"} for i in range(n)], None
 
-        app = unit_app([CountingUnit("a", [])], saved=saved,
-                       saved_watch=lambda: [str(events_file)])
+        app = unit_app([CountingUnit("a", [str(events_file)])], saved=saved)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.pause(0.3)
-            self.assertEqual(calls, [])             # closed: nothing is read
-            await pilot.press("S")
-            await pilot.pause(0.4)
-            self.assertEqual(len(calls), 3 - 2)     # the open itself
-            table = app.screen.query_one("#saved-table")
-            self.assertEqual(table.row_count, 3)
-            events_file.write_text("one two")
-            self.assertTrue(await until(pilot, lambda: table.row_count == 7))
-            await pilot.pause(0.4)
-            reads = len(calls)
+            self.assertEqual(len(calls), 1)         # the first refresh
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 3)
+            before = len(calls)
             await pilot.pause(0.5)
-            self.assertEqual(len(calls), reads)     # no change: no reads
-            await pilot.press("escape")
-            await pilot.pause(0.2)
-            events_file.write_text("closed again, longer")
-            await pilot.pause(0.5)
-            self.assertEqual(len(calls), reads)     # closed: not watched
+            self.assertEqual(len(calls), before)    # no change: no reads
+            events_file.write_text("one two")       # the events file changed
+            self.assertTrue(await until(
+                pilot, lambda: dict(app.feed_data.counts).get(
+                    "saved to memory") == 7))
 
 
     async def test_a_fallback_refresh_that_collides_is_queued_not_dropped(self):

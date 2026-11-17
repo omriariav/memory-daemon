@@ -932,11 +932,18 @@ async def wait_for(pilot, cond, tries=100, step=0.05):
     return cond()
 
 
+def start_view(rows):
+    """The view a test opens in: the Feed when every row is an FYI row (the
+    Inbox lists only what needs a move), else the Inbox."""
+    rows = list(rows)
+    return "feed" if rows and all(r["section"] == "fyi" for r in rows) else "inbox"
+
+
 def make_app(rows, actions, **kw):
     kw.setdefault("context_debounce_s", 0.05)
     return InboxApp(Fixed(rows), InboxStore(None), actions,
                     settings=dict(DEFAULTS), undo_s=30, leave_s=0,
-                    stream_delay=0, **kw)
+                    stream_delay=0, view=start_view(rows), **kw)
 
 
 if HAVE_TEXTUAL:

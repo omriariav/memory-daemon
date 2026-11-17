@@ -52,7 +52,7 @@ CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEP")
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEPxM")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))

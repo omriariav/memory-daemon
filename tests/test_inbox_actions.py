@@ -86,7 +86,7 @@ class ActionsSettingsTest(unittest.TestCase):
         self.assertEqual((out["timeout_s"], out["mark_done"]), (300.0, False))
 
     def test_every_free_key_is_accepted(self):
-        for key in "hlptwxz" + "BDFHJKMNOQUVWZ":
+        for key in "hlptwz" + "BDFHJKNOQUVWZ":
             self.assertEqual(
                 validated({"actions": [dict(ACTION, key=key)]})
                 ["actions"][0]["key"], key)
@@ -147,7 +147,7 @@ class ActionsSettingsTest(unittest.TestCase):
                          letters - settings.RESERVED_KEYS)
         self.assertEqual(
             "".join(settings.ACTION_KEY_CHOICES),
-            "BDFHJKMNOQUVWZhlptwxz")
+            "BDFHJKNOQUVWZhlptwz")
 
 
 # ----------------------------------------------------------------- protocol
@@ -574,9 +574,17 @@ class Fixed:
         return self.results
 
 
+def start_view(rows):
+    """The view a test opens in: the Feed when every row is an FYI row (the
+    Inbox lists only what needs a move), else the Inbox."""
+    rows = list(rows)
+    return "feed" if rows and all(r["section"] == "fyi" for r in rows) else "inbox"
+
+
 def make_app(rows, actions, store, undo_s=0.25):
     return InboxApp(Fixed(rows), store, actions, settings=dict(DEFAULTS),
-                    undo_s=undo_s, leave_s=0, stream_delay=0)
+                    undo_s=undo_s, leave_s=0, stream_delay=0,
+                    view=start_view(rows))
 
 
 if HAVE_TEXTUAL:
@@ -1322,7 +1330,7 @@ class KeyMapInvariantTest(unittest.TestCase):
         bound = set(self.bound())
         for key in settings.ACTION_KEY_CHOICES:
             self.assertNotIn(key, bound, key)
-        for key in "hlptwxzBDFHJKMNOQUVWZ":
+        for key in "hlptwzBDFHJKNOQUVWZ":
             self.assertIn(key, settings.ACTION_KEY_CHOICES)
         InboxApp(lambda: [], InboxStore(None), Scripted(None),
                  settings=dict(DEFAULTS))
@@ -1340,8 +1348,8 @@ class KeyMapInvariantTest(unittest.TestCase):
 
     def test_the_example_and_docs_use_free_keys_and_name_them(self):
         text = (ROOT / "docs" / "inbox.md").read_text()
-        self.assertIn("`h l p t w x z`", text)
-        self.assertIn("`B D F H J K M N O Q U V W Z`", text)
+        self.assertIn("`h l p t w z`", text)
+        self.assertIn("`B D F H J K N O Q U V W Z`", text)
         example = (ROOT / "inbox.example.yaml").read_text()
         self.assertIn('#   - key: "p"', example)
 

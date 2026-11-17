@@ -833,9 +833,17 @@ def toasts(app):
     return [f"{n.title} {n.message}".strip() for n in app._notifications]
 
 
+def start_view(rows):
+    """The view a test opens in: the Feed when every row is an FYI row (the
+    Inbox lists only what needs a move), else the Inbox."""
+    rows = list(rows)
+    return "feed" if rows and all(r["section"] == "fyi" for r in rows) else "inbox"
+
+
 def make_app(rows, actions, store, undo_s=0.15):
     return InboxApp(Fixed(rows), store, actions, settings=dict(DEFAULTS),
-                    undo_s=undo_s, leave_s=0, stream_delay=0)
+                    undo_s=undo_s, leave_s=0, stream_delay=0,
+                    view=start_view(rows))
 
 
 def rsvp_actions(store, call, save=None):
@@ -1562,6 +1570,8 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([p.kind for p in app.pending], ["done"])
             await pilot.press("u")
             await pilot.pause(0.1)
+            await pilot.press("4")                       # the Feed holds FYI rows
+            await pilot.pause(0.1)
             app.current_key = "t:2"                      # an ordinary calendar row
             app.redraw(keep="t:2")
             await pilot.pause(0.1)
@@ -1569,6 +1579,8 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertEqual([p.kind for p in app.pending], ["ack"])
             await pilot.press("u")
+            await pilot.pause(0.1)
+            await pilot.press("1")
             await pilot.pause(0.1)
             app.current_key = "t:3"
             app.redraw(keep="t:3")

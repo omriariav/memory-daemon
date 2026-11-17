@@ -37,7 +37,8 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
         return 2
     from .actions import FakeActions, LocalActions
     from .app import InboxApp
-    from .demo import DemoSource, demo_saved
+    from .demo import DemoSource, demo_health, demo_saved
+    from . import health as healthmod
     from .store import InboxStore
     from . import sources
 
@@ -47,7 +48,7 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
         store = InboxStore(None)
         app = InboxApp(DemoSource(empty=empty), store,
                        FakeActions(store=store), settings, demo=True,
-                       saved=demo_saved, saved_days=2)
+                       saved=demo_saved, saved_days=2, health=demo_health)
     else:
         base = Path(base_dir)
         store = InboxStore(base)
@@ -73,9 +74,11 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
                                polish=settings["polish"],
                                copy=settings["copy"], team=settings["team"],
                                slack_open=settings["slack_open"])
+        reader = healthmod.HealthReader(
+            base, settings["health"]["heartbeats"])
         app = InboxApp(fetch, store, actions, settings,
                        stream_delay=0, saved=saved if events else None,
                        saved_days=days, units=sources.make_units(settings, base),
-                       saved_watch=sources.saved_watch(base) if events else None)
+                       health=reader.read)
     app.run()
     return 0
