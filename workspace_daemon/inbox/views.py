@@ -1,0 +1,238 @@
+"""The inbox views: filters and groupings of the same items (no Textual).
+
+A view is not a copy of the data. Each function here takes the live
+`models.Item` objects (marks and snoozes already applied) and returns
+`Group`s of those same objects, so selection, marks and the 5 s undo work the
+same in every view. Only two kinds of row are made here: a digest row (many
+rows of one routine and day folded into one) and a saved-to-memory row.
+
+1 Inbox    URGENT, I OWE (needs_reply, invites included), NUDGE DUE
+2 Waiting  waiting rows by person, then bookmarks as TRACKING
+3 Tasks    nothing yet (a placeholder; the tab keeps the keys stable)
+4 Feed     every fyi row by routine; saved-to-memory is one more routine
+5 Health   not a list of items (see health.py)
+"""
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import List
+
+from .models import Item, Msg, fmt_age
+
+VIEWS = (("inbox", "Inbox"), ("waiting", "Waiting"), ("tasks", "Tasks"),
+         ("feed", "Feed"), ("health", "Health"))
+VIEW_KEYS = tuple(k for k, _ in VIEWS)
+VIEW_TITLES = dict(VIEWS)
+# The views that list items in the queue.
+QUEUE_VIEWS = ("inbox", "waiting", "feed")
+SAVED_ROUTINE = "saved to memory"
+DEFAULT_WINDOW_H = 24.0
+DIGEST_PREFIX = "digest:"
+SAVED_PREFIX = "saved:"
+
+
+@dataclass
+class Group:
+    """A titled run of rows in the queue (a section, a person, a routine)."""
+    key: str
+    title: str
+    items: List[Item] = field(default_factory=list)
+    tail: str = ""             # text after the title; default is the count
+    hot: bool = False          # drawn in the urgent colour
+    keep_empty: bool = False   # listed with a dash even when empty
+
+
+def view_rows(groups):
+    """The rows of `groups`, in order."""
+    return [i for g in groups for i in g.items]
+
+
+# --- predicates -------------------------------------------------------------
+
+def is_bookmark(item):
+    """A waiting row the owner bookmarked: `meta.via` starts with
+    `track_reaction`, or `meta.cls` is `bookmarked`."""
+    meta = item.meta if isinstance(item.meta, dict) else {}
+    via = meta.get("via")
+    return ((isinstance(via, str) and via.startswith("track_reaction"))
+            or meta.get("cls") == "bookmarked")
+
+
+def nudge_due(item):
+    """A waiting row whose nudge is due: it can be nudged and a nudge draft
+    is stored."""
+    return (item.section == "waiting" and "nudge" in item.actions
+            and bool(item.draft and item.draft.strip()))
+
+
+def is_digest(item):
+    return item.key.startswith(DIGEST_PREFIX)
+
+
+def is_saved_row(item):
+    return item.key.startswith(SAVED_PREFIX)
+
+
+def _soonest_first(item):
+    """Waiting rows and pending invites (whose ts is the event start) list the
+    oldest / soonest first; everything else newest first."""
+    return item.ts if (item.section == "waiting"
+                       or item.meta.get("kind") == "invite") else -item.ts
+
+
+# --- 1 Inbox ----------------------------------------------------------------
+
+def inbox_groups(items):
+    """URGENT, I OWE and NUDGE DUE (always listed, with a dash when empty).
+    A Feed row that a rule promotes (`feed == "inbox"`) joins URGENT. The
+    place for DUE TODAY tasks is the empty slot after NUDGE DUE (0.11)."""
+    urgent = [i for i in items
+              if i.section == "urgent"
+              or (i.section == "fyi" and i.feed == "inbox")]
+    owe = [i for i in items if i.section == "needs_reply"]
+    nudge = [i for i in items if nudge_due(i)]
+    for rows in (urgent, owe, nudge):
+        rows.sort(key=_soonest_first)
+    return [Group("urgent", "URGENT", urgent, hot=True, keep_empty=True),
+            Group("owe", "I OWE", owe, keep_empty=True),
+            Group("nudge", "NUDGE DUE", nudge, keep_empty=True)]
+
+
+# --- 2 Waiting --------------------------------------------------------------
+
+def person_key(item):
+    return (item.who or "").strip().casefold() or "?"
+
+
+def waiting_groups(items, now):
+    """Waiting rows grouped by person (the sender / awaited name), the person
+    with the oldest open ask first and each person's oldest ask first; the
+    header reads `NAME  n open · oldest 3d`. Bookmarked rows close the list as
+    TRACKING."""
+    people = OrderedDict()
+    tracking = []
+    for it in sorted((i for i in items if i.section == "waiting"),
+                     key=lambda i: i.ts):
+        if is_bookmark(it):
+            tracking.append(it)
+        else:
+            people.setdefault(person_key(it), []).append(it)
+    groups = []
+    for key, rows in people.items():
+        oldest = fmt_age(now - rows[0].ts)
+        groups.append(Group(f"person:{key}", rows[-1].who or "(unknown)", rows,
+                            tail=f"{len(rows)} open · oldest {oldest}"))
+    if tracking:
+        groups.append(Group("tracking", "TRACKING", tracking))
+    return groups
+
+
+# --- 4 Feed -----------------------------------------------------------------
+
+def _day(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def digest_row(routine, day, members):
+    """One row standing for `members` (rows of one routine and day): marking
+    it done marks every member."""
+    rows = sorted(members, key=lambda i: i.ts)
+    newest = rows[-1]
+    n = len(rows)
+    return Item(
+        key=f"{DIGEST_PREFIX}{routine}:{day}", section="fyi", who=routine,
+        where="digest", ts=newest.ts, gist=f"{n} changes · {newest.gist}"[:120],
+        source=newest.source, origin=newest.origin,
+        messages=[Msg(time.strftime("%H:%M", time.localtime(m.ts)), m.ts,
+                      m.gist) for m in rows],
+        actions=[], meta={"routine": routine, "digest": True, "count": n},
+        members=rows)
+
+
+def saved_item(row):
+    """An `Item` for a saved-to-memory row of `sources.load_saved`."""
+    return Item(
+        key=f"{SAVED_PREFIX}{row['id']}", section="fyi", who=row["title"],
+        where=SAVED_ROUTINE, ts=row["ts"], gist=row["title"],
+        source=row["source"], link=row.get("link"), saved=True,
+        actions=["open"] if row.get("link") else [],
+        meta={"routine": SAVED_ROUTINE, "source_id": row.get("source_id", ""),
+              "kind": row.get("kind", ""), "saved_row": True},
+        origin=SAVED_ROUTINE)
+
+
+@dataclass
+class Feed:
+    groups: list                # every routine's group, before the filter
+    counts: list                # [(routine, rows)] for the routine list
+    muted: list                 # [(label, rows)] rows a rule hides
+    total: int = 0              # rows in the Feed (members, not digests)
+
+
+def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
+              saved=()):
+    """The Feed: every fyi row, by routine. Rows older than `window_h` age out
+    (all of them show again with `show_all`). A row a rule hides is counted as
+    muted, one a rule digests is folded into one row per routine and day, one
+    a rule promotes (`inbox`) is left to the Inbox view. `saved` is a list of
+    saved-to-memory `Item`s: they form the routine `saved to memory`, with no
+    window of their own here (the saved view's own `saved_days` bounds them)."""
+    cutoff = now - float(window_h) * 3600
+    by_routine = OrderedDict()
+    muted = OrderedDict()
+    for it in sorted((i for i in items if i.section == "fyi"),
+                     key=lambda i: -i.ts):
+        if it.feed == "inbox":
+            continue
+        if not show_all and it.ts < cutoff:
+            continue
+        if it.feed == "hide":
+            muted[it.feed_label or it.routine] = \
+                muted.get(it.feed_label or it.routine, 0) + 1
+            continue
+        by_routine.setdefault(it.routine, []).append(it)
+    for it in sorted(saved, key=lambda i: -i.ts):
+        by_routine.setdefault(SAVED_ROUTINE, []).append(it)
+    groups, counts = [], []
+    ordered = sorted(by_routine.items(),
+                     key=lambda kv: (kv[0] == SAVED_ROUTINE, -kv[1][0].ts))
+    for routine, rows in ordered:
+        rows = list(rows)
+        folds = OrderedDict()
+        for it in rows:
+            if it.feed == "digest":
+                folds.setdefault(_day(it.ts), []).append(it)
+        shown, done = [], set()
+        for it in rows:
+            if it.feed != "digest":
+                shown.append(it)
+                continue
+            day = _day(it.ts)
+            if day not in done:
+                done.add(day)
+                shown.append(digest_row(routine, day, folds[day]))
+        tail = str(len(rows))
+        if folds:
+            changes = sum(len(v) for v in folds.values())
+            tail += f" · {changes} changes → {len(folds)} row" \
+                    + ("" if len(folds) == 1 else "s")
+        groups.append(Group(f"routine:{routine}", routine.upper(), shown,
+                            tail=tail))
+        counts.append((routine, len(rows)))
+    return Feed(groups, counts, list(muted.items()),
+                sum(n for _, n in counts))
+
+
+def only_routine(groups, routine):
+    """The groups of one routine (all of them when `routine` is None)."""
+    if routine is None:
+        return list(groups)
+    return [g for g in groups if g.key == f"routine:{routine}"]
+
+
+def group_of(groups, item):
+    """The group holding `item`, or None."""
+    for g in groups:
+        if any(i is item or i.key == item.key for i in g.items):
+            return g
+    return None

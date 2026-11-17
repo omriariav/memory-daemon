@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from .. import state as daemon_state
+from . import feedrules
 
 FILE_NAME = "inbox-state.json"
 LOCK_NAME = "inbox-state.lock"
@@ -26,6 +27,8 @@ RSVP_ANSWERS = ("accepted", "declined", "tentative")
 # Display preferences kept beside the marks (`prefs` in the file): name ->
 # the values it may hold. A value outside this table reads as unset.
 PREF_VALUES = {"thread_order": ("newest", "oldest")}
+# The Feed rules made with `x` and `-` (a list of rules, see feedrules.py).
+FEED_RULES_PREF = "feed_rules"
 # An RSVP mark hides the invite until the calendar cache shows the answer. A
 # snapshot fetched this long after the answer that still lists the same event
 # as unanswered means the answer did not take: the row comes back.
@@ -87,7 +90,10 @@ class InboxStore:
         prefs = doc.get("prefs")
         if isinstance(prefs, dict):
             self._disk_prefs = {k: v for k, v in prefs.items()
-                                if v in PREF_VALUES.get(k, ())}
+                                if k in PREF_VALUES and v in PREF_VALUES[k]}
+            rules = feedrules.clean_ui_rules(prefs.get(FEED_RULES_PREF))
+            if rules:
+                self._disk_prefs[FEED_RULES_PREF] = rules
         marks = {}
         for key, mark in raw.items():
             if not isinstance(key, str) or not isinstance(mark, dict):
@@ -192,6 +198,67 @@ class InboxStore:
             self.prefs = dict(self.prefs, **{name: value})
             return True
         self._transaction(change)
+
+    # -- Feed rules (a display preference: UI rules, never inbox.yaml) --
+    def feed_rules(self):
+        """The Feed rules made in the UI, oldest first (copies)."""
+        return [dict(r) for r in
+                feedrules.clean_ui_rules(self.prefs.get(FEED_RULES_PREF))]
+
+    def _change_feed_rules(self, edit):
+        """Re-read under the locks, apply `edit(rules)` (a list it may change
+        in place; it returns False to skip the write), and save."""
+        def change(_marks):
+            rules = feedrules.clean_ui_rules(self.prefs.get(FEED_RULES_PREF))
+            if edit(rules) is False:
+                return False
+            prefs = dict(self.prefs)
+            kept = feedrules.clean_ui_rules(rules)
+            if kept:
+                prefs[FEED_RULES_PREF] = kept
+            else:
+                prefs.pop(FEED_RULES_PREF, None)
+            self.prefs = prefs
+            return True
+        self._transaction(change)
+
+    def add_feed_rule(self, rule):
+        """Save a UI rule (from `feedrules.new_ui_rule`); the oldest go once
+        there are more than the cap."""
+        clean = feedrules.clean_ui_rule(rule)
+        if clean is None:
+            raise ValueError("bad feed rule")
+
+        def edit(rules):
+            rules[:] = [r for r in rules if r["id"] != clean["id"]]
+            rules.append(clean)
+            del rules[:-feedrules.MAX_RULES]
+        self._change_feed_rules(edit)
+
+    def set_feed_rule_enabled(self, rule_id, enabled):
+        """Switch a UI rule on or off; False when there is no such rule."""
+        found = []
+
+        def edit(rules):
+            for r in rules:
+                if r["id"] == rule_id:
+                    r["enabled"] = bool(enabled)
+                    found.append(r)
+            return bool(found)
+        self._change_feed_rules(edit)
+        return bool(found)
+
+    def remove_feed_rule(self, rule_id):
+        """Delete a UI rule; False when there is no such rule."""
+        found = []
+
+        def edit(rules):
+            keep = [r for r in rules if r["id"] != rule_id]
+            found.append(len(keep) != len(rules))
+            rules[:] = keep
+            return found[0]
+        self._change_feed_rules(edit)
+        return bool(found and found[0])
 
     # -- marks --
     def _mark(self, item_id, **fields):

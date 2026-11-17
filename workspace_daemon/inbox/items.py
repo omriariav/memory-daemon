@@ -11,7 +11,8 @@ import re
 
 SCHEMA_VERSION = 1
 
-SOURCES = ("slack", "email", "calendar", "recording", "alert", "drive", "other")
+SOURCES = ("slack", "email", "calendar", "recording", "alert", "drive", "sheet",
+           "other")
 SECTIONS = ("urgent", "needs_reply", "waiting", "fyi")
 URGENCY_LEVELS = ("urgent", "digest")
 ACTIONS = ("reply", "ack", "done", "snooze", "nudge", "open")

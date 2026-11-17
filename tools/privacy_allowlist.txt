@@ -41,3 +41,8 @@ README.md :: re:alice@(?:acme|corp)\.com
 daemon.py :: x@y.com
 # Google system calendar domains (rooms, group calendars) in synthetic fixtures
 tests/test_calendar_events.py :: re:[a-z0-9_-]+@(resource|group)\.calendar\.google\.com
+
+# A Health section title in capitals (not a Slack id)
+docs/inbox.md :: CONNECTORS
+workspace_daemon/inbox/widgets.py :: CONNECTORS
+tests/test_inbox_views_ui.py :: CONNECTORS
