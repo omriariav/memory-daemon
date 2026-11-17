@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from .items import MEMORY_ID
+
 SECTIONS = [
     ("urgent", "Urgent"),
     ("needs_reply", "Needs reply"),
@@ -55,8 +57,16 @@ class Item:
     def memory_id(self):
         """The memory entry this item is already saved as (`meta.memory_id`,
         set by the daemon's capture or by the inbox's match), else ""."""
-        from .items import MEMORY_ID
-        mid = self.meta.get("memory_id") if isinstance(self.meta, dict) else None
+        return self._memory_key("memory_id")
+
+    @property
+    def thread_memory_id(self):
+        """The memory entry the item's Slack thread was saved as, when the
+        item itself is not known to be in memory (`meta.thread_memory_id`)."""
+        return "" if self.memory_id else self._memory_key("thread_memory_id")
+
+    def _memory_key(self, key):
+        mid = self.meta.get(key) if isinstance(self.meta, dict) else None
         return mid if isinstance(mid, str) and MEMORY_ID.match(mid) else ""
 
     @property

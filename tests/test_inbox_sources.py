@@ -210,6 +210,19 @@ class EventsMappingTest(unittest.TestCase):
         self.assertEqual(gists(show_rsvp_replies=True),
                          ["Cancelled", "New invite", "RSVP", "Updated"])
 
+    def test_a_newer_rsvp_hides_the_older_rows_of_the_same_event(self):
+        write_events(self.base, [
+            ev("gcal:e1", "new", "Review", ago_h=3),
+            ev("gcal:e1", "rsvp", "Review", ["Di Test"], ago_h=1),
+            ev("gcal:e2", "rsvp", "Lunch", ago_h=3),
+            ev("gcal:e2", "update", "Lunch", ago_h=1)])
+        gists = lambda **kw: sorted(i["gist"].split(":")[0]
+                                    for i in self.load(**kw).items)
+        # e1's newest row is the RSVP: nothing shows, not the older `new`
+        # e2's newest row is an update: it shows
+        self.assertEqual(gists(), ["Updated"])
+        self.assertEqual(gists(show_rsvp_replies=True), ["RSVP", "Updated"])
+
     def test_show_rsvp_replies_setting(self):
         from workspace_daemon.inbox import settings
         self.assertIs(settings.default_settings()["show_rsvp_replies"], False)

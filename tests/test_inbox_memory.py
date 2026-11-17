@@ -10,7 +10,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import events
 from workspace_daemon.inbox import items as itm, settings, sources
 from workspace_daemon.inbox.actions import FakeActions, LocalActions
 from workspace_daemon.inbox.store import InboxStore
@@ -19,7 +18,7 @@ HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 if HAVE_TEXTUAL:
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.screens import HelpScreen
-    from workspace_daemon.inbox.widgets import SAVED_GLYPH, Queue
+    from workspace_daemon.inbox.widgets import SAVED_GLYPH, THREAD_GLYPH, Queue
 
 CHAN = "C" + "0123ABCDEF"   # fake; built so no literal looks like an id
 THREAD_TS = "1700000000.000100"
@@ -91,15 +90,40 @@ class MatchTest(unittest.TestCase):
         self.assertEqual(self.find({"source_id": "gmail:abc"}), "mem-mail")
         self.assertEqual(self.find({"source_id": "gmail:other"}), "")
 
-    def test_slack_reply_to_thread_then_message(self):
-        both = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS,
+    def test_slack_reply_level_then_message_level_are_exact(self):
+        reply_id = f"slack:{CHAN}:{THREAD_TS}:{MSG_TS}"
+        full = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS,
                              "message_ts": MSG_TS}}
-        self.assertEqual(self.find(both), "mem-thread")
+        idx = dict(self.INDEX, **{reply_id: "mem-reply"})
+        self.assertEqual(sources.memory_match(full, idx), ("mem-reply", ""))
+        # without a reply-level entry, the message itself is the next try
+        self.assertEqual(sources.memory_match(full, self.INDEX),
+                         ("mem-msg", ""))
         only_msg = {"reply_to": {"channel": CHAN, "message_ts": MSG_TS}}
-        self.assertEqual(self.find(only_msg), "mem-msg")
-        # a thread that was not saved falls back to the message itself
-        idx = {f"slack:{CHAN}:{MSG_TS}": "mem-msg"}
-        self.assertEqual(self.find(both, idx), "mem-msg")
+        self.assertEqual(sources.memory_match(only_msg, self.INDEX),
+                         ("mem-msg", ""))
+
+    def test_a_saved_thread_root_is_a_thread_level_match_only(self):
+        full = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS,
+                             "message_ts": MSG_TS}}
+        idx = {f"slack:{CHAN}:{THREAD_TS}": "mem-thread"}
+        self.assertEqual(sources.memory_match(full, idx), ("", "mem-thread"))
+        only_thread = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS}}
+        self.assertEqual(sources.memory_match(only_thread, self.INDEX),
+                         ("", "mem-thread"))
+        self.assertEqual(sources.memory_id_for(only_thread, self.INDEX), "")
+
+    def test_the_root_message_itself_is_exact(self):
+        root = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS,
+                             "message_ts": THREAD_TS}}
+        idx = {f"slack:{CHAN}:{THREAD_TS}": "mem-thread"}
+        self.assertEqual(sources.memory_match(root, idx),
+                         ("mem-thread", ""))
+
+    def test_a_message_that_is_not_saved_has_no_match(self):
+        meta = {"reply_to": {"channel": CHAN, "thread_ts": "1700000009.000900",
+                             "message_ts": "1700000009.000901"}}
+        self.assertEqual(sources.memory_match(meta, self.INDEX), ("", ""))
 
     def test_invalid_reply_to_never_matches(self):
         for reply in ({"channel": "bad", "thread_ts": THREAD_TS},
@@ -125,6 +149,16 @@ class MatchTest(unittest.TestCase):
         self.assertNotIn("memory_id", by["t:3"]["meta"])   # never "unsaved"
         self.assertNotIn("memory_id", saved["meta"])       # input untouched
         self.assertIs(sources.annotate_memory(res, {}), res)
+
+    def test_annotate_marks_a_thread_level_match_apart(self):
+        idx = {f"slack:{CHAN}:{THREAD_TS}": "mem-thread"}
+        row = item(1, reply_to={"channel": CHAN, "thread_ts": THREAD_TS,
+                                "message_ts": MSG_TS})
+        res = [sources.SourceResult("t", [row], False, None, None)]
+        (out,) = sources.annotate_memory(res, idx)
+        meta = out.items[0]["meta"]
+        self.assertEqual(meta["thread_memory_id"], "mem-thread")
+        self.assertNotIn("memory_id", meta)
 
 
 class EventsUnitTest(unittest.TestCase):
@@ -163,7 +197,9 @@ class EventsUnitTest(unittest.TestCase):
                                return_value=ok):
             results = sources.collect(cfg, self.base, now=time.time())
         found = [i for r in results for i in r.items if i["id"] == "t:1"]
-        self.assertEqual(found[0]["meta"]["memory_id"], "mem-thread")
+        # only a thread id in the reply_to: the thread is in memory
+        self.assertEqual(found[0]["meta"]["thread_memory_id"], "mem-thread")
+        self.assertNotIn("memory_id", found[0]["meta"])
 
 
 class Fixed:
@@ -197,7 +233,8 @@ def toasts(app):
 class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
     def rows(self):
         return [item(1, memory_id="mem-one"), item(2),
-                item(3, source="calendar", kind="invite")]
+                item(3, source="calendar", kind="invite"),
+                item(4, thread_memory_id="mem-root")]
 
     async def test_only_items_in_memory_carry_the_mark(self):
         app = make_app(self.rows(), lambda s: FakeActions(store=s,
@@ -210,6 +247,7 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             text = " ".join(str(q.get_option_at_index(n).prompt)
                             for n in range(q.option_count))
             self.assertEqual(text.count(SAVED_GLYPH), 1)
+            self.assertEqual(text.count(THREAD_GLYPH), 1)   # t:4 only
 
     async def test_detail_view_names_the_memory(self):
         app = make_app(self.rows(), lambda s: FakeActions(store=s,
@@ -225,6 +263,12 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             app.redraw()
             await pilot.pause(0.2)
             self.assertNotIn("In memory", body())
+            self.assertNotIn("Thread in memory", body())
+            app.current_key = "t:4"
+            app.redraw()
+            await pilot.pause(0.2)
+            self.assertIn("Thread in memory: mem-root", body())
+            self.assertNotIn("\nIn memory", body())
 
     async def test_m_on_a_saved_item_toasts_and_runs_nothing(self):
         def actions(store):
@@ -242,6 +286,25 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
                                 for t in toasts(app)), toasts(app))
             self.assertEqual(app.pending, [])
             self.assertNotEqual(type(app.screen).__name__, "ConfirmWrite")
+
+    async def test_m_on_a_thread_level_match_offers_save_anyway(self):
+        app = make_app(self.rows(), lambda s: FakeActions(store=s,
+                                                          draft_delay=0))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.current_key = "t:4"
+            await pilot.pause(0.1)
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            self.assertEqual(type(app.screen).__name__, "ConfirmWrite")
+            text = " ".join(str(w.render()) for w in app.screen.query("Static"))
+            self.assertIn("Thread already in memory", text)
+            self.assertIn("mem-root", text)
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertTrue(any("thread is already in memory" in t
+                                for t in toasts(app)), toasts(app))
+            self.assertEqual(app.pending, [])
 
     async def test_the_label_says_by_hand_when_save_is_configured(self):
         app = make_app(self.rows(), lambda s: FakeActions(store=s,
@@ -267,6 +330,9 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             text = " ".join(str(w.render())
                             for w in app.screen.query("Static"))
             self.assertNotIn("save to memory by hand", text)
+            self.assertNotIn("RSVP / save", text)
+            self.assertNotIn("both confirm", text)
+            self.assertIn("RSVP", text)
 
     async def test_help_lists_m_when_save_is_configured(self):
         app = make_app(self.rows(), lambda s: FakeActions(store=s,

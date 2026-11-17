@@ -237,36 +237,58 @@ def memory_index(events):
     return {sid: mid for sid, (_ts, mid) in best.items()}
 
 
-def memory_id_for(meta, index):
-    """The memory entry an item is saved as, or "" (not known to be saved;
-    never a claim that it is not). In order: `meta.memory_id`;
+def memory_match(meta, index):
+    """`(exact, thread)`: the memory entry an item is saved as, and the entry
+    its Slack thread was saved as (each "" when unknown; never a claim that
+    the item is not saved). `exact`, in order: `meta.memory_id`;
     `meta.source_id` in the index; for a Slack item with a valid
-    `meta.reply_to`, `slack:<channel>:<thread_ts>` then
-    `slack:<channel>:<message_ts>`."""
+    `meta.reply_to`, `slack:<channel>:<thread_ts>:<message_ts>` (a reply the
+    daemon saved) then `slack:<channel>:<message_ts>`. `thread` is
+    `slack:<channel>:<thread_ts>` (the thread root's entry), reported only
+    when there is no exact match: the thread is in memory, this message may
+    not be."""
     if not isinstance(meta, dict):
-        return ""
+        return "", ""
     mid = meta.get("memory_id")
     if isinstance(mid, str) and MEMORY_ID.match(mid):
-        return mid
+        return mid, ""
     sid = meta.get("source_id")
     if isinstance(sid, str) and sid in index:
-        return index[sid]
+        return index[sid], ""
     raw = meta.get("reply_to")
-    if isinstance(raw, dict):
-        channel = raw.get("channel")
-        if isinstance(channel, str) and _SLACK_CHANNEL.match(channel):
-            for key in ("thread_ts", "message_ts"):
-                ts = raw.get(key)
-                if isinstance(ts, str) and _SLACK_TS.match(ts):
-                    found = index.get(f"slack:{channel}:{ts}")
-                    if found:
-                        return found
-    return ""
+    if not isinstance(raw, dict):
+        return "", ""
+    channel = raw.get("channel")
+    if not isinstance(channel, str) or not _SLACK_CHANNEL.match(channel):
+        return "", ""
+    stamps = {}
+    for key in ("thread_ts", "message_ts"):
+        ts = raw.get(key)
+        stamps[key] = ts if isinstance(ts, str) and _SLACK_TS.match(ts) \
+            else None
+    thread, message = stamps["thread_ts"], stamps["message_ts"]
+    tries = []
+    if thread and message:
+        tries.append(f"slack:{channel}:{thread}:{message}")
+    if message:
+        tries.append(f"slack:{channel}:{message}")
+    for sid in tries:
+        if sid in index:
+            return index[sid], ""
+    if thread and f"slack:{channel}:{thread}" in index:
+        return "", index[f"slack:{channel}:{thread}"]
+    return "", ""
+
+
+def memory_id_for(meta, index):
+    """The exact memory entry of an item, or "" (see `memory_match`)."""
+    return memory_match(meta, index)[0]
 
 
 def annotate_memory(results, index):
-    """`results` with `meta.memory_id` filled in on every item the index says
-    is in memory (a copy; the cached rows are never changed)."""
+    """`results` with `meta.memory_id` (an exact match) or
+    `meta.thread_memory_id` (only the thread is in memory) filled in on every
+    item the index knows (a copy; the cached rows are never changed)."""
     if not index:
         return results
     out = []
@@ -274,10 +296,15 @@ def annotate_memory(results, index):
         rows = []
         for item in res.items:
             meta = item.get("meta")
-            mid = memory_id_for(meta, index)
-            if mid and (not isinstance(meta, dict)
-                        or meta.get("memory_id") != mid):
-                item = dict(item, meta=dict(meta, memory_id=mid))
+            exact, thread = memory_match(meta, index)
+            if isinstance(meta, dict):
+                add = {}
+                if exact and meta.get("memory_id") != exact:
+                    add["memory_id"] = exact
+                if thread and meta.get("thread_memory_id") != thread:
+                    add["thread_memory_id"] = thread
+                if add:
+                    item = dict(item, meta=dict(meta, **add))
             rows.append(item)
         out.append(res._replace(items=rows))
     return out
@@ -378,7 +405,9 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     """The built-in source: recent events as items. Never raises.
 
     Calendar events of kind `rsvp` (other people answering the owner's
-    invites) are left out unless `show_rsvp_replies` is true.
+    invites) are left out unless `show_rsvp_replies` is true: an item whose
+    newest event (per source id) is an RSVP reply is not listed, so an older
+    `new` or `update` row of the same event does not show in its place.
 
     `email_routines` (a set of routine ids, or None for no filter) keeps only
     the Gmail events written by those routines; see `daemoncfg.label_routines`.
@@ -396,10 +425,6 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     cutoff = now - float(window_h) * 3600
     latest = {}  # one row per source_id: the newest event wins
     for event in events:
-        if (not show_rsvp_replies and isinstance(event, dict)
-                and event.get("source") == "gcal"
-                and event.get("kind") == "rsvp"):
-            continue
         try:
             item = event_to_item(event, now, rules, gmail_account)
         except (itm.ItemError, TypeError, ValueError):
@@ -416,6 +441,9 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     recovery = recovery if recovery is not None else Recovery(base_dir)
     rows, alerts = [], {}
     for item in latest.values():
+        if (not show_rsvp_replies and item["source"] == "calendar"
+                and item["meta"].get("kind") == "rsvp"):
+            continue
         if item["source"] == "alert":
             # The newest alert per key wins, whatever its source_id.
             key = item["meta"].get("key")

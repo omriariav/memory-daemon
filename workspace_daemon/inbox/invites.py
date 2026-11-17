@@ -157,22 +157,28 @@ def _organizers(path):
 
 def _attendees(row):
     """`(names, total, known)` from a snapshot row: the named people (rooms
-    and groups skipped, a nameless or address-like entry counted but not
-    named), how many people there are, and whether that number is firm.
-    Anything of the wrong type is ignored."""
+    and groups skipped, declined guests and the owner left out, a nameless or
+    address-like entry not named), how many people there are, and whether that
+    number is firm. `attendee_count` (the cache already leaves declined guests
+    out of it) is trusted when it is a valid integer; the listed people are
+    counted only when it is missing or invalid. Anything of the wrong type is
+    ignored."""
     people = row.get("attendees")
     names, listed = [], 0
     for person in people if isinstance(people, list) else []:
-        if not isinstance(person, dict) or person.get("group") is True:
+        if (not isinstance(person, dict) or person.get("group") is True
+                or person.get("response") == "declined"):
             continue
         listed += 1
+        if person.get("self") is True:
+            continue  # the owner is counted, never named
         name = _name(person.get("name"), NAME_MAX)
         if name:
             names.append(name)
     count = row.get("attendee_count")
     total = count if (isinstance(count, int) and not isinstance(count, bool)
-                      and count >= 0) else 0
-    return names, max(total, listed), row.get("attendees_known") is not False
+                      and count >= 0) else listed
+    return names, total, row.get("attendees_known") is not False
 
 
 def _attendees_line(names, total, known):
@@ -239,23 +245,36 @@ def _busy(rows):
 
 
 def _conflicts(busy, key, start_ts, end_ts, all_day):
-    """The busy rows that overlap `[start_ts, end_ts)` (touching edges do
-    not), leaving out the invite's own series."""
+    """`(clashes, also_pending)`: the busy rows that overlap
+    `[start_ts, end_ts)` (touching edges do not), leaving out the invite's own
+    series. A clash is with something you are going to or organize; an overlap
+    with another unanswered invite is only "also pending" (information, not a
+    warning, since you can still decline one)."""
     if all_day or end_ts <= start_ts:
-        return []
-    return [b for b in busy
+        return [], []
+    hits = [b for b in busy
             if b[0] < end_ts and b[1] > start_ts and b[2] != key]
+    return ([b for b in hits if b[4] != "pending"],
+            [b for b in hits if b[4] == "pending"])
+
+
+def _span(b, start_ts):
+    """`10:30-11:00`; with the date when the other event is not on the
+    invite's day."""
+    if (_clock(b[0], "%Y%m%d") == _clock(start_ts, "%Y%m%d")
+            and _clock(b[1], "%Y%m%d") == _clock(b[0], "%Y%m%d")):
+        return _clock(b[0], "%H:%M") + "-" + _clock(b[1], "%H:%M")
+    return describe_when(b[0], b[1], False)
 
 
 def _conflict_line(b, start_ts):
-    """`⚠ Title 10:30-11:00 (label)`; the date is added when the other event
-    is not on the invite's day."""
-    if (_clock(b[0], "%Y%m%d") == _clock(start_ts, "%Y%m%d")
-            and _clock(b[1], "%Y%m%d") == _clock(b[0], "%Y%m%d")):
-        span = _clock(b[0], "%H:%M") + "-" + _clock(b[1], "%H:%M")
-    else:
-        span = describe_when(b[0], b[1], False)
-    return f"\u26a0 {b[3]} {span} ({b[4]})"
+    """`⚠ Title 10:30-11:00 (label)`."""
+    return f"\u26a0 {b[3]} {_span(b, start_ts)} ({b[4]})"
+
+
+def _pending_line(b, start_ts):
+    """`Title 10:30-11:00`: another unanswered invite at the same time."""
+    return f"{b[3]} {_span(b, start_ts)}"
 
 
 def _gist(title, when, organizer, warn=False):
@@ -353,7 +372,7 @@ def build(data, now, days=DEFAULT_DAYS):
         link = row.get("conference")
         link = link if itm.valid_link(link) else None
         att_names, att_total, att_known = _attendees(row)
-        clashes = _conflicts(busy, key, start_ts, end_ts, all_day)
+        clashes, pending_too = _conflicts(busy, key, start_ts, end_ts, all_day)
         thread = [{"who": "subject", "ts": start_ts,
                    "text": itm.truncate(title, SUBJECT_MAX)},
                   {"who": "when", "ts": start_ts, "text": when}]
@@ -372,6 +391,12 @@ def build(data, now, days=DEFAULT_DAYS):
         if len(clashes) > CONFLICTS_SHOWN:
             thread.append({"who": "conflict", "ts": start_ts,
                            "text": f"+{len(clashes) - CONFLICTS_SHOWN} more"})
+        for other in pending_too[:CONFLICTS_SHOWN]:
+            thread.append({"who": "also pending", "ts": start_ts,
+                           "text": _pending_line(other, start_ts)})
+        if len(pending_too) > CONFLICTS_SHOWN:
+            thread.append({"who": "also pending", "ts": start_ts,
+                           "text": f"+{len(pending_too) - CONFLICTS_SHOWN} more"})
         try:
             built.append(itm.make_item(
                 id=f"invites:{key}", source="calendar", section="needs_reply",
@@ -390,6 +415,7 @@ def build(data, now, days=DEFAULT_DAYS):
                       "attendee_count": att_total if att_known else None,
                       "attendees_known": att_known,
                       "conflicts": len(clashes),
+                      "also_pending": len(pending_too),
                       "source_id": f"gcal:{event_id}"}))
         except itm.ItemError:
             skipped += 1

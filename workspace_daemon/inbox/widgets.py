@@ -15,6 +15,7 @@ from .models import SECTIONS, SOURCES, thread_note
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
+THREAD_GLYPH = "◇"  # only the item's Slack thread is in memory
 ITEM_PREFIX = "i:"  # Option id of an item row; item ids are arbitrary text
 
 
@@ -178,8 +179,11 @@ class Queue(OptionList):
             t.append(" !", Style(color=pal["warn"], bold=True))
         if it.saved:  # saved to memory (m): a small glyph, the row stays
             t.append(" " + SAVED_GLYPH, Style(color=pal["ok"]))
+        elif it.thread_memory_id:  # its thread is in memory, not this message
+            t.append(" " + THREAD_GLYPH, Style(color=pal["muted"]))
+        marked = it.saved or bool(it.thread_memory_id)
         where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9
-                                  - (2 if it.saved else 0) - (2 if it.hint else 0)))
+                                  - (2 if marked else 0) - (2 if it.hint else 0)))
         if where:
             t.append("  " + where, Style(color=pal["muted"]))
         pad = max(1, width - t.cell_len - cell_len(age))
@@ -224,6 +228,9 @@ class ThreadView(VerticalScroll):
         if item.memory_id:  # already saved to memory (the ◆ of the row)
             out.append(f"{SAVED_GLYPH} In memory: {item.memory_id}\n",
                        Style(color=pal["ok"]))
+        elif item.thread_memory_id:
+            out.append(f"{THREAD_GLYPH} Thread in memory: "
+                       f"{item.thread_memory_id}\n", Style(color=pal["muted"]))
         note = thread_note(item)
         if note:  # one dim line above the thread; alone when the thread is empty
             out.append(vis(note, visual) + "\n", Style(color=pal["muted"], dim=True))

@@ -1471,6 +1471,25 @@ class InboxApp(App):
             "Possible duplicate", rows, "Save anyway",
             "Saving anyway adds another memory.", self.bidi), after)
 
+    def _confirm_thread_saved(self, it):
+        """The item's Slack thread is already in memory, this message may not
+        be: the same choice as a likely duplicate."""
+        rows = [("Said", "The thread is already in memory"),
+                ("Thread memory", it.thread_memory_id), ("Gist", it.gist)]
+
+        def after(ok):
+            if ok:
+                self._enqueue("save", it, f"Save anyway: {it.who}", hide=False,
+                              detail="save anyway", force=True)
+            else:
+                self.record("save", it, "thread in memory: not saved",
+                            "cancelled")
+                self.notify("Not saved: the thread is already in memory.",
+                            timeout=3, markup=False)
+        self.push_screen(ConfirmWrite(
+            "Thread already in memory", rows, "Save anyway",
+            "Saving anyway adds another memory.", self.bidi), after)
+
     def action_save_memory(self):
         """m: save the item to memory through the configured command."""
         it = self.current
@@ -1490,6 +1509,9 @@ class InboxApp(App):
             return
         if it.key in self.dups:        # the command asked about a duplicate
             self._confirm_save_anyway(*self.dups[it.key])
+            return
+        if it.thread_memory_id:        # only the thread is in memory
+            self._confirm_thread_saved(it)
             return
         label = SOURCES.get(it.source, SOURCES["other"])[2]
         rows = [("Source", f"{label} · {it.where}"), ("From", it.who),

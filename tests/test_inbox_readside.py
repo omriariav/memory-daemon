@@ -121,9 +121,12 @@ class ShowAllTest(TmpBase):
 
 # --- richer invite items (0.8.0) --------------------------------------------
 
-def person(name, email=None, group=False):
+def person(name, email=None, group=False, response=None, me=False):
     email = email or f"{(name or 'x').split()[0].lower()}@example.com"
-    return {"name": name, "email": email, "group": group}
+    out = {"name": name, "email": email, "group": group, "self": me}
+    if response:
+        out["response"] = response
+    return out
 
 
 class InviteDetailsTest(TmpBase):
@@ -184,6 +187,37 @@ class InviteDetailsTest(TmpBase):
         self.assertEqual(item["meta"]["attendees"],
                          ["Ann Lee", "Bob Ray", "Di Park"])
         self.assertEqual(item["meta"]["attendee_count"], 6)
+
+    def test_declined_guests_and_the_owner_are_not_named(self):
+        item = self.one(attendee_count=4, attendees_known=True, attendees=[
+            person("Me Owner", me=True, response="accepted"),
+            person("Ann Lee", response="accepted"),
+            person("Bob Ray", response="declined"),
+            person("Cy Dean", response="tentative"),
+            person("Di Park", response="declined", me=False)])
+        (line,) = self.lines(item, "attendees")
+        self.assertEqual(line, "4 people: Ann Lee, Cy Dean, +2 more")
+        self.assertEqual(item["meta"]["attendees"], ["Ann Lee", "Cy Dean"])
+        self.assertNotIn("Me Owner", json.dumps(item["thread"]))
+        self.assertNotIn("Bob Ray", json.dumps(item))
+
+    def test_a_valid_attendee_count_is_trusted_over_the_list(self):
+        listed = [person("Ann Lee"), person("Bob Ray"), person("Cy Dean")]
+        item = self.one(attendee_count=2, attendees_known=True,
+                        attendees=listed)
+        self.assertEqual(item["meta"]["attendee_count"], 2)
+        self.assertTrue(self.lines(item, "attendees")[0].startswith("2 people"))
+
+    def test_the_listed_people_count_when_the_count_is_missing_or_bad(self):
+        listed = [person("Ann Lee"), person("Bob Ray", response="declined"),
+                  person("Room 4", group=True), person("Me", me=True)]
+        for bad in ({}, {"attendee_count": "9"}, {"attendee_count": True},
+                    {"attendee_count": -1}, {"attendee_count": None}):
+            item = self.one(attendees_known=True, attendees=listed, **bad)
+            # Ann and the owner: the declined guest and the room do not count
+            self.assertEqual(item["meta"]["attendee_count"], 2, bad)
+            self.assertEqual(self.lines(item, "attendees"),
+                             ["2 people: Ann Lee, +1 more"], bad)
 
     def test_attendee_names_are_capped(self):
         many = [person(f"Guest {i}") for i in range(40)]
@@ -265,7 +299,6 @@ class InviteDetailsTest(TmpBase):
 
     def test_labels(self):
         for kw, label in (({"rsvp": "tentative"}, "tentative"),
-                          ({"rsvp": "needsAction"}, "pending"),
                           ({"rsvp": None, "organizer": {"name": "Me",
                                                         "self": True}},
                            "organizer"),
@@ -273,6 +306,33 @@ class InviteDetailsTest(TmpBase):
             item = self.clash(row(3, 4, title="Other", **kw))
             (line,) = self.lines(item, "conflict")
             self.assertTrue(line.endswith(f"({label})"), (kw, line))
+
+    def test_a_clash_with_another_pending_invite_is_not_a_warning(self):
+        item = self.clash(row(3.5, 4.5, rsvp="needsAction", title="Other invite"))
+        s, e = (time.strftime("%H:%M", time.localtime(NOW + h * H))
+                for h in (3.5, 4.5))
+        self.assertEqual(self.lines(item, "conflict"), [])
+        self.assertEqual(self.lines(item, "also pending"),
+                         [f"Other invite {s}-{e}"])
+        self.assertEqual(item["meta"]["conflicts"], 0)
+        self.assertEqual(item["meta"]["also_pending"], 1)
+        self.assertFalse(item["gist"].startswith("\u26a0"))
+        self.assertNotIn("\u26a0", json.dumps(item["thread"]))
+
+    def test_warning_and_pending_overlaps_are_counted_apart(self):
+        rows = {"inv": row(3, 4, title="Invite"),
+                "a": row(3, 4, rsvp="accepted", title="Going"),
+                "p": row(3, 4, title="Pending one")}
+        for i in range(7):
+            rows[f"q{i}"] = row(3, 4, title=f"More {i}")
+        item = self.build(rows)["inv"]
+        self.assertEqual(item["meta"]["conflicts"], 1)
+        self.assertEqual(item["meta"]["also_pending"], 8)
+        self.assertTrue(item["gist"].startswith("\u26a0 "))
+        pending = self.lines(item, "also pending")
+        self.assertEqual(len(pending), 6)
+        self.assertEqual(pending[-1], "+3 more")
+        self.assertEqual(itm.validate_item(item), [])
 
     def test_touching_edges_are_not_a_clash(self):
         for other in (row(2, 3, rsvp="accepted"), row(4, 5, rsvp="accepted")):
