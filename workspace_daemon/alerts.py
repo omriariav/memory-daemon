@@ -53,9 +53,11 @@ Every alert's details may also say why (all optional; see `cause_of`):
   text per alert-key prefix (`alert_remedies`, see `load_remedies`).
 - `connector`: the connector's server name, when the cause names one.
 
-"meeting match" (a recording not matched to a calendar meeting) and a memory
-sink error that is only a near-duplicate are review items, not failures: they
-never raise `attention:` by themselves.
+A recording still being matched to a calendar meeting ("meeting match") and
+a memory sink issue whose every stored error (last day) is a near-duplicate
+are review items, not failures: they never raise `attention:` by themselves.
+A recording whose match is final, seen in the last day, was not captured and
+does raise it ("N meeting not captured").
 
 Budget conditions carry spend by routine. Deduplication state lives in
 `state/alerts.json`; `state/alerts.lock` keeps concurrent ticks (capture,
@@ -92,11 +94,13 @@ TRANSIENT_ISSUES = ("incomplete", "overlap", "interrupted")
 # status's wording for a failed last tick; the streak rules replace it.
 _LAST_RUN_ISSUE = re.compile(r"^(?:\d+ last-run errors?|last run)$")
 
-# Review items, not failures: a recording that matched no calendar meeting,
-# and (when the log says so) a memory sink error that is a near-duplicate.
+# Review items, not failures: a recording still being matched to a calendar
+# meeting, and a memory sink issue made only of near-duplicates. A recording
+# whose match is final was not captured, which does alert (see _ledger_facts).
 _REVIEW_ISSUE = re.compile(r"^\d+ meeting match$")
 _MEMORY_SINK_LINE = re.compile(r"^routine=\S+ memory ERROR\b")
 _MEMORY_SINK_ISSUE = re.compile(r"^\d+ memory sink$")
+_UNCAPTURED_ISSUE = re.compile(r"^\d+ meeting not captured$")
 
 LOG_TAIL_BYTES = 256 * 1024
 LAST_ERROR_CHARS = 160
@@ -124,14 +128,16 @@ REMEDIES = {
     "unknown": "Run `daemon.py status` and read logs/run.log for the routine",
 }
 _UNNAMED_SERVER = "affected"
+# Only the bridge's own tag and the connector's explicit sign-in phrases
+# mean an auth failure: a message body (a memory CLI error echoing a note,
+# say) may contain any auth word.
 _AUTH_MARKERS = (
-    "unauthenticated", "unauthorized", "invalid api key", "authentication",
-    "invalid_auth", "not_authed", "token_expired", "token_revoked",
-    "invalid_grant", "auth failed", "sign in again", "re-authenticate",
-    "reauthenticate",
+    "(auth failed)", "sign in again", "re-authenticate", "reauthenticate",
 )
+# Not "timed out": the Claude CLI itself times out too, and says nothing
+# about a connector.
 _DOWN_MARKERS = (
-    "timed out", "connection refused", "connection reset", "not connected",
+    "connection refused", "connection reset", "not connected",
     "failed to connect", "could not resolve host", "name or service not known",
     "network is unreachable", "service unavailable", "mcp server",
     "had no init event",
@@ -142,9 +148,22 @@ _BUDGET_MARKERS = ("budget exhausted", "daily budget", "budget cap")
 _MCP_SERVER = re.compile(r"\bmcp__([A-Za-z0-9][A-Za-z0-9_-]*?)__")
 _URL = re.compile(r"https?://\S+")
 _EMAIL = re.compile(r"[^\s<>@]+@[^\s<>@]+\.[A-Za-z]{2,}")
+# `id=...` and `thread_id=...` tokens are dropped whole.
+_ID_FIELD = re.compile(r"(?<![A-Za-z0-9])((?:\w+_)?id)=\S+")
+# Slack-shaped ids (a channel, user, group or workspace letter then 8-11
+# capitals and digits, at least one digit).
+_SLACK_ID = re.compile(r"\b[CDGUW](?=[A-Z0-9]*\d)[A-Z0-9]{8,11}\b")
 # Digit runs, and long tokens that mix letters and digits (ids, hashes).
 _ID_LIKE = re.compile(
     r"\b(?:\d{5,}|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{12,})\b")
+# Names such as mcp__srv2__tool or claude-sonnet-4-5: lowercase words joined
+# by - or _, never an id.
+_IDENTIFIER = re.compile(r"^[a-z]+(?:[-_]+[A-Za-z0-9]+)+$")
+
+
+def _mask_id(match):
+    token = match.group(0)
+    return token if _IDENTIFIER.match(token) else "<id>"
 
 
 def read_log_tail(path, cap=LOG_TAIL_BYTES):
@@ -166,7 +185,9 @@ def clean_error(message, routine_id=None):
         text = text.replace(f"routine={routine_id} ", "", 1)
     text = _URL.sub("<url>", text)
     text = _EMAIL.sub("<email>", text)
-    text = _ID_LIKE.sub("<id>", text)
+    text = _ID_FIELD.sub(r"\1=<id>", text)
+    text = _SLACK_ID.sub("<id>", text)
+    text = _ID_LIKE.sub(_mask_id, text)
     return events.one_line(text, LAST_ERROR_CHARS)
 
 
@@ -429,13 +450,40 @@ def _outcome_cause(outcome):
     return "connector_down"
 
 
-def _diagnose(lines, rid, streak, issues, failing, now, failures):
+def _ledger_facts(base_dir, now):
+    """{routine: {"memory_errors": [text], "uncaptured": n}} from the ledger.
+
+    Both count only the last MEMORY_ERROR_WINDOW_SECONDS, as `status` does.
+    `uncaptured` is recordings whose calendar match is final: the transcript
+    was not captured. A ledger that cannot be read gives nothing.
+    """
+    try:
+        ledger = state.load(base_dir)
+    except Exception:  # noqa: BLE001 - routine_rows reports it
+        return {}
+    facts = {}
+    for entry in ledger.values():
+        if not status._within(entry.get("processed_at"), now,
+                              status.MEMORY_ERROR_WINDOW_SECONDS):
+            continue
+        row = facts.setdefault(entry.get("rule_id"),
+                               {"memory_errors": [], "uncaptured": 0})
+        if entry.get("memory_error"):
+            row["memory_errors"].append(str(entry["memory_error"]))
+        if (entry.get("calendar_match_rejected")
+                and entry.get("calendar_match_final")):
+            row["uncaptured"] += 1
+    return facts
+
+
+def _diagnose(lines, rid, streak, issues, failing, now, failures, facts):
     """(issues without review items, details) for one routine's attention.
 
     Reads the routine's ERROR/FATAL lines since its streak began and says
     what they mean. Near-duplicate memory errors are review items: the memory
-    sink issue is dropped when the newest memory error of the last day is
-    one, and so is the streak when every error of it is one.
+    sink issue is dropped when every memory error the ledger holds for the
+    last day is one (a real error beside a near-duplicate still alerts, in
+    any order), and the streak is dropped when every error line of it is one.
     """
     since = (streak or {}).get("started_at") or (streak or {}).get(
         "first_error_at")
@@ -447,9 +495,9 @@ def _diagnose(lines, rid, streak, issues, failing, now, failures):
         return bool(_MEMORY_SINK_LINE.match(message)
                     and _is_near_duplicate(message))
 
-    memory = [m for _, m in recent if _MEMORY_SINK_LINE.match(m)]
+    stored = facts.get("memory_errors", [])
     dropped = set()
-    if memory and duplicate(memory[0]):
+    if stored and all(_is_near_duplicate(m) for m in stored):
         dropped.update(i for i in issues if _MEMORY_SINK_ISSUE.match(i))
     if failing and errors and all(duplicate(m) for _, m in errors):
         dropped.add(failing)
@@ -474,8 +522,10 @@ def _diagnose(lines, rid, streak, issues, failing, now, failures):
             # "no usable result" hides why; the usage log may know.
             if _outcome_cause(failures[server][2]) == "connector_auth":
                 cause = "connector_auth"
+    elif all(_UNCAPTURED_ISSUE.match(i) for i in issues):
+        cause = "meeting_match"
     details["cause"] = cause
-    if server and cause in ("connector_auth", "connector_down"):
+    if server and cause in ("connector_auth", "connector_down", "tool_error"):
         details["connector"] = server
     details["remedy"] = remedy_for(cause, server)
     return issues, details
@@ -487,18 +537,22 @@ def health_conditions(base_dir, routines, entries, now):
     log_path = Path(base_dir) / "logs" / "run.log"
     history = status.read_tick_history(log_path)
     lines = read_log_tail(log_path)
+    facts = _ledger_facts(base_dir, now)
     failures = ({} if isinstance(entries, claude_bridge.BridgeError)
                 else _connector_failures(entries))
     for row in status.routine_rows(base_dir, routines, history, now=now):
         if row["armed"] != "yes":
             continue
         rid = row["routine"]
+        mine = facts.get(rid, {})
         issues = [
             issue for issue in row["issues"].split(", ")
             if issue != "-" and issue not in TRANSIENT_ISSUES
             and not _LAST_RUN_ISSUE.match(issue)
             and not _REVIEW_ISSUE.match(issue)
         ]
+        if mine.get("uncaptured"):
+            issues.append(f"{mine['uncaptured']} meeting not captured")
         failing = _failing_streak(history, rid)
         if failing:
             issues.append(failing)
@@ -511,16 +565,20 @@ def health_conditions(base_dir, routines, entries, now):
                  "cause": "run_state", "since": run["first_at"],
                  "remedy": remedy_for("run_state")},
             )
+        if not issues:
+            continue
         issues, details = _diagnose(
             lines, rid, history.get("streaks", {}).get(rid), issues, failing,
-            now, failures)
+            now, failures, mine)
         if issues:
-            cause = details.get("cause")
+            # The short form names the cause in place of the streak text, so
+            # it needs a streak to replace.
+            named = failing in issues and details.get("cause") in _CAUSE_TEXT
             text = ", ".join(
-                _CAUSE_TEXT.get(cause, i) if i == failing and cause in
-                _CAUSE_TEXT else i for i in issues)
+                _CAUSE_TEXT[details["cause"]] if named and i == failing
+                else i for i in issues)
             found[f"attention:{rid}"] = (
-                f"{rid}: {text}" if cause in _CAUSE_TEXT
+                f"{rid}: {text}" if named
                 else f"{rid} needs attention: {text}",
                 {"routine": rid, "issues": issues, **details},
             )

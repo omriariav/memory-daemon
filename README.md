@@ -1959,7 +1959,7 @@ only after it clears.
 | `budget-invalid` | `state/budget.yaml` is malformed and routines are held because of it |
 | `usage-unreadable` | `state/claude-usage.jsonl` cannot be read; lists routines held because spend is unknown, and alerts even when none are, since spend and connector health are then unknown |
 | `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
-| `attention:<routine>` | `status` shows the routine as attention, ignoring `meeting match` (a recording not matched to a calendar meeting: a review task), a `memory sink` issue whose newest memory error is a near-duplicate, `incomplete` and `overlap` (a tick running in another group) and `interrupted` (every failure line of the tick names a measured sleep or a dead network such as an unresolvable host; timeouts, refused connections, rate-limit, quota and auth failures stay errors, and one real error makes the tick an error). Last-run errors alert only on a streak: the last 3 ticks in a row failed (interrupted ticks neither count nor break the streak, a clean tick resets it), or the routine has had no clean tick for 2 hours of awake time since the streak's first error. Awake time adds up the gaps between consecutive daemon ticks of any group; a gap over 30 minutes is sleep and adds nothing. Other issue kinds alert at once |
+| `attention:<routine>` | `status` shows the routine as attention, ignoring `meeting match` (a recording still being matched to a calendar meeting: a review task; `status` counts only the last 24 hours), a `memory sink` issue whose every memory error of the last 24 hours is a near-duplicate (one real error beside them still alerts), `incomplete` and `overlap` (a tick running in another group) and `interrupted` (every failure line of the tick names a measured sleep or a dead network such as an unresolvable host; timeouts, refused connections, rate-limit, quota and auth failures stay errors, and one real error makes the tick an error). Last-run errors alert only on a streak: the last 3 ticks in a row failed (interrupted ticks neither count nor break the streak, a clean tick resets it), or the routine has had no clean tick for 2 hours of awake time since the streak's first error. Awake time adds up the gaps between consecutive daemon ticks of any group; a gap over 30 minutes is sleep and adds nothing. Other issue kinds alert at once |
 | `interrupted:<routine>` | safety net for outages: at least 3 ticks in a row were interrupted (no clean or error tick between) and 2 hours of awake time passed since the first. A routine that is merely off schedule does not trigger it. It has its own key, so a change from outages to errors alerts again |
 | `connector:<server>` | a connector's last error has been newer than its last success for over an hour, counted from the first error since that success |
 
@@ -1973,11 +1973,19 @@ Every alert's `details` may also say why. All of these fields are optional:
 | `remedy` | one short generic sentence, such as `Sign in to the <server> connector again (in Claude Code: /mcp), then the routine retries on its next run` |
 | `connector` | the connector's server name, when the cause names one |
 
-When the cause is known the alert text says it (`zoom-meetings: connector
-sign-in expired`) instead of `1 last-run error`. `memory_duplicate` and
-`meeting_match` never raise `attention:` on their own: a streak whose every
-error is a near-duplicate, and a lone `meeting match`, stay out of the alert
-(`status` still lists them). To add or replace remedy text, set
+When the cause is `connector_auth`, `connector_down`, `tool_error` or
+`budget` and a failure streak raised the alert, the alert text names the cause
+in place of the streak text (`N failed runs in a row`): `zoom-meetings:
+connector sign-in expired`, `connector not answering`, `connector tool error`
+or `budget cap reached`. Any other issue stays listed after it. Every other
+case keeps `<routine> needs attention: ...`. `connector_auth` is only set from
+the bridge's own `(auth failed)` tag or an explicit "sign in again" /
+"re-authenticate" message, never from words in a message body.
+`memory_duplicate` never raises `attention:` on its own: a streak whose every
+error is a near-duplicate stays out of the alert (`status` still lists it).
+`meeting_match` raises it only when a recording's calendar match is final in
+the last 24 hours, which means the transcript was not captured (`N meeting not
+captured`). To add or replace remedy text, set
 `alert_remedies` in the optional `state/daemon.yaml`, a map from alert-key
 prefix to text; the longest matching prefix wins, `{server}` and `{routine}`
 are filled in, and a text is cut to 300 characters:
@@ -2003,7 +2011,12 @@ sleep or offline outage is retried once, 10 seconds later, in the same tick
 The retry repeats the whole source listing, so a failing source can cost up to
 twice its usual listing, and the scheduler holds `run.lock` for the 10 seconds.
 Both attempts are logged, each is charged as its own call under the routine's
-cap, and cursors move only after the whole source succeeds. A tick held by a
+cap, and cursors move only after the whole source succeeds.
+A tool error the bridge tagged `(auth failed)` that names a connector (an expired
+sign-in) stops the rest of that routine's candidates for the run, but not other
+routines': one connector's sign-in says nothing about the others. Other shared
+failures (network down, rate limit, quota) still stop every routine's remaining
+candidates. A tick held by a
 budget cap is written as `held=<ids>` on its done line and neither counts toward
 nor resets a failure streak.
 

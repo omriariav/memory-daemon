@@ -44,6 +44,16 @@ def _is_shared_dependency_failure(value):
     return any(marker in text for marker in _SHARED_DEPENDENCY_ERRORS)
 
 
+def _is_connector_auth_failure(value):
+    """A tool error the bridge tagged "(auth failed)" and that names a connector.
+
+    One connector's expired sign-in says nothing about the others, so it
+    stops only the routine that hit it (see _run_owned), not the whole tick.
+    """
+    text = str(value).casefold()
+    return "(auth failed)" in text and "mcp__" in text
+
+
 def _retryable_tool_error(exc, source):
     """True for a connector tool error worth one more try in the same tick.
 
@@ -2339,6 +2349,8 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
     rid = routine["id"]
     person_resolver.new_run()
     shared_circuit = {} if shared_circuit is None else shared_circuit
+    # Opened by one connector's expired sign-in: stops this routine only.
+    own_circuit = {}
     failed_source_keys = set()
     circuit_reported = False
 
@@ -2452,13 +2464,14 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 )
                 circuit_reported = True
             continue
-        if shared_circuit and not dry_run:
+        if (shared_circuit or own_circuit) and not dry_run:
             hold_claim(claim)
             totals["skipped"] += 1
             if not circuit_reported:
                 log(
                     f"routine={rid} dependency circuit open after: "
-                    f"{shared_circuit['error']}; deferring remaining candidates"
+                    f"{(shared_circuit or own_circuit)['error']}; "
+                    "deferring remaining candidates"
                 )
                 circuit_reported = True
             continue
@@ -2512,7 +2525,9 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
                 and outcome_record.get("memory_error")
                 and _is_shared_dependency_failure(outcome_record["memory_error"])
             ):
-                shared_circuit["error"] = outcome_record["memory_error"]
+                (own_circuit if _is_connector_auth_failure(
+                    outcome_record["memory_error"]) else shared_circuit
+                 )["error"] = outcome_record["memory_error"]
             if isinstance(outcome_record, dict) and outcome_record.get("memory_held"):
                 hold_claim(claim)
                 totals["skipped"] += 1
@@ -2542,7 +2557,8 @@ def _run_owned(routine, claims, processed, label_catalog, dry_run, totals,
             totals["errors"] += 1
             log(f"routine={rid} ERROR id={candidate['id']}: {exc}")
             if _is_shared_dependency_failure(exc):
-                shared_circuit["error"] = str(exc)[:300]
+                (own_circuit if _is_connector_auth_failure(exc)
+                 else shared_circuit)["error"] = str(exc)[:300]
             transcript_module = TRANSCRIPT_SOURCES.get(
                 claim["source"].get("kind")
             )

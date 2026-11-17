@@ -21,14 +21,12 @@ class ClassifyTest(unittest.TestCase):
             (AUTH, "connector_auth"),
             ("MCP server needs you to sign in again (run /mcp to "
              "re-authenticate)", "connector_auth"),
-            ("slack said token_expired", "connector_auth"),
-            ("slack said invalid_auth", "connector_auth"),
-            ("claude said unauthenticated", "connector_auth"),
             ("daily budget exhausted", "budget"),
             ("memory add failed (exit 2): near-duplicate of x",
              "memory_duplicate"),
             ("not captured: Calendar match confidence=low", "meeting_match"),
             ("connection refused by the connector", "connector_down"),
+            ("claude run timed out after 180s", "unknown"),
             ("claude stream had no init event", "connector_down"),
             ("tool returned no usable result: mcp__demo_srv__x", "tool_error"),
             ("tool returned an error: mcp__demo_srv__x", "tool_error"),
@@ -36,6 +34,14 @@ class ClassifyTest(unittest.TestCase):
             ("something odd happened", "unknown"),
         ):
             self.assertEqual(alerts.cause_of(text), cause, text)
+
+    def test_auth_words_in_a_message_body_are_not_auth(self):
+        for text in (
+            "routine=r memory ERROR: memory add failed (exit 1): the note "
+            "says authentication, unauthorized and token_expired",
+            "claude said invalid_auth and unauthenticated",
+        ):
+            self.assertNotEqual(alerts.cause_of(text), "connector_auth", text)
 
     def test_server_comes_from_the_tool_name(self):
         self.assertEqual(alerts.server_of(AUTH), "demo_srv")
@@ -61,6 +67,28 @@ class CleanErrorTest(unittest.TestCase):
         out = alerts.clean_error(text, "r1")
         self.assertEqual(
             out, "source=x FATAL: failed for <id> <id> <email> <url> item 42 ok")
+
+    def test_id_fields_and_slack_ids_are_removed(self):
+        # Built from pieces so the source holds no id-shaped literal.
+        chan, user, group = "C" + "08AB12CD", "U" + "02ABCD3EF", "G" + "01234ABC"
+        out = alerts.clean_error(
+            f"routine=r1 ERROR id=slack:{chan}:1700000000.123456: boom", "r1")
+        self.assertEqual(out, "ERROR id=<id> boom")
+        out = alerts.clean_error(f"user {user} not found in {group}")
+        self.assertEqual(out, "user <id> not found in <id>")
+        self.assertEqual(alerts.clean_error("thread_id=t-9 gone"),
+                         "thread_id=<id> gone")
+
+    def test_plain_capitals_are_not_slack_ids(self):
+        text = "CONN" + "ECTION DROPPED"
+        self.assertEqual(alerts.clean_error(text), text)
+
+    def test_names_with_digits_are_kept(self):
+        text = ("tool returned an error: mcp__srv2__get_things_v2 "
+                "for claude-sonnet-4-5")
+        self.assertEqual(alerts.clean_error(text), text)
+        self.assertEqual(alerts.clean_error("hash 9f86d081884c7d659a2f"),
+                         "hash <id>")
 
     def test_cut_to_160_characters(self):
         out = alerts.clean_error("word " * 100)
@@ -161,6 +189,13 @@ class AttentionCauseTest(CauseBase):
         last = event["details"]["last_error"]
         self.assertLessEqual(len(last), alerts.LAST_ERROR_CHARS)
         self.assertNotIn("99887766554433", last)
+
+    def test_tool_error_names_the_connector_for_overrides(self):
+        self.fail("tool returned an error: mcp__demo_srv__list_things")
+        self.check()
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["cause"], "tool_error")
+        self.assertEqual(event["details"]["connector"], "demo_srv")
 
     def test_unknown_error_keeps_the_old_title(self):
         self.fail("something odd happened")
@@ -270,24 +305,90 @@ class ReviewItemTest(CauseBase):
         self.assertEqual(self.emitted()[0]["details"]["issues"],
                          ["1 source expansion"])
 
-    def sink_error(self, text):
-        state.save(self.base, {"a": {
-            "rule_id": "slack-direct", "processed_at": stamp(START),
-            "memory_error": "x"}})
-        self.log.lines.append(
-            f"{stamp(START + 5)} routine=slack-direct memory ERROR: {text}")
+    def test_routines_without_issues_are_not_diagnosed(self):
+        from unittest import mock
+        with mock.patch.object(alerts, "_diagnose") as diagnose:
+            self.assertEqual(self.run_check(), [])
+        diagnose.assert_not_called()
+
+    DUP = "memory add failed (exit 2): near-duplicate of e1"
+    REAL = "memory add failed (exit 1): store locked"
+
+    def sink_errors(self, *texts):
+        """One ledger row per stored error (oldest first), and its log line."""
+        rows = {}
+        for n, text in enumerate(texts):
+            rows[f"r{n}"] = {
+                "rule_id": "slack-direct",
+                "processed_at": stamp(START + n), "memory_error": text}
+            self.log.lines.append(
+                f"{stamp(START + n)} routine=slack-direct memory ERROR: {text}")
+        state.save(self.base, rows)
         self.log.flush()
 
     def test_near_duplicate_memory_error_raises_nothing(self):
-        self.sink_error("memory add failed (exit 2): near-duplicate of e1")
+        self.sink_errors(self.DUP)
         self.assertEqual(self.run_check(), [])
 
-    def test_other_memory_error_still_alerts_with_its_line(self):
-        self.sink_error("memory add failed (exit 1): store locked")
+    def test_only_near_duplicates_raise_nothing(self):
+        self.sink_errors(self.DUP, self.DUP)
+        self.assertEqual(self.run_check(), [])
+
+    def test_real_error_after_a_near_duplicate_still_alerts(self):
+        self.sink_errors(self.DUP, self.REAL)
         self.assertEqual(self.run_check(), ["attention:slack-direct"])
         details = self.emitted()[0]["details"]
-        self.assertEqual(details["issues"], ["1 memory sink"])
+        self.assertEqual(details["issues"], ["2 memory sink"])
         self.assertIn("store locked", details["last_error"])
+
+    def test_real_error_before_a_near_duplicate_still_alerts(self):
+        self.sink_errors(self.REAL, self.DUP)
+        self.assertEqual(self.run_check(), ["attention:slack-direct"])
+        self.assertIn("store locked",
+                      self.emitted()[0]["details"]["last_error"])
+
+    def test_the_result_does_not_flip_between_ticks(self):
+        self.sink_errors(self.REAL, self.DUP)
+        for _ in range(3):
+            alerts.check(self.base, self.ROUTINES, now=START + 10)
+        self.assertEqual(len(self.emitted()), 1)  # one alert, never cleared
+        self.assertEqual(self.run_check(), [])
+
+    def test_memory_error_title_keeps_needs_attention(self):
+        self.sink_errors(self.REAL)
+        self.run_check()
+        self.assertEqual(self.emitted()[0]["title"],
+                         "slack-direct needs attention: 1 memory sink")
+
+    def test_final_meeting_match_alerts(self):
+        state.save(self.base, {"a": {
+            "rule_id": "slack-direct", "processed_at": stamp(START),
+            "calendar_match_rejected": True, "calendar_match_final": True}})
+        self.assertEqual(self.run_check(), ["attention:slack-direct"])
+        [event] = self.emitted()
+        self.assertEqual(event["details"]["issues"],
+                         ["1 meeting not captured"])
+        self.assertEqual(event["details"]["cause"], "meeting_match")
+        self.assertIn("needs attention", event["title"])
+
+    def test_final_meeting_match_older_than_a_day_is_dropped(self):
+        state.save(self.base, {"a": {
+            "rule_id": "slack-direct",
+            "processed_at": stamp(START - 25 * 3600),
+            "calendar_match_rejected": True, "calendar_match_final": True}})
+        self.assertEqual(self.run_check(), [])
+
+    def test_status_counts_meeting_match_for_a_day_only(self):
+        from workspace_daemon import status
+        state.save(self.base, {
+            "new": {"rule_id": "slack-direct", "processed_at": stamp(START),
+                    "calendar_match_rejected": True},
+            "old": {"rule_id": "slack-direct",
+                    "processed_at": stamp(START - 3 * 86400),
+                    "calendar_match_rejected": True}})
+        rows = status.routine_rows(
+            self.base, self.ROUTINES, {"routines": {}}, now=START + 10)
+        self.assertEqual(rows[0]["issues"], "1 meeting match")
 
     def test_a_streak_of_only_near_duplicates_raises_nothing(self):
         for _ in range(3):

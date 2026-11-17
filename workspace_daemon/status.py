@@ -19,6 +19,8 @@ TICK_STALE_INTERVALS = 2
 AWAKE_GAP_CAP_SECONDS = 30 * 60
 # Memory-sink failures older than this no longer count as an open issue.
 MEMORY_ERROR_WINDOW_SECONDS = 24 * 3600
+# A rejected calendar match counts as a review item for this long.
+MEETING_MATCH_WINDOW_SECONDS = 24 * 3600
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
 _TICK_PREFIX = (
     r"^tick(?:\[(?P<id>[^\]]+)\])?"
@@ -479,7 +481,10 @@ def routine_rows(
         )
         pending_actions = sum(bool(entry.get("actions_pending")) for entry in entries)
         calendar_reviews = sum(
-            bool(entry.get("calendar_match_rejected")) for entry in entries
+            bool(entry.get("calendar_match_rejected"))
+            and _within(entry.get("processed_at"), now,
+                        MEETING_MATCH_WINDOW_SECONDS)
+            for entry in entries
         )
         issues = []
         if memory_errors:
