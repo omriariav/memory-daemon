@@ -444,6 +444,20 @@ class InboxApp(App):
     def main_active(self):
         return len(self.screen_stack) == 1
 
+    def on_app_focus(self, _e):
+        """The terminal regained focus: after Textual restored its own
+        widget, give the queue the focus only if nothing has it (a blur
+        during the first poll)."""
+        self.call_after_refresh(self._focus_queue_if_idle)
+
+    def _focus_queue_if_idle(self):
+        try:
+            q = self.query_one("#queue", Queue)
+        except NoMatches:
+            return
+        if self.focused is None and self.main_active and q.display:
+            q.focus()
+
     def check_action(self, action, parameters):
         if action in ("quit", "toggle_theme"):
             return True
@@ -466,8 +480,11 @@ class InboxApp(App):
             q.build(vis_items, counts, self.pal, now, keep=keep, ghost=ghost,
                     ghost_at=ghost_at, visual=self.bidi)
             # While the queue was hidden (the first poll still running) it
-            # lost focus; give it back, or the arrows do nothing until a click.
-            if self.focused is None and len(self.screen_stack) == 1:
+            # lost focus; give it back, or the arrows do nothing until a
+            # click. Not while the terminal is in the background: Textual
+            # clears the focus then and restores the widget on regain.
+            if (self.focused is None and self.main_active
+                    and getattr(self, "app_focus", True)):
                 q.focus()
         left = self.query_one("#left")
         left.border_title = ("Queue" + (f"  /{self.filter_text}" if self.filter_text else "")

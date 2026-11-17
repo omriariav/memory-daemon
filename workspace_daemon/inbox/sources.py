@@ -274,6 +274,15 @@ def memory_match(meta, index):
         ts = raw.get(key)
         stamps[key] = ts if isinstance(ts, str) and _SLACK_TS.match(ts) \
             else None
+    if (isinstance(meta.get("reply_to"), dict) and raw is meta["reply_to"]
+            and meta.get("channel_id") == channel
+            and not stamps["thread_ts"] and not stamps["message_ts"]):
+        # A reply_to with only a channel: borrow the item's own stamps
+        # (matching only), for the same channel.
+        for key in ("thread_ts", "message_ts"):
+            ts = meta.get(key)
+            if isinstance(ts, str) and _SLACK_TS.match(ts):
+                stamps[key] = ts
     thread, message = stamps["thread_ts"], stamps["message_ts"]
     tries = []
     if thread and message:

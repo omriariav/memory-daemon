@@ -16,6 +16,7 @@ from workspace_daemon.inbox.store import InboxStore
 
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 if HAVE_TEXTUAL:
+    from textual import events
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.screens import HelpScreen
     from workspace_daemon.inbox.widgets import SAVED_GLYPH, THREAD_GLYPH, Queue
@@ -181,6 +182,20 @@ class MatchTest(unittest.TestCase):
                 "message_ts": MSG_TS}
         self.assertEqual(sources.memory_match(half, self.INDEX),
                          ("mem-msg", ""))
+
+    def test_a_channel_only_reply_to_borrows_the_items_own_stamps(self):
+        meta = {"reply_to": {"channel": CHAN}, "channel_id": CHAN,
+                "thread_ts": THREAD_TS}
+        self.assertEqual(sources.memory_match(meta, self.INDEX),
+                         ("", "mem-thread"))
+        with_msg = dict(meta, message_ts=MSG_TS)
+        self.assertEqual(sources.memory_match(with_msg, self.INDEX),
+                         ("mem-msg", ""))
+        # another channel's stamps are never borrowed
+        other = {"reply_to": {"channel": CHAN}, "channel_id": "C" + "9ZYXWVUT1",
+                 "thread_ts": THREAD_TS}
+        self.assertEqual(sources.memory_match(other, self.INDEX), ("", ""))
+        self.assertIsNone(writes.reply_to(meta).thread_ts)   # never sent
 
     def test_fallback_keys_never_make_a_send_destination(self):
         meta = {"channel_id": CHAN, "thread_ts": THREAD_TS,
@@ -411,10 +426,6 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("save to memory by hand", text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Slow(Fixed):
     """A source whose items arrive `delay` seconds after the app starts."""
     def __init__(self, rows, delay):
@@ -469,3 +480,65 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
             app.redraw()
             await pilot.pause(0.1)
             self.assertIs(app.focused, app.query_one("#thread"))
+
+    def make(self, fetch):
+        store = InboxStore(None)
+        return InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
+                        settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
+                        stream_delay=0)
+
+    async def test_a_poll_redraw_while_blurred_keeps_the_panes_focus(self):
+        app = self.make(Fixed([item(1), item(2)]))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for target in ("#filter", "#thread"):
+                if target == "#filter":
+                    app.action_filter()
+                else:
+                    app.query_one(target).focus()
+                await pilot.pause(0.1)
+                want = app.query_one(target)
+                self.assertIs(app.focused, want)
+                app.post_message(events.AppBlur())
+                await pilot.pause(0.1)
+                app.redraw()   # a poll landing in the background
+                await pilot.pause(0.1)
+                self.assertIsNot(app.focused, app.query_one("#queue"))
+                app.post_message(events.AppFocus())
+                await pilot.pause(0.2)
+                self.assertIs(app.focused, want, target)
+
+    async def test_items_arriving_while_blurred_focus_the_queue_on_regain(self):
+        app = self.make(Slow([item(1), item(2), item(3)], 0.5))
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.AppBlur())
+            await settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            app.post_message(events.AppFocus())
+            await pilot.pause(0.3)
+            self.assertIs(app.focused, q)
+            first = q.highlighted
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            self.assertNotEqual(q.highlighted, first)
+
+    async def test_hidden_then_shown_keeps_another_panes_focus(self):
+        app = self.make(Fixed([item(1), item(2)]))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.action_filter()
+            await pilot.pause(0.1)
+            f = app.query_one("#filter")
+            f.value = "zzz-no-match"      # zero items: the queue is hidden
+            await pilot.pause(0.2)
+            self.assertFalse(app.query_one("#queue").display)
+            f.focus()
+            await pilot.pause(0.1)
+            f.value = ""                  # items are back: the queue shows
+            await pilot.pause(0.2)
+            self.assertTrue(app.query_one("#queue").display)
+            self.assertIs(app.focused, f)
+
+
+if __name__ == "__main__":
+    unittest.main()

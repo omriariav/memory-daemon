@@ -17,12 +17,16 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   Without a valid `reply_to` channel the match now falls back to
   `meta.channel_id`, `meta.thread_ts` and `meta.message_ts` (same patterns,
   same exact and thread-level rules). Matching only: `reply_to` stays the only
-  send destination, and a valid `reply_to` still wins.
+  send destination, and a valid `reply_to` still wins. A `reply_to` that has
+  only a channel borrows `meta.thread_ts` / `meta.message_ts` for matching
+  when `meta.channel_id` is the same channel.
 - **Arrow keys at start.** When the first poll was still running at start,
   the queue was hidden, lost focus and kept none once the items arrived, so
   up and down did nothing until a mouse click. The queue now takes focus back
   when it is shown with nothing focused (the first item is highlighted as
-  before).
+  before). It does not do so while the terminal is in the background (a poll
+  then no longer takes the focus from the filter, the thread pane or the
+  draft editor); on regaining focus it takes the focus only if nothing has it.
 
 ## [0.8.0] - 2026-11-17
 
