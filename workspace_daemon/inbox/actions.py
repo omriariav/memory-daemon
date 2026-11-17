@@ -26,6 +26,12 @@ gated by `send.mode`; `place_draft` is the pinned draft call (never marks the
 item done); `copy_text` is the pure conversion; `open_target` is the URL `o`
 opens (`slack_open.url_template`, else the item's link).
 
+0.10.0 adds acts (acts.py): after a local mark and the undo window the inbox
+tells a command source that opted in with `acts:` (`LocalActions.send_act`),
+keeps unsent ops in a small pending file and retries them with the same op_id,
+and logs every op for the audit screen. `D` drafts a reply (`draft_for_me`) and
+`done_reaction` adds an emoji reaction after `d` (`react_done`).
+
 0.4.0 adds two read-only calls: `fetch_context` (the configured context
 command) and `summarize` (one no-tools bridge call, cached on disk). Neither
 changes anything outside the inbox's own state files, so neither confirms.
@@ -33,10 +39,13 @@ changes anything outside the inbox's own state files, so neither confirms.
 import threading
 import time
 import webbrowser
+from collections import namedtuple
 from dataclasses import dataclass, field
 
-from . import context, customactions, invites, items, mrkdwn, writes
+from . import acts as acts_mod
+from . import context, customactions, draftme, invites, items, mrkdwn, views
 from . import polish as polish_mod
+from . import sources, writes
 from . import summary as summary_mod
 from .models import to_v1
 
@@ -48,6 +57,21 @@ class Result:
     # save: with ok False a likely duplicate (ask), with ok True "already in memory"
     duplicate: bool = False
     candidate: dict = None    # save: the memory it looks like
+    # 0.10.0 acts: how the source answered (`ok`, `shadow`, `conflict`,
+    # `pending` = kept for a retry), the op id, and a second line for the
+    # toast (a done reaction that failed, ops dropped from the pending file).
+    sync: str = ""
+    op_id: str = ""
+    note: str = ""
+    shadow: bool = False
+
+
+# What `send_act` and the retry report: `status` is one of acts.OK, SHADOW,
+# CONFLICT, PENDING (kept for a retry) or "unavailable" (not configured);
+# `dropped` counts pending entries dropped for age or the cap.
+ActOutcome = namedtuple("ActOutcome", "status message op_id dropped shadow",
+                        defaults=("", "", 0, False))
+RetryReport = namedtuple("RetryReport", "results dropped")
 
 
 def _invite_event(item):
@@ -79,13 +103,19 @@ class LocalActions:
     def __init__(self, store, opener=None, rsvp=None, save=None,
                  base_dir=None, call_tools=None, context=None, summary=None,
                  complete=None, actions=None, send=None, react=None,
-                 polish=None, copy=False, team=None, slack_open=None):
+                 polish=None, copy=False, team=None, slack_open=None,
+                 acts=None, done_reaction=None, nudge_template=None):
         """`rsvp`, `save`, `context`, `summary`, `send`, `react` and `polish`
         are the validated settings blocks (None: not configured); `actions`
         the validated list. `call_tools` and `complete` replace the Claude
         bridge's two entry points (tests). `copy` (the top-level `copy:`
         setting) offers "Copy for Slack" without `send:`; `team` and
-        `slack_open` build the URL `o` opens for a Slack item."""
+        `slack_open` build the URL `o` opens for a Slack item.
+
+        `acts` maps a command source's name to `{"argv", "timeout_s", "acts"}`
+        for each source that listed `acts:` (None or empty: acts are off and
+        nothing here runs). `done_reaction` is an emoji name or None, and
+        `nudge_template` the text `n` falls back to (see acts.py)."""
         self.store = store
         self.send_cfg, self.react_cfg, self.polish_cfg = send, react, polish
         self.copy_cfg, self.team = bool(copy), team
@@ -103,6 +133,12 @@ class LocalActions:
         self._summary_cache = (summary_mod.SummaryCache(base_dir)
                                if summary is not None and base_dir is not None
                                else None)
+        self.acts_cfg = dict(acts or {}) if base_dir is not None else {}
+        self.done_reaction = done_reaction
+        self.nudge_template = nudge_template or acts_mod.DEFAULT_NUDGE_TEMPLATE
+        self._ops = (acts_mod.OpsLog(base_dir) if self.acts_cfg else None)
+        self._pending_ops = (acts_mod.PendingOps(base_dir)
+                             if self.acts_cfg else None)
 
     @property
     def rsvp_configured(self):
@@ -466,6 +502,278 @@ class LocalActions:
         return polish_mod.run_polish(
             self.polish_cfg, self.base_dir, to_v1(item), draft,
             call_tools=self._call_tools, complete=self._complete)
+
+    # ---- acts (0.10.0) ----
+    @property
+    def acts_configured(self):
+        """At least one command source lists `acts:`."""
+        return bool(self.acts_cfg)
+
+    def act_names(self, item):
+        """The acts the item's source listed (empty for a source without
+        `acts:` and for any row the views made: digest and saved rows never
+        act)."""
+        if item is None or views.is_synthetic(item):
+            return ()
+        cfg = self.acts_cfg.get(getattr(item, "origin", ""))
+        return tuple(cfg["acts"]) if cfg else ()
+
+    def act_enabled(self, item, action):
+        return action in self.act_names(item)
+
+    def send_act(self, item, action, args=None):
+        """Tell the item's source (blocks: call from a worker): one `act`
+        call with a fresh op_id. A failure keeps the op in the pending file
+        for a retry; a conflict is not retried. An `ActOutcome`."""
+        if not self.act_enabled(item, action):
+            return ActOutcome("unavailable", f"{action} is not enabled for "
+                                             "this source")
+        request = acts_mod.build_request(
+            acts_mod.new_op_id(), action, item.key, item.meta, item.ts, args)
+        return self._deliver(item.origin, request, item.who, item.where)
+
+    def _log_op(self, source, request, who, where, status, message,
+                inverse_of=None, retry=False):
+        if self._ops is None:
+            return
+        row = {"at": time.time(), "op_id": request["op_id"],
+               "action": request["action"], "id": request["id"],
+               "who": str(who)[:acts_mod.WHO_MAX],
+               "where": str(where)[:acts_mod.WHO_MAX], "source": source,
+               "args": request.get("args") or {},
+               "meta": acts_mod.small_meta(request.get("meta"),
+                                           acts_mod.LOG_META_MAX_BYTES),
+               "result": status,
+               "message": str(message)[:200]}
+        if inverse_of:
+            row["inverse_of"] = inverse_of
+        if retry:
+            row["retry"] = True
+        try:
+            self._ops.append(row)
+        except OSError:
+            pass            # the log must never break an act
+
+    def _call(self, source, request):
+        cfg = self.acts_cfg[source]
+        resp = sources.run_command_act(cfg["argv"], request, cfg["timeout_s"])
+        if resp["conflict"]:
+            status = acts_mod.CONFLICT
+        elif resp["ok"]:
+            status = acts_mod.SHADOW if resp["shadow"] else acts_mod.OK
+        else:
+            status = acts_mod.PENDING
+        return status, resp
+
+    def _deliver(self, source, request, who, where, inverse_of=None):
+        status, resp = self._call(source, request)
+        dropped = 0
+        if status == acts_mod.PENDING and inverse_of is None:
+            now = time.time()
+            entry = {"op_id": request["op_id"], "request": request,
+                     "source": source, "action": request["action"],
+                     "id": request["id"], "who": str(who)[:acts_mod.WHO_MAX],
+                     "where": str(where)[:acts_mod.WHO_MAX],
+                     "queued_at": now, "last_try": now, "tries": 1,
+                     "message": resp["message"][:200]}
+            try:
+                dropped = sum(self._pending_ops.add(entry, now))
+            except OSError:
+                pass
+        self._log_op(source, request, who, where,
+                     "pending" if status == acts_mod.PENDING else status,
+                     resp["message"], inverse_of)
+        return ActOutcome(status, resp["message"], request["op_id"], dropped,
+                          resp["shadow"])
+
+    def pending_count(self):
+        """How many ops are waiting for a retry."""
+        if self._pending_ops is None:
+            return 0
+        try:
+            return self._pending_ops.count()
+        except OSError:
+            return 0
+
+    def retry_pending(self, now=None, cancel=None):
+        """Resend every pending op that was last tried at least
+        acts.RETRY_EVERY_S ago, with the SAME op_id (the source is idempotent
+        on it). Blocks: call from a worker. Entries older than 7 days are
+        dropped first. A conflict drops the entry and puts the local mark
+        back. A `RetryReport` of `(entry, ActOutcome)` pairs and the number of
+        entries dropped for age."""
+        if self._pending_ops is None:
+            return RetryReport([], 0)
+        now = time.time() if now is None else now
+        try:
+            dropped = self._pending_ops.prune(now)
+            due = self._pending_ops.due(now)
+        except OSError:
+            return RetryReport([], 0)
+        results = []
+        for entry in due:
+            if cancel is not None and cancel.is_set():
+                break
+            source, request = entry.get("source"), entry.get("request")
+            if source not in self.acts_cfg or not isinstance(request, dict):
+                continue
+            status, resp = self._call(source, request)
+            try:
+                if status == acts_mod.PENDING:
+                    self._pending_ops.touch(entry["op_id"], now,
+                                            resp["message"])
+                else:
+                    self._pending_ops.remove(entry["op_id"])
+            except OSError:
+                pass
+            if status == acts_mod.CONFLICT and request["action"] in (
+                    "close", "snooze", "mute"):
+                try:
+                    self.store.restore(request["id"])
+                except OSError:
+                    pass
+            self._log_op(source, request, entry.get("who", ""),
+                         entry.get("where", ""),
+                         "pending" if status == acts_mod.PENDING else status,
+                         resp["message"], retry=True)
+            results.append((entry, ActOutcome(
+                status, resp["message"], entry["op_id"], 0, resp["shadow"])))
+        return RetryReport(results, dropped)
+
+    def queue_act(self, item, action, args=None):
+        """Keep an op for a later retry without calling the source (the app is
+        quitting, so nothing may block). Returns True when it was stored."""
+        if not self.act_enabled(item, action) or self._pending_ops is None:
+            return False
+        request = acts_mod.build_request(
+            acts_mod.new_op_id(), action, item.key, item.meta, item.ts, args)
+        now = time.time()
+        entry = {"op_id": request["op_id"], "request": request,
+                 "source": item.origin, "action": action, "id": item.key,
+                 "who": str(item.who)[:acts_mod.WHO_MAX],
+                 "where": str(item.where)[:acts_mod.WHO_MAX],
+                 "queued_at": now, "last_try": 0, "tries": 0,
+                 "message": "not sent: the inbox was closed"}
+        try:
+            self._pending_ops.add(entry, now)
+        except OSError:
+            return False
+        self._log_op(item.origin, request, item.who, item.where, "pending",
+                     entry["message"])
+        return True
+
+    def ops_rows(self):
+        """The ops log, newest first (the audit screen)."""
+        if self._ops is None:
+            return []
+        try:
+            return self._ops.rows()
+        except OSError:
+            return []
+
+    def invertible(self, row):
+        """The act that undoes a logged op, or None: only a `close` or a `mute`
+        that reached the source (ok or shadow) has one, and only while its
+        source still lists the act."""
+        action = acts_mod.INVERSE.get(row.get("action"))
+        cfg = self.acts_cfg.get(row.get("source"))
+        if (action is None or cfg is None or row.get("inverse_of")
+                or row.get("result") not in (acts_mod.OK, acts_mod.SHADOW)
+                or row.get("action") not in cfg["acts"]):
+            return None
+        return action
+
+    def send_inverse(self, row):
+        """Send the inverse of a logged op (blocks: call from a worker) and,
+        when the source took it, drop the local mark. An `ActOutcome`."""
+        action = self.invertible(row)
+        if action is None:
+            return ActOutcome("unavailable", "this op has no inverse")
+        request = acts_mod.build_request(
+            acts_mod.new_op_id(), action, row["id"], row.get("meta") or {},
+            time.time(), {})
+        out = self._deliver(row["source"], request, row.get("who", ""),
+                            row.get("where", ""), inverse_of=row["op_id"])
+        if out.status in (acts_mod.OK, acts_mod.SHADOW):
+            try:
+                self.store.restore(row["id"])
+            except OSError:
+                pass
+        return out
+
+    def undo_marks(self, item):
+        """Take the local marks of an item back (a conflict)."""
+        self.store.restore(item.key)
+
+    def act_nudge_text(self, item):
+        """The `nudge_template` text for an item (see acts.render_nudge)."""
+        return acts_mod.render_nudge(self.nudge_template, item.who, item.gist)
+
+    # ---- done reaction (0.10.0) ----
+    def done_reaction_for(self, item):
+        """The emoji `d` also reacts with, or None: `done_reaction` is set,
+        `react:` is configured and the item has a message to react to."""
+        if (not self.done_reaction or not self.react_configured
+                or item is None or views.is_synthetic(item)
+                or writes.react_target(item.meta) is None):
+            return None
+        return self.done_reaction
+
+    def react_done(self, item, emoji):
+        """The done reaction: the existing react path (one pinned call, never
+        retried) with the configured emoji. Blocks: call from a worker."""
+        if not self.react_configured:
+            return Result(False, "React not configured")
+        target = writes.react_target(item.meta)
+        if target is None:
+            return Result(False, "this item has no message to react to")
+        if not writes.valid_emoji(emoji):
+            return Result(False, "not a valid emoji name")
+        out = writes.run_react(self.react_cfg, self.base_dir, target[0],
+                               target[1], emoji, call_tools=self._call_tools)
+        if not out.ok:
+            return Result(False, out.detail)
+        return Result(True, out.detail or f"Reacted :{emoji}:")
+
+    # ---- D: a draft for me (0.10.0) ----
+    @property
+    def draft_me_configured(self):
+        """`D` needs the model settings of `summary:` or `polish:`."""
+        return ((self.summary_cfg is not None or self.polish_cfg is not None)
+                and self.base_dir is not None)
+
+    def _draft_me_cfg(self):
+        return self.summary_cfg if self.summary_cfg is not None \
+            else self.polish_cfg
+
+    def draft_me_key(self, item):
+        return draftme.cache_key(to_v1(item))
+
+    def cached_draft_me(self, item):
+        """The draft `D` made for this item's current thread, or None."""
+        fn = getattr(self.store, "get_draft", None)
+        return fn(item.key, self.draft_me_key(item)) if fn else None
+
+    def draft_for_me(self, item, force=False):
+        """A draft reply for `item`: from the store unless `force`, else one
+        no-tools bridge call (then kept in the store). Never sends. Blocks:
+        call from a worker. A `draftme.Outcome`."""
+        if not self.draft_me_configured:
+            return draftme.Outcome(False, "", "Draft for me needs summary: "
+                                              "or polish: in inbox.yaml")
+        if not force:
+            hit = self.cached_draft_me(item)
+            if hit:
+                return draftme.Outcome(True, hit, "", True)
+        out = draftme.run_draft(self._draft_me_cfg(), self.base_dir,
+                                to_v1(item), complete=self._complete)
+        if not out.ok:
+            return out
+        try:
+            self.store.set_draft(item.key, out.text, self.draft_me_key(item))
+        except (OSError, ValueError, AttributeError):
+            return out._replace(detail="not kept: cannot write the state")
+        return out
 
     def mark_done(self, item):
         self.store.done(item.key, _invite_event(item))
