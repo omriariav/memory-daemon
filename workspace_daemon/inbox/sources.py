@@ -243,7 +243,11 @@ def memory_match(meta, index):
     the item is not saved). `exact`, in order: `meta.memory_id`;
     `meta.source_id` in the index; for a Slack item with a valid
     `meta.reply_to`, `slack:<channel>:<thread_ts>:<message_ts>` (a reply the
-    daemon saved) then `slack:<channel>:<message_ts>`. `thread` is
+    daemon saved) then `slack:<channel>:<message_ts>`. Without a valid
+    `reply_to` channel (it is a send-safety contract, so many items carry
+    none) the same ids come from `meta.channel_id`, `meta.thread_ts` and
+    `meta.message_ts`, validated alike: for matching only, never a send
+    destination. `thread` is
     `slack:<channel>:<thread_ts>` (the thread root's entry), reported only
     when there is no exact match: the thread is in memory, this message may
     not be."""
@@ -256,16 +260,29 @@ def memory_match(meta, index):
     if isinstance(sid, str) and sid in index:
         return index[sid], ""
     raw = meta.get("reply_to")
-    if not isinstance(raw, dict):
-        return "", ""
-    channel = raw.get("channel")
+    channel = raw.get("channel") if isinstance(raw, dict) else None
     if not isinstance(channel, str) or not _SLACK_CHANNEL.match(channel):
-        return "", ""
+        # No usable reply_to: match on the item's own Slack keys.
+        raw = {"channel": meta.get("channel_id"),
+               "thread_ts": meta.get("thread_ts"),
+               "message_ts": meta.get("message_ts")}
+        channel = raw["channel"]
+        if not isinstance(channel, str) or not _SLACK_CHANNEL.match(channel):
+            return "", ""
     stamps = {}
     for key in ("thread_ts", "message_ts"):
         ts = raw.get(key)
         stamps[key] = ts if isinstance(ts, str) and _SLACK_TS.match(ts) \
             else None
+    if (isinstance(meta.get("reply_to"), dict) and raw is meta["reply_to"]
+            and meta.get("channel_id") == channel
+            and not stamps["thread_ts"] and not stamps["message_ts"]):
+        # A reply_to with only a channel: borrow the item's own stamps
+        # (matching only), for the same channel.
+        for key in ("thread_ts", "message_ts"):
+            ts = meta.get(key)
+            if isinstance(ts, str) and _SLACK_TS.match(ts):
+                stamps[key] = ts
     thread, message = stamps["thread_ts"], stamps["message_ts"]
     tries = []
     if thread and message:
