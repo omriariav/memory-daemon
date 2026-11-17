@@ -40,6 +40,22 @@ LISTED_REFRESH_S = 3600  # how often a still-listed item's mark is re-stamped
 MAX_ENTRIES = 5000
 
 
+def rsvp_state(rsvp_at, rsvp_event, meta):
+    """What an RSVP mark (`rsvp_at`, `rsvp_event`; either may be None) means
+    for the invite whose meta is `meta`: `hidden` (the answer stands),
+    `moved` (the invite is now another instance of the series) or
+    `unconfirmed` (a snapshot fetched well after the answer still lists the
+    event as unanswered)."""
+    meta = meta if isinstance(meta, dict) else {}
+    event, fetched = InboxStore._meta_ids(meta)
+    if rsvp_event is not None and event is not None and rsvp_event != event:
+        return "moved"
+    if (fetched is not None and rsvp_at is not None
+            and fetched > rsvp_at + RSVP_CONFIRM_MARGIN_S):
+        return "unconfirmed"
+    return "hidden"
+
+
 class InboxStore:
     def __init__(self, base_dir=None, clock=time.time):
         """`base_dir=None` keeps marks in memory only (demo mode, tests)."""
@@ -82,6 +98,9 @@ class InboxStore:
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
+            event = mark.get("closed_event")
+            if isinstance(event, str) and 0 < len(event) <= 200:
+                clean["closed_event"] = event
             if mark.get("rsvp") in RSVP_ANSWERS:
                 clean["rsvp"] = mark["rsvp"]
                 event = mark.get("rsvp_event")
@@ -184,11 +203,20 @@ class InboxStore:
             return True
         self._transaction(change)
 
-    def done(self, item_id):
-        self._mark(item_id, done=self.clock())
+    def _closing(self, item_id, field, event_id):
+        """Mark done or acked. For an invite, `event_id` is the instance it
+        showed when closed, kept so that only that instance's calendar rows
+        count as seen (see `closed_ids`)."""
+        fields = {field: self.clock()}
+        if isinstance(event_id, str) and 0 < len(event_id) <= 200:
+            fields["closed_event"] = event_id
+        self._mark(item_id, **fields)
 
-    def ack(self, item_id):
-        self._mark(item_id, ack=self.clock())
+    def done(self, item_id, event_id=None):
+        self._closing(item_id, "done", event_id)
+
+    def ack(self, item_id, event_id=None):
+        self._closing(item_id, "ack", event_id)
 
     def snooze(self, item_id, until):
         self._mark(item_id, snooze_until=float(until))
@@ -281,14 +309,7 @@ class InboxStore:
     def _rsvp_state(self, mark, meta):
         """`hidden` | `moved` (another instance) | `unconfirmed` (a later
         snapshot still lists this event as unanswered)."""
-        event, fetched = self._meta_ids(meta)
-        answered = mark.get("rsvp_event")
-        if answered is not None and event is not None and answered != event:
-            return "moved"
-        if (fetched is not None and "rsvp_at" in mark
-                and fetched > mark["rsvp_at"] + RSVP_CONFIRM_MARGIN_S):
-            return "unconfirmed"
-        return "hidden"
+        return rsvp_state(mark.get("rsvp_at"), mark.get("rsvp_event"), meta)
 
     def _rsvp_hides(self, mark, meta):
         return self._rsvp_state(mark, meta) == "hidden"
@@ -302,6 +323,34 @@ class InboxStore:
 
     def is_saved(self, item_id):
         return "saved" in (self.marks.get(item_id) or {})
+
+    def rsvp_series(self):
+        """`{series: {"answer": "declined" | "answered", "at": rsvp_at,
+        "event": rsvp_event}}` for the invites answered here (the marks of
+        `invites:<series>` items), for hiding the events stream's rows about
+        them. `at` and `event` are None when the mark has none."""
+        out = {}
+        for key, mark in list(self.marks.items()):
+            if key.startswith("invites:") and mark.get("rsvp") in RSVP_ANSWERS:
+                out[key[len("invites:"):]] = {
+                    "answer": "declined" if mark["rsvp"] == "declined"
+                    else "answered",
+                    "at": mark.get("rsvp_at"), "event": mark.get("rsvp_event")}
+        return out
+
+    def closed_ids(self):
+        """`{id: {"at": when, "event": event id or None}}` of the `invites:`
+        items marked done or acknowledged: the user is finished with them, so
+        they no longer stand for their event, and the calendar rows up to `at`
+        count as seen. `event` is the invite's event id at that time; None for
+        a mark made before it was recorded (then the whole series counts)."""
+        out = {}
+        for key, mark in list(self.marks.items()):
+            times = [mark[f] for f in ("done", "ack") if f in mark]
+            if key.startswith("invites:") and times:
+                out[key] = {"at": max(times),
+                            "event": mark.get("closed_event")}
+        return out
 
     def rsvp_answer(self, item_id):
         return (self.marks.get(item_id) or {}).get("rsvp")

@@ -50,6 +50,15 @@ class Result:
     candidate: dict = None    # save: the memory it looks like
 
 
+def _invite_event(item):
+    """The event id a pending-invite row shows (kept in its done/ack mark), or
+    None for any other row."""
+    meta = getattr(item, "meta", None)
+    event = meta.get("event_id") if isinstance(meta, dict) else None
+    return event if (str(getattr(item, "key", "")).startswith("invites:")
+                     and isinstance(event, str)) else None
+
+
 def _cached(row):
     if row is None:
         return None
@@ -459,11 +468,11 @@ class LocalActions:
             call_tools=self._call_tools, complete=self._complete)
 
     def mark_done(self, item):
-        self.store.done(item.key)
+        self.store.done(item.key, _invite_event(item))
         return Result()
 
     def ack(self, item):
-        self.store.ack(item.key)
+        self.store.ack(item.key, _invite_event(item))
         return Result()
 
     def snooze(self, item, until):
@@ -590,13 +599,13 @@ class FakeActions:
     def mark_done(self, item):
         self.calls.append(("mark_done", item.key))
         if self.store is not None:
-            self.store.done(item.key)
+            self.store.done(item.key, _invite_event(item))
         return Result()
 
     def ack(self, item):
         self.calls.append(("ack", item.key))
         if self.store is not None:
-            self.store.ack(item.key)
+            self.store.ack(item.key, _invite_event(item))
         return Result()
 
     def snooze(self, item, until):

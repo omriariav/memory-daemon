@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from . import daemoncfg, invites
 from . import items as itm
 from .alertstate import Recovery
+from .store import rsvp_state
 
 SourceResult = namedtuple(
     "SourceResult", "name items stale age_min error", defaults=(None,)
@@ -746,9 +747,12 @@ class Unit:
     nothing to rebuild."""
 
     def __init__(self, name, run, watch=lambda: [], uses_all=False,
-                 reeval=None, memory=None):
+                 reeval=None, memory=None, answers=None):
         self.name, self.run, self.watch, self.uses_all = name, run, watch, uses_all
         self.reeval = reeval
+        # `answers()` returns `{series: "declined" | "answered"}` from what
+        # the unit last read (see `invites.answered_series`).
+        self.answers = answers
         # `memory()` returns the `{source_id: memory_id}` the unit last read.
         self.memory = memory
 
@@ -806,8 +810,8 @@ def _events_unit_run(src, settings, base_dir):
 
 
 def _invites_unit_run(src, base_dir):
-    """`(run, reeval)` for the pending-invite source: `[]` when there is no
-    calendar cache at all (nothing to report)."""
+    """`(run, reeval, answers)` for the pending-invite source: `[]` when there
+    is no calendar cache at all (nothing to report)."""
     kept = {}
 
     def results(data, now):
@@ -824,7 +828,10 @@ def _invites_unit_run(src, base_dir):
     def reeval(now):
         return results(kept["data"], now) if "data" in kept else None
 
-    return run, reeval
+    def answers():
+        return invites.answered_series(kept.get("data") or {})
+
+    return run, reeval, answers
 
 
 def events_files(base_dir):
@@ -861,12 +868,12 @@ def make_units(settings, base_dir):
             units.append(Unit(src["name"], run, watch, reeval=reeval,
                               memory=memory))
             if src.get("invites_days", invites.DEFAULT_DAYS) > 0:
-                run, reeval = _invites_unit_run(src, base_dir)
+                run, reeval, answers = _invites_unit_run(src, base_dir)
                 units.append(Unit(
                     f"{src['name']}.invites", run,
                     lambda: [os.path.join(str(base_dir), "state",
                                           invites.SNAPSHOT_FILE)],
-                    reeval=reeval))
+                    reeval=reeval, answers=answers))
         else:
             units.append(Unit(
                 src["name"],
@@ -883,25 +890,183 @@ def saved_watch(base_dir):
     return lambda: events_files(base_dir)
 
 
-def _announces_invite(item, series):
-    """A `New invite` calendar event row for an invite that now has its own
-    pending row (same recurring series)."""
+def units_answers(units, marks=None):
+    """`{series: {"snapshot": "declined" | "answered" | None, "mark": {...} |
+    None}}`: what is known of your answers, by recurring series (see
+    `invites.series_of`). `snapshot` is from the calendar snapshot the units
+    last read (a series with a row still waiting for an answer has none);
+    `mark` is the inbox RSVP of the series, `InboxStore.rsvp_series()`'s entry
+    (`answer`, `at`, `event`)."""
+    out = {k: {"snapshot": None, "mark": dict(v)}
+           for k, v in (marks or {}).items()}
+    for unit in units:
+        getter = getattr(unit, "answers", None)
+        if getter is None:
+            continue
+        for series, answer in getter().items():
+            out.setdefault(series, {"mark": None})["snapshot"] = answer
+    return out
+
+
+CHANGED_FIELDS = 3     # fields named in an invite's `changed` line
+
+
+def _twin_parts(item):
+    """`(series, event id, kind)` for a calendar row of the events stream with
+    a `gcal:` source id, else None."""
     meta = item["meta"]
     source_id = meta.get("source_id")
-    return (item["source"] == "calendar" and meta.get("kind") == "new"
-            and isinstance(source_id, str) and source_id.startswith("gcal:")
-            and invites.series_of(source_id[len("gcal:"):]) in series)
+    if (item["source"] != "calendar" or not isinstance(source_id, str)
+            or not source_id.startswith("gcal:")):
+        return None
+    event_id = source_id[len("gcal:"):]
+    return invites.series_of(event_id), event_id, meta.get("kind")
 
 
-def merge(batches):
+def _listed_invites(batches, closed):
+    """`{series: meta}` of the pending-invite rows that stand for their
+    event: not the ones marked done or acknowledged (`closed`, a dict by id;
+    a snoozed row still counts)."""
+    return {i["meta"]["series"]: i["meta"] for b in batches for r in b
+            for i in r.items
+            if i["id"].startswith("invites:") and i["id"] not in closed
+            and isinstance(i["meta"].get("series"), str)}
+
+
+def _standing(listed, answered):
+    """`{series: (snapshot answer, mark)}` of the answers that count. The
+    mark of a series whose invite is listed counts only when the store would
+    still hide that invite: not when the listed invite is another instance of
+    the series than the one answered (`moved`), nor when a later snapshot
+    still lists it as unanswered (`unconfirmed`)."""
+    out = {}
+    for series, state in (answered or {}).items():
+        snap, mark = state.get("snapshot"), state.get("mark")
+        if mark is not None and series in listed and rsvp_state(
+                mark.get("at"), mark.get("event"), listed[series]) != "hidden":
+            mark = None
+        if snap or mark:
+            out[series] = (snap, mark)
+    return out
+
+
+def _seen_at_close(parts, ts, closed):
+    """True for a calendar row (any kind) of an invite marked done or
+    acknowledged, that is not newer than the close and about the instance that
+    was closed (or any instance of the series, for a mark that recorded none):
+    you saw it, and chose to be finished with it."""
+    series, event_id, kind = parts
+    if kind not in ("new", "update", "cancel"):
+        return False
+    mark = (closed or {}).get(f"invites:{series}")
+    return (mark is not None and mark.get("event") in (None, event_id)
+            and isinstance(ts, (int, float)) and ts <= mark["at"])
+
+
+def _hides_calendar_twin(item, listed, standing, closed=None):
+    """True for a calendar row of the events stream that an invite makes
+    redundant (the rules are in docs/inbox.md). `listed` is `_listed_invites`'
+    result, `standing` is `_standing`'s.
+
+    - `New invite` goes while the series has a pending-invite row and once it
+      is answered.
+    - `Updated` goes while the invite is listed and the update is about the
+      listed instance (the invite shows its current time and title, see
+      `_carry_changes`), and, after an inbox answer, when it is about the
+      answered instance and not newer than the answer (you saw the invite as it
+      was). Any other update stays.
+    - `Cancelled` stays. For a declined meeting (every row declined in the
+      snapshot, or the instance declined in the inbox) `Updated` and
+      `Cancelled` both go.
+    - Whatever the answer, every kind goes when the invite was marked done or
+      acknowledged (`closed`, see `_seen_at_close`) and the row is not newer
+      than the close."""
+    parts = _twin_parts(item)
+    if parts is None:
+        return False
+    series, event_id, kind = parts
+    if _seen_at_close(parts, item.get("ts"), closed):
+        return True
+    snap, mark = standing.get(series, (None, None))
+    if kind == "new":
+        return series in listed or snap is not None or mark is not None
+    if kind not in ("update", "cancel"):
+        return False
+    same = mark is not None and mark.get("event") in (None, event_id)
+    if snap == "declined" or (same and mark["answer"] == "declined"):
+        return True
+    if kind == "cancel":
+        return False
+    if mark is not None:
+        ts = item.get("ts")
+        return (same and mark.get("at") is not None
+                and isinstance(ts, (int, float)) and ts <= mark["at"])
+    return (series in listed and snap is None
+            and listed[series].get("event_id") == event_id)
+
+
+def _changed_line(item):
+    """The `changed` thread line for an `Updated` row's changed fields (the
+    `field: old -> new` lines `_calendar_parts` built), or None."""
+    pairs = [m for m in item["thread"]
+             if isinstance(m, dict) and m.get("who") != "when"
+             and isinstance(m.get("text"), str) and " -> " in m["text"]]
+    if not pairs:
+        return None
+    text = "; ".join(f"{m['who']}: {m['text']}" for m in pairs[:CHANGED_FIELDS])
+    if len(pairs) > CHANGED_FIELDS:
+        text += f"; +{len(pairs) - CHANGED_FIELDS} more"
+    return {"who": "changed", "ts": item["ts"],
+            "text": itm.truncate(text, itm.TEXT_MAX)}
+
+
+def _carry_changes(batches, listed, standing, closed=None):
+    """`{series: thread line}`: the newest update of each listed invite's own
+    instance that `_hides_calendar_twin` hides, to show on the invite row. A
+    series with an answer that counts has none (its invite is not what you
+    read)."""
+    best = {}
+    for batch in batches:
+        for res in batch:
+            for i in res.items:
+                parts = _twin_parts(i)
+                if (parts is None or parts[2] != "update"
+                        or parts[0] not in listed or parts[0] in standing
+                        or not _hides_calendar_twin(i, listed, standing, closed)):
+                    continue
+                line = _changed_line(i)
+                if line and (parts[0] not in best
+                             or i["ts"] >= best[parts[0]][0]):
+                    best[parts[0]] = (i["ts"], line)
+    return {k: v[1] for k, v in best.items()}
+
+
+def _with_line(item, line):
+    """A copy of an invite row with the `changed` line after its `when`
+    line."""
+    thread = [m for m in item["thread"]]
+    at = next((n + 1 for n, m in enumerate(thread)
+               if isinstance(m, dict) and m.get("who") == "when"), len(thread))
+    thread.insert(at, line)
+    return dict(item, thread=thread)
+
+
+def merge(batches, answered=None, closed=None):
     """Flatten per-unit results (in source order). A duplicate item id across
-    sources keeps the first and flags the later source. A calendar `New
-    invite` row is dropped when its series has a pending-invite row, which
-    says the same thing and can be acted on."""
+    sources keeps the first and flags the later source. Calendar rows of the
+    events stream that a pending invite makes redundant are dropped (see
+    `_hides_calendar_twin`), and the newest change of a listed invite is added
+    to its row as a `changed` line. `answered` is what `units_answers`
+    returns; `closed` is `InboxStore.closed_ids()`: the invite rows marked done
+    or acknowledged no longer count as listed, and the calendar rows they had
+    seen are hidden. Cached rows are never changed: a row with a new line
+    is a copy."""
     batches = [list(b) for b in batches]
-    series = {i["meta"]["series"] for b in batches for r in b for i in r.items
-              if i["id"].startswith("invites:")
-              and isinstance(i["meta"].get("series"), str)}
+    closed = closed or {}
+    listed = _listed_invites(batches, closed)
+    standing = _standing(listed, answered)
+    changes = (_carry_changes(batches, listed, standing, closed)
+               if listed else {})
     results = []
     seen = set()
     for batch in batches:
@@ -911,7 +1076,14 @@ def merge(batches):
             for i in res.items:
                 if i["id"] in seen:
                     dropped += 1   # a duplicate id
-                elif not (series and _announces_invite(i, series)):
+                elif (listed or standing or closed) and _hides_calendar_twin(
+                        i, listed, standing, closed):
+                    continue
+                elif (changes and i["id"].startswith("invites:")
+                      and i["id"] not in closed
+                      and i["meta"].get("series") in changes):
+                    kept.append(_with_line(i, changes[i["meta"]["series"]]))
+                else:
                     kept.append(i)
             seen.update(i["id"] for i in kept)
             error = res.error
@@ -922,14 +1094,18 @@ def merge(batches):
     return results
 
 
-def collect(settings, base_dir, now=None, show_all=False):
+def collect(settings, base_dir, now=None, show_all=False, marks=None,
+            closed=None):
     """Poll every configured source. Returns a list of SourceResult.
 
     `show_all` adds `--all` to `list` for the command sources that declared
     `supports_all`; no other source ever receives it. Duplicate ids across
-    sources keep the first and flag the later source.
+    sources keep the first and flag the later source. `marks` is
+    `InboxStore.rsvp_series()`, to hide the events stream's rows about invites
+    answered in the inbox, `closed` is `InboxStore.closed_ids()`.
     """
     now = time.time() if now is None else now
     units = make_units(settings, base_dir)
-    results = merge(u.run(now, show_all) for u in units)
+    batches = [list(u.run(now, show_all)) for u in units]
+    results = merge(batches, units_answers(units, marks), closed)
     return annotate_memory(results, units_memory_index(units))

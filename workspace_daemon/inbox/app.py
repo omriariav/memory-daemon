@@ -29,7 +29,7 @@ from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, HelpScreen, PolishScreen, SavedScreen,
                       SnoozePicker)
-from .sources import (SourceResult, annotate_memory, merge,
+from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
 from .watch import Watcher
@@ -2267,8 +2267,10 @@ class InboxApp(App):
                                       f"poll failed: {type(exc).__name__}: {exc}")]
             if batch is not None:
                 self._unit_results[unit.name] = batch
-        results = merge(self._unit_results[u.name] for u in self.units
-                        if u.name in self._unit_results)
+        results = merge((self._unit_results[u.name] for u in self.units
+                         if u.name in self._unit_results),
+                        units_answers(self.units, self.store.rsvp_series()),
+                        self.store.closed_ids())
         return annotate_memory(results, units_memory_index(self.units))
 
     def _safe_fetch(self, show_all=None, names=None, reeval=False):

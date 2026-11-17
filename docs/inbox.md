@@ -385,15 +385,75 @@ and invites list soonest first, after the replies in the section. `meta` is
 "also_pending"}`
 so a later RSVP action has what it needs. Actions: `ack` (hides
 the row locally) and `open` (the meeting link from the cache, only when it is a
-plain http(s) URL; otherwise there is no `open`). A `New invite` calendar row
-from the events stream is dropped when its series has a pending-invite row
-(the same event, now actionable). Titles and organizers are untrusted display
+plain http(s) URL; otherwise there is no `open`). Calendar rows of the events
+stream about the same event are hidden, see
+[Calendar rows that an invite makes redundant](#calendar-rows-that-an-invite-makes-redundant).
+Titles and organizers are untrusted display
 text. A missing cache means no invites and no error; an
 unreadable or unfamiliar one is a source error (`events.invites`) and a cache
 older than 6 hours marks the source stale.
 
+#### Calendar rows that an invite makes redundant
+
+The events stream announces the same invites (`source: calendar`, `meta.kind`
+`new`, `update` or `cancel`, `meta.source_id` `gcal:<event id>`). Ids are
+compared by series: a recurring instance suffix `_YYYYMMDD[THHMMSS[Z]]` is
+stripped on both sides (`invites.series_of`). While the events stream and the
+invites are merged (in `collect` and in the app's refresh), these rows are
+hidden:
+
+- **While the invite is listed** (a pending-invite row of the series is in the
+  list, and it is not marked done or acknowledged, see the next point; a
+  snoozed row still counts as listed): `New invite` rows, and `Updated` rows
+  about the listed instance (the update's event id is the invite's
+  `meta.event_id`). The invite row shows the current time and title, so the
+  newest such update's changes are added to it as one thread line, `changed`,
+  after `when`: `start: 10:00 -> 11:00; title: Old -> New` (the fields as the
+  update row lists them, up to 3, then `; +N more`; none when the update changed
+  no field). An update about another instance of a recurring series stays
+  visible and is not carried. `Cancelled` stays visible.
+- **After the invite is marked done (`d`) or acknowledged**, whether or not it
+  was answered: the row no longer stands for its event, and every calendar row
+  (`New invite`, `Updated`, `Cancelled`) that is not newer than the close is
+  hidden, as you had seen it. The row must be about the instance that was
+  closed (its event id is the one the invite showed at close; the done/ack mark
+  records it as `closed_event`; a non-recurring event matches its series). A
+  row newer than the close shows, a cancel included, and so does a row about
+  another instance. A mark made by an earlier version has no event id and
+  covers the series, up to the close.
+- **After an RSVP from the inbox** (the mark of the `invites:<series>` row):
+  `New invite` rows, and `Updated` rows about the answered instance that are not
+  newer than the answer (`rsvp_at`): you saw the invite as it was when you
+  answered. An update after the answer, or about another instance, is real news
+  and shows. `Cancelled` stays. The mark is ignored, and the listed rules above
+  apply, when its invite is listed and the store would no longer hide it: it is
+  another instance of the series than the one answered (the series has
+  *moved*: answering one instance of a recurring series answers that instance
+  only), or a snapshot fetched more than 10 minutes after the answer still lists
+  the event as unanswered (*unconfirmed*). So a declined instance does not hide
+  a later instance's changes or a whole-series cancel.
+- **After an answer given elsewhere** (the calendar snapshot shows `accepted`,
+  `declined` or `tentative` on the series' rows, and no row of the series is
+  still `needsAction`: `needsAction` is not an answer): `New invite` rows are
+  hidden, `Updated` and `Cancelled` stay. With an inbox mark too, the mark's
+  time and instance still apply to updates; the snapshot decides `declined`
+  only when every row of the series is declined.
+- **Declined** (every row of the series declined in the snapshot, or the inbox
+  RSVP was `declined` for that instance): `New invite`, `Updated` and
+  `Cancelled` are all hidden: a move or a cancel of a meeting you are not going
+  to is noise. An inbox decline hides the rows of the declined instance only
+  (the event id of the row is the answered one); a decline seen in the snapshot
+  covers the series.
+
+Only calendar rows with a `gcal:` `source_id` are affected, and nothing is
+changed or deleted: rows are left out of the list (and the invite row gets a
+copy with the `changed` line, the cached row is untouched), so a row comes back
+if the answer is no longer in the snapshot or the marks. The snapshot part
+needs the invites source (`invites_days` above 0); without it only the inbox
+RSVP marks apply.
+
 The thread of an invite has one line per fact, each as its own `who`:
-`subject` (the full title), `when`, `from` (the organizer's name), `attendees`,
+`subject` (the full title), `when`, `changed` (only after an update, see above), `from` (the organizer's name), `attendees`,
 `where`, `conflict` and `also pending`.
 
 - **Organizer**: the snapshot row's `organizer.name` when it has one, else the
