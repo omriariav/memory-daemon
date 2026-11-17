@@ -40,6 +40,22 @@ LISTED_REFRESH_S = 3600  # how often a still-listed item's mark is re-stamped
 MAX_ENTRIES = 5000
 
 
+def rsvp_state(rsvp_at, rsvp_event, meta):
+    """What an RSVP mark (`rsvp_at`, `rsvp_event`; either may be None) means
+    for the invite whose meta is `meta`: `hidden` (the answer stands),
+    `moved` (the invite is now another instance of the series) or
+    `unconfirmed` (a snapshot fetched well after the answer still lists the
+    event as unanswered)."""
+    meta = meta if isinstance(meta, dict) else {}
+    event, fetched = InboxStore._meta_ids(meta)
+    if rsvp_event is not None and event is not None and rsvp_event != event:
+        return "moved"
+    if (fetched is not None and rsvp_at is not None
+            and fetched > rsvp_at + RSVP_CONFIRM_MARGIN_S):
+        return "unconfirmed"
+    return "hidden"
+
+
 class InboxStore:
     def __init__(self, base_dir=None, clock=time.time):
         """`base_dir=None` keeps marks in memory only (demo mode, tests)."""
@@ -281,14 +297,7 @@ class InboxStore:
     def _rsvp_state(self, mark, meta):
         """`hidden` | `moved` (another instance) | `unconfirmed` (a later
         snapshot still lists this event as unanswered)."""
-        event, fetched = self._meta_ids(meta)
-        answered = mark.get("rsvp_event")
-        if answered is not None and event is not None and answered != event:
-            return "moved"
-        if (fetched is not None and "rsvp_at" in mark
-                and fetched > mark["rsvp_at"] + RSVP_CONFIRM_MARGIN_S):
-            return "unconfirmed"
-        return "hidden"
+        return rsvp_state(mark.get("rsvp_at"), mark.get("rsvp_event"), meta)
 
     def _rsvp_hides(self, mark, meta):
         return self._rsvp_state(mark, meta) == "hidden"
@@ -304,17 +313,25 @@ class InboxStore:
         return "saved" in (self.marks.get(item_id) or {})
 
     def rsvp_series(self):
-        """`{series: {"answer": "declined" | "answered", "at": rsvp_at}}` for
-        the invites answered here (the marks of `invites:<series>` items), for
-        hiding the events stream's rows about them. `at` is None when the
-        mark has no time."""
+        """`{series: {"answer": "declined" | "answered", "at": rsvp_at,
+        "event": rsvp_event}}` for the invites answered here (the marks of
+        `invites:<series>` items), for hiding the events stream's rows about
+        them. `at` and `event` are None when the mark has none."""
         out = {}
         for key, mark in list(self.marks.items()):
             if key.startswith("invites:") and mark.get("rsvp") in RSVP_ANSWERS:
                 out[key[len("invites:"):]] = {
                     "answer": "declined" if mark["rsvp"] == "declined"
-                    else "answered", "at": mark.get("rsvp_at")}
+                    else "answered",
+                    "at": mark.get("rsvp_at"), "event": mark.get("rsvp_event")}
         return out
+
+    def closed_ids(self):
+        """The ids of the `invites:` items marked done or acknowledged: the
+        user is finished with them, so they no longer stand for their event."""
+        return {key for key, mark in list(self.marks.items())
+                if key.startswith("invites:") and ("done" in mark
+                                                   or "ack" in mark)}
 
     def rsvp_answer(self, item_id):
         return (self.marks.get(item_id) or {}).get("rsvp")

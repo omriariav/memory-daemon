@@ -403,23 +403,39 @@ invites are merged (in `collect` and in the app's refresh), these rows are
 hidden:
 
 - **While the invite is listed** (a pending-invite row of the series is in the
-  list): `New invite` and `Updated` rows. The invite row shows the current time
-  and title, so the newest update's changes are added to it as one thread line,
-  `changed`, after `when`: `start: 10:00 -> 11:00; title: Old -> New` (the
-  fields as the update row lists them, up to 3, then `; +N more`; none when the
-  update changed no field). `Cancelled` stays visible.
-- **After an RSVP from the inbox** (the mark of the `invites:<series>` row has a
-  time, `rsvp_at`): `New invite` rows, and `Updated` rows that are not newer
-  than the answer: you saw the invite as it was when you answered. An update
-  after the answer is real news and shows. `Cancelled` stays.
+  list, and it is not marked done or acknowledged: such a row no longer stands
+  for its event, so its rows show): `New invite` rows, and `Updated` rows about
+  the listed instance (the update's event id is the invite's `meta.event_id`).
+  The invite row shows the current time and title, so the newest such update's
+  changes are added to it as one thread line, `changed`, after `when`:
+  `start: 10:00 -> 11:00; title: Old -> New` (the fields as the update row
+  lists them, up to 3, then `; +N more`; none when the update changed no
+  field). An update about another instance of a recurring series stays visible
+  and is not carried. `Cancelled` stays visible. A snoozed invite still counts
+  as listed.
+- **After an RSVP from the inbox** (the mark of the `invites:<series>` row):
+  `New invite` rows, and `Updated` rows about the answered instance that are not
+  newer than the answer (`rsvp_at`): you saw the invite as it was when you
+  answered. An update after the answer, or about another instance, is real news
+  and shows. `Cancelled` stays. The mark is ignored, and the listed rules above
+  apply, when its invite is listed and the store would no longer hide it: it is
+  another instance of the series than the one answered (the series has
+  *moved*: answering one instance of a recurring series answers that instance
+  only), or a snapshot fetched more than 10 minutes after the answer still lists
+  the event as unanswered (*unconfirmed*). So a declined instance does not hide
+  a later instance's changes or a whole-series cancel.
 - **After an answer given elsewhere** (the calendar snapshot shows `accepted`,
-  `declined` or `tentative` on the series' rows and none still waiting, with no
-  inbox mark): `New invite` rows are hidden, `Updated` and `Cancelled` stay.
-  The snapshot's answer wins over the inbox mark when they differ (the mark's
-  time is still used).
+  `declined` or `tentative` on the series' rows, and no row of the series is
+  still `needsAction`: `needsAction` is not an answer): `New invite` rows are
+  hidden, `Updated` and `Cancelled` stay. With an inbox mark too, the mark's
+  time and instance still apply to updates; the snapshot decides `declined`
+  only when every row of the series is declined.
 - **Declined** (every row of the series declined in the snapshot, or the inbox
-  RSVP was `declined`): `New invite`, `Updated` and `Cancelled` are all hidden:
-  a move or a cancel of a meeting you are not going to is noise.
+  RSVP was `declined` for that instance): `New invite`, `Updated` and
+  `Cancelled` are all hidden: a move or a cancel of a meeting you are not going
+  to is noise. An inbox decline hides the rows of the declined instance only
+  (the event id of the row is the answered one); a decline seen in the snapshot
+  covers the series.
 
 Only calendar rows with a `gcal:` `source_id` are affected, and nothing is
 changed or deleted: rows are left out of the list (and the invite row gets a

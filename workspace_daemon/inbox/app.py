@@ -2269,7 +2269,8 @@ class InboxApp(App):
                 self._unit_results[unit.name] = batch
         results = merge((self._unit_results[u.name] for u in self.units
                          if u.name in self._unit_results),
-                        units_answers(self.units, self.store.rsvp_series()))
+                        units_answers(self.units, self.store.rsvp_series()),
+                        self.store.closed_ids())
         return annotate_memory(results, units_memory_index(self.units))
 
     def _safe_fetch(self, show_all=None, names=None, reeval=False):

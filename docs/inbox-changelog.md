@@ -14,15 +14,20 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 - **A calendar invite no longer shows twice.** The events stream's calendar
   rows stayed in the list next to, or after, the invite they announce. Ids are
   now compared by series (a recurring instance suffix `_YYYYMMDD[THHMMSS[Z]]`
-  is stripped). While the pending invite is listed, its `New invite` and
-  `Updated` rows are hidden and the newest update's changed fields are added
-  to the invite row as a `changed` thread line; `Cancelled` stays. After an RSVP
-  from the inbox, `New invite` rows and `Updated` rows not newer than the
-  answer are hidden; a later update shows. After an answer given in the
-  calendar, `New invite` is hidden and updates stay. For a declined meeting,
-  update and cancel rows are hidden too. The filter runs when the sources are
-  merged (`collect` and the app's refresh) and leaves the cached rows alone.
-  See [inbox.md](inbox.md#calendar-rows-that-an-invite-makes-redundant).
+  is stripped). While the pending invite is listed (and not marked done or
+  acknowledged), its `New invite` rows and the `Updated` rows about the listed
+  instance are hidden and the newest such update's changed fields are added to
+  the invite row as a `changed` thread line; `Cancelled` stays, and so does an
+  update about another instance. After an RSVP from the inbox, `New invite`
+  rows and `Updated` rows about the answered instance not newer than the answer
+  are hidden; a later update shows. That mark is ignored once the series has
+  moved to another instance, or when a later snapshot still lists the event as
+  unanswered. After an answer given in the calendar, `New invite` is hidden and
+  updates stay. For a declined meeting, update and cancel rows are hidden too
+  (an inbox decline covers its own instance, a snapshot decline the series).
+  The filter runs when the sources are merged (`collect` and the app's refresh)
+  and leaves the cached rows alone. See
+  [inbox.md](inbox.md#calendar-rows-that-an-invite-makes-redundant).
 
 ## [0.8.1] - 2026-11-17
 

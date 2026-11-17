@@ -40,10 +40,11 @@ def ev(source_id, kind, title, ago_h=1.0, details=None):
 CHANGED = {"changed": {"start": ["10:00", "11:00"], "title": ["Old", "New"]}}
 
 
-def marks_at(answer, at, series="aaa"):
-    """The marks of an RSVP given at `at` (offset hours from NOW)."""
+def marks_at(answer, at, series="aaa", event=None):
+    """The marks of an RSVP given at `at` (offset hours from NOW) for one
+    event (default: the series itself)."""
     store = InboxStore(None, clock=lambda: NOW + at * H)
-    store.rsvp(f"invites:{series}", answer, series)
+    store.rsvp(f"invites:{series}", answer, event or series)
     return store.rsvp_series()
 
 
@@ -67,15 +68,15 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
 
-    def collect(self, marks=None):
+    def collect(self, marks=None, closed=()):
         res = sources.collect(settings.default_settings(), self.base, now=NOW,
-                              marks=marks)
+                              marks=marks, closed=closed)
         return {r.name: r.items for r in res}
 
-    def calendar(self, marks=None):
+    def calendar(self, marks=None, closed=()):
         """Gists of the events stream's rows, as `Kind: title`."""
         return sorted(i["gist"].split(" (")[0]
-                      for i in self.collect(marks)["events"])
+                      for i in self.collect(marks, closed)["events"])
 
 
 class ListedTwinTest(Base):
@@ -140,7 +141,8 @@ class AnsweredTest(Base):
         self.assertEqual(self.calendar(),
                          ["New invite: Alpha", "New invite: Gamma"])
         marks = marks_at("accepted", 0)
-        self.assertEqual(marks, {"aaa": {"answer": "answered", "at": NOW}})
+        self.assertEqual(marks, {"aaa": {"answer": "answered", "at": NOW,
+                                 "event": "aaa"}})
         self.assertEqual(self.calendar(marks), ["New invite: Gamma"])
 
     def test_an_update_before_the_inbox_answer_is_hidden_after_it_shows(self):
@@ -219,6 +221,75 @@ class AnsweredTest(Base):
             "mail", "new", None, "gmail:aaaaaaaa11111111", "A mail", [],
             ts=iso(-1))])
         self.assertEqual(len(self.collect()["events"]), 1)
+
+
+class ReviewFixesTest(Base):
+    W1, W2, W3 = "w_20231116T100000Z", "w_20231123T100000Z", "w_20231130T100000Z"
+
+    def test_a_mark_for_another_instance_is_ignored_when_the_series_moves_on(self):
+        # Instance 1 was declined; the snapshot now lists instance 2.
+        write_snapshot(self.base, {self.W1: row(-100, "declined"),
+                                   self.W2: row(30)})
+        write_events(self.base, [
+            ev(f"gcal:{self.W2}", "update", "W", details=CHANGED),
+            ev("gcal:w", "cancel", "W whole series")])
+        marks = marks_at("declined", -20, "w", self.W1)
+        self.assertEqual(self.calendar(marks), ["Cancelled: W whole series"])
+        inv = self.collect(marks)["events.invites"]
+        self.assertEqual([m["who"] for i in inv for m in i["thread"]
+                          if m["who"] == "changed"], ["changed"])
+
+    def test_a_declined_mark_hides_only_its_own_instance_when_not_listed(self):
+        write_snapshot(self.base, {self.W1: row(30, "declined"),
+                                   self.W2: row(40, "accepted")})
+        write_events(self.base, [ev(f"gcal:{self.W1}", "cancel", "One"),
+                                 ev("gcal:w", "cancel", "Whole")])
+        # The snapshot has an accepted row, so only the mark declines.
+        marks = marks_at("declined", -5, "w", self.W1)
+        self.assertEqual(self.calendar(marks), ["Cancelled: Whole"])
+
+    def test_an_unconfirmed_decline_does_not_hide_a_cancel(self):
+        write_snapshot(self.base, {"ccc": row(30)})   # still needsAction
+        write_events(self.base, [ev("gcal:ccc", "cancel", "C")])
+        # Answered 2h ago; the snapshot was fetched 0.1h ago: not confirmed.
+        self.assertEqual(self.calendar(marks_at("declined", -2, "ccc")),
+                         ["Cancelled: C"])
+        # Answered after the snapshot: the decline still stands.
+        self.assertEqual(self.calendar(marks_at("declined", 0, "ccc")), [])
+
+    def test_an_acked_or_done_invite_no_longer_counts_as_listed(self):
+        write_snapshot(self.base, {"aaa": row(30), "bbb": row(31),
+                                   "ccc": row(32)})
+        write_events(self.base, [ev("gcal:aaa", "update", "A",
+                                    details=CHANGED),
+                                 ev("gcal:bbb", "update", "B"),
+                                 ev("gcal:ccc", "update", "C")])
+        store = InboxStore(None)
+        store.ack("invites:aaa")
+        store.done("invites:bbb")
+        store.snooze("invites:ccc", NOW + H)
+        self.assertEqual(store.closed_ids(), {"invites:aaa", "invites:bbb"})
+        self.assertEqual(self.calendar(closed=store.closed_ids()),
+                         ["Updated: A", "Updated: B"])
+
+    def test_an_update_of_another_instance_is_neither_hidden_nor_carried(self):
+        write_snapshot(self.base, {self.W2: row(30)})
+        write_events(self.base, [
+            ev(f"gcal:{self.W3}", "update", "Other instance", details=CHANGED),
+            ev(f"gcal:{self.W2}", "update", "Same instance")])
+        self.assertEqual(self.calendar(), ["Updated: Other instance"])
+        inv = self.collect()["events.invites"]
+        self.assertFalse([m for i in inv for m in i["thread"]
+                          if m["who"] == "changed"])
+
+    def test_an_update_of_another_instance_is_not_seen_at_the_answer(self):
+        write_snapshot(self.base, {self.W1: row(30, "accepted"),
+                                   self.W2: row(40, "accepted")})
+        write_events(self.base, [
+            ev(f"gcal:{self.W1}", "update", "Answered", ago_h=3),
+            ev(f"gcal:{self.W2}", "update", "Other", ago_h=3)])
+        marks = marks_at("accepted", 0, "w", self.W1)
+        self.assertEqual(self.calendar(marks), ["Updated: Other"])
 
 
 class OddSnapshotTest(Base):

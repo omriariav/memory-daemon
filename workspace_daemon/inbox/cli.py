@@ -61,7 +61,8 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
 
         def fetch(show_all=False):
             return sources.collect(settings, base, show_all=show_all,
-                                   marks=store.rsvp_series())
+                                   marks=store.rsvp_series(),
+                                   closed=store.closed_ids())
 
         actions = LocalActions(store, rsvp=settings["rsvp"],
                                save=settings["save"], base_dir=base,
