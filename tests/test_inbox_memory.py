@@ -413,3 +413,59 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Slow(Fixed):
+    """A source whose items arrive `delay` seconds after the app starts."""
+    def __init__(self, rows, delay):
+        super().__init__(rows)
+        self.delay = delay
+
+    def __call__(self):
+        time.sleep(self.delay)
+        return self.results
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
+    """0.8.1: the arrows work at start without a mouse click, whether the
+    items are ready at mount or arrive later."""
+
+    async def check(self, fetch):
+        store = InboxStore(None)
+        app = InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
+                       settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
+                       stream_delay=0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            self.assertIs(app.focused, q)
+            first = q.highlighted
+            self.assertIsNotNone(first)
+            self.assertTrue(q.get_option_at_index(first).id.startswith("i:"))
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            self.assertIsNot(q.highlighted, None)
+            self.assertNotEqual(q.highlighted, first)
+            self.assertEqual(app.current_key,
+                             q.get_option_at_index(q.highlighted).id[2:])
+
+    async def test_items_ready_before_mount(self):
+        await self.check(Fixed([item(1), item(2), item(3)]))
+
+    async def test_items_arriving_after_mount(self):
+        await self.check(Slow([item(1), item(2), item(3)], 0.5))
+
+    async def test_a_later_redraw_does_not_steal_another_panes_focus(self):
+        store = InboxStore(None)
+        app = InboxApp(Fixed([item(1), item(2)]), store,
+                       FakeActions(store=store, draft_delay=0),
+                       settings=dict(DEFAULTS), undo_s=0.15, leave_s=0,
+                       stream_delay=0)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.query_one("#thread").focus()
+            await pilot.pause(0.1)
+            app.redraw()
+            await pilot.pause(0.1)
+            self.assertIs(app.focused, app.query_one("#thread"))

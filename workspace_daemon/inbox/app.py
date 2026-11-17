@@ -465,6 +465,10 @@ class InboxApp(App):
         else:
             q.build(vis_items, counts, self.pal, now, keep=keep, ghost=ghost,
                     ghost_at=ghost_at, visual=self.bidi)
+            # While the queue was hidden (the first poll still running) it
+            # lost focus; give it back, or the arrows do nothing until a click.
+            if self.focused is None and len(self.screen_stack) == 1:
+                q.focus()
         left = self.query_one("#left")
         left.border_title = ("Queue" + (f"  /{self.filter_text}" if self.filter_text else "")
                              + (f"  [{SOURCES[self.source_filter][2]}]" if self.source_filter else ""))

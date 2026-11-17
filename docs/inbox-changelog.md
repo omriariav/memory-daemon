@@ -18,6 +18,11 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   `meta.channel_id`, `meta.thread_ts` and `meta.message_ts` (same patterns,
   same exact and thread-level rules). Matching only: `reply_to` stays the only
   send destination, and a valid `reply_to` still wins.
+- **Arrow keys at start.** When the first poll was still running at start,
+  the queue was hidden, lost focus and kept none once the items arrived, so
+  up and down did nothing until a mouse click. The queue now takes focus back
+  when it is shown with nothing focused (the first item is highlighted as
+  before).
 
 ## [0.8.0] - 2026-11-17
 
