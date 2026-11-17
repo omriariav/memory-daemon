@@ -47,6 +47,12 @@ MUTE_CHOICES = (("1d", "1 day", 86400), ("1w", "1 week", 7 * 86400),
 
 # Outcomes (`ActOutcome.status`).
 OK, SHADOW, CONFLICT, PENDING = "ok", "shadow", "conflict", "pending"
+# A failure whose op could not even be written to the pending file: it will
+# never be retried.
+LOST = "lost"
+# Acts that are one-off events, not a state: a newer op for the same item does
+# not replace a pending one of these.
+EVENT_ACTS = ("relay",)
 
 
 def new_op_id():
@@ -140,6 +146,14 @@ class _Jsonl:
             except OSError:
                 pass
             raise
+        try:  # make the rename itself durable; best effort
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
     def _locked(self):
         return _Locked(self)
@@ -223,13 +237,25 @@ class PendingOps(_Jsonl):
         over = max(0, len(kept) - PENDING_MAX)
         return kept[over:], expired, over
 
+    @staticmethod
+    def _supersedes(entry, old):
+        """A newer op on an item makes an older pending one on the same item
+        stale (the user changed their mind): it would be retried later and
+        undo or contradict the newer decision. Events (relay) never are."""
+        return (old.get("id") == entry.get("id")
+                and old.get("action") not in EVENT_ACTS
+                and entry.get("action") not in EVENT_ACTS)
+
     def add(self, entry, now=None):
-        """Store `entry` (a new op replaces one with the same op_id).
-        Returns `(expired, over_cap)`: how many old entries were dropped."""
+        """Store `entry` (a new op replaces one with the same op_id, and drops
+        the older pending ops of the same item, see `_supersedes`). Returns
+        `(expired, over_cap)`: how many old entries were dropped for age or the
+        cap."""
         now = time.time() if now is None else now
         with self._locked():
             rows = [r for r in self._read()
-                    if r.get("op_id") != entry["op_id"]] + [entry]
+                    if r.get("op_id") != entry["op_id"]
+                    and not self._supersedes(entry, r)] + [entry]
             kept, expired, over = self._fresh(rows, now)
             self._write(kept)
         return expired, over
@@ -259,6 +285,27 @@ class PendingOps(_Jsonl):
                 if not int(r.get("tries") or 0)        # kept at quit: never tried
                 or now - (r.get("last_try") or r.get("queued_at") or 0)
                 >= RETRY_EVERY_S]
+
+    def drop_for_id(self, item_id, keep_op=None):
+        """Drop the pending state ops of an item (a newer op, such as an
+        inverse, replaced them). Returns how many."""
+        with self._locked():
+            rows = self._read()
+            kept = [r for r in rows if r.get("op_id") == keep_op
+                    or r.get("id") != item_id
+                    or r.get("action") in EVENT_ACTS]
+            if len(kept) != len(rows):
+                self._write(kept)
+            return len(rows) - len(kept)
+
+    def note(self, op_id, message):
+        """Keep the reason of the latest failed try."""
+        with self._locked():
+            rows = self._read()
+            for row in rows:
+                if row.get("op_id") == op_id:
+                    row["message"] = str(message)[:200]
+            self._write(rows)
 
     def remove(self, op_id):
         with self._locked():
@@ -309,14 +356,28 @@ def template_problem(template):
     return None
 
 
+_PUNCT = "\"'.,;:!?()[]{}<>*_~`|/\\-–—…"
+
+
+def first_name(who):
+    """The first word of a person's first name, without punctuation, or ""
+    when `who` is not a person (a channel such as `#launch`, a name with no
+    letters, or You)."""
+    who = " ".join(str(who or "").split())
+    if not who or who[0] == "#" or who.lower() in ("you", "me"):
+        return ""
+    word = who.split(" ")[0].strip(_PUNCT)
+    return word if any(c.isalpha() for c in word) else ""
+
+
 def render_nudge(template, who, gist):
     """The nudge text for a row: `{first}` is the first word of the person's
-    name, `{who}` the whole name, `{topic}` the row's gist cut to one line of
-    at most TOPIC_MAX characters."""
+    first name (`there` for a channel or any name that is not a person),
+    `{who}` the whole name, `{topic}` the row's gist cut to one line of at
+    most TOPIC_MAX characters."""
     who = " ".join(str(who or "").split())
     topic = " ".join(str(gist or "").split())
     if len(topic) > TOPIC_MAX:
         topic = topic[:TOPIC_MAX - 1].rstrip() + "…"
-    first = who.split(" ")[0] if who else ""
-    return template.format(first=first or who or "there", who=who,
+    return template.format(first=first_name(who) or "there", who=who,
                            topic=topic or "this")

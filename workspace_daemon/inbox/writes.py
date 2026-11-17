@@ -289,6 +289,16 @@ def react_target(meta):
     return (target.channel, ts) if ts else None
 
 
+def message_target(meta):
+    """`(channel, message_ts)` of the message itself, or None. Unlike
+    `react_target` it never falls back to `thread_ts` (a thread's root post is
+    somebody else's message): used by the done reaction."""
+    target = reply_to(meta)
+    if target is None or not target.message_ts:
+        return None
+    return (target.channel, target.message_ts)
+
+
 def valid_emoji(name):
     return isinstance(name, str) and bool(EMOJI_NAME.match(name))
 

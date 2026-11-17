@@ -104,7 +104,7 @@ class InboxStore:
                 continue
             clean = {}
             for field in ("done", "ack", "snooze_until", "updated",
-                          "last_listed", "saved", "rsvp_at"):
+                          "last_listed", "saved", "rsvp_at", "marked"):
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
@@ -279,6 +279,8 @@ class InboxStore:
             mark = dict(marks.get(item_id, {}))
             mark.update(fields)
             mark["updated"] = self.clock()
+            if not set(fields) <= set(DRAFT_FIELDS):
+                mark["marked"] = mark["updated"]   # a mark, not a kept draft
             marks[item_id] = mark
             return True
         self._transaction(change)
@@ -316,6 +318,7 @@ class InboxStore:
                     if k not in ("rsvp", "rsvp_at", "rsvp_event")}
             mark.update(fields)
             mark["updated"] = self.clock()
+            mark["marked"] = mark["updated"]
             marks[item_id] = mark
             return True
         self._transaction(change)
@@ -338,6 +341,28 @@ class InboxStore:
                 del marks[item_id]
             return True
         self._transaction(change)
+
+    def restore_unless_newer(self, item_id, since):
+        """Like `restore`, but only when the item's marks were all made at or
+        before `since`: a mark made after that (a later snooze, say) is the
+        user's newer decision and stays. True when the marks were dropped."""
+        done = []
+
+        def change(marks):
+            mark = marks.get(item_id)
+            if mark is None:
+                return False
+            if mark.get("marked", mark.get("updated", 0)) > since:
+                return False
+            done.append(True)
+            keep = {k: v for k, v in mark.items() if k in DRAFT_FIELDS}
+            if keep:
+                marks[item_id] = dict(keep, updated=self.clock())
+            else:
+                del marks[item_id]
+            return True
+        self._transaction(change)
+        return bool(done)
 
     def set_draft(self, item_id, text, key):
         """Keep the draft `D` made for this item (`key` names the thread it

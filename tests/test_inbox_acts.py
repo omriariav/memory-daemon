@@ -6,18 +6,22 @@ that a source with no `acts:` behaves as before.
 
 A fake command source script records the requests (tests/inbox_fake_source.py).
 Nothing here calls Slack, claude or the network."""
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inbox_acts_support as support  # noqa: E402
 
 from workspace_daemon.inbox import acts, items as itm  # noqa: E402
 from workspace_daemon.inbox import settings, sources  # noqa: E402
+from workspace_daemon.inbox import writes as writes_mod  # noqa: E402
 from workspace_daemon.inbox.actions import LocalActions  # noqa: E402
 from workspace_daemon.inbox.models import from_v1  # noqa: E402
 from workspace_daemon.inbox.store import InboxStore  # noqa: E402
@@ -249,9 +253,9 @@ class OutcomeTest(Base):
 
     def test_failures_are_kept_for_a_retry(self):
         a = self.actions()
-        for mode in ("fail", "badjson", "exit"):
+        for n, mode in enumerate(("fail", "badjson", "exit"), 1):
             self.src.configure(mode)
-            out = a.send_act(row(), "close", {})
+            out = a.send_act(row(n), "close", {})
             self.assertEqual(out.status, acts.PENDING, mode)
         self.assertEqual(a.pending_count(), 3)
 
@@ -318,9 +322,10 @@ class RetryTest(Base):
     def test_a_conflict_on_retry_drops_it_and_puts_the_mark_back(self):
         a = self.actions()
         it = row()
+        self.store.done(it.key)                 # the mark comes first, then the op
+        time.sleep(0.02)
         self.src.configure("fail")
         a.send_act(it, "close", {})
-        self.store.done(it.key)
         self.assertTrue(self.store.is_hidden(it.key))
         self.src.configure("conflict")
         report = a.retry_pending(now=time.time() + acts.RETRY_EVERY_S + 1)
@@ -355,9 +360,10 @@ class RetryTest(Base):
 
     def test_a_new_op_also_prunes_old_ones(self):
         pend = acts.PendingOps(self.base)
-        old = {"op_id": "old", "request": {"op_id": "old"}, "queued_at": 1.0}
+        old = {"op_id": "old", "id": "x", "request": {"op_id": "old"},
+               "queued_at": 1.0}
         pend.add(old, now=1.0)
-        fresh = {"op_id": "new", "request": {"op_id": "new"},
+        fresh = {"op_id": "new", "id": "y", "request": {"op_id": "new"},
                  "queued_at": 1000.0 + acts.PENDING_MAX_AGE_S}
         expired, over = pend.add(fresh, now=1000.0 + acts.PENDING_MAX_AGE_S)
         self.assertEqual((expired, over), (1, 0))
@@ -383,14 +389,219 @@ class RetryTest(Base):
         report = a.retry_pending(now=time.time() + 1)   # never tried: due now
         self.assertEqual(report.results[0][1].status, acts.OK)
 
-    def test_a_source_that_is_no_longer_configured_is_left_alone(self):
+    def test_a_source_that_is_no_longer_configured_is_not_counted(self):
+        """Nothing can retry it, so "N not synced" would never clear: it is
+        not counted (nor dropped: a source put back finds it), and it expires
+        after 7 days like any entry."""
         a = self.actions()
         self.src.configure("fail")
         a.send_act(row(), "close", {})
+        self.assertEqual(a.pending_count(), 1)
         b = self.actions(acts=support.acts_cfg(self.src, name="other"))
         self.assertEqual(b.retry_pending(
             now=time.time() + acts.RETRY_EVERY_S + 1).results, [])
-        self.assertEqual(b.pending_count(), 1)
+        self.assertEqual(b.pending_count(), 0)
+        self.assertEqual(len(b._pending_ops.all()), 1)       # still on file
+        self.assertEqual(self.actions().pending_count(), 1)  # put back: counted
+        far = time.time() + acts.PENDING_MAX_AGE_S + 60
+        self.assertEqual(b.retry_pending(now=far).dropped, 1)
+        self.assertEqual(b._pending_ops.all(), [])
+
+
+class ReviewFixesTest(Base):
+    """Op ordering, durability and the small contract points."""
+
+    def test_the_op_is_on_file_before_the_call_and_removed_on_ok(self):
+        a = self.actions()
+        seen = []
+        real = sources.run_command_act
+
+        def spy(argv, request, timeout_s=20.0):
+            seen.append([(e["op_id"], e["tries"], e["last_try"] > 0)
+                         for e in a._pending_ops.all()])
+            return real(argv, request, timeout_s)
+        with mock.patch.object(sources, "run_command_act", spy):
+            out = a.send_act(row(), "close", {})
+        self.assertEqual(seen, [[(out.op_id, 1, True)]])
+        self.assertEqual(a.pending_count(), 0)           # ok: removed
+        for mode in ("shadow", "conflict"):
+            self.src.configure(mode)
+            a.send_act(row(), "close", {})
+            self.assertEqual(a.pending_count(), 0, mode)
+
+    def test_a_kill_during_the_call_leaves_the_op_for_a_retry(self):
+        self.src.configure("ok", sleep=30)
+        child = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "from workspace_daemon.inbox import items as itm\n"
+            "from workspace_daemon.inbox.models import from_v1\n"
+            "from workspace_daemon.inbox.actions import LocalActions\n"
+            "from workspace_daemon.inbox.store import InboxStore\n"
+            "base, argv = sys.argv[1], json.loads(sys.argv[2])\n"
+            "raw = itm.make_item(id='t:1', source='slack', section='needs_reply',"
+            " urgency='digest', sender='P', where='#w', gist='g',"
+            " ts=1893492001.0, actions=['reply'], meta={})\n"
+            "it = from_v1(raw); it.origin = 'src'\n"
+            "a = LocalActions(InboxStore(base), base_dir=base, acts={'src': {"
+            "'argv': argv, 'timeout_s': 60.0, 'acts': ['close']}})\n"
+            "a.send_act(it, 'close', {})\n")
+        proc = subprocess.Popen([sys.executable, "-c", child, str(self.base),
+                                 json.dumps(self.src.argv)])
+        try:
+            pend = acts.PendingOps(self.base)
+            deadline = time.time() + 20
+            while time.time() < deadline and not (
+                    pend.all() and self.src.requests()):
+                time.sleep(0.05)
+            self.assertTrue(pend.all(), "no pending entry during the call")
+            proc.kill()                                  # SIGKILL: no cleanup
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        (entry,) = pend.all()
+        self.assertEqual((entry["tries"], entry["action"], entry["id"]),
+                         (1, "close", "t:1"))
+        self.assertEqual(self.src.requests()[0]["op_id"], entry["op_id"])
+        # The next session retries it with the same op_id.
+        self.src.configure("ok")
+        a = self.actions()
+        report = a.retry_pending(now=time.time() + acts.RETRY_EVERY_S + 5)
+        self.assertEqual(report.results[0][1].status, acts.OK)
+        self.assertEqual(report.results[0][0]["op_id"], entry["op_id"])
+        self.assertEqual(a.pending_count(), 0)
+
+    def test_the_files_are_fsynced_with_their_directory(self):
+        pend = acts.PendingOps(self.base)
+        with mock.patch.object(acts.os, "fsync",
+                               wraps=acts.os.fsync) as fsync:
+            pend.add({"op_id": "a", "id": "x", "action": "close",
+                      "request": {"op_id": "a"}, "queued_at": time.time()})
+        self.assertGreaterEqual(fsync.call_count, 2)     # the file, then the dir
+
+    def test_a_newer_op_drops_the_older_pending_ones_of_the_item(self):
+        a = self.actions()
+        self.src.configure("fail")
+        it = row()
+        a.send_act(it, "close", {})
+        a.send_act(it, "snooze", {"until": 5.0})
+        self.assertEqual([e["action"] for e in a._pending_ops.all()],
+                         ["snooze"])
+        a.send_act(row(2), "close", {})                  # another item: kept
+        self.assertEqual(a.pending_count(), 2)
+        a.send_act(it, "relay", {"note": "x"})           # an event: both stay
+        a.send_act(it, "mute", {"until": None})
+        self.assertEqual(sorted(e["action"] for e in a._pending_ops.all()
+                                if e["id"] == "t:1"), ["mute", "relay"])
+
+    def test_a_successful_inverse_drops_the_items_older_pending_ops(self):
+        a = self.actions()
+        it = row()
+        a.send_act(it, "close", {})
+        close_row = a.ops_rows()[0]
+        self.src.configure("fail")
+        a.send_act(it, "snooze", {"until": 5.0})
+        self.assertEqual(a.pending_count(), 1)
+        self.src.configure("ok")
+        self.assertEqual(a.send_inverse(close_row).status, acts.OK)
+        self.assertEqual(a.pending_count(), 0)
+
+    def test_a_conflict_on_retry_keeps_a_newer_mark(self):
+        """The probe: close fails, the user then makes a newer decision (a
+        snooze), and the old op conflicts on retry. It must not wipe it."""
+        a = self.actions()
+        it = row()
+        self.store.done(it.key)
+        time.sleep(0.02)
+        self.src.configure("fail")
+        a.send_act(it, "close", {})
+        time.sleep(0.02)
+        self.store.snooze(it.key, time.time() + 3600)      # the newer mark
+        self.src.configure("conflict")
+        a.retry_pending(now=time.time() + acts.RETRY_EVERY_S + 1)
+        self.assertIsNotNone(self.store.snoozed_until(it.key))
+        self.assertTrue(self.store.is_hidden(it.key))
+        self.assertEqual(a.pending_count(), 0)
+
+    def test_restore_unless_newer(self):
+        self.store.done("a")
+        t = time.time()
+        time.sleep(0.02)
+        self.assertTrue(self.store.restore_unless_newer("a", t + 1))
+        self.assertFalse(self.store.is_hidden("a"))
+        self.store.done("b")
+        time.sleep(0.02)
+        self.store.snooze("b", time.time() + 99)
+        self.assertFalse(self.store.restore_unless_newer("b", t))
+        self.assertTrue(self.store.is_hidden("b"))
+        self.store.set_draft("c", "d", "k")               # a draft is no mark
+        self.store.done("c")
+        self.store.set_draft("c", "d2", "k2")
+        self.assertTrue(self.store.restore_unless_newer("c", time.time()))
+        self.assertEqual(self.store.get_draft("c", "k2"), "d2")
+
+    def test_an_op_that_cannot_be_kept_is_reported_lost(self):
+        a = self.actions()
+        self.src.configure("fail")
+        with mock.patch.object(acts.PendingOps, "add",
+                               side_effect=OSError("disk full")):
+            out = a.send_act(row(), "close", {})
+        self.assertEqual(out.status, acts.LOST)
+        self.assertEqual(a.pending_count(), 0)
+        self.assertEqual(a.ops_rows()[0]["result"], "failed")
+        # ok with an unwritable pending file is still ok
+        self.src.configure("ok")
+        with mock.patch.object(acts.PendingOps, "add",
+                               side_effect=OSError("disk full")):
+            self.assertEqual(a.send_act(row(2), "close", {}).status, acts.OK)
+
+    def test_an_undone_row_offers_no_second_undo(self):
+        a = self.actions()
+        a.send_act(row(), "close", {})
+        (close_row,) = a.ops_rows()
+        self.assertIsNotNone(a.invertible(close_row))
+        self.assertEqual(a.send_inverse(close_row).status, acts.OK)
+        rows = a.ops_rows()
+        undone = next(r for r in rows if r["action"] == "close")
+        self.assertTrue(undone["undone"])
+        self.assertIsNone(a.invertible(undone))
+        self.assertEqual(a.send_inverse(close_row).status, "unavailable")
+        self.assertEqual([r["action"] for r in self.src.requests()],
+                         ["close", "reopen"])
+        # a failed undo leaves the row undoable
+        a.send_act(row(2), "mute", {"until": None})
+        mute_row = a.ops_rows()[0]
+        self.src.configure("fail")
+        a.send_inverse(mute_row)
+        self.assertIsNotNone(a.invertible(a.ops_rows()[1]))
+
+    def test_the_shadow_marker_is_rebuilt_from_the_log(self):
+        a = self.actions()
+        self.assertFalse(a.last_act_shadow())
+        self.src.configure("shadow")
+        a.send_act(row(1), "close", {})
+        self.assertTrue(a.last_act_shadow())
+        self.src.configure("conflict")
+        a.send_act(row(2), "close", {})                  # not the source's word
+        self.src.configure("fail")
+        a.send_act(row(3), "close", {})
+        self.assertTrue(a.last_act_shadow())
+        self.src.configure("ok")
+        a.send_act(row(4), "close", {})
+        self.assertFalse(a.last_act_shadow())
+
+    def test_first_name_in_the_nudge_template(self):
+        t = acts.DEFAULT_NUDGE_TEMPLATE
+        for who, first in (("Ada Lovelace", "Ada"), ("Ada, hi", "Ada"),
+                           ("Jean-Luc Picard", "Jean-Luc"), ("(Ada) B", "Ada"),
+                           ("Ada.", "Ada"), ("  Ada   Marie  Lovelace ", "Ada"),
+                           ("#launch", "there"), ("#launch-team", "there"),
+                           ("", "there"), ("You", "there"), ("12345", "there"),
+                           ("...", "there")):
+            self.assertEqual(acts.render_nudge(t, who, "x"),
+                             f"Hi {first}, any news on x?", who)
 
 
 class OpsLogTest(Base):
@@ -525,6 +736,30 @@ class DoneReactionTest(Base):
         self.assertEqual(pins[TOOL], {"ch": support.CHANNEL,
                                       "ts": support.MESSAGE,
                                       "nm": "white_check_mark"})
+
+    def test_it_targets_the_message_itself_never_the_thread_root(self):
+        seen, call = self.calls()
+        a = self.actions(react=self.react(), done_reaction="eyes",
+                         call_tools=call)
+        thread_only = {"reply_to": {"channel": support.CHANNEL,
+                                    "thread_ts": support.THREAD}}
+        it = row(meta=thread_only)
+        self.assertIsNone(a.done_reaction_for(it))
+        res = a.react_done(it, "eyes")       # also refused when called directly
+        self.assertFalse(res.ok)
+        self.assertEqual(seen, [])
+        # null message_ts is the same as absent
+        it = row(meta={"reply_to": {"channel": support.CHANNEL,
+                                    "thread_ts": support.THREAD,
+                                    "message_ts": None}})
+        self.assertIsNone(a.done_reaction_for(it))
+        # E (the existing react key) still falls back to the thread: unchanged
+        self.assertEqual(writes_mod.react_target(thread_only),
+                         (support.CHANNEL, support.THREAD))
+        both = row()
+        self.assertEqual(a.done_reaction_for(both), "eyes")
+        self.assertTrue(a.react_done(both, "eyes").ok)
+        self.assertEqual(seen[0][TOOL]["ts"], support.MESSAGE)
 
     def test_it_is_skipped_without_a_message_or_without_react(self):
         _seen, call = self.calls()

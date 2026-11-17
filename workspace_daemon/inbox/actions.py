@@ -566,32 +566,50 @@ class LocalActions:
         return status, resp
 
     def _deliver(self, source, request, who, where, inverse_of=None):
-        status, resp = self._call(source, request)
-        dropped = 0
-        if status == acts_mod.PENDING and inverse_of is None:
-            now = time.time()
+        """One act call. The op is written to the pending file BEFORE the call
+        (so a crash or a kill during it leaves it for a retry with the same
+        op_id) and removed once the source answers ok, shadow or conflict. An
+        inverse is not retried, so it is not kept."""
+        dropped, kept, now = 0, True, time.time()
+        keep = inverse_of is None and self._pending_ops is not None
+        if keep:
             entry = {"op_id": request["op_id"], "request": request,
                      "source": source, "action": request["action"],
                      "id": request["id"], "who": str(who)[:acts_mod.WHO_MAX],
                      "where": str(where)[:acts_mod.WHO_MAX],
                      "queued_at": now, "last_try": now, "tries": 1,
-                     "message": resp["message"][:200]}
+                     "message": "sent, no answer yet"}
             try:
                 dropped = sum(self._pending_ops.add(entry, now))
             except OSError:
+                kept = False
+        status, resp = self._call(source, request)
+        if keep and kept:
+            try:
+                if status == acts_mod.PENDING:
+                    self._pending_ops.note(request["op_id"], resp["message"])
+                else:
+                    self._pending_ops.remove(request["op_id"])
+            except OSError:
                 pass
+        lost = status == acts_mod.PENDING and not kept and inverse_of is None
         self._log_op(source, request, who, where,
-                     "pending" if status == acts_mod.PENDING else status,
-                     resp["message"], inverse_of)
-        return ActOutcome(status, resp["message"], request["op_id"], dropped,
-                          resp["shadow"])
+                     "failed" if lost else status, resp["message"],
+                     inverse_of)
+        return ActOutcome(acts_mod.LOST if lost else status, resp["message"],
+                          request["op_id"], dropped, resp["shadow"])
 
     def pending_count(self):
-        """How many ops are waiting for a retry."""
+        """How many ops are waiting for a retry. Entries of a source that is
+        no longer configured are not counted: nothing can retry them, so
+        counting them would show an "N not synced" no action can clear. They
+        stay in the file (a source put back in `inbox.yaml` finds them again)
+        and expire after 7 days."""
         if self._pending_ops is None:
             return 0
         try:
-            return self._pending_ops.count()
+            return sum(1 for e in self._pending_ops.all()
+                       if e.get("source") in self.acts_cfg)
         except OSError:
             return 0
 
@@ -617,19 +635,23 @@ class LocalActions:
             source, request = entry.get("source"), entry.get("request")
             if source not in self.acts_cfg or not isinstance(request, dict):
                 continue
+            try:     # stamp the try first: another pane skips it, a crash keeps it
+                self._pending_ops.touch(entry["op_id"], now, "retrying")
+            except OSError:
+                pass
             status, resp = self._call(source, request)
             try:
                 if status == acts_mod.PENDING:
-                    self._pending_ops.touch(entry["op_id"], now,
-                                            resp["message"])
+                    self._pending_ops.note(entry["op_id"], resp["message"])
                 else:
                     self._pending_ops.remove(entry["op_id"])
             except OSError:
                 pass
             if status == acts_mod.CONFLICT and request["action"] in (
                     "close", "snooze", "mute"):
-                try:
-                    self.store.restore(request["id"])
+                try:    # a mark made after the op was queued is a newer decision
+                    self.store.restore_unless_newer(
+                        request["id"], entry.get("queued_at") or now)
                 except OSError:
                     pass
             self._log_op(source, request, entry.get("who", ""),
@@ -667,9 +689,15 @@ class LocalActions:
         if self._ops is None:
             return []
         try:
-            return self._ops.rows()
+            rows = self._ops.rows()
         except OSError:
             return []
+        undone = {r.get("inverse_of") for r in rows if r.get("inverse_of")
+                  and r.get("result") in (acts_mod.OK, acts_mod.SHADOW)}
+        for r in rows:       # a row an inverse already undid offers no `u`
+            if r.get("op_id") in undone:
+                r["undone"] = True
+        return rows
 
     def invertible(self, row):
         """The act that undoes a logged op, or None: only a `close` or a `mute`
@@ -678,6 +706,7 @@ class LocalActions:
         action = acts_mod.INVERSE.get(row.get("action"))
         cfg = self.acts_cfg.get(row.get("source"))
         if (action is None or cfg is None or row.get("inverse_of")
+                or row.get("undone")
                 or row.get("result") not in (acts_mod.OK, acts_mod.SHADOW)
                 or row.get("action") not in cfg["acts"]):
             return None
@@ -687,8 +716,9 @@ class LocalActions:
         """Send the inverse of a logged op (blocks: call from a worker) and,
         when the source took it, drop the local mark. An `ActOutcome`."""
         action = self.invertible(row)
-        if action is None:
-            return ActOutcome("unavailable", "this op has no inverse")
+        if action is None or row.get("op_id") in self._undone_ids():
+            return ActOutcome("unavailable", "this op has no inverse (or it "
+                                             "was already undone)")
         request = acts_mod.build_request(
             acts_mod.new_op_id(), action, row["id"], row.get("meta") or {},
             time.time(), {})
@@ -697,13 +727,33 @@ class LocalActions:
         if out.status in (acts_mod.OK, acts_mod.SHADOW):
             try:
                 self.store.restore(row["id"])
+                if self._pending_ops is not None:   # a pending op is stale now
+                    self._pending_ops.drop_for_id(row["id"])
             except OSError:
                 pass
         return out
 
-    def undo_marks(self, item):
-        """Take the local marks of an item back (a conflict)."""
-        self.store.restore(item.key)
+    def _undone_ids(self):
+        """The op ids that a later inverse (ok or shadow) already undid."""
+        return {r.get("inverse_of") for r in self.ops_rows()
+                if r.get("inverse_of") and r.get("result") in (
+                    acts_mod.OK, acts_mod.SHADOW)}
+
+    def last_act_shadow(self):
+        """Whether the newest op the source took (ok or shadow) was a shadow
+        one: rebuilds the health strip's marker at startup."""
+        for row in self.ops_rows():
+            if row.get("result") in (acts_mod.OK, acts_mod.SHADOW):
+                return row["result"] == acts_mod.SHADOW
+        return False
+
+    def undo_marks(self, item, since=None):
+        """Take the local marks of an item back (a conflict). With `since`,
+        only when they were made at or before it: a newer mark stays."""
+        if since is None:
+            self.store.restore(item.key)
+        else:
+            self.store.restore_unless_newer(item.key, since)
 
     def act_nudge_text(self, item):
         """The `nudge_template` text for an item (see acts.render_nudge)."""
@@ -712,10 +762,12 @@ class LocalActions:
     # ---- done reaction (0.10.0) ----
     def done_reaction_for(self, item):
         """The emoji `d` also reacts with, or None: `done_reaction` is set,
-        `react:` is configured and the item has a message to react to."""
+        `react:` is configured and the item has its own message to react to
+        (`reply_to.message_ts`: never a thread's root post, which is somebody
+        else's)."""
         if (not self.done_reaction or not self.react_configured
                 or item is None or views.is_synthetic(item)
-                or writes.react_target(item.meta) is None):
+                or writes.message_target(item.meta) is None):
             return None
         return self.done_reaction
 
@@ -724,9 +776,10 @@ class LocalActions:
         retried) with the configured emoji. Blocks: call from a worker."""
         if not self.react_configured:
             return Result(False, "React not configured")
-        target = writes.react_target(item.meta)
+        target = writes.message_target(item.meta)
         if target is None:
-            return Result(False, "this item has no message to react to")
+            return Result(False, "this item has no message of its own to "
+                                 "react to (reply_to.message_ts)")
         if not writes.valid_emoji(emoji):
             return Result(False, "not a valid emoji name")
         out = writes.run_react(self.react_cfg, self.base_dir, target[0],
