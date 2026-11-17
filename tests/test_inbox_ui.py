@@ -1025,12 +1025,12 @@ class CountingUnit:
 
 
 def unit_app(units, poll_s=300.0, watch_s=0.05, debounce_s=0.0, saved=None,
-             saved_watch=None, **kw):
+             **kw):
     store = InboxStore(None)
     cfg = dict(DEFAULTS, watch_interval_s=watch_s)
     app = InboxApp(lambda: [], store, FakeActions(store=store, draft_delay=0),
                    cfg, undo_s=0.15, leave_s=0, stream_delay=0, poll_s=poll_s,
-                   units=units, saved=saved, saved_watch=saved_watch, **kw)
+                   units=units, saved=saved, **kw)
     app.watcher.debounce_s = debounce_s
     return app
 

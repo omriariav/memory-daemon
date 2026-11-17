@@ -223,14 +223,19 @@ class InboxStore:
         self._transaction(change)
 
     def add_feed_rule(self, rule):
-        """Save a UI rule (from `feedrules.new_ui_rule`); the oldest go once
-        there are more than the cap."""
+        """Save a UI rule (from `feedrules.new_ui_rule`). Expired rules are
+        dropped first; then the oldest go once there are more than the cap."""
         clean = feedrules.clean_ui_rule(rule)
         if clean is None:
             raise ValueError("bad feed rule")
 
+        now = self.clock()
+
         def edit(rules):
-            rules[:] = [r for r in rules if r["id"] != clean["id"]]
+            # Rules that have ended go first, so they never push a live one
+            # out at the cap.
+            rules[:] = [r for r in rules if r["id"] != clean["id"]
+                        and (r.get("until") is None or r["until"] > now)]
             rules.append(clean)
             del rules[:-feedrules.MAX_RULES]
         self._change_feed_rules(edit)

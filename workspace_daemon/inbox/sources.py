@@ -1142,11 +1142,6 @@ def make_units(settings, base_dir):
     return units
 
 
-def saved_watch(base_dir):
-    """The files the Saved view depends on."""
-    return lambda: events_files(base_dir)
-
-
 def units_answers(units, marks=None):
     """`{series: {"snapshot": "declined" | "answered" | None, "mark": {...} |
     None}}`: what is known of your answers, by recurring series (see

@@ -35,20 +35,22 @@ def item(i, section="needs_reply", source="slack", actions=("reply",),
     return itm.make_item(**base)
 
 
-def feed_item(i, routine="cal", kind="update", ago_min=None, **meta):
+def feed_item(i, routine="cal", kind="update", ago_min=None, who=None,
+              **meta):
+    extra = {"sender": who} if who else {}
     return item(i, "fyi", "calendar", ("ack",), ago_min=ago_min,
                 meta=dict({"routine": routine, "kind": kind,
-                           "title": f"Title {i}"}, **meta))
+                           "title": f"Title {i}"}, **meta), **extra)
 
 
 class Fixed:
-    def __init__(self, rows, delay=0.0):
-        self.rows, self.delay = rows, delay
+    def __init__(self, rows, delay=0.0, name="events"):
+        self.rows, self.delay, self.name = rows, delay, name
 
     def __call__(self):
         if self.delay:
             time.sleep(self.delay)
-        return [sources.SourceResult("src", self.rows, False, None, None)]
+        return [sources.SourceResult(self.name, self.rows, False, None, None)]
 
 
 async def settle(pilot, app):
@@ -67,11 +69,12 @@ async def until(pilot, cond, tries=100, step=0.05):
     return cond()
 
 
-def make_app(rows, store=None, delay=0.0, undo_s=0.15, **kw):
+def make_app(rows, store=None, delay=0.0, undo_s=0.15, name="events",
+             actions=None, **kw):
     store = store or InboxStore(None)
     kw.setdefault("settings", dict(DEFAULTS))
-    return InboxApp(Fixed(rows, delay), store,
-                    FakeActions(store=store, draft_delay=0), undo_s=undo_s,
+    actions = actions or FakeActions(store=store, draft_delay=0)
+    return InboxApp(Fixed(rows, delay, name), store, actions, undo_s=undo_s,
                     leave_s=0, stream_delay=0, **kw), store
 
 
@@ -564,6 +567,304 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.screen_stack), 1)
 
 
+SAVED = [{"id": "s1", "source": "slack", "kind": "new", "ts": time.time() - 600,
+          "title": "A saved thread", "link": None, "source_id": "slack:s1"},
+         {"id": "s2", "source": "email", "kind": "new", "ts": time.time() - 900,
+          "title": "A saved mail", "link": "https://example.com/m",
+          "source_id": "gmail:s2"}]
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class FeedPinningTest(unittest.IsolatedAsyncioTestCase):
+    """Review fixes: active alerts stay, only events age out."""
+
+    def settings(self, rules=()):
+        return dict(DEFAULTS, feed={"window_h": 24.0, "rules": list(rules)})
+
+    async def test_an_alert_active_for_30_hours_is_listed_and_can_be_acked(self):
+        old = item(1, "fyi", "alert", ("ack",), ago_min=30 * 60,
+                   meta={"key": "attention:zoom", "routine": "zoom",
+                         "kind": "alert"})
+        rows = [old, feed_item(2, "cal", ago_min=30 * 60)]   # this one ages out
+        rules = [{"routine": "zoom", "action": "hide"}]
+        app, store = make_app(rows, view="feed", settings=self.settings(rules),
+                              undo_s=0.1)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual([r.key for r in app.visible()], ["t:1"])
+            self.assertEqual(app.view_counts()["feed"], 1)
+            await pilot.press("a")                        # ack it
+            await pilot.pause(0.5)
+            self.assertIn("ack", store.marks["t:1"])
+            self.assertEqual(app.visible(), [])
+
+    async def test_an_active_alert_stays_when_a_rule_digests_its_routine(self):
+        rows = [item(i, "fyi", "alert", ("ack",), ago_min=i * 10,
+                     meta={"key": f"attention:z{i}", "routine": "zoom",
+                           "kind": "alert"}) for i in (1, 2)]
+        rules = [{"routine": "zoom", "action": "digest"}]
+        app, _ = make_app(rows, view="feed", settings=self.settings(rules))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(sorted(r.key for r in app.visible()),
+                             ["t:1", "t:2"])
+
+    async def test_a_command_source_row_never_ages_out(self):
+        old = feed_item(1, "reg", ago_min=60 * 24 * 10)
+        new = feed_item(2, "reg", ago_min=5)
+        app, _ = make_app([old, new], view="feed", name="registry",
+                          settings=self.settings())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(sorted(r.key for r in app.visible()),
+                             ["t:1", "t:2"])
+
+    async def test_a_renamed_events_source_still_ages_out(self):
+        rows = [feed_item(1, "cal", ago_min=60 * 30)]
+        cfg = dict(self.settings(), sources=[{"name": "main", "type": "events"}])
+        app, _ = make_app(rows, view="feed", name="main", settings=cfg)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(app.visible(), [])
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class DigestFilterTest(unittest.IsolatedAsyncioTestCase):
+    def rows(self):
+        return [feed_item(1, "sheet-watch", "change", ago_min=1, who="Alpha One"),
+                feed_item(2, "sheet-watch", "change", ago_min=2, who="Beta Two"),
+                feed_item(3, "sheet-watch", "change", ago_min=3, who="Alpha Three")]
+
+    def settings(self):
+        return dict(DEFAULTS, feed={"window_h": 48.0, "rules": [
+            {"routine": "sheet-watch", "action": "digest"}]})
+
+    async def digest_app(self, undo_s=0.1):
+        app, store = make_app(self.rows(), view="feed", settings=self.settings(),
+                              undo_s=undo_s)
+        return app, store
+
+    async def test_d_acts_only_on_the_members_the_text_filter_shows(self):
+        app, store = await self.digest_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            (row,) = app.visible()
+            self.assertEqual(len(row.members), 3)
+            app.filter_text = "alpha"
+            app.redraw()
+            await pilot.pause(0.1)
+            (row,) = app.visible()
+            self.assertEqual(sorted(m.key for m in row.members), ["t:1", "t:3"])
+            self.assertTrue(row.gist.startswith("2 changes"))
+            self.assertEqual(sorted(m.key for m in app.current.members),
+                             ["t:1", "t:3"])
+            await pilot.press("d")
+            await pilot.pause(0.6)
+            self.assertTrue(store.is_hidden("t:1"))
+            self.assertTrue(store.is_hidden("t:3"))
+            self.assertFalse(store.is_hidden("t:2"))          # not shown: untouched
+
+    async def test_s_acts_only_on_the_members_the_source_filter_shows(self):
+        rows = self.rows()
+        rows[1] = item(2, "fyi", "drive", ("ack",), ago_min=2, sender="Beta Two",
+                       meta={"routine": "sheet-watch", "kind": "change",
+                             "title": "Title 2"})
+        app, store = make_app(rows, view="feed", settings=self.settings(),
+                              undo_s=0.1)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.source_filter = "calendar"
+            app.redraw()
+            await pilot.pause(0.1)
+            await pilot.press("s", "1")
+            await pilot.pause(0.6)
+            self.assertIsNotNone(store.snoozed_until("t:1"))
+            self.assertIsNotNone(store.snoozed_until("t:3"))
+            self.assertIsNone(store.snoozed_until("t:2"))
+
+    async def test_a_digest_with_no_member_passing_is_not_listed(self):
+        app, _ = await self.digest_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.filter_text = "zzz"
+            app.redraw()
+            await pilot.pause(0.1)
+            self.assertEqual(app.visible(), [])
+            self.assertIsNone(app.current)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
+    """Saved and digest rows take only the keys the docs list."""
+
+    def actions(self, store):
+        class Rich(FakeActions):
+            react_configured = True
+            polish_configured = True
+
+            def react_plan(self, item):
+                return ("C1", "1.0")
+
+            def react_choices(self, item):
+                return ["eyes"], "eyes"
+        return Rich(store=store, draft_delay=0)
+
+    KEYS = ["a", "e", "n", "m", "E", "P", "X", "T", "p", "c", "i", "I", "C",
+            "x", "minus"]
+
+    async def press_all(self, pilot, app, store, acts):
+        for key in self.KEYS:
+            await pilot.press(key)
+            await pilot.pause(0.05)
+            self.assertEqual(len(app.screen_stack), 1, key)   # no picker, no modal
+        await pilot.pause(0.2)
+        self.assertEqual(app.pending, [])
+        self.assertEqual(store.marks, {})
+        self.assertEqual([c for c in acts.calls if c[0] != "draft"], [])
+
+    async def test_saved_rows(self):
+        store = InboxStore(None)
+        acts = self.actions(store)
+        app, _ = make_app([feed_item(1)], store=store, actions=acts,
+                          saved=lambda: (SAVED, None), saved_days=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            self.assertTrue(app.current.key.startswith("saved:"))
+            await self.press_all(pilot, app, store, acts)
+            self.assertEqual(store.feed_rules(), [])
+            await pilot.press("y")              # copy still works
+            await pilot.press("j", "o")
+            await pilot.pause(0.1)
+            self.assertEqual([c[0] for c in acts.calls if c[0] == "open"], ["open"])
+
+    async def test_digest_rows(self):
+        store = InboxStore(None)
+        acts = self.actions(store)
+        cfg = dict(DEFAULTS, feed={"window_h": 48.0, "rules": [
+            {"routine": "sheet-watch", "action": "digest"}]})
+        rows = [feed_item(n, "sheet-watch", "change", ago_min=n)
+                for n in (1, 2)]
+        app, _ = make_app(rows, store=store, actions=acts, view="feed",
+                          settings=cfg)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(app.current.key.startswith("digest:"))
+            keys = [k for k in self.KEYS if k not in ("x", "minus")]
+            for key in keys:
+                await pilot.press(key)
+                await pilot.pause(0.05)
+                self.assertEqual(len(app.screen_stack), 1, key)
+            self.assertEqual(app.pending, [])
+            self.assertEqual(store.marks, {})
+            self.assertEqual([c for c in acts.calls if c[0] != "draft"], [])
+            await pilot.press("x")              # a rule from its newest row works
+            await pilot.pause(0.2)
+            self.assertEqual(type(app.screen).__name__, "ChoicePicker")
+
+    async def test_a_digest_opens_the_one_link_its_rows_share(self):
+        cfg = dict(DEFAULTS, feed={"window_h": 48.0, "rules": [
+            {"routine": "sheet-watch", "action": "digest"}]})
+        rows = [feed_item(n, "sheet-watch", "change", ago_min=n)
+                for n in (1, 2)]
+        for r in rows:
+            r["link"] = "https://example.com/shared"
+        app, _ = make_app(rows, view="feed", settings=cfg)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(app.current.link, "https://example.com/shared")
+            self.assertIn(("o", "open"), app.hints())
+
+    async def test_a_saved_row_goes_at_once_on_d_and_comes_back_on_u(self):
+        app, store = make_app([feed_item(1)], undo_s=5,
+                              saved=lambda: (SAVED, None), saved_days=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            await pilot.pause(0.3)
+            first = app.current_key
+            self.assertTrue(first.startswith("saved:"))
+            await pilot.press("d")
+            await pilot.pause(0.2)
+            self.assertNotIn(first, [r.key for r in app.visible()])   # undo window
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 1)
+            await pilot.press("u")
+            await pilot.pause(0.2)
+            self.assertIn(first, [r.key for r in app.visible()])
+
+    async def test_a_saved_row_is_dropped_only_while_the_mail_row_shows(self):
+        row = item(1, "fyi", "email", ("ack",), meta={
+            "routine": "mail", "source_id": "gmail:s2"})
+        app, store = make_app([row], saved=lambda: (SAVED, None), saved_days=2,
+                              view="feed")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 1)
+            store.done("t:1")                   # the mail row is gone
+            app.refilter()
+            await pilot.pause(0.1)
+            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 2)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class ViewDetailsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_entering_the_feed_clears_a_source_filter_from_elsewhere(self):
+        rows = [item(1, "needs_reply", "slack"), feed_item(2), feed_item(3)]
+        app, _ = make_app(rows)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.source_filter = "slack"
+            app.redraw()
+            await pilot.press("4")
+            await pilot.pause(0.2)
+            self.assertIsNone(app.source_filter)
+            self.assertEqual(len(app.visible()), 2)
+
+    async def test_the_rules_screen_survives_a_failing_write(self):
+        store = InboxStore(None)
+        store.add_feed_rule(feedrules.new_ui_rule(
+            from_row(feed_item(1)), "routine", "hide", None, time.time()))
+
+        def boom(*args):
+            raise OSError(13, "denied")
+        store.set_feed_rule_enabled = boom
+        store.remove_feed_rule = boom
+        app, _ = make_app([feed_item(2, "other")], store=store, view="feed")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("M")
+            await pilot.pause(0.3)
+            await pilot.press("space")
+            await pilot.pause(0.2)
+            await pilot.press("delete")
+            await pilot.pause(0.2)
+            self.assertIsInstance(app.screen, RulesScreen)        # still open
+            told = [n.message for n in app._notifications]
+            self.assertTrue(any("Rule not changed" in t for t in told))
+
+    async def test_the_health_badge_counts_failing_groups_without_an_alert(self):
+        snap = routine_snapshot()                  # zoom fails, no alert yet
+        app, _ = make_app([item(1)], health=lambda: snap)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await until(pilot, lambda: app.health_snap is not None)
+            self.assertEqual(app.needs_you(), [])
+            self.assertEqual(app.health_badge(), 1)
+            self.assertIn("5 Health ⚠1", str(app.query_one("#hdr").render()))
+
+    async def test_an_alert_and_its_failing_group_count_once(self):
+        alerts = [{"key": "attention:zoom-meetings",
+                   "routine": "zoom-meetings", "since": time.time() - 600}]
+        snap = routine_snapshot(alerts)
+        app, _ = make_app([item(1)], health=lambda: snap)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await until(pilot, lambda: app.health_snap is not None)
+            self.assertEqual(len(app.needs_you()), 1)
+            self.assertEqual(app.health_badge(), 1)
+
+
 def from_row(raw):
     from workspace_daemon.inbox.models import from_v1
     return from_v1(raw)
@@ -631,7 +932,7 @@ class HealthUiTest(unittest.IsolatedAsyncioTestCase):
                    "since": time.time() - 600}]
         rows = [alert_item(1, "interrupted:slack-mcp", "slack-mcp",
                            benign=True)]
-        app, _ = make_app(rows, health=lambda: routine_snapshot(alerts))
+        app, _ = make_app(rows, health=lambda: snapshot(alerts=alerts))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await until(pilot, lambda: app.health_snap is not None)

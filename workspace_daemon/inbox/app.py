@@ -169,7 +169,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, SavedScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-warn { margin: 1 0 0 0; }
@@ -203,9 +203,6 @@ class InboxApp(App):
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
-    #saved { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
-    #saved-title { margin-bottom: 1; }
-    #saved-table { height: 1fr; }
     #rules { width: 96%; height: 70%; border: heavy $primary; background: $surface; padding: 1 2; }
     #rules-title { margin-bottom: 1; }
     #rules-table { height: 1fr; }
@@ -213,7 +210,7 @@ class InboxApp(App):
 
     def __init__(self, fetch, store, actions, settings=None, demo=False,
                  undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None,
-                 saved=None, saved_days=None, units=None, saved_watch=None,
+                 saved=None, saved_days=None, units=None,
                  context_debounce_s=CONTEXT_DEBOUNCE_S, context_cache=None,
                  health=None, view="inbox"):
         """`fetch()` blocks and returns a list of SourceResult (it runs in a
@@ -229,8 +226,7 @@ class InboxApp(App):
         every `watch_interval_s` the files each unit depends on are
         stat-checked and only a unit with a changed file is re-run; the
         fallback timer (`poll_interval_s`) and `r` run them all, and `fetch`
-        is then unused. (`saved_watch` is accepted and ignored: the saved rows
-        are read with every refresh, and the events unit watches the files.)
+        is then unused. The saved rows are read with every refresh.
 
         `context_debounce_s` is how long a new selection must stay before the
         open Context pane fetches its context; `context_cache` replaces the
@@ -258,6 +254,10 @@ class InboxApp(App):
         self.feed_cfg.setdefault("window_h", views.DEFAULT_WINDOW_H)
         self.feed_cfg.setdefault("rules", [])
         self.feed_data = views.Feed([], [], [], 0)
+        # Only the rows of the events source age out of the Feed.
+        self._event_origins = tuple(
+            s["name"] for s in settings.get("sources") or []
+            if s.get("type") == "events") or views.EVENT_ORIGINS
         self._views = {"inbox": [], "waiting": [], "feed": []}
         self._rows = {}                    # key -> row, digest and saved rows too
         self._groups_sig = None
@@ -422,9 +422,19 @@ class InboxApp(App):
             groups = views.only_routine(groups, self.feed_routine)
         if not (self.filter_text or self.source_filter):
             return list(groups)
-        return [replace(g, items=[i for i in g.items if self._passes(i)],
-                        tail="")
+        return [replace(g, items=self._filtered(g.items), tail="")
                 for g in groups]
+
+    def _filtered(self, rows):
+        """`rows` that pass the filters. A digest row is rebuilt from the
+        members that pass, so a mark made on it reaches only those."""
+        out = []
+        for i in rows:
+            row = (views.digest_subset(i, self._passes) if views.is_digest(i)
+                   else (i if self._passes(i) else None))
+            if row is not None:
+                out.append(row)
+        return out
 
     def visible(self):
         """The rows of the open view, in the order the queue lists them."""
@@ -436,7 +446,7 @@ class InboxApp(App):
         return {"inbox": len(views.view_rows(self._views["inbox"])),
                 "waiting": len(views.view_rows(self._views["waiting"])),
                 "feed": self.feed_data.total,
-                "health": len(self.needs_you())}
+                "health": self.health_badge()}
 
     def _ui_rules(self):
         fn = getattr(self.store, "feed_rules", None)
@@ -454,32 +464,43 @@ class InboxApp(App):
                 if rule is not None:
                     it.feed_label = feedrules.rule_label(rule)
 
-    def _saved_items(self, listed):
-        """The saved-to-memory rows as Feed rows, leaving out the ones an
-        item of the queue already shows (same `source_id`) and the ones
-        marked done."""
-        have = {i.meta.get("source_id") for i in listed
+    def _saved_items(self, visible):
+        """The saved-to-memory rows as Feed rows, leaving out the ones a row
+        that is visible in the views already shows (same `source_id`), the
+        ones marked done and the ones a pending mark is hiding."""
+        have = {i.meta.get("source_id") for i in visible
                 if i.meta.get("source_id")}
         now = time.time()
+        busy = self._busy_keys()
         out = []
         for row in self.saved_rows:
             if row.get("source_id") in have:
                 continue
             it = views.saved_item(row)
-            if not self.store.is_hidden(it.key, now):
+            if it.key not in busy and not self.store.is_hidden(it.key, now):
                 out.append(it)
         return out
 
     def _build_views(self, now):
         """Group the shown rows into the views. Returns a signature of the
         result, so a caller can tell whether anything moved."""
-        saved = self._saved_items(self.all_rows)
-        self.feed_data = views.feed_view(
-            self.items, now, window_h=self.feed_cfg["window_h"],
-            show_all=self.show_all, saved=saved)
-        self._views = {"inbox": views.inbox_groups(self.items),
-                       "waiting": views.waiting_groups(self.items, now),
-                       "feed": self.feed_data.groups}
+        def feed(saved=()):
+            return views.feed_view(
+                self.items, now, window_h=self.feed_cfg["window_h"],
+                show_all=self.show_all, saved=saved,
+                windowed=self._event_origins)
+        inbox = views.inbox_groups(self.items)
+        waiting = views.waiting_groups(self.items, now)
+        data = feed()
+        shown = (views.view_rows(inbox) + views.view_rows(waiting)
+                 + [m for r in views.view_rows(data.groups)
+                    for m in (r.members or [r])])
+        saved = self._saved_items(shown)
+        if saved:
+            data = feed(saved)
+        self.feed_data = data
+        self._views = {"inbox": inbox, "waiting": waiting,
+                       "feed": data.groups}
         self._rows = {i.key: i for i in self.items}
         for g in self.feed_data.groups:
             for i in g.items:
@@ -540,6 +561,8 @@ class InboxApp(App):
     def current(self):
         it = self._rows.get(self.current_key)
         if it is not None:
+            if views.is_digest(it) and (self.filter_text or self.source_filter):
+                return views.digest_subset(it, self._passes)
             return it
         for it in self.items:
             if it.key == self.current_key:
@@ -565,6 +588,23 @@ class InboxApp(App):
         return [{"key": a["key"], "routine": a["routine"],
                  "since": a["since"], "info": by_key.get(a["key"], {})}
                 for a in snap.get("alerts") or [] if a["key"] not in benign]
+
+    def health_badge(self):
+        """The number on the Health tab: the alerts that need you, plus the
+        failing routine groups (`✗` in the strip) that no such alert names yet
+        (an alert only fires after a streak of failed runs, so a group can be
+        failing before one exists)."""
+        snap = self.health_snap
+        if not snap:
+            return 0
+        needs = self.needs_you()
+        covered = {n["routine"] for n in needs if n["routine"]}
+        groups = {r["group"] for r in snap.get("routines") or []
+                  if r["id"] in covered}
+        failing = [g for g in snap.get("groups") or []
+                   if g["state"] == healthmod.FAIL
+                   and g["name"] not in groups]
+        return len(needs) + len(failing)
 
     def health_refresh(self):
         """Read the daemon's state in a worker (every 30 s, and on `r`). The
@@ -984,6 +1024,8 @@ class InboxApp(App):
             self.end_edit(save=True)
         if key == "feed" and routine is not None:
             self.feed_routine = routine or None
+        if key == "feed" and self.view != "feed" and self.source_filter:
+            self.source_filter = None   # `f` filters by routine here
         self.view = key
         self.redraw(keep=self.current_key)
         self._focus_view()
@@ -1104,8 +1146,23 @@ class InboxApp(App):
         self._focus_view()
 
     # ---------- editing ----------
+    def _synthetic(self, it):
+        """True (with a notice) for a row the views made: a saved-to-memory
+        row takes o, d, s and y; a digest row takes d and s (on its rows), o
+        (when its rows share one link), y, and x or - (a rule from its newest
+        row). Nothing else acts on them."""
+        if it is None or not views.is_synthetic(it):
+            return False
+        self.notify("A saved-to-memory row: only o, d, s and y work on it"
+                    if views.is_saved_row(it) else
+                    "A digest row: d and s act on its rows, o and y on the "
+                    "row, x and - on its newest", timeout=3, markup=False)
+        return True
+
     def action_edit(self):
         it = self.current
+        if self._synthetic(it):
+            return
         if it is None or it.kind in ("fyi", "ack"):
             self.notify("Nothing to edit here", timeout=2, markup=False)
             return
@@ -1374,6 +1431,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if self._synthetic(it):
+            return
         if self._rsvp_on(it):          # an invite: `a` accepts it
             return self._rsvp("accept", it)
         if it.kind == "ack":
@@ -1392,6 +1451,8 @@ class InboxApp(App):
     def action_nudge(self):
         it = self.current
         if it is None:
+            return
+        if self._synthetic(it):
             return
         if it.kind != "nudge":
             self.notify("n nudges items under 'Waiting on them'", timeout=3, markup=False)
@@ -1595,6 +1656,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if self._synthetic(it):
+            return
         if not getattr(self.actions, "react_configured", False):
             self.notify(REACT_OFF, timeout=3, severity="warning", markup=False)
             return
@@ -1647,6 +1710,8 @@ class InboxApp(App):
         accept, edit or cancel. Never sends anything."""
         it = self.current
         if it is None:
+            return
+        if self._synthetic(it):
             return
         if not getattr(self.actions, "polish_configured", False):
             self.notify(POLISH_OFF, timeout=3, severity="warning", markup=False)
@@ -1761,6 +1826,8 @@ class InboxApp(App):
         it = it or self.current
         if it is None:
             return
+        if self._synthetic(it):
+            return
         if not getattr(self.actions, "rsvp_configured", False):
             self.notify(RSVP_OFF, timeout=3, severity="warning", markup=False)
             return
@@ -1831,6 +1898,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if self._synthetic(it):
+            return
         if it.memory_id:      # the daemon (or an earlier save) already did it
             self.notify(f"Already in memory ({it.memory_id})", timeout=4,
                         markup=False)
@@ -1875,6 +1944,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             self.notify("Nothing selected", timeout=2, markup=False)
+            return
+        if self._synthetic(it):
             return
         if self._act_op is not None:
             self.notify("An action lookup is already running", timeout=2,
@@ -2093,7 +2164,8 @@ class InboxApp(App):
         # longer selected: it never starts.
         self._ctx_pending = [p for p in self._ctx_pending
                              if self._ident(p) == ident]
-        if (it is not None and self._ctx_on() and ident not in self._ctx_loading
+        if (it is not None and self._ctx_on()
+                and not views.is_synthetic(it) and ident not in self._ctx_loading
                 and self.ctx_cache.get(*ident) is None):
             if immediate or self.context_debounce_s <= 0:
                 self._ctx_start(it)
@@ -2188,6 +2260,7 @@ class InboxApp(App):
             return
         it = self.current
         if (it is not None and self._ctx_on()
+                and not views.is_synthetic(it)
                 and self._ident(it) == self._ctx_shown):
             ident = self._ident(it)
             if (self.ctx_cache.get(*ident) is None
@@ -2208,6 +2281,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if self._synthetic(it):
+            return
         ident = self._ident(it)
         if ident in self._ctx_loading:
             self.notify("Context is already loading", timeout=2, markup=False)
@@ -2221,7 +2296,8 @@ class InboxApp(App):
         it = self.current
         ident = self._ident(it)
         ctx = {"state": "off"}
-        if it is not None and self._ctx_on():
+        if (it is not None and self._ctx_on()
+                and not views.is_synthetic(it)):
             entry = self.ctx_cache.get(*ident, stale=True)
             busy = (ident in self._ctx_loading or self._ctx_timer is not None
                     or any(self._ident(p) == ident for p in self._ctx_pending))
@@ -2294,6 +2370,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             self.notify("Nothing selected", timeout=2, markup=False)
+            return
+        if self._synthetic(it):
             return
         self._set_context_open(True)
         skey = self._summary_key(it)
@@ -2513,13 +2591,21 @@ class InboxApp(App):
         if self.rules_screen is not None:
             return
 
-        def toggled(rule_id, enabled):
-            self.store.set_feed_rule_enabled(rule_id, enabled)
+        def guarded(write, *args):
+            try:
+                write(*args)
+            except (OSError, ValueError) as exc:
+                self.notify("Rule not changed: "
+                            f"{getattr(exc, 'strerror', None) or exc}",
+                            severity="warning", timeout=4, markup=False)
+                return
             self._rules_changed()
 
+        def toggled(rule_id, enabled):
+            guarded(self.store.set_feed_rule_enabled, rule_id, enabled)
+
         def removed(rule_id):
-            self.store.remove_feed_rule(rule_id)
-            self._rules_changed()
+            guarded(self.store.remove_feed_rule, rule_id)
         screen = RulesScreen(self.feed_cfg["rules"], self._ui_rules(),
                              toggled, removed)
         self.rules_screen = screen

@@ -14,17 +14,21 @@ from workspace_daemon.inbox.store import InboxStore
 
 NOW = 1_700_000_000.0
 H = 3600.0
+# `ago_h` that puts a row at local noon, so rows around it share one local day
+# whatever the timezone.
+NOON = (NOW - datetime.fromtimestamp(NOW).replace(
+    hour=12, minute=0, second=0, microsecond=0).timestamp()) / H
 
 
 def mk(key, section="fyi", source="calendar", ago_h=1.0, who="Pat Sample",
-       actions=("ack",), draft=None, **meta):
+       actions=("ack",), draft=None, origin="events", **meta):
     raw = itm.make_item(
         id=key, source=source, section=section,
         urgency="urgent" if section == "urgent" else "digest",
         sender=who, where="somewhere", gist=f"gist {key}", ts=NOW - ago_h * H,
         link=None, thread=[], draft=draft, actions=list(actions), meta=meta)
     it = from_v1(raw)
-    it.origin = "src"
+    it.origin = origin
     return it
 
 
@@ -118,9 +122,9 @@ class FeedViewTest(unittest.TestCase):
         feed = views.feed_view(rows, NOW)
         names = [g.title for g in feed.groups]
         # newest row first; a row with no routine groups by its source's name
-        self.assertEqual(names, ["REC", "CAL", "SRC"])
+        self.assertEqual(names, ["REC", "CAL", "EVENTS"])
         self.assertEqual(keys(feed.groups[1].items), ["c2", "c1"])
-        self.assertEqual(feed.counts, [("rec", 1), ("cal", 2), ("src", 1)])
+        self.assertEqual(feed.counts, [("rec", 1), ("cal", 2), ("events", 1)])
         self.assertEqual(feed.total, 4)
 
     def test_window_ages_rows_out_and_show_all_brings_them_back(self):
@@ -132,6 +136,37 @@ class FeedViewTest(unittest.TestCase):
                               .groups[0].items), ["new", "old"])
         self.assertEqual(keys(views.feed_view(rows, NOW, show_all=True)
                               .groups[0].items), ["new", "old"])
+
+    def test_only_event_rows_age_out_of_the_feed(self):
+        events_row = mk("ev", routine="cal", ago_h=30)
+        state_row = mk("st", source="slack", routine="reg", ago_h=300,
+                       origin="registry")
+        feed = views.feed_view([events_row, state_row], NOW)
+        self.assertEqual([k for g in feed.groups for k in keys(g.items)],
+                         ["st"])
+        # a deployment may name its events source anything
+        feed = views.feed_view([events_row, state_row], NOW,
+                               windowed=("registry",))
+        self.assertEqual(sorted(k for g in feed.groups for k in keys(g.items)),
+                         ["ev"])
+
+    def test_an_active_alert_is_never_aged_out_hidden_or_digested(self):
+        old = mk("a1", source="alert", routine="zoom", ago_h=30)
+        gone = mk("a2", source="alert", routine="zoom", ago_h=30,
+                  resolved=True)
+        for row in (old, gone):
+            row.feed = "hide"
+        digested = mk("a3", source="alert", routine="zoom", ago_h=2)
+        digested.feed = "digest"
+        feed = views.feed_view([old, gone, digested], NOW)
+        rows = [i for g in feed.groups for i in g.items]
+        self.assertEqual(sorted(keys(rows)), ["a1", "a3"])   # not digested
+        self.assertEqual(feed.muted, [])
+        # a resolved alert is an ordinary row: here it is hidden by its rule
+        # (and one that is old would age out)
+        aged = mk("a4", source="alert", routine="zoom", ago_h=30,
+                  resolved=True)
+        self.assertEqual(views.feed_view([aged], NOW).total, 0)
 
     def test_hidden_rows_are_counted_as_muted(self):
         a, b = mk("a", routine="cal"), mk("b", routine="cal")
@@ -158,6 +193,35 @@ class FeedViewTest(unittest.TestCase):
         self.assertIn("3 changes → 1 row", group.tail)
         self.assertEqual(feed.total, 3)
         self.assertEqual([m.key for m in row.members], ["s3", "s2", "s1"])
+
+    def test_a_digest_has_a_link_only_when_its_rows_share_one(self):
+        a = mk("l1", routine="r", ago_h=NOON + 0.3)
+        b = mk("l2", routine="r", ago_h=NOON + 0.2)
+        for row in (a, b):
+            row.feed = "digest"
+            row.link = "https://example.com/x"
+        (group,) = views.feed_view([a, b], NOW).groups
+        self.assertEqual(group.items[0].link, "https://example.com/x")
+        b.link = "https://example.com/y"
+        (group,) = views.feed_view([a, b], NOW).groups
+        self.assertIsNone(group.items[0].link)
+
+    def test_a_digest_is_rebuilt_from_the_members_a_filter_keeps(self):
+        rows = [mk(f"d{n}", routine="r", ago_h=NOON + 0.1 * n, who=who)
+                for n, who in ((1, "Alpha One"), (2, "Beta Two"),
+                               (3, "Alpha Three"))]
+        for row in rows:
+            row.feed = "digest"
+        (group,) = views.feed_view(rows, NOW).groups
+        digest = group.items[0]
+        part = views.digest_subset(digest, lambda m: "alpha" in m.who.lower())
+        self.assertEqual(sorted(m.key for m in part.members), ["d1", "d3"])
+        self.assertEqual(part.key, digest.key)
+        self.assertTrue(part.gist.startswith("2 changes"))
+        self.assertIs(views.digest_subset(digest, lambda m: True), digest)
+        self.assertIsNone(views.digest_subset(digest, lambda m: False))
+        plain = mk("p")
+        self.assertIs(views.digest_subset(plain, lambda m: False), plain)
 
     def test_saved_to_memory_is_one_more_routine(self):
         saved = [views.saved_item({
@@ -277,6 +341,12 @@ class RuleMatchingTest(unittest.TestCase):
             row, [{"source": "drive", "title_regex": "^gist", "action": "hide"}],
             NOW)[0], "hide")
 
+    def test_synthetic_rows_are_told_apart(self):
+        row = views.saved_item({"id": "e", "source": "slack", "kind": "new",
+                                "ts": NOW, "title": "t", "link": None})
+        self.assertTrue(views.is_synthetic(row))
+        self.assertFalse(views.is_synthetic(mk("x")))
+
     def test_window_ageing_is_applied_after_rules(self):
         old = mk("old", routine="cal", ago_h=30)
         old.feed = "show"
@@ -361,6 +431,31 @@ class UiRulesPersistTest(unittest.TestCase):
                     {"id": "reg1", "action": "hide", "title_regex": "("}]}}))
             self.assertEqual([r["id"] for r in InboxStore(Path(base))
                               .feed_rules()], ["good1"])
+
+    def test_adding_a_rule_prunes_expired_ones_before_the_cap(self):
+        clock = [1000.0]
+        store = InboxStore(None, clock=lambda: clock[0])
+        row = mk("r", routine="cal")
+        for n in range(feedrules.MAX_RULES):
+            store.add_feed_rule(feedrules.new_ui_rule(
+                row, "routine", "hide", 100 + n, clock[0]))
+        self.assertEqual(len(store.feed_rules()), feedrules.MAX_RULES)
+        clock[0] = 5000.0                       # every one of them has ended
+        live = feedrules.new_ui_rule(row, "routine", "digest", None, clock[0])
+        store.add_feed_rule(live)
+        self.assertEqual([r["id"] for r in store.feed_rules()], [live["id"]])
+
+    def test_a_full_list_drops_the_oldest_live_rule(self):
+        store = InboxStore(None, clock=lambda: 1000.0)
+        row = mk("r", routine="cal")
+        ids = []
+        for _ in range(feedrules.MAX_RULES + 1):
+            rule = feedrules.new_ui_rule(row, "routine", "hide", None, 1000.0)
+            ids.append(rule["id"])
+            store.add_feed_rule(rule)
+        kept = [r["id"] for r in store.feed_rules()]
+        self.assertEqual(len(kept), feedrules.MAX_RULES)
+        self.assertNotIn(ids[0], kept)
 
     def test_memory_store_works_too(self):
         store = InboxStore(None)

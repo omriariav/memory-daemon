@@ -29,6 +29,10 @@ SAVED_ROUTINE = "saved to memory"
 DEFAULT_WINDOW_H = 24.0
 DIGEST_PREFIX = "digest:"
 SAVED_PREFIX = "saved:"
+# The origin (source) names whose rows are time-based events: only these age
+# out of the Feed. A command source lists state (an open item shown as fyi),
+# which stays for as long as the source lists it.
+EVENT_ORIGINS = ("events",)
 
 
 @dataclass
@@ -71,6 +75,19 @@ def is_digest(item):
 
 def is_saved_row(item):
     return item.key.startswith(SAVED_PREFIX)
+
+
+def is_synthetic(item):
+    """A row the views make (a digest or a saved-to-memory row), not a source
+    item: only a few keys act on it."""
+    return is_digest(item) or is_saved_row(item)
+
+
+def is_active_alert(item):
+    """A daemon alert whose condition has not ended. It is always listed
+    (docs/inbox.md, "Active keys are always listed"): no Feed window and no
+    `hide` or `digest` rule takes it out of view."""
+    return item.source == "alert" and not item.resolved
 
 
 def _soonest_first(item):
@@ -135,18 +152,37 @@ def _day(ts):
 
 def digest_row(routine, day, members):
     """One row standing for `members` (rows of one routine and day): marking
-    it done marks every member."""
+    it done or snoozing it marks every member. It has a link when its members
+    share exactly one."""
     rows = sorted(members, key=lambda i: i.ts)
     newest = rows[-1]
     n = len(rows)
+    links = {m.link for m in rows if m.link}
     return Item(
         key=f"{DIGEST_PREFIX}{routine}:{day}", section="fyi", who=routine,
         where="digest", ts=newest.ts, gist=f"{n} changes · {newest.gist}"[:120],
         source=newest.source, origin=newest.origin,
+        link=links.pop() if len(links) == 1 else None,
         messages=[Msg(time.strftime("%H:%M", time.localtime(m.ts)), m.ts,
                       m.gist) for m in rows],
         actions=[], meta={"routine": routine, "digest": True, "count": n},
         members=rows)
+
+
+def digest_subset(row, keep):
+    """A digest row rebuilt from the members for which `keep(member)` holds
+    (None when none does); any other row is returned as it is. With a filter
+    on, a mark made on the digest row must reach only the rows the filter
+    shows."""
+    if not is_digest(row):
+        return row
+    rows = [m for m in row.members if keep(m)]
+    if not rows:
+        return None
+    if len(rows) == len(row.members):
+        return row
+    return digest_row(row.meta.get("routine") or "", row.key.rsplit(":", 1)[1],
+                      rows)
 
 
 def saved_item(row):
@@ -170,13 +206,15 @@ class Feed:
 
 
 def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
-              saved=()):
+              saved=(), windowed=EVENT_ORIGINS):
     """The Feed: every fyi row, by routine. Rows older than `window_h` age out
     (all of them show again with `show_all`). A row a rule hides is counted as
     muted, one a rule digests is folded into one row per routine and day, one
     a rule promotes (`inbox`) is left to the Inbox view. `saved` is a list of
     saved-to-memory `Item`s: they form the routine `saved to memory`, with no
-    window of their own here (the saved view's own `saved_days` bounds them)."""
+    window of their own here (the saved view's own `saved_days` bounds them).
+    The window applies to rows of the `windowed` origins only (the events
+    source); an active alert is exempt from it and from `hide` and `digest`."""
     cutoff = now - float(window_h) * 3600
     by_routine = OrderedDict()
     muted = OrderedDict()
@@ -184,8 +222,12 @@ def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
                      key=lambda i: -i.ts):
         if it.feed == "inbox":
             continue
-        if not show_all and it.ts < cutoff:
+        pinned = is_active_alert(it)
+        if (not pinned and not show_all and it.origin in windowed
+                and it.ts < cutoff):
             continue
+        if pinned and it.feed in ("hide", "digest"):
+            it.feed = "show"
         if it.feed == "hide":
             muted[it.feed_label or it.routine] = \
                 muted.get(it.feed_label or it.routine, 0) + 1
