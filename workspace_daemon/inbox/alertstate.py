@@ -16,6 +16,7 @@ Nothing is written, locked or raised.
 """
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 ALERT_FILE = "alerts.json"
@@ -32,6 +33,24 @@ def _valid(value):
                 and bool(value["pending"])))
 
 
+def _epoch(value):
+    """Epoch seconds of a key's value (its time, or its pending time), or None."""
+    if isinstance(value, dict):
+        value = value.get("pending")
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
 class Recovery:
     """Lazy lookup; the file is only read when an alert needs it."""
 
@@ -40,7 +59,8 @@ class Recovery:
         self._state = _UNSET
 
     def _read(self):
-        """(active keys, file mtime), or None when the state is unknown."""
+        """({active key: since epoch or None}, file mtime), or None when the
+        state is unknown."""
         try:
             with open(self.path, "rb") as handle:
                 mtime = os.fstat(handle.fileno()).st_mtime
@@ -51,7 +71,7 @@ class Recovery:
             if not isinstance(doc, dict) or not all(
                     isinstance(k, str) and _valid(v) for k, v in doc.items()):
                 return None
-            return set(doc), mtime
+            return {k: _epoch(v) for k, v in doc.items()}, mtime
         except Exception:  # noqa: BLE001 - missing, unreadable or unknown shape
             return None
 
@@ -63,3 +83,17 @@ class Recovery:
             return False
         active, mtime = self._state
         return mtime >= ts - MTIME_SLACK_S and key not in active
+
+    def active_since(self):
+        """`{key: since epoch}` of the keys the daemon lists as active.
+
+        A key whose time is unreadable, or later than the file's own mtime (a
+        copy, a clock jump), is left out; an unknown state gives `{}`.
+        """
+        if self._state is _UNSET:
+            self._state = self._read()
+        if self._state is None:
+            return {}
+        active, mtime = self._state
+        return {key: since for key, since in active.items()
+                if since is not None and mtime >= since - MTIME_SLACK_S}

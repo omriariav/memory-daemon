@@ -125,6 +125,12 @@ def thread_note(item):
     return truncate(clean_line(note), THREAD_NOTE_MAX)
 
 
+def thread_fixed(item):
+    """True when `meta.thread_fixed` is set: the thread is a fixed list of
+    labelled entries (an alert's), shown top-down in either thread order."""
+    return isinstance(item.meta, dict) and item.meta.get("thread_fixed") is True
+
+
 def to_v1(item):
     """The v1 dict of an item: the validated one it was built from, else a
     rebuild from its fields (an item made by the UI itself)."""

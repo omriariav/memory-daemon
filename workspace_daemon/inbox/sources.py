@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from . import daemoncfg, invites
 from . import items as itm
-from .alertstate import Recovery
+from .alertstate import MTIME_SLACK_S, Recovery
 from .store import rsvp_state
 
 SourceResult = namedtuple(
@@ -30,6 +30,11 @@ DEFAULT_WINDOW_H = 48.0
 DEFAULT_ALERT_MAX_AGE_H = 6.0
 DEFAULT_SAVED_DAYS = 2.0
 SAVED_MAX_ROWS = 500
+LOG_TAIL_BYTES = 256 * 1024  # tail of logs/run.log read for an alert's error
+LOG_LINE_MAX = 200           # characters of a log line shown in a thread
+# A routine's failing run is logged before the tick that raises the alert, so
+# an error up to this much older than the alert's time still belongs to it.
+LOG_ERROR_LEAD_S = 900
 STDERR_TAIL = 200       # characters of stderr shown in an error
 STDERR_KEEP = 64 * 1024  # bytes of stderr kept while the child runs
 
@@ -39,6 +44,14 @@ DEFAULT_URGENT_RULES = (
     {"source": "daemon", "key_prefix": "connector:"},
     {"source": "daemon", "key_prefix": "attention:"},
 )
+
+# Run states a routine passes through without being at fault: an alert that
+# lists only these is never urgent (see docs/inbox.md, "Stale and recovered
+# alerts").
+BENIGN_ALERT_ISSUES = frozenset(("overlap", "interrupted", "incomplete"))
+ALERT_HINT = "run `daemon.py status` for details"
+_LOG_ERROR = re.compile(
+    r"^(?P<ts>\S+)\s+routine=(?P<id>\S+)\b.*\b(?:ERROR|FATAL)\b")
 
 _CAL_KIND = {"new": "New invite", "update": "Updated", "cancel": "Cancelled",
              "rsvp": "RSVP"}
@@ -379,6 +392,8 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
             thread = [{"who": mail_from or "mail", "ts": ts, "text": snippet}]
     urgent = any(_rule_matches(r, event, kind, key, start_ts, now)
                  for r in rules)
+    if source == "alert" and _benign_only(_alert_issues(details)):
+        urgent = False
     link = _event_link(event, source, gmail_account)
     raw_memory_id = event.get("memory_id")
     memory_id = raw_memory_id if (isinstance(raw_memory_id, str)
@@ -400,6 +415,118 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     )
 
 
+def _alert_issues(details):
+    issues = details.get("issues")
+    if not isinstance(issues, list):
+        return []
+    return [t for t in (_text(x) for x in issues) if t]
+
+
+def _benign_only(issues):
+    """True when every issue is a benign run state (and there is one)."""
+    return bool(issues) and all(
+        i.lower() in BENIGN_ALERT_ISSUES for i in issues)
+
+
+def _key_routine(key):
+    """The routine an alert key names (`attention:<r>`, `interrupted:<r>`,
+    `hold:<r>:<day>`), or ''."""
+    kind, _, rest = key.partition(":")
+    if kind in ("attention", "interrupted"):
+        return rest
+    if kind == "hold":
+        return rest.rsplit(":", 1)[0]
+    return ""
+
+
+class _RunLog:
+    """The newest ERROR/FATAL line per routine in the tail of logs/run.log.
+
+    Read at most once per load, and only when an alert row asks. A missing or
+    unreadable file means no lines.
+    """
+
+    def __init__(self, base_dir):
+        self.path = os.path.join(str(base_dir), "logs", "run.log")
+        self._errors = None
+
+    def _scan(self):
+        errors = {}
+        try:
+            with open(self.path, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > LOG_TAIL_BYTES:
+                    handle.seek(size - LOG_TAIL_BYTES)
+                    handle.readline()  # discard a partial first line
+                data = handle.read(LOG_TAIL_BYTES)
+        except OSError:
+            return errors
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            match = _LOG_ERROR.match(line)
+            if match:
+                errors[match.group("id")] = (parse_iso(match.group("ts")),
+                                             line)
+        return errors
+
+    def last_error(self, routine):
+        """`(epoch or None, line)` for the routine, or None."""
+        if self._errors is None:
+            self._errors = self._scan()
+        return self._errors.get(routine)
+
+
+def _age_text(seconds):
+    seconds = max(seconds, 0)
+    if seconds < 90:
+        return "just now"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min ago"
+    if seconds < 36 * 3600:
+        return f"{round(seconds / 3600)} h ago"
+    return f"{round(seconds / 86400)} d ago"
+
+
+def _alert_thread(event, key, since, runlog, now):
+    """The detail pane of an alert row: routine, issues, active since (local
+    time, like the header clock), the newest log error of the routine written
+    since the alert became active (with its age), and where to look next."""
+    details = event.get("details") if isinstance(event.get("details"), dict) \
+        else {}
+    routine = _text(details.get("routine")) or _key_routine(key)
+    issues = _alert_issues(details)
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(since))
+    thread = []
+    if routine:
+        thread.append({"who": "routine", "ts": since, "text": routine})
+    if issues:
+        thread.append({"who": "issues", "ts": since,
+                       "text": "; ".join(issues)})
+    thread.append({"who": "active since", "ts": since, "text": stamp})
+    found = runlog.last_error(routine) if routine else None
+    if found is not None and found[0] is not None \
+            and found[0] >= since - LOG_ERROR_LEAD_S:
+        thread.append({"who": f"last error, {_age_text(now - found[0])}",
+                       "ts": found[0],
+                       "text": itm.truncate(itm.clean_line(found[1]),
+                                            LOG_LINE_MAX)})
+    thread.append({"who": "hint", "ts": since, "text": ALERT_HINT})
+    return thread
+
+
+def _synth_alert_event(key, since):
+    """An alert event for an active key that has none on file."""
+    routine = _key_routine(key)
+    title = (f"{routine} needs attention" if key.startswith("attention:")
+             and routine else f"Alert active: {key}")
+    details = {"key": key}
+    if routine:
+        details["routine"] = routine
+    return {"id": f"alert-active:{key}", "source": "daemon", "kind": "alert",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
+            "routine": routine or None, "source_id": f"daemon:{key}",
+            "title": title, "people": [], "details": details}
+
+
 def _alert_state(item, now, max_age_h, recovery):
     """Apply the alert rules to one alert item (see docs/inbox.md).
 
@@ -416,10 +543,23 @@ def _alert_state(item, now, max_age_h, recovery):
     return item
 
 
+def _with_thread(item, event, key, since, runlog, now, item_id=None):
+    """The alert item with its thread. `thread_fixed` keeps the pane from
+    reversing the entries: they read top-down in either thread order."""
+    try:
+        return itm.parse_item(dict(
+            item, id=item_id or item["id"],
+            thread=_alert_thread(event, key, since, runlog, now),
+            meta=dict(item["meta"], thread_fixed=True)))
+    except itm.ItemError:
+        return item
+
+
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0,
                 alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H, email_routines=None,
-                events=None, recovery=None, show_rsvp_replies=False):
+                events=None, recovery=None, show_rsvp_replies=False,
+                runlog=None):
     """The built-in source: recent events as items. Never raises.
 
     Calendar events of kind `rsvp` (other people answering the owner's
@@ -429,9 +569,14 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
 
     `email_routines` (a set of routine ids, or None for no filter) keeps only
     the Gmail events written by those routines; see `daemoncfg.label_routines`.
-    `events` and `recovery` let a caller that kept them from an earlier read
-    rebuild the items for a later `now` without reading a file (the window,
-    alert age and `starts_within_h` rules depend on the time).
+    `events`, `recovery` and `runlog` let a caller that kept them from an
+    earlier read rebuild the items for a later `now` without reading a file
+    (the window, alert age and `starts_within_h` rules depend on the time).
+
+    Every key active in `alerts.json` is listed, whatever the age of its event,
+    under one id per episode, `events:alert-active:<key>@<since>`, so a mark
+    survives rotation of the event files; a re-fire changes `since` and the
+    row shows again.
     """
     now = time.time() if now is None else now
     if events is None:
@@ -440,8 +585,12 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
         except OSError as exc:
             return SourceResult(name, [], False, None,
                                 f"cannot read events: {exc.strerror or exc}")
+    recovery = recovery if recovery is not None else Recovery(base_dir)
+    active = recovery.active_since()
+    runlog = runlog if runlog is not None else _RunLog(base_dir)
     cutoff = now - float(window_h) * 3600
     latest = {}  # one row per source_id: the newest event wins
+    newest_active = {}  # active alert key -> its newest (item, event), any age
     for event in events:
         if (not show_rsvp_replies and isinstance(event, dict)
                 and event.get("source") == "gcal"
@@ -451,30 +600,56 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
             item = event_to_item(event, now, rules, gmail_account)
         except (itm.ItemError, TypeError, ValueError):
             continue
-        if item is None or item["ts"] < cutoff:
+        if item is None:
+            continue
+        if item["source"] == "alert" and item["meta"].get("key") in active:
+            prev = newest_active.get(item["meta"]["key"])
+            if prev is None or item["ts"] >= prev[0]["ts"]:
+                newest_active[item["meta"]["key"]] = (item, event)
+        if item["ts"] < cutoff:
             continue
         if (email_routines is not None and item["source"] == "email"
                 and event.get("routine") not in email_routines):
             continue
         sid = item["meta"].get("source_id") or item["id"]
         prev = latest.get(sid)
-        if prev is None or item["ts"] >= prev["ts"]:
-            latest[sid] = item
-    recovery = recovery if recovery is not None else Recovery(base_dir)
+        if prev is None or item["ts"] >= prev[0]["ts"]:
+            latest[sid] = (item, event)
     rows, alerts = [], {}
-    for item in latest.values():
+    for item, event in latest.values():
         if item["source"] == "alert":
             # The newest alert per key wins, whatever its source_id.
             key = item["meta"].get("key")
             if key:
                 prev = alerts.get(key)
-                if prev is None or item["ts"] >= prev["ts"]:
-                    alerts[key] = item
+                if prev is None or item["ts"] >= prev[0]["ts"]:
+                    alerts[key] = (item, event)
                 continue
-            item = _alert_state(item, now, alert_max_age_h, recovery)
+            item = _alert_state(
+                _with_thread(item, event, "", item["ts"], runlog, now), now,
+                alert_max_age_h, recovery)
         rows.append(item)
-    rows.extend(_alert_state(item, now, alert_max_age_h, recovery)
-                for item in alerts.values())
+    # A key the daemon lists as active is always shown, however old its
+    # event. The event must not predate the episode (`since`); with none on
+    # file, a row is made from the key.
+    episode = {}
+    for key, since in active.items():
+        found = newest_active.get(key)
+        if found is None or found[0]["ts"] < since - MTIME_SLACK_S:
+            event = _synth_alert_event(key, since)
+            try:
+                item = event_to_item(event, now, rules, gmail_account)
+            except (itm.ItemError, TypeError, ValueError):
+                continue
+            if item is None:
+                continue
+            found = (item, event)
+        alerts[key] = found
+        episode[key] = f"events:alert-active:{key}@{int(since)}"
+    for key, (item, event) in alerts.items():
+        item = _with_thread(item, event, key, active.get(key, item["ts"]),
+                            runlog, now, episode.get(key))
+        rows.append(_alert_state(item, now, alert_max_age_h, recovery))
     rows.sort(key=lambda i: i["ts"], reverse=True)
     newest = max((i["ts"] for i in rows), default=None)
     age = None if newest is None else max((now - newest) / 60.0, 0.0)
@@ -760,20 +935,20 @@ class Unit:
 def _events_unit_run(src, settings, base_dir):
     """`(run, reeval)` for the built-in events source. `run` reads the event
     files; `reeval` rebuilds the items for a later time from what `run` read
-    (and from the alert state it already loaded)."""
+    (and from the alert state and run log tail it already loaded)."""
     kept = {}
 
     def memory():
         return kept.get("memory", {})
 
-    def build(now, events, recovery, note):
+    def build(now, events, recovery, runlog, note):
         res = load_events(base_dir, now=now, window_h=src["window_h"],
                           rules=src["urgent"], name=src["name"],
                           gmail_account=settings["gmail_account"],
                           alert_max_age_h=settings.get(
                               "alert_urgent_max_age_h", DEFAULT_ALERT_MAX_AGE_H),
                           email_routines=kept.get("routines"),
-                          events=events, recovery=recovery,
+                          events=events, recovery=recovery, runlog=runlog,
                           show_rsvp_replies=bool(
                               settings.get("show_rsvp_replies")))
         if note:
@@ -797,14 +972,16 @@ def _events_unit_run(src, settings, base_dir):
             kept.pop("memory", None)
             return [SourceResult(src["name"], [], False, None,
                                  f"cannot read events: {exc.strerror or exc}")]
-        kept.update(events=events, recovery=Recovery(base_dir), note=note,
+        kept.update(events=events, recovery=Recovery(base_dir),
+                    runlog=_RunLog(base_dir), note=note,
                     memory=memory_index(events))
-        return [build(now, events, kept["recovery"], note)]
+        return [build(now, events, kept["recovery"], kept["runlog"], note)]
 
     def reeval(now):
         if "events" not in kept:
             return None
-        return [build(now, kept["events"], kept["recovery"], kept["note"])]
+        return [build(now, kept["events"], kept["recovery"], kept["runlog"],
+                      kept["note"])]
 
     return run, reeval, memory
 

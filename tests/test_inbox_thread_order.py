@@ -166,6 +166,19 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("thread start", text)
             self.assertGreater(text.index("thread start"), text.index("FIRST"))
 
+    async def test_a_fixed_thread_reads_top_down_in_both_orders(self):
+        # An alert's labelled entries (meta.thread_fixed) are not reversed.
+        app = make_app([thread_item(meta={"thread_fixed": True})],
+                       InboxStore(None))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for _ in range(2):
+                text = thread_text(app)
+                self.assertEqual(order_of(text), ["FIRST", "SECOND", "THIRD"])
+                self.assertNotIn("thread start", text)
+                await pilot.press("v")
+                await pilot.pause(0.2)
+
     async def test_v_reverses_it_and_back(self):
         store = InboxStore(None)
         app = make_app([thread_item()], store)
