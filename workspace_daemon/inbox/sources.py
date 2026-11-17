@@ -746,9 +746,12 @@ class Unit:
     nothing to rebuild."""
 
     def __init__(self, name, run, watch=lambda: [], uses_all=False,
-                 reeval=None, memory=None):
+                 reeval=None, memory=None, answers=None):
         self.name, self.run, self.watch, self.uses_all = name, run, watch, uses_all
         self.reeval = reeval
+        # `answers()` returns `{series: "declined" | "answered"}` from what
+        # the unit last read (see `invites.answered_series`).
+        self.answers = answers
         # `memory()` returns the `{source_id: memory_id}` the unit last read.
         self.memory = memory
 
@@ -824,7 +827,10 @@ def _invites_unit_run(src, base_dir):
     def reeval(now):
         return results(kept["data"], now) if "data" in kept else None
 
-    return run, reeval
+    def answers():
+        return invites.answered_series(kept.get("data") or {})
+
+    return run, reeval, answers
 
 
 def events_files(base_dir):
@@ -861,12 +867,12 @@ def make_units(settings, base_dir):
             units.append(Unit(src["name"], run, watch, reeval=reeval,
                               memory=memory))
             if src.get("invites_days", invites.DEFAULT_DAYS) > 0:
-                run, reeval = _invites_unit_run(src, base_dir)
+                run, reeval, answers = _invites_unit_run(src, base_dir)
                 units.append(Unit(
                     f"{src['name']}.invites", run,
                     lambda: [os.path.join(str(base_dir), "state",
                                           invites.SNAPSHOT_FILE)],
-                    reeval=reeval))
+                    reeval=reeval, answers=answers))
         else:
             units.append(Unit(
                 src["name"],
@@ -883,25 +889,49 @@ def saved_watch(base_dir):
     return lambda: events_files(base_dir)
 
 
-def _announces_invite(item, series):
-    """A `New invite` calendar event row for an invite that now has its own
-    pending row (same recurring series)."""
+def units_answers(units, marks=None):
+    """`{series: "declined" | "answered"}`: the recurring series (see
+    `invites.series_of`) you have answered, from the calendar snapshot the
+    units last read, else from `marks` (the same shape, from the RSVP marks of
+    the inbox store)."""
+    out = dict(marks or {})
+    for unit in units:
+        getter = getattr(unit, "answers", None)
+        if getter is not None:
+            out.update(getter())
+    return out
+
+
+def _hides_calendar_twin(item, listed, answered):
+    """True for a calendar row of the events stream that an invite makes
+    redundant. `New invite` goes when the series has a pending-invite row
+    (`listed`: it says the same and can be acted on) or is answered
+    (`answered`: nothing is left to do). `Updated` and `Cancelled` stay, as
+    news, except for a series you declined: a move or a cancel of a meeting
+    you are not going to is noise."""
     meta = item["meta"]
     source_id = meta.get("source_id")
-    return (item["source"] == "calendar" and meta.get("kind") == "new"
-            and isinstance(source_id, str) and source_id.startswith("gcal:")
-            and invites.series_of(source_id[len("gcal:"):]) in series)
+    if (item["source"] != "calendar" or not isinstance(source_id, str)
+            or not source_id.startswith("gcal:")):
+        return False
+    series = invites.series_of(source_id[len("gcal:"):])
+    kind = meta.get("kind")
+    if kind == "new":
+        return series in listed or series in answered
+    return kind in ("update", "cancel") and answered.get(series) == "declined"
 
 
-def merge(batches):
+def merge(batches, answered=None):
     """Flatten per-unit results (in source order). A duplicate item id across
-    sources keeps the first and flags the later source. A calendar `New
-    invite` row is dropped when its series has a pending-invite row, which
-    says the same thing and can be acted on."""
+    sources keeps the first and flags the later source. Calendar rows of the
+    events stream that a pending invite makes redundant are dropped (see
+    `_hides_calendar_twin`); `answered` is `{series: "declined" | "answered"}`
+    (see `units_answers`). The rows are not changed, only left out."""
     batches = [list(b) for b in batches]
-    series = {i["meta"]["series"] for b in batches for r in b for i in r.items
+    listed = {i["meta"]["series"] for b in batches for r in b for i in r.items
               if i["id"].startswith("invites:")
               and isinstance(i["meta"].get("series"), str)}
+    answered = answered or {}
     results = []
     seen = set()
     for batch in batches:
@@ -911,7 +941,8 @@ def merge(batches):
             for i in res.items:
                 if i["id"] in seen:
                     dropped += 1   # a duplicate id
-                elif not (series and _announces_invite(i, series)):
+                elif not ((listed or answered)
+                          and _hides_calendar_twin(i, listed, answered)):
                     kept.append(i)
             seen.update(i["id"] for i in kept)
             error = res.error
@@ -922,14 +953,17 @@ def merge(batches):
     return results
 
 
-def collect(settings, base_dir, now=None, show_all=False):
+def collect(settings, base_dir, now=None, show_all=False, marks=None):
     """Poll every configured source. Returns a list of SourceResult.
 
     `show_all` adds `--all` to `list` for the command sources that declared
     `supports_all`; no other source ever receives it. Duplicate ids across
-    sources keep the first and flag the later source.
+    sources keep the first and flag the later source. `marks` is
+    `InboxStore.rsvp_series()`, to hide the events stream's rows about invites
+    answered in the inbox.
     """
     now = time.time() if now is None else now
     units = make_units(settings, base_dir)
-    results = merge(u.run(now, show_all) for u in units)
+    batches = [list(u.run(now, show_all)) for u in units]
+    results = merge(batches, units_answers(units, marks))
     return annotate_memory(results, units_memory_index(units))

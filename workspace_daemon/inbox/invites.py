@@ -50,6 +50,28 @@ def series_of(event_id):
     return _RECURRING_ID.sub("", event_id)
 
 
+ANSWERED = ("accepted", "declined", "tentative")
+
+
+def answered_series(data):
+    """`{series: "declined" | "answered"}` from what `read` returned: the
+    series whose rows in the snapshot show an answer of yours and no row still
+    waiting for one. `declined` only when every row of the series is declined.
+    `{}` when there is no usable snapshot."""
+    doc = data.get("doc") if isinstance(data, dict) else None
+    rows = doc.get("events") if isinstance(doc, dict) else None
+    states = {}
+    for event_id, row in rows.items() if isinstance(rows, dict) else ():
+        if not isinstance(event_id, str) or not isinstance(row, dict):
+            continue
+        rsvp = row.get("my_rsvp")
+        if rsvp == "needsAction" or rsvp in ANSWERED:
+            states.setdefault(series_of(event_id), set()).add(rsvp)
+    return {key: "declined" if seen == {"declined"} else "answered"
+            for key, seen in states.items()
+            if "needsAction" not in seen and seen}
+
+
 # What an id may contain before it is allowed into an RSVP call: Google event
 # ids are base32hex plus a `_<timestamp>` suffix, calendar ids are `primary`
 # or an address. Anything else is refused rather than passed on.

@@ -385,12 +385,39 @@ and invites list soonest first, after the replies in the section. `meta` is
 "also_pending"}`
 so a later RSVP action has what it needs. Actions: `ack` (hides
 the row locally) and `open` (the meeting link from the cache, only when it is a
-plain http(s) URL; otherwise there is no `open`). A `New invite` calendar row
-from the events stream is dropped when its series has a pending-invite row
-(the same event, now actionable). Titles and organizers are untrusted display
+plain http(s) URL; otherwise there is no `open`). Calendar rows of the events
+stream about the same event are hidden, see
+[Calendar rows that an invite makes redundant](#calendar-rows-that-an-invite-makes-redundant).
+Titles and organizers are untrusted display
 text. A missing cache means no invites and no error; an
 unreadable or unfamiliar one is a source error (`events.invites`) and a cache
 older than 6 hours marks the source stale.
+
+#### Calendar rows that an invite makes redundant
+
+The events stream announces the same invites (`source: calendar`, `meta.kind`
+`new`, `update` or `cancel`, `meta.source_id` `gcal:<event id>`). Ids are
+compared by series: a recurring instance suffix `_YYYYMMDD[THHMMSS[Z]]` is
+stripped on both sides (`invites.series_of`). While the events stream and the
+invites are merged (in `collect` and in the app's refresh), these rows are
+hidden:
+
+- **`New invite`**: while a pending-invite row of the same series is listed
+  (it says the same and can be answered), and once the series is answered,
+  either with an RSVP made in the inbox (the mark of the `invites:<series>`
+  row) or because the calendar snapshot shows your answer (`accepted`,
+  `declined` or `tentative`) on the series' rows and none still waiting. The
+  answer in the snapshot wins over the inbox mark.
+- **`Updated` and `Cancelled`**: kept, as they are real news, except for a
+  series you **declined** (every row of it declined in the snapshot, or the
+  inbox RSVP was `declined`): a move or a cancel of a meeting you are not
+  going to is noise, so they are hidden too. For an accepted or tentative
+  meeting they stay.
+
+Only calendar rows with a `gcal:` `source_id` are affected, and nothing is
+changed or deleted: the rows are left out of the list, so they come back if
+the snapshot no longer shows the answer. The snapshot part needs the invites
+source (`invites_days` above 0); without it only the inbox RSVP marks apply.
 
 The thread of an invite has one line per fact, each as its own `who`:
 `subject` (the full title), `when`, `from` (the organizer's name), `attendees`,

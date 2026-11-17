@@ -7,6 +7,22 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-17
+
+### Fixed
+
+- **A calendar invite no longer shows twice.** The events stream's `New
+  invite` row stayed in the list after the invite was answered (the pending
+  invite row had gone, so nothing hid it). Ids are now compared by series (a
+  recurring instance suffix `_YYYYMMDD[THHMMSS[Z]]` is stripped), and a `New
+  invite` row is hidden while its pending invite is listed and once the series
+  is answered, by an RSVP made in the inbox or by your answer in the calendar
+  snapshot. `Updated` and `Cancelled` rows stay (real news), except for a
+  meeting you declined, where they are hidden as noise. The filter runs when
+  the sources are merged (`collect` and the app's refresh) and leaves the
+  cached rows alone. See
+  [inbox.md](inbox.md#calendar-rows-that-an-invite-makes-redundant).
+
 ## [0.8.1] - 2026-11-17
 
 ### Fixed
