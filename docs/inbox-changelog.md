@@ -7,6 +7,26 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-17
+
+### Fixed
+
+- **An active alert no longer drops out of the inbox.** Only events inside
+  `window_h` were read, and an alert fires one event when it becomes active,
+  so a condition active for days was not listed. Every key that
+  `state/alerts.json` lists as active is now always shown, using its newest
+  alert event whatever its age; with no event on file, a row is made from the
+  key and its time. The age rule still applies (urgent while younger than
+  `alert_urgent_max_age_h`, `fyi` after). Resolved keys behave as before.
+- **Alert rows have a thread.** The detail pane shows the routine, the issues,
+  when the alert became active, the newest `ERROR` or `FATAL` line of that
+  routine from `logs/run.log` (the last 256 KB are read, once per load; the
+  line is cut to 200 characters; a missing log adds nothing) and the hint
+  `run `daemon.py status` for details`.
+- **Benign run states are never urgent.** An alert whose only issues are
+  `overlap`, `interrupted` or `incomplete` is `fyi`, even under a custom
+  urgent rule. See [inbox.md](inbox.md#stale-and-recovered-alerts).
+
 ## [0.8.2] - 2026-11-17
 
 ### Fixed

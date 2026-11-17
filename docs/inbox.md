@@ -1052,15 +1052,29 @@ from the queue, so an item that a save marked done is still listed here.
 
 ### Stale and recovered alerts
 
-An alert stays urgent only while it is relevant. Three rules apply to every
+An alert stays urgent only while it is relevant. These rules apply to every
 alert (`daemon` kind `alert`), after the urgent rules above:
 
 1. **Newest per key.** Alerts are grouped by `details.key`; only the newest
    of each key is listed, so an older alert for the same condition never
    shows beside it.
 2. **Age.** An alert older than `alert_urgent_max_age_h` (default 6, range 1
-   to 168) drops to `fyi`/`digest`. It stays listed until `window_h` passes.
-3. **Recovery.** An alert whose condition has ended is *resolved*: it is
+   to 168) drops to `fyi`/`digest`. It stays listed until `window_h` passes,
+   unless its key is still active (next rule).
+3. **Active keys are always listed.** An alert fires one event when it
+   becomes active, so a condition that lasts longer than `window_h` would
+   vanish. Every key that `state/alerts.json` lists as active (a pending key
+   too) is shown, using its newest alert event even when that event is older
+   than `window_h`. A key with no event on file gets a synthesized row built
+   from the key and the time in `alerts.json` (`attention:<routine>` reads
+   `<routine> needs attention`, any other key `Alert active: <key>`). The age
+   rule above still sets urgent or `fyi`. A key the daemon dropped is resolved
+   (next rule) and, once its event is older than `window_h`, no longer listed.
+   An unknown `alerts.json` adds nothing.
+4. **Benign states.** An alert whose `details.issues` are all `overlap`,
+   `interrupted` or `incomplete` (a routine passing through a state, not
+   failing) is never urgent, whatever the urgent rules say.
+5. **Recovery.** An alert whose condition has ended is *resolved*: it is
    `fyi`, carries `meta.resolved: true`, and is hidden unless `R` is on
    (`R` toggles "show resolved"; the header counts the hidden ones). Resolved
    rows show a green check. Only `alert` items can be resolved; a command
@@ -1076,6 +1090,15 @@ alert (`daemon` kind `alert`), after the urgent rules above:
    active even if the problem changed (a last-run error that became a memory
    sink issue keeps its key), so it is never resolved early. The run log and
    the usage log are not consulted.
+
+**Alert thread.** An alert row has a thread (the detail pane) with these
+entries, each only when known: `routine` (`details.routine`, or the routine in
+an `attention:`, `interrupted:` or `hold:` key), `issues` (`details.issues`),
+`active since` (the time in `alerts.json`, else the event time), `last error`
+(the newest `ERROR` or `FATAL` line of that routine in `logs/run.log`) and a
+`hint`: run `daemon.py status` for details. Only the last 256 KB of the log
+are read, once per load and only when an alert row is built; the line is cut to
+200 characters, and a missing or unreadable log leaves the entry out.
 
 Recovery is read-only and best effort. A missing, unreadable, oversized or
 unfamiliar `alerts.json` (a different daemon version), or one last written
