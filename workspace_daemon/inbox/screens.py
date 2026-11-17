@@ -1,4 +1,5 @@
-"""Modal screens: confirm-send, confirm-write, snooze picker, help, audit log.
+"""Modal screens: confirm-send, confirm-write, snooze picker, help, audit log,
+the relay note and the ops log.
 
 Anything that came from a source (names, text) is shown through Rich `Text`
 objects, never markup strings, so a title like "[b]x[/]" cannot restyle or
@@ -199,10 +200,14 @@ class ConfirmWrite(ModalScreen):
     LABEL_MIN, LABEL_MAX = 8, 16      # the label column, in cells
     INNER = 61                        # label column + value, in cells: fits the box
 
-    def __init__(self, title, rows, verb, note="", visual=False):
+    FIXED = ("Nothing happens until you confirm. Undo stays open for the "
+             "grace period.")
+
+    def __init__(self, title, rows, verb, note="", visual=False, fixed=None):
         super().__init__()
         self.title_text, self.rows, self.verb = title, rows, verb
         self.note, self.visual = note, visual
+        self.fixed = self.FIXED if fixed is None else fixed
 
     def compose(self) -> ComposeResult:
         shown = [(label, value) for label, value in self.rows if value]
@@ -230,8 +235,7 @@ class ConfirmWrite(ModalScreen):
                 yield Static(body, id="confirm-text")
             if self.note:
                 yield Static(Text(self.note, Style(dim=True)), id="confirm-note")
-            yield Static(Text("Nothing happens until you confirm. Undo stays open for the grace period.",
-                              Style(dim=True)), id="confirm-fixed")
+            yield Static(Text(self.fixed, Style(dim=True)), id="confirm-fixed")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Cancel  esc", id="cancel", variant="default")
                 yield Button(f"{self.verb}  y", id="send", variant="error")
@@ -515,6 +519,14 @@ HELP = [
         ("E", "react to the message with an emoji (react: in inbox.yaml)"),
         ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
         ("", "draft, send and react confirm first, then wait out the 5 s undo window; copy is local")]),
+    ("Acts (acts: on a command source)", [
+        ("d / s", "also tell the source: close / snooze"),
+        ("w", "waits on: Me, a person in the thread, or Nobody (FYI)"),
+        ("x", "mute this conversation: 1 day, 1 week or untrack (Feed rules stay in the Feed)"),
+        ("!", "relay the item to your work session, with an optional note"),
+        ("D", "draft a reply for me (summary: or polish:); fills the Draft pane, never sends"),
+        ("", "acts wait out the 5 s undo window; u cancels before anything is sent"),
+        ("L", "ops log; u on a row sends the inverse (reopen / unmute) after a confirm")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
                            ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),
@@ -598,6 +610,111 @@ class AuditScreen(ModalScreen):
         if not self.rows:
             tb.add_row("", Text("no actions yet"), "", "", "")
         tb.focus()
+
+    def action_close(self):
+        self.dismiss(None)
+
+
+class NoteScreen(ModalScreen):
+    """A one-line note (the relay note): enter sends what is typed (it may be
+    empty), esc cancels. Dismisses with the text, or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title, who, max_len=300):
+        super().__init__()
+        self.title_text, self.who, self.max_len = title, who, max_len
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append(self.title_text + " ", Style(bold=True))
+        head.append(self.who, Style(dim=True))
+        with Vertical(id="note"):
+            yield Static(head, id="note-title")
+            yield Input(placeholder="optional one-line note  (enter to send)",
+                        id="note-input", max_length=self.max_len)
+            yield Static(Text("enter send  ·  esc cancel", Style(dim=True)),
+                         id="note-hint")
+
+    def on_mount(self):
+        self.query_one("#note-input").focus()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def on_input_submitted(self, e):
+        self.dismiss(" ".join(e.value.split()))
+
+
+class OpsScreen(ModalScreen):
+    """The ops log (`L` with acts on): what the inbox told a command source,
+    newest first, with the result. `u` on a row asks for its inverse (reopen
+    after a close, unmute after a mute); `a` shows the session's audit log.
+    Dismisses with None, `("inverse", row)` or `("session", None)`."""
+
+    BINDINGS = [Binding("escape,L,q", "close", "Close"),
+                Binding("u", "inverse", "Undo in source"),
+                Binding("a", "session", "Session log", show=False)]
+
+    def __init__(self, rows, invertible=lambda row: None):
+        super().__init__()
+        self.rows = list(rows)
+        self.invertible = invertible
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append("Ops log", Style(bold=True))
+        head.append("  what the inbox sent to its sources, newest first  ·  "
+                    "u undo in the source  ·  a session log  ·  esc close",
+                    Style(dim=True))
+        with Vertical(id="ops"):
+            yield Static(head, id="ops-title")
+            yield DataTable(id="ops-table", cursor_type="row",
+                            zebra_stripes=True)
+
+    def on_mount(self):
+        tb = self.query_one(DataTable)
+        tb.add_columns("Time", "Action", "Item", "Result", "Message")
+        for n, r in enumerate(self.rows):
+            when = dt.datetime.fromtimestamp(r.get("at") or 0).strftime(
+                "%m-%d %H:%M:%S")
+            result = {"pending": "not synced"}.get(r.get("result"),
+                                                   r.get("result") or "")
+            if r.get("retry"):
+                result += " (retry)"
+            action = str(r.get("action", ""))
+            if r.get("inverse_of"):
+                action += " (undo)"
+            tb.add_row(when, Text(action), Text(str(r.get("who", ""))),
+                       Text(result), Text(str(r.get("message", ""))),
+                       key=str(n))
+        if not self.rows:
+            tb.add_row("", Text("no ops yet"), "", "", "")
+        tb.focus()
+
+    def _row(self):
+        tb = self.query_one(DataTable)
+        if not self.rows or tb.row_count == 0:
+            return None
+        try:
+            key = tb.coordinate_to_cell_key(tb.cursor_coordinate).row_key.value
+            return self.rows[int(key)]
+        except Exception:   # an empty table, a row that went away
+            return None
+
+    def action_inverse(self):
+        row = self._row()
+        if row is None:
+            return
+        if self.invertible(row) is None:
+            self.notify("This op has no inverse (only a close or a mute that "
+                        "reached the source can be undone)", timeout=4,
+                        markup=False)
+            return
+        self.dismiss(("inverse", row))
+
+    def action_session(self):
+        self.dismiss(("session", None))
 
     def action_close(self):
         self.dismiss(None)

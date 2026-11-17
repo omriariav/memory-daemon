@@ -73,7 +73,14 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
                                send=settings["send"], react=settings["react"],
                                polish=settings["polish"],
                                copy=settings["copy"], team=settings["team"],
-                               slack_open=settings["slack_open"])
+                               slack_open=settings["slack_open"],
+                               acts={s["name"]: {"argv": s["argv"],
+                                                 "timeout_s": s["timeout_s"],
+                                                 "acts": s["acts"]}
+                                     for s in settings["sources"]
+                                     if s.get("acts")},
+                               done_reaction=settings["done_reaction"],
+                               nudge_template=settings["nudge_template"])
         reader = healthmod.HealthReader(
             base, settings["health"]["heartbeats"])
         app = InboxApp(fetch, store, actions, settings,
