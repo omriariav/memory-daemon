@@ -513,7 +513,8 @@ class CommandSourceTest(unittest.TestCase):
             print(json.dumps({"ok": True, "message": "did " + req["action"]}))""")
         out = sources.run_command_act(
             argv, {"action": "done", "id": "x", "meta": {}})
-        self.assertEqual(out, {"ok": True, "message": "did done"})
+        self.assertEqual(out, {"ok": True, "message": "did done",
+                               "shadow": False, "conflict": False})
 
     def test_act_timeout_kills_the_process_group(self):
         marker = Path(self.tmp.name) / "act-child"

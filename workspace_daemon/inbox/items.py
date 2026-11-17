@@ -16,6 +16,10 @@ SOURCES = ("slack", "email", "calendar", "recording", "alert", "drive", "sheet",
 SECTIONS = ("urgent", "needs_reply", "waiting", "fyi")
 URGENCY_LEVELS = ("urgent", "digest")
 ACTIONS = ("reply", "ack", "done", "snooze", "nudge", "open")
+# The acts of 0.10.0 (docs/inbox.md, "Acts"): what `<argv> act` may be asked.
+# `reopen` and `unmute` are the inverses of `close` and `mute`.
+ACT_NAMES = ("close", "snooze", "mute", "waits_on", "relay", "reopen",
+             "unmute")
 
 GIST_MAX = 120
 ID_MAX = 200
@@ -289,23 +293,32 @@ def parse_list_output(text):
 
 
 def parse_act_request(text):
-    """Validate the stdin of `act` (used by tests and phase 2 sources)."""
+    """Validate the stdin of `act` (used by tests and sources). `action` is
+    one of ACTIONS or, since 0.10.0, ACT_NAMES; a request that carries
+    `op_id` (str), `args` (object) or `seen` (object) must have them well
+    formed."""
     try:
         doc = json.loads(text)
     except ValueError as exc:
         raise ItemError(f"request is not JSON ({exc})") from None
     if (not isinstance(doc, dict) or doc.get("v") != SCHEMA_VERSION
-            or doc.get("action") not in ACTIONS
+            or doc.get("action") not in ACTIONS + ACT_NAMES
             or not isinstance(doc.get("id"), str) or not doc["id"]
             or not isinstance(doc.get("meta"), dict)
-            or ("text" in doc and not isinstance(doc["text"], str))):
+            or ("text" in doc and not isinstance(doc["text"], str))
+            or ("op_id" in doc and not isinstance(doc["op_id"], str))
+            or any(k in doc and not isinstance(doc[k], dict)
+                   for k in ("args", "seen"))):
         raise ItemError("request needs v, action, id, meta (object), "
-                        "optional text")
+                        "optional text, op_id, args, seen")
     return doc
 
 
 def parse_act_response(text):
-    """Validate the stdout of `act`: `{"ok": bool, "message": str}`."""
+    """Validate the stdout of `act`: `{"ok": bool, "message": str}`, plus the
+    optional `"shadow": bool` (the source only logged the op) and
+    `"conflict": bool` (the item changed since it was shown; the op was not
+    applied). Both default to false."""
     try:
         doc = json.loads(text)
     except ValueError as exc:
@@ -313,7 +326,15 @@ def parse_act_response(text):
     if (not isinstance(doc, dict) or not isinstance(doc.get("ok"), bool)
             or not isinstance(doc.get("message"), str)):
         raise ItemError("response needs ok (bool) and message (str)")
-    return {"ok": doc["ok"], "message": clean_line(doc["message"])}
+    out = {"ok": doc["ok"], "message": clean_line(doc["message"])}
+    for flag in ("shadow", "conflict"):
+        value = doc.get(flag, False)
+        if value is None:
+            value = False
+        if not isinstance(value, bool):
+            raise ItemError(f"response {flag} must be a bool")
+        out[flag] = value
+    return out
 
 
 MEMORY_ID_MAX = 200
