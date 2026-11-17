@@ -167,6 +167,21 @@ alert_urgent_max_age_h: 6
 #   allow_suggested: false   # true: a suggestion outside `emojis` is offered too
 #   # model: haiku
 
+# Done reaction: with this set, d also adds this emoji to the row's message
+# once the undo window ends (the same pinned call as E, so it needs the react:
+# block above; skipped for a row with no message). Off until set.
+# done_reaction: white_check_mark
+
+# The text n uses on a waiting row of a source that lists `acts:` when no draft
+# is stored. {first} = the person's first name, {who} = the whole name,
+# {topic} = the row's gist (one line, up to 80 characters). It goes through the
+# normal confirm and send path. See "Acts" in docs/inbox.md.
+# nudge_template: "Hi {first}, any news on {topic}?"
+
+# Draft for me (D key) needs no setting of its own: it uses the model, timeout
+# and budget of summary: (or else polish:) above, writes a reply from the
+# thread into the Draft pane and never sends.
+
 # Polish the draft in your tone (P key). Off until set; there is no default.
 # Never sends anything. Step 1: one read-only call of tone_tool with exactly
 # tone_args, on the MCP servers of the JSON file mcp_config (mode 0600, yours,
@@ -221,6 +236,14 @@ sources:
   #   # base dir, or absolute / ~). No watch list: fallback timer and `r` only.
   #   watch: ["state/comms-inbox.jsonl"]
   #   supports_all: true   # `<argv> list --all` works: the A key uses it
+  #   # Acts (0.10.0): tell this source what you did. Off until listed; with no
+  #   # `acts:` nothing is ever sent to it. After the 5 s undo window the inbox
+  #   # calls `<argv> act` (JSON request on stdin, with an op_id the source
+  #   # must treat idempotently): d = close, s = snooze, x = mute this
+  #   # conversation, w = waits on, ! = relay. A failure is kept in
+  #   # state/inbox-ops-pending.jsonl and retried on refresh; a conflict undoes
+  #   # the local mark. See "Acts" in docs/inbox.md.
+  #   acts: [close, snooze, mute, waits_on, relay]
 
 # The Feed (view 4) lists every FYI row by routine. Rows older than window_h
 # age out of it (the A key shows them again). Rules are tried in order, the
@@ -247,8 +270,8 @@ sources:
 # default. The command is called with JSON on stdin (never argv): choices
 # (read-only, pick one), prepare (read-only, shows what will happen; may say
 # duplicate), then, after the confirm and the 5 s undo window, run (once, never
-# retried). The key must be one the inbox does not use: h l p t w z or one
-# of B D F H J K N O Q U V W Z. A successful run marks the item done
+# retried). The key must be one the inbox does not use: h l p t z or one
+# of B F H J K N O Q U V W Z. A successful run marks the item done
 # (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
 # actions:
 #   - key: "p"

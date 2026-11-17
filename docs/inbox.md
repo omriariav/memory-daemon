@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -253,10 +253,12 @@ argument is expanded):
   `supports_all: true` in `inbox.yaml`. A source that does not declare it
   never receives `--all`, so existing sources need no change. A source that
   declares it must accept the flag and print the same JSON.
-- `<argv...> act` reads `{"v": 1, "action": str, "id": str, "meta": object, "text"?: str}`
-  on stdin and prints `{"ok": bool, "message": str}`.
+- `<argv...> act` reads one JSON request on stdin and prints
+  `{"ok": bool, "message": str, "shadow": bool, "conflict": bool}` (`shadow` and
+  `conflict` are optional and default to false). Since 0.10.0 the inbox calls it
+  for the sources that opt in with `acts:`; see [Acts](#acts).
 
-Phase 1 calls only `list` (with `--all` as above), with the configured timeout, stdin closed, in its
+`list` (with `--all` as above) runs with the configured timeout, stdin closed, in its
 own process group (killed whole on timeout). stdout is read in chunks and the
 group is killed as soon as it passes 4 MB; only the last 64 KB of stderr are
 kept, so a chatty source cannot exhaust memory. `timeout_s` must be below
@@ -274,9 +276,10 @@ wants to outlive the call (a cache refresher, a daemon) must detach it into its
 own session, e.g. `setsid cmd &` (or `start_new_session=True` in Python);
 otherwise the child dies with the call.
 
-`act` (`run_command_act` in `sources.py`) is defined and tested but not called
-until phase 2. It has the same limits: its own process group, killed whole on
-timeout or an oversized response.
+`act` (`run_command_act` in `sources.py`) is called only for a source that
+lists `acts:` (see [Acts](#acts)). It has the same limits as `list`: its own
+process group, killed whole on timeout (the source's `timeout_s`) or an
+oversized response, stdin carrying the request.
 
 Refreshes never overlap: one that is still running when the next is due (or
 when you press `r`) is skipped, and `r` says "Poll already running". Each
@@ -313,6 +316,167 @@ and `r` refreshes everything at once.
   without touching a file: an invite that has ended, the `window_h` cutoff, an
   alert dropping from urgent after `alert_urgent_max_age_h`, and
   `starts_within_h` urgent rules.
+
+## Acts
+
+Acts let the inbox tell a command source what you did with a row, so the
+source's own state follows your decision (for example, a row you closed stays
+closed there). They are **off by default**: a source with no `acts:` never
+receives an `act` call, no key sends anything to it, and the inbox behaves
+exactly as before 0.10.0.
+
+### Opting in
+
+```yaml
+sources:
+  - name: chat
+    type: command
+    argv: ["~/bin/my-source"]
+    acts: [close, snooze, mute, waits_on, relay]   # what the source may be told
+```
+
+`acts` lists any of `close`, `snooze`, `mute`, `waits_on`, `relay` (each once;
+omitted or `[]` means none). Each act is active only on rows of the source that
+lists it. `reopen` and `unmute` are never listed: they are the inverses of
+`close` and `mute`, sent from the ops log (below). Rows the views make (the
+digest and the saved-to-memory rows) never send acts.
+
+### The request
+
+`<argv...> act` reads one JSON object on stdin (never argv):
+
+```json
+{"v": 1, "op_id": "<uuid4>", "action": "close", "id": "<item id>",
+ "meta": {"...": "the item's meta"}, "args": {},
+ "seen": {"ts": 1893492000.0, "last_seen_ts": 1893492001.5}}
+```
+
+`seen` is what you had in front of you: the item's `ts` and the item's
+`meta.last_seen_ts` (a number, or `null` when the source gave none). A source
+uses it for a compare-and-set: if the item has a newer message than `seen`
+says, it answers `conflict` instead of applying the act. `meta` larger than
+8 KB is sent as `{}`.
+
+| `action` | `args` | Sent by |
+| --- | --- | --- |
+| `close` | `{}` | `d` |
+| `snooze` | `{"until": <epoch>}` | `s` (the chosen time) |
+| `mute` | `{"until": <epoch>}` or `{"until": null}` (never: stop tracking it) | `x`: Mute this conversation |
+| `waits_on` | `{"who": "me"}`, `{"who": "nobody"}` or `{"who": "<display name>"}` | `w` |
+| `relay` | `{"note": "<one line, up to 300 characters>"}` | `!` |
+| `reopen` | `{}` | `u` in the ops log, on a `close` |
+| `unmute` | `{}` | `u` in the ops log, on a `mute` |
+
+### The response and what the inbox does
+
+One JSON object on stdout: `{"ok": bool, "message": str, "shadow": bool,
+"conflict": bool}`. A source in shadow mode logs the op without applying it and
+answers `ok` true with `shadow` true.
+
+| Outcome | What the inbox does |
+| --- | --- |
+| `ok` true | Keeps the local mark and says `✓ synced` (or `shadow` when `shadow` is true). |
+| `conflict` true | Takes the local mark back (the row returns), toasts `New message since you looked; refresh`, and **does not retry**. |
+| anything else: `ok` false, a timeout, a non-zero exit, output that is not valid JSON | Keeps the local mark, stores the op in `state/inbox-ops-pending.jsonl` and shows `N not synced` in the health strip. |
+
+The call runs in a worker thread after the 5 s undo window: the interface never
+waits for a source. `u` inside the window cancels the op before anything is
+sent. Quitting inside the window commits a local mark (`d`, `s`, a mute) and
+keeps its op in the pending file, to be sent by the next session; it never
+waits for a source. A `w` or `!` has no local mark and is cancelled on quit,
+like a send.
+
+A conflict can only undo a local mark: `d`, `s` and a mute have one (the
+inbox restores the row); `w` and `!` have none, so they only toast.
+
+### Idempotency and the pending file
+
+Every op has an `op_id` (a uuid4). A retry sends the **same request, with the
+same `op_id`**: a source must be idempotent on it and answer a repeat with the
+result it gave the first time (the first `ok` or `conflict`; a failure need not
+be remembered).
+
+- The pending file holds the exact request, the source name and the time of
+  the last try. After each refresh the inbox retries the entries not tried for
+  5 minutes, in a worker. A success (`ok` or `shadow`) removes the entry; a
+  `conflict` removes it too and puts the local mark back; a failure keeps it
+  for the next try.
+- It is capped at 50 ops (the oldest are dropped first), and an entry older
+  than 7 days is dropped. A toast says how many were dropped, because those
+  ops will never reach the source.
+- Both files are mode 0600 in `state/`, written atomically under an `fcntl`
+  lock, so several panes can share them. A damaged line is skipped.
+
+### `w`, `x`, `!`
+
+- `w` opens a picker: **Me** (`"me"`), each distinct person in the thread
+  (thread `who`, without You; the row's sender when the thread has none) and
+  **Nobody (FYI)** (`"nobody"`). It sends `waits_on` (after the undo window)
+  and refreshes the source. There is no local mark.
+- `x` on a row whose source lists `mute` extends the mute picker of the Feed.
+  In the Feed the rule choices come first and are unchanged ("This kind from
+  ...", "Everything from ...", "Titles like this", then the duration picker);
+  after them come **Mute this conversation: 1 day / 1 week / untrack**, which
+  send `mute` (`until` an epoch for a day or a week, `null` for untrack) and
+  hide the row here for that long (untrack hides it like `d`). Outside the Feed
+  only the conversation choices are offered.
+- `!` opens a one-line note box (it may be empty) and sends `relay`, which
+  hands the row over to the work session of the source's owner. There is no
+  local mark.
+
+### The ops log (`L`)
+
+With any source listing acts, `L` opens the ops log: one row per op the inbox
+sent (time, action, item, result, message), newest first, from
+`state/inbox-ops-log.jsonl` (capped at 500 rows, mode 0600). The result is `ok`,
+`shadow`, `conflict` or `not synced`; a row kept for a retry shows `(retry)`
+when it was resent. `u` on a `close` or `mute` that reached the source (ok or
+shadow) asks to confirm, then sends the inverse (`reopen` or `unmute`, with
+`seen.ts` set to now) and drops the local mark, so the row returns; there is no
+undo window and the inverse is not retried. Other rows have no inverse. `a`
+shows the session audit log (what `L` shows without acts), `esc` closes.
+
+### Draft for me (`D`)
+
+`D` on a replyable row (a `reply` or `nudge` action) writes a reply from the
+thread. It makes one no-tools bridge call (the bridge of [AI summary](#ai-summary-i)):
+the thread is data between random per-call markers, and the model, timeout and
+budget are those of `summary:` or, when that is not set, `polish:`; with
+neither `D` says so. The call runs in a worker, so you can keep working. The
+text fills the Draft pane (`P`, `e` and the confirm screens work on it as on any
+draft) and is **kept per item in `state/inbox-state.json`**, keyed by the item,
+its time and its thread: an unchanged item shows it again after a restart and
+a new message drops it. `D` never sends and never marks anything, and it
+refuses a row that already has a draft you have not made with `D` (edit it or
+`P` polish it instead); `D` again on its own draft writes a new one. Spend is
+logged as `inbox-draft`. `D` works on any source, with or without `acts:`.
+
+### `nudge_template` (`n` without a stored draft)
+
+A waiting row that has no draft normally says "Nudge not due yet". On a row of
+a source that lists any act, `n` instead fills the Draft pane from the
+`nudge_template` setting and goes through the normal confirm and send path (so
+`send.mode: draft` still places a Slack draft, and the precheck and
+destinations are unchanged). The template may use `{first}` (the first word of
+the person's name), `{who}` (the whole name) and `{topic}` (the row's gist cut
+to one line of 80 characters); any other field, a format spec or an unbalanced
+brace is a settings error. Write a literal brace as `{{` or `}}`.
+
+### `done_reaction`
+
+`done_reaction: white_check_mark` (an emoji name; off by default; it needs a
+`react:` block) makes `d` also react to the row's message once the undo window
+ends, through the same pinned call as `E` and with the same safeguards. It is
+skipped for a row with no `reply_to.message_ts` or `thread_ts`, for digest and
+saved rows, and after a conflict (the row was reopened); a reaction that fails
+toasts a warning and does not undo the `d`. It works with or without `acts:`.
+
+### Health strip
+
+`N not synced` (warning colour) shows while the pending file has entries, and
+`shadow` shows once the last act reply had `shadow` true, until a later reply
+says otherwise. Neither shows without acts. With acts on and no
+`health.heartbeats`/reader the strip appears for these two alone.
 
 ## Built-in `events` source
 
@@ -912,7 +1076,7 @@ argv unchanged for every other caller.)
 
 The key of an `actions:` entry (`p` in the example) runs the flow below on the
 selected item. The key must be a letter the inbox does not use itself; the
-free ones are `h l p t w z` and `B D F H J K N O Q U V W Z`, and
+free ones are `h l p t z` and `B F H J K N O Q U V W Z`, and
 validation refuses any other (and a key or label used twice).
 
 1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
@@ -1166,6 +1330,11 @@ with `x` and `-` are kept there too, as `prefs.feed_rules` (see [Feed](#feed)).
   panes (and threads) never corrupt the file or lose each other's marks.
 - Done, ack and snooze are queued for 5 seconds so `u` can undo them; quitting
   commits them. A queued send or nudge is never committed on quit.
+- With acts on, `<base>/state/inbox-ops-log.jsonl` (the ops sent, newest 500
+  rows) and `<base>/state/inbox-ops-pending.jsonl` (ops waiting for a retry,
+  at most 50, none older than 7 days) are kept the same way (mode 0600, atomic,
+  locked). See [Acts](#acts). A draft made with `D` is kept on the item's mark
+  (`draft`, `draft_key`) and survives `u` (undo) of a done mark.
 - `<base>/state/inbox-summary/cache.json` holds the AI summaries (see
   [AI summary](#ai-summary-i)): mode 0600 in a 0700 directory of its own, the
   200 most recently used entries.
@@ -1198,6 +1367,8 @@ defaults; a broken one prints every problem and exits 2.
 | `team`, `slack_open` | off | where `o` opens a Slack item (see "Draft and copy") |
 | `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
 | `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
+| `done_reaction` | off | an emoji name: `d` also reacts to the row's message; needs `react:` (see [Acts](#donereaction)) |
+| `nudge_template` | `Hi {first}, any news on {topic}?` | the text `n` uses on an acts source's waiting row with no stored draft (see [Acts](#nudge_template-n-without-a-stored-draft)) |
 | `feed` | window 24 h, no rules | what the Feed shows and does with a row: `window_h` and `rules` (see [Feed](#feed)) |
 | `health` | no heartbeats | `heartbeats`: files that say a process is alive (see [Health](#health)) |
 
@@ -1211,9 +1382,11 @@ and:
 | `email_require_label` | `null` | a label name, e.g. `MY_LABEL`: show only mail captured through a routine whose query requires that label (see "Mail label filter"); `null` shows all mail |
 
 A `command` source takes `argv` (list), `timeout_s` (1 to 120),
-`watch` (list of paths, default none; see "Change-driven refresh") and
+`watch` (list of paths, default none; see "Change-driven refresh"),
 `supports_all` (`true` or `false`, default `false`): declare it only if
-`<argv> list --all` works.
+`<argv> list --all` works, and `acts` (a list of `close`, `snooze`, `mute`,
+`waits_on`, `relay`, default none; see [Acts](#acts); `timeout_s` is also the
+timeout of an `act` call).
 
 `rsvp:` (no default; omit it and RSVP is off):
 
@@ -1290,7 +1463,7 @@ The inbox is organised by whose move it is. A tab bar and a one-line health
 strip sit on top; `1` to `5` switch the view.
 
 ```
- inbox 0.9.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ inbox 0.10.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
  slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
 ```
 
@@ -1447,7 +1620,7 @@ At most 10 heartbeats. The files are only `stat`ed.
 `1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
 group, `tab` switches pane,
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze, `n` nudge, `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
+`d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
 memory by hand (needs `save:`; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
@@ -1456,7 +1629,8 @@ everything now (inside the context pane, fetch its context again),
 `R` show or hide resolved alerts, `A` show all (see below), `S` the Feed's
 saved-to-memory routine, in the Feed `x` mute, `-` less like this and `M` the
 rules, `y` copy the item, `Y` copy its group,
-`L` audit log, `b` Hebrew order, `v` thread order (newest or oldest first;
+`w` waits on, `!` relay and `D` draft for me, and in a row whose source lists `mute` `x` also mutes the conversation (all in [Acts](#acts)),
+`L` audit log (the ops log with acts on), `b` Hebrew order, `v` thread order (newest or oldest first;
 saved), `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
 
@@ -1539,6 +1713,11 @@ header and the help overlay show the inbox version.
   confirmation. The context command is yours and must be read-only; the summary
   runs the bridge with no tools at all and treats item text as data.
 - Every action lands in the audit log (`L`).
+- Acts (0.10.0) are off until a source lists `acts:`. They go out only after
+  the undo window, from a worker, to the command you configured, with the item
+  as JSON on stdin; a retry reuses the op id and never runs on the UI thread.
+  `D` makes a no-tools bridge call over the thread and never sends;
+  `done_reaction` uses the pinned react call.
 - `open` launches plain `http(s)` links, and with `slack_open` the template's
   `slack://` or `https://` URL (built only from validated ids).
 - Sources run with your privileges: only configure commands you trust.
