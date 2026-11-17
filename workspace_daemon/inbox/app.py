@@ -10,16 +10,18 @@ from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
 from textual import work
-from textual.app import App, ComposeResult, SystemCommand
+from textual.app import App, ComposeResult, ScreenStackError, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Input, Static, TextArea
 
+from . import acts as actsmod
 from . import bidi, customactions, feedrules, invites, themes, views
 from . import context as ctxmod
 from . import health as healthmod
 from . import items as itm_items
+from . import draftme as draftme_mod
 from . import polish as polishmod
 from . import writes as writes_mod
 from . import summary as summod
@@ -27,8 +29,8 @@ from .actions import Result
 from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
                      copy_section_text, from_v1)
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
-                      ConfirmWrite, HelpScreen, PolishScreen, RulesScreen,
-                      SnoozePicker)
+                      ConfirmWrite, HelpScreen, NoteScreen, OpsScreen,
+                      PolishScreen, RulesScreen, SnoozePicker)
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
@@ -66,7 +68,24 @@ RSVP_KEYS = {
 }
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
-EXTERNAL_KINDS = ("send", "nudge", "draft", "rsvp", "save", "action", "react")
+EXTERNAL_KINDS = ("send", "nudge", "draft", "rsvp", "save", "action", "react",
+                  "waits_on", "relay")
+# 0.10.0 acts. `done`, `snooze` and `mute` write a local mark and then tell the
+# source (quitting commits the mark and keeps the op for a retry: it never
+# calls the source); `waits_on` and `relay` have no local mark (they are in
+# EXTERNAL_KINDS: quitting cancels them).
+ACT_MARK_KINDS = ("done", "snooze", "mute")
+ACTS_OFF = ("Acts are not enabled for this source (set acts: on its command "
+            "source in inbox.yaml)")
+CONFLICT_TOAST = "New message since you looked; refresh"
+SHADOW_WORD = "shadow"
+
+
+def _stub(entry):
+    """A row-shaped stand-in for an op's item, for the audit log."""
+    return Item(key=str(entry.get("id", "")), section="fyi",
+                who=str(entry.get("who", "")), where=str(entry.get("where", "")),
+                ts=0.0, gist="")
 
 
 def _takes_show_all(fetch):
@@ -81,7 +100,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | draft | done | ack | snooze | rsvp | save | action | react
+    kind: str                 # send | nudge | draft | done | ack | snooze | mute | waits_on | relay | rsvp | save | action | react
     item: Item
     text: str = ""
     until: float = 0.0
@@ -96,6 +115,9 @@ class Pending:
     choice: str = ""          # action: the id of the chosen choice; react: the emoji name
     state: str = ""           # action: the opaque state prepare returned
     mark_done: bool = False   # action: a successful run marks the item done
+    act: str = ""             # 0.10.0: the act to send after the mark (close, snooze, ...)
+    act_args: dict = field(default_factory=dict)   # its args
+    react: str = ""           # 0.10.0: done reaction emoji sent after the act
 
 
 class InboxApp(App):
@@ -125,6 +147,8 @@ class InboxApp(App):
         Binding("R", "toggle_resolved", show=False),
         Binding("X", "rsvp_decline", show=False), Binding("T", "rsvp_tentative", show=False),
         Binding("m", "save_memory", show=False),
+        Binding("w", "waits_on", show=False), Binding("D", "draft_me", show=False),
+        Binding("exclamation_mark", "relay", show=False),
         Binding("E", "react", show=False), Binding("P", "polish", show=False),
         Binding("c", "context", show=False), Binding("C", "context_refresh", show=False),
         Binding("i", "summary(False)", show=False), Binding("I", "summary(True)", show=False),
@@ -169,7 +193,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, OpsScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-warn { margin: 1 0 0 0; }
@@ -203,6 +227,10 @@ class InboxApp(App):
     #help-title { margin-bottom: 1; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
+    #ops { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #ops-table { height: 1fr; }
+    #note { width: 70; max-width: 94%; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
+    #note-hint { margin-top: 1; color: $text-muted; }
     #rules { width: 96%; height: 70%; border: heavy $primary; background: $surface; padding: 1 2; }
     #rules-title { margin-bottom: 1; }
     #rules-table { height: 1fr; }
@@ -323,6 +351,11 @@ class InboxApp(App):
         self._pre_op = None                # the send precheck being waited for
         self._pre_gen = 0                  # bumped on every precheck
         self._pre_screen = None            # its "checking" modal
+        self.act_pending = 0               # ops waiting for a retry (health strip)
+        self.act_shadow = False            # the last act reply said shadow
+        self._retrying = False             # a pending-ops retry thread is alive
+        self._draft_running = set()        # item keys with a `D` draft running
+        self._inverse_running = 0          # ops-log inverses being sent
         for n, cfg in enumerate(self._custom):
             self.bind(cfg["key"], f"custom_action({n})", show=False)
 
@@ -367,6 +400,13 @@ class InboxApp(App):
         self.set_interval(self.poll_s, self.poll)   # the fallback full refresh
         self.set_interval(healthmod.REFRESH_S, self.health_refresh)
         self.health_refresh()
+        if self._acts_any():
+            fn = getattr(self.actions, "last_act_shadow", None)
+            try:
+                self.act_shadow = bool(fn()) if fn else False
+            except Exception:
+                self.act_shadow = False
+            self._refresh_act_count()
         if self.watcher is not None:
             self.set_interval(self.watch_s, self.watch_tick)
         self.query_one("#queue").focus()
@@ -820,7 +860,9 @@ class InboxApp(App):
             return
         h.update(h.render_header(self, self.pal, self.size.width))
         strip = self.query_one("#strip", HealthStrip)
-        strip.display = self.health_fetch is not None
+        # With acts on the strip also tells how many ops are not synced.
+        strip.display = (self.health_fetch is not None
+                         or bool(self.act_pending or self.act_shadow))
         if strip.display:
             strip.update(strip.render_strip(self, self.pal, self.size.width))
 
@@ -842,6 +884,15 @@ class InboxApp(App):
                 extra.append(("E", "react"))
             if self._polish_on(self.current):
                 extra.append(("P", "polish"))
+            if self._acts_on(self.current, "waits_on"):
+                extra.append(("w", "waits on"))
+            if self._acts_on(self.current, "relay"):
+                extra.append(("!", "relay"))
+            if (self._acts_any() and not views.is_synthetic(self.current)
+                    and getattr(self.actions, "draft_me_configured", False)
+                    and ("reply" in self.current.actions
+                         or "nudge" in self.current.actions)):
+                extra.append(("D", "draft for me"))
             extra.extend((c["key"], c["label"][:16]) for c in self._custom)
         if extra and hints and hints[-1] == ("?", "help"):
             return hints[:-1] + extra + hints[-1:]
@@ -911,7 +962,11 @@ class InboxApp(App):
                 and bool(it.draft and it.draft.strip()))
 
     def update_hints(self):
-        self.query_one("#hints", HintBar).set_hints(self.hints(), self.pal)
+        try:
+            hints = self.query_one("#hints", HintBar)
+        except (NoMatches, ScreenStackError):   # a message during teardown
+            return
+        hints.set_hints(self.hints(), self.pal)
 
     def on_descendant_focus(self, _e):
         self.update_hints()
@@ -1230,10 +1285,11 @@ class InboxApp(App):
 
     def _enqueue(self, kind, it, toast, text="", until=0.0, detail="",
                  answer="", hide=True, force=False, name="", choice="",
-                 state="", mark_done=False):
+                 state="", mark_done=False, act="", act_args=None, react=""):
         p = Pending(kind=kind, item=it, text=text, until=until, label=toast,
                     answer=answer, hide=hide, force=force, name=name,
-                    choice=choice, state=state, mark_done=mark_done)
+                    choice=choice, state=state, mark_done=mark_done, act=act,
+                    act_args=dict(act_args or {}), react=react)
         p.audit = self.record(kind, it, detail, "queued")
         self.pending.append(p)
         if hide:
@@ -1263,7 +1319,9 @@ class InboxApp(App):
         self.busy += 1
         self.run_worker(lambda: self._run_in_thread(p), thread=True, group="commit")
 
-    def _run(self, p):
+    def _run(self, p, send=True):
+        """Do a committed action. `send` False (the app is quitting) writes
+        the local marks only: an act is kept for a retry, never sent."""
         a, it = self.actions, p.item
         if p.kind == "send":
             return a.send(it, p.text)
@@ -1272,7 +1330,12 @@ class InboxApp(App):
         if p.kind == "draft":
             return a.place_draft(it, p.text)
         if p.kind == "done":
-            return self._each(it, a.mark_done)
+            return self._after_mark(p, self._each(it, a.mark_done), send)
+        if p.kind == "mute":
+            res = (a.snooze(it, p.until) if p.until else a.mark_done(it))
+            return self._after_mark(p, res, send)
+        if p.kind in ("waits_on", "relay"):
+            return self._after_mark(p, Result(), send)
         if p.kind == "ack":
             return self._each(it, a.ack)
         if p.kind == "rsvp":
@@ -1283,7 +1346,54 @@ class InboxApp(App):
             return a.run_action(p.name, it, p.choice, p.state)
         if p.kind == "react":
             return a.react(it, p.choice)
-        return self._each(it, lambda row: a.snooze(row, p.until))
+        return self._after_mark(
+            p, self._each(it, lambda row: a.snooze(row, p.until)), send)
+
+    def _after_mark(self, p, res, send):
+        """After the local mark of a done, snooze or mute (or with none, for
+        waits-on and relay): tell the source (`p.act`) and add the done
+        reaction (`p.react`). The act may take as long as the source's timeout:
+        this runs in a worker, never on the UI thread."""
+        if not res.ok or not (p.act or p.react):
+            return res
+        a, it = self.actions, p.item
+        if not send:                      # quitting: nothing may block
+            if p.act:
+                a.queue_act(it, p.act, p.act_args)
+            return res
+        note, out = [], None
+        if p.act:
+            started = time.time()
+            out = a.send_act(it, p.act, p.act_args)
+            if out.dropped:
+                note.append(f"{out.dropped} unsynced op(s) older than "
+                            f"{actsmod.PENDING_MAX_AGE_S // 86400} days or "
+                            "over the cap were dropped")
+            if out.status == actsmod.CONFLICT:
+                if p.kind in ACT_MARK_KINDS:
+                    # The local mark goes back, unless a newer one was made.
+                    a.undo_marks(it, since=started)
+                if p.react:
+                    note.append("reaction skipped (conflict)")
+                return Result(True, out.message, sync=actsmod.CONFLICT,
+                              op_id=out.op_id, shadow=out.shadow,
+                              note="; ".join(note))
+        if p.react:
+            # The reaction says "handled": only when the source took it for
+            # real (or there is no act). Not after a shadow, a failure kept
+            # for a retry, or a lost op.
+            if out is None or out.status == actsmod.OK:
+                done = a.react_done(it, p.react)
+                note.append(f"Reacted :{p.react}:" if done.ok
+                            else f"Reaction failed: {done.detail}")
+            else:
+                why = {actsmod.SHADOW: "shadow", actsmod.PENDING: "not synced",
+                       actsmod.LOST: "not synced"}.get(out.status, out.status)
+                note.append(f"reaction skipped ({why})")
+        return Result(True, out.message if out else "",
+                      sync=out.status if out else "",
+                      op_id=out.op_id if out else "",
+                      shadow=bool(out and out.shadow), note="; ".join(note))
 
     @staticmethod
     def _each(it, fn):
@@ -1307,7 +1417,9 @@ class InboxApp(App):
             # write that was still running says how it ended.
             self._late_report(p, res)
             return
-        if p.kind in ("action", "send", "nudge", "draft", "react"):
+        if p.kind in ("action", "send", "nudge", "draft", "react") or (
+                p.kind in ACT_MARK_KINDS + ("waits_on", "relay")
+                and (p.act or p.react)):
             # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
             return
@@ -1338,7 +1450,10 @@ class InboxApp(App):
         p.audit["status"] = "committed" if res.ok else "failed"
         p.audit["detail"] = (p.audit["detail"] + " · " + res.detail).strip(" ·")
         self.last_committed = p
-        if p.kind == "save" and not res.ok and res.duplicate and not p.force:
+        if res.ok and (res.sync or res.note) and p.kind in (
+                ACT_MARK_KINDS + ("waits_on", "relay")):
+            self._synced(p, res)
+        elif p.kind == "save" and not res.ok and res.duplicate and not p.force:
             # Not a failure: the command found a likely duplicate. A modal
             # opened here could stack on whatever the user is doing, so tell
             # them instead; `m` on the item opens the question.
@@ -1393,6 +1508,124 @@ class InboxApp(App):
         elif p.kind in SEND_KINDS:
             self.notify(f"{res.detail or 'would send'}  ->  {p.item.destination}",
                         title="Demo", timeout=4, markup=False)
+
+    # ---------- acts (0.10.0) ----------
+    def act_status(self):
+        """`(not_synced, shadow)` for the health strip: how many ops wait for a
+        retry and whether the last act reply said shadow."""
+        return self.act_pending, self.act_shadow
+
+    def _acts_on(self, it, action):
+        """True when the row's source lists the act (False for rows the views
+        made, and for every backend without acts)."""
+        fn = getattr(self.actions, "act_enabled", None)
+        try:
+            return bool(fn and fn(it, action))
+        except Exception:
+            return False
+
+    def _acts_on_source(self, it):
+        """True when the row's source lists any act."""
+        fn = getattr(self.actions, "act_names", None)
+        try:
+            return bool(fn and fn(it))
+        except Exception:
+            return False
+
+    def _acts_any(self):
+        return bool(getattr(self.actions, "acts_configured", False))
+
+    def _refresh_act_count(self):
+        fn = getattr(self.actions, "pending_count", None)
+        try:
+            self.act_pending = int(fn()) if fn else 0
+        except Exception:
+            self.act_pending = 0
+        self.tick_header()
+
+    def _synced(self, p, res):
+        """UI thread: the source answered (or the done reaction ran). ok keeps
+        the mark; a conflict has already put it back; a failure keeps it and
+        the op waits for a retry."""
+        if res.sync in (actsmod.OK, actsmod.SHADOW):
+            self.act_shadow = res.sync == actsmod.SHADOW
+        self._refresh_act_count()
+        self.refilter(redraw=False)
+        self.redraw(keep=p.item.key if res.sync == actsmod.CONFLICT
+                    else self.current_key)
+        what = p.act or p.kind
+        if res.sync == actsmod.CONFLICT:
+            p.audit["status"] = "conflict"
+            self.notify(CONFLICT_TOAST, title="Not applied", severity="warning",
+                        timeout=8, markup=False)
+        elif res.sync == actsmod.LOST:
+            p.audit["status"] = "lost"
+            self.notify(f"{what}: not synced AND not saved for a retry "
+                        f"({res.detail}). The source never got it; do it "
+                        "again once it works.", title="Op lost",
+                        severity="error", timeout=12, markup=False)
+        elif res.sync == actsmod.PENDING:
+            p.audit["status"] = "not synced"
+            self.notify(f"{what}: saved here, not synced: {res.detail}\n"
+                        f"{self.act_pending} not synced; retried on refresh",
+                        title="Not synced", severity="warning", timeout=8,
+                        markup=False)
+        elif res.sync in (actsmod.OK, actsmod.SHADOW):
+            word = SHADOW_WORD if res.sync == actsmod.SHADOW else "✓ synced"
+            p.audit["status"] = "shadow" if res.sync == actsmod.SHADOW \
+                else "synced"
+            self.notify(f"{word}: {what} · {p.item.who}", title="Source",
+                        timeout=4, markup=False)
+            if p.kind == "waits_on" and self.polled_once:
+                self.poll(quiet=True, names=(
+                    {p.item.origin} if self.units is not None else None))
+        if res.note:
+            self.notify(res.note, timeout=6, markup=False,
+                        severity="warning" if "ailed" in res.note
+                        or "dropped" in res.note else "information")
+
+    def _retry_ops(self):
+        """After a refresh: resend the ops that could not be delivered, in a
+        worker (never on the UI thread), at most every 5 minutes each."""
+        fn = getattr(self.actions, "retry_pending", None)
+        if (fn is None or self._retrying or self._quitting
+                or not self.act_pending):
+            return
+        self._retrying = True
+        threading.Thread(target=self._retry_thread, args=(fn,),
+                         name="inbox-acts-retry", daemon=True).start()
+
+    def _retry_thread(self, fn):
+        try:
+            report = fn(cancel=self._cancel)
+        except Exception:
+            report = None
+        self._retrying = False
+        if report is not None and not self._quitting:
+            self._post(self._retried, report)
+
+    def _retried(self, report):
+        self._refresh_act_count()
+        done = [(e, o) for e, o in report.results
+                if o.status != actsmod.PENDING]
+        for entry, out in report.results:
+            self.record("retry", _stub(entry), f"{entry.get('action')}: "
+                        f"{out.message}", out.status)
+            if out.status in (actsmod.OK, actsmod.SHADOW):
+                self.act_shadow = out.status == actsmod.SHADOW
+        conflicts = [e for e, o in done if o.status == actsmod.CONFLICT]
+        if report.dropped:
+            self.notify(f"{report.dropped} unsynced op(s) older than "
+                        f"{actsmod.PENDING_MAX_AGE_S // 86400} days were "
+                        "dropped", severity="warning", timeout=8, markup=False)
+        if conflicts:
+            self.refilter(redraw=False)
+            self.redraw(keep=self.current_key)
+            self.notify(CONFLICT_TOAST, title="Not applied", severity="warning",
+                        timeout=8, markup=False)
+        elif done:
+            self.notify(f"✓ synced {len(done)} earlier op(s)", timeout=4,
+                        markup=False)
 
     def _auto_done(self, it, why):
         """Mark a handled item done the way `d` does (store mark, audit, the
@@ -1460,10 +1693,22 @@ class InboxApp(App):
         if not self.actions.supports_send:
             self.notify(NOT_YET, timeout=3, markup=False)
             return
+        text = None
         if not it.draft:
-            self.notify(f"Nudge not due yet (waiting {fmt_age(time.time() - it.ts)})", timeout=3, markup=False)
-            return
-        self._confirm_send("nudge", it, "Send nudge")
+            fn = getattr(self.actions, "act_nudge_text", None)
+            if fn is not None and self._acts_any() and getattr(
+                    it, "origin", "") and self._acts_on_source(it):
+                # 0.10.0: a row of an acts source with no stored draft falls
+                # back to the `nudge_template` text; it goes through the same
+                # confirm and send path (draft mode stays a Slack draft). The
+                # text is only the confirm screen's: it is never put in the
+                # row's draft, so cancelling leaves the row as it was (and D
+                # is not blocked).
+                text = fn(it)
+            else:
+                self.notify(f"Nudge not due yet (waiting {fmt_age(time.time() - it.ts)})", timeout=3, markup=False)
+                return
+        self._confirm_send("nudge", it, "Send nudge", text=text)
 
     def _real_send(self):
         """True when sends go to Slack (`send:` is configured), False in the
@@ -1493,10 +1738,11 @@ class InboxApp(App):
             return ("send",)
         return tuple(fn())
 
-    def _confirm_send(self, kind, it, verb):
+    def _confirm_send(self, kind, it, verb, text=None):
         if self.editing:
             self.end_edit(save=True)      # send what the draft pane holds
-        text = it.draft
+        if text is None:
+            text = it.draft
         if not text.strip():
             self.notify("No draft to send. Press e to write one.", timeout=3, severity="warning", markup=False)
             return
@@ -1703,6 +1949,90 @@ class InboxApp(App):
             "React to message", rows, "React",
             "Adds the reaction as you. Nothing else is posted.",
             self.bidi), after)
+
+    def action_draft_me(self):
+        """D: a draft reply for me, from the thread. One no-tools bridge call
+        in a worker (the UI stays live; the result is kept in the store so an
+        unchanged item shows it again). It fills the Draft pane and never
+        sends."""
+        it = self.current
+        if it is None or self._synthetic(it):
+            return
+        if "reply" not in it.actions and "nudge" not in it.actions:
+            self.notify("D drafts a reply: this row has none to write",
+                        timeout=3, severity="warning", markup=False)
+            return
+        if not getattr(self.actions, "draft_me_configured", False):
+            self.notify("Draft for me needs summary: or polish: in inbox.yaml "
+                        "(its model and budget)", timeout=4,
+                        severity="warning", markup=False)
+            return
+        if it.key in self._draft_running:
+            self.notify("A draft is already being written for this row",
+                        timeout=2, markup=False)
+            return
+        if self.editing:
+            self.end_edit(save=True)
+        cached = self.actions.cached_draft_me(it)
+        mine = bool(cached) and it.draft == cached
+        if it.draft and it.draft.strip() and not mine:
+            self.notify("This row already has a draft: edit it (e) or polish "
+                        "it (P). D never overwrites one.", timeout=5,
+                        severity="warning", markup=False)
+            return
+        if cached and not mine:
+            self._draft_filled(it, cached, True)
+            return
+        self._draft_running.add(it.key)
+        self.busy += 1
+        self.set_badge(it, "drafting for you…")
+        threading.Thread(target=self._draft_thread, args=(it, mine, it.draft),
+                         name="inbox-draft-me").start()
+
+    def _draft_thread(self, it, force, base):
+        try:
+            out = self.actions.draft_for_me(it, force=force)
+        except Exception as exc:  # a backend bug must not end the session
+            out = draftme_mod.Outcome(False, "", f"cannot run: {type(exc).__name__}")
+        if self._quitting:
+            return
+        self._post(self._draft_done, it, out, base)
+
+    def _draft_done(self, it, out, base):
+        self.busy = max(0, self.busy - 1)
+        self._draft_running.discard(it.key)
+        live = self._live_item(it.key)
+        if not out.ok:
+            self.record("draft-me", it, out.detail, "failed")
+            self.notify(f"Draft for me failed: {out.detail}", severity="warning",
+                        timeout=6, markup=False)
+            if live is not None and live is self.current:
+                self.set_badge(live, "")
+            return
+        if live is None:
+            self.record("draft-me", it, "item gone", "discarded")
+            return
+        if live.draft and live.draft.strip() and live.draft != base:
+            self.record("draft-me", live, "a draft appeared meanwhile",
+                        "discarded")
+            self.notify("The row got a draft while this one was written; "
+                        "kept yours.", timeout=4, severity="warning",
+                        markup=False)
+            return
+        self._draft_filled(live, out.text, out.cached)
+
+    def _draft_filled(self, it, text, cached):
+        it.draft, it.streamed, it.drafted_by = text, True, "model"
+        self.record("draft-me", it, f"{len(text)} chars"
+                    + (" (kept)" if cached else ""), "filled")
+        if it is self.current:
+            self.query_one("#draft-view", Static).update(
+                self.draft_text(it, it.draft, False))
+            self.set_badge(it, "from the store" if cached else "drafted")
+            self.update_hints()
+        self.notify("Draft filled in. Nothing was sent." + (
+            " D again writes a new one." if cached else ""), timeout=4,
+            markup=False)
 
     def action_polish(self):
         """P: rewrite the draft in your tone (tone guidance from the
@@ -2064,7 +2394,18 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
-        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' else 'Done'}: {it.who}")
+        # 0.10.0: a row whose source lists `close` also closes there, and with
+        # `done_reaction:` the message gets its emoji. Neither runs before the
+        # undo window ends; with neither configured this is the old `d`.
+        act = "close" if self._acts_on(it, "close") else ""
+        fn = getattr(self.actions, "done_reaction_for", None)
+        emoji = ""
+        try:
+            emoji = (fn(it) if fn else None) or ""
+        except Exception:
+            emoji = ""
+        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' else 'Done'}: {it.who}",
+                      act=act, react=emoji)
 
     def action_snooze(self):
         it = self.current
@@ -2074,7 +2415,10 @@ class InboxApp(App):
         def after(res):
             if res:
                 until, label = res
-                self._enqueue("snooze", it, f"Snoozed {label}: {it.who}", until=until, detail=label)
+                act = "snooze" if self._acts_on(it, "snooze") else ""
+                self._enqueue("snooze", it, f"Snoozed {label}: {it.who}", until=until,
+                              detail=label, act=act,
+                              act_args={"until": until} if act else None)
         self.push_screen(SnoozePicker(it.who), after)
 
     def action_open(self):
@@ -2524,6 +2868,11 @@ class InboxApp(App):
         """x on a Feed row: pick what to mute (this kind from this routine,
         this routine, titles like this), then for how long. The rule is saved
         in the inbox state, never in inbox.yaml."""
+        cur = self.current
+        conv = cur is not None and self._acts_on(cur, "mute")
+        if conv and not (self.view == "feed" and not views.is_saved_row(cur)):
+            # Not a Feed row: only the source's conversation mute is offered.
+            return self._mute_picker(cur, [])
         it = self._feed_row()
         if it is None:
             return
@@ -2536,6 +2885,8 @@ class InboxApp(App):
                    "detail": feedrules.title_pattern(title)}]
         if not kind:
             scopes = scopes[1:]
+        if conv:
+            return self._mute_picker(cur, scopes, it)
 
         def scoped(scope):
             if scope is None:
@@ -2543,6 +2894,107 @@ class InboxApp(App):
                 return
             self._pick_duration(it, scope["id"], "hide")
         self.push_screen(ChoicePicker("Mute: what", scopes, self.bidi), scoped)
+
+    def _mute_picker(self, cur, scopes, rule_item=None):
+        """x on a row whose source lists `mute`: the Feed rule choices (when
+        the row is in the Feed) and, after them, "Mute this conversation" for
+        a day, a week or until untracked, which tells the source."""
+        convs = [{"id": f"conv:{key}", "label": f"Mute this conversation: {label}",
+                  "detail": "tells the source" + (
+                      "; stops tracking it" if key == "never" else "")}
+                 for key, label, _s in actsmod.MUTE_CHOICES]
+
+        def scoped(scope):
+            if scope is None:
+                self.notify("Cancelled. Nothing muted.", timeout=2, markup=False)
+                return
+            if scope["id"].startswith("conv:"):
+                self._mute_conversation(cur, scope["id"][5:])
+            else:
+                self._pick_duration(rule_item, scope["id"], "hide")
+        self.push_screen(ChoicePicker("Mute: what", list(scopes) + convs,
+                                      self.bidi), scoped)
+
+    def _mute_conversation(self, it, key):
+        seconds = next((s for k, _l, s in actsmod.MUTE_CHOICES if k == key),
+                       None)
+        until = time.time() + seconds if seconds else None
+        label = next(l for k, l, _s in actsmod.MUTE_CHOICES if k == key)
+        if self._act_busy("mute", it):
+            return
+        self._enqueue("mute", it, f"Muted ({label}): {it.who}",
+                      until=until or 0.0, detail=label, act="mute",
+                      act_args={"until": until})
+
+    def _act_busy(self, kind, it):
+        """True (with a notice) when this act is already waiting or running
+        for the item."""
+        if any(p.kind == kind and p.item.key == it.key and not p.done
+               for p in self.pending) or any(
+                p.kind == kind and p.item.key == it.key for p in self.running):
+            self.notify(f"{kind} already in progress", timeout=2, markup=False)
+            return True
+        return False
+
+    def _act_gate(self, it, action):
+        """True when `it` may take the act; otherwise the reason is toasted."""
+        if it is None:
+            return False
+        if self._synthetic(it):
+            return False
+        if self._acts_on(it, action):
+            return True
+        listed = getattr(self.actions, "act_names", lambda _i: ())(it)
+        self.notify(ACTS_OFF if not listed else
+                    f"This source does not list the {action} act", timeout=4,
+                    severity="warning", markup=False)
+        return False
+
+    def action_waits_on(self):
+        """w: who the next move is with. Choices: Me, the people in the
+        thread (not you) and Nobody (FYI); sent as the `waits_on` act."""
+        it = self.current
+        if not self._act_gate(it, "waits_on") or self._act_busy("waits_on", it):
+            return
+        people = []
+        for m in it.messages:
+            if not m.mine and m.who and m.who not in people:
+                people.append(m.who)
+        if not people and it.who and it.who not in ("You", "you", "me"):
+            people.append(it.who)
+        choices = [{"id": "me", "label": "Me", "detail": "I owe the next move"}]
+        choices += [{"id": f"p:{n}", "label": n, "detail": "waiting on them"}
+                    for n in people[:7]]
+        choices.append({"id": "nobody", "label": "Nobody (FYI)",
+                        "detail": "nothing is waiting"})
+
+        def picked(choice):
+            if choice is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+                return
+            who = ("me" if choice["id"] == "me" else "nobody"
+                   if choice["id"] == "nobody" else choice["id"][2:])
+            self._enqueue("waits_on", it, f"Waits on {choice['label']}: {it.who}",
+                          hide=False, detail=choice["label"], act="waits_on",
+                          act_args={"who": who[:actsmod.WHO_MAX]})
+        self.push_screen(ChoicePicker("Waits on", choices, self.bidi), picked)
+
+    def action_relay(self):
+        """!: hand the item to your work session, with an optional one-line
+        note (the `relay` act)."""
+        it = self.current
+        if not self._act_gate(it, "relay") or self._act_busy("relay", it):
+            return
+
+        def noted(note):
+            if note is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+                return
+            note = actsmod.clean_note(note)
+            self._enqueue("relay", it, f"Relay to your work session: {it.who}",
+                          hide=False, detail=note[:60] or "no note",
+                          act="relay", act_args={"note": note})
+        self.push_screen(NoteScreen("Relay", it.who, actsmod.NOTE_MAX), noted)
 
     def _pick_duration(self, it, scope, action):
         choices = [{"id": str(n), "label": label, "detail": ""}
@@ -2618,7 +3070,83 @@ class InboxApp(App):
             self.rules_screen.reload(self._ui_rules())
 
     def action_audit(self):
-        self.push_screen(AuditScreen(self.audit))
+        """L: the audit log. With acts on, the ops log (what was sent to the
+        sources, with `u` to undo one there); `a` in it shows the session's
+        audit log."""
+        if not self._acts_any():
+            self.push_screen(AuditScreen(self.audit))
+            return
+        self._ops_screen()
+
+    def _ops_screen(self):
+        def closed(result):
+            if not result:
+                return
+            kind, row = result
+            if kind == "session":
+                self.push_screen(AuditScreen(self.audit),
+                                 lambda _r: self._ops_screen())
+            elif kind == "inverse":
+                self._confirm_inverse(row)
+        self.push_screen(OpsScreen(self.actions.ops_rows(),
+                                   self.actions.invertible), closed)
+
+    def _confirm_inverse(self, row):
+        action = self.actions.invertible(row)
+        if action is None:
+            return
+        rows = [("Item", str(row.get("who", ""))),
+                ("Where", str(row.get("where", ""))),
+                ("Was", f"{row.get('action')} ({row.get('result')})"),
+                ("Send", action), ("To source", str(row.get("source", "")))]
+
+        def after(ok):
+            if not ok:
+                self.notify("Cancelled. Nothing sent.", timeout=2, markup=False)
+                return
+            self.busy += 1
+            self._inverse_running += 1
+            threading.Thread(target=self._inverse_thread, args=(row, action),
+                             name="inbox-acts-inverse").start()
+        self.push_screen(ConfirmWrite(
+            "Undo in the source", rows, "Send",
+            f"Sends {action} for this item and brings it back here.",
+            self.bidi, fixed="Nothing is sent until you confirm. This cannot "
+                             "be taken back."), after)
+
+    def _inverse_thread(self, row, action):
+        try:
+            out = self.actions.send_inverse(row)
+        except Exception as exc:
+            out = None
+            detail = f"{type(exc).__name__}"
+        else:
+            detail = out.message
+        finally:
+            self._inverse_running = max(0, self._inverse_running - 1)
+        if self._quitting:
+            return
+        self._post(self._inverse_done, row, action, out, detail)
+
+    def _inverse_done(self, row, action, out, detail):
+        self.busy = max(0, self.busy - 1)
+        stub = _stub(row)
+        status = out.status if out is not None else "failed"
+        self.record(action, stub, detail, status)
+        if out is not None and out.status in (actsmod.OK, actsmod.SHADOW):
+            self.act_shadow = bool(out.shadow)
+            self.refilter(redraw=False)
+            self.redraw(keep=self.current_key)
+            self.notify(("shadow" if out.status == actsmod.SHADOW
+                         else "✓ synced") + f": {action} · {row.get('who', '')}",
+                        title="Source", timeout=4, markup=False)
+        elif out is not None and out.status == actsmod.CONFLICT:
+            self.notify(CONFLICT_TOAST, severity="warning", timeout=6,
+                        markup=False)
+        else:
+            self.notify(f"{action} not sent: {detail}", severity="warning",
+                        timeout=6, markup=False)
+        self._refresh_act_count()
 
     def action_help(self):
         self.push_screen(HelpScreen(
@@ -2670,6 +3198,10 @@ class InboxApp(App):
             busy.append("summary still running")
         if self._polish_running:
             busy.append("polish still running")
+        if self._draft_running:
+            busy.append("draft for me still running")
+        if self._inverse_running:
+            busy.append("undo in the source still running")
         if busy and not self._quit_armed:
             self._quit_armed = True
             self.set_timer(8, self._disarm_quit)
@@ -2679,6 +3211,7 @@ class InboxApp(App):
                         severity="warning", timeout=6, markup=False)
             return
         cancelled = 0
+        react_skipped = 0
         for p in list(self.pending):
             if p.timer:
                 p.timer.stop()
@@ -2689,10 +3222,12 @@ class InboxApp(App):
                 cancelled += 1
             else:
                 try:
-                    res = self._run(p)
+                    res = self._run(p, send=False)
                 except Exception as exc:
                     res = Result(False, str(exc))
                 p.audit["status"] = "committed" if res.ok else "failed"
+                if p.react:
+                    react_skipped += 1
         self._quitting = True
         self._cancel.set()      # context commands get SIGTERM and wind down
         if self._act_op is not None:   # a choices/prepare lookup: read-only
@@ -2703,9 +3238,21 @@ class InboxApp(App):
         parts = []
         if cancelled:
             parts.append(f"Nothing sent: {cancelled} pending action(s) cancelled on quit.")
+        if react_skipped:
+            parts.append(f"{react_skipped} done reaction(s) skipped: quitting "
+                         "never sends one.")
         if self.running:
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
+        for p in self.running:
+            if p.kind in ACT_MARK_KINDS + ("waits_on", "relay") and (
+                    p.act or p.react):
+                p.audit["status"] = "running at quit"
+                parts.append(f"{p.label}: still running; it may already have "
+                             "reached the source" + (
+                                 f", and the done reaction (:{p.react}:) may "
+                                 "already have been posted, check Slack"
+                                 if p.react else "") + ".")
         for p in self.running:
             if p.kind in SLACK_WRITE_KINDS or p.kind == "react":
                 did = "placed in your Slack drafts" if p.kind == "draft" \
@@ -2721,6 +3268,12 @@ class InboxApp(App):
         if self._polish_running:
             parts.append("The polish is still finishing; the process exits "
                          "when it ends.")
+        if self._draft_running:
+            parts.append("The draft for you is still finishing; the process "
+                         "exits when it ends.")
+        if self._inverse_running:
+            parts.append("An undo in the source is still finishing; the "
+                         "process exits when it ends.")
         self.exit(message=" ".join(parts) or None)
 
     def _disarm_quit(self):
@@ -2868,6 +3421,22 @@ class InboxApp(App):
         if queued:
             self.poll(quiet=queued["quiet"], names=queued["names"])
 
+    def _kept_draft(self, it):
+        """A draft `D` made for this item and thread earlier (kept in the
+        store) comes back as its draft. Cheap: only items with one are hashed."""
+        has = getattr(self.store, "has_draft", None)
+        fn = getattr(self.actions, "cached_draft_me", None)
+        if has is None or fn is None or not has(it.key):
+            return False
+        try:
+            text = fn(it)
+        except Exception:
+            return False
+        if not text:
+            return False
+        it.draft, it.streamed, it.drafted_by = text, True, "model"
+        return True
+
     def apply_results(self, results, manual=False, quiet=False):
         """Merge a poll into the queue. Runs on the UI thread."""
         self.results = list(results)
@@ -2885,11 +3454,16 @@ class InboxApp(App):
                 prev = old.get(it.key)
                 if prev is not None and prev.streamed:
                     it.draft, it.streamed = prev.draft, True
+                elif not it.draft:
+                    self._kept_draft(it)
                 rows.append(it)
         self.all_rows = rows
         fresh = [i for i in rows if i.key not in self.known_ids
                  and i.section == "urgent" and not self.store.is_hidden(i.key, meta=i.meta)]
         self.known_ids.update(i.key for i in rows)
+        if self._acts_any():
+            self._refresh_act_count()
+            self._retry_ops()      # each op at most every 5 minutes
         first = not self.polled_once
         self.polled_once = True
         self.refilter(redraw=False)
@@ -2927,6 +3501,9 @@ class InboxApp(App):
             ("Tentative", "T: answer an invite tentatively (needs rsvp: in inbox.yaml)", self.action_rsvp_tentative),
             ("React to message", "E: add an emoji reaction (needs react: in inbox.yaml)", self.action_react),
             ("Polish draft", "P: rewrite the draft in your tone, never sends (needs polish: in inbox.yaml)", self.action_polish),
+            ("Draft for me", "D: write a reply from the thread, never sends (needs summary: or polish:)", self.action_draft_me),
+            ("Waits on…", "w: who the next move is with (needs acts: waits_on on the source)", self.action_waits_on),
+            ("Relay to work session…", "!: hand the item over with a note (needs acts: relay on the source)", self.action_relay),
             ("Toggle context pane", "c: context for the selected item (needs context: in inbox.yaml)", self.action_context),
             ("Refresh context", "C (or r inside the pane): fetch the context again", self.action_context_refresh),
             ("Summarize item", "i: AI summary in the context pane (needs summary: in inbox.yaml)", lambda: self.action_summary(False)),

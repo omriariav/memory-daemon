@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from . import feedrules, health, invites, sources, themes
+from . import acts, feedrules, health, invites, sources, themes
 from .views import DEFAULT_WINDOW_H
 
 FILE_NAME = "inbox.yaml"
@@ -23,7 +23,8 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
-            "slack_open", "show_rsvp_replies", "feed", "health")
+            "slack_open", "show_rsvp_replies", "feed", "health",
+            "done_reaction", "nudge_template")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -52,7 +53,10 @@ CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEPxM")
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEPxMwD")
+# Bound keys that are not letters (an `actions:` key must be a letter, so
+# these can never clash; listed so the docs and a test can name them).
+RESERVED_NONLETTER_KEYS = frozenset("!")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))
@@ -85,7 +89,7 @@ SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent", "invites_days",
                "saved_days", "email_require_label"),
     "command": ("name", "type", "argv", "timeout_s", "supports_all",
-                "watch"),
+                "watch", "acts"),
 }
 DEFAULT_TIMEOUT_S = 20
 MAX_WATCH = 50
@@ -105,6 +109,8 @@ DEFAULTS = {
     "send": None,      # no default: replies and nudges are demo-only until set
     "react": None,     # no default: no emoji reaction until configured
     "polish": None,    # no default: no draft polishing until configured
+    "done_reaction": None,   # no default: `d` adds no emoji reaction
+    "nudge_template": acts.DEFAULT_NUDGE_TEMPLATE,   # `n` with no draft (acts sources)
     "copy": False,     # true: "Copy for Slack" without `send:`
     "show_rsvp_replies": False,   # true: list other people's RSVP answers
     "team": None,      # the Slack workspace id for slack_open (T...)
@@ -205,6 +211,22 @@ def validate(raw):
     out["send"] = _check_send(raw.get("send"), problems)
     out["react"] = _check_react(raw.get("react"), problems)
     out["polish"] = _check_polish(raw.get("polish"), problems)
+    done = raw.get("done_reaction")
+    if done is not None:
+        if not isinstance(done, str) or not EMOJI_NAME.match(done):
+            problems.append("done_reaction must be an emoji name "
+                            "(a-z, 0-9, _ + -, no colons) or omitted")
+        elif out["react"] is None:
+            problems.append("done_reaction needs a valid react: block "
+                            "(it uses the react tool)")
+        else:
+            out["done_reaction"] = done
+    template = raw.get("nudge_template", DEFAULTS["nudge_template"])
+    why = acts.template_problem(template)
+    if why:
+        problems.append(f"nudge_template {why}")
+    else:
+        out["nudge_template"] = template
     copy = raw.get("copy", DEFAULTS["copy"])
     if not isinstance(copy, bool):
         problems.append("copy must be true or false")
@@ -315,14 +337,39 @@ def validate(raw):
                 problems.append(f"{label}.watch must be a list of up to "
                                 f"{MAX_WATCH} paths (strings)")
                 watch = []
-            built.append({"name": name, "type": "command",
-                          "argv": list(argv), "timeout_s": float(timeout),
-                          "supports_all": supports_all,
-                          "watch": [w.strip() for w in watch]})
+            source = {"name": name, "type": "command",
+                      "argv": list(argv), "timeout_s": float(timeout),
+                      "supports_all": supports_all,
+                      "watch": [w.strip() for w in watch]}
+            listed = _check_acts(src.get("acts"), f"{label}.acts", problems)
+            if listed:        # no `acts:` leaves the source exactly as before
+                source["acts"] = listed
+            built.append(source)
     out["sources"] = built
     if problems:
         raise SettingsError(problems)
     return out
+
+
+def _check_acts(raw, label, problems):
+    """A command source's `acts:` list: names from acts.ACT_SETTINGS, each at
+    most once. Missing or empty means no acts."""
+    if raw is None:
+        return []
+    if (not isinstance(raw, list)
+            or not all(isinstance(a, str) for a in raw)):
+        problems.append(f"{label} must be a list of act names "
+                        f"({', '.join(acts.ACT_SETTINGS)})")
+        return []
+    bad = [a for a in raw if a not in acts.ACT_SETTINGS]
+    if bad:
+        problems.append(f"{label}: unknown act {bad[0]!r}; the acts are "
+                        f"{', '.join(acts.ACT_SETTINGS)}")
+        return []
+    if len(set(raw)) != len(raw):
+        problems.append(f"{label} names an act twice")
+        return []
+    return list(raw)
 
 
 def _check_feed(raw, problems):

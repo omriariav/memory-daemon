@@ -965,29 +965,35 @@ def run_command_source(name, argv, timeout_s=20.0, show_all=False):
     return SourceResult(name, rows, stale, age, error)
 
 
-def run_command_act(argv, request, timeout_s=20.0):
-    """Phase 2: run `<argv...> act` with the request on stdin.
+def _act_failure(message):
+    return {"ok": False, "message": message, "shadow": False,
+            "conflict": False}
 
-    Defined so sources can implement it now; nothing in phase 1 calls it.
-    Returns `{"ok": bool, "message": str}` and never raises. Like `list`, it
-    runs in its own process group, killed whole on timeout or oversized output.
-    """
+
+def run_command_act(argv, request, timeout_s=20.0):
+    """Run `<argv...> act` with the request on stdin (`v` is added).
+
+    Returns `{"ok": bool, "message": str, "shadow": bool, "conflict": bool}`
+    and never raises. Like `list`, it runs in its own process group, killed
+    whole on timeout or oversized output. A failure to run, a timeout, a
+    non-zero exit or a bad reply is `ok` False without `conflict`. Since 0.10.0
+    the inbox calls it from a worker after the undo window (see acts.py)."""
     try:
         payload = json.dumps(dict(request, v=itm.SCHEMA_VERSION)).encode("utf-8")
         status, code, out, err = _run_capped(
             _expand(argv) + ["act"], timeout_s, stdin_bytes=payload)
     except (OSError, ValueError, TypeError) as exc:
-        return {"ok": False, "message": f"cannot run: {exc}"}
+        return _act_failure(f"cannot run: {exc}")
     if status == "timeout":
-        return {"ok": False, "message": f"timed out after {timeout_s:g}s"}
+        return _act_failure(f"timed out after {timeout_s:g}s")
     if status == "overflow":
-        return {"ok": False, "message": "response is too large"}
+        return _act_failure("response is too large")
     if code != 0:
-        return {"ok": False, "message": f"exit {code}: {_stderr_tail(err)}"}
+        return _act_failure(f"exit {code}: {_stderr_tail(err)}")
     try:
         return itm.parse_act_response(out.decode("utf-8", "replace"))
     except itm.ItemError as exc:
-        return {"ok": False, "message": f"bad response: {exc}"}
+        return _act_failure(f"bad response: {exc}")
 
 
 # --- aggregate --------------------------------------------------------------

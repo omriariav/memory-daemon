@@ -41,6 +41,10 @@ RSVP_CONFIRM_MARGIN_S = 600
 RETENTION_S = 7 * 86400
 LISTED_REFRESH_S = 3600  # how often a still-listed item's mark is re-stamped
 MAX_ENTRIES = 5000
+# A draft made with `D` (0.10.0) is kept on the item's mark, with the key of
+# the thread it answered, so an unchanged item shows it again after a restart.
+DRAFT_MAX = 4000
+DRAFT_FIELDS = ("draft", "draft_key")
 
 
 def rsvp_state(rsvp_at, rsvp_event, meta):
@@ -100,13 +104,17 @@ class InboxStore:
                 continue
             clean = {}
             for field in ("done", "ack", "snooze_until", "updated",
-                          "last_listed", "saved", "rsvp_at"):
+                          "last_listed", "saved", "rsvp_at", "marked"):
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
             event = mark.get("closed_event")
             if isinstance(event, str) and 0 < len(event) <= 200:
                 clean["closed_event"] = event
+            draft, dkey = mark.get("draft"), mark.get("draft_key")
+            if (isinstance(draft, str) and 0 < len(draft) <= DRAFT_MAX
+                    and isinstance(dkey, str) and 0 < len(dkey) <= 100):
+                clean["draft"], clean["draft_key"] = draft, dkey
             if mark.get("rsvp") in RSVP_ANSWERS:
                 clean["rsvp"] = mark["rsvp"]
                 event = mark.get("rsvp_event")
@@ -271,6 +279,8 @@ class InboxStore:
             mark = dict(marks.get(item_id, {}))
             mark.update(fields)
             mark["updated"] = self.clock()
+            if not set(fields) <= set(DRAFT_FIELDS):
+                mark["marked"] = mark["updated"]   # a mark, not a kept draft
             marks[item_id] = mark
             return True
         self._transaction(change)
@@ -308,6 +318,7 @@ class InboxStore:
                     if k not in ("rsvp", "rsvp_at", "rsvp_event")}
             mark.update(fields)
             mark["updated"] = self.clock()
+            mark["marked"] = mark["updated"]
             marks[item_id] = mark
             return True
         self._transaction(change)
@@ -317,8 +328,59 @@ class InboxStore:
         self._mark(item_id, saved=self.clock())
 
     def restore(self, item_id):
-        """Drop every mark (undo)."""
-        self._transaction(lambda marks: marks.pop(item_id, None) is not None)
+        """Drop every mark (undo). A draft made with `D` is not a mark of
+        this kind and stays."""
+        def change(marks):
+            mark = marks.get(item_id)
+            if mark is None:
+                return False
+            keep = {k: v for k, v in mark.items() if k in DRAFT_FIELDS}
+            if keep:
+                marks[item_id] = dict(keep, updated=self.clock())
+            else:
+                del marks[item_id]
+            return True
+        self._transaction(change)
+
+    def restore_unless_newer(self, item_id, since):
+        """Like `restore`, but only when the item's marks were all made at or
+        before `since`: a mark made after that (a later snooze, say) is the
+        user's newer decision and stays. True when the marks were dropped."""
+        done = []
+
+        def change(marks):
+            mark = marks.get(item_id)
+            if mark is None:
+                return False
+            if mark.get("marked", mark.get("updated", 0)) > since:
+                return False
+            done.append(True)
+            keep = {k: v for k, v in mark.items() if k in DRAFT_FIELDS}
+            if keep:
+                marks[item_id] = dict(keep, updated=self.clock())
+            else:
+                del marks[item_id]
+            return True
+        self._transaction(change)
+        return bool(done)
+
+    def set_draft(self, item_id, text, key):
+        """Keep the draft `D` made for this item (`key` names the thread it
+        answered)."""
+        if not isinstance(text, str) or not 0 < len(text) <= DRAFT_MAX:
+            raise ValueError("bad draft")
+        self._mark(item_id, draft=text, draft_key=key)
+
+    def get_draft(self, item_id, key):
+        """The kept draft of the item when it was made for the same thread
+        (`key`), else None."""
+        mark = self.marks.get(item_id) or {}
+        if mark.get("draft_key") == key and mark.get("draft"):
+            return mark["draft"]
+        return None
+
+    def has_draft(self, item_id):
+        return "draft" in (self.marks.get(item_id) or {})
 
     def note_listed(self, item_ids, prune=False):
         """Record that these ids are still listed by a source, so their marks

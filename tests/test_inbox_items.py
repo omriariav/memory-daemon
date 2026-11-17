@@ -177,9 +177,26 @@ class ListOutputTest(unittest.TestCase):
             itm.parse_act_request('{"v": 1, "action": "zap", "id": "x", "meta": {}}')
         self.assertEqual(
             itm.parse_act_response('{"ok": true, "message": "done"}'),
-            {"ok": True, "message": "done"})
+            {"ok": True, "message": "done", "shadow": False,
+             "conflict": False})
+        self.assertEqual(
+            itm.parse_act_response(
+                '{"ok": true, "message": "m", "shadow": true}')["shadow"], True)
+        self.assertTrue(itm.parse_act_response(
+            '{"ok": false, "message": "m", "conflict": true}')["conflict"])
         with self.assertRaises(itm.ItemError):
             itm.parse_act_response('{"ok": "yes", "message": "x"}')
+        with self.assertRaises(itm.ItemError):
+            itm.parse_act_response(
+                '{"ok": true, "message": "x", "shadow": "yes"}')
+        req = itm.parse_act_request(json.dumps(
+            {"v": 1, "op_id": "o", "action": "close", "id": "x", "meta": {},
+             "args": {}, "seen": {"ts": 1, "last_seen_ts": None}}))
+        self.assertEqual(req["action"], "close")
+        with self.assertRaises(itm.ItemError):
+            itm.parse_act_request(json.dumps(
+                {"v": 1, "action": "close", "id": "x", "meta": {},
+                 "args": []}))
 
 
 class CopyTextTest(unittest.TestCase):

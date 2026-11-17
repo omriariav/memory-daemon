@@ -441,7 +441,34 @@ class HealthStrip(Static):
     """One line under the tab bar: a cell per routine group, the spend and
     the heartbeats, from the latest health snapshot."""
 
+    @staticmethod
+    def act_part(app, pal):
+        """The acts part of the strip (0.10.0): `N not synced` while ops wait
+        for a retry, and `shadow` when the source's last reply said it only
+        logged the op. Empty (and so invisible) without acts."""
+        fn = getattr(app, "act_status", None)
+        pending, shadow = fn() if fn else (0, False)
+        out = Text(no_wrap=True, overflow="crop")
+        if pending:
+            out.append(f" {pending} not synced",
+                       Style(color=pal["warn"], bold=True))
+        if shadow:
+            out.append(" shadow", Style(color=pal["accent"], bold=True))
+        return out
+
     def render_strip(self, app, pal, width):
+        lead = self.act_part(app, pal)
+        if not lead.plain:                  # no acts part: the 0.9.0 strip
+            return self._render_health(app, pal, width)
+        if app.health_fetch is None:
+            return lead
+        out = Text(no_wrap=True, overflow="crop")
+        out.append_text(lead)
+        out.append_text(self._render_health(
+            app, pal, max(10, width - lead.cell_len)))
+        return out
+
+    def _render_health(self, app, pal, width):
         snap = app.health_snap
         out = Text(no_wrap=True, overflow="crop")
         if snap is None:

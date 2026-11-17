@@ -7,6 +7,87 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-17
+
+Comms control: the inbox can tell a command source what you did with a row,
+and write a reply for you. Everything here is opt-in. A source with no
+`acts:` behaves exactly as in 0.9.0 (a test pins it).
+
+### Added
+
+- **Acts.** A `command` source may list `acts: [close, snooze, mute, waits_on,
+  relay]` in `inbox.yaml`. After the 5 s undo window the inbox calls
+  `<argv> act` in a worker (never on the UI thread) with
+  `{"v":1, "op_id", "action", "id", "meta", "args", "seen"}` and reads
+  `{"ok", "message", "shadow", "conflict"}`. `ok` keeps the local mark (the
+  status says `✓ synced`, or `shadow` when the source only logged the op); a
+  `conflict` (the item has a newer message) puts the local mark back with a
+  toast and is not retried; any other failure (ok false, a timeout, a bad
+  reply) keeps the mark, stores the op in `state/inbox-ops-pending.jsonl` and
+  retries it on refresh, at most every 5 minutes, with the **same `op_id`**
+  (the source must be idempotent on it). The pending file holds at most 50 ops
+  and drops entries older than 7 days, with a toast. `u` within the undo
+  window cancels before anything is sent. See [inbox.md](inbox.md#acts).
+- **`d` and `s` also tell the source** (`close`, `snooze` with the chosen
+  time) on a row whose source lists the act. **`w`** picks who the next move
+  is with (Me, a person in the thread, Nobody (FYI)); **`x`** on such a row
+  adds "Mute this conversation: 1 day / 1 week / untrack" to the mute picker
+  (the Feed rule choices stay first, and unchanged); **`!`** relays the row to
+  your work session with an optional one-line note. Rows the views make (digest
+  and saved-to-memory rows) never send acts.
+- **`D` drafts a reply for you** from the thread: one no-tools bridge call
+  (the model, timeout and budget of `summary:` or `polish:`) that fills the
+  Draft pane, is kept per item in the inbox state (an unchanged thread shows it
+  again after a restart) and never sends. It does not overwrite a draft the
+  row already has.
+- **`n` with no stored draft** on a row of an acts source falls back to the
+  new `nudge_template` setting (default `Hi {first}, any news on {topic}?`),
+  through the same confirm and send path (draft mode stays a Slack draft).
+- **`done_reaction`** (new setting, off by default): after the undo window, `d`
+  on a row with its own Slack message also adds that emoji through the existing
+  `react:` path. It needs `react:`. It uses `reply_to.message_ts` only (never
+  the thread root, unlike `E`), and with acts on it is sent only after the
+  source answered `ok`: a shadow answer, a failure kept for a retry or a
+  conflict skip it with a toast. Quitting drops it.
+- **Health strip**: `N not synced` while ops wait for a retry, and `shadow`
+  when the last act reply said shadow.
+- **`L` is the ops log** when any source lists acts: time, action, item and
+  result of the ops sent, from `state/inbox-ops-log.jsonl` (capped at 500
+  rows). `u` on a `close` or `mute` row sends the inverse (`reopen` /
+  `unmute`) after a confirm, once per op; `a` shows the session audit log. Without acts `L`
+  is the session audit log as before.
+- `tests/inbox_fake_source.py`: a fake command source that records requests
+  and answers ok, shadow, conflict or failure as configured.
+
+- The pending op is written **before** the `act` call (a kill during it leaves
+  the op for a retry with the same `op_id`) and the files are fsynced with their
+  directory; a newer op for the same item replaces its older pending ones; a
+  conflict on a retry leaves a mark you made since alone; ops of a source no
+  longer configured are not counted in `N not synced`; an op that cannot be
+  stored is reported as lost.
+
+### Changed
+
+- `w` and `!` on a row whose source lists no acts now toast "Acts are not
+  enabled for this source" (they did nothing before; the other keys are
+  unchanged).
+- `w` and `D` are now the inbox's own keys (and `!`, which is not a letter):
+  `w` and `D` are no longer free for `actions:`. The free letters are
+  `h l p t z` and `B F H J K N O Q U V W Z`.
+- `sources.run_command_act` (which no code called until now) and
+  `items.parse_act_response` carry the optional `shadow` and `conflict` flags
+  (both default to false); `items.parse_act_request` also accepts the acts and
+  the optional `op_id`, `args` and `seen`.
+- Quitting inside the undo window of a `d`, `s` or mute still commits the local
+  mark; the op is kept in the pending file instead of being sent (quitting never
+  waits for a source) and a done reaction is dropped. A `w` or `!` is cancelled
+  on quit, like a send. A running `D` draft or ops-log undo asks before
+  quitting, like a polish; the quit message says when a done reaction may
+  already have been posted.
+- `update_hints` no longer fails on a message that arrives during teardown.
+- The help screen, the footer hints (for rows whose source lists acts) and the
+  command palette describe the new keys.
+
 ## [0.9.0] - 2026-11-17
 
 The inbox is organised by whose move it is: five views on the keys `1` to `5`
