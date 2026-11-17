@@ -7,6 +7,18 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-17
+
+### Fixed
+
+- **Memory mark on Slack items without `reply_to`.** The match for the
+  `◆`/`◇` mark built Slack ids only from `meta.reply_to`, which a source sets
+  only where a reply is allowed, so many captured threads showed no mark.
+  Without a valid `reply_to` channel the match now falls back to
+  `meta.channel_id`, `meta.thread_ts` and `meta.message_ts` (same patterns,
+  same exact and thread-level rules). Matching only: `reply_to` stays the only
+  send destination, and a valid `reply_to` still wins.
+
 ## [0.8.0] - 2026-11-17
 
 Pending invites say more, the inbox shows what the daemon already saved to

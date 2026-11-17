@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Four optional keys are read: `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Four optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -514,7 +514,12 @@ order:
 1. `meta.memory_id`, when it is a well-formed memory id;
 2. `meta.source_id` found in the index;
 3. with a valid `meta.reply_to`: `slack:<channel>:<thread_ts>:<message_ts>`
-   (a reply the daemon saved), then `slack:<channel>:<message_ts>`.
+   (a reply the daemon saved), then `slack:<channel>:<message_ts>`. Without a
+   valid `reply_to` channel (many items carry none: `reply_to` is only set
+   where a reply is allowed), the same ids are built from `meta.channel_id`,
+   `meta.thread_ts` and `meta.message_ts`, validated with the same patterns.
+   These keys are used for matching only, never as a send destination; a
+   present valid `reply_to` always wins.
 
 Those are **exact** matches: the `◆`, the `In memory: <id>` line and the `m`
 toast. The daemon saves a thread root as `slack:<channel>:<root_ts>`; when that

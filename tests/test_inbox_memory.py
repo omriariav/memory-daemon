@@ -1,4 +1,4 @@
-"""Inbox 0.8.0: items the daemon already saved to memory show a mark.
+"""Inbox 0.8.0/0.8.1: items the daemon already saved to memory show a mark.
 
 Synthetic data only (fake names, fake memory and Slack ids); nothing reads
 live data. The non-Textual classes run without Textual."""
@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon.inbox import items as itm, settings, sources
+from workspace_daemon.inbox import items as itm, settings, sources, writes
 from workspace_daemon.inbox.actions import FakeActions, LocalActions
 from workspace_daemon.inbox.store import InboxStore
 
@@ -130,6 +130,71 @@ class MatchTest(unittest.TestCase):
                       {"channel": CHAN, "thread_ts": "nope"},
                       {"thread_ts": THREAD_TS}, "x", None, []):
             self.assertEqual(self.find({"reply_to": reply}), "", reply)
+
+    def test_fallback_thread_level_match_without_reply_to(self):
+        meta = {"channel_id": CHAN, "thread_ts": THREAD_TS}
+        self.assertEqual(sources.memory_match(meta, self.INDEX),
+                         ("", "mem-thread"))
+        self.assertEqual(sources.memory_id_for(meta, self.INDEX), "")
+
+    def test_fallback_exact_match_via_message_ts(self):
+        meta = {"channel_id": CHAN, "thread_ts": THREAD_TS,
+                "message_ts": MSG_TS}
+        self.assertEqual(sources.memory_match(meta, self.INDEX),
+                         ("mem-msg", ""))
+        reply_id = f"slack:{CHAN}:{THREAD_TS}:{MSG_TS}"
+        idx = dict(self.INDEX, **{reply_id: "mem-reply"})
+        self.assertEqual(sources.memory_match(meta, idx), ("mem-reply", ""))
+        root = {"channel_id": CHAN, "thread_ts": THREAD_TS,
+                "message_ts": THREAD_TS}
+        self.assertEqual(sources.memory_match(root, self.INDEX),
+                         ("mem-thread", ""))
+
+    def test_reply_to_wins_over_the_fallback_keys(self):
+        other = "C" + "9ZYXWVUT1"
+        meta = {"reply_to": {"channel": CHAN, "thread_ts": THREAD_TS},
+                "channel_id": other, "thread_ts": "1700000009.000900",
+                "message_ts": MSG_TS}
+        # reply_to's thread matches; the fallback message_ts is not used
+        self.assertEqual(sources.memory_match(meta, self.INDEX),
+                         ("", "mem-thread"))
+        idx = {f"slack:{other}:1700000009.000900": "mem-other"}
+        self.assertEqual(sources.memory_match(meta, idx), ("", ""))
+        # a reply_to with a bad channel does not block the fallback
+        bad = {"reply_to": {"channel": "bad"}, "channel_id": CHAN,
+               "thread_ts": THREAD_TS}
+        self.assertEqual(sources.memory_match(bad, self.INDEX),
+                         ("", "mem-thread"))
+
+    def test_invalid_fallback_values_are_ignored(self):
+        for meta in ({"channel_id": "bad", "thread_ts": THREAD_TS},
+                     {"channel_id": 5, "thread_ts": THREAD_TS},
+                     {"thread_ts": THREAD_TS},
+                     {"channel_id": CHAN},
+                     {"channel_id": CHAN, "thread_ts": "nope",
+                      "message_ts": "also-nope"},
+                     {"channel_id": CHAN, "thread_ts": [THREAD_TS]}):
+            self.assertEqual(sources.memory_match(meta, self.INDEX),
+                             ("", ""), meta)
+        # one bad stamp is dropped, the other still matches
+        half = {"channel_id": CHAN, "thread_ts": "nope",
+                "message_ts": MSG_TS}
+        self.assertEqual(sources.memory_match(half, self.INDEX),
+                         ("mem-msg", ""))
+
+    def test_fallback_keys_never_make_a_send_destination(self):
+        meta = {"channel_id": CHAN, "thread_ts": THREAD_TS,
+                "message_ts": MSG_TS}
+        self.assertIsNone(writes.reply_to(meta))
+        for what in ("send", "draft"):
+            plan = writes.send_plan(meta, "hello", what=what)
+            self.assertFalse(plan.ok)
+            self.assertTrue(plan.dest_refused)
+        self.assertIsNone(writes.react_target(meta))
+        # matching them must not have added a destination either
+        sources.memory_match(meta, self.INDEX)
+        self.assertEqual(meta, {"channel_id": CHAN, "thread_ts": THREAD_TS,
+                                "message_ts": MSG_TS})
 
     def test_odd_meta_does_not_crash(self):
         for meta in (None, "x", [], {"source_id": ["a"]}, {"source_id": 5}):
