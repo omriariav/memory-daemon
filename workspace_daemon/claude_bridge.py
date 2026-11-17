@@ -595,9 +595,14 @@ def _error_category(text):
     if any(m in text for m in (
             "unauthenticated", "unauthorized", "invalid api key",
             "authentication", "invalid_auth", "not_authed", "token_expired",
-            "token_revoked", "invalid_grant")):
+            "token_revoked", "invalid_grant", "sign in again",
+            "re-authenticate", "reauthenticate")):
         return " (auth failed)"
     return ""
+
+
+# Public name for callers that tag an error they raise from tool results.
+error_category = _error_category
 
 
 def _content_blocks(event):

@@ -223,6 +223,19 @@ class ZoomSourceTest(unittest.TestCase):
         with self.assertRaises(claude_bridge.BridgeError):
             self.listing()
 
+    def test_expired_sign_in_is_tagged_as_an_auth_failure(self):
+        self.write_calendar([event(), event("ev2", number="91234567891")])
+        self.listing()
+        for number in ("91234567890", "91234567891"):
+            self.connector.errors[number] = (
+                "This connector needs you to sign in again "
+                "(run /mcp to re-authenticate)")
+        self.at(41)
+        with self.assertRaises(claude_bridge.BridgeError) as caught:
+            self.listing()
+        self.assertTrue(str(caught.exception).endswith("(auth failed)"))
+        self.assertIn("no usable result", str(caught.exception))
+
     def test_empty_session_is_retried_once(self):
         self.write_calendar([event()])
         self.listing()

@@ -19,6 +19,8 @@ TICK_STALE_INTERVALS = 2
 AWAKE_GAP_CAP_SECONDS = 30 * 60
 # Memory-sink failures older than this no longer count as an open issue.
 MEMORY_ERROR_WINDOW_SECONDS = 24 * 3600
+# A rejected calendar match counts as a review item for this long.
+MEETING_MATCH_WINDOW_SECONDS = 24 * 3600
 _LOG_LINE = re.compile(r"^(?P<at>\S+)\s+(?P<message>.*)$")
 _TICK_PREFIX = (
     r"^tick(?:\[(?P<id>[^\]]+)\])?"
@@ -131,7 +133,9 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
 
     `streaks[routine]` describes the current run of failed ticks: `errors`
     (ticks that ended in error; interrupted ticks neither count nor break
-    it, a clean tick ends it), `first_error_at`, and `awake` (seconds of
+    it, a clean tick ends it), `first_error_at` (when that tick finished),
+    `started_at` (when it started: its error lines are stamped from here on),
+    and `awake` (seconds of
     awake time since that first error: the gaps between consecutive ticks of
     any group, each counted only when at most AWAKE_GAP_CAP_SECONDS).
     """
@@ -175,7 +179,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
             for streak in (*streaks.values(), *outage_runs.values()):
                 streak["awake"] += gap
 
-    def note_outcome(routine_id, at, outcome):
+    def note_outcome(routine_id, at, outcome, started=None):
         if outcome in ("ok", "error"):
             outage_runs.pop(routine_id, None)
         if outcome == "interrupted":
@@ -187,7 +191,8 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
         elif outcome == "error":
             streak = streaks.setdefault(
                 routine_id,
-                {"errors": 0, "first_error_at": at, "awake": 0.0},
+                {"errors": 0, "first_error_at": at, "awake": 0.0,
+                 "started_at": started or at},
             )
             streak["errors"] += 1
 
@@ -315,7 +320,7 @@ def read_tick_history(path, max_bytes=32 * 1024 * 1024):
                             "at": at,
                             "group": block["group"],
                         }
-                        note_outcome(routine_id, at, outcome)
+                        note_outcome(routine_id, at, outcome, block["at"])
                         if failed and attribution_complete:
                             routine_results[routine_id]["errors"] = (
                                 routine_error_count
@@ -476,7 +481,10 @@ def routine_rows(
         )
         pending_actions = sum(bool(entry.get("actions_pending")) for entry in entries)
         calendar_reviews = sum(
-            bool(entry.get("calendar_match_rejected")) for entry in entries
+            bool(entry.get("calendar_match_rejected"))
+            and _within(entry.get("processed_at"), now,
+                        MEETING_MATCH_WINDOW_SECONDS)
+            for entry in entries
         )
         issues = []
         if memory_errors:

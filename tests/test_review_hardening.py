@@ -251,6 +251,62 @@ class CursorIsolationTest(unittest.TestCase):
         self.assertEqual(totals["errors"], 1)
         self.assertEqual(totals["skipped"], 1)
 
+    def run_two_mail_routines(self, error, per_routine=1):
+        def source(query):
+            return {
+                "kind": "gmail", "query": query, "catch_up": True,
+                "catch_up_after": "2026-08-01T00:00:00Z", "max_results": 0,
+            }
+
+        def candidates(src):
+            tag = src["query"]
+            return [{"id": f"{tag}-{n}", "title": f"{tag} {n}",
+                     "raw": {"thread_id": f"{tag}-t{n}"}}
+                    for n in range(per_routine)]
+
+        def fetch(_routine, _source, value):
+            return {
+                "id": value["id"], "source_id": f"gmail:{value['id']}",
+                "title": value["title"], "date": "2026-08-02", "body": "body",
+                "frontmatter": {},
+            }
+
+        routines = [self.routine("one", source("a")),
+                    self.routine("two", source("b"))]
+        for routine in routines:
+            routine["routing"] = {"priority": 1}
+        with mock.patch.dict(runner.SOURCES, {"gmail": (candidates, fetch)}), \
+             mock.patch.object(config, "validate", return_value=[]), \
+             mock.patch.object(
+                 runner.llm, "analyze", side_effect=error) as analyze:
+            totals = runner.run(self.base, routines)
+        return totals, analyze
+
+    def test_expired_sign_in_stops_only_its_own_routine(self):
+        error = runner.claude_bridge.BridgeError(
+            "tool returned an error: mcp__demo_srv__get (auth failed)")
+        totals, analyze = self.run_two_mail_routines(error, per_routine=2)
+        # one failed call per routine; each routine's second candidate waits
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(totals["errors"], 2)
+        self.assertEqual(totals["skipped"], 2)
+
+    def test_network_outage_still_stops_every_routine(self):
+        totals, analyze = self.run_two_mail_routines(
+            RuntimeError("could not resolve host"), per_routine=2)
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(totals["skipped"], 3)
+
+    def test_auth_tagged_error_is_still_not_retried(self):
+        error = runner.claude_bridge.BridgeError(
+            "tool returned an error: mcp__demo_srv__get (auth failed)")
+        self.assertTrue(runner._is_shared_dependency_failure(error))
+        self.assertTrue(runner._is_connector_auth_failure(error))
+        self.assertFalse(runner._is_connector_auth_failure(
+            "unauthenticated: invalid api key"))
+        self.assertFalse(runner._retryable_tool_error(
+            error, {"kind": "slack_mcp"}))
+
     def test_failed_owner_holds_every_overlapping_claimant_cursor(self):
         candidate = {
             "id": "m1", "title": "durable",

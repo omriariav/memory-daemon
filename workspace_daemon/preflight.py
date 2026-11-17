@@ -13,6 +13,7 @@ Optional `state/daemon.yaml` (every key optional, safe defaults):
       hosts: ["api.anthropic.com:443"]
       timeout_seconds: 3
     skip_warn_hours: 12
+    alert_remedies: {}      # read by alerts.py: alert-key prefix -> text
 
 The lid guard fails open: any detection error means "do not skip". A broken
 config file also falls back to the defaults.
