@@ -32,9 +32,19 @@ def write_events(base, rows):
             fh.write(json.dumps(row) + "\n")
 
 
-def ev(source_id, kind, title, ago_h=1.0):
+def ev(source_id, kind, title, ago_h=1.0, details=None):
     return events.build("calendar-cache", kind, None, source_id, title, [],
-                        ts=iso(-ago_h))
+                        ts=iso(-ago_h), details=details)
+
+
+CHANGED = {"changed": {"start": ["10:00", "11:00"], "title": ["Old", "New"]}}
+
+
+def marks_at(answer, at, series="aaa"):
+    """The marks of an RSVP given at `at` (offset hours from NOW)."""
+    store = InboxStore(None, clock=lambda: NOW + at * H)
+    store.rsvp(f"invites:{series}", answer, series)
+    return store.rsvp_series()
 
 
 def row(start_h, rsvp="needsAction", title="Planning chat"):
@@ -69,14 +79,51 @@ class Base(unittest.TestCase):
 
 
 class ListedTwinTest(Base):
-    def test_new_is_hidden_while_its_invite_is_listed_update_stays(self):
+    def test_new_and_update_are_hidden_while_the_invite_is_listed(self):
         write_snapshot(self.base, {"aaa": row(30, title="Alpha"),
-                                   "bbb": row(31, title="Beta")})
+                                   "bbb": row(31, title="Beta"),
+                                   "ccc": row(32, title="Gamma")})
         write_events(self.base, [ev("gcal:aaa", "new", "Alpha"),
                                  ev("gcal:bbb", "update", "Beta"),
-                                 ev("gcal:bbb", "new", "Beta", ago_h=5)])
-        self.assertEqual(self.calendar(), ["Updated: Beta"])
-        self.assertEqual(len(self.collect()["events.invites"]), 2)
+                                 ev("gcal:ccc", "cancel", "Gamma")])
+        self.assertEqual(self.calendar(), ["Cancelled: Gamma"])
+        self.assertEqual(len(self.collect()["events.invites"]), 3)
+
+    def test_the_listed_invite_shows_the_latest_change(self):
+        write_snapshot(self.base, {"bbb": row(31, title="Beta"),
+                                   "ddd": row(33, title="Delta")})
+        write_events(self.base, [ev("gcal:bbb", "update", "Beta",
+                                    details=CHANGED)])
+        by = {i["id"]: i for i in self.collect()["events.invites"]}
+        thread = by["invites:bbb"]["thread"]
+        line = [m for m in thread if m["who"] == "changed"]
+        self.assertEqual(len(line), 1)
+        self.assertEqual(line[0]["text"],
+                         "start: 10:00 -> 11:00; title: Old -> New")
+        self.assertEqual([m["who"] for m in thread][:3],
+                         ["subject", "when", "changed"])
+        self.assertFalse([m for m in by["invites:ddd"]["thread"]
+                          if m["who"] == "changed"])
+
+    def test_the_changed_line_is_capped_and_the_cache_is_not_changed(self):
+        write_snapshot(self.base, {"bbb": row(31)})
+        many = {"changed": {f"f{n}": ["a", "b"] for n in range(5)}}
+        write_events(self.base, [ev("gcal:bbb", "update", "Beta",
+                                    details=many)])
+        units = sources.make_units(settings.default_settings(), self.base)
+        batches = [list(u.run(NOW, False)) for u in units]
+        merged = sources.merge(batches)
+        line = [m for r in merged for i in r.items for m in i["thread"]
+                if m["who"] == "changed"]
+        self.assertEqual(line[0]["text"].count("->"), 3)
+        self.assertTrue(line[0]["text"].endswith("+2 more"))
+        cached = [m for r in batches[1] for i in r.items for m in i["thread"]]
+        self.assertFalse([m for m in cached if m["who"] == "changed"])
+
+    def test_a_cancel_while_listed_shows(self):
+        write_snapshot(self.base, {"bbb": row(31, title="Beta")})
+        write_events(self.base, [ev("gcal:bbb", "cancel", "Beta")])
+        self.assertEqual(self.calendar(), ["Cancelled: Beta"])
 
     def test_recurring_instance_ids_normalize_to_the_series(self):
         write_snapshot(self.base, {"weekly_20231116T100000Z": row(30)})
@@ -92,11 +139,28 @@ class AnsweredTest(Base):
                                  ev("gcal:ccc", "new", "Gamma")])
         self.assertEqual(self.calendar(),
                          ["New invite: Alpha", "New invite: Gamma"])
-        store = InboxStore(None)
-        store.rsvp("invites:aaa", "accepted", "aaa")
-        self.assertEqual(store.rsvp_series(), {"aaa": "answered"})
-        self.assertEqual(self.calendar(store.rsvp_series()),
-                         ["New invite: Gamma"])
+        marks = marks_at("accepted", 0)
+        self.assertEqual(marks, {"aaa": {"answer": "answered", "at": NOW}})
+        self.assertEqual(self.calendar(marks), ["New invite: Gamma"])
+
+    def test_an_update_before_the_inbox_answer_is_hidden_after_it_shows(self):
+        write_events(self.base, [
+            ev("gcal:aaa", "update", "Before", ago_h=3),
+            ev("gcal:bbb", "update", "After", ago_h=-1),
+            ev("gcal:ccc", "update", "Other series", ago_h=3)])
+        marks = dict(marks_at("accepted", 0), **marks_at("accepted", 0, "bbb"))
+        self.assertEqual(self.calendar(marks),
+                         ["Updated: After", "Updated: Other series"])
+
+    def test_an_update_after_an_answer_given_elsewhere_stays(self):
+        write_snapshot(self.base, {"aaa": row(30, "accepted")})
+        write_events(self.base, [ev("gcal:aaa", "update", "Moved")])
+        self.assertEqual(self.calendar(), ["Updated: Moved"])
+
+    def test_the_inbox_answer_time_wins_when_the_snapshot_agrees(self):
+        write_snapshot(self.base, {"aaa": row(30, "accepted")})
+        write_events(self.base, [ev("gcal:aaa", "update", "Seen", ago_h=3)])
+        self.assertEqual(self.calendar(marks_at("accepted", 0)), [])
 
     def test_new_is_hidden_when_the_snapshot_shows_it_answered(self):
         write_snapshot(self.base, {"aaa": row(30, "accepted"),
@@ -127,9 +191,7 @@ class AnsweredTest(Base):
 
     def test_declined_by_an_inbox_mark_hides_update_too(self):
         write_events(self.base, [ev("gcal:ccc", "update", "C")])
-        store = InboxStore(None)
-        store.rsvp("invites:ccc", "declined", "ccc")
-        self.assertEqual(self.calendar(store.rsvp_series()), [])
+        self.assertEqual(self.calendar(marks_at("declined", -5, "ccc")), [])
 
     def test_accepted_or_tentative_meeting_keeps_update_and_cancel(self):
         write_snapshot(self.base, {"aaa": row(30, "accepted"),
@@ -204,9 +266,12 @@ class NoMutationTest(Base):
 class AppRefreshTest(Base):
     def test_run_units_hides_twins_on_refresh_and_reeval(self):
         write_snapshot(self.base, {"aaa": row(30, "declined"),
-                                   "bbb": row(31, "accepted")})
+                                   "bbb": row(31, "accepted"),
+                                   "lst": row(34)})
         write_events(self.base, [ev("gcal:aaa", "update", "A"),
                                  ev("gcal:bbb", "update", "B"),
+                                 ev("gcal:lst", "update", "L",
+                                    details=CHANGED),
                                  ev("gcal:ccc", "new", "C"),
                                  ev("gcal:marked", "new", "M")])
         cfg = settings.default_settings()
@@ -222,6 +287,10 @@ class AppRefreshTest(Base):
         want = ["New invite: C", "Updated: B"]
         self.assertEqual(gists(app._run_units(None, False)), want)
         self.assertEqual(gists(app._run_units(None, False, reeval=True)), want)
+        inv = [i for r in app._run_units(None, False, reeval=True)
+               if r.name == "events.invites" for i in r.items]
+        self.assertEqual([m["who"] for i in inv for m in i["thread"]
+                          if m["who"] == "changed"], ["changed"])
 
 
 if __name__ == "__main__":

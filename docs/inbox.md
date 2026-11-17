@@ -402,25 +402,34 @@ stripped on both sides (`invites.series_of`). While the events stream and the
 invites are merged (in `collect` and in the app's refresh), these rows are
 hidden:
 
-- **`New invite`**: while a pending-invite row of the same series is listed
-  (it says the same and can be answered), and once the series is answered,
-  either with an RSVP made in the inbox (the mark of the `invites:<series>`
-  row) or because the calendar snapshot shows your answer (`accepted`,
-  `declined` or `tentative`) on the series' rows and none still waiting. The
-  answer in the snapshot wins over the inbox mark.
-- **`Updated` and `Cancelled`**: kept, as they are real news, except for a
-  series you **declined** (every row of it declined in the snapshot, or the
-  inbox RSVP was `declined`): a move or a cancel of a meeting you are not
-  going to is noise, so they are hidden too. For an accepted or tentative
-  meeting they stay.
+- **While the invite is listed** (a pending-invite row of the series is in the
+  list): `New invite` and `Updated` rows. The invite row shows the current time
+  and title, so the newest update's changes are added to it as one thread line,
+  `changed`, after `when`: `start: 10:00 -> 11:00; title: Old -> New` (the
+  fields as the update row lists them, up to 3, then `; +N more`; none when the
+  update changed no field). `Cancelled` stays visible.
+- **After an RSVP from the inbox** (the mark of the `invites:<series>` row has a
+  time, `rsvp_at`): `New invite` rows, and `Updated` rows that are not newer
+  than the answer: you saw the invite as it was when you answered. An update
+  after the answer is real news and shows. `Cancelled` stays.
+- **After an answer given elsewhere** (the calendar snapshot shows `accepted`,
+  `declined` or `tentative` on the series' rows and none still waiting, with no
+  inbox mark): `New invite` rows are hidden, `Updated` and `Cancelled` stay.
+  The snapshot's answer wins over the inbox mark when they differ (the mark's
+  time is still used).
+- **Declined** (every row of the series declined in the snapshot, or the inbox
+  RSVP was `declined`): `New invite`, `Updated` and `Cancelled` are all hidden:
+  a move or a cancel of a meeting you are not going to is noise.
 
 Only calendar rows with a `gcal:` `source_id` are affected, and nothing is
-changed or deleted: the rows are left out of the list, so they come back if
-the snapshot no longer shows the answer. The snapshot part needs the invites
-source (`invites_days` above 0); without it only the inbox RSVP marks apply.
+changed or deleted: rows are left out of the list (and the invite row gets a
+copy with the `changed` line, the cached row is untouched), so a row comes back
+if the answer is no longer in the snapshot or the marks. The snapshot part
+needs the invites source (`invites_days` above 0); without it only the inbox
+RSVP marks apply.
 
 The thread of an invite has one line per fact, each as its own `who`:
-`subject` (the full title), `when`, `from` (the organizer's name), `attendees`,
+`subject` (the full title), `when`, `changed` (only after an update, see above), `from` (the organizer's name), `attendees`,
 `where`, `conflict` and `also pending`.
 
 - **Organizer**: the snapshot row's `organizer.name` when it has one, else the

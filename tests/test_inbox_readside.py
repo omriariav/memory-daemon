@@ -640,13 +640,13 @@ class InvitesTest(TmpBase):
             "solo": row(40, title="Solo invite")})
         write_events(self.base, [
             ev("gcal:weekly_20231123T100000Z", "new", "Weekly sync"),
-            ev("gcal:solo", "update", "Solo invite"),       # not a `new`
+            ev("gcal:solo", "cancel", "Solo invite"),       # not a `new`
             ev("gcal:other", "new", "Unrelated new invite")])
         res = sources.collect(settings.default_settings(), self.base, now=NOW)
         by = {r.name: [i["gist"] for i in r.items] for r in res}
         self.assertEqual(sorted(g.split(" (")[0] for g in by["events"]),
-                         ["New invite: Unrelated new invite",
-                          "Updated: Solo invite"])
+                         ["Cancelled: Solo invite",
+                          "New invite: Unrelated new invite"])
         self.assertEqual(len(by["events.invites"]), 2)
         self.assertIsNone(res[0].error)       # not reported as a duplicate id
 

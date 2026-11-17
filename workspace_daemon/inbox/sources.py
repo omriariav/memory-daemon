@@ -890,48 +890,129 @@ def saved_watch(base_dir):
 
 
 def units_answers(units, marks=None):
-    """`{series: "declined" | "answered"}`: the recurring series (see
-    `invites.series_of`) you have answered, from the calendar snapshot the
-    units last read, else from `marks` (the same shape, from the RSVP marks of
-    the inbox store)."""
-    out = dict(marks or {})
+    """`{series: {"answer": "declined" | "answered", "at": float | None}}`:
+    the recurring series (see `invites.series_of`) you have answered. The
+    answer comes from the calendar snapshot the units last read, else from
+    `marks` (the same shape, `InboxStore.rsvp_series()`); `at` is when the
+    answer was given in the inbox, None for one given elsewhere."""
+    out = {k: dict(v) for k, v in (marks or {}).items()}
     for unit in units:
         getter = getattr(unit, "answers", None)
-        if getter is not None:
-            out.update(getter())
+        if getter is None:
+            continue
+        for series, answer in getter().items():
+            out.setdefault(series, {"at": None})["answer"] = answer
     return out
 
 
-def _hides_calendar_twin(item, listed, answered):
-    """True for a calendar row of the events stream that an invite makes
-    redundant. `New invite` goes when the series has a pending-invite row
-    (`listed`: it says the same and can be acted on) or is answered
-    (`answered`: nothing is left to do). `Updated` and `Cancelled` stay, as
-    news, except for a series you declined: a move or a cancel of a meeting
-    you are not going to is noise."""
+CHANGED_FIELDS = 3     # fields named in an invite's `changed` line
+
+
+def _twin_parts(item):
+    """`(series, kind, ts, answer, at)` for a calendar row of the events
+    stream with a `gcal:` source id, else None; `answer` and `at` are filled
+    in by the caller."""
     meta = item["meta"]
     source_id = meta.get("source_id")
     if (item["source"] != "calendar" or not isinstance(source_id, str)
             or not source_id.startswith("gcal:")):
+        return None
+    return invites.series_of(source_id[len("gcal:"):]), meta.get("kind")
+
+
+def _hides_calendar_twin(item, listed, answered):
+    """True for a calendar row of the events stream that an invite makes
+    redundant (the rules are in docs/inbox.md):
+
+    - `New invite` goes while the series has a pending-invite row (`listed`)
+      and once it is answered.
+    - `Updated` goes while the series is listed, since the invite shows the
+      current time and title (see `_carry_changes`), and, after an inbox
+      answer, when it is not newer than the answer (you saw the invite as it
+      was). An update after the answer, or after an answer given elsewhere,
+      stays.
+    - `Cancelled` stays, except for a series you declined; so does `Updated`
+      for a declined series."""
+    parts = _twin_parts(item)
+    if parts is None:
         return False
-    series = invites.series_of(source_id[len("gcal:"):])
-    kind = meta.get("kind")
+    series, kind = parts
+    state = answered.get(series)
     if kind == "new":
-        return series in listed or series in answered
-    return kind in ("update", "cancel") and answered.get(series) == "declined"
+        return series in listed or state is not None
+    if kind not in ("update", "cancel"):
+        return False
+    if state is not None and state["answer"] == "declined":
+        return True
+    if kind == "cancel":
+        return False
+    at = state.get("at") if state else None
+    if at is not None:
+        ts = item.get("ts")
+        return isinstance(ts, (int, float)) and ts <= at
+    return series in listed and state is None
+
+
+def _changed_line(item):
+    """The `changed` thread line for an `Updated` row's changed fields (the
+    `field: old -> new` lines `_calendar_parts` built), or None."""
+    pairs = [m for m in item["thread"]
+             if isinstance(m, dict) and m.get("who") != "when"
+             and isinstance(m.get("text"), str) and " -> " in m["text"]]
+    if not pairs:
+        return None
+    text = "; ".join(f"{m['who']}: {m['text']}" for m in pairs[:CHANGED_FIELDS])
+    if len(pairs) > CHANGED_FIELDS:
+        text += f"; +{len(pairs) - CHANGED_FIELDS} more"
+    return {"who": "changed", "ts": item["ts"],
+            "text": itm.truncate(text, itm.TEXT_MAX)}
+
+
+def _carry_changes(batches, listed, answered):
+    """`{series: thread line}`: the newest update of each listed series that
+    `_hides_calendar_twin` hides, to show on the invite row."""
+    best = {}
+    for batch in batches:
+        for res in batch:
+            for i in res.items:
+                parts = _twin_parts(i)
+                if (parts is None or parts[1] != "update"
+                        or parts[0] not in listed
+                        or not _hides_calendar_twin(i, listed, answered)):
+                    continue
+                state = answered.get(parts[0])
+                if state is not None:
+                    continue  # answered: the invite row is not what you read
+                line = _changed_line(i)
+                if line and (parts[0] not in best
+                             or i["ts"] >= best[parts[0]][0]):
+                    best[parts[0]] = (i["ts"], line)
+    return {k: v[1] for k, v in best.items()}
+
+
+def _with_line(item, line):
+    """A copy of an invite row with the `changed` line after its `when`
+    line."""
+    thread = [m for m in item["thread"]]
+    at = next((n + 1 for n, m in enumerate(thread)
+               if isinstance(m, dict) and m.get("who") == "when"), len(thread))
+    thread.insert(at, line)
+    return dict(item, thread=thread)
 
 
 def merge(batches, answered=None):
     """Flatten per-unit results (in source order). A duplicate item id across
     sources keeps the first and flags the later source. Calendar rows of the
     events stream that a pending invite makes redundant are dropped (see
-    `_hides_calendar_twin`); `answered` is `{series: "declined" | "answered"}`
-    (see `units_answers`). The rows are not changed, only left out."""
+    `_hides_calendar_twin`), and the newest change of a listed invite is added
+    to its row as a `changed` line; `answered` is what `units_answers`
+    returns. Cached rows are never changed: a row with a new line is a copy."""
     batches = [list(b) for b in batches]
     listed = {i["meta"]["series"] for b in batches for r in b for i in r.items
               if i["id"].startswith("invites:")
               and isinstance(i["meta"].get("series"), str)}
     answered = answered or {}
+    changes = _carry_changes(batches, listed, answered) if listed else {}
     results = []
     seen = set()
     for batch in batches:
@@ -941,8 +1022,13 @@ def merge(batches, answered=None):
             for i in res.items:
                 if i["id"] in seen:
                     dropped += 1   # a duplicate id
-                elif not ((listed or answered)
-                          and _hides_calendar_twin(i, listed, answered)):
+                elif (listed or answered) and _hides_calendar_twin(
+                        i, listed, answered):
+                    continue
+                elif (changes and i["id"].startswith("invites:")
+                      and i["meta"].get("series") in changes):
+                    kept.append(_with_line(i, changes[i["meta"]["series"]]))
+                else:
                     kept.append(i)
             seen.update(i["id"] for i in kept)
             error = res.error

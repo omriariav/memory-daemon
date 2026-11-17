@@ -304,14 +304,16 @@ class InboxStore:
         return "saved" in (self.marks.get(item_id) or {})
 
     def rsvp_series(self):
-        """`{series: "declined" | "answered"}` for the invites answered here
-        (the marks of `invites:<series>` items), for hiding the events
-        stream's rows about them."""
+        """`{series: {"answer": "declined" | "answered", "at": rsvp_at}}` for
+        the invites answered here (the marks of `invites:<series>` items), for
+        hiding the events stream's rows about them. `at` is None when the
+        mark has no time."""
         out = {}
         for key, mark in list(self.marks.items()):
             if key.startswith("invites:") and mark.get("rsvp") in RSVP_ANSWERS:
-                out[key[len("invites:"):]] = \
-                    "declined" if mark["rsvp"] == "declined" else "answered"
+                out[key[len("invites:"):]] = {
+                    "answer": "declined" if mark["rsvp"] == "declined"
+                    else "answered", "at": mark.get("rsvp_at")}
         return out
 
     def rsvp_answer(self, item_id):
