@@ -98,6 +98,9 @@ class InboxStore:
                 val = mark.get(field)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     clean[field] = float(val)
+            event = mark.get("closed_event")
+            if isinstance(event, str) and 0 < len(event) <= 200:
+                clean["closed_event"] = event
             if mark.get("rsvp") in RSVP_ANSWERS:
                 clean["rsvp"] = mark["rsvp"]
                 event = mark.get("rsvp_event")
@@ -200,11 +203,20 @@ class InboxStore:
             return True
         self._transaction(change)
 
-    def done(self, item_id):
-        self._mark(item_id, done=self.clock())
+    def _closing(self, item_id, field, event_id):
+        """Mark done or acked. For an invite, `event_id` is the instance it
+        showed when closed, kept so that only that instance's calendar rows
+        count as seen (see `closed_ids`)."""
+        fields = {field: self.clock()}
+        if isinstance(event_id, str) and 0 < len(event_id) <= 200:
+            fields["closed_event"] = event_id
+        self._mark(item_id, **fields)
 
-    def ack(self, item_id):
-        self._mark(item_id, ack=self.clock())
+    def done(self, item_id, event_id=None):
+        self._closing(item_id, "done", event_id)
+
+    def ack(self, item_id, event_id=None):
+        self._closing(item_id, "ack", event_id)
 
     def snooze(self, item_id, until):
         self._mark(item_id, snooze_until=float(until))
@@ -327,11 +339,18 @@ class InboxStore:
         return out
 
     def closed_ids(self):
-        """The ids of the `invites:` items marked done or acknowledged: the
-        user is finished with them, so they no longer stand for their event."""
-        return {key for key, mark in list(self.marks.items())
-                if key.startswith("invites:") and ("done" in mark
-                                                   or "ack" in mark)}
+        """`{id: {"at": when, "event": event id or None}}` of the `invites:`
+        items marked done or acknowledged: the user is finished with them, so
+        they no longer stand for their event, and the calendar rows up to `at`
+        count as seen. `event` is the invite's event id at that time; None for
+        a mark made before it was recorded (then the whole series counts)."""
+        out = {}
+        for key, mark in list(self.marks.items()):
+            times = [mark[f] for f in ("done", "ack") if f in mark]
+            if key.startswith("invites:") and times:
+                out[key] = {"at": max(times),
+                            "event": mark.get("closed_event")}
+        return out
 
     def rsvp_answer(self, item_id):
         return (self.marks.get(item_id) or {}).get("rsvp")

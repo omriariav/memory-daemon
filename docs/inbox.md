@@ -403,16 +403,24 @@ invites are merged (in `collect` and in the app's refresh), these rows are
 hidden:
 
 - **While the invite is listed** (a pending-invite row of the series is in the
-  list, and it is not marked done or acknowledged: such a row no longer stands
-  for its event, so its rows show): `New invite` rows, and `Updated` rows about
-  the listed instance (the update's event id is the invite's `meta.event_id`).
-  The invite row shows the current time and title, so the newest such update's
-  changes are added to it as one thread line, `changed`, after `when`:
-  `start: 10:00 -> 11:00; title: Old -> New` (the fields as the update row
-  lists them, up to 3, then `; +N more`; none when the update changed no
-  field). An update about another instance of a recurring series stays visible
-  and is not carried. `Cancelled` stays visible. A snoozed invite still counts
-  as listed.
+  list, and it is not marked done or acknowledged, see the next point; a
+  snoozed row still counts as listed): `New invite` rows, and `Updated` rows
+  about the listed instance (the update's event id is the invite's
+  `meta.event_id`). The invite row shows the current time and title, so the
+  newest such update's changes are added to it as one thread line, `changed`,
+  after `when`: `start: 10:00 -> 11:00; title: Old -> New` (the fields as the
+  update row lists them, up to 3, then `; +N more`; none when the update changed
+  no field). An update about another instance of a recurring series stays
+  visible and is not carried. `Cancelled` stays visible.
+- **After the invite is marked done (`d`) or acknowledged**, whether or not it
+  was answered: the row no longer stands for its event, and every calendar row
+  (`New invite`, `Updated`, `Cancelled`) that is not newer than the close is
+  hidden, as you had seen it. The row must be about the instance that was
+  closed (its event id is the one the invite showed at close; the done/ack mark
+  records it as `closed_event`; a non-recurring event matches its series). A
+  row newer than the close shows, a cancel included, and so does a row about
+  another instance. A mark made by an earlier version has no event id and
+  covers the series, up to the close.
 - **After an RSVP from the inbox** (the mark of the `invites:<series>` row):
   `New invite` rows, and `Updated` rows about the answered instance that are not
   newer than the answer (`rsvp_at`): you saw the invite as it was when you

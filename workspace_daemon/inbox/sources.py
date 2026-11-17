@@ -925,7 +925,8 @@ def _twin_parts(item):
 
 def _listed_invites(batches, closed):
     """`{series: meta}` of the pending-invite rows that stand for their
-    event: not the ones marked done or acknowledged (`closed`)."""
+    event: not the ones marked done or acknowledged (`closed`, a dict by id;
+    a snoozed row still counts)."""
     return {i["meta"]["series"]: i["meta"] for b in batches for r in b
             for i in r.items
             if i["id"].startswith("invites:") and i["id"] not in closed
@@ -949,7 +950,20 @@ def _standing(listed, answered):
     return out
 
 
-def _hides_calendar_twin(item, listed, standing):
+def _seen_at_close(parts, ts, closed):
+    """True for a calendar row (any kind) of an invite marked done or
+    acknowledged, that is not newer than the close and about the instance that
+    was closed (or any instance of the series, for a mark that recorded none):
+    you saw it, and chose to be finished with it."""
+    series, event_id, kind = parts
+    if kind not in ("new", "update", "cancel"):
+        return False
+    mark = (closed or {}).get(f"invites:{series}")
+    return (mark is not None and mark.get("event") in (None, event_id)
+            and isinstance(ts, (int, float)) and ts <= mark["at"])
+
+
+def _hides_calendar_twin(item, listed, standing, closed=None):
     """True for a calendar row of the events stream that an invite makes
     redundant (the rules are in docs/inbox.md). `listed` is `_listed_invites`'
     result, `standing` is `_standing`'s.
@@ -963,11 +977,16 @@ def _hides_calendar_twin(item, listed, standing):
       was). Any other update stays.
     - `Cancelled` stays. For a declined meeting (every row declined in the
       snapshot, or the instance declined in the inbox) `Updated` and
-      `Cancelled` both go."""
+      `Cancelled` both go.
+    - Whatever the answer, every kind goes when the invite was marked done or
+      acknowledged (`closed`, see `_seen_at_close`) and the row is not newer
+      than the close."""
     parts = _twin_parts(item)
     if parts is None:
         return False
     series, event_id, kind = parts
+    if _seen_at_close(parts, item.get("ts"), closed):
+        return True
     snap, mark = standing.get(series, (None, None))
     if kind == "new":
         return series in listed or snap is not None or mark is not None
@@ -1001,7 +1020,7 @@ def _changed_line(item):
             "text": itm.truncate(text, itm.TEXT_MAX)}
 
 
-def _carry_changes(batches, listed, standing):
+def _carry_changes(batches, listed, standing, closed=None):
     """`{series: thread line}`: the newest update of each listed invite's own
     instance that `_hides_calendar_twin` hides, to show on the invite row. A
     series with an answer that counts has none (its invite is not what you
@@ -1013,7 +1032,7 @@ def _carry_changes(batches, listed, standing):
                 parts = _twin_parts(i)
                 if (parts is None or parts[2] != "update"
                         or parts[0] not in listed or parts[0] in standing
-                        or not _hides_calendar_twin(i, listed, standing)):
+                        or not _hides_calendar_twin(i, listed, standing, closed)):
                     continue
                 line = _changed_line(i)
                 if line and (parts[0] not in best
@@ -1032,19 +1051,22 @@ def _with_line(item, line):
     return dict(item, thread=thread)
 
 
-def merge(batches, answered=None, closed=()):
+def merge(batches, answered=None, closed=None):
     """Flatten per-unit results (in source order). A duplicate item id across
     sources keeps the first and flags the later source. Calendar rows of the
     events stream that a pending invite makes redundant are dropped (see
     `_hides_calendar_twin`), and the newest change of a listed invite is added
     to its row as a `changed` line. `answered` is what `units_answers`
-    returns; `closed` the ids of invite rows marked done or acknowledged
-    (`InboxStore.closed_ids()`), which no longer count as listed. Cached rows
-    are never changed: a row with a new line is a copy."""
+    returns; `closed` is `InboxStore.closed_ids()`: the invite rows marked done
+    or acknowledged no longer count as listed, and the calendar rows they had
+    seen are hidden. Cached rows are never changed: a row with a new line
+    is a copy."""
     batches = [list(b) for b in batches]
+    closed = closed or {}
     listed = _listed_invites(batches, closed)
     standing = _standing(listed, answered)
-    changes = _carry_changes(batches, listed, standing) if listed else {}
+    changes = (_carry_changes(batches, listed, standing, closed)
+               if listed else {})
     results = []
     seen = set()
     for batch in batches:
@@ -1054,8 +1076,8 @@ def merge(batches, answered=None, closed=()):
             for i in res.items:
                 if i["id"] in seen:
                     dropped += 1   # a duplicate id
-                elif (listed or standing) and _hides_calendar_twin(
-                        i, listed, standing):
+                elif (listed or standing or closed) and _hides_calendar_twin(
+                        i, listed, standing, closed):
                     continue
                 elif (changes and i["id"].startswith("invites:")
                       and i["id"] not in closed
@@ -1073,7 +1095,7 @@ def merge(batches, answered=None, closed=()):
 
 
 def collect(settings, base_dir, now=None, show_all=False, marks=None,
-            closed=()):
+            closed=None):
     """Poll every configured source. Returns a list of SourceResult.
 
     `show_all` adds `--all` to `list` for the command sources that declared

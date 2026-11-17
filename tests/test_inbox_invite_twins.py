@@ -68,12 +68,12 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
 
-    def collect(self, marks=None, closed=()):
+    def collect(self, marks=None, closed=None):
         res = sources.collect(settings.default_settings(), self.base, now=NOW,
                               marks=marks, closed=closed)
         return {r.name: r.items for r in res}
 
-    def calendar(self, marks=None, closed=()):
+    def calendar(self, marks=None, closed=None):
         """Gists of the events stream's rows, as `Kind: title`."""
         return sorted(i["gist"].split(" (")[0]
                       for i in self.collect(marks, closed)["events"])
@@ -260,17 +260,23 @@ class ReviewFixesTest(Base):
     def test_an_acked_or_done_invite_no_longer_counts_as_listed(self):
         write_snapshot(self.base, {"aaa": row(30), "bbb": row(31),
                                    "ccc": row(32)})
+        # All three updates are newer than the closes below, so they show.
         write_events(self.base, [ev("gcal:aaa", "update", "A",
-                                    details=CHANGED),
-                                 ev("gcal:bbb", "update", "B"),
-                                 ev("gcal:ccc", "update", "C")])
-        store = InboxStore(None)
-        store.ack("invites:aaa")
-        store.done("invites:bbb")
+                                    details=CHANGED, ago_h=-2),
+                                 ev("gcal:bbb", "update", "B", ago_h=-2),
+                                 ev("gcal:ccc", "update", "C", ago_h=-2)])
+        store = InboxStore(None, clock=lambda: NOW)
+        store.ack("invites:aaa", "aaa")
+        store.done("invites:bbb", "bbb")
         store.snooze("invites:ccc", NOW + H)
-        self.assertEqual(store.closed_ids(), {"invites:aaa", "invites:bbb"})
+        self.assertEqual(store.closed_ids(), {
+            "invites:aaa": {"at": NOW, "event": "aaa"},
+            "invites:bbb": {"at": NOW, "event": "bbb"}})
         self.assertEqual(self.calendar(closed=store.closed_ids()),
                          ["Updated: A", "Updated: B"])
+        inv = self.collect(closed=store.closed_ids())["events.invites"]
+        self.assertEqual({i["id"] for i in inv for m in i["thread"]
+                          if m["who"] == "changed"}, set())
 
     def test_an_update_of_another_instance_is_neither_hidden_nor_carried(self):
         write_snapshot(self.base, {self.W2: row(30)})
@@ -290,6 +296,75 @@ class ReviewFixesTest(Base):
             ev(f"gcal:{self.W2}", "update", "Other", ago_h=3)])
         marks = marks_at("accepted", 0, "w", self.W1)
         self.assertEqual(self.calendar(marks), ["Updated: Other"])
+
+
+class ClosedInviteTest(Base):
+    W1, W2 = "w_20231116T100000Z", "w_20231123T100000Z"
+
+    def closed(self, at=0, series="aaa", event="aaa", how="done"):
+        store = InboxStore(None, clock=lambda: NOW + at * H)
+        getattr(store, how)(f"invites:{series}", event)
+        return store.closed_ids()
+
+    def test_rows_up_to_the_close_are_hidden_whether_done_or_acked(self):
+        write_events(self.base, [ev("gcal:aaa", "update", "A", ago_h=3),
+                                 ev("gcal:bbb", "new", "B", ago_h=3)])
+        for how in ("done", "ack"):
+            self.assertEqual(self.calendar(closed=self.closed(how=how)),
+                             ["New invite: B"], how)
+        closed = dict(self.closed(), **self.closed(series="bbb", event="bbb"))
+        self.assertEqual(self.calendar(closed=closed), [])
+
+    def test_an_update_or_cancel_after_the_close_shows(self):
+        write_snapshot(self.base, {"aaa": row(30), "bbb": row(31),
+                                   "ccc": row(32)})
+        write_events(self.base, [ev("gcal:aaa", "update", "A", ago_h=-1),
+                                 ev("gcal:bbb", "cancel", "B", ago_h=-1),
+                                 ev("gcal:ccc", "cancel", "C", ago_h=3)])
+        closed = {}
+        for s in ("aaa", "bbb", "ccc"):
+            closed.update(self.closed(series=s, event=s))
+        self.assertEqual(self.calendar(closed=closed),
+                         ["Cancelled: B", "Updated: A"])
+
+    def test_another_instances_row_is_not_hidden(self):
+        write_events(self.base, [
+            ev(f"gcal:{self.W2}", "update", "Other instance", ago_h=3),
+            ev(f"gcal:{self.W1}", "update", "Closed instance", ago_h=3),
+            ev("gcal:w", "cancel", "Whole series", ago_h=3)])
+        closed = self.closed(series="w", event=self.W1)
+        self.assertEqual(self.calendar(closed=closed),
+                         ["Cancelled: Whole series", "Updated: Other instance"])
+
+    def test_an_old_mark_without_an_event_covers_the_series_up_to_the_close(self):
+        write_events(self.base, [
+            ev(f"gcal:{self.W2}", "update", "Before", ago_h=3),
+            ev(f"gcal:{self.W1}", "cancel", "After", ago_h=-1)])
+        closed = self.closed(series="w", event=None)
+        self.assertEqual(closed["invites:w"]["event"], None)
+        self.assertEqual(self.calendar(closed=closed), ["Cancelled: After"])
+
+    def test_the_close_is_kept_on_disk_and_old_files_still_load(self):
+        store = InboxStore(self.base, clock=lambda: NOW)
+        store.done("invites:aaa", "aaa")
+        store.ack("invites:old")
+        again = InboxStore(self.base, clock=lambda: NOW)
+        again.load()
+        self.assertEqual(again.closed_ids(), {
+            "invites:aaa": {"at": NOW, "event": "aaa"},
+            "invites:old": {"at": NOW, "event": None}})
+
+    def test_the_actions_record_the_invites_event_id(self):
+        from types import SimpleNamespace
+        store = InboxStore(None, clock=lambda: NOW)
+        actions = FakeActions(store=store)
+        inv = SimpleNamespace(key="invites:w", meta={"event_id": self.W2})
+        other = SimpleNamespace(key="slack:1", meta={"event_id": "zzz"})
+        actions.ack(inv)
+        actions.mark_done(other)
+        self.assertEqual(set(store.closed_ids()), {"invites:w"})
+        self.assertEqual(store.marks["invites:w"]["closed_event"], self.W2)
+        self.assertNotIn("closed_event", store.marks["slack:1"])
 
 
 class OddSnapshotTest(Base):
