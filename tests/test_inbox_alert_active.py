@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from workspace_daemon import events
-from workspace_daemon.inbox import items as itm, sources
+from workspace_daemon.inbox import items as itm, models, settings, sources
+from workspace_daemon.inbox.store import InboxStore
 
 NOW = 1_700_000_000.0
 DAY_H = 24.0
@@ -48,7 +49,9 @@ class ActiveAlertTest(unittest.TestCase):
 
     @staticmethod
     def thread(item):
-        return {m["who"]: m for m in item["thread"]}
+        """Entries by label; `last error, <age>` is found as `last error`."""
+        return {("last error" if m["who"].startswith("last error")
+                 else m["who"]): m for m in item["thread"]}
 
     # 1. active but older than the window
     def test_active_alert_older_than_the_window_is_listed(self):
@@ -120,7 +123,7 @@ class ActiveAlertTest(unittest.TestCase):
         self.events([alert_event("attention:a", 3, routine="a",
                                  issues=["2 memory sink", "last run"])])
         self.active({"attention:a": iso(-4)})
-        self.log(f"{iso(-5)} routine=a ERROR old failure\n"
+        self.log(f"{iso(-5)} routine=a ERROR before the episode\n"
                  f"{iso(-1)} routine=b FATAL other routine\n"
                  f"{iso(-0.5)} routine=a FATAL: sample failure {'x' * 400}\n"
                  f"{iso(-0.2)} routine=a info all fine\n")
@@ -128,7 +131,9 @@ class ActiveAlertTest(unittest.TestCase):
         self.assertEqual(thread["routine"]["text"], "a")
         self.assertEqual(thread["issues"]["text"], "2 memory sink; last run")
         self.assertEqual(thread["active since"]["ts"], NOW - 4 * 3600)
-        self.assertIn("2023-11-14", thread["active since"]["text"])
+        self.assertEqual(thread["active since"]["text"], time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(NOW - 4 * 3600)))
+        self.assertEqual(thread["last error"]["who"], "last error, 30 min ago")
         err = thread["last error"]
         self.assertTrue(err["text"].startswith(f"{iso(-0.5)} routine=a FATAL: sample"))
         self.assertLessEqual(len(err["text"]), 200)
@@ -201,6 +206,104 @@ class ActiveAlertTest(unittest.TestCase):
         got = self.load()
         self.assertEqual(got["attention:a"]["section"], "urgent")
         self.assertEqual(got["attention:b"]["section"], "urgent")  # no issues named
+
+    # NIT (b): only an error written since the alert became active
+    def test_an_error_from_before_the_episode_is_left_out(self):
+        self.events([alert_event("attention:a", 3, routine="a")])
+        self.active({"attention:a": iso(-3)})
+        self.log(f"{iso(-30)} routine=a ERROR an earlier episode\n")
+        self.assertNotIn("last error", self.thread(self.load()["attention:a"]))
+        # the failing run just before the alert's tick still belongs to it
+        self.log(f"{iso(-3.1)} routine=a ERROR the failing run\n")
+        self.assertIn("last error", self.thread(self.load()["attention:a"]))
+
+    # NIT (a): an event of an earlier episode is not used
+    def test_an_event_from_an_earlier_episode_gives_a_synthesized_row(self):
+        self.events([alert_event("attention:a", 9 * DAY_H, routine="a",
+                                 issues=["old issue"])])
+        self.active({"attention:a": iso(-2)})
+        item = self.load()["attention:a"]
+        self.assertEqual(item["gist"], "a needs attention")
+        self.assertAlmostEqual(item["ts"], NOW - 2 * 3600, delta=1)
+        self.assertNotIn("issues", self.thread(item))
+
+    # 1. stable id per episode
+    def test_active_rows_use_one_id_per_episode(self):
+        since = iso(-3)
+        self.events([alert_event("attention:a", 3, routine="a")])
+        self.active({"attention:a": since, "attention:ghost": since})
+        got = self.load()
+        want = f"events:alert-active:attention:a@{int(NOW - 3 * 3600)}"
+        self.assertEqual(got["attention:a"]["id"], want)
+        self.assertEqual(got["attention:ghost"]["id"],
+                         f"events:alert-active:attention:ghost@{int(NOW - 3 * 3600)}")
+        self.assertEqual(itm.validate_item(got["attention:a"]), [])
+
+    def test_a_row_that_is_not_active_keeps_the_event_id(self):
+        row = alert_event("attention:gone", 3, routine="gone")
+        self.events([row])
+        self.active({})
+        self.assertEqual(self.load()["attention:gone"]["id"], f"events:{row['id']}")
+
+    def test_done_survives_rotation_and_a_switch_to_a_synthesized_row(self):
+        row = alert_event("attention:a", 3, routine="a")
+        self.events([row])
+        self.active({"attention:a": iso(-3)})
+        before = self.load()["attention:a"]
+        store = InboxStore(self.base)
+        store.done(before["id"])
+        # the event file rotates away: the row is now synthesized
+        (self.base / "state" / "events.jsonl").unlink()
+        after = self.load()["attention:a"]
+        self.assertEqual(after["id"], before["id"])
+        self.assertNotEqual(after["gist"], before["gist"])
+        self.assertTrue(InboxStore(self.base).is_hidden(after["id"]))
+
+    def test_a_re_fire_changes_the_id_and_shows_again(self):
+        self.events([alert_event("attention:a", 8, routine="a")])
+        self.active({"attention:a": iso(-8)})
+        first = self.load()["attention:a"]
+        store = InboxStore(self.base)
+        store.done(first["id"])
+        self.assertTrue(store.is_hidden(first["id"]))
+        # cleared, then active again: a new event and a new time
+        self.events([alert_event("attention:a", 1, routine="a")])
+        self.active({"attention:a": iso(-1)})
+        second = self.load()["attention:a"]
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertFalse(store.is_hidden(second["id"]))
+
+    # 2. thread order
+    def test_alert_rows_are_fixed_and_others_are_not(self):
+        self.events([alert_event("attention:a", 3, routine="a"),
+                     events.build("r", "new", None, "mila:x", "A call", [],
+                                  ts=iso(-1))])
+        self.active({"attention:a": iso(-3)})
+        res = sources.load_events(self.base, now=NOW)
+        by_source = {i["source"]: i for i in res.items}
+        self.assertTrue(models.thread_fixed(models.from_v1(by_source["alert"])))
+        self.assertFalse(models.thread_fixed(models.from_v1(by_source["recording"])))
+        self.assertFalse(models.thread_fixed(models.from_v1(dict(
+            by_source["alert"], meta={"thread_fixed": "yes"}))))
+
+    # 4. reeval reads no file
+    def test_reeval_uses_the_log_and_state_it_already_read(self):
+        self.events([alert_event("attention:a", 3, routine="a")])
+        self.active({"attention:a": iso(-3)})
+        self.log(f"{iso(-1)} routine=a ERROR first read\n")
+        cfg = settings.validate({})
+        units = sources.make_units(cfg, self.base)
+        (unit,) = [u for u in units if u.name == "events"]
+        (res,) = unit.run(NOW, False)
+        self.assertIn("first read", self.thread(res.items[0])["last error"]["text"])
+        for path in (self.base / "logs" / "run.log",
+                     self.base / "state" / "alerts.json",
+                     self.base / "state" / "events.jsonl"):
+            path.unlink()
+        (res,) = unit.reeval(NOW + 60)
+        item = res.items[0]
+        self.assertIn("first read", self.thread(item)["last error"]["text"])
+        self.assertEqual(item["id"], f"events:alert-active:attention:a@{int(NOW - 3 * 3600)}")
 
 
 if __name__ == "__main__":

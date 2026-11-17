@@ -17,12 +17,17 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   `state/alerts.json` lists as active is now always shown, using its newest
   alert event whatever its age; with no event on file, a row is made from the
   key and its time. The age rule still applies (urgent while younger than
-  `alert_urgent_max_age_h`, `fyi` after). Resolved keys behave as before.
-- **Alert rows have a thread.** The detail pane shows the routine, the issues,
-  when the alert became active, the newest `ERROR` or `FATAL` line of that
-  routine from `logs/run.log` (the last 256 KB are read, once per load; the
-  line is cut to 200 characters; a missing log adds nothing) and the hint
-  `run `daemon.py status` for details`.
+  `alert_urgent_max_age_h`, `fyi` after). An active row has one id per
+  episode, `events:alert-active:<key>@<since>`, so a done or ack mark survives
+  the event file's rotation and a re-fire (a new time) shows it again. An event
+  older than the episode is not used. Resolved keys behave as before.
+- **Alert rows had an empty detail pane.** An alert row now has a thread: the
+  routine, the issues, when the alert became active (local time), the newest
+  `ERROR` or `FATAL` line of that routine from `logs/run.log` that was written
+  since the alert became active (shown with its age; the last 256 KB are read,
+  once per refresh; the line is cut to 200 characters; a missing log adds
+  nothing) and the hint `run `daemon.py status` for details`. The entries read
+  top-down in both thread orders (`v`).
 - **Benign run states are never urgent.** An alert whose only issues are
   `overlap`, `interrupted` or `incomplete` is `fyi`, even under a custom
   urgent rule. See [inbox.md](inbox.md#stale-and-recovered-alerts).

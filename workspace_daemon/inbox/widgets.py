@@ -11,7 +11,7 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
-from .models import SECTIONS, SOURCES, thread_note
+from .models import SECTIONS, SOURCES, thread_fixed, thread_note
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
@@ -238,6 +238,7 @@ class ThreadView(VerticalScroll):
                 out.append("\n")
         elif not item.messages:
             out.append(vis(item.gist, visual) + "\n", Style(color=pal["fg"]))
+        newest_first = newest_first and not thread_fixed(item)
         messages = list(reversed(item.messages)) if newest_first \
             else item.messages
         for m in messages:

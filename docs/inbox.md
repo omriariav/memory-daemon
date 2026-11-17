@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Four optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -1068,7 +1068,17 @@ alert (`daemon` kind `alert`), after the urgent rules above:
    than `window_h`. A key with no event on file gets a synthesized row built
    from the key and the time in `alerts.json` (`attention:<routine>` reads
    `<routine> needs attention`, any other key `Alert active: <key>`). The age
-   rule above still sets urgent or `fyi`. A key the daemon dropped is resolved
+   rule above still sets urgent or `fyi`. An event older than the key's time
+   in `alerts.json` belongs to an earlier episode and is not used (the row is
+   synthesized). Every active row has the id
+   `events:alert-active:<key>@<since>` (`since` in epoch seconds): one id per
+   episode, so a done or ack mark survives rotation of the event files and the
+   switch to a synthesized row, and a re-fire (a new `since`) shows the row
+   again. Rows that are not active keep the plain event id, so a mark on an
+   alert that then resolves does not carry over to its resolved row. Day-stamped
+   budget keys (`budget-hit:<day>`, `budget-80:<day>`, `hold:<routine>:<day>`)
+   stay listed while the daemon cannot read the usage log or budget file, since
+   it keeps their saved state then. A key the daemon dropped is resolved
    (next rule) and, once its event is older than `window_h`, no longer listed.
    An unknown `alerts.json` adds nothing.
 4. **Benign states.** An alert whose `details.issues` are all `overlap`,
@@ -1094,11 +1104,16 @@ alert (`daemon` kind `alert`), after the urgent rules above:
 **Alert thread.** An alert row has a thread (the detail pane) with these
 entries, each only when known: `routine` (`details.routine`, or the routine in
 an `attention:`, `interrupted:` or `hold:` key), `issues` (`details.issues`),
-`active since` (the time in `alerts.json`, else the event time), `last error`
-(the newest `ERROR` or `FATAL` line of that routine in `logs/run.log`) and a
-`hint`: run `daemon.py status` for details. Only the last 256 KB of the log
-are read, once per load and only when an alert row is built; the line is cut to
-200 characters, and a missing or unreadable log leaves the entry out.
+`active since` (the time in `alerts.json`, else the event time, in local time
+like the header clock), `last error, <age>` (the newest `ERROR` or `FATAL` line
+of that routine in `logs/run.log`, only when written since the alert became
+active, give or take the 15 minutes a failing run precedes the tick that
+alerts) and a `hint`: run `daemon.py status` for details. The entries are a
+fixed list (`meta.thread_fixed`): they read top-down in both thread orders and
+`v` does not reverse them. Only the last 256 KB of the log are read, once per
+refresh (a re-evaluation for a later time reuses that read) and only when an
+alert row is built; the line is cut to 200 characters, and a missing or
+unreadable log leaves the entry out.
 
 Recovery is read-only and best effort. A missing, unreadable, oversized or
 unfamiliar `alerts.json` (a different daemon version), or one last written
