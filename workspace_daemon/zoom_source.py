@@ -402,8 +402,13 @@ def _fetch_assets(cfg, numbers):
         raise claude_bridge.BridgeOutage(
             f"zoom assets incomplete ({sleepclock.OUTAGE_NOTE})")
     if all(text is None for text in texts.values()):
+        # Tagged like a bridge tool error, so an expired connector sign-in
+        # reads as "(auth failed)" in the run log and in alerts.
         raise claude_bridge.BridgeError(
-            f"tool returned no usable result: {tool}")
+            f"tool returned no usable result: {tool}"
+            + claude_bridge.error_category(" ".join(
+                str(r.get("text") or "") for r in results
+                if r["name"] == tool and r.get("is_error"))))
     return texts
 
 

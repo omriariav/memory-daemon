@@ -1959,9 +1959,34 @@ only after it clears.
 | `budget-invalid` | `state/budget.yaml` is malformed and routines are held because of it |
 | `usage-unreadable` | `state/claude-usage.jsonl` cannot be read; lists routines held because spend is unknown, and alerts even when none are, since spend and connector health are then unknown |
 | `hold:<routine>:<day>` | a routine reached its own `budget.daily_usd` |
-| `attention:<routine>` | `status` shows the routine as attention, ignoring `incomplete` and `overlap` (a tick running in another group) and `interrupted` (every failure line of the tick names a measured sleep or a dead network such as an unresolvable host; timeouts, refused connections, rate-limit, quota and auth failures stay errors, and one real error makes the tick an error). Last-run errors alert only on a streak: the last 3 ticks in a row failed (interrupted ticks neither count nor break the streak, a clean tick resets it), or the routine has had no clean tick for 2 hours of awake time since the streak's first error. Awake time adds up the gaps between consecutive daemon ticks of any group; a gap over 30 minutes is sleep and adds nothing. Other issue kinds alert at once |
+| `attention:<routine>` | `status` shows the routine as attention, ignoring `meeting match` (a recording not matched to a calendar meeting: a review task), a `memory sink` issue whose newest memory error is a near-duplicate, `incomplete` and `overlap` (a tick running in another group) and `interrupted` (every failure line of the tick names a measured sleep or a dead network such as an unresolvable host; timeouts, refused connections, rate-limit, quota and auth failures stay errors, and one real error makes the tick an error). Last-run errors alert only on a streak: the last 3 ticks in a row failed (interrupted ticks neither count nor break the streak, a clean tick resets it), or the routine has had no clean tick for 2 hours of awake time since the streak's first error. Awake time adds up the gaps between consecutive daemon ticks of any group; a gap over 30 minutes is sleep and adds nothing. Other issue kinds alert at once |
 | `interrupted:<routine>` | safety net for outages: at least 3 ticks in a row were interrupted (no clean or error tick between) and 2 hours of awake time passed since the first. A routine that is merely off schedule does not trigger it. It has its own key, so a change from outages to errors alerts again |
 | `connector:<server>` | a connector's last error has been newer than its last success for over an hour, counted from the first error since that success |
+
+Every alert's `details` may also say why. All of these fields are optional:
+
+| field | meaning |
+|---|---|
+| `cause` | `connector_auth` (sign-in expired, or an auth error), `connector_down`, `tool_error`, `memory_duplicate`, `meeting_match`, `budget`, `run_state` (sleep or offline) or `unknown` |
+| `last_error` | the newest ERROR/FATAL `logs/run.log` line of the routine since its streak began, at most 160 characters, with digit runs, long id-like tokens, addresses and URLs replaced (only the last 256 KB of the log are read). A connector alert carries the newest failed call's outcome instead |
+| `since` | when the streak began (UTC); for a connector, its first failure since the last success |
+| `remedy` | one short generic sentence, such as `Sign in to the <server> connector again (in Claude Code: /mcp), then the routine retries on its next run` |
+| `connector` | the connector's server name, when the cause names one |
+
+When the cause is known the alert text says it (`zoom-meetings: connector
+sign-in expired`) instead of `1 last-run error`. `memory_duplicate` and
+`meeting_match` never raise `attention:` on their own: a streak whose every
+error is a near-duplicate, and a lone `meeting match`, stay out of the alert
+(`status` still lists them). To add or replace remedy text, set
+`alert_remedies` in the optional `state/daemon.yaml`, a map from alert-key
+prefix to text; the longest matching prefix wins, `{server}` and `{routine}`
+are filled in, and a text is cut to 300 characters:
+
+```yaml
+alert_remedies:
+  "connector:": "Re-run the team's connector sign-in, then wait one run"
+  "attention:zoom": "Sign in to {server} again, then ping the channel"
+```
 
 Who is held comes from the same check the runner uses, and budget alerts
 carry spend by routine. Dedupe state is `state/alerts.json`, and
@@ -3235,6 +3260,7 @@ network_check:
   hosts: ["api.anthropic.com:443"]
   timeout_seconds: 3
 skip_warn_hours: 12
+alert_remedies: {}              # alert-key prefix -> remedy text (see Alerts)
 ```
 
 A missing or malformed file means these defaults. `MEMORY_DAEMON_PREFLIGHT=0`

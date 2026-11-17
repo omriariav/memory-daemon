@@ -393,7 +393,9 @@ class ToolErrorCategoryTest(BridgeBase):
 
     def test_oauth_error_codes_are_tagged_auth_failed(self):
         for body in ("invalid_auth", "not_authed", "token_expired",
-                     "token_revoked", "invalid_grant"):
+                     "token_revoked", "invalid_grant",
+                     "needs you to sign in again (run /mcp to "
+                     "re-authenticate)"):
             exc = self.failure(body)
             self.assertTrue(str(exc).endswith("(auth failed)"), body)
 
