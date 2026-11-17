@@ -1052,11 +1052,15 @@ filtered to its routine `saved to memory`: what the daemon saved in the last
 `saved_days` days (default 2), read from the capture events (kind `new` or
 `update` with a memory id) of `events.jsonl`, newest first, one row per saved
 item (the newest capture of a `source_id` wins). A capture that a queue row
-already shows (an email or a recording, same `source_id`) is not listed twice.
+already shows (an email or a recording, same `source_id`, and that row is
+visible in a view) is not listed twice.
 Each row has the source glyph, the title, its age and `◆`; `o` opens the link
-when the row has one (Gmail threads). Saved rows are not queue items: they have
-no draft and no actions apart from `o` and `d` (hides the row), and nothing is
-written to the daemon. The rows are read with every refresh.
+when the row has one (Gmail threads). Saved rows are not queue items. Only
+`o` (open), `d` (hide the row, with the 5 s undo), `s` (snooze), `y` (copy) and
+the movement and view keys work on them; every other key (`a`, `e`, `n`, `m`,
+`E`, `P`, `X`, `T`, `c`, `i`, `x`, `-` and the keys of `actions:`) does nothing
+and says so in a notice. Nothing is written to the daemon. The rows are read
+with every refresh.
 
 ### Stale and recovered alerts
 
@@ -1305,7 +1309,10 @@ same mark, and selection, `/` filtering and the thread, draft and context
 panes work the same in all of them. Rows show who is waiting: `← Alice` (Alice
 waits on you) on rows you owe, `→ Alice` (you wait on Alice) in Waiting; the
 thread pane says so too. The count after a tab is the number of rows in the
-view; the Health badge `⚠2` is the number of alerts that need you.
+view; the Health badge `⚠2` is the number of alerts that need you plus the failing
+routine groups (`✗` in the strip) that no such alert names yet: an alert only
+fires after a streak of failed runs, so a group can be failing before one
+exists, and the badge should not stay quiet over a red cell.
 
 `[` and `]` jump to the first row of the previous and next group (a section in
 the Inbox, a person in Waiting, a routine in the Feed).
@@ -1314,8 +1321,15 @@ the Inbox, a person in Waiting, a routine in the Feed).
 
 The Feed lists every `fyi` row of every source, grouped by routine: the
 event's `routine` (`meta.routine`) for the built-in events source, the source's
-name for a `command` source. Rows older than `feed.window_h` (default 24)
-age out of it; `A` (show all) brings them back for the session. The left pane
+name for a `command` source. Rows of the events source older than
+`feed.window_h` (default 24) age out of it (they are time-based events);
+`A` (show all) brings them back for the session. Rows of a `command` source
+never age out: they are state (an open item listed as `fyi`) and stay while the
+source lists them. An active alert (a daemon alert whose key is still in
+`state/alerts.json`, not resolved) is never aged out and no `hide` or `digest`
+rule takes it out of the Feed ("Active keys are always listed"). Entering the
+Feed clears a source filter set in another view; `f` is the routine filter
+there. The left pane
 lists the routines with their counts, then the muted rows; `f` cycles the
 routine filter (`esc` clears it) and `enter` moves to the thread pane.
 
@@ -1351,8 +1365,10 @@ feed:
 | `hide` | leave the row out of the Feed. It is counted in the muted list. |
 | `inbox` | promote the row into the Inbox view, under `URGENT` |
 
-A rule is re-evaluated every 30 s, so `starts_within_h` and the window follow
-the clock. `show_rsvp_replies: false` (the default) keeps working: those
+The Feed re-applies the rules and the window against the clock every 30 s,
+with the same timer whether the sources are refreshed by change (`units`) or
+by the single fetch; no file is read for that, so `starts_within_h` and the
+window follow the clock between refreshes. `show_rsvp_replies: false` (the default) keeps working: those
 calendar rows are left out when the events are read, as a `hide` rule would.
 
 **On a Feed row.** `x` opens the mute picker: what to mute (*this kind from
@@ -1362,12 +1378,23 @@ always). `-` ("less like this") adds a rule for the same routine and kind that
 `digest`s instead of hiding, with no end. `M` opens the rules screen: the rules
 of `inbox.yaml` (read-only) and the ones made with `x` and `-`; `space` switches
 a rule you made off and on, `delete` removes it. A mute is a rule like any
-other, with an optional end time.
+other, with an optional end time. A mute made on a digest row uses its newest
+row; on a saved-to-memory row it is refused.
+
+**Digest rows.** A digest row has no draft or actions of its own. `d` and `s`
+mark every row it stands for; `o` opens the link the rows share (a digest has a
+link only when its rows have exactly one); `y` copies it; `x` and `-` make a
+rule from its newest row. Every other key does nothing and says so. With a `/`
+text filter or an `f` source filter on, the digest shows only the rows that pass
+it, and `d` and `s` mark only those.
 
 The rules made in the UI are stored in `state/inbox-state.json`
 (`prefs.feed_rules`), never in `inbox.yaml`, and are tried before the rules of
 the file, so a mute you make wins over a file rule. They are kept like the
 other display choices (not pruned, 100 at most, malformed entries ignored).
+A rule whose end time has passed is dropped the next time a rule is added,
+before the cap of 100 applies. An older inbox (0.8.x) does not know the
+entry and drops it the next time it writes the state file.
 
 ### Health
 

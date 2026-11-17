@@ -66,8 +66,18 @@ and a one-line health strip under the tab bar.
   every refresh, so the change-driven refresh of the old screen is gone.
 - **The Inbox shows what needs a move from you**: `fyi` rows no longer sit
   under it; they are in the Feed (older than `feed.window_h` they age out of it,
-  `A` shows them all). A waiting row whose nudge is due is in the Inbox as well
-  as in Waiting.
+  `A` shows them all; only rows of the events source age out, a `command`
+  source's rows stay while it lists them, and an active alert never ages out or
+  hides). A waiting row whose nudge is due is in the Inbox as well as in
+  Waiting.
+- **The Health badge** counts the alerts that need you and the failing routine
+  groups that no such alert names yet.
+- **Saved-to-memory and digest rows take few keys** (`o`, `d`, `s`, `y`; a digest
+  also `x` and `-`); the rest says why it does nothing. With a filter on,
+  `d` and `s` on a digest row reach only the rows the filter shows.
+- Rules made with `x` and `-` live in `prefs.feed_rules` of the state file. A
+  downgrade to 0.8.x ignores them and drops them the next time it writes the
+  file.
 - The alert thread prefers the daemon's own `cause`, `last_error`, `remedy`
   and `since` (shown in local time) and falls back to the 0.8.3 logic (the
   time in `alerts.json`, the newest log line) when they are absent.
