@@ -44,21 +44,33 @@ and write a reply for you. Everything here is opt-in. A source with no
   new `nudge_template` setting (default `Hi {first}, any news on {topic}?`),
   through the same confirm and send path (draft mode stays a Slack draft).
 - **`done_reaction`** (new setting, off by default): after the undo window, `d`
-  on a row with a Slack message also adds that emoji through the existing
-  `react:` path. It needs `react:`, skips a row with no message, and is not sent
-  after a conflict.
+  on a row with its own Slack message also adds that emoji through the existing
+  `react:` path. It needs `react:`. It uses `reply_to.message_ts` only (never
+  the thread root, unlike `E`), and with acts on it is sent only after the
+  source answered `ok`: a shadow answer, a failure kept for a retry or a
+  conflict skip it with a toast. Quitting drops it.
 - **Health strip**: `N not synced` while ops wait for a retry, and `shadow`
   when the last act reply said shadow.
 - **`L` is the ops log** when any source lists acts: time, action, item and
   result of the ops sent, from `state/inbox-ops-log.jsonl` (capped at 500
   rows). `u` on a `close` or `mute` row sends the inverse (`reopen` /
-  `unmute`) after a confirm; `a` shows the session audit log. Without acts `L`
+  `unmute`) after a confirm, once per op; `a` shows the session audit log. Without acts `L`
   is the session audit log as before.
 - `tests/inbox_fake_source.py`: a fake command source that records requests
   and answers ok, shadow, conflict or failure as configured.
 
+- The pending op is written **before** the `act` call (a kill during it leaves
+  the op for a retry with the same `op_id`) and the files are fsynced with their
+  directory; a newer op for the same item replaces its older pending ones; a
+  conflict on a retry leaves a mark you made since alone; ops of a source no
+  longer configured are not counted in `N not synced`; an op that cannot be
+  stored is reported as lost.
+
 ### Changed
 
+- `w` and `!` on a row whose source lists no acts now toast "Acts are not
+  enabled for this source" (they did nothing before; the other keys are
+  unchanged).
 - `w` and `D` are now the inbox's own keys (and `!`, which is not a letter):
   `w` and `D` are no longer free for `actions:`. The free letters are
   `h l p t z` and `B F H J K N O Q U V W Z`.
@@ -68,7 +80,11 @@ and write a reply for you. Everything here is opt-in. A source with no
   the optional `op_id`, `args` and `seen`.
 - Quitting inside the undo window of a `d`, `s` or mute still commits the local
   mark; the op is kept in the pending file instead of being sent (quitting never
-  waits for a source). A `w` or `!` is cancelled on quit, like a send.
+  waits for a source) and a done reaction is dropped. A `w` or `!` is cancelled
+  on quit, like a send. A running `D` draft or ops-log undo asks before
+  quitting, like a polish; the quit message says when a done reaction may
+  already have been posted.
+- `update_hints` no longer fails on a message that arrives during teardown.
 - The help screen, the footer hints (for rows whose source lists acts) and the
   command palette describe the new keys.
 

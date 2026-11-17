@@ -401,6 +401,23 @@ be remembered).
   5 minutes, in a worker. A success (`ok` or `shadow`) removes the entry; a
   `conflict` removes it too and puts the local mark back; a failure keeps it
   for the next try.
+- **Written before the call.** The op is stored (tries 1, last try now) before
+  `act` is called and removed once the source answers `ok`, `shadow` or
+  `conflict`, so a crash or a kill during the call leaves it for the next
+  session, which retries it with the same `op_id`. The files are fsynced, and
+  so is their directory. If the entry cannot even be written and the call then
+  fails, the op is **lost**: an error toast says the source never got it.
+- **A newer op replaces an older pending one for the same item** (a state act
+  such as `close`, `snooze`, `mute`, `waits_on`; a `relay` is an event and is
+  never replaced), and so does a successful inverse from the ops log: a stale
+  retry must not undo or contradict what you decided since.
+- **A conflict on a retry puts the local mark back only if it is still the one
+  the op was made with**: a mark made after the op was queued (a later snooze,
+  say) is a newer decision and stays.
+- Entries of a source that is no longer in `inbox.yaml` are **not counted** in
+  `N not synced` (nothing can retry them, so the number could never clear).
+  They stay on file, a source put back finds them again, and they expire after 7
+  days like any entry.
 - It is capped at 50 ops (the oldest are dropped first), and an entry older
   than 7 days is dropped. A toast says how many were dropped, because those
   ops will never reach the source.
@@ -433,8 +450,9 @@ sent (time, action, item, result, message), newest first, from
 when it was resent. `u` on a `close` or `mute` that reached the source (ok or
 shadow) asks to confirm, then sends the inverse (`reopen` or `unmute`, with
 `seen.ts` set to now) and drops the local mark, so the row returns; there is no
-undo window and the inverse is not retried. Other rows have no inverse. `a`
-shows the session audit log (what `L` shows without acts), `esc` closes.
+undo window and the inverse is not retried. A row an inverse already undid
+offers no second `u`; a failed inverse leaves it undoable. Other rows have no
+inverse. `a` shows the session audit log (what `L` shows without acts), `esc` closes.
 
 ### Draft for me (`D`)
 
@@ -454,28 +472,47 @@ logged as `inbox-draft`. `D` works on any source, with or without `acts:`.
 ### `nudge_template` (`n` without a stored draft)
 
 A waiting row that has no draft normally says "Nudge not due yet". On a row of
-a source that lists any act, `n` instead fills the Draft pane from the
-`nudge_template` setting and goes through the normal confirm and send path (so
+a source that lists any act, `n` instead takes the text from the
+`nudge_template` setting and goes through the normal confirm and send path. The
+text is only shown in the confirm screen and is never stored as the row's
+draft, so cancelling leaves the row as it was and `D` still works (so
 `send.mode: draft` still places a Slack draft, and the precheck and
 destinations are unchanged). The template may use `{first}` (the first word of
-the person's name), `{who}` (the whole name) and `{topic}` (the row's gist cut
-to one line of 80 characters); any other field, a format spec or an unbalanced
+the person's first name without punctuation; `there` when the sender is a
+channel such as `#launch`, You, or a name with no letters), `{who}` (the whole
+name) and `{topic}` (the row's gist cut to one line of 80 characters); any other field, a format spec or an unbalanced
 brace is a settings error. Write a literal brace as `{{` or `}}`.
 
 ### `done_reaction`
 
 `done_reaction: white_check_mark` (an emoji name; off by default; it needs a
-`react:` block) makes `d` also react to the row's message once the undo window
-ends, through the same pinned call as `E` and with the same safeguards. It is
-skipped for a row with no `reply_to.message_ts` or `thread_ts`, for digest and
-saved rows, and after a conflict (the row was reopened); a reaction that fails
-toasts a warning and does not undo the `d`. It works with or without `acts:`.
+`react:` block) makes `d` also react to the row's own message once the undo
+window ends, through the same pinned call as `E` and with the same safeguards.
+
+- **Only `reply_to.message_ts`.** Unlike `E`, which falls back to `thread_ts`,
+  the done reaction never does: a thread's root post is somebody else's
+  message. A row with only a `thread_ts` (or no `reply_to`) gets no reaction.
+- **Only when the source took the close for real.** With acts on, the reaction
+  is sent after the `close` act answered `ok`, never after a shadow answer, a
+  failure kept for a retry, a lost op or a conflict; the toast says
+  `reaction skipped (shadow)`, `(not synced)` or `(conflict)`. On a row whose
+  source lists no acts it follows the local mark directly.
+- Skipped for digest and saved rows. A reaction that fails toasts a warning and
+  does not undo the `d`.
+- **Quitting drops it.** Quitting inside the undo window commits the local mark
+  but sends no reaction (the quit message says so). If the `d` was already
+  running, the reaction may already have been posted: the quit message says that
+  too.
+
+It works with or without `acts:`.
 
 ### Health strip
 
 `N not synced` (warning colour) shows while the pending file has entries, and
-`shadow` shows once the last act reply had `shadow` true, until a later reply
-says otherwise. Neither shows without acts. With acts on and no
+`shadow` shows once the last act reply the source took (`ok` or `shadow`; a
+conflict or a failure does not change it) had `shadow` true, until a later reply
+says otherwise. It is rebuilt at startup from the newest such row of the ops
+log. Neither shows without acts. With acts on and no
 `health.heartbeats`/reader the strip appears for these two alone.
 
 ## Built-in `events` source
@@ -1334,7 +1371,9 @@ with `x` and `-` are kept there too, as `prefs.feed_rules` (see [Feed](#feed)).
   rows) and `<base>/state/inbox-ops-pending.jsonl` (ops waiting for a retry,
   at most 50, none older than 7 days) are kept the same way (mode 0600, atomic,
   locked). See [Acts](#acts). A draft made with `D` is kept on the item's mark
-  (`draft`, `draft_key`) and survives `u` (undo) of a done mark.
+  (`draft`, `draft_key`) and survives `u` (undo) of a done mark. Each mark also
+  records when it was last made (`marked`), which a conflict uses to leave a
+  newer mark alone.
 - `<base>/state/inbox-summary/cache.json` holds the AI summaries (see
   [AI summary](#ai-summary-i)): mode 0600 in a 0700 directory of its own, the
   200 most recently used entries.

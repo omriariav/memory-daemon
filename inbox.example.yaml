@@ -167,14 +167,17 @@ alert_urgent_max_age_h: 6
 #   allow_suggested: false   # true: a suggestion outside `emojis` is offered too
 #   # model: haiku
 
-# Done reaction: with this set, d also adds this emoji to the row's message
-# once the undo window ends (the same pinned call as E, so it needs the react:
-# block above; skipped for a row with no message). Off until set.
+# Done reaction: with this set, d also adds this emoji to the row's own message
+# (reply_to.message_ts only, never a thread's root post) once the undo window
+# ends, through the same pinned call as E, so it needs the react: block above.
+# With acts on, only after the source answered ok (not after shadow, a failure
+# or a conflict); quitting drops it. Off until set.
 # done_reaction: white_check_mark
 
 # The text n uses on a waiting row of a source that lists `acts:` when no draft
 # is stored. {first} = the person's first name, {who} = the whole name,
-# {topic} = the row's gist (one line, up to 80 characters). It goes through the
+# {topic} = the row's gist (one line, up to 80 characters); {first} is "there"
+# for a channel. The text is only shown in the confirm screen. It goes through the
 # normal confirm and send path. See "Acts" in docs/inbox.md.
 # nudge_template: "Hi {first}, any news on {topic}?"
 
