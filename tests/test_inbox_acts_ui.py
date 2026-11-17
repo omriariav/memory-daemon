@@ -523,6 +523,27 @@ class DraftAndNudgeTest(Base):
             await pilot.press("escape")
             await pilot.pause(0.2)
             self.assertEqual(self.src.requests(), [])
+            # Cancelled: the template is not left behind as the row's draft.
+            self.assertEqual(app.current.draft, "")
+
+    async def test_a_cancelled_n_template_does_not_block_D(self):
+        complete_calls = []
+        app = self.app([self.waiting()], view="waiting",
+                       actions=self.actions(
+                           copy=True, summary=self.summary(),
+                           complete=lambda p, **k: complete_calls.append(1)
+                           or "A real draft"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("n")
+            await pilot.pause(0.3)
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertEqual(app.current.draft, "")
+            await pilot.press("D")
+            self.assertTrue(await until(pilot, lambda: app.current.draft))
+            self.assertEqual(app.current.draft, "A real draft")
+            self.assertEqual(len(complete_calls), 1)
 
     async def test_n_uses_the_configured_template(self):
         app = self.app([self.waiting()], view="waiting",
@@ -605,6 +626,94 @@ class DoneReactionTest(Base):
             await pilot.pause(0.5)
             self.assertEqual(calls, [])
 
+    async def test_a_thread_only_row_gets_no_reaction(self):
+        """Without reply_to.message_ts the reaction would land on the root
+        post of someone else's thread."""
+        calls = []
+        thread_only = item(1, meta={"reply_to": {
+            "channel": support.CHANNEL, "thread_ts": support.THREAD}})
+        app = self.app([thread_only, item(2)],
+                       actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(app.current_key, "t:1")
+            await pilot.press("d")
+            await until(pilot, lambda: self.src.requests())
+            await pilot.pause(0.5)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.src.requests()[0]["action"], "close")
+
+    async def test_a_shadow_op_gets_no_reaction_and_says_so(self):
+        self.src.configure("shadow")
+        calls = []
+        app = self.app([item(1), item(2)],
+                       actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            self.assertTrue(await until(pilot, lambda: any(
+                "reaction skipped (shadow)" in t for t in toasts(app))))
+            self.assertEqual(calls, [])
+
+    async def test_an_unsynced_op_gets_no_reaction_and_says_so(self):
+        self.src.configure("fail")
+        calls = []
+        app = self.app([item(1), item(2)],
+                       actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            self.assertTrue(await until(pilot, lambda: any(
+                "reaction skipped (not synced)" in t for t in toasts(app))))
+            self.assertEqual(calls, [])
+
+    async def test_a_conflict_says_the_reaction_was_skipped(self):
+        self.src.configure("conflict")
+        calls = []
+        app = self.app([item(1)], actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            self.assertTrue(await until(pilot, lambda: any(
+                "reaction skipped (conflict)" in t for t in toasts(app))))
+            self.assertEqual(calls, [])
+
+    async def test_quitting_inside_the_window_skips_the_reaction(self):
+        calls = []
+        app = self.app([item(1), item(2)], undo_s=5,
+                       actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(app, "exit") as leave:
+                await pilot.press("d")
+                await pilot.pause(0.2)
+                await pilot.press("q")
+                await pilot.pause(0.3)
+            message = leave.call_args.kwargs["message"]
+            self.assertIn("done reaction(s) skipped", message)
+        self.assertEqual(calls, [])
+
+    async def test_quitting_while_the_act_runs_warns_about_the_reaction(self):
+        self.src.configure("ok", sleep=2)
+        calls = []
+        app = self.app([item(1), item(2)],
+                       actions=self.react_actions(calls, "eyes"))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            await until(pilot, lambda: app.running)
+            await pilot.pause(0.3)
+            await pilot.press("q")                  # asks first
+            await pilot.pause(0.2)
+            with mock.patch.object(app, "exit") as leave:
+                await pilot.press("q")
+                await pilot.pause(0.3)
+            message = leave.call_args.kwargs["message"]
+            self.assertIn("may already have reached the source", message)
+            self.assertIn("done reaction (:eyes:) may already have been "
+                          "posted", message)
+            await until(pilot, lambda: not app.running, tries=100)
+
     async def test_undo_cancels_the_reaction_too(self):
         calls = []
         app = self.app([item(1)], undo_s=5,
@@ -652,6 +761,134 @@ class DoneReactionTest(Base):
             await pilot.press("d")
             self.assertTrue(await until(pilot, lambda: calls))
             self.assertEqual(self.src.requests(), [])
+
+
+class ReviewFixesUITest(Base):
+    async def test_a_conflict_does_not_set_the_shadow_marker(self):
+        self.src.configure("conflict")
+        app = self.app([item(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            await until(pilot, lambda: any(
+                r["status"] == "conflict" for r in app.audit))
+            self.assertFalse(app.act_shadow)
+
+    async def test_the_shadow_marker_comes_back_after_a_restart(self):
+        self.src.configure("shadow")
+        a = self.actions()
+        from workspace_daemon.inbox.models import from_v1
+        it = from_v1(item(1))
+        it.origin = "src"
+        a.send_act(it, "close", {})                  # an earlier session
+        app = self.app([item(2)], actions=self.actions())
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertTrue(app.act_shadow)
+            await pilot.pause(0.4)
+            strip = app.query_one("#strip", HealthStrip)
+            self.assertTrue(strip.display)
+            self.assertIn("shadow", strip.render_strip(app, app.pal, 120).plain)
+
+    async def test_a_lost_op_is_an_error_toast(self):
+        self.src.configure("fail")
+        app = self.app([item(1), item(2)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            with mock.patch.object(acts.PendingOps, "add",
+                                   side_effect=OSError("disk full")):
+                await pilot.press("d")
+                self.assertTrue(await until(pilot, lambda: any(
+                    "never got it" in t for t in toasts(app))))
+            self.assertEqual(app.act_pending, 0)
+
+    async def test_an_undone_row_does_not_offer_u_again(self):
+        app = self.app([item(1), item(2)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            self.assertTrue(await until(pilot, lambda: any(
+                r["status"] == "synced" for r in app.audit)))
+            await pilot.press("L")
+            await pilot.pause(0.3)
+            await pilot.press("u")
+            await pilot.pause(0.3)
+            await pilot.press("y")
+            self.assertTrue(await until(pilot, lambda: len(
+                self.src.requests()) == 2))
+            await pilot.pause(0.5)
+            self.assertEqual(len(app.screen_stack), 1)
+            await pilot.press("L")
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, OpsScreen)
+            close_row = next(r for r in app.screen.rows
+                             if r["action"] == "close")
+            self.assertTrue(close_row.get("undone"))
+            await pilot.press("u")                   # on the newest row (the
+            await pilot.pause(0.2)                   # reopen) or the close:
+            self.assertIsInstance(app.screen, OpsScreen)     # never a confirm
+            await pilot.press("j", "u")
+            await pilot.pause(0.2)
+            self.assertIsInstance(app.screen, OpsScreen)
+            self.assertEqual(len(self.src.requests()), 2)
+
+    async def test_quit_waits_for_a_running_draft(self):
+        import threading
+        release = threading.Event()
+
+        def complete(prompt, **kw):
+            release.wait(10)
+            return "late"
+        app = self.app([item(1)], actions=self.actions(
+            summary=settings.validate({"summary": {}})["summary"],
+            complete=complete))
+        try:
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.press("D")
+                await until(pilot, lambda: app._draft_running)
+                await pilot.press("q")
+                await pilot.pause(0.2)
+                self.assertFalse(app._quitting)           # asked first
+                self.assertTrue(any("draft for me still running" in t
+                                    for t in toasts(app)))
+                release.set()
+                await pilot.pause(0.5)
+        finally:
+            release.set()
+
+    async def test_quit_waits_for_a_running_inverse(self):
+        app = self.app([item(1), item(2)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("d")
+            await until(pilot, lambda: any(
+                r["status"] == "synced" for r in app.audit))
+            self.src.configure("ok", sleep=1.5)
+            await pilot.press("L")
+            await pilot.pause(0.3)
+            await pilot.press("u")
+            await pilot.pause(0.3)
+            await pilot.press("y")
+            await until(pilot, lambda: app._inverse_running)
+            await pilot.press("q")
+            await pilot.pause(0.2)
+            self.assertFalse(app._quitting)
+            self.assertTrue(any("undo in the source still running" in t
+                                for t in toasts(app)))
+            await until(pilot, lambda: not app._inverse_running, tries=100)
+
+    async def test_update_hints_survives_a_missing_bar(self):
+        app = self.app([item(1)])
+        # Before mount (as during teardown) there is no #hints to find.
+        app.update_hints()
+
+    async def test_the_d_hint_needs_draft_me_configured(self):
+        app = self.app([item(1)])                  # acts on, no summary/polish
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            keys = {k for k, _label in app.hints()}
+            self.assertNotIn("D", keys)
 
 
 class AuditTest(Base):
