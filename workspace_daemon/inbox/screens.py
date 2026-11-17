@@ -18,8 +18,7 @@ from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi
-from .models import SOURCES
-from .widgets import fit, fmt_age, palette, vis
+from .widgets import vis
 
 
 CHOICE_LABELS = {"draft": "Draft in Slack", "send": None,
@@ -491,12 +490,20 @@ class PolishScreen(ModalScreen):
 
 
 HELP = [
-    ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"), ("1-4", "jump to section"),
-              ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"), ("f", "filter by source"),
+    ("Views", [("1 2 3 4 5", "Inbox · Waiting · Tasks · Feed · Health"),
+               ("[ / ]", "previous / next group in the view (section, person, routine)"),
+               ("", "the same items in every view: marks and the undo work alike")]),
+    ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"),
+              ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"),
+              ("f", "filter by source (in the Feed: by routine)"),
               ("R", "show / hide resolved alerts"),
-              ("A", "show all: ask sources that support it for everything"),
-              ("S", "saved: what the daemon saved to memory (read-only)"),
+              ("A", "show all: sources that support it, and Feed rows older than the window"),
+              ("S", "Feed, filtered to saved to memory"),
               ("esc", "clear filters / back")]),
+    ("Feed", [("x", "mute this row: this kind from this routine / this routine / titles like it, for 1 day, 1 week or always"),
+              ("-", "less like this: fold the routine's rows of a day into one"),
+              ("M", "rules: the ones in inbox.yaml and the ones made here (space switches a rule off, delete removes it)"),
+              ("d", "dismiss"), ("enter", "details")]),
     ("Act", [("a", "approve draft (confirm first) / ack / accept an invite"), ("e", "edit draft  (esc / ctrl+s done)"),
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link (the Slack thread with slack_open:)"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
@@ -513,7 +520,7 @@ HELP = [
                            ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),
                            ("I", "ask for a new summary even if one is cached"),
                            ("", "read-only: nothing is confirmed or changed")]),
-    ("Copy", [("y", "copy this item (sender, where, gist, link)"), ("Y", "copy every item in this section"),
+    ("Copy", [("y", "copy this item (sender, where, gist, link)"), ("Y", "copy every item in this group"),
               ("ctrl+p", "palette: copy section as Markdown"),
               ("mouse drag", "select text in the thread or draft pane")]),
     ("App", [("ctrl+p", "command palette"), ("ctrl+t", "dark / light theme"), ("L", "audit log"),
@@ -596,80 +603,106 @@ class AuditScreen(ModalScreen):
         self.dismiss(None)
 
 
-class SavedScreen(ModalScreen):
-    """What the daemon saved to memory recently. Read-only: these rows are not
-    inbox items, so nothing here can be acted on except opening a link."""
+class RulesScreen(ModalScreen):
+    """The Feed rules: the ones from `inbox.yaml` (read-only) and the ones
+    made in the UI, which can be switched off (space) or removed (delete)."""
 
-    BINDINGS = [Binding("escape,S,q", "close", "Close"), Binding("o", "open", "Open"),
-                Binding("j", "cursor(1)", show=False), Binding("k", "cursor(-1)", show=False)]
+    BINDINGS = [Binding("escape,M,q", "close", "Close"),
+                Binding("space", "toggle", "Switch on/off", show=False),
+                Binding("delete,backspace", "remove", "Remove", show=False),
+                Binding("j", "cursor(1)", show=False),
+                Binding("k", "cursor(-1)", show=False)]
 
-    def __init__(self, rows, error=None, days=None, visual=False, opener=None):
+    def __init__(self, config_rules, ui_rules, on_toggle, on_remove,
+                 now=None):
+        """`on_toggle(rule_id, enabled)` and `on_remove(rule_id)` write the
+        change; `ui_rules` is a list the screen re-reads through `reload`."""
         super().__init__()
-        self.rows, self.error, self.days = rows, error, days
-        self.visual, self.opener = visual, opener
+        self.config_rules, self.ui_rules = list(config_rules), list(ui_rules)
+        self.on_toggle, self.on_remove = on_toggle, on_remove
+        self.now = now or time.time()
+        self.entries = []          # (origin, rule) per table row
 
     def compose(self) -> ComposeResult:
         head = Text()
-        head.append("Saved to memory", Style(bold=True))
-        span = f"  last {self.days:g} days" if self.days else ""
-        head.append(f"{span}  ·  o open  ·  esc back  (read-only)", Style(dim=True))
-        with Vertical(id="saved"):
-            yield Static(head, id="saved-title")
-            yield DataTable(id="saved-table", cursor_type="row", zebra_stripes=True)
+        head.append("Feed rules", Style(bold=True))
+        head.append("  tried top to bottom, the first match wins  ·  "
+                    "space on/off  ·  delete remove  ·  esc back",
+                    Style(dim=True))
+        with Vertical(id="rules"):
+            yield Static(head, id="rules-title")
+            yield DataTable(id="rules-table", cursor_type="row",
+                            zebra_stripes=True)
 
     def on_mount(self):
-        tb = self.query_one("#saved-table", DataTable)
-        tb.add_columns("", "Title", "Time", "Kind")
-        self._fill(tb)
+        tb = self.query_one("#rules-table", DataTable)
+        tb.add_columns("From", "On", "Action", "Matches", "Until")
+        self._fill()
         tb.focus()
 
-    def _fill(self, tb):
-        pal = palette(self.app)
-        now = time.time()
-        for row in self.rows:
-            glyph, color, _label = SOURCES.get(row["source"], SOURCES["other"])
-            when = dt.datetime.fromtimestamp(row["ts"]).strftime("%a %H:%M")
-            tb.add_row(Text(glyph, Style(color=pal[color], bold=True)),
-                       Text(fit(vis(row["title"], self.visual), 90)),
-                       Text(f"{when}  {fmt_age(now - row['ts'])} ago"),
-                       Text(row["kind"]), key=row["id"])
-        if not self.rows:
-            msg = self.error or "nothing saved in this period"
-            tb.add_row("", Text(msg, Style(italic=True)), "", "")
-
-    def reload(self, rows, error=None):
-        """Replace the rows (the daemon saved something new), keeping the
-        cursor on the same row when it is still listed."""
-        tb = self.query_one("#saved-table", DataTable)
-        current = self._current_row()
-        keep = current["id"] if current else None
-        self.rows, self.error = rows, error
+    def _fill(self):
+        from . import feedrules
+        tb = self.query_one("#rules-table", DataTable)
         tb.clear()
-        self._fill(tb)
-        if keep is not None:
-            for n, row in enumerate(self.rows):
-                if row["id"] == keep:
-                    tb.move_cursor(row=n)
-                    break
+        self.entries = ([("here", r) for r in sorted(
+            self.ui_rules, key=lambda r: -r.get("created", 0))]
+            + [("inbox.yaml", r) for r in self.config_rules])
+        for origin, rule in self.entries:
+            until = rule.get("until")
+            if origin == "inbox.yaml":
+                on, until_text = "yes", "-"
+            else:
+                expired = until is not None and until <= self.now
+                on = "no" if (rule.get("enabled") is False) else (
+                    "expired" if expired else "yes")
+                until_text = ("always" if until is None else
+                              dt.datetime.fromtimestamp(until).strftime("%a %H:%M"))
+            tb.add_row(origin, on, rule["action"],
+                       Text(feedrules.rule_label(rule)), until_text,
+                       key=f"{origin}:{rule.get('id', id(rule))}")
+        if not self.entries:
+            tb.add_row("", "", "", Text("no rules yet: x on a Feed row makes one",
+                                        Style(italic=True)), "")
 
-    def _current_row(self):
-        tb = self.query_one("#saved-table", DataTable)
-        if not self.rows or tb.row_count == 0:
+    def reload(self, ui_rules):
+        tb = self.query_one("#rules-table", DataTable)
+        row = tb.cursor_row
+        self.ui_rules = list(ui_rules)
+        self._fill()
+        if self.entries:
+            tb.move_cursor(row=min(row, len(self.entries) - 1))
+
+    def _current(self):
+        tb = self.query_one("#rules-table", DataTable)
+        if not self.entries or not 0 <= tb.cursor_row < len(self.entries):
             return None
-        index = tb.cursor_row
-        return self.rows[index] if 0 <= index < len(self.rows) else None
+        return self.entries[tb.cursor_row]
 
     def action_cursor(self, step):
-        tb = self.query_one("#saved-table", DataTable)
+        tb = self.query_one("#rules-table", DataTable)
         tb.action_cursor_down() if step > 0 else tb.action_cursor_up()
 
-    def action_open(self):
-        row = self._current_row()
-        if row is None or not row.get("link"):
-            self.notify("This row has no link", timeout=2, markup=False)
+    def action_toggle(self):
+        cur = self._current()
+        if cur is None:
             return
-        if self.opener is not None:
-            self.opener(row)
+        origin, rule = cur
+        if origin != "here":
+            self.notify("This rule is in inbox.yaml: edit it there",
+                        timeout=3, markup=False)
+            return
+        self.on_toggle(rule["id"], rule.get("enabled") is False)
+
+    def action_remove(self):
+        cur = self._current()
+        if cur is None:
+            return
+        origin, rule = cur
+        if origin != "here":
+            self.notify("This rule is in inbox.yaml: edit it there",
+                        timeout=3, markup=False)
+            return
+        self.on_remove(rule["id"])
 
     def action_close(self):
         self.dismiss(None)

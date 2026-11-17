@@ -168,6 +168,8 @@ def _map_source(event):
         return "recording"
     if src == "daemon" and kind == "alert":
         return "alert"
+    if src == "sheet":
+        return "sheet"
     return None
 
 
@@ -381,6 +383,9 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     elif source == "recording":
         gist = title
         where = _text(event.get("source")) or "recording"
+    elif source == "sheet":
+        gist = title
+        where = _text(event.get("routine")) or "sheet"
     else:
         gist = title
         where = "daemon"
@@ -401,6 +406,18 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     actions = ["ack"] if source != "email" else []
     if link is not None:
         actions.append("open")  # nothing to open without a link
+    extra = {}
+    routine = _text(event.get("routine"))
+    if routine:
+        extra["routine"] = routine      # the Feed groups by it
+    if event.get("title"):
+        extra["title"] = itm.truncate(title, itm.GIST_MAX)
+    if start_ts is not None:
+        extra["starts"] = start_ts      # `starts_within_h` Feed rules
+    if source == "alert":
+        extra.update(_alert_fields(details))
+        if _benign_only(_alert_issues(details)):
+            extra["benign"] = True
     return itm.make_item(
         id=f"events:{eid}", source=source,
         section="urgent" if urgent else "fyi",
@@ -411,8 +428,57 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         meta=dict({"source_id": _text(event.get("source_id")),
                    "kind": _text(kind)},
                   **({"key": key} if key else {}),
-                  **({"memory_id": memory_id} if memory_id else {})),
+                  **({"memory_id": memory_id} if memory_id else {}),
+                  **extra),
     )
+
+
+ALERT_FIELD_MAX = 300
+# Optional alert details a newer daemon adds (cause, the last error, a
+# remedy, when the condition began). Each is shown when present and ignored
+# when not.
+ALERT_TEXT_FIELDS = ("cause", "last_error", "remedy", "connector")
+# What each `details.cause` value reads as; another value shows as its own
+# words (underscores as spaces), so a cause a newer daemon adds still reads.
+CAUSE_LABELS = {
+    "connector_auth": "connector sign-in expired",
+    "connector_down": "connector not answering",
+    "tool_error": "connector tool error",
+    "memory_duplicate": "memory duplicate check failed",
+    "meeting_match": "meeting could not be matched",
+    "budget": "budget cap reached",
+    "run_state": "run state",
+    "unknown": "cause not known",
+}
+
+
+def cause_label(cause):
+    """A readable phrase for a `details.cause` value."""
+    if not isinstance(cause, str) or not cause:
+        return ""
+    return CAUSE_LABELS.get(cause) or cause.replace("_", " ")
+
+
+def _alert_fields(details):
+    """The optional alert details as cleaned one-line text (`cause`,
+    `last_error`, `remedy`) and `since` (an ISO time as epoch seconds, else
+    the cleaned text), left out when absent or blank."""
+    out = {}
+    for name in ALERT_TEXT_FIELDS:
+        text = itm.truncate(_text(details.get(name)), ALERT_FIELD_MAX)
+        if text:
+            out[name] = text
+    raw = details.get("since")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) \
+            and raw > 0:
+        out["since"] = float(raw)
+    else:
+        parsed = parse_iso(raw)
+        if parsed is not None:
+            out["since"] = parsed
+        elif _text(raw):
+            out["since"] = itm.truncate(_text(raw), 60)
+    return out
 
 
 def _alert_issues(details):
@@ -494,6 +560,9 @@ def _alert_thread(event, key, since, runlog, now):
         else {}
     routine = _text(details.get("routine")) or _key_routine(key)
     issues = _alert_issues(details)
+    fields = _alert_fields(details)
+    if isinstance(fields.get("since"), float):
+        since = fields["since"]       # the daemon's own time wins
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(since))
     thread = []
     if routine:
@@ -501,14 +570,25 @@ def _alert_thread(event, key, since, runlog, now):
     if issues:
         thread.append({"who": "issues", "ts": since,
                        "text": "; ".join(issues)})
+    if "cause" in fields:
+        text = cause_label(fields["cause"])
+        if fields.get("connector"):
+            text += f" ({fields['connector']})"
+        thread.append({"who": "cause", "ts": since, "text": text})
     thread.append({"who": "active since", "ts": since, "text": stamp})
-    found = runlog.last_error(routine) if routine else None
+    if "last_error" in fields:
+        thread.append({"who": "last error", "ts": since,
+                       "text": fields["last_error"]})
+    found = (runlog.last_error(routine)
+             if routine and "last_error" not in fields else None)
     if found is not None and found[0] is not None \
             and found[0] >= since - LOG_ERROR_LEAD_S:
         thread.append({"who": f"last error, {_age_text(now - found[0])}",
                        "ts": found[0],
                        "text": itm.truncate(itm.clean_line(found[1]),
                                             LOG_LINE_MAX)})
+    if "remedy" in fields:
+        thread.append({"who": "remedy", "ts": since, "text": fields["remedy"]})
     thread.append({"who": "hint", "ts": since, "text": ALERT_HINT})
     return thread
 
@@ -1060,11 +1140,6 @@ def make_units(settings, base_dir):
                 lambda src=src: expand_watch(base_dir, src.get("watch", [])),
                 uses_all=bool(src.get("supports_all"))))
     return units
-
-
-def saved_watch(base_dir):
-    """The files the Saved view depends on."""
-    return lambda: events_files(base_dir)
 
 
 def units_answers(units, marks=None):

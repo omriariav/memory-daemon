@@ -193,7 +193,7 @@ sources:
     # the network): shown under Needs reply when they start within N days.
     # 0 turns it off; the cache must cover the range (docs/inbox.md).
     invites_days: 7
-    # How many days back the Saved view (S key) looks: what the daemon saved
+    # How many days back the Feed's "saved to memory" routine (S key) looks: what the daemon saved
     # to memory (1 to 30).
     saved_days: 2
     # Show only mail captured through a Gmail routine whose search query
@@ -222,12 +222,33 @@ sources:
   #   watch: ["state/comms-inbox.jsonl"]
   #   supports_all: true   # `<argv> list --all` works: the A key uses it
 
+# The Feed (view 4) lists every FYI row by routine. Rows older than window_h
+# age out of it (the A key shows them again). Rules are tried in order, the
+# first match wins; action is show | digest | hide | inbox. Rules made in the
+# Feed with x and - are saved in the inbox state, not here. See docs/inbox.md.
+# feed:
+#   window_h: 24
+#   rules:
+#     - {routine: my-calendar-routine, kind: rsvp, action: hide}
+#     - {routine: my-sheet-routine, action: digest}       # one row a day
+#     - {routine: my-calendar-routine, kind: cancel, starts_within_h: 24, action: inbox}
+#     - {routine: my-calendar-routine, title_regex: "^Weekly", action: hide}
+
+# Health (view 5 and the line under the tab bar). A heartbeat is a file some
+# process touches while it is alive: the cell is OK while its mtime is newer
+# than stale_min, and a warning otherwise (only inside `hours`, local time,
+# when given).
+# health:
+#   heartbeats:
+#     - {name: poller, path: state/poller.alive, stale_min: 10,
+#        hours: "sun-thu 09:00-19:00"}
+
 # Custom actions: your own confirmed write, one key each. Off until set; no
 # default. The command is called with JSON on stdin (never argv): choices
 # (read-only, pick one), prepare (read-only, shows what will happen; may say
 # duplicate), then, after the confirm and the 5 s undo window, run (once, never
-# retried). The key must be one the inbox does not use: h l p t w x z or one
-# of B D F H J K M N O Q U V W Z. A successful run marks the item done
+# retried). The key must be one the inbox does not use: h l p t w z or one
+# of B D F H J K N O Q U V W Z. A successful run marks the item done
 # (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
 # actions:
 #   - key: "p"

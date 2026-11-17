@@ -21,8 +21,22 @@ SOURCES = {
     "recording": ("◉", "ok", "Recording"),
     "alert": ("▲", "warn", "Alert"),
     "drive": ("▤", "accent", "Drive"),
+    "sheet": ("▦", "accent", "Sheet"),
     "other": ("•", "muted", "Other"),
 }
+
+
+def fmt_age(secs):
+    """`now`, `5m`, `2h05m`, `3d`: a short age for a row."""
+    s = max(0, int(secs))
+    if s < 60:
+        return "now"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        h, m = divmod(s // 60, 60)
+        return f"{h}h" if h >= 3 or not m else f"{h}h{m:02d}m"
+    return f"{s // 86400}d"
 
 
 @dataclass
@@ -51,6 +65,11 @@ class Item:
     streamed: bool = False         # UI-only: the draft animation already ran
     saved: bool = False            # UI-only: marked saved to memory (local state)
     hint: str = ""                 # UI-only: a line shown above the thread (warn colour)
+    origin: str = ""               # UI-only: the name of the source that listed it
+    feed: str = "show"             # UI-only: the Feed rule outcome (show/digest/hide/inbox)
+    feed_label: str = ""           # UI-only: what the matching rule says (muted list)
+    members: List["Item"] = field(default_factory=list, repr=False,
+                                  compare=False)   # UI-only: a digest row's items
     raw: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property
@@ -74,6 +93,24 @@ class Item:
         """A daemon alert whose condition has ended (hidden unless R is on).
         Only alerts: another source's `meta.resolved` means nothing here."""
         return self.source == "alert" and self.meta.get("resolved") is True
+
+    @property
+    def routine(self):
+        """The routine (or source name) the Feed groups this row under."""
+        name = self.meta.get("routine") if isinstance(self.meta, dict) else None
+        return name if isinstance(name, str) and name else (
+            self.origin or self.source)
+
+    @property
+    def direction(self):
+        """`←` someone waits on you, `→` you wait on someone, else ''."""
+        if self.section == "waiting":
+            return "→"
+        if (self.section in ("needs_reply", "urgent")
+                and "reply" in self.actions
+                and self.meta.get("kind") != "invite"):
+            return "←"
+        return ""
 
     @property
     def kind(self):

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import yaml
 
-from . import invites, sources, themes
+from . import feedrules, health, invites, sources, themes
+from .views import DEFAULT_WINDOW_H
 
 FILE_NAME = "inbox.yaml"
 BIDI_MODES = ("logical", "visual", "auto")
@@ -22,7 +23,11 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
-            "slack_open", "show_rsvp_replies")
+            "slack_open", "show_rsvp_replies", "feed", "health")
+FEED_KEYS = ("window_h", "rules")
+HEALTH_KEYS = ("heartbeats",)
+HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
+HEARTBEAT_NAME = re.compile(r"^[\w.-]{1,24}$")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s", "mark_done")
@@ -47,7 +52,7 @@ CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEP")
+RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEPxM")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))
@@ -104,6 +109,8 @@ DEFAULTS = {
     "show_rsvp_replies": False,   # true: list other people's RSVP answers
     "team": None,      # the Slack workspace id for slack_open (T...)
     "slack_open": None,   # no default: `o` opens the item's link
+    "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
+    "health": {"heartbeats": []},
 }
 
 
@@ -218,6 +225,9 @@ def validate(raw):
     out["slack_open"] = _check_slack_open(raw.get("slack_open"), team,
                                           problems)
 
+    out["feed"] = _check_feed(raw.get("feed"), problems)
+    out["health"] = _check_health(raw.get("health"), problems)
+
     raw_sources = raw.get("sources")
     if raw_sources is None:
         raw_sources = [{"name": "events", "type": "events"}]
@@ -312,6 +322,81 @@ def validate(raw):
     out["sources"] = built
     if problems:
         raise SettingsError(problems)
+    return out
+
+
+def _check_feed(raw, problems):
+    """The `feed:` block: `window_h` and the `rules` list."""
+    out = {"window_h": DEFAULT_WINDOW_H, "rules": []}
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        problems.append("feed must be a mapping")
+        return out
+    for key in raw:
+        if key not in FEED_KEYS:
+            problems.append(f"feed: unknown key '{key}'")
+    window = raw.get("window_h", DEFAULT_WINDOW_H)
+    if not _num(window) or not 1 <= window <= 24 * 30:
+        problems.append("feed.window_h must be 1 to 720 hours")
+    else:
+        out["window_h"] = float(window)
+    out["rules"] = feedrules.check_rules(raw.get("rules"), "feed.rules",
+                                         problems)
+    return out
+
+
+def _check_health(raw, problems):
+    """The `health:` block: the `heartbeats` list."""
+    out = {"heartbeats": []}
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        problems.append("health must be a mapping")
+        return out
+    for key in raw:
+        if key not in HEALTH_KEYS:
+            problems.append(f"health: unknown key '{key}'")
+    beats = raw.get("heartbeats")
+    if beats is None:
+        return out
+    if not isinstance(beats, list) or len(beats) > health.MAX_HEARTBEATS:
+        problems.append("health.heartbeats must be a list of up to "
+                        f"{health.MAX_HEARTBEATS} entries")
+        return out
+    names = set()
+    for n, beat in enumerate(beats):
+        label = f"health.heartbeats[{n}]"
+        if not isinstance(beat, dict):
+            problems.append(f"{label} must be a mapping")
+            continue
+        start = len(problems)
+        for key in beat:
+            if key not in HEARTBEAT_KEYS:
+                problems.append(f"{label}: unknown key '{key}'")
+        name, path = beat.get("name"), beat.get("path")
+        stale = beat.get("stale_min")
+        hours = beat.get("hours")
+        if not isinstance(name, str) or not HEARTBEAT_NAME.match(name):
+            problems.append(f"{label}.name must be 1-24 chars of [\\w.-]")
+        elif name in names:
+            problems.append(f"{label}.name '{name}' is used twice")
+        else:
+            names.add(name)
+        if (not isinstance(path, str) or not path.strip()
+                or re.search(r"[\x00-\x1f\x7f]", path)):
+            problems.append(f"{label}.path must be a file path (a string)")
+        if not _num(stale) or not 1 <= stale <= 7 * 24 * 60:
+            problems.append(f"{label}.stale_min must be 1 to 10080 minutes")
+        if hours is not None and health.parse_hours(hours) is None:
+            problems.append(f"{label}.hours must look like "
+                            "'sun-thu 09:00-19:00' (days optional)")
+        if len(problems) == start:
+            entry = {"name": name, "path": path.strip(),
+                     "stale_min": float(stale)}
+            if hours is not None:
+                entry["hours"] = hours.strip()
+            out["heartbeats"].append(entry)
     return out
 
 

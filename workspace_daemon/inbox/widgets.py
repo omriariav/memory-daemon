@@ -11,7 +11,9 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
-from .models import SECTIONS, SOURCES, thread_fixed, thread_note
+from . import health as healthmod
+from .models import SOURCES, fmt_age, thread_fixed, thread_note
+from .views import VIEWS
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
@@ -35,18 +37,6 @@ def palette(app):
         "chip_bg": g("primary", "#5588ff"), "code_bg": g("panel", "#222222"),
         "code_fg": g("warning", "#ffaa00"),
     }
-
-
-def fmt_age(secs):
-    s = max(0, int(secs))
-    if s < 60:
-        return "now"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        h, m = divmod(s // 60, 60)
-        return f"{h}h" if h >= 3 or not m else f"{h}h{m:02d}m"
-    return f"{s // 86400}d"
 
 
 def rel(now, ts):
@@ -113,39 +103,48 @@ class SelectableText(Static):
 
 
 class Queue(OptionList):
-    """Sectioned queue. Rows are Options keyed `i:<item id>`; headers are
-    disabled Options."""
+    """The grouped queue. Rows are Options keyed `i:<item id>`; the group
+    headers (a section, a person, a routine) are disabled Options."""
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.rows = []
         self.first_idx = {}
 
-    def build(self, items, counts, pal, now, keep=None, ghost=None,
+    def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
               ghost_at=None, visual=False):
+        """Draw `groups` (`views.Group`). A group with no rows is skipped,
+        unless it is `keep_empty` (then a dash stands in). `ghost` is a row
+        that just left `ghost_group` at position `ghost_at`."""
         width = max(24, (self.size.width or 40) - 1)
         opts = []
         self.rows = []
         first_idx = {}
-        by_sec = {k: [i for i in items if i.section == k] for k, _ in SECTIONS}
-        for k, title in SECTIONS:
-            col = pal["urgent"] if k == "urgent" else pal["muted"]
+        for g in groups:
+            rows = g.items
+            if not rows and not g.keep_empty and not (
+                    ghost is not None and ghost_group == g.key):
+                continue
+            col = pal["urgent"] if g.hot else pal["muted"]
             head = Text()
-            head.append(f"{title.upper()}", Style(color=col, bold=True))
-            head.append(f"  {counts.get(k, 0)}", Style(color=col if k == "urgent" else pal["muted"]))
-            opts.append(Option(head, disabled=True, id=f"hdr:{k}"))
-            rows = by_sec[k]
-            first_idx[k] = len(opts)
-            if not rows:
-                opts.append(Option(Text("  –", Style(color=pal["muted"])), disabled=True, id=f"empty:{k}"))
-                first_idx[k] = -1
+            head.append(g.title, Style(color=col, bold=True))
+            head.append("  " + (g.tail or str(len(rows))),
+                        Style(color=col if g.hot else pal["muted"]))
+            opts.append(Option(head, disabled=True, id=f"hdr:{g.key}"))
+            first_idx[g.key] = len(opts)
+            if not rows and ghost is None:
+                opts.append(Option(Text("  –", Style(color=pal["muted"])),
+                                   disabled=True, id=f"empty:{g.key}"))
+                first_idx[g.key] = -1
                 continue
             for n, it in enumerate(rows):
-                if ghost is not None and ghost.section == k and ghost_at == n:
+                if ghost is not None and ghost_group == g.key and ghost_at == n:
                     opts.append(self._ghost_opt(ghost, width, pal, visual))
-                opts.append(Option(self._row(it, width, pal, now, visual), id=ITEM_PREFIX + it.key))
+                opts.append(Option(self._row(it, width, pal, now, visual),
+                                   id=ITEM_PREFIX + it.key))
                 self.rows.append(it)
-            if ghost is not None and ghost.section == k and ghost_at is not None and ghost_at >= len(rows):
+            if (ghost is not None and ghost_group == g.key
+                    and ghost_at is not None and ghost_at >= len(rows)):
                 opts.append(self._ghost_opt(ghost, width, pal, visual))
         self.first_idx = first_idx
         self.clear_options()
@@ -173,8 +172,13 @@ class Queue(OptionList):
         t.append(f" {mark} ", Style(color=pal["ok"] if resolved else pal["urgent"] if urgent else pal["primary"]))
         glyph, scol, _ = SOURCES.get(it.source, SOURCES["other"])
         t.append(glyph + " ", Style(color=pal[scol], bold=True))
+        arrow = it.direction
+        if arrow:      # ← waits on you, → you wait on them
+            t.append(arrow + " ", Style(color=pal["muted"], bold=True))
         who = fit(vis(it.who, visual), max(8, width // 2 - 2))
         t.append(who, Style(bold=True, color=pal["urgent"] if urgent else None))
+        if it.meta.get("kind") == "invite":
+            t.append(" · invite", Style(color=pal["muted"]))
         if it.hint:
             t.append(" !", Style(color=pal["warn"], bold=True))
         if it.saved:  # saved to memory (m): a small glyph, the row stays
@@ -183,6 +187,8 @@ class Queue(OptionList):
             t.append(" " + THREAD_GLYPH, Style(color=pal["muted"]))
         marked = it.saved or bool(it.thread_memory_id)
         where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9
+                                  - (2 if arrow else 0)
+                                  - (9 if it.meta.get("kind") == "invite" else 0)
                                   - (2 if marked else 0) - (2 if it.hint else 0)))
         if where:
             t.append("  " + where, Style(color=pal["muted"]))
@@ -223,6 +229,12 @@ class ThreadView(VerticalScroll):
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
         out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
+        if item.direction == "←":
+            out.append(f"← {vis(item.who, visual)} waits on you · asked "
+                       f"{ago(now, item.ts)}\n", Style(color=pal["muted"]))
+        elif item.direction == "→":
+            out.append(f"→ you wait on {vis(item.who, visual)} · asked "
+                       f"{ago(now, item.ts)}\n", Style(color=pal["muted"]))
         if item.hint:  # e.g. an RSVP the calendar never confirmed
             out.append("! " + item.hint + "\n", Style(color=pal["warn"], bold=True))
         if item.memory_id:  # already saved to memory (the ◆ of the row)
@@ -366,21 +378,36 @@ class HintBar(Static):
         self.update(t)
 
 
+STATE_COLORS = {healthmod.OK: "ok", healthmod.WARN: "warn",
+                healthmod.FAIL: "urgent", healthmod.BUSY: "muted",
+                healthmod.OFF: "muted"}
+
+
 class StatusHeader(Static):
+    """The tab bar: the version, the five views with their counts, then the
+    freshness and the clock."""
+
     def render_header(self, app, pal, width):
         now = time.time()
-        n_open = len(app.items)
-        n_urg = sum(1 for i in app.items if i.section == "urgent")
+        counts = app.view_counts()
         left = Text(no_wrap=True)
         left.append(" inbox ", Style(color=pal["bg"], bgcolor=pal["primary"], bold=True))
-        left.append(f" v{__version__}", Style(color=pal["muted"], dim=True))
+        left.append(f" {__version__} ", Style(color=pal["muted"], dim=True))
         if app.demo:
             left.append(" demo ", Style(color=pal["bg"], bgcolor=pal["warn"], bold=True))
-        left.append(f"  {n_open} open", Style(color=pal["fg"]))
+        for n, (key, title) in enumerate(VIEWS, 1):
+            on = app.view == key
+            count = counts.get(key)
+            label = f"{n} {title}" + (f" {count}" if count else "")
+            if key == "health" and counts.get("health"):
+                label = f"{n} {title} ⚠{counts['health']}"
+            if on:
+                left.append(f" [{label}]", Style(color=pal["primary"], bold=True))
+            else:
+                hot = key == "health" and counts.get("health")
+                left.append(f"  {label}", Style(color=pal["warn"] if hot else pal["muted"]))
         if getattr(app, "show_all", False):
-            left.append(" all ", Style(color=pal["bg"], bgcolor=pal["accent"], bold=True))
-        if n_urg:
-            left.append(f"  ● {n_urg} urgent", Style(color=pal["urgent"], bold=True))
+            left.append("  all ", Style(color=pal["bg"], bgcolor=pal["accent"], bold=True))
         hidden = app.resolved_hidden
         if hidden:
             left.append(f"  ✓ {hidden} resolved (R)", Style(color=pal["muted"]))
@@ -393,12 +420,12 @@ class StatusHeader(Static):
         else:
             mid.append(f"updated {fmt_age(age) if age >= 60 else f'{int(age)}s'} ago", Style(color=pal["muted"]))
         for line in app.source_problems()[:1]:
-            mid.append("  ⚠ " + fit(line, 48), Style(color=pal["warn"], bold=True))
+            mid.append("  ⚠ " + fit(line, 36), Style(color=pal["warn"], bold=True))
         right = Text(no_wrap=True)
-        right.append(f"bidi: {app.bidi_mode}  ", Style(color=pal["muted"]))
-        right.append(dt.datetime.now().strftime("%H:%M:%S") + " ", Style(color=pal["fg"], bold=True))
-        if width < 120:
-            right = Text(dt.datetime.now().strftime("%H:%M:%S") + " ", Style(bold=True))
+        if width >= 150:
+            right.append(f"bidi: {app.bidi_mode}  ", Style(color=pal["muted"]))
+        right.append(dt.datetime.now().strftime("%H:%M" if width < 120 else "%H:%M:%S") + " ",
+                     Style(color=pal["fg"], bold=True))
         gap1 = max(1, (width - left.cell_len - mid.cell_len - right.cell_len) // 2)
         gap2 = max(1, width - left.cell_len - gap1 - mid.cell_len - right.cell_len)
         out = Text(no_wrap=True, overflow="crop")
@@ -408,3 +435,173 @@ class StatusHeader(Static):
         out.append(" " * gap2)
         out.append_text(right)
         return out
+
+
+class HealthStrip(Static):
+    """One line under the tab bar: a cell per routine group, the spend and
+    the heartbeats, from the latest health snapshot."""
+
+    def render_strip(self, app, pal, width):
+        snap = app.health_snap
+        out = Text(no_wrap=True, overflow="crop")
+        if snap is None:
+            out.append(" health: reading…", Style(color=pal["muted"]))
+            return out
+        cells = healthmod.strip_cells(snap, time.time(), app.alert_infos())
+        if not cells:
+            msg = snap.get("error") or "no routines found"
+            out.append(" health: " + fit(msg, max(10, width - 10)),
+                       Style(color=pal["warn"] if snap.get("error") else pal["muted"]))
+            return out
+        out.append(" ")
+        used = 1
+        for n, (state, text) in enumerate(cells):
+            piece = ("  " if n else "") + text
+            if used + cell_len(piece) > width - 1:
+                out.append(" …", Style(color=pal["muted"]))
+                break
+            if n:
+                out.append("  ")
+            out.append(text, Style(color=pal[STATE_COLORS[state]],
+                                   bold=state in (healthmod.WARN, healthmod.FAIL)))
+            used += cell_len(piece)
+        return out
+
+
+def render_routines(counts, muted, selected, pal, total):
+    """The Feed's routine list: `all`, each routine with its count, then the
+    muted rows (hidden by a rule)."""
+    out = Text(no_wrap=True, overflow="ellipsis")
+    mark = lambda on: "▸ " if on else "  "
+    out.append(mark(selected is None) + f"{'all':<16}{total:>4}\n",
+               Style(bold=selected is None, color=pal["primary"] if selected is None else None))
+    for name, n in counts:
+        on = name == selected
+        out.append(mark(on) + f"{fit(name, 16):<16}{n:>4}\n",
+                   Style(bold=on, color=pal["primary"] if on else None))
+    if muted:
+        out.append("── muted ────────────\n", Style(color=pal["muted"]))
+        for label, n in muted:
+            out.append(f"  {fit(label, 16):<16}{n:>4} ⊘\n", Style(color=pal["muted"]))
+    return out
+
+
+def _age_since(now, epoch):
+    return fmt_age(now - epoch) if epoch else "-"
+
+
+def render_health(snap, needs, pal, now, width, visual=False):
+    """The Health view: NEEDS YOU, the routine table, the connectors, the
+    spend and the heartbeats. `needs` is `app.needs_you()`."""
+    out = Text()
+    muted = Style(color=pal["muted"])
+    if snap is None:
+        out.append("Reading the daemon state…\n", muted)
+        return out
+    if snap.get("error"):
+        out.append("! " + snap["error"] + "\n", Style(color=pal["warn"], bold=True))
+    out.append(f"NEEDS YOU {len(needs)}\n", Style(bold=True, color=pal["urgent"] if needs else pal["muted"]))
+    if not needs:
+        out.append("  nothing needs you\n", muted)
+    from .sources import cause_label
+    for entry in needs:
+        info = entry["info"]
+        name = entry["routine"] or entry["key"]
+        why = cause_label(info.get("cause")) if info.get("cause") else ""
+        if why and info.get("connector"):
+            why += f" ({info['connector']})"
+        text = why or info.get("title") or entry["key"]
+        since = info.get("since") if isinstance(info.get("since"), float) else entry["since"]
+        when = f" (since {_age_since(now, since)} ago)" if since else ""
+        out.append("✗ ", Style(color=pal["urgent"], bold=True))
+        out.append(f"{fit(vis(name, visual), 22):<22}", Style(bold=True))
+        out.append(vis(text, visual) + when + "\n")
+        for label, field in (("last error", "last_error"), ("→", "remedy")):
+            if info.get(field):
+                lead = " " * 24 + (f"{label}: " if label != "→" else "→ ")
+                out.append(lead, muted)
+                out.append(fit(vis(info[field], visual), max(20, width - len(lead) - 4)) + "\n")
+    out.append("\n")
+    nw = min(22, max([len(r["id"]) for r in snap["routines"]] + [8]))
+    out.append(f"  {'ROUTINES':<{nw}}  {'state':<9} {'every':<12} {'last run':<9} {'last capture':<13} note\n", muted)
+    for r in snap["routines"]:
+        glyph = healthmod.GLYPHS[r["state"]]
+        col = pal[STATE_COLORS[r["state"]]]
+        state_word = {"ok": "ok", "warn": "attention", "fail": "failing",
+                      "busy": "busy", "off": "off"}[r["state"]]
+        out.append(f"{glyph} ", Style(color=col, bold=True))
+        out.append(f"{fit(r['id'], nw):<{nw}}  ")
+        out.append(f"{state_word:<9} ", Style(color=col))
+        out.append(f"{fit(r['every'], 12):<12} {fit(r['last_run'], 9):<9} "
+                   f"{fit(r['last_capture'], 13):<13} ")
+        out.append((r["note"] or "-") + "\n", muted)
+    if not snap["routines"]:
+        out.append("  no routines configured\n", muted)
+    out.append("\n")
+    out.append("CONNECTORS  ", Style(bold=True))
+    conns = snap.get("connectors") or []
+    if not conns:
+        out.append("none seen\n", muted)
+    for n, c in enumerate(conns):
+        if n:
+            out.append(" · ", muted)
+        out.append(healthmod.connector_label(c["name"]) + " ")
+        out.append(healthmod.GLYPHS[c["state"]], Style(color=pal[STATE_COLORS[c["state"]]], bold=True))
+    if conns:
+        out.append("\n")
+    spend = snap.get("spend") or {}
+    out.append("SPEND       ", Style(bold=True))
+    if spend.get("total") is None:
+        out.append("not recorded\n", muted)
+    else:
+        out.append(f"${spend['total']:.2f} today"
+                   + (f" of ${spend['cap']:g} cap" if spend.get("cap") is not None else "") + "\n")
+    beats = snap.get("heartbeats") or []
+    if beats:
+        out.append("HEARTBEATS  ", Style(bold=True))
+        for n, b in enumerate(beats):
+            if n:
+                out.append(" · ", muted)
+            out.append(f"{b['name']} ")
+            out.append(healthmod.GLYPHS[b["state"]], Style(color=pal[STATE_COLORS[b["state"]]], bold=True))
+            if b.get("age_s") is not None:
+                out.append(f" {fmt_age(b['age_s'])}", muted)
+            if b.get("note"):
+                out.append(f" {b['note']}", muted)
+        out.append("\n")
+    return out
+
+
+def scheduler_title(snap, now):
+    """The Health pane's title: scheduler state, the last tick and the spend."""
+    if snap is None:
+        return "Health"
+    sch = snap.get("scheduler") or {}
+    bits = ["Health"]
+    if sch.get("paused"):
+        bits.append("PAUSED")
+    elif sch.get("armed") is True:
+        bits.append("scheduler armed")
+    elif sch.get("armed") is False:
+        bits.append("scheduler not armed")
+    if sch.get("last_tick"):
+        bits.append(f"last tick {fmt_age(now - sch['last_tick'])}")
+    spend = snap.get("spend") or {}
+    if spend.get("total") is not None:
+        bits.append(f"spend ${spend['total']:.0f}"
+                    + (f" of ${spend['cap']:.0f}" if spend.get("cap") is not None else ""))
+    return " · ".join(bits)
+
+
+class RoutinePane(Static):
+    """The Feed's left pane (a list the app draws; `f` moves the marker)."""
+
+
+class HealthView(VerticalScroll):
+    can_focus = True
+
+    def compose(self) -> ComposeResult:
+        yield SelectableText("", id="health-body")
+
+    def show(self, text):
+        self.query_one("#health-body", Static).update(text)

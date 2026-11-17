@@ -113,10 +113,17 @@ async def settle(pilot, app):
     await pilot.pause(0.25)
 
 
+def start_view(rows):
+    """The view a test opens in: the Feed when every row is an FYI row (the
+    Inbox lists only what needs a move), else the Inbox."""
+    rows = list(rows)
+    return "feed" if rows and all(r["section"] == "fyi" for r in rows) else "inbox"
+
+
 def make_app(rows, store, **cfg):
     return InboxApp(Fixed(rows), store, FakeActions(store=store, draft_delay=0),
                     settings=dict(DEFAULTS, **cfg), undo_s=30, leave_s=0,
-                    stream_delay=0)
+                    stream_delay=0, view=start_view(rows))
 
 
 def thread_text(app):

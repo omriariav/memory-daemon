@@ -954,7 +954,9 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(modal.text, "Thanks, on it.")
             self.assertEqual(calls, [])
             await pilot.press("y")
-            await pilot.pause(0.1)
+            # Wait for the queued send instead of a fixed pause: the modal
+            # closes and the pending entry appears a moment after the key.
+            self.assertTrue(await wait_for(pilot, lambda: app.pending))
             [p] = app.pending
             self.assertEqual((p.kind, p.text), ("send", "Thanks, on it."))
             self.assertEqual(calls, [])                         # undo window

@@ -26,14 +26,17 @@ def demo_items(now=None):
     out = []
 
     def add(key, section, sender, where, ago_min, gist, spec, draft=None,
-            actions=REPLY, source="slack"):
+            actions=REPLY, source="slack", routine=None, kind=None,
+            extra=None):
         out.append(itm.make_item(
             id=f"demo:{key}", source=source, section=section,
             urgency="urgent" if section == "urgent" else "digest",
             sender=sender, where=where, gist=gist, ts=now - ago_min * M,
             link=f"https://example.invalid/item/{key}",
             thread=_thread(now, spec), draft=draft, actions=actions,
-            meta={"demo": True}))
+            meta=dict({"demo": True},
+                      **({"routine": routine} if routine else {}),
+                      **({"kind": kind} if kind else {}), **(extra or {}))))
 
     add("c01", "urgent", "Dana Levi", "#launch-sync", 8,
         "Rollback decision needed before 15:00",
@@ -81,15 +84,19 @@ def demo_items(now=None):
     add("c10", "fyi", "Alex Kim", "#platform-releases", 55,
         "Release 4.12 is out: faster cold starts",
         [("Alex Kim", 55, "*Release 4.12* is live. Highlights: faster cold starts, new `--dry-run` flag.")],
-        actions=FYI)
+        actions=FYI, routine="slack-demo")
     add("drive1", "fyi", "Jo Park", "Drive", 180,
         "shared Roadmap draft v2",
         [("Jo Park", 180, "Jo Park shared <https://example.invalid/doc/roadmap|Roadmap draft v2> with you.")],
-        actions=FYI, source="drive")
+        actions=FYI, source="drive", routine="drive-demo")
     add("c11", "fyi", "Mia Costa", "#announcements", 320,
         "Office closed Friday afternoon",
         [("Mia Costa", 320, "The office closes at 13:00 on Friday for maintenance.")],
-        actions=FYI)
+        actions=FYI, routine="slack-demo")
+    add("sheet1", "fyi", "Sheet", "sheet-demo", 95,
+        "Launch timeline: 2 rows moved, 1 added",
+        [("Sheet", 95, "Two rows moved and one was added.")],
+        actions=["ack"], source="sheet", routine="sheet-demo", kind="change")
     add("mail1", "needs_reply", "Naomi Katz", "Vendor contract renewal", 75,
         "Please confirm the renewal terms by Friday",
         [("Naomi Katz", 75, "Subject: Vendor contract renewal\nHi, can you confirm the renewal terms (12 months, same rate) by Friday? Contract: renewal.pdf")],
@@ -98,11 +105,14 @@ def demo_items(now=None):
     add("alert1", "urgent", "daemon", "alerts", 14,
         "Poll lag: last successful sync 14 min ago",
         [("daemon", 14, "Poll lag detected: last successful sync was 14 minutes ago. Check sync.log for retries.")],
-        actions=ACK, source="alert")
+        actions=ACK, source="alert", routine="drive-demo", kind="alert",
+        extra={"key": "attention:drive-demo", "cause": "tool_error",
+               "last_error": "the folder listing call failed twice",
+               "remedy": "open the drive routine and re-run it"})
     add("cal1", "fyi", "Calendar", "Weekly planning", 40,
         "Moved to Thu 11:00 (was Wed 15:00)",
         [("Calendar", 40, "Weekly planning moved: Wed 15:00 -> Thu 11:00. Organizer: Dana Levi.")],
-        actions=ACK, source="calendar")
+        actions=ACK, source="calendar", routine="calendar-demo", kind="update")
     # A pending invite for the RSVP keys (a / X / T); the demo answers nothing.
     out.append(itm.make_item(
         id="invites:demo-sync", source="calendar", section="needs_reply",
@@ -120,7 +130,15 @@ def demo_items(now=None):
     add("rec1", "fyi", "Recorder", "meeting notes", 150,
         "Design sync notes are ready",
         [("Recorder", 150, "Notes and action items for the design sync are ready.")],
-        actions=ACK, source="recording")
+        actions=ACK, source="recording", routine="meetings-demo", kind="new")
+    # A bookmarked thread you wait on (the Waiting view's TRACKING group).
+    out.append(itm.make_item(
+        id="demo:track1", source="slack", section="waiting", urgency="digest",
+        sender="Ines Duarte", where="#vendor-sync", gist="Watching: pricing answer",
+        ts=now - 50 * H, link="https://example.invalid/item/track1",
+        thread=_thread(now, [("Ines Duarte", 50 * 60, "I will check pricing and get back.")]),
+        draft=None, actions=["done", "snooze", "open"],
+        meta={"demo": True, "via": "track_reaction", "cls": "bookmarked"}))
     return out
 
 
@@ -188,3 +206,39 @@ def demo_saved(now=None):
              "ts": now - ago * M, "title": title, "link": link,
              "source_id": f"demo:{n}"}
             for n, (src, kind, ago, title, link) in enumerate(spec)], None
+
+
+def demo_health(now=None):
+    """An invented health snapshot for `--demo` (nothing is read)."""
+    from . import health
+    now = now or time.time()
+    rows = [
+        {"routine": "slack-demo", "status": "waiting", "every": "5m",
+         "last_attempt": "8m ago", "last_capture": "14m ago", "issues": "-"},
+        {"routine": "calendar-demo", "status": "waiting", "every": "30m",
+         "last_attempt": "4m ago", "last_capture": "N/A", "issues": "-"},
+        {"routine": "meetings-demo", "status": "attention", "every": "15m",
+         "last_attempt": "20m ago", "last_capture": "1h ago",
+         "issues": "1 meeting match"},
+        {"routine": "sheet-demo", "status": "in-tick", "every": "30m",
+         "last_attempt": "37m ago", "last_capture": "-", "issues": "-"},
+        {"routine": "drive-demo", "status": "attention", "every": "1h",
+         "last_attempt": "34m ago", "last_capture": "2h ago",
+         "issues": "1 last-run error"},
+    ]
+    ok = {"state": "ok", "at": time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 180))}
+    ticks = {"slack-demo": ok, "calendar-demo": ok, "meetings-demo": ok,
+             "drive-demo": {"state": "error", "at": ok["at"]}}
+    routines, groups = health.build_routines(
+        rows, ticks, [], lambda v: now - 180)
+    return {"at": now, "error": None,
+            "scheduler": {"armed": True, "last_tick": now - 46,
+                          "paused": None},
+            "routines": routines, "groups": groups,
+            "alerts": [{"key": "attention:drive-demo",
+                        "routine": "drive-demo", "since": now - 2040}],
+            "connectors": [{"name": "Slack", "state": "ok", "at": now - 300},
+                           {"name": "Calendar", "state": "ok", "at": now - 900}],
+            "spend": {"total": 6.0, "cap": 20.0},
+            "heartbeats": []}

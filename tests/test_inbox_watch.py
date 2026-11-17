@@ -238,9 +238,6 @@ class UnitsTest(TmpBase):
             str(state / "alerts.json")])
         self.assertEqual(units["events.invites"].watch(),
                          [str(state / "calendar-snapshot.json")])
-        self.assertEqual(sources.saved_watch(self.base)(),
-                         [str(state / "events.jsonl"),
-                          str(state / "events.jsonl.1")])
 
     def test_invites_off_means_no_invites_unit(self):
         units = self.units({"sources": [{"type": "events",

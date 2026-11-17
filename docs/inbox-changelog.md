@@ -7,6 +7,87 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-17
+
+The inbox is organised by whose move it is: five views on the keys `1` to `5`
+and a one-line health strip under the tab bar.
+
+### Added
+
+- **Five views.** `1` Inbox (URGENT, I OWE, NUDGE DUE), `2` Waiting (open asks
+  by person, bookmarks last as TRACKING), `3` Tasks (a placeholder: tasks
+  arrive in 0.11; the tab keeps the keys stable), `4` Feed (every `fyi` row by
+  routine) and `5` Health. A view is a filter and a grouping of the same
+  items, so selection, marks (done, snooze, ack) and the 5 s undo work the same
+  in every view. Rows show their direction: `← Alice` (Alice waits on you) and
+  `→ Alice` (you wait on Alice). The header is now a tab bar with a count per
+  view; Health shows how many alerts need you.
+- **Health strip and Health view.** The line under the tab bar shows one cell
+  per routine group (`✓` ok with the age of the last good run, `⚠` attention,
+  `✗` failing, `◌` busy), the day's spend against its cap, and optional
+  heartbeats. The Health view lists what needs you (an alert's `cause`,
+  `last_error`, `remedy` and `since` when the daemon provides them), a
+  routine table (state, schedule, last run, last capture, note), the
+  connectors, the spend and the heartbeats. Both read the same code as
+  `daemon.py status`, read-only, in a worker thread every 30 s, cached by the
+  mtimes of `logs/run.log`, `state/alerts.json` and
+  `state/claude-usage.jsonl` (see [inbox.md](inbox.md#health)).
+- **Feed rules.** `feed.window_h` (default 24) and `feed.rules` in
+  `inbox.yaml`: the first matching rule decides `show`, `digest` (one row per
+  routine and day), `hide` or `inbox` (promote the row into the Inbox view).
+  In the Feed, `x` mutes a row (this kind from this routine, this routine, or
+  titles like it; for a day, a week or always), `-` is "less like this" (a
+  digest instead of a hide) and `M` lists the rules from the file and the ones
+  made in the UI, which can be switched off or removed there. UI rules are
+  saved in `state/inbox-state.json` (prefs), never in `inbox.yaml`. See
+  [inbox.md](inbox.md#feed).
+- **`health.heartbeats`** in `inbox.yaml`: files whose mtime says a process is
+  alive, each with `stale_min` and an optional `hours` window such as
+  `sun-thu 09:00-19:00` (outside it a stale file is not a warning).
+- **Sheet events** (`source: sheet`, the events of a sheet-watching routine)
+  now show, as `sheet` rows with the `▦` glyph, grouped under their routine in
+  the Feed. `sheet` is a new value of the item `source` field.
+- **Events carry `meta.routine`, `meta.title` and, for calendar rows,
+  `meta.starts`** (read by the Feed rules). Alert rows carry the daemon's
+  optional `cause`, `last_error`, `remedy`, `since` and `connector` in `meta`.
+
+### Changed
+
+- **Keys.** `1` to `4` no longer jump to a section: they switch the view (and
+  `5` is Health). Section jumps are now `[` and `]`, which move to the previous
+  and next group of the open view (a section in the Inbox, a person in
+  Waiting, a routine in the Feed). New keys: `x`, `-` and `M` in the Feed.
+  `x` and `M` are no longer free for `actions:` (a configured key is refused as
+  for any other built-in letter). `S` is now a shortcut to the Feed, filtered
+  to saved-to-memory; `f` cycles the routine filter in the Feed (the source
+  filter elsewhere); `Y` copies the group the selected row is in.
+- **The Saved view is part of the Feed**, as the routine `saved to memory`
+  (captures that no queue row already shows). The saved rows are read with
+  every refresh, so the change-driven refresh of the old screen is gone.
+- **The Inbox shows what needs a move from you**: `fyi` rows no longer sit
+  under it; they are in the Feed (older than `feed.window_h` they age out of it,
+  `A` shows them all; only rows of the events source age out, a `command`
+  source's rows stay while it lists them, and an active alert never ages out or
+  hides). A waiting row whose nudge is due is in the Inbox as well as in
+  Waiting.
+- **The Health badge** counts the alerts that need you and the failing routine
+  groups that no such alert names yet.
+- **Saved-to-memory and digest rows take few keys** (`o`, `d`, `s`, `y`; a digest
+  also `x` and `-`); the rest says why it does nothing. With a filter on,
+  `d` and `s` on a digest row reach only the rows the filter shows.
+- Rules made with `x` and `-` live in `prefs.feed_rules` of the state file. A
+  downgrade to 0.8.x ignores them and drops them the next time it writes the
+  file.
+- The alert thread prefers the daemon's own `cause`, `last_error`, `remedy`
+  and `since` (shown in local time) and falls back to the 0.8.3 logic (the
+  time in `alerts.json`, the newest log line) when they are absent.
+- The help screen and the footer hints describe the views.
+
+### Fixed
+
+- A flaky test of the send flow that read the pending list right after a
+  fixed pause now waits for the condition.
+
 ## [0.8.3] - 2026-11-17
 
 ### Fixed

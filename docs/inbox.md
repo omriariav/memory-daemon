@@ -43,7 +43,7 @@ One item is one JSON object:
 | --- | --- | --- |
 | `v` | int | exactly `1` |
 | `id` | string | 1 to 200 chars, no control characters. Stable across polls and scoped to its source, e.g. `events:<event id>`. Done, snooze and ack marks are keyed by it. |
-| `source` | string | `slack`, `email`, `calendar`, `recording`, `alert`, `drive`, `other` (picks the glyph and the `f` filter) |
+| `source` | string | `slack`, `email`, `calendar`, `recording`, `alert`, `drive`, `sheet`, `other` (picks the glyph and the `f` filter) |
 | `section` | string | `urgent`, `needs_reply`, `waiting`, `fyi` |
 | `urgency` | string | `urgent` or `digest` |
 | `sender`, `where` | string | one line, up to 200 chars |
@@ -293,8 +293,8 @@ and `r` refreshes everything at once.
 - Built-in sources know their files. `events`: `state/events.jsonl`, its `.1`
   rotation and `state/alerts.json` (resolved alerts), plus `routines/*.yaml`
   while `email_require_label` is set. `events.invites`: the calendar cache's
-  `state/calendar-snapshot.json`. The Saved view watches `events.jsonl` while
-  it is open and reloads its rows when the file changes.
+  `state/calendar-snapshot.json`. The Feed's `saved to memory` rows are read
+  with every refresh (the events unit already watches `events.jsonl`).
 - A `command` source lists its files in `watch: [paths]`. Relative paths are
   relative to the base directory; absolute paths and `~` work. A source with
   no `watch` list is refreshed by the fallback timer and `r` only.
@@ -330,6 +330,12 @@ event that was created, then updated, appears once.
 | `gcal` kinds `new`, `update`, `cancel`, `rsvp` (`rsvp` only with `show_rsvp_replies: true`) | `calendar` | `calendar` | `ack` |
 | `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack` |
 | `daemon` kind `alert` | `alert` | `daemon` | `ack` |
+| `sheet` (a sheet-watching routine) | `sheet` | the routine id, else `sheet` | `ack` |
+
+Every row also carries `meta.routine` (the event's `routine`, which the Feed
+groups by), `meta.title` (the event title, which the Feed rules match with
+`title_regex`) and, for a calendar row with a start time, `meta.starts` (epoch
+seconds, for `starts_within_h`).
 
 A Gmail capture event carries plain-text display fields in `details` (each
 is cleaned to one line and capped when it is written and read again;
@@ -906,7 +912,7 @@ argv unchanged for every other caller.)
 
 The key of an `actions:` entry (`p` in the example) runs the flow below on the
 selected item. The key must be a letter the inbox does not use itself; the
-free ones are `h l p t w x z` and `B D F H J K M N O Q U V W Z`, and
+free ones are `h l p t w z` and `B D F H J K N O Q U V W Z`, and
 validation refuses any other (and a key or label used twice).
 
 1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
@@ -1041,14 +1047,20 @@ the `saved_request` flag, per event would need the capture to record them in
 
 ### Saved view
 
-`S` opens a read-only list of what the daemon saved to memory in the last
-`saved_days` days (default 2): capture events (kind `new` or `update` with a
-memory id) from `events.jsonl`, newest first, one row per saved item (the
-newest capture of a `source_id` wins). Each row shows the source glyph, title,
-time and kind. `o` opens the link when the row has one (Gmail threads);
-`esc` (or `S`) returns to the inbox. Saved rows are not inbox items: no
-marks, no actions, nothing is written. They come from the capture events, not
-from the queue, so an item that a save marked done is still listed here.
+The old Saved screen is part of the [Feed](#feed) now. `S` opens the Feed
+filtered to its routine `saved to memory`: what the daemon saved in the last
+`saved_days` days (default 2), read from the capture events (kind `new` or
+`update` with a memory id) of `events.jsonl`, newest first, one row per saved
+item (the newest capture of a `source_id` wins). A capture that a queue row
+already shows (an email or a recording, same `source_id`, and that row is
+visible in a view) is not listed twice.
+Each row has the source glyph, the title, its age and `◆`; `o` opens the link
+when the row has one (Gmail threads). Saved rows are not queue items. Only
+`o` (open), `d` (hide the row, with the 5 s undo), `s` (snooze), `y` (copy) and
+the movement and view keys work on them; every other key (`a`, `e`, `n`, `m`,
+`E`, `P`, `X`, `T`, `c`, `i`, `x`, `-` and the keys of `actions:`) does nothing
+and says so in a notice. Nothing is written to the daemon. The rows are read
+with every refresh.
 
 ### Stale and recovered alerts
 
@@ -1104,11 +1116,21 @@ alert (`daemon` kind `alert`), after the urgent rules above:
 **Alert thread.** An alert row has a thread (the detail pane) with these
 entries, each only when known: `routine` (`details.routine`, or the routine in
 an `attention:`, `interrupted:` or `hold:` key), `issues` (`details.issues`),
-`active since` (the time in `alerts.json`, else the event time, in local time
-like the header clock), `last error, <age>` (the newest `ERROR` or `FATAL` line
+`cause` (the daemon's `details.cause` as words, with `details.connector` when
+it names one), `active since` (`details.since`, else the time in
+`alerts.json`, else the event time; in local time like the header clock),
+`last error` (`details.last_error`; when absent, the 0.8.3 logic below),
+`last error, <age>` (the newest `ERROR` or `FATAL` line
 of that routine in `logs/run.log`, only when written since the alert became
 active, give or take the 15 minutes a failing run precedes the tick that
-alerts) and a `hint`: run `daemon.py status` for details. The entries are a
+alerts), `remedy` (`details.remedy`) and a `hint`: run `daemon.py status` for
+details. The details `cause` (one of `connector_auth`, `connector_down`,
+`tool_error`, `memory_duplicate`, `meeting_match`, `budget`, `run_state`,
+`unknown`; another value shows as its own words), `last_error`, `remedy`,
+`since` (ISO UTC) and `connector` are all optional; a daemon that does not
+send them gives the earlier thread. They are also kept in the row's `meta`
+(`cause`, `last_error`, `remedy`, `since` as epoch seconds, `connector`) for
+the Health view and the health strip. The entries are a
 fixed list (`meta.thread_fixed`): they read top-down in both thread orders and
 `v` does not reverse them. Only the last 256 KB of the log are read, once per
 refresh (a re-evaluation for a later time reuses that read) and only when an
@@ -1126,7 +1148,8 @@ daemon's next tick that drops the key, so it can lag by a tick.
 `<base>/state/inbox-state.json`:
 `{"v": 1, "items": {"<id>": {"done": ts, "ack": ts, "snooze_until": ts, "updated": ts}}}`.
 A `prefs` object may sit beside `items` (`{"thread_order": "newest"}`): display
-choices made with a key, never item data, and not pruned.
+choices made with a key, never item data, and not pruned. The Feed rules made
+with `x` and `-` are kept there too, as `prefs.feed_rules` (see [Feed](#feed)).
 
 - Done and ack hide an item; a snooze hides it until its time, then it
   reappears (checked every 30 s and on each poll).
@@ -1175,6 +1198,8 @@ defaults; a broken one prints every problem and exits 2.
 | `team`, `slack_open` | off | where `o` opens a Slack item (see "Draft and copy") |
 | `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
 | `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
+| `feed` | window 24 h, no rules | what the Feed shows and does with a row: `window_h` and `rules` (see [Feed](#feed)) |
+| `health` | no heartbeats | `heartbeats`: files that say a process is alive (see [Health](#health)) |
 
 The `events` source takes `window_h` (1 to 720, default 48), `urgent` rules,
 and:
@@ -1182,7 +1207,7 @@ and:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `invites_days` | `7` | 0 to 60: show unanswered calendar invites starting within this many days (0 turns them off; see "Pending calendar invites") |
-| `saved_days` | `2` | 1 to 30: how far back the Saved view (`S`) looks |
+| `saved_days` | `2` | 1 to 30: how far back the Feed's `saved to memory` routine (`S`) looks |
 | `email_require_label` | `null` | a label name, e.g. `MY_LABEL`: show only mail captured through a routine whose query requires that label (see "Mail label filter"); `null` shows all mail |
 
 A `command` source takes `argv` (list), `timeout_s` (1 to 120),
@@ -1259,25 +1284,189 @@ terminals fall back to `visual`. `$INBOX_BIDI` overrides
 to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 `AUTO_TABLE` there is the one place to record a terminal's behaviour.
 
+## Views
+
+The inbox is organised by whose move it is. A tab bar and a one-line health
+strip sit on top; `1` to `5` switch the view.
+
+```
+ inbox 0.9.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
+```
+
+| View | What it lists |
+| --- | --- |
+| `1` Inbox | `URGENT` (urgent rows, and Feed rows a rule promotes), `I OWE` (`needs_reply` rows, pending invites included, soonest invite first) and `NUDGE DUE` (waiting rows that can be nudged and have a stored nudge draft). The three groups are always listed, with a dash when empty. |
+| `2` Waiting | the `waiting` rows by person (the item's `sender`, compared without case), the person with the oldest open ask first and each person's oldest ask first. A group header reads `NAME  3 open · oldest 2d`. A bookmark (`meta.via` starting with `track_reaction`, or `meta.cls` `bookmarked`) goes to a last group, `TRACKING`. |
+| `3` Tasks | nothing yet: "Tasks arrive in 0.11". The tab is kept so the keys stay stable. |
+| `4` Feed | every `fyi` row, by routine (see [Feed](#feed)). |
+| `5` Health | the daemon's state (see [Health](#health)). |
+
+The views are filters and groupings of the same rows, not copies. A row that
+is in two views (a waiting row whose nudge is due is in Inbox and Waiting) is
+one object: a mark made in either view (done, snooze, ack, the 5 s undo) is the
+same mark, and selection, `/` filtering and the thread, draft and context
+panes work the same in all of them. Rows show who is waiting: `← Alice` (Alice
+waits on you) on rows you owe, `→ Alice` (you wait on Alice) in Waiting; the
+thread pane says so too. The count after a tab is the number of rows in the
+view; the Health badge `⚠2` is the number of alerts that need you plus the failing
+routine groups (`✗` in the strip) that no such alert names yet: an alert only
+fires after a streak of failed runs, so a group can be failing before one
+exists, and the badge should not stay quiet over a red cell.
+
+`[` and `]` jump to the first row of the previous and next group (a section in
+the Inbox, a person in Waiting, a routine in the Feed).
+
+### Feed
+
+The Feed lists every `fyi` row of every source, grouped by routine: the
+event's `routine` (`meta.routine`) for the built-in events source, the source's
+name for a `command` source. Rows of the events source older than
+`feed.window_h` (default 24) age out of it (they are time-based events);
+`A` (show all) brings them back for the session. Rows of a `command` source
+never age out: they are state (an open item listed as `fyi`) and stay while the
+source lists them. An active alert (a daemon alert whose key is still in
+`state/alerts.json`, not resolved) is never aged out and no `hide` or `digest`
+rule takes it out of the Feed ("Active keys are always listed"). Entering the
+Feed clears a source filter set in another view; `f` is the routine filter
+there. The left pane
+lists the routines with their counts, then the muted rows; `f` cycles the
+routine filter (`esc` clears it) and `enter` moves to the thread pane.
+
+The routine `saved to memory` holds what the daemon saved (see
+[Saved view](#saved-view)); `S` jumps to it.
+
+`feed.rules` in `inbox.yaml` decides what happens to a row. Rules are tried in
+order and the first match wins; a row no rule matches is shown. Every key of a
+rule must match.
+
+```yaml
+feed:
+  window_h: 24
+  rules:
+    - {routine: calendar-cache, kind: rsvp, action: hide}
+    - {routine: sheet-watch, action: digest}
+    - {routine: calendar-cache, kind: cancel, starts_within_h: 24, action: inbox}
+    - {routine: calendar-cache, title_regex: "^Weekly", action: hide}
+```
+
+| Match key | Matches |
+| --- | --- |
+| `routine` | the row's routine (see above) |
+| `source` | the item `source` (`calendar`, `email`, `sheet`, ...) |
+| `kind` | the event kind (`meta.kind`: `new`, `update`, `cancel`, `rsvp`, ...) |
+| `title_regex` | a regular expression searched in `meta.title` (else the gist), case-insensitive |
+| `starts_within_h` | a calendar row whose start is within that many hours from now (not one that has begun) |
+
+| `action` | Effect |
+| --- | --- |
+| `show` | keep the row; later rules do not see it |
+| `digest` | fold the routine's rows of one local day into one row (`3 changes · ...`). Marking it done (or snoozing it) marks every row it stands for; its thread lists them. |
+| `hide` | leave the row out of the Feed. It is counted in the muted list. |
+| `inbox` | promote the row into the Inbox view, under `URGENT` |
+
+The Feed re-applies the rules and the window against the clock every 30 s,
+with the same timer whether the sources are refreshed by change (`units`) or
+by the single fetch; no file is read for that, so `starts_within_h` and the
+window follow the clock between refreshes. `show_rsvp_replies: false` (the default) keeps working: those
+calendar rows are left out when the events are read, as a `hide` rule would.
+
+**On a Feed row.** `x` opens the mute picker: what to mute (*this kind from
+this routine*, *everything from this routine*, or *titles like this*: the
+first words of the title, digits generalised) and for how long (1 day, 1 week,
+always). `-` ("less like this") adds a rule for the same routine and kind that
+`digest`s instead of hiding, with no end. `M` opens the rules screen: the rules
+of `inbox.yaml` (read-only) and the ones made with `x` and `-`; `space` switches
+a rule you made off and on, `delete` removes it. A mute is a rule like any
+other, with an optional end time. A mute made on a digest row uses its newest
+row; on a saved-to-memory row it is refused.
+
+**Digest rows.** A digest row has no draft or actions of its own. `d` and `s`
+mark every row it stands for; `o` opens the link the rows share (a digest has a
+link only when its rows have exactly one); `y` copies it; `x` and `-` make a
+rule from its newest row. Every other key does nothing and says so. With a `/`
+text filter or an `f` source filter on, the digest shows only the rows that pass
+it, and `d` and `s` mark only those.
+
+The rules made in the UI are stored in `state/inbox-state.json`
+(`prefs.feed_rules`), never in `inbox.yaml`, and are tried before the rules of
+the file, so a mute you make wins over a file rule. They are kept like the
+other display choices (not pruned, 100 at most, malformed entries ignored).
+A rule whose end time has passed is dropped the next time a rule is added,
+before the cap of 100 applies. An older inbox (0.8.x) does not know the
+entry and drops it the next time it writes the state file.
+
+### Health
+
+The strip under the tab bar and the Health view read the same snapshot:
+the state of the daemon, read-only, from the code behind `daemon.py status`
+(the tick log `logs/run.log`, the routine files, `state/schedule.json`, the
+usage log `state/claude-usage.jsonl`, `state/budget.yaml` and
+`state/alerts.json`). It is read in a worker thread every 30 s and on `r`, and
+cached by the mtimes of the log, the alert file and the usage log (and the
+schedule and routine files), with a full re-read at most every 5 minutes so the
+scheduler state still moves; the UI thread does no file I/O for it. Nothing is
+written. A routine group is the text before the first `-`, `_` or `.` of the
+routine ids (`slack-mcp` and `slack-direct` are `slack`).
+
+The strip shows one cell per group: `✓` ok with the age of the last good run,
+`⚠` attention (the first issue, or the cause of its alert), `✗` failing (with
+the cause of its alert when it names one) and `◌` busy (grey: running now, or
+the previous run still going), then the day's spend as `$spent/$cap`, then the
+heartbeats. A cell that does not fit is cut with `…`.
+
+The Health view shows: `NEEDS YOU` (each active alert that is not only a benign
+run state: its routine, the `cause`, how long ago it began, the `last_error` and
+the `remedy` when the alert carries them, otherwise the alert's title), the
+routine table (state, schedule, last run, last capture, note), `CONNECTORS`
+(from the usage log: failing since a call failed, else ok), the spend and the
+heartbeats. Its title shows whether the scheduler is armed, the last tick and
+the spend.
+
+`health.heartbeats` in `inbox.yaml` adds a cell for a file that a process
+touches while it is alive:
+
+```yaml
+health:
+  heartbeats:
+    - {name: poller, path: state/poller.alive, stale_min: 10,
+       hours: "sun-thu 09:00-19:00"}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `name` | the label (1 to 24 characters of `[\w.-]`, unique) |
+| `path` | the file (`~` expands; a relative path is under the base directory) |
+| `stale_min` | 1 to 10080: the cell is `✓` while the file's mtime is newer than this many minutes, `⚠` otherwise (also when the file is missing) |
+| `hours` | optional, local time: `[days ]HH:MM-HH:MM`, days as `mon`, `mon-fri`, `fri-mon` (wraps) or `mon,wed`; an end before the start crosses midnight. Outside the window a stale file is not a warning (the cell stays `✓`, noted `off hours`). |
+
+At most 10 heartbeats. The files are only `stat`ed.
+
 ## Keys
 
-`j`/`k` move, `g`/`G` ends, `1`-`4` jump to a section, `tab` switches pane,
-`/` fuzzy filter, `f` source filter, `a` approve or ack, `e` edit draft,
+`1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
+group, `tab` switches pane,
+`/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze, `n` nudge, `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
 memory by hand (needs `save:`; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),
-`R` show or hide resolved alerts, `A` show all (see below), `S` saved view
-(read-only; `o` opens, `esc` returns), `y` copy the item, `Y` copy its section,
+`R` show or hide resolved alerts, `A` show all (see below), `S` the Feed's
+saved-to-memory routine, in the Feed `x` mute, `-` less like this and `M` the
+rules, `y` copy the item, `Y` copy its group,
 `L` audit log, `b` Hebrew order, `v` thread order (newest or oldest first;
 saved), `ctrl+t` theme, `ctrl+p` palette, `?` help,
 `q` quit.
 
+Up to 0.8 `1`-`4` jumped to a section and `S` opened a Saved screen; `[`/`]`
+and the Feed replace them.
+
 ### Show all (`A`)
 
-`A` toggles "show all": while on, the header shows `all` and every `command`
+`A` toggles "show all": while on, the header shows `all`, Feed rows older than
+`feed.window_h` are listed, and every `command`
 source with `supports_all: true` is polled as `<argv> list --all`; other
 sources are unaffected. It polls at once, is off at every start and is never
 saved. Items revealed by the toggle do not raise "new urgent" alerts.
