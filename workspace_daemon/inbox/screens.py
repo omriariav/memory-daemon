@@ -501,7 +501,7 @@ HELP = [
              ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
              ("o", "open the item's link (the Slack thread with slack_open:)"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
-                     ("m", "save the item to memory (save: in inbox.yaml); marks it done"),
+                     ("m", "save to memory by hand (save: in inbox.yaml; the daemon saves on its own, ◆ = already in memory); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
     ("Slack send / react / polish", [
         ("a / n", "reply or nudge: Draft in Slack (d), Send (y) or Copy for Slack (c) (send: / copy: in inbox.yaml)"),
@@ -525,14 +525,17 @@ HELP = [
 class HelpScreen(ModalScreen):
     BINDINGS = [Binding("escape,question_mark,q", "close", "Close")]
 
-    def __init__(self, extra=None):
-        """`extra` is a list of (key, label) for the `actions:` of inbox.yaml."""
+    def __init__(self, extra=None, save_on=True):
+        """`extra` is a list of (key, label) for the `actions:` of inbox.yaml.
+        `save_on` False (no `save:` configured) leaves the `m` line out."""
         super().__init__()
         self.extra = list(extra or [])
+        self.save_on = save_on
 
     def compose(self) -> ComposeResult:
         t = Text()
-        sections = list(HELP)
+        sections = [(title, [r for r in rows if self.save_on or r[0] != "m"])
+                    for title, rows in HELP]
         if self.extra:
             sections.insert(-2, ("Custom actions (actions: in inbox.yaml)", (
                 [(k, f"{label}: pick, confirm, then wait out the 5 s undo window")

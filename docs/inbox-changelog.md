@@ -7,6 +7,43 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-17
+
+Pending invites say more, the inbox shows what the daemon already saved to
+memory, and other people's RSVP answers are hidden by default. No setting is
+required: a 0.7.0 `inbox.yaml` works unchanged.
+
+### Added
+
+- **Richer invite items.** The thread of a pending invite now has `subject`
+  (the full title), `when`, `from` (the organizer's name, taken from the
+  snapshot row first, then the JSON twin), `attendees` (`5 people: Ann Lee,
+  Bob Ray, +3 more`; rooms and groups skipped, nameless guests counted but not
+  named, `attendees unknown` when the guest list is hidden), `where` (the
+  location) and one `conflict` line per overlapping event you are going to or
+  might go to (up to 5, then `+N more`). The gist starts with `⚠ ` when there
+  is a clash. New `meta` keys: `attendees` (up to 25 names), `attendee_count`,
+  `attendees_known`, `conflicts`. Names only: an email address, or a name that
+  contains an at-sign, never appears in the item.
+- **`show_rsvp_replies`** (top-level, `true` or `false`, default `false`): the
+  calendar events of kind `rsvp` (other people answering your invites) are no
+  longer listed unless it is `true`. New, updated and cancelled invites are not
+  affected.
+- **Already in memory.** An item the daemon saved to memory shows the `◆` mark
+  (the one `m` leaves with `mark_done: false`) and an `In memory: <id>` line in
+  the detail view. The match uses `state/events.jsonl`: `meta.memory_id`, then
+  `meta.source_id`, then for Slack items `slack:<channel>:<thread_ts>` and
+  `slack:<channel>:<message_ts>` from a valid `meta.reply_to`. The id found is
+  put in `meta.memory_id` of the listed item. Items with no match get no mark.
+
+### Changed
+
+- `m` is labelled "save to memory by hand" (the daemon saves on its own); on an
+  item already in memory it toasts "Already in memory (<id>)" and runs nothing.
+- Without `save:`, `m` no longer appears in the footer, the help screen or the
+  command palette.
+- Invite thread: the first line is now `subject`, then `when`.
+
 ## [0.7.0] - 2026-11-16
 
 "Send" becomes a choice. Some workplaces block headless (non-interactive)

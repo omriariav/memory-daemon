@@ -52,6 +52,14 @@ class Item:
     raw: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property
+    def memory_id(self):
+        """The memory entry this item is already saved as (`meta.memory_id`,
+        set by the daemon's capture or by the inbox's match), else ""."""
+        from .items import MEMORY_ID
+        mid = self.meta.get("memory_id") if isinstance(self.meta, dict) else None
+        return mid if isinstance(mid, str) and MEMORY_ID.match(mid) else ""
+
+    @property
     def resolved(self):
         """A daemon alert whose condition has ended (hidden unless R is on).
         Only alerts: another source's `meta.resolved` means nothing here."""

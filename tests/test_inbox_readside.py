@@ -119,6 +119,229 @@ class ShowAllTest(TmpBase):
                 {"type": "events", "supports_all": True}]})
 
 
+# --- richer invite items (0.8.0) --------------------------------------------
+
+def person(name, email=None, group=False):
+    email = email or f"{(name or 'x').split()[0].lower()}@example.com"
+    return {"name": name, "email": email, "group": group}
+
+
+class InviteDetailsTest(TmpBase):
+    def build(self, rows, days=7):
+        write_snapshot(self.base, rows)
+        items, *_ = invites.load(self.base, NOW, days)
+        return {i["meta"]["event_id"]: i for i in items}
+
+    def lines(self, item, who):
+        return [m["text"] for m in item["thread"] if m["who"] == who]
+
+    def one(self, **extra):
+        return self.build({"e1": row(3, 4, title="Design review", **extra)})["e1"]
+
+    def test_subject_line_holds_the_full_title(self):
+        title = "Design review " + "very long " * 30
+        item = self.build({"e1": row(3, 4, title=title)})["e1"]
+        (subject,) = self.lines(item, "subject")
+        self.assertEqual(subject, itm.clean_line(title))
+        self.assertGreater(len(subject), itm.GIST_MAX)
+
+    def test_organizer_comes_from_the_row_name_only(self):
+        item = self.one(organizer={"name": "Ann Lee", "email": "ann@example.com",
+                                   "self": False})
+        self.assertEqual(self.lines(item, "from"), ["Ann Lee"])
+        self.assertEqual(item["sender"], "Ann Lee")
+        self.assertTrue(item["gist"].endswith("from Ann Lee"))
+
+    def test_an_organizer_name_that_is_an_address_is_dropped(self):
+        item = self.one(organizer={"name": "ann@example.com",
+                                   "email": "ann@example.com"})
+        self.assertEqual(self.lines(item, "from"), [])
+        self.assertEqual(item["sender"], "calendar invite")
+
+    def test_organizer_falls_back_to_the_twin(self):
+        out = self.base / "cache" / "next48h.txt"
+        write(out.with_suffix(".json"), json.dumps({"events": [
+            {"event_id": "e1", "organizer": {"name": "Bob Ray"}}]}))
+        write(self.base / "routines" / "cal.yaml", textwrap.dedent(f"""
+            id: calendar-cache
+            maintenance:
+              kind: calendar_cache
+              output: {out}"""))
+        item = self.build({"e1": row(3, 4, title="Sync")})["e1"]
+        self.assertEqual(self.lines(item, "from"), ["Bob Ray"])
+        item = self.build({"e1": row(3, 4, title="Sync", organizer={
+            "name": "Ann Lee", "email": "ann@example.com"})})["e1"]
+        self.assertEqual(self.lines(item, "from"), ["Ann Lee"])
+
+    def test_attendees_line_and_meta(self):
+        item = self.one(attendee_count=6, attendees_known=True, attendees=[
+            person("Ann Lee"), person("Bob Ray"),
+            person("Room 4", group=True), person(""), person(None),
+            person("cy@example.com"), person("Di Park")])
+        (line,) = self.lines(item, "attendees")
+        # groups are not people; the nameless and address-like ones are counted
+        self.assertEqual(line, "6 people: Ann Lee, Bob Ray, Di Park, +3 more")
+        self.assertEqual(item["meta"]["attendees"],
+                         ["Ann Lee", "Bob Ray", "Di Park"])
+        self.assertEqual(item["meta"]["attendee_count"], 6)
+
+    def test_attendee_names_are_capped(self):
+        many = [person(f"Guest {i}") for i in range(40)]
+        item = self.one(attendee_count=40, attendees_known=True, attendees=many)
+        (line,) = self.lines(item, "attendees")
+        self.assertTrue(line.startswith("40 people: Guest 0, Guest 1"))
+        self.assertIn("Guest 7, +32 more", line)
+        self.assertNotIn("Guest 8", line)
+        self.assertEqual(len(item["meta"]["attendees"]), 25)
+
+    def test_one_person_and_count_only(self):
+        item = self.one(attendee_count=1, attendees_known=True,
+                        attendees=[person("Ann Lee")])
+        self.assertEqual(self.lines(item, "attendees"), ["1 person: Ann Lee"])
+        item = self.one(attendee_count=4, attendees_known=True)
+        self.assertEqual(self.lines(item, "attendees"), ["4 people"])
+
+    def test_unknown_attendees_are_said_so(self):
+        item = self.one(attendee_count=1, attendees_known=False,
+                        attendees=[person("Ann Lee")])
+        self.assertEqual(self.lines(item, "attendees"), ["attendees unknown"])
+        self.assertIsNone(item["meta"]["attendee_count"])
+
+    def test_no_attendee_data_means_no_line(self):
+        item = self.one()
+        self.assertEqual(self.lines(item, "attendees"), [])
+
+    def test_where_line(self):
+        item = self.one(location="Room 4, floor 2")
+        self.assertEqual(self.lines(item, "where"), ["Room 4, floor 2"])
+        self.assertEqual(self.lines(self.one(location=""), "where"), [])
+        self.assertEqual(self.lines(self.one(location="  \n "), "where"), [])
+        self.assertEqual(self.lines(self.one(location="a@example.com"),
+                                    "where"), [])
+        long = self.lines(self.one(location="x" * 500), "where")[0]
+        self.assertLessEqual(len(long), 120)
+
+    def test_no_address_anywhere_in_the_item(self):
+        item = self.one(
+            organizer={"name": "Ann Lee", "email": "ann@example.com",
+                       "self": False},
+            location="meet at lee@example.com", attendee_count=3,
+            attendees_known=True,
+            attendees=[person("Ann Lee"), person("bob@example.com"),
+                       person("", "cy@example.com")])
+        self.assertNotIn("@", json.dumps(item))
+
+    def test_odd_types_do_not_crash(self):
+        rows = {}
+        for i, extra in enumerate([
+                {"organizer": "Ann"}, {"organizer": ["x"]},
+                {"organizer": {"name": 5}}, {"attendees": "all"},
+                {"attendees": [None, 3, "x", {"name": ["y"]}, {"group": 1}]},
+                {"attendee_count": "9"}, {"attendee_count": True},
+                {"attendee_count": -4}, {"attendee_count": 1.5},
+                {"attendees_known": "no"}, {"location": 5},
+                {"location": ["x"]}]):
+            rows[f"e{i}"] = row(3 + i * 2, title=f"T{i}", **extra)
+        built = self.build(rows)
+        self.assertEqual(len(built), 12)
+        for item in built.values():
+            self.assertEqual(itm.validate_item(item), [])
+
+    # -- conflicts ----------------------------------------------------------
+
+    def clash(self, other, **kw):
+        rows = {"inv": row(3, 4, title="Invite"), "oth": other}
+        return self.build(rows, **kw)["inv"]
+
+    def test_accepted_overlap_is_listed_with_its_time(self):
+        item = self.clash(row(3.5, 4.5, rsvp="accepted", title="Weekly sync"))
+        s, e = (time.strftime("%H:%M", time.localtime(NOW + h * H))
+                for h in (3.5, 4.5))
+        self.assertEqual(self.lines(item, "conflict"),
+                         [f"\u26a0 Weekly sync {s}-{e} (accepted)"])
+        self.assertEqual(item["meta"]["conflicts"], 1)
+        self.assertTrue(item["gist"].startswith("\u26a0 Invite - "))
+        self.assertLessEqual(len(item["gist"]), itm.GIST_MAX)
+
+    def test_labels(self):
+        for kw, label in (({"rsvp": "tentative"}, "tentative"),
+                          ({"rsvp": "needsAction"}, "pending"),
+                          ({"rsvp": None, "organizer": {"name": "Me",
+                                                        "self": True}},
+                           "organizer"),
+                          ({"rsvp": "organizer"}, "organizer")):
+            item = self.clash(row(3, 4, title="Other", **kw))
+            (line,) = self.lines(item, "conflict")
+            self.assertTrue(line.endswith(f"({label})"), (kw, line))
+
+    def test_touching_edges_are_not_a_clash(self):
+        for other in (row(2, 3, rsvp="accepted"), row(4, 5, rsvp="accepted")):
+            item = self.clash(other)
+            self.assertEqual(self.lines(item, "conflict"), [])
+            self.assertEqual(item["meta"]["conflicts"], 0)
+            self.assertFalse(item["gist"].startswith("\u26a0"))
+
+    def test_rows_that_are_not_going_are_ignored(self):
+        day = time.strftime("%Y-%m-%d", time.localtime(NOW + 3 * H))
+        nxt = time.strftime("%Y-%m-%d", time.localtime(NOW + 27 * H))
+        for other in (row(3, 4, rsvp="declined"),
+                      row(3, 4, rsvp="accepted", status="cancelled"),
+                      row(3, 4, rsvp=None),
+                      {"start": day, "end": nxt, "status": "confirmed",
+                       "my_rsvp": "accepted", "title": "Offsite"},
+                      row(3, 4, rsvp="accepted", start="soon"),
+                      row(3, 3, rsvp="accepted"),
+                      "junk"):
+            item = self.clash(other)
+            self.assertEqual(item["meta"]["conflicts"], 0, other)
+
+    def test_the_same_series_is_not_a_clash(self):
+        rows = {"w_20231115T100000Z": row(3, 4, title="Weekly"),
+                "w_20231116T100000Z": row(3, 4, rsvp="accepted",
+                                          title="Weekly"),
+                "x": row(3, 4, title="Other", rsvp="accepted")}
+        item = self.build(rows)["w_20231115T100000Z"]
+        self.assertEqual(item["meta"]["conflicts"], 1)
+        self.assertIn("Other", self.lines(item, "conflict")[0])
+
+    def test_conflicts_use_the_listed_instance(self):
+        rows = {"w_20231115T100000Z": row(30, 31, title="Weekly"),
+                "w_20231122T100000Z": row(30 + 168, 31 + 168, title="Weekly"),
+                "a": row(2, 3, rsvp="accepted", title="Early"),
+                "b": row(30.5, 31.5, rsvp="accepted", title="Next day")}
+        item = self.build(rows, days=3)["w_20231115T100000Z"]
+        (line,) = self.lines(item, "conflict")
+        self.assertIn("Next day", line)
+
+    def test_conflicts_are_capped(self):
+        rows = {"inv": row(3, 4, title="Invite")}
+        for i in range(8):
+            rows[f"o{i}"] = row(3 + i * 0.05, 4, rsvp="accepted",
+                                title=f"Clash {i}")
+        item = self.build(rows)["inv"]
+        lines = self.lines(item, "conflict")
+        self.assertEqual(len(lines), 6)
+        self.assertEqual(lines[-1], "+3 more")
+        self.assertEqual(item["meta"]["conflicts"], 8)
+
+    def test_a_long_title_keeps_the_gist_within_its_limit(self):
+        rows = {"inv": row(3, 4, title="T" * 300,
+                           organizer={"name": "O" * 100}),
+                "o": row(3, 4, rsvp="accepted", title="Clash")}
+        item = self.build(rows)["inv"]
+        self.assertLessEqual(len(item["gist"]), itm.GIST_MAX)
+        self.assertTrue(item["gist"].startswith("\u26a0 "))
+        self.assertEqual(itm.validate_item(item), [])
+
+    def test_all_day_invite_has_no_conflicts(self):
+        day = time.strftime("%Y-%m-%d", time.localtime(NOW + 2 * 86400))
+        nxt = time.strftime("%Y-%m-%d", time.localtime(NOW + 3 * 86400))
+        rows = {"inv": {"start": day, "end": nxt, "status": "confirmed",
+                        "my_rsvp": "needsAction", "title": "Offsite"},
+                "o": row(48, 49, rsvp="accepted")}
+        self.assertEqual(self.build(rows)["inv"]["meta"]["conflicts"], 0)
+
+
 # --- pending calendar invites ---------------------------------------------
 
 class InvitesTest(TmpBase):
@@ -127,7 +350,9 @@ class InvitesTest(TmpBase):
 
     def titles(self, **kw):
         items, _stale, _age, err = self.load(**kw)
-        return sorted(i["gist"].split(" - ")[0] for i in items), err
+        # (rows at the same time clash with each other: drop the warning)
+        return sorted(i["gist"].replace("\u26a0 ", "", 1).split(" - ")[0]
+                      for i in items), err
 
     def test_only_needs_action_is_shown(self):
         write_snapshot(self.base, {
@@ -176,7 +401,8 @@ class InvitesTest(TmpBase):
         (item,), *_ = self.load()
         local = time.strftime("%a %d %b %H:%M", time.localtime(NOW + 3 * H))
         self.assertIn(local, item["gist"])
-        self.assertIn(local, item["thread"][0]["text"])
+        when = [m for m in item["thread"] if m["who"] == "when"][0]
+        self.assertIn(local, when["text"])
 
     def test_no_link_or_unsafe_link_means_no_open(self):
         write_snapshot(self.base, {

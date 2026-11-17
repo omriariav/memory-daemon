@@ -14,7 +14,7 @@ from . import __version__, bidi, slackfmt
 from .models import SECTIONS, SOURCES, thread_note
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-SAVED_GLYPH = "◆"  # an item saved to memory
+SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
 ITEM_PREFIX = "i:"  # Option id of an item row; item ids are arbitrary text
 
 
@@ -221,6 +221,9 @@ class ThreadView(VerticalScroll):
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
         if item.hint:  # e.g. an RSVP the calendar never confirmed
             out.append("! " + item.hint + "\n", Style(color=pal["warn"], bold=True))
+        if item.memory_id:  # already saved to memory (the ◆ of the row)
+            out.append(f"{SAVED_GLYPH} In memory: {item.memory_id}\n",
+                       Style(color=pal["ok"]))
         note = thread_note(item)
         if note:  # one dim line above the thread; alone when the thread is empty
             out.append(vis(note, visual) + "\n", Style(color=pal["muted"], dim=True))

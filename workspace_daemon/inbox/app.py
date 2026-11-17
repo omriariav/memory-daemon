@@ -29,7 +29,8 @@ from .models import (SECTION_KEYS, SECTION_TITLES, SECTIONS, SOURCES, Item,
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, HelpScreen, PolishScreen, SavedScreen,
                       SnoozePicker)
-from .sources import SourceResult, merge
+from .sources import (SourceResult, annotate_memory, merge,
+                      units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HintBar, Queue,
@@ -393,7 +394,9 @@ class InboxApp(App):
         busy_keys = self._busy_keys()
         now = time.time()
         for i in self.all_rows:
-            i.saved = self.store.is_saved(i.key)
+            # One mark for "this is in memory": saved here with `m`, or
+            # saved by the daemon (meta.memory_id).
+            i.saved = self.store.is_saved(i.key) or bool(i.memory_id)
             i.hint = (NOT_CONFIRMED if self.store.rsvp_unconfirmed(i.key, i.meta)
                       else "")
         shown = [i for i in self.all_rows
@@ -561,7 +564,7 @@ class InboxApp(App):
             return [("r", "poll"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
-        save = [("m", "save")] if self.actions_save_on else []
+        save = [("m", "save by hand")] if self.actions_save_on else []
         if self._rsvp_on(it):
             tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
                 ("u", "undo"), ("S", "saved"), ("?", "help")]
@@ -1473,6 +1476,10 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if it.memory_id:      # the daemon (or an earlier save) already did it
+            self.notify(f"Already in memory ({it.memory_id})", timeout=4,
+                        markup=False)
+            return
         if not getattr(self.actions, "save_configured", False):
             self.notify(SAVE_OFF, timeout=3, severity="warning", markup=False)
             return
@@ -2092,7 +2099,8 @@ class InboxApp(App):
 
     def action_help(self):
         self.push_screen(HelpScreen(
-            [(c["key"], c["label"]) for c in self._custom]))
+            [(c["key"], c["label"]) for c in self._custom],
+            save_on=self.actions_save_on))
 
     def action_toggle_theme(self):
         dark = self.theme == themes.theme_id("dark")
@@ -2216,8 +2224,9 @@ class InboxApp(App):
                                       f"poll failed: {type(exc).__name__}: {exc}")]
             if batch is not None:
                 self._unit_results[unit.name] = batch
-        return merge(self._unit_results[u.name] for u in self.units
-                     if u.name in self._unit_results)
+        results = merge(self._unit_results[u.name] for u in self.units
+                        if u.name in self._unit_results)
+        return annotate_memory(results, units_memory_index(self.units))
 
     def _safe_fetch(self, show_all=None, names=None, reeval=False):
         """Runs in a worker thread: pick up other panes' marks, fetch, and
@@ -2389,7 +2398,6 @@ class InboxApp(App):
             ("Accept invite", "a on a calendar invite (needs rsvp: in inbox.yaml)", lambda: self._rsvp("accept")),
             ("Decline invite", "X (needs rsvp: in inbox.yaml)", self.action_rsvp_decline),
             ("Tentative", "T: answer an invite tentatively (needs rsvp: in inbox.yaml)", self.action_rsvp_tentative),
-            ("Save item to memory", "m: save this item (needs save: in inbox.yaml)", self.action_save_memory),
             ("React to message", "E: add an emoji reaction (needs react: in inbox.yaml)", self.action_react),
             ("Polish draft", "P: rewrite the draft in your tone, never sends (needs polish: in inbox.yaml)", self.action_polish),
             ("Toggle context pane", "c: context for the selected item (needs context: in inbox.yaml)", self.action_context),
@@ -2412,7 +2420,8 @@ class InboxApp(App):
             ("Toggle thread order", "v: newest or oldest message first in the thread pane", self.action_toggle_thread_order),
             ("Filter queue", "Fuzzy filter", self.action_filter),
             ("Keyboard help", "?", self.action_help),
-        ] + [(f"Jump to {t}", f"key {n}", (lambda n=n: self.action_section(n)))
+        ] + ([("Save item to memory", "m: save this item by hand (the daemon saves on its own, ◆ = already in memory)", self.action_save_memory)] if self.actions_save_on else []) + [
+            (f"Jump to {t}", f"key {n}", (lambda n=n: self.action_section(n)))
              for n, (_k, t) in enumerate(SECTIONS, 1)]
         cmds += [(c["label"], f"{c['key']}: custom action (actions: in inbox.yaml)",
                   (lambda n=n: self.action_custom_action(n)))

@@ -20,6 +20,9 @@ bidi_mode: auto
 # Gmail links open /mail/u/<N>/: set N to your account's position when it is
 # not the first one signed in to your browser.
 gmail_account: 0
+# Other people's RSVP answers to your invites ("RSVP" calendar rows) are
+# hidden; true lists them (see docs/inbox.md).
+show_rsvp_replies: false
 
 # Daemon alerts are urgent only while they are relevant. An alert older than
 # this many hours drops to the FYI section (1 to 168). An alert the daemon no

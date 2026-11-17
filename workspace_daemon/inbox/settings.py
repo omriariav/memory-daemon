@@ -22,7 +22,7 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "gmail_account",
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
-            "slack_open")
+            "slack_open", "show_rsvp_replies")
 RSVP_KEYS = ("tool", "args", "timeout_s", "model")
 RSVP_ARG_KEYS = ("event_id", "calendar_id", "response")
 SAVE_KEYS = ("argv", "timeout_s", "mark_done")
@@ -101,6 +101,7 @@ DEFAULTS = {
     "react": None,     # no default: no emoji reaction until configured
     "polish": None,    # no default: no draft polishing until configured
     "copy": False,     # true: "Copy for Slack" without `send:`
+    "show_rsvp_replies": False,   # true: list other people's RSVP answers
     "team": None,      # the Slack workspace id for slack_open (T...)
     "slack_open": None,   # no default: `o` opens the item's link
 }
@@ -202,6 +203,11 @@ def validate(raw):
         problems.append("copy must be true or false")
     else:
         out["copy"] = copy
+    show_rsvp = raw.get("show_rsvp_replies", DEFAULTS["show_rsvp_replies"])
+    if not isinstance(show_rsvp, bool):
+        problems.append("show_rsvp_replies must be true or false")
+    else:
+        out["show_rsvp_replies"] = show_rsvp
     team = raw.get("team")
     if team is not None:
         if not isinstance(team, str) or not TEAM_ID.match(team):

@@ -24,6 +24,8 @@ TEXT_MAX = 8000
 THREAD_MAX = 100
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 ITEMS_MAX = 2000
+# A memory entry id as the inbox shows and links it (`meta.memory_id`).
+MEMORY_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,200}\Z")
 
 # Bidi embeddings, overrides and isolates can reorder surrounding text to
 # spoof it; plain marks (LRM, RLM, ALM) are harmless and kept.
