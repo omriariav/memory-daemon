@@ -405,9 +405,9 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     """The built-in source: recent events as items. Never raises.
 
     Calendar events of kind `rsvp` (other people answering the owner's
-    invites) are left out unless `show_rsvp_replies` is true: an item whose
-    newest event (per source id) is an RSVP reply is not listed, so an older
-    `new` or `update` row of the same event does not show in its place.
+    invites) are left out unless `show_rsvp_replies` is true. They are dropped
+    before the newest-per-source-id step, so the event's latest non-RSVP change
+    (`new`, `update`, `cancel`) still shows after someone replies.
 
     `email_routines` (a set of routine ids, or None for no filter) keeps only
     the Gmail events written by those routines; see `daemoncfg.label_routines`.
@@ -425,6 +425,10 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     cutoff = now - float(window_h) * 3600
     latest = {}  # one row per source_id: the newest event wins
     for event in events:
+        if (not show_rsvp_replies and isinstance(event, dict)
+                and event.get("source") == "gcal"
+                and event.get("kind") == "rsvp"):
+            continue
         try:
             item = event_to_item(event, now, rules, gmail_account)
         except (itm.ItemError, TypeError, ValueError):
@@ -441,9 +445,6 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     recovery = recovery if recovery is not None else Recovery(base_dir)
     rows, alerts = [], {}
     for item in latest.values():
-        if (not show_rsvp_replies and item["source"] == "calendar"
-                and item["meta"].get("kind") == "rsvp"):
-            continue
         if item["source"] == "alert":
             # The newest alert per key wins, whatever its source_id.
             key = item["meta"].get("key")

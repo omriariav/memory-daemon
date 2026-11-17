@@ -1059,7 +1059,7 @@ defaults; a broken one prints every problem and exits 2.
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
-| `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default an event whose newest row is an RSVP is left out (an older `new` or `update` row of the same event does not show in its place). New, updated and cancelled invites are not affected |
+| `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default they are left out before the newest row per event is chosen, so the event shows its latest non-RSVP change (`new`, `update` or `cancel`). New, updated and cancelled invites are not affected |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
 | `sources` | the `events` source | list of `type: events` and `type: command` sources (below) |
 | `rsvp` | off | calendar RSVP through the Claude bridge (below) |

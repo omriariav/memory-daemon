@@ -30,8 +30,9 @@ required: a 0.7.0 `inbox.yaml` works unchanged.
   contains an at-sign, never appears in the item.
 - **`show_rsvp_replies`** (top-level, `true` or `false`, default `false`): the
   calendar events of kind `rsvp` (other people answering your invites) are no
-  longer listed unless it is `true`: an event whose newest row is an RSVP is
-  left out entirely (an older `new` or `update` row does not take its place).
+  longer listed unless it is `true`. They are dropped before the newest row per
+  event is chosen, so the event still shows its latest non-RSVP change (`new`,
+  `update` or `cancel`) after someone replies.
   New, updated and cancelled invites are not affected.
 - **Already in memory.** An item the daemon saved to memory shows the `◆` mark
   (the one `m` leaves with `mark_done: false`) and an `In memory: <id>` line in
