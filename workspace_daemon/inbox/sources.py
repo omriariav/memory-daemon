@@ -380,8 +380,11 @@ def _duplicate_parts(event, details, ts, match_titles):
     texts = [t for t in (_text(a) for a in actions[:DUPLICATE_ACTIONS_MAX])
              if t] if isinstance(actions, list) else []
     if texts:
-        entries.append(("owner actions not filed",
-                        "\n".join(f"- {t}" for t in texts)))
+        lines = [f"- {t}" for t in texts]
+        more = len(actions) - DUPLICATE_ACTIONS_MAX
+        if more > 0:
+            lines.append(f"+{more} more")
+        entries.append(("owner actions not filed", "\n".join(lines)))
     thread = [{"who": who, "ts": ts, "text": text} for who, text in entries]
     extra = {"thread_fixed": True,
              "duplicate_of": matched,
@@ -446,7 +449,11 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0,
         urgent = False
     if source == "memory":
         urgent = False      # a refused capture is a review, never urgent
-    link = _event_link(event, source, gmail_account)
+    # A refused capture keeps the link of its own source (the mail), so `o`
+    # still opens it.
+    link = _event_link(
+        event, _map_source(dict(event, kind="")) if source == "memory"
+        else source, gmail_account)
     raw_memory_id = event.get("memory_id")
     memory_id = raw_memory_id if (isinstance(raw_memory_id, str)
                                   and MEMORY_ID.match(raw_memory_id)) else ""

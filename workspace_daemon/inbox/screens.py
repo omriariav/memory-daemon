@@ -517,7 +517,7 @@ HELP = [
     ("Review (REVIEW in the Inbox)", [
         ("", "a capture the memory store refused as a near-duplicate: Not saved: near-duplicate of ..."),
         ("d", "dismiss: it is a duplicate, fine (a local mark)"),
-        ("D / m", "save anyway: confirm, then your save: command gets the row with force: true; without save: a CLI hint is copied")]),
+        ("D", "copy a command-line hint for saving it anyway (a template: it needs the entry text; nothing is saved from here)")]),
     ("Slack send / react / polish", [
         ("a / n", "reply or nudge: Draft in Slack (d), Send (y) or Copy for Slack (c) (send: / copy: in inbox.yaml)"),
         ("E", "react to the message with an emoji (react: in inbox.yaml)"),

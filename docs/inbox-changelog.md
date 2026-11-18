@@ -16,11 +16,11 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   a row in the Inbox's new `REVIEW` group (listed only when there is one):
   `Not saved: near-duplicate of <matched title or id>`, with a detail pane of
   the skipped title, source id, matched entry and any owner actions not filed.
-  `d` dismisses it (a local mark). `D` (or `m`) saves it anyway through the
-  existing `save:` command, with `"force": true` and the row's
-  `meta.source_id` and `meta.title`; without `save:` it copies a command-line
-  hint and says so. Rows age out with the events window and dedupe by event
-  id. A `duplicate` event of Gmail, Zoom or Mila used to show as an ordinary
+  `d` dismisses it (a local mark). `D` copies a command-line hint (a template
+  for the store's `add --force-new`) and saves nothing: the `save:` command
+  would receive the review text, not the captured content, so it is not used.
+  Rows age out with the events window and dedupe per source id (newest wins)
+  and by event id. A `duplicate` event of Gmail, Zoom or Mila used to show as an ordinary
   mail or recording row; it now shows here. See
   [Review rows](inbox.md#review-rows).
 
@@ -31,9 +31,20 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   resize) drew the detail card or thread again and scrolled it home, so a
   long card could not be read. The pane now keeps its scroll position for the
   same item and starts at the top for another item or the other thread order.
+- **A redraw no longer moves the list.** Every redraw (a refresh about every
+  30 s, a resize) rebuilt the queue and snapped its scroll to the cursor or
+  the top, so a list scrolled with the wheel or a half-read page jumped. The
+  viewport now stays where it was; only a hidden cursor row is brought into
+  view, with the least scrolling. In the thread pane (newest message first) a
+  new message on top no longer pushes the reader's place down.
+- **Task footer hints.** A task row lists `tab card`; with the card focused the
+  footer says `j/k scroll` and `esc queue`.
+- **Flaky teardown.** `context_tick` could raise `NoMatches '#context-body'`
+  while the app was closing; the render now returns when the pane is gone.
 - **Queue paging.** PgUp near the top cleared the cursor (the page landed on a
   group header); it now stays on the first row. Home, `g` and PgUp to the
-  first row also show that row's group header, and resizing the terminal
+  first row also show that row's group header (and reach the top when the
+  cursor is already there), and resizing the terminal
   shorter keeps the cursor row in view.
 
 ## [0.12.1] - 2026-11-18

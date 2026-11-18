@@ -1,6 +1,6 @@
 """Inbox 0.12.2: a `duplicate` capture event is a row in the Inbox's REVIEW
 section ("Not saved: near-duplicate of ..."), with `d` to dismiss it and `D`
-to save it anyway.
+to copy a command-line hint for saving it anyway (never the `save:` command).
 
 Synthetic data only (invented names, ids and sources). The classes without
 "UI" in their name need no Textual; the UI class skips without it. Every wait
@@ -100,7 +100,11 @@ class MappingTest(unittest.TestCase):
                 item = sources.event_to_item(
                     dup(source_id=sid, source=sid.split(":")[0]), NOW)
                 self.assertEqual(item["source"], "memory")
-                self.assertIsNone(item["link"])
+                # a refused capture keeps its own source's link
+                self.assertEqual(item["link"] is not None,
+                                 sid.startswith("gmail:"))
+                self.assertEqual("open" in item["actions"],
+                                 sid.startswith("gmail:"))
 
     def test_without_a_match_and_with_a_matched_title(self):
         item = sources.event_to_item(dup(duplicate_of=None), NOW)
@@ -117,6 +121,14 @@ class MappingTest(unittest.TestCase):
         rule = {"kind": "duplicate"}
         item = sources.event_to_item(dup(), NOW, rules=[rule])
         self.assertEqual(item["section"], "fyi")
+
+    def test_a_long_owner_action_list_says_how_many_more(self):
+        item = sources.event_to_item(
+            dup(actions=[f"Action {n}" for n in range(13)]), NOW)
+        text = {m["who"]: m["text"] for m in item["thread"]}
+        lines = text["owner actions not filed"].split("\n")
+        self.assertEqual(len(lines), 11)
+        self.assertEqual(lines[-1], "+3 more")
 
     def test_text_from_the_event_is_cleaned(self):
         item = sources.event_to_item(
@@ -274,7 +286,7 @@ class ReviewUITest(unittest.IsolatedAsyncioTestCase):
                          MATCH, "Send the notes"):
                 self.assertIn(want, body)
             hints = " ".join(f"{k} {v}" for k, v in app.hints())
-            self.assertIn("D save anyway", hints)
+            self.assertIn("D copy save hint", hints)
 
     async def test_d_dismisses_it_with_a_local_mark(self):
         actions = FakeActions(store=self.store, draft_delay=0)
@@ -289,62 +301,56 @@ class ReviewUITest(unittest.IsolatedAsyncioTestCase):
             # the only call is the local mark: no save, nothing sent
             self.assertEqual(actions.calls, [("mark_done", self.row["id"])])
 
-    async def test_D_saves_anyway_through_the_save_command(self):
+    async def test_D_never_calls_the_save_command(self):
+        # With save: configured, D still only copies a hint: the save command
+        # would get the review text, not the captured content.
         actions = SaveRecorder(store=self.store, draft_delay=0, saved_with=[])
-        app = self.app(actions)
-        async with app.run_test(size=SIZE) as pilot:
-            await self.settle(pilot, app)
-            await pilot.press("D")
-            self.assertTrue(await wait_for(
-                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
-            await pilot.press("y")
-            self.assertTrue(await wait_for(
-                pilot, lambda: bool(actions.saved_with), tries=300))
-            key, raw, force = actions.saved_with[0]
-            self.assertEqual(key, self.row["id"])
-            self.assertTrue(force)
-            self.assertEqual(raw["meta"]["source_id"], "slack:C0EXAMPLE:100.5")
-            self.assertEqual(raw["meta"]["title"], "Example sync notes")
-            self.assertEqual(raw["meta"]["duplicate_of"], MATCH)
-            self.assertTrue(await wait_for(
-                pilot, lambda: app.current_key is None and not app.running))
-
-    async def test_cancelling_the_confirm_saves_nothing(self):
-        actions = SaveRecorder(store=self.store, draft_delay=0, saved_with=[])
-        app = self.app(actions)
-        async with app.run_test(size=SIZE) as pilot:
-            await self.settle(pilot, app)
-            await pilot.press("D")
-            self.assertTrue(await wait_for(
-                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
-            await pilot.press("escape")
-            self.assertTrue(await wait_for(
-                pilot, lambda: not isinstance(app.screen, ConfirmWrite)))
-            await pilot.pause(0.8)   # negative check: outlasts the undo window
-            self.assertEqual(actions.saved_with, [])
-            self.assertEqual(app.current_key, self.row["id"])
-
-    async def test_without_a_save_command_D_copies_a_cli_hint(self):
-        actions = NoSave(store=self.store, draft_delay=0)
         app = self.app(actions)
         async with app.run_test(size=SIZE) as pilot:
             await self.settle(pilot, app)
             with mock.patch.object(app, "copy_to_clipboard") as copied:
                 await pilot.press("D")
-                self.assertTrue(await wait_for(
-                    pilot, lambda: copied.called))
+                self.assertTrue(await wait_for(pilot, lambda: copied.called))
             hint = copied.call_args.args[0]
             self.assertIn("--force-new", hint)
-            self.assertIn("slack:C0EXAMPLE:100.5", hint)
-            self.assertIn("Example sync notes", hint)
+            self.assertIn("--source-ids=slack:C0EXAMPLE:100.5", hint)
+            self.assertIn("--title='Example sync notes'", hint)
+            self.assertIn("network", hint)
+            self.assertIn("memory store directory", hint)
             toasts = [n.message for n in app._notifications]
-            self.assertTrue(any("CLI hint" in t for t in toasts), toasts)
-            self.assertFalse(isinstance(app.screen, ConfirmWrite))
+            self.assertTrue(any("save hint" in t for t in toasts), toasts)
+            self.assertNotIsInstance(app.screen, ConfirmWrite)
+            await pilot.pause(0.8)   # negative check: outlasts the undo window
+            self.assertEqual(actions.saved_with, [])
             self.assertEqual(actions.calls, [])
+            self.assertEqual(app.current_key, self.row["id"])  # row stays
+
+    async def test_m_is_not_bound_on_a_review_row(self):
+        actions = SaveRecorder(store=self.store, draft_delay=0, saved_with=[])
+        app = self.app(actions)
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            await pilot.press("m")
+            await pilot.pause(0.8)   # negative check: nothing opens or runs
+            self.assertNotIsInstance(app.screen, ConfirmWrite)
+            self.assertEqual(actions.saved_with, [])
+            self.assertEqual(app.current_key, self.row["id"])
+            hints = " ".join(f"{k} {v}" for k, v in app.hints())
+            self.assertNotIn("save by hand", hints)
+
+    async def test_the_hint_is_the_same_without_a_save_command(self):
+        app = self.app(NoSave(store=self.store, draft_delay=0))
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            with mock.patch.object(app, "copy_to_clipboard") as copied:
+                await pilot.press("D")
+                self.assertTrue(await wait_for(pilot, lambda: copied.called))
+            self.assertIn("--force-new", copied.call_args.args[0])
 
     def test_the_hint_quotes_the_title(self):
         hint = review_cli_hint("slack:C0EXAMPLE:1.5", "it's; rm -rf x")
-        self.assertIn("'it'\"'\"'s; rm -rf x'", hint)
+        self.assertIn("--title='it'\"'\"'s; rm -rf x'", hint)
+        self.assertIn("--source-ids=slack:C0EXAMPLE:1.5", hint)
 
 
 if __name__ == "__main__":

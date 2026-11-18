@@ -1587,15 +1587,16 @@ daemon did not file.
 
 - `d` dismisses the row: a local mark, like any `d`, with the 5 s undo. Nothing
   is sent anywhere.
-- `D` (also `m`) saves it anyway. It needs the `save:` command (see
-  [Save protocol](#save-protocol)): after a confirm and the 5 s undo window the
-  command gets the row as its `item` with `"force": true`, the same request as
-  "Save anyway" after a duplicate answer. The command reads the capture it must
-  write from `item.meta.source_id` (and `item.meta.title`, `item.meta.duplicate_of`);
-  the row's `gist` is the review text, not the content. A successful save marks
-  the row done. Without `save:` nothing is saved: `D` copies a command-line hint
-  (a template for the store's `add --force-new`, with the source id and title
-  quoted) and says so in a toast.
+- `D` copies a command-line hint and says so in a toast; it saves nothing, with
+  or without `save:`. The hint is a template for the store's
+  `add --force-new` with `--source-ids=` and `--title=` filled in (shell-quoted);
+  run it in the memory store directory and add `--type`, `--date` and `--body`.
+  `npx` may reach the network. `m` is not bound on these rows.
+
+The `save:` command is not used here on purpose: it receives the row, whose text
+is the review line, not the captured content, and the `duplicate` event carries
+no body, so a forced save would write a junk entry. Saving the skipped capture
+for real needs the daemon to recapture the source (future work).
 
 A review row is in no other view and no Feed rule applies to it.
 
@@ -1795,7 +1796,7 @@ group, `tab` switches pane, on a task row `d`, `D`, `s`, `x` and `o` (see [Tasks
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`, in a desktop app with `open_with:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
-memory by hand (needs `save:`; on a REVIEW row `d` dismisses and `D` saves it anyway; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
+memory by hand (needs `save:`; on a REVIEW row `d` dismisses and `D` copies a save hint; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),

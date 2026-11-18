@@ -125,6 +125,37 @@ class Queue(OptionList):
         # A shorter pane can leave the cursor row below its edge.
         self.call_after_refresh(self.scroll_to_highlight)
 
+    def action_first(self):
+        super().action_first()
+        self.scroll_to_highlight()      # also when the cursor was on it
+
+    def action_last(self):
+        super().action_last()
+        self.scroll_to_highlight()
+
+    def _restore_scroll(self, y):
+        """After a rebuild: the viewport where it was (a redraw must not move
+        what the reader scrolled to), then the least scrolling that shows the
+        cursor row."""
+        if not self.is_mounted:
+            return
+        self._update_lines()
+        self.scroll_to(y=min(max(0, y), self.max_scroll_y), animate=False,
+                       immediate=True)
+        hl = self.highlighted
+        if hl is None or hl not in self._index_to_line:
+            return
+        top = self._index_to_line[hl]
+        bottom = top + self._heights[hl] - 1
+        height = self.scrollable_content_region.height
+        cur = self.scroll_offset.y
+        if top < cur:
+            cur = top
+        elif bottom >= cur + height:
+            cur = bottom - height + 1
+        if cur != self.scroll_offset.y:
+            self.scroll_to(y=cur, animate=False, immediate=True)
+
     def _page(self, step):
         """PgUp/PgDn: a page of lines. A page that lands on a group header
         (a disabled option) must not clear the cursor."""
@@ -154,6 +185,7 @@ class Queue(OptionList):
         `datetime.date`, default the local date) is what a task row's due cell
         counts from."""
         width = max(24, (self.size.width or 40) - 1)
+        keep_y = self.scroll_y if self.options else None
         self.today = today or dt.date.today()
         opts = []
         self.rows = []
@@ -196,6 +228,10 @@ class Queue(OptionList):
         if target is None and self.rows:
             target = self.get_option_index(ITEM_PREFIX + self.rows[0].key)
         self.highlighted = target
+        if keep_y is not None:
+            # clear_options and the highlight scroll the list on their own:
+            # put the viewport back once the new rows are laid out.
+            self.call_after_refresh(self._restore_scroll, keep_y)
 
     def _task_row(self, it, width, pal, visual):
         """A task: glyph, title, the due cell and the age on the first line,
@@ -280,6 +316,12 @@ class ThreadView(VerticalScroll):
     can_focus = True
     _shown = None      # (item key, newest_first) of the last drawing
 
+    def _keep_place(self, before):
+        delta = self.virtual_size.height - before
+        if delta and self.scroll_y > 0:
+            self.scroll_to(y=max(0, self.scroll_y + delta), animate=False,
+                           immediate=True)
+
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
 
@@ -296,6 +338,11 @@ class ThreadView(VerticalScroll):
         shown = (None if item is None else item.key, newest_first)
         fresh = shown != self._shown
         self._shown = shown
+        if not fresh and newest_first and self.scroll_y > 0:
+            # Same item, newest message first: a new message lands on top.
+            # Keep the reader's place by the change in content height.
+            before = self.virtual_size.height
+            self.call_after_refresh(self._keep_place, before)
         if item is None:
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
             return

@@ -9,6 +9,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -257,6 +258,129 @@ class TasksScrollTest(ScrollBase):
                 self.assertTrue(await wait_for(
                     pilot, lambda: app.size.height == rows))
                 await self.assert_cursor_visible(pilot, app, q, rows)
+
+
+class ViewportTest(ScrollBase):
+    """A redraw (a refresh every 30 s or so) must not move the viewport the
+    reader scrolled to; the list used to snap to the cursor or the top."""
+
+    async def test_a_redraw_after_the_wheel_keeps_the_offset(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            for _ in range(8):      # the cursor is low in the first page
+                await self.step(pilot, app, "j")
+            wheel(q)                # one notch: the cursor stays in view
+            self.assertTrue(await wait_for(
+                pilot, lambda: q.scroll_offset.y > 0))
+            await self.assert_cursor_visible(pilot, app, q, "after wheel")
+            offset, key = q.scroll_offset.y, app.current_key
+            app.redraw()
+            await pilot.pause(0.4)    # negative check: the offset must not move
+            self.assertEqual(q.scroll_offset.y, offset)
+            self.assertEqual(app.current_key, key)
+
+    async def test_a_redraw_keeps_the_viewport_with_the_cursor_mid_view(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            for _ in range(20):
+                await self.step(pilot, app, "j")
+            for _ in range(5):
+                await self.step(pilot, app, "k")
+            await self.assert_cursor_visible(pilot, app, q, "after k")
+            offset, key = q.scroll_offset.y, app.current_key
+            self.assertGreater(offset, 0)
+            app.redraw()
+            await pilot.pause(0.4)    # negative check: the viewport stays
+            self.assertEqual(q.scroll_offset.y, offset)
+            self.assertEqual(app.current_key, key)
+            await self.assert_cursor_visible(pilot, app, q, "after redraw")
+
+    async def test_a_redraw_still_brings_a_hidden_cursor_into_view(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            for _ in range(8):
+                wheel(q)    # the wheel scrolls the cursor row out of view
+            self.assertTrue(await wait_for(
+                pilot, lambda: not visible(q, app.current_key)))
+            app.redraw()
+            self.assertTrue(await wait_for(
+                pilot, lambda: visible(q, app.current_key)))
+
+    async def test_g_and_home_reach_the_top_when_already_on_the_first_row(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            first = app.current_key
+            for key in ("g", "home"):
+                for _ in range(2):
+                    wheel(q)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: q.scroll_offset.y > 0))
+                await pilot.press(key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: q.scroll_offset.y == 0), key)
+                self.assertEqual(app.current_key, first)
+
+    async def test_a_new_message_on_top_keeps_the_readers_place(self):
+        thread = [{"who": f"P{n}", "ts": 1893490000.0 + n,
+                   "text": "line " * 40} for n in range(30)]
+        row = itm.make_item(
+            id="t:1", source="slack", section="urgent", urgency="urgent",
+            sender="Person", where="#room", gist="gist", ts=1893492000.0,
+            link=None, draft=None, actions=["ack"], thread=thread)
+        app = self.app(lambda: [sources.SourceResult("t", [row], False, None,
+                                                      None)], "inbox")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            pane = app.query_one("#thread")
+            self.assertTrue(await wait_for(pilot, lambda: pane.max_scroll_y > 0))
+            pane.scroll_to(y=10, animate=False)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y == 10))
+            before = pane.virtual_size.height
+            app.current.messages.append(type(app.current.messages[0])(
+                "Late", 1893499000.0, "a new reply\n" * 6))
+            app.redraw()
+            self.assertTrue(await wait_for(
+                pilot, lambda: pane.virtual_size.height > before
+                and pane.scroll_y == 10 + pane.virtual_size.height - before))
+
+
+class HintsTest(ScrollBase):
+    async def test_task_hints_follow_the_focus(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            keys = lambda: [k for k, _v in app.hints()]  # noqa: E731
+            self.assertIn("tab", keys())            # "tab  card"
+            self.assertIn(("tab", "card"), app.hints())
+            await pilot.press("tab")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.focused is app.query_one("#thread")))
+            self.assertIn(("j/k", "scroll"), app.hints())
+            self.assertIn(("esc", "queue"), app.hints())
+            self.assertNotIn(("j/k", "move"), app.hints())
+
+
+class ContextGuardTest(ScrollBase):
+    async def test_context_render_returns_when_the_pane_body_is_gone(self):
+        from textual.css.query import NoMatches
+        from workspace_daemon.inbox.widgets import ContextPane
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            app.context_open = True
+            with unittest.mock.patch.object(
+                    ContextPane, "show", side_effect=NoMatches("#context-body")):
+                app.context_render()          # must not raise
+            self.assertIsNone(app._ctx_sig)   # and must not claim a drawing
+            app.context_open = False
 
 
 class OtherViewsScrollTest(ScrollBase):
