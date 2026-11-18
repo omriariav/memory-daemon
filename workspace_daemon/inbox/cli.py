@@ -74,6 +74,7 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
                                polish=settings["polish"],
                                copy=settings["copy"], team=settings["team"],
                                slack_open=settings["slack_open"],
+                               open_with=settings["open_with"],
                                acts={s["name"]: {"argv": s["argv"],
                                                  "timeout_s": s["timeout_s"],
                                                  "acts": s["acts"]}

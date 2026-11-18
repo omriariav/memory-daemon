@@ -149,6 +149,15 @@ alert_urgent_max_age_h: 6
 # slack_open:
 #   url_template: "slack://channel?team={team}&id={channel}"
 
+# Open links in a desktop app (macOS). `o` hands an https URL whose host matches
+# a rule to `open -a <app> <url>` instead of the default browser; the URL is the
+# one `o` already chose (the slack_open template, else the item link). Rules are
+# host globs, case insensitive, first match wins; app is the application name
+# (letters, digits, space . _ -). A slack:// or http URL, a non-zero exit, a
+# timeout or another platform falls back to the browser. Off until set.
+# open_with:
+#   - {host: "*.example-chat.com", app: "Example Chat"}
+
 # Slack reaction (E key). Off until set; there is no default. Pick an emoji
 # (1-9 quick keys), confirm, 5 s undo, then one pinned call with exactly the
 # channel, the message timestamp and the emoji name. The target is

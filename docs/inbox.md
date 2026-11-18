@@ -1027,6 +1027,28 @@ send:
 | `team` | none | the Slack workspace id for `{team}` |
 | `slack_open.url_template` | none | starts with `slack://` or `https://`; placeholders `{channel}`, `{thread_ts}`, `{message_ts}`, `{team}` (`{team}` needs `team:`) |
 
+**Open a link in a desktop app (`open_with`).** `o` normally hands the URL to
+the default browser. With `open_with`, an `https` URL whose host matches a rule
+opens in the named macOS app instead (`open -a <app> <url>`, no shell, 5 s
+timeout). The URL is the one `o` already chose: the `slack_open` template when
+it applies, else the item's link. Rules are `fnmatch` globs on the host, case
+insensitive, first match wins; `*.example-chat.com` matches a subdomain but not
+`example-chat.com` itself. Only `https` URLs go to an app: a `slack://` or
+`http://` URL uses the browser path as before. A non-zero exit, a timeout, a
+failure to run `open`, or any platform other than macOS falls back to the
+browser, and the toast says why, for example `opened in browser (Slack: exit 1)`.
+
+```yaml
+open_with:
+  - {host: "*.slack.com", app: "Slack"}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `open_with` | none | a list of up to 20 `{host, app}` rules, nothing else |
+| `open_with[].host` | required | a glob of letters, digits, `.`, `-` and `*` |
+| `open_with[].app` | required | the app name: `^[A-Za-z0-9 ._-]{1,64}$`, not starting with `-` |
+
 ### Slack reactions (`E`)
 
 `E` adds an emoji reaction to the item's message when `react:` is set (no
@@ -1404,6 +1426,7 @@ defaults; a broken one prints every problem and exits 2.
 | `send` | off | real Slack send for replies and nudges; `mode` send / draft / both (see "Slack send" and "Draft and copy") |
 | `copy` | `false` | "Copy for Slack" without `send:` (see "Draft and copy") |
 | `team`, `slack_open` | off | where `o` opens a Slack item (see "Draft and copy") |
+| `open_with` | off | open matching https links in a macOS app instead of the browser (see "Draft and copy") |
 | `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
 | `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
 | `done_reaction` | off | an emoji name: `d` also reacts to the row's message; needs `react:` (see [Acts](#donereaction)) |
@@ -1502,7 +1525,7 @@ The inbox is organised by whose move it is. A tab bar and a one-line health
 strip sit on top; `1` to `5` switch the view.
 
 ```
- inbox 0.10.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ inbox 0.10.1  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
  slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
 ```
 
@@ -1659,7 +1682,7 @@ At most 10 heartbeats. The files are only `stat`ed.
 `1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
 group, `tab` switches pane,
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
-`d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`), `u` undo, on a pending invite
+`d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`, in a desktop app with `open_with:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
 memory by hand (needs `save:`; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
@@ -1758,7 +1781,9 @@ header and the help overlay show the inbox version.
   `D` makes a no-tools bridge call over the thread and never sends;
   `done_reaction` uses the pinned react call.
 - `open` launches plain `http(s)` links, and with `slack_open` the template's
-  `slack://` or `https://` URL (built only from validated ids).
+  `slack://` or `https://` URL (built only from validated ids). With
+  `open_with`, a matching `https` URL runs `open -a <app> <url>` as an argv
+  list (no shell); the app name is validated at load time.
 - Sources run with your privileges: only configure commands you trust.
 
 ## Keeping private data out of the repo
