@@ -10,6 +10,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "inbox_fake_source.py"
 CHANNEL, THREAD, MESSAGE = "C0EXAMPLE01", "1893492000.000100", "1893492060.000200"
 ALL_ACTS = ["close", "snooze", "mute", "waits_on", "relay"]
+TASK_ACTS = ["close", "drop", "due"]
 
 
 class FakeSource:
@@ -41,6 +42,13 @@ class FakeSource:
     def applied(self):
         return self._lines("applied.jsonl")
 
+    def set_items(self, items):
+        """The items `list` returns (and that task acts change)."""
+        (self.root / "items.json").write_text(json.dumps(items))
+
+    def items(self):
+        return json.loads((self.root / "items.json").read_text())
+
 
 def acts_cfg(source, name="src", acts=None, timeout_s=15.0):
     return {name: {"argv": source.argv, "timeout_s": timeout_s,
@@ -50,3 +58,18 @@ def acts_cfg(source, name="src", acts=None, timeout_s=15.0):
 def thread(*who):
     return [{"who": w, "ts": time.time() - 100 + n, "text": f"msg {n}"}
             for n, w in enumerate(who)]
+
+
+def task_item(n, task_type="todo", due=None, date="2030-01-01", people=(),
+              evidence=None, link=None, source="memory", name=None, **meta):
+    """A synthetic task item (v1 dict, JSON-able) for a task source."""
+    base = {"kind": "task", "task_type": task_type, "due": due, "date": date,
+            "people": list(people), "evidence": evidence,
+            "source_ids": [f"src-{n}"]}
+    base.update(meta)
+    return {"v": 1, "id": f"task:{n}", "source": source,
+            "section": "fyi", "urgency": "digest",
+            "sender": (people[0] if people else "me"), "where": "tasks",
+            "gist": name or f"Task {n}", "ts": 1893492000.0 + n,
+            "link": link, "thread": [], "draft": None,
+            "actions": ["done"] + (["open"] if link else []), "meta": base}

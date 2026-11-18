@@ -256,6 +256,18 @@ sources:
   #   # state/inbox-ops-pending.jsonl and retried on refresh; a conflict undoes
   #   # the local mark. See "Acts" in docs/inbox.md.
   #   acts: [close, snooze, mute, waits_on, relay]
+  #
+  # A task source (0.12.0): a command source whose items carry
+  # meta.kind: "task" (plus task_type todo|decision, due, date, people,
+  # evidence, source_ids) fills the Tasks view and the Inbox's DUE TODAY
+  # section. d closes (a decision asks for its text), D closes with an
+  # outcome, s sets the due date, x drops. Without `acts:` it is read-only.
+  # See "Tasks" in docs/inbox.md.
+  # - name: tasks
+  #   type: command
+  #   argv: ["python3", "~/bin/my-task-source.py"]
+  #   timeout_s: 20
+  #   acts: [close, drop, due]
 
 # The Feed (view 4) lists every FYI row by routine. Rows older than window_h
 # age out of it (the A key shows them again). Rules are tried in order, the

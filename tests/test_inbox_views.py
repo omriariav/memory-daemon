@@ -51,9 +51,10 @@ class InboxViewTest(unittest.TestCase):
         self.assertEqual(keys(groups["urgent"].items), ["u1"])
         self.assertEqual(keys(groups["owe"].items), ["o2", "o1"])  # newest first
         self.assertEqual(keys(groups["nudge"].items), ["n1"])
-        # every group is listed even when empty; DUE TODAY has no slot yet
+        # the first three are listed even when empty; DUE TODAY (tasks) is
+        # a fourth group the queue hides while it has no rows
         self.assertEqual([g.title for g in views.inbox_groups([])],
-                         ["URGENT", "I OWE", "NUDGE DUE"])
+                         ["URGENT", "I OWE", "NUDGE DUE", "DUE TODAY"])
 
     def test_invites_belong_to_i_owe_soonest_first(self):
         later = mk("inv2", "needs_reply", "calendar", -48, actions=("ack",),

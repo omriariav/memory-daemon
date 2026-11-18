@@ -7,6 +7,41 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-18
+
+The Tasks view: a command source can list open tasks, and the inbox shows,
+sorts and acts on them. Opt-in: a source whose items are not tasks, and a task
+source with no `acts:`, change nothing else.
+
+### Added
+
+- **Task rows.** An item with `meta.kind: "task"` (and `task_type` `todo` or
+  `decision`, `due`, `date`, `people`, `evidence`, `source_ids`, and the item's
+  own `link`) is a task. Task rows never show in the Feed, Waiting or the
+  Inbox's URGENT, I OWE and NUDGE DUE.
+- **View 3 Tasks** replaces the placeholder: OVERDUE, DUE TODAY, THIS WEEK,
+  LATER, DECIDE (every decision) and NO DATE, empty sections hidden, each
+  sorted by due date then creation date. The tab shows how many tasks are
+  overdue or due today (`3 Tasks 4`). "Today" is the local date, recomputed on
+  every refresh. Rows show a `☐` or `◇` glyph, the title, people, a due cell
+  (`today`, `2d late`, `Thu`, `21 Nov`, `-`) and the age; overdue rows are
+  drawn like urgent ones. The detail pane shows type, due, created date,
+  people, evidence and source ids; `o` opens the link or says "no link".
+- **Inbox `DUE TODAY`** after NUDGE DUE: the overdue and due-today tasks
+  (shown only when there are some).
+- **Task keys** on the acts protocol (undo window, pending retry, ops log): `d`
+  closes a todo at once and asks for the decision (required) on a decision; `D`
+  asks for an outcome and closes a todo; `s` picks a due date (Tomorrow, Next
+  Sunday, +1 week, a validated `YYYY-MM-DD`, No date); `x` drops with an
+  optional reason. New acts `drop` and `due` for `acts:` (the inverses are
+  `reopen` and `due` with the previous date, so `u` in `L` undoes them). A
+  source with no `acts:` is read-only.
+- `memory` is a valid item `source` (a generic label and glyph for items that
+  come from a memory store).
+- `tests/inbox_fake_source.py` lists task items and `tests/test_inbox_tasks*.py`
+  cover the sections across midnight, each key path, the due inverse, the
+  Inbox section, the tab count and a read-only source.
+
 ## [0.11.0] - 2026-11-18
 
 ### Added
