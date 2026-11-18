@@ -9,6 +9,21 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [0.12.2] - 2026-11-18
 
+### Added
+
+- **Near-duplicate captures show as REVIEW rows.** When the memory store
+  refuses a capture as a near-duplicate, the daemon's `duplicate` event is now
+  a row in the Inbox's new `REVIEW` group (listed only when there is one):
+  `Not saved: near-duplicate of <matched title or id>`, with a detail pane of
+  the skipped title, source id, matched entry and any owner actions not filed.
+  `d` dismisses it (a local mark). `D` (or `m`) saves it anyway through the
+  existing `save:` command, with `"force": true` and the row's
+  `meta.source_id` and `meta.title`; without `save:` it copies a command-line
+  hint and says so. Rows age out with the events window and dedupe by event
+  id. A `duplicate` event of Gmail, Zoom or Mila used to show as an ordinary
+  mail or recording row; it now shows here. See
+  [Review rows](inbox.md#review-rows).
+
 ### Fixed
 
 - **The Tasks view (and the thread pane) kept snapping back to the top.**

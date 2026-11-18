@@ -535,6 +535,7 @@ event that was created, then updated, appears once.
 | `mila`, `zoom` | `recording` | `mila` or `zoom` | `ack` |
 | `daemon` kind `alert` | `alert` | `daemon` | `ack` |
 | `sheet` (a sheet-watching routine) | `sheet` | the routine id, else `sheet` | `ack` |
+| any source, kind `duplicate` | `memory` | `not saved` | `ack` |
 
 Every row also carries `meta.routine` (the event's `routine`, which the Feed
 groups by), `meta.title` (the event title, which the Feed rules match with
@@ -557,6 +558,20 @@ when there is a snippet, and a link to the Gmail thread built from
 `gist` stays the memory title. The event's `memory_id`, when it matches
 `^[a-z0-9][a-z0-9-]{0,200}$`, is copied to `meta.memory_id` so a context
 command can link the captured entry.
+
+A `duplicate` event (the memory store refused a capture as a near-duplicate;
+`memory_id` and `details.duplicate_of` name the entry it matched) is one
+`memory` row, whatever the capture's source: `sender` is the skipped title,
+`gist` is `Not saved: near-duplicate of <matched title, else id>` (the title
+comes from an earlier `new`/`update` event naming that entry), and the thread
+lists the skipped title, its source id, the matched entry and any
+`details.owner_actions_not_filed`. `meta` holds `kind: duplicate`, `source_id`,
+`title`, `duplicate_of` and `matched_title`. The event's `memory_id` is not
+copied to `meta.memory_id`: it is the matched entry, not this row's own. The
+row never counts as the item's memory entry and never lists as urgent. It is
+kept per source id apart from the capture rows of the same id, and ages out
+with the `window_h` like every event row. It shows in the Inbox's `REVIEW`
+group (see [Views](#views)) and nowhere else.
 
 `open` is listed only when the item has a link (the UI also hides it for any
 item with a null `link`, whatever a source says). Today only Gmail events have
@@ -1539,7 +1554,7 @@ strip sit on top; `1` to `5` switch the view.
 
 | View | What it lists |
 | --- | --- |
-| `1` Inbox | `URGENT` (urgent rows, and Feed rows a rule promotes), `I OWE` (`needs_reply` rows, pending invites included, soonest invite first) and `NUDGE DUE` (waiting rows that can be nudged and have a stored nudge draft). The three groups are always listed, with a dash when empty. A fourth, `DUE TODAY`, follows them when there are overdue or due-today [tasks](#tasks) (todos and decisions, by due date). |
+| `1` Inbox | `URGENT` (urgent rows, and Feed rows a rule promotes), `I OWE` (`needs_reply` rows, pending invites included, soonest invite first) and `NUDGE DUE` (waiting rows that can be nudged and have a stored nudge draft). The three groups are always listed, with a dash when empty. A fourth, `DUE TODAY`, follows them when there are overdue or due-today [tasks](#tasks) (todos and decisions, by due date). A fifth, `REVIEW`, lists captures the store refused as near-duplicates (see [Review rows](#review-rows)), newest first, when there are any. |
 | `2` Waiting | the `waiting` rows by person (the item's `sender`, compared without case), the person with the oldest open ask first and each person's oldest ask first. A group header reads `NAME  3 open · oldest 2d`. A bookmark (`meta.via` starting with `track_reaction`, or `meta.cls` `bookmarked`) goes to a last group, `TRACKING`. |
 | `3` Tasks | the task rows of the command sources, by due date (see [Tasks](#tasks)). The tab counts the overdue and due-today ones: `3 Tasks 4`. |
 | `4` Feed | every `fyi` row, by routine (see [Feed](#feed)). |
@@ -1559,6 +1574,30 @@ exists, and the badge should not stay quiet over a red cell.
 
 `[` and `]` jump to the first row of the previous and next group (a section in
 the Inbox, a person in Waiting, a routine in the Feed).
+
+### Review rows
+
+When the memory store refuses a capture as a near-duplicate, the daemon writes
+a `duplicate` event (see the [events source](#built-in-events-source)); the
+inbox shows it under `REVIEW` in the Inbox, not under `I OWE`, because nobody
+waits on you: it is the daemon asking you to look at something it did not do.
+The row reads `Not saved: near-duplicate of <entry>`, and its detail pane lists
+the skipped title, the source id, the matched entry and any owner actions the
+daemon did not file.
+
+- `d` dismisses the row: a local mark, like any `d`, with the 5 s undo. Nothing
+  is sent anywhere.
+- `D` (also `m`) saves it anyway. It needs the `save:` command (see
+  [Save protocol](#save-protocol)): after a confirm and the 5 s undo window the
+  command gets the row as its `item` with `"force": true`, the same request as
+  "Save anyway" after a duplicate answer. The command reads the capture it must
+  write from `item.meta.source_id` (and `item.meta.title`, `item.meta.duplicate_of`);
+  the row's `gist` is the review text, not the content. A successful save marks
+  the row done. Without `save:` nothing is saved: `D` copies a command-line hint
+  (a template for the store's `add --force-new`, with the source id and title
+  quoted) and says so in a toast.
+
+A review row is in no other view and no Feed rule applies to it.
 
 ### Tasks
 
@@ -1756,7 +1795,7 @@ group, `tab` switches pane, on a task row `d`, `D`, `s`, `x` and `o` (see [Tasks
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`, in a desktop app with `open_with:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
-memory by hand (needs `save:`; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
+memory by hand (needs `save:`; on a REVIEW row `d` dismisses and `D` saves it anyway; the daemon saves on its own, `◆` marks what is already in memory), any key set in `actions:`
 (needs `actions:`), `E` react to the message (needs `react:`), `P` polish the draft (needs `polish:`), `a`/`n` also send to Slack, place a Slack draft or copy for Slack when `send:` or `copy:` is set (inside the confirm screen: `y` send, `d` draft, `c` copy), `c` context pane (needs `context:`), `C` fetch its
 context again, `i` AI summary and `I` a new one (needs `summary:`), `r` refresh
 everything now (inside the context pane, fetch its context again),

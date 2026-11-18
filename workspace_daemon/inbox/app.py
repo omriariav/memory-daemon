@@ -2,6 +2,7 @@
 import asyncio
 import datetime
 import inspect
+import shlex
 import sys
 import threading
 import time
@@ -107,6 +108,16 @@ def _takes_show_all(fetch):
         return False
     return "show_all" in params or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def review_cli_hint(source_id, title):
+    """A command line to copy when a skipped near-duplicate cannot be saved
+    from the inbox (no `save:` command). A template: it runs in the memory
+    store directory and still needs the entry text (`--body`, or on stdin)."""
+    return ("# in your memory store directory; add --type, --date and the text"
+            " (--body)\n"
+            "npx tsx src/cli.ts add --force-new --source-ids "
+            f"{shlex.quote(source_id)} --title {shlex.quote(title)}")
 
 
 @dataclass
@@ -524,7 +535,8 @@ class InboxApp(App):
                                   now)
         for it in rows:
             it.feed, it.feed_label = "show", ""
-            if it.section == "fyi" and rules and not tasksmod.is_task(it):
+            if (it.section == "fyi" and rules and not tasksmod.is_task(it)
+                    and not views.is_review(it)):
                 action, rule = feedrules.classify(it, rules, now)
                 it.feed = action
                 if rule is not None:
@@ -973,6 +985,9 @@ class InboxApp(App):
                 keys.append(("x", "drop"))
             return base + keys + opn + [("u", "undo"), ("/", "filter"),
                                         ("?", "help")]
+        if views.is_review(it):
+            return base + [("d", "dismiss"), ("D", "save anyway")] + [
+                ("y", "copy"), ("u", "undo"), ("S", "saved"), ("?", "help")]
         if self._rsvp_on(it):
             tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
                 ("u", "undo"), ("S", "saved"), ("?", "help")]
@@ -2103,6 +2118,8 @@ class InboxApp(App):
         it = self.current
         if it is not None and tasksmod.is_task(it):
             return self._task_done(it, outcome=True)
+        if it is not None and views.is_review(it):
+            return self._review_save(it)
         if it is None or self._synthetic(it):
             return
         if "reply" not in it.actions and "nudge" not in it.actions:
@@ -2351,6 +2368,46 @@ class InboxApp(App):
             "Possible duplicate", rows, "Save anyway",
             "Saving anyway adds another memory.", self.bidi), after)
 
+    def _review_save(self, it):
+        """D (or m) on a REVIEW row: save the skipped capture anyway. With
+        `save:` configured the row goes to that command like any save, with
+        `"force": true` (the command gets the row's `meta.source_id` and
+        `meta.title`); without it a CLI hint is copied and nothing is saved."""
+        title = str(it.meta.get("title") or it.who)
+        sid = str(it.meta.get("source_id") or "")
+        matched = str(it.meta.get("duplicate_of") or "")
+        if not getattr(self.actions, "save_configured", False):
+            hint = review_cli_hint(sid, title)
+            self.copy_to_clipboard(hint)
+            self.record("save", it, "no save command: CLI hint copied",
+                        "cancelled")
+            self.notify("Copied a CLI hint: set save: in inbox.yaml to save "
+                        "from here", timeout=6, markup=False)
+            return
+        if any(p.kind == "save" and p.item.key == it.key and not p.done
+               for p in self.pending) or any(
+                p.kind == "save" and p.item.key == it.key for p in self.running):
+            self.notify("save already in progress", timeout=2, markup=False)
+            return
+        rows = [("Skipped", title), ("Source id", sid),
+                ("Matched", f"{matched} ({it.meta.get('matched_title')})"
+                 if it.meta.get("matched_title") else matched)]
+
+        def after(ok):
+            if ok:
+                self._enqueue("save", it, f"Save anyway: {title}", hide=False,
+                              detail="save anyway (duplicate review)",
+                              force=True)
+            else:
+                self.record("save", it, "duplicate review: not saved",
+                            "cancelled")
+                self.notify("Cancelled. Nothing saved.", timeout=2,
+                            markup=False)
+        self.push_screen(ConfirmWrite(
+            "Save anyway", rows, "Save anyway",
+            "Saving anyway adds another memory next to the matched one.",
+            self.bidi), after)
+
     def _confirm_thread_saved(self, it):
         """The item's Slack thread is already in memory, this message may not
         be: the same choice as a likely duplicate."""
@@ -2377,6 +2434,8 @@ class InboxApp(App):
             return
         if self._synthetic(it):
             return
+        if views.is_review(it):
+            return self._review_save(it)
         if it.memory_id:      # the daemon (or an earlier save) already did it
             self.notify(f"Already in memory ({it.memory_id})", timeout=4,
                         markup=False)
@@ -2553,7 +2612,7 @@ class InboxApp(App):
             emoji = (fn(it) if fn else None) or ""
         except Exception:
             emoji = ""
-        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' else 'Done'}: {it.who}",
+        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' or views.is_review(it) else 'Done'}: {it.who}",
                       act=act, react=emoji)
 
     def action_snooze(self):

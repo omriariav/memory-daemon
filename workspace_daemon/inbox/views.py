@@ -6,8 +6,9 @@ A view is not a copy of the data. Each function here takes the live
 same in every view. Only two kinds of row are made here: a digest row (many
 rows of one routine and day folded into one) and a saved-to-memory row.
 
-1 Inbox    URGENT, I OWE (needs_reply, invites included), NUDGE DUE, and
-           DUE TODAY (the overdue and due-today tasks)
+1 Inbox    URGENT, I OWE (needs_reply, invites included), NUDGE DUE,
+           DUE TODAY (the overdue and due-today tasks) and REVIEW (captures
+           the store refused as near-duplicates; listed only when present)
 2 Waiting  waiting rows by person, then bookmarks as TRACKING
 3 Tasks    the task rows (tasks.py) by due date: OVERDUE, DUE TODAY, THIS
            WEEK, LATER, DECIDE, NO DATE
@@ -15,7 +16,8 @@ rows of one routine and day folded into one) and a saved-to-memory row.
 5 Health   not a list of items (see health.py)
 
 A task row (`meta.kind == "task"`) never shows in Waiting, the Feed or the
-Inbox's URGENT, I OWE and NUDGE DUE.
+Inbox's URGENT, I OWE and NUDGE DUE. A review row (a refused near-duplicate
+capture) shows only in REVIEW.
 """
 import datetime
 import time
@@ -76,6 +78,13 @@ def nudge_due(item):
             and bool(item.draft and item.draft.strip()))
 
 
+def is_review(item):
+    """A `duplicate` capture event: the store refused a capture as a
+    near-duplicate (events source, `meta.kind == "duplicate"`)."""
+    return item.source == "memory" and (
+        isinstance(item.meta, dict) and item.meta.get("kind") == "duplicate")
+
+
 def is_digest(item):
     return item.key.startswith(DIGEST_PREFIX)
 
@@ -113,7 +122,7 @@ def inbox_groups(items, today=None):
     (`feed == "inbox"`) joins URGENT. Task rows are in none of the first
     three. `today` is a `datetime.date` (default: the local date)."""
     today = today or datetime.date.today()
-    rows = [i for i in items if not tasks.is_task(i)]
+    rows = [i for i in items if not tasks.is_task(i) and not is_review(i)]
     urgent = [i for i in rows
               if i.section == "urgent"
               or (i.section == "fyi" and i.feed == "inbox")]
@@ -125,10 +134,12 @@ def inbox_groups(items, today=None):
                   if tasks.is_task(i) and tasks.is_due_by(i, today)),
                  key=tasks.sort_key)
     overdue = any(tasks.due_of(i) < today for i in due)
+    review = sorted((i for i in items if is_review(i)), key=lambda i: -i.ts)
     return [Group("urgent", "URGENT", urgent, hot=True, keep_empty=True),
             Group("owe", "I OWE", owe, keep_empty=True),
             Group("nudge", "NUDGE DUE", nudge, keep_empty=True),
-            Group("due_today", "DUE TODAY", due, hot=overdue)]
+            Group("due_today", "DUE TODAY", due, hot=overdue),
+            Group("review", "REVIEW", review)]
 
 
 # --- 3 Tasks ----------------------------------------------------------------
@@ -252,7 +263,8 @@ def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
     by_routine = OrderedDict()
     muted = OrderedDict()
     for it in sorted((i for i in items if i.section == "fyi"
-                      and not tasks.is_task(i)), key=lambda i: -i.ts):
+                      and not tasks.is_task(i) and not is_review(i)),
+                     key=lambda i: -i.ts):
         if it.feed == "inbox":
             continue
         pinned = is_active_alert(it)
