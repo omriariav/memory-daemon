@@ -1033,10 +1033,15 @@ opens in the named macOS app instead (`open -a <app> <url>`, no shell, 5 s
 timeout). The URL is the one `o` already chose: the `slack_open` template when
 it applies, else the item's link. Rules are `fnmatch` globs on the host, case
 insensitive, first match wins; `*.example-chat.com` matches a subdomain but not
-`example-chat.com` itself. Only `https` URLs go to an app: a `slack://` or
-`http://` URL uses the browser path as before. A non-zero exit, a timeout, a
-failure to run `open`, or any platform other than macOS falls back to the
-browser, and the toast says why, for example `opened in browser (Slack: exit 1)`.
+`example-chat.com` itself. `host: "*"` sends every `https` link to the app.
+Write an internationalized host in punycode (`xn--...`), since the match is on
+the ASCII host. A URL with `user@` before the host, or a backslash in it, is
+never matched. Only `https` URLs go to an app: a `slack://` or
+`http://` URL uses the browser path as before. A non-zero exit, a timeout or a
+failure to run `open` falls back to the browser, and the toast says why, for
+example `<url> (browser; Slack: exit 1)`; on success it ends `(in Slack)`. On
+any platform other than macOS the rules are skipped silently. The open runs in
+a worker thread, so the UI never waits for it.
 
 ```yaml
 open_with:
@@ -1047,7 +1052,7 @@ open_with:
 | --- | --- | --- |
 | `open_with` | none | a list of up to 20 `{host, app}` rules, nothing else |
 | `open_with[].host` | required | a glob of letters, digits, `.`, `-` and `*` |
-| `open_with[].app` | required | the app name: `^[A-Za-z0-9 ._-]{1,64}$`, not starting with `-` |
+| `open_with[].app` | required | the app name: `^[A-Za-z0-9 ._-]{1,64}$`, not starting with `-`, not only dots or spaces |
 
 ### Slack reactions (`E`)
 
@@ -1525,7 +1530,7 @@ The inbox is organised by whose move it is. A tab bar and a one-line health
 strip sit on top; `1` to `5` switch the view.
 
 ```
- inbox 0.10.1  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ inbox 0.11.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
  slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
 ```
 

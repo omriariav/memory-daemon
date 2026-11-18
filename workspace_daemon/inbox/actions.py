@@ -99,6 +99,9 @@ def safe_link(link):
     return link if items.valid_link(link) else None
 
 
+OPEN_BIN = "/usr/bin/open"   # macOS; an absolute path, never looked up on PATH
+
+
 class LocalActions:
     """Real backend for phase 1a: local marks only."""
 
@@ -856,15 +859,19 @@ class LocalActions:
 
     def open_app_for(self, link):
         """The app name of the first `open_with` rule that matches the host
-        of an https `link`, else None (any other scheme never matches)."""
+        of an https `link`, else None (any other scheme never matches). A URL
+        with userinfo (`user@host`) or a backslash in its authority is never
+        matched: browsers and `urlsplit` can disagree on its real host."""
         if not self.open_with:
             return None
         try:
             parts = urlsplit(link)
             host = (parts.hostname or "").lower()
+            userinfo = parts.username is not None or parts.password is not None
         except ValueError:
             return None
-        if parts.scheme != "https" or not host:
+        if parts.scheme != "https" or not host or userinfo \
+                or "\\" in parts.netloc or "@" in parts.netloc:
             return None
         for rule in self.open_with:
             if fnmatch.fnmatchcase(host, rule["host"].lower()):
@@ -872,12 +879,10 @@ class LocalActions:
         return None
 
     def _open_in_app(self, app, link):
-        """`(opened, reason)`: run `open -a <app> <link>` without a shell.
-        `reason` says why it did not open (macOS only)."""
-        if sys.platform != "darwin":
-            return False, "only on macOS"
+        """`(opened, reason)`: run `/usr/bin/open -a <app> <link>` without a
+        shell. `reason` says why it did not open."""
         try:
-            done = self._run(["open", "-a", app, link], timeout=5,
+            done = self._run([OPEN_BIN, "-a", app, link], timeout=5,
                              check=False, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
@@ -892,20 +897,23 @@ class LocalActions:
         link = self.open_target(item)
         if link is None:
             return Result(False, "this item has no link")
-        app = self.open_app_for(link)
+        # `open -a` exists on macOS only: elsewhere the rules are skipped
+        # silently and the browser path runs exactly as before.
+        app = self.open_app_for(link) if sys.platform == "darwin" else None
         note = ""
         if app:
             opened, why = self._open_in_app(app, link)
             if opened:
-                return Result(True, f"opened in {app}")
-            note = f" ({app}: {why})"
+                return Result(True, f"{link} (in {app})")
+            note = f"{app}: {why}"
         try:
             ok = self._open(link)
         except Exception as exc:  # webbrowser can raise on odd platforms
             return Result(False, f"cannot open: {exc}")
-        if app and ok:
-            return Result(True, f"opened in browser{note}")
-        return Result(bool(ok), link if ok else f"no browser available{note}")
+        if ok:
+            return Result(True, f"{link} (browser; {note})" if note else link)
+        return Result(False, "no browser available"
+                      + (f" ({note})" if note else ""))
 
 
 @dataclass

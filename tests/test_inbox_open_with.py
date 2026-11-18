@@ -3,10 +3,14 @@ app (`open -a`) instead of the default browser.
 
 The runner and the opener are injected: nothing here spawns `open` or a
 browser. Synthetic hosts only."""
+import importlib.util
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from workspace_daemon.inbox import items as itm
@@ -14,20 +18,30 @@ from workspace_daemon.inbox import models, settings
 from workspace_daemon.inbox.actions import LocalActions
 from workspace_daemon.inbox.store import InboxStore
 
+HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
+if HAVE_TEXTUAL:
+    from workspace_daemon.inbox.app import InboxApp
+
 RULES = [{"host": "*.example-chat.com", "app": "Example Chat"}]
 LINK = "https://team.example-chat.com/archives/C0EXAMPLE01/p1893492060000200"
 CHANNEL, THREAD, MESSAGE = ("C0EXAMPLE01", "1893492000.000100",
                             "1893492060.000200")
 TEAM = "T0EXAMPLE1"
+AT = "@"   # kept apart so no URL here looks like an email address
+
+
+def raw_item(link=LINK, reply_to=False):
+    """The v1 dict a source returns."""
+    meta = {"reply_to": {"channel": CHANNEL, "thread_ts": THREAD,
+                         "message_ts": MESSAGE}} if reply_to else {}
+    return itm.make_item(
+        id="t:1", source="slack", section="needs_reply", urgency="digest",
+        sender="Person 1", where="#launch", gist="gist", ts=time.time() - 60,
+        link=link, thread=[], draft="", actions=["reply"], meta=meta)
 
 
 def item(link=LINK, reply_to=False):
-    meta = {"reply_to": {"channel": CHANNEL, "thread_ts": THREAD,
-                         "message_ts": MESSAGE}} if reply_to else {}
-    return models.from_v1(itm.make_item(
-        id="t:1", source="slack", section="needs_reply", urgency="digest",
-        sender="Person 1", where="#launch", gist="gist", ts=time.time() - 60,
-        link=link, thread=[], draft="", actions=["reply"], meta=meta))
+    return models.from_v1(raw_item(link, reply_to))
 
 
 class Runner:
@@ -80,6 +94,16 @@ class MatchTest(unittest.TestCase):
         self.assertIsNone(self.app(LINK, []))
         self.assertIsNone(self.app(LINK, None))
 
+    def test_userinfo_or_a_backslash_never_matches(self):
+        # A browser may read the real host differently from urlsplit.
+        for url in ("https://evil.org\\" + AT + "team.example-chat.com/x",
+                    "https://user" + AT + "team.example-chat.com/x",
+                    "https://user:pw" + AT + "team.example-chat.com/x",
+                    "https://" + AT + "team.example-chat.com/x",
+                    "https://team.example-chat.com%2F" + AT + "evil.org/x",
+                    "https://team.example-chat.com\\.evil.org/x"):
+            self.assertIsNone(self.app(url), url)
+
     def test_only_https_matches(self):
         for url in ("http://team.example-chat.com/x",
                     "slack://channel?team=T0EXAMPLE1&id=C0EXAMPLE01",
@@ -93,9 +117,9 @@ class DarwinOpenTest(unittest.TestCase):
         h = Harness()
         res = h.acts.open_link(item())
         self.assertTrue(res.ok)
-        self.assertEqual(res.detail, "opened in Example Chat")
+        self.assertEqual(res.detail, f"{LINK} (in Example Chat)")
         (argv, kw), = h.runner.calls
-        self.assertEqual(argv, ["open", "-a", "Example Chat", LINK])
+        self.assertEqual(argv, ["/usr/bin/open", "-a", "Example Chat", LINK])
         self.assertIsInstance(argv, list)
         self.assertEqual(kw["timeout"], 5)
         self.assertIs(kw["check"], False)
@@ -131,7 +155,7 @@ class DarwinOpenTest(unittest.TestCase):
         h = Harness(team=TEAM, slack_open={"url_template": tpl})
         res = h.acts.open_link(item(reply_to=True))
         (argv, _), = h.runner.calls
-        self.assertEqual(argv[:3], ["open", "-a", "Example Chat"])
+        self.assertEqual(argv[:3], ["/usr/bin/open", "-a", "Example Chat"])
         self.assertEqual(
             argv[3], f"https://team.example-chat.com/archives/{CHANNEL}/p"
                      f"{MESSAGE}")
@@ -155,21 +179,21 @@ class DarwinOpenTest(unittest.TestCase):
         self.assertEqual(h.opened, [LINK])
         self.assertTrue(res.ok)
         self.assertEqual(res.detail,
-                         "opened in browser (Example Chat: exit 1)")
+                         f"{LINK} (browser; Example Chat: exit 1)")
 
     def test_a_timeout_falls_back_to_the_browser(self):
         h = Harness(runner=Runner(raises=subprocess.TimeoutExpired("open", 5)))
         res = h.acts.open_link(item())
         self.assertEqual(h.opened, [LINK])
         self.assertEqual(res.detail,
-                         "opened in browser (Example Chat: timed out)")
+                         f"{LINK} (browser; Example Chat: timed out)")
 
     def test_an_oserror_falls_back_to_the_browser(self):
         h = Harness(runner=Runner(raises=FileNotFoundError("open")))
         res = h.acts.open_link(item())
         self.assertEqual(h.opened, [LINK])
         self.assertTrue(res.ok)
-        self.assertIn("opened in browser (Example Chat: ", res.detail)
+        self.assertIn(f"{LINK} (browser; Example Chat: ", res.detail)
 
     def test_a_failing_browser_after_a_failed_app_is_reported(self):
         acts = LocalActions(InboxStore(None), base_dir="/b", open_with=RULES,
@@ -177,11 +201,12 @@ class DarwinOpenTest(unittest.TestCase):
         res = acts.open_link(item())
         self.assertFalse(res.ok)
         self.assertIn("no browser available", res.detail)
-        self.assertIn("Example Chat: exit 2", res.detail)
+        self.assertEqual(res.detail,
+                         "no browser available (Example Chat: exit 2)")
 
 
 class NonDarwinTest(unittest.TestCase):
-    def test_other_platforms_use_the_browser_and_never_run_open(self):
+    def test_other_platforms_skip_the_rules_silently(self):
         for plat in ("linux", "win32"):
             with mock.patch.object(sys, "platform", plat):
                 h = Harness()
@@ -189,8 +214,23 @@ class NonDarwinTest(unittest.TestCase):
             self.assertEqual(h.runner.calls, [], plat)
             self.assertEqual(h.opened, [LINK], plat)
             self.assertTrue(res.ok)
-            self.assertEqual(
-                res.detail, "opened in browser (Example Chat: only on macOS)")
+            self.assertEqual(res.detail, LINK)   # exactly as without rules
+
+
+class WiringTest(unittest.TestCase):
+    @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+    def test_the_cli_passes_open_with_to_local_actions(self):
+        from workspace_daemon.inbox import cli
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "inbox.yaml").write_text(
+                "open_with:\n  - {host: '*.example-chat.com', "
+                "app: 'Example Chat'}\n", encoding="utf-8")
+            with mock.patch("workspace_daemon.inbox.actions.LocalActions") \
+                    as local, mock.patch(
+                        "workspace_daemon.inbox.app.InboxApp") as app:
+                self.assertEqual(cli.run(Path(tmp)), 0)
+        self.assertEqual(local.call_args.kwargs["open_with"], RULES)
+        app.return_value.run.assert_called_once()
 
 
 class SettingsTest(unittest.TestCase):
@@ -212,7 +252,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_a_bad_app_name_is_refused(self):
         for bad in ("Chat; rm -rf", "a/b", "../x", "", "x" * 65, "-a", 5,
-                    None, "Chat\n", "Ch@t"):
+                    None, "Chat\n", "Ch@t", ".", "..", "...", " ", ". ."):
             msg = self.problems({"open_with": [
                 {"host": "*.example-chat.com", "app": bad}]})
             self.assertIn("open_with[0].app", msg, repr(bad))
@@ -248,6 +288,48 @@ class SettingsTest(unittest.TestCase):
             {"host": "b.example.org", "app": "B/C"}]})
         self.assertIn("open_with[1].app", msg)
         self.assertNotIn("open_with[0]", msg)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class OpenOffTheUiThreadTest(unittest.IsolatedAsyncioTestCase):
+    """`o` runs the open in a worker: a slow `open -a` never freezes the UI."""
+
+    async def test_a_slow_open_does_not_block_and_is_audited_after(self):
+        from test_inbox_draft import Fixed, wait_for
+        gate, started = threading.Event(), threading.Event()
+
+        def slow(argv, **kw):
+            started.set()
+            gate.wait(10)
+            return subprocess.CompletedProcess(argv, 0)
+
+        store = InboxStore(None)
+        acts = LocalActions(store, base_dir="/b", open_with=RULES,
+                            runner=slow, opener=lambda u: True)
+        rows = [raw_item()]
+        app = InboxApp(Fixed(rows), store, acts,
+                       settings={"poll_interval_s": 300.0, "theme": "dark",
+                                 "bidi_mode": "logical"},
+                       undo_s=30, leave_s=0, stream_delay=0)
+        try:
+            with mock.patch.object(sys, "platform", "darwin"):
+                async with app.run_test(size=(150, 42)) as pilot:
+                    await wait_for(pilot, lambda: app.polled_once, tries=200)
+                    await pilot.pause(0.25)
+                    await pilot.press("o")
+                    self.assertTrue(await wait_for(pilot, started.is_set))
+                    # the open is still running and the UI still answers
+                    await pilot.pause(0.1)
+                    self.assertEqual(
+                        [r for r in app.audit if r["action"] == "open"], [])
+                    gate.set()
+                    self.assertTrue(await wait_for(pilot, lambda: any(
+                        r["action"] == "open" for r in app.audit)))
+                    [row] = [r for r in app.audit if r["action"] == "open"]
+                    self.assertEqual(row["status"], "ok")
+                    self.assertEqual(row["detail"], f"{LINK} (in Example Chat)")
+        finally:
+            gate.set()
 
 
 if __name__ == "__main__":

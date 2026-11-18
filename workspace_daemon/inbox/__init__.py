@@ -6,4 +6,4 @@ can be tested without Textual. See docs/inbox.md.
 
 # The inbox component version (SemVer). Single source of truth: the CLI,
 # the header, the help overlay and docs/inbox-changelog.md all follow this.
-__version__ = "0.10.1"
+__version__ = "0.11.0"

@@ -2426,10 +2426,21 @@ class InboxApp(App):
 
     def _open_item(self, it):
         """Open `it`'s URL (the Slack template URL or its link) and audit it
-        for that item, whatever is selected now."""
+        for that item, whatever is selected now. `open -a` can take seconds,
+        so the open runs in a worker thread, never on the UI loop."""
         if it is None:
             return
-        res = self.actions.open_link(it)
+        self.run_worker(lambda: self._open_in_thread(it), thread=True,
+                        group="open")
+
+    def _open_in_thread(self, it):
+        try:
+            res = self.actions.open_link(it)
+        except Exception as exc:  # a backend bug must not end the session
+            res = Result(False, f"{type(exc).__name__}: {exc}")
+        self._post(self._open_done, it, res)
+
+    def _open_done(self, it, res):
         self.record("open", it, res.detail, "ok" if res.ok else "failed")
         self.notify(res.detail if res.ok else f"Not opened: {res.detail}", timeout=3,
                     severity="information" if res.ok else "warning", markup=False)

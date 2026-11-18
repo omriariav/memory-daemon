@@ -680,7 +680,7 @@ def _check_open_with(raw, problems):
         host, app = entry.get("host"), entry.get("app")
         host_ok = isinstance(host, str) and bool(OPEN_WITH_HOST.match(host))
         app_ok = (isinstance(app, str) and bool(OPEN_WITH_APP.match(app))
-                  and not app.startswith("-"))
+                  and not app.startswith("-") and bool(app.strip(" .")))
         if not host_ok:
             problems.append(f"{label}.host must be a host name glob "
                             "(letters, digits, . - and *), such as "
@@ -688,7 +688,7 @@ def _check_open_with(raw, problems):
         if not app_ok:
             problems.append(f"{label}.app must be an application name "
                             "(letters, digits, space . _ -, up to 64, not "
-                            "starting with '-')")
+                            "starting with '-', not only dots or spaces)")
         if host_ok and app_ok:
             out.append({"host": host, "app": app})
     return [] if len(problems) > start else out
