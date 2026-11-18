@@ -12,6 +12,7 @@ from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
+from . import tasks as tasksmod
 from .models import SOURCES, fmt_age, thread_fixed, thread_note
 from .views import VIEWS
 
@@ -112,11 +113,14 @@ class Queue(OptionList):
         self.first_idx = {}
 
     def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
-              ghost_at=None, visual=False):
+              ghost_at=None, visual=False, today=None):
         """Draw `groups` (`views.Group`). A group with no rows is skipped,
         unless it is `keep_empty` (then a dash stands in). `ghost` is a row
-        that just left `ghost_group` at position `ghost_at`."""
+        that just left `ghost_group` at position `ghost_at`. `today` (a
+        `datetime.date`, default the local date) is what a task row's due cell
+        counts from."""
         width = max(24, (self.size.width or 40) - 1)
+        self.today = today or dt.date.today()
         opts = []
         self.rows = []
         first_idx = {}
@@ -159,7 +163,38 @@ class Queue(OptionList):
             target = self.get_option_index(ITEM_PREFIX + self.rows[0].key)
         self.highlighted = target
 
+    def _task_row(self, it, width, pal, visual):
+        """A task: glyph, title, the due cell and the age on the first line,
+        the people (first names, `+n`) under it. An overdue row is drawn like
+        an urgent one."""
+        today = getattr(self, "today", None) or dt.date.today()
+        due = tasksmod.due_of(it)
+        overdue = due is not None and due < today
+        col = pal["urgent"] if overdue else pal["primary"]
+        cell = tasksmod.due_cell(due, today)
+        age = tasksmod.age_label(tasksmod.created_of(it), today)
+        right = f"{cell:>7} {age:>4}"
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append(f" {tasksmod.GLYPHS[tasksmod.task_type(it)]} ",
+                 Style(color=col, bold=True))
+        title = fit(vis(it.gist, visual),
+                    max(8, width - 4 - cell_len(right) - 1))
+        t.append(title, Style(bold=True, color=pal["urgent"] if overdue else None))
+        pad = max(1, width - t.cell_len - cell_len(right))
+        t.append(" " * pad)
+        t.append(f"{cell:>7}", Style(
+            color=pal["urgent"] if overdue else pal["warn"] if due == today
+            else pal["muted"], bold=overdue or due == today))
+        t.append(f" {age:>4}", Style(color=pal["muted"]))
+        t.append("\n")
+        people = tasksmod.people_compact(tasksmod.people_of(it))
+        t.append("   " + (vis(fit(people, width - 4), visual) or "-"),
+                 Style(color=pal["muted"]))
+        return t
+
     def _row(self, it, width, pal, now, visual):
+        if tasksmod.is_task(it):
+            return self._task_row(it, width, pal, visual)
         urgent = it.section == "urgent"
         age = rel(now, it.ts) if it.ts > now + 60 else fmt_age(now - it.ts)
         if it.kind == "nudge" and it.draft:
@@ -213,15 +248,21 @@ class ThreadView(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
 
-    def show(self, item, pal, now, visual, newest_first=False):
+    def show(self, item, pal, now, visual, newest_first=False, today=None):
         """Draw the item and its thread. The thread is stored oldest first;
         with `newest_first` the latest message is drawn first (the note and
         the item header stay on top) and a dim marker closes the list at the
-        thread's first message."""
+        thread's first message. A task is drawn as a detail card instead (see
+        `task_detail`)."""
         body = self.query_one("#thread-body", Static)
         width = max(30, (self.size.width or 60) - 4)
         if item is None:
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
+            return
+        if tasksmod.is_task(item):
+            body.update(task_detail(item, pal, width, visual,
+                                    today or dt.date.today()))
+            self.scroll_home(animate=False)
             return
         out = Text()
         out.append(vis(item.who, visual), Style(bold=True, color=pal["urgent"] if item.section == "urgent" else pal["primary"]))
@@ -265,6 +306,53 @@ class ThreadView(VerticalScroll):
             out.append("─ thread start ─\n", Style(color=pal["muted"], dim=True))
         body.update(out)
         self.scroll_home(animate=False)
+
+
+def task_detail(item, pal, width, visual, today):
+    """The detail card of a task: title, type, due, created date, people,
+    the evidence (wrapped) and the source ids."""
+    out = Text()
+    muted = Style(color=pal["muted"])
+    due = tasksmod.due_of(item)
+    overdue = due is not None and due < today
+    kind = tasksmod.task_type(item)
+    out.append(f"{tasksmod.GLYPHS[kind]} ", Style(
+        color=pal["urgent"] if overdue else pal["primary"], bold=True))
+    for line in bidi.visual_lines(item.gist, max(10, width - 2), visual) or [""]:
+        out.append(line + "\n", Style(bold=True))
+    out.append("─" * min(width, 60) + "\n", muted)
+
+    def field(label, value, style=None):
+        out.append(f"{label:<10}", muted)
+        out.append(vis(value, visual) + "\n", style)
+    field("Type", kind)
+    field("Due", tasksmod.due_words(due, today),
+          Style(color=pal["urgent"], bold=True) if overdue else None)
+    created = tasksmod.created_of(item)
+    field("Created", f"{created.isoformat()} ({tasksmod.age_label(created, today)} ago)"
+          if created else "-")
+    field("People", ", ".join(tasksmod.people_of(item)) or "-")
+    evidence = tasksmod.evidence_of(item)
+    out.append(f"{'Evidence':<10}", muted)
+    if evidence:
+        out.append("\n")
+        for para in evidence.split("\n"):
+            _wrapped(out, para, width, visual, indent="  ")
+    else:
+        out.append("-\n")
+    sids = tasksmod.source_ids_of(item)
+    out.append(f"{'Sources':<10}", muted)
+    if sids:
+        out.append("\n")
+        for sid in sids:
+            out.append("  " + vis(sid, visual) + "\n")
+    else:
+        out.append("-\n")
+    if item.link:
+        field("Link", item.link, Style(color=pal["link"]))
+    else:
+        field("Link", "none")
+    return out
 
 
 def _wrapped(out, text, width, visual, style=None, indent=""):

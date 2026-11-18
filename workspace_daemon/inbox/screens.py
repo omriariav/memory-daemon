@@ -526,7 +526,16 @@ HELP = [
         ("!", "relay the item to your work session, with an optional note"),
         ("D", "draft a reply for me (summary: or polish:); fills the Draft pane, never sends"),
         ("", "acts wait out the 5 s undo window; u cancels before anything is sent"),
-        ("L", "ops log; u on a row sends the inverse (reopen / unmute) after a confirm")]),
+        ("L", "ops log; u on a row sends the inverse (reopen / unmute / the old due date) after a confirm")]),
+    ("Tasks (a source's meta.kind: task rows)", [
+        ("3", "the Tasks view: OVERDUE, DUE TODAY, THIS WEEK, LATER, DECIDE, NO DATE; overdue and due-today tasks are also in the Inbox"),
+        ("d", "todo: close it now. decision: asks for the decision (required), then closes it"),
+        ("D", "todo: asks for the outcome, then closes it"),
+        ("s", "due date: tomorrow, next Sunday, +1 week, a date (YYYY-MM-DD) or none"),
+        ("x", "drop it, with an optional reason (enter alone drops with none)"),
+        ("o", "open the task's link (none: says so)"),
+        ("", "needs acts: [close, drop, due] on the source; without it the keys only say so"),
+        ("", "all of them wait out the 5 s undo window; L can undo one afterwards")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
                            ("C  (r in pane)", "fetch the context again"),
                            ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),
@@ -621,9 +630,12 @@ class NoteScreen(ModalScreen):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, title, who, max_len=300):
+    def __init__(self, title, who, max_len=300,
+                 placeholder="optional one-line note  (enter to send)",
+                 hint="enter send  ·  esc cancel"):
         super().__init__()
         self.title_text, self.who, self.max_len = title, who, max_len
+        self.placeholder, self.hint = placeholder, hint
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -631,10 +643,9 @@ class NoteScreen(ModalScreen):
         head.append(self.who, Style(dim=True))
         with Vertical(id="note"):
             yield Static(head, id="note-title")
-            yield Input(placeholder="optional one-line note  (enter to send)",
+            yield Input(placeholder=self.placeholder,
                         id="note-input", max_length=self.max_len)
-            yield Static(Text("enter send  ·  esc cancel", Style(dim=True)),
-                         id="note-hint")
+            yield Static(Text(self.hint, Style(dim=True)), id="note-hint")
 
     def on_mount(self):
         self.query_one("#note-input").focus()
@@ -646,10 +657,50 @@ class NoteScreen(ModalScreen):
         self.dismiss(" ".join(e.value.split()))
 
 
+class DateScreen(ModalScreen):
+    """A `YYYY-MM-DD` date (the task due date picker's "Pick date"). Enter
+    accepts a real date and stays open on anything else, with the reason;
+    esc cancels. Dismisses with the date string, or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title, who):
+        super().__init__()
+        self.title_text, self.who = title, who
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append(self.title_text + " ", Style(bold=True))
+        head.append(self.who, Style(dim=True))
+        with Vertical(id="note"):
+            yield Static(head, id="note-title")
+            yield Input(placeholder="YYYY-MM-DD  (enter to set)",
+                        id="note-input", max_length=10)
+            yield Static(Text("enter set  ·  esc cancel", Style(dim=True)),
+                         id="note-hint")
+
+    def on_mount(self):
+        self.query_one("#note-input").focus()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def on_input_submitted(self, e):
+        from .tasks import parse_day
+        text = e.value.strip()
+        if parse_day(text) is None:
+            self.query_one("#note-hint", Static).update(Text(
+                "Not a date. Use YYYY-MM-DD, for example 2030-01-31",
+                Style(bold=True, color="red")))
+            return
+        self.dismiss(text)
+
+
 class OpsScreen(ModalScreen):
     """The ops log (`L` with acts on): what the inbox told a command source,
     newest first, with the result. `u` on a row asks for its inverse (reopen
-    after a close, unmute after a mute); `a` shows the session's audit log.
+    after a close or a drop, unmute after a mute, the old date after a due
+    move); `a` shows the session's audit log.
     Dismisses with None, `("inverse", row)` or `("session", None)`."""
 
     BINDINGS = [Binding("escape,L,q", "close", "Close"),
@@ -707,9 +758,9 @@ class OpsScreen(ModalScreen):
         if row is None:
             return
         if self.invertible(row) is None:
-            self.notify("This op has no inverse (only a close or a mute that "
-                        "reached the source can be undone)", timeout=4,
-                        markup=False)
+            self.notify("This op has no inverse (only a close, drop, due or "
+                        "mute that reached the source can be undone)",
+                        timeout=4, markup=False)
             return
         self.dismiss(("inverse", row))
 

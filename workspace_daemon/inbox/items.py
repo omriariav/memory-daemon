@@ -12,14 +12,15 @@ import re
 SCHEMA_VERSION = 1
 
 SOURCES = ("slack", "email", "calendar", "recording", "alert", "drive", "sheet",
-           "other")
+           "memory", "other")
 SECTIONS = ("urgent", "needs_reply", "waiting", "fyi")
 URGENCY_LEVELS = ("urgent", "digest")
 ACTIONS = ("reply", "ack", "done", "snooze", "nudge", "open")
 # The acts of 0.10.0 (docs/inbox.md, "Acts"): what `<argv> act` may be asked.
-# `reopen` and `unmute` are the inverses of `close` and `mute`.
+# `reopen` and `unmute` are the inverses of `close` and `mute`; 0.12.0 adds
+# `drop` and `due` (tasks; `drop` is undone by `reopen`, `due` by `due`).
 ACT_NAMES = ("close", "snooze", "mute", "waits_on", "relay", "reopen",
-             "unmute")
+             "unmute", "drop", "due")
 
 GIST_MAX = 120
 ID_MAX = 200

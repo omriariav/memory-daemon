@@ -6,17 +6,24 @@ A view is not a copy of the data. Each function here takes the live
 same in every view. Only two kinds of row are made here: a digest row (many
 rows of one routine and day folded into one) and a saved-to-memory row.
 
-1 Inbox    URGENT, I OWE (needs_reply, invites included), NUDGE DUE
+1 Inbox    URGENT, I OWE (needs_reply, invites included), NUDGE DUE, and
+           DUE TODAY (the overdue and due-today tasks)
 2 Waiting  waiting rows by person, then bookmarks as TRACKING
-3 Tasks    nothing yet (a placeholder; the tab keeps the keys stable)
+3 Tasks    the task rows (tasks.py) by due date: OVERDUE, DUE TODAY, THIS
+           WEEK, LATER, DECIDE, NO DATE
 4 Feed     every fyi row by routine; saved-to-memory is one more routine
 5 Health   not a list of items (see health.py)
+
+A task row (`meta.kind == "task"`) never shows in Waiting, the Feed or the
+Inbox's URGENT, I OWE and NUDGE DUE.
 """
+import datetime
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List
 
+from . import tasks
 from .models import Item, Msg, fmt_age
 
 VIEWS = (("inbox", "Inbox"), ("waiting", "Waiting"), ("tasks", "Tasks"),
@@ -24,7 +31,7 @@ VIEWS = (("inbox", "Inbox"), ("waiting", "Waiting"), ("tasks", "Tasks"),
 VIEW_KEYS = tuple(k for k, _ in VIEWS)
 VIEW_TITLES = dict(VIEWS)
 # The views that list items in the queue.
-QUEUE_VIEWS = ("inbox", "waiting", "feed")
+QUEUE_VIEWS = ("inbox", "waiting", "tasks", "feed")
 SAVED_ROUTINE = "saved to memory"
 DEFAULT_WINDOW_H = 24.0
 DIGEST_PREFIX = "digest:"
@@ -99,20 +106,46 @@ def _soonest_first(item):
 
 # --- 1 Inbox ----------------------------------------------------------------
 
-def inbox_groups(items):
-    """URGENT, I OWE and NUDGE DUE (always listed, with a dash when empty).
-    A Feed row that a rule promotes (`feed == "inbox"`) joins URGENT. The
-    place for DUE TODAY tasks is the empty slot after NUDGE DUE (0.11)."""
-    urgent = [i for i in items
+def inbox_groups(items, today=None):
+    """URGENT, I OWE and NUDGE DUE (always listed, with a dash when empty),
+    then DUE TODAY (listed only when it has rows): the overdue and due-today
+    tasks, todos and decisions, by due date. A Feed row that a rule promotes
+    (`feed == "inbox"`) joins URGENT. Task rows are in none of the first
+    three. `today` is a `datetime.date` (default: the local date)."""
+    today = today or datetime.date.today()
+    rows = [i for i in items if not tasks.is_task(i)]
+    urgent = [i for i in rows
               if i.section == "urgent"
               or (i.section == "fyi" and i.feed == "inbox")]
-    owe = [i for i in items if i.section == "needs_reply"]
-    nudge = [i for i in items if nudge_due(i)]
-    for rows in (urgent, owe, nudge):
-        rows.sort(key=_soonest_first)
+    owe = [i for i in rows if i.section == "needs_reply"]
+    nudge = [i for i in rows if nudge_due(i)]
+    for group in (urgent, owe, nudge):
+        group.sort(key=_soonest_first)
+    due = sorted((i for i in items
+                  if tasks.is_task(i) and tasks.is_due_by(i, today)),
+                 key=tasks.sort_key)
+    overdue = any(tasks.due_of(i) < today for i in due)
     return [Group("urgent", "URGENT", urgent, hot=True, keep_empty=True),
             Group("owe", "I OWE", owe, keep_empty=True),
-            Group("nudge", "NUDGE DUE", nudge, keep_empty=True)]
+            Group("nudge", "NUDGE DUE", nudge, keep_empty=True),
+            Group("due_today", "DUE TODAY", due, hot=overdue)]
+
+
+# --- 3 Tasks ----------------------------------------------------------------
+
+def task_groups(items, today):
+    """The Tasks view: OVERDUE, DUE TODAY, THIS WEEK, LATER, DECIDE and NO
+    DATE, in that order, empty sections left out. Inside a section the rows
+    go by due date, then creation date (tasks.sort_key). `today` is a
+    `datetime.date`."""
+    buckets = OrderedDict((key, []) for key, _title in tasks.BUCKETS)
+    for it in items:
+        if tasks.is_task(it):
+            buckets[tasks.bucket(it, today)].append(it)
+    titles = dict(tasks.BUCKETS)
+    return [Group(key, titles[key], sorted(rows, key=tasks.sort_key),
+                  hot=key == tasks.OVERDUE)
+            for key, rows in buckets.items() if rows]
 
 
 # --- 2 Waiting --------------------------------------------------------------
@@ -128,8 +161,8 @@ def waiting_groups(items, now):
     TRACKING."""
     people = OrderedDict()
     tracking = []
-    for it in sorted((i for i in items if i.section == "waiting"),
-                     key=lambda i: i.ts):
+    for it in sorted((i for i in items if i.section == "waiting"
+                      and not tasks.is_task(i)), key=lambda i: i.ts):
         if is_bookmark(it):
             tracking.append(it)
         else:
@@ -218,8 +251,8 @@ def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
     cutoff = now - float(window_h) * 3600
     by_routine = OrderedDict()
     muted = OrderedDict()
-    for it in sorted((i for i in items if i.section == "fyi"),
-                     key=lambda i: -i.ts):
+    for it in sorted((i for i in items if i.section == "fyi"
+                      and not tasks.is_task(i)), key=lambda i: -i.ts):
         if it.feed == "inbox":
             continue
         pinned = is_active_alert(it)

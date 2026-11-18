@@ -26,9 +26,11 @@ import uuid
 from .. import state as daemon_state
 
 # What `acts:` may list on a command source. `reopen` and `unmute` are not
-# listed on their own: they are sent as the inverse of `close` and `mute`.
-ACT_SETTINGS = ("close", "snooze", "mute", "waits_on", "relay")
-INVERSE = {"close": "reopen", "mute": "unmute"}
+# listed on their own: they are sent as the inverse of `close`, `drop` and
+# `mute`. 0.12.0 (tasks) adds `drop` and `due`; the inverse of `due` is `due`
+# with the date it had before (`inverse_args`).
+ACT_SETTINGS = ("close", "snooze", "mute", "waits_on", "relay", "drop", "due")
+INVERSE = {"close": "reopen", "mute": "unmute", "drop": "reopen", "due": "due"}
 # The act that undoes a local mark of each kind, for the audit screen.
 OPS_LOG_NAME = "inbox-ops-log.jsonl"
 PENDING_NAME = "inbox-ops-pending.jsonl"
@@ -87,6 +89,14 @@ def build_request(op_id, action, item_id, meta, ts, args):
     return {"op_id": op_id, "action": action, "id": item_id,
             "meta": small_meta(meta), "args": dict(args or {}),
             "seen": seen_of(ts, meta)}
+
+
+def inverse_args(row):
+    """The args of the inverse of a logged op: `due` goes back to the date it
+    had (`prev_due`, null for no date); the others take none."""
+    if row.get("action") == "due":
+        return {"date": row.get("prev_due")}
+    return {}
 
 
 def clean_note(text):
