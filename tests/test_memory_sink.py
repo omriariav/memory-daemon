@@ -641,6 +641,62 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(out["memory"], "duplicate_skipped")
         self.assertNotIn("memory_duplicate_of", out)
 
+    def test_near_duplicate_surfaces_as_an_event_not_an_error(self):
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            out, _, log = self._run_add(
+                FakeResult("", returncode=2, stderr=self.NEAR_DUP))
+        emit.assert_called_once()
+        args, kwargs = emit.call_args
+        self.assertEqual(args[1], "duplicate")
+        self.assertEqual(args[2], "2026-01-02-example-entry-one")
+        self.assertEqual(args[3], out["memory_source_id"])
+        self.assertTrue(args[4])  # the capture title
+        self.assertEqual(kwargs["details"],
+                         {"untrusted": True,
+                          "duplicate_of": "2026-01-02-example-entry-one"})
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("near-duplicate of 2026-01-02-example-entry-one "
+                      "(not written)", logged)
+
+    def test_errors_and_writes_emit_no_duplicate_event(self):
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            self._run_add(FakeResult("", returncode=1, stderr="boom\n"))
+            self._run_add(FakeResult("✓ created 2026-01-05-new\n"))
+        self.assertNotIn("duplicate", [c.args[1] for c in emit.call_args_list])
+
+    def test_skipped_meeting_lists_its_owner_actions_for_review(self):
+        routine = {"id": "r", "memory": {"store": "/store",
+                                         "owner_todos": {"enabled": True}}}
+        entry = {"owner_actions": [
+            {"text": "Send the example summary", "evidence_ts": "00:01"},
+            {"text": "not valid", "bogus": 1}]}
+        with mock.patch.object(memory_sink.owner_todos, "is_meeting_item",
+                               return_value=True):
+            texts = memory_sink._unfiled_owner_actions(
+                routine, {}, {}, entry, "meeting", True, False)
+            self.assertEqual(texts, ["Send the example summary"])
+            for args in (("note", True, False), ("meeting", False, False),
+                         ("meeting", True, True)):
+                self.assertEqual(memory_sink._unfiled_owner_actions(
+                    routine, {}, {}, entry, *args), [])
+
+    def test_embedder_warnings_do_not_hide_the_real_error(self):
+        noise = ('dtype not specified for "model". Using the default dtype '
+                 "(fp32) for this device (cpu).\n"
+                 "/x/y.py:1: UserWarning: something deprecated\n"
+                 "  warnings.warn(msg)\n")
+        out, _, _ = self._run_add(FakeResult(
+            "", returncode=1, stderr=noise + "✗ store is locked\n"))
+        self.assertIsInstance(out, RuntimeError)
+        self.assertEqual(str(out), "memory add failed (exit 1): "
+                                   "✗ store is locked")
+        from workspace_daemon import alerts
+        self.assertEqual(alerts.cause_of(str(out)), "unknown")
+        # Warnings alone are still reported, never turned into "no output".
+        self.assertIn("embedder warnings",
+                      memory_sink._head_and_tail(noise))
+        self.assertEqual(memory_sink._head_and_tail(""), "(no output)")
+
     def test_other_failures_are_still_errors(self):
         for name, result in {
             "exit 2 without the refusal": FakeResult(

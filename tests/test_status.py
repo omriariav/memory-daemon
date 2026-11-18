@@ -275,6 +275,33 @@ class RoutineStatusTest(unittest.TestCase):
         self.assertEqual(by_id["alpha"]["role"], "specialized")
         self.assertEqual(by_id["alpha"]["sources"], "-")
 
+    def test_near_duplicates_are_counted_not_flagged(self):
+        def _iso(epoch):
+            return datetime.datetime.fromtimestamp(
+                epoch, datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        recent = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS + 60
+        stale = 5000 - status.MEMORY_ERROR_WINDOW_SECONDS - 60
+        state.save(self.base, {
+            "a": {"rule_id": "alpha", "processed_at": _iso(recent),
+                  "memory": "duplicate_skipped",
+                  "memory_duplicate_of": "2026-01-02-example-entry"},
+            "b": {"rule_id": "alpha", "processed_at": _iso(recent),
+                  "memory": "duplicate_skipped"},
+            "c": {"rule_id": "alpha", "processed_at": _iso(stale),
+                  "memory": "duplicate_skipped"},
+            "d": {"rule_id": "beta", "processed_at": _iso(recent),
+                  "memory": "created"},
+        })
+        rows = status.routine_rows(
+            self.base, self.routines, {"routines": {}}, now=5000)
+        by_id = {row["routine"]: row for row in rows}
+        self.assertEqual(by_id["alpha"]["near_duplicates"], 2)
+        self.assertEqual(by_id["beta"]["near_duplicates"], 0)
+        self.assertNotIn("memory sink", by_id["alpha"]["issues"])
+        self.assertNotEqual(by_id["alpha"]["status"], "attention")
+
     def test_old_memory_sink_failures_are_not_open_issues(self):
         def _iso(epoch):
             return datetime.datetime.fromtimestamp(

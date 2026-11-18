@@ -476,6 +476,12 @@ def routine_rows(
                         MEMORY_ERROR_WINDOW_SECONDS)
             for entry in entries
         )
+        near_duplicates = sum(
+            entry.get("memory") == "duplicate_skipped"
+            and _within(entry.get("processed_at"), now,
+                        MEMORY_ERROR_WINDOW_SECONDS)
+            for entry in entries
+        )
         expansion_fallbacks = sum(
             bool(entry.get("expand_fallback")) for entry in entries
         )
@@ -576,6 +582,7 @@ def routine_rows(
             ),
             "issues": ", ".join(issues) or "-",
             "extract_failed": extract_failed,
+            "near_duplicates": near_duplicates,
         })
     return rows
 
@@ -736,6 +743,13 @@ def render(base_dir, routines, label=DEFAULT_LAUNCHD_LABEL, now=None):
             lines.append(
                 f"Info: {row['routine']}: {row['extract_failed']} item(s) "
                 "not stored after extraction failed twice (last 24h)"
+            )
+    for row in rows:
+        if row.get("near_duplicates"):
+            lines.append(
+                f"Info: {row['routine']}: {row['near_duplicates']} item(s) "
+                "skipped as near-duplicates of existing entries, not "
+                "written (last 24h; see the duplicate events)"
             )
     bridge_text, bridge_problems = bridge_lines(base_dir, now)
     lines.extend(bridge_text)

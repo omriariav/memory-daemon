@@ -2183,11 +2183,11 @@ def _gmail_followup_predecessor(processed, claim, existing=None):
         persisted = existing.get("gmail_followup_predecessor_entry_id")
         if isinstance(persisted, str) and persisted.strip():
             return persisted.strip()
-        if (
-            existing.get("gmail_manual_chat_followup") is not True
-            and existing.get("memory_entry_id")
-        ):
-            return existing["memory_entry_id"]
+        if existing.get("gmail_manual_chat_followup") is not True:
+            held = existing.get("memory_entry_id") \
+                or existing.get("memory_duplicate_of")
+            if held:
+                return held
     candidate_predecessor = (
         (claim["candidate"].get("raw") or {}).get(
             "_gmail_followup_predecessor_entry_id"
@@ -2202,12 +2202,14 @@ def _gmail_followup_predecessor(processed, claim, existing=None):
     if processed is None or not source_id:
         return None
     matching = [
-        (entry.get("processed_at") or "", item_id, entry["memory_entry_id"])
+        (entry.get("processed_at") or "", item_id,
+         entry.get("memory_entry_id") or entry["memory_duplicate_of"])
         for item_id, entry in processed.items()
         if (
             entry.get("memory_source_id") == source_id
             and entry.get("gmail_manual_chat_followup") is not True
-            and entry.get("memory_entry_id")
+            and (entry.get("memory_entry_id")
+                 or entry.get("memory_duplicate_of"))
         )
     ]
     return max(matching, default=(None, None, None))[-1]
