@@ -1297,7 +1297,7 @@ class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase
             self.assertIn("t:1", keys(app))
             self.assertFalse(store.is_hidden("t:1"))
             await pilot.press("o")                     # falls back to item.link
-            await wait_for(pilot, lambda: opened)
+            self.assertTrue(await wait_for(pilot, lambda: opened))
             return clip, warn, opened
 
     async def test_copy_is_offered_alone_with_the_reason(self):

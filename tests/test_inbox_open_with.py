@@ -295,7 +295,10 @@ class OpenOffTheUiThreadTest(unittest.IsolatedAsyncioTestCase):
     """`o` runs the open in a worker: a slow `open -a` never freezes the UI."""
 
     async def test_a_slow_open_does_not_block_and_is_audited_after(self):
-        from test_inbox_draft import Fixed, wait_for
+        try:    # run by discovery (tests/ on sys.path) or by dotted name
+            from test_inbox_draft import Fixed, wait_for
+        except ImportError:
+            from tests.test_inbox_draft import Fixed, wait_for
         gate, started = threading.Event(), threading.Event()
 
         def slow(argv, **kw):
