@@ -321,6 +321,7 @@ class InboxApp(App):
         self._list_started = {}            # units mode: source name -> when its list was last fetched (not re-evaluated)
         self._rows = {}                    # key -> row, digest and saved rows too
         self._groups_sig = None
+        self._list_sig = None              # (view, filters) the queue was last built for
         self.health_fetch = health
         self.health_snap = None
         self._health_loading = False
@@ -801,9 +802,14 @@ class InboxApp(App):
         if empty:
             zero.update(self.zero_text())
         else:
+            list_sig = (self.view, self.filter_text, self.source_filter,
+                        self.feed_routine if self.view == "feed" else None)
+            reset = list_sig != self._list_sig
+            self._list_sig = list_sig
             q.build(groups, self.pal, now, keep=keep, ghost=ghost,
                     ghost_group=ghost_group, ghost_at=ghost_at,
-                    visual=self.bidi, today=self._today())
+                    visual=self.bidi, today=self._today(),
+                    reset_scroll=reset)
             # While the queue was hidden (the first poll still running) it
             # lost focus; give it back, or the arrows do nothing until a
             # click. Not while the terminal is in the background: Textual

@@ -299,6 +299,57 @@ class ViewportTest(ScrollBase):
             self.assertEqual(app.current_key, key)
             await self.assert_cursor_visible(pilot, app, q, "after redraw")
 
+    async def test_no_frame_is_painted_at_a_snapped_offset(self):
+        app = self.app(Fixed(task_rows()), "tasks")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            for _ in range(20):
+                await self.step(pilot, app, "j")
+            for _ in range(5):
+                await self.step(pilot, app, "k")
+            await self.assert_cursor_visible(pilot, app, q, "before")
+            offset = q.scroll_offset.y
+            self.assertGreater(offset, 4)
+            frames = []
+            real = Queue.render_lines
+
+            def spy(widget, crop):
+                if widget is q:
+                    frames.append(widget.scroll_offset.y)
+                return real(widget, crop)
+            with unittest.mock.patch.object(Queue, "render_lines", spy):
+                for _ in range(3):
+                    app.redraw()
+                    await pilot.pause()
+                self.assertTrue(await wait_for(pilot, lambda: bool(frames)))
+                await pilot.pause(0.3)    # let every queued frame paint
+            self.assertEqual(set(frames), {offset}, frames)
+
+    async def test_a_view_switch_starts_the_new_list_at_its_header(self):
+        class Mixed:
+            def __call__(self):
+                rows = [itm.parse_item(r) for r in task_rows()]
+                rows += [feed_row(n, "urgent") for n in range(40)]
+                return [sources.SourceResult("m", rows, False, None, None)]
+        app = self.app(Mixed(), "inbox")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.settle(pilot, app)
+            q = app.query_one("#queue", Queue)
+            for _ in range(30):
+                await self.step(pilot, app, "j")
+            self.assertGreater(q.scroll_offset.y, 10)
+            await pilot.press("3")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.view == "tasks"
+                and app.current_key.startswith("task:")))
+            self.assertTrue(await wait_for(
+                pilot, lambda: q.scroll_offset.y == 0))   # the header shows
+            await pilot.press("1")
+            self.assertTrue(await wait_for(pilot, lambda: app.view == "inbox"))
+            self.assertTrue(await wait_for(
+                pilot, lambda: visible(q, app.current_key)))
+
     async def test_a_redraw_still_brings_a_hidden_cursor_into_view(self):
         app = self.app(Fixed(task_rows()), "tasks")
         async with app.run_test(size=SIZE) as pilot:

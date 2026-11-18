@@ -178,14 +178,16 @@ class Queue(OptionList):
         self._page(1)
 
     def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
-              ghost_at=None, visual=False, today=None):
+              ghost_at=None, visual=False, today=None, reset_scroll=False):
         """Draw `groups` (`views.Group`). A group with no rows is skipped,
         unless it is `keep_empty` (then a dash stands in). `ghost` is a row
         that just left `ghost_group` at position `ghost_at`. `today` (a
         `datetime.date`, default the local date) is what a task row's due cell
         counts from."""
         width = max(24, (self.size.width or 40) - 1)
-        keep_y = self.scroll_y if self.options else None
+        # `reset_scroll`: another list (a view or a filter changed), so it
+        # starts at the top instead of at the old offset.
+        keep_y = self.scroll_y if self.options and not reset_scroll else None
         self.today = today or dt.date.today()
         opts = []
         self.rows = []
@@ -227,11 +229,14 @@ class Queue(OptionList):
                 target = None
         if target is None and self.rows:
             target = self.get_option_index(ITEM_PREFIX + self.rows[0].key)
+        if reset_scroll:
+            self.scroll_to(y=0, animate=False, immediate=True)
         self.highlighted = target
         if keep_y is not None:
             # clear_options and the highlight scroll the list on their own:
-            # put the viewport back once the new rows are laid out.
-            self.call_after_refresh(self._restore_scroll, keep_y)
+            # put the viewport back at once (the new rows are already laid
+            # out), so no frame is painted at the snapped offset.
+            self._restore_scroll(keep_y)
 
     def _task_row(self, it, width, pal, visual):
         """A task: glyph, title, the due cell and the age on the first line,
