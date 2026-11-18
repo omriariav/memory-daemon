@@ -1349,6 +1349,29 @@ class TreeFormatTest(RunBase):
         fti.assign_keys(tasks, items)
         self.assertEqual([t["block_id"] for t in tasks], ["ab12", "ab12f~2"])
 
+    def test_a_pin_never_outlives_its_block(self):
+        old = "ab12cdef-0000-4000-8000-000000000001"
+        # assign_keys ignores a stale pin on a gone row ...
+        items = {old: self.row("Open todo", gone=True, pin="ab12")}
+        tasks = [self.task("ab12", "A new task", "DONE")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], "ab12~2")
+        # ... and a run drops the pin when its block disappears, so a new
+        # block shown under the same id never closes the old open todo.
+        doc = Doc()
+        doc.bullets([(old, "TODO", [q("Open todo")])])
+        self.run_once(doc.text())
+        fti.resolve_block(self.checkpoint, "ab12", old)
+        self.run_once(TreeDoc(["a1b2 paragraph parentId=null | x"]).text())
+        self.assertTrue(self.items()[old]["gone"])
+        self.assertNotIn("pin", self.items()[old])
+        before = len(self.memory.calls)
+        report = self.run_once(self._only("DONE", "A different new task"))
+        self.assertEqual(len(self.memory.calls), before)    # no done note
+        self.assertEqual(report["done"], 0)
+        self.assertEqual(self.items()[old]["state"], "TODO")
+        self.assertIn("ab12~2", self.items())
+
     def test_pin_beats_the_text_and_takes_the_row_from_other_tasks(self):
         items = {"ab12": self.row("Alpha", pin="ab12c")}
         tasks = [self.task("ab12c", "Beta"), self.task("ab12f", "Alpha")]
@@ -1460,13 +1483,19 @@ class OperatorFixCliTest(RunBase):
 
     def _args(self, **over):
         base = {"routine": "fib-in", "dry_run": False, "resolve": None,
-                "mark_gone": None}
+                "mark_gone": None, "wait_lock": 0}
         base.update(over)
         return SimpleNamespace(**base)
 
     def _routines(self, kind="fibery_tasks_inbound"):
         return [{"id": "fib-in", "maintenance": {
             "kind": kind, "checkpoint": str(self.checkpoint)}}]
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("daemon.BASE_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_pairs_pin_rows_and_keys_retire_them(self):
         import daemon
@@ -1477,6 +1506,19 @@ class OperatorFixCliTest(RunBase):
         items = self.items()
         self.assertEqual(items["ab12f~2"]["pin"], "ab12")
         self.assertTrue(items["ab12"]["gone"])
+
+    def test_a_busy_run_lock_refuses_the_write(self):
+        import daemon
+        from workspace_daemon import config as cfg_module, state as st
+        TreeFormatTest._twin_setup(self)
+        before = self.checkpoint.read_text()
+        with st.RunLock(self.dir, name="run"):
+            with self.assertRaises(cfg_module.RoutineError) as caught:
+                daemon._fibery_block_fixes(
+                    self._args(resolve="ab12=ab12f~2", wait_lock=0.01),
+                    self._routines())
+        self.assertIn("--wait-lock", str(caught.exception))
+        self.assertEqual(self.checkpoint.read_text(), before)
 
     def test_misuse_is_refused(self):
         import daemon

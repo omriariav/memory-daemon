@@ -686,7 +686,7 @@ def assign_keys(tasks, items, entry_keys=lambda: set()):
     """
     pins = {}
     for key, row in items.items():
-        if row.get("pin"):
+        if row.get("pin") and not row.get("gone"):
             pins.setdefault(row["pin"], key)
     chosen = {}
     live = {}
@@ -1255,6 +1255,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         log(f"fibery_tasks_inbound: reopened block={task['block_id']}")
     for block_id in plan["gone"]:
         items[block_id]["gone"] = True
+        items[block_id].pop("pin", None)    # a pin never outlives its block
     for task in tasks:
         # How each live block is shown now: outbound resolves a short anchor
         # only through a row last seen under exactly that id. A pin names

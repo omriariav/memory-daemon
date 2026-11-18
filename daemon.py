@@ -412,20 +412,32 @@ def _fibery_block_fixes(args, routines):
         "checkpoint", inbound.DEFAULT_CHECKPOINT)).expanduser()
     if not path.is_absolute():
         path = BASE_DIR / path
+    pairs = []
     for pair in (args.resolve or "").split(","):
         if pair.strip():
             shown, sep, key = pair.strip().partition("=")
             if not sep:
                 raise config.RoutineError(
                     f"--resolve needs SHOWN=KEY pairs, got {pair.strip()!r}")
-            inbound.resolve_block(path, shown, key)
-            log(f"routine={args.routine} fibery_tasks_inbound: pinned "
-                f"{shown} to {key}")
-    for key in (args.mark_gone or "").split(","):
-        if key.strip():
-            inbound.mark_block_gone(path, key.strip())
-            log(f"routine={args.routine} fibery_tasks_inbound: marked "
-                f"{key.strip()} gone")
+            pairs.append((shown, key))
+    # The maintenance run rewrites this checkpoint under the "run" lock; a
+    # scheduled tick must not overwrite the fix. The lock is released before
+    # the normal run takes its own.
+    try:
+        with state.RunLock(BASE_DIR, name="run",
+                           wait=getattr(args, "wait_lock", 0) or 30):
+            for shown, key in pairs:
+                inbound.resolve_block(path, shown, key)
+                log(f"routine={args.routine} fibery_tasks_inbound: pinned "
+                    f"{shown} to {key}")
+            for key in (args.mark_gone or "").split(","):
+                if key.strip():
+                    inbound.mark_block_gone(path, key.strip())
+                    log(f"routine={args.routine} fibery_tasks_inbound: "
+                        f"marked {key.strip()} gone")
+    except state.AlreadyRunning as exc:
+        raise config.RoutineError(
+            f"{exc}; retry later or raise --wait-lock") from None
 
 
 def _has_pending_work(routines, active_ids):
