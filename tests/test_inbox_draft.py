@@ -1034,7 +1034,7 @@ class DraftFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("#launch (thread)", row["detail"])
             # `o` now opens the thread
             await pilot.press("o")
-            await pilot.pause(0.1)
+            self.assertTrue(await wait_for(pilot, lambda: opened))
             self.assertEqual(opened, [
                 f"https://app.slack.com/client/{TEAM}/{CHANNEL}/thread/"
                 f"{CHANNEL}-{THREAD}"])
@@ -1297,7 +1297,7 @@ class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase
             self.assertIn("t:1", keys(app))
             self.assertFalse(store.is_hidden("t:1"))
             await pilot.press("o")                     # falls back to item.link
-            await pilot.pause(0.1)
+            self.assertTrue(await wait_for(pilot, lambda: opened))
             return clip, warn, opened
 
     async def test_copy_is_offered_alone_with_the_reason(self):
@@ -1418,7 +1418,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             # the selection moves under the screen
             app.current_key = "t:2" if first == "t:1" else "t:1"
             await pilot.press("o")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(pilot, lambda: any(
+                r["action"] == "open" for r in app.audit)))
             self.assertIs(app.screen, modal)
             self.assertEqual(opened, [mine])
             row = [r for r in app.audit if r["action"] == "open"]
@@ -1446,7 +1447,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             # the queue moved on to the other item (the old `o` opened that)
             self.assertNotEqual(app.current_key, target)
             await pilot.press("o")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(pilot, lambda: any(
+                r["action"] == "open" for r in app.audit)))
             self.assertIs(app.screen, modal)
             self.assertEqual(opened, [url])
             [row] = [r for r in app.audit if r["action"] == "open"]
@@ -1521,7 +1523,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("Open (o)", shown)
             self.assertIn(f"slack://channel?team={TEAM}&id={CHANNEL}", shown)
             await pilot.press("o")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(pilot, lambda: any(
+                r["action"] == "open" for r in app.audit)))
             self.assertEqual(opened, [f"slack://channel?team={TEAM}&id={CHANNEL}"])
             self.assertIs(app.screen, modal)
             self.assertEqual(app.pending, [])

@@ -247,9 +247,11 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("o")
-            await pilot.pause(0.1)
+            await until(pilot, lambda: len(
+                [r for r in app.audit if r["action"] == "open"]) == 1)
             await pilot.press("j", "o")
-            await pilot.pause(0.1)
+            await until(pilot, lambda: len(
+                [r for r in app.audit if r["action"] == "open"]) == 2)
         self.assertEqual(opened, ["https://example.com/a"])
         self.assertEqual([r["status"] for r in app.audit if r["action"] == "open"],
                          ["ok", "failed"])
@@ -914,9 +916,9 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.3)
             self.assertNotIn(("o", "open"), app.hints())   # first row: no link
             await pilot.press("j", "o")       # second row: has a link
-            await pilot.pause(0.1)
+            self.assertTrue(await until(pilot, lambda: any(
+                r["action"] == "open" for r in app.audit)))
             self.assertEqual([c[0] for c in actions.calls if c[0] == "open"], ["open"])
-            self.assertIn("open", [r["action"] for r in app.audit])
 
     async def test_saved_rows_have_no_draft_actions_and_no_rules(self):
         app, store, actions = self.make(SAVED_ROWS)

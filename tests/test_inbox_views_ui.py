@@ -736,7 +736,8 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.feed_rules(), [])
             await pilot.press("y")              # copy still works
             await pilot.press("j", "o")
-            await pilot.pause(0.1)
+            self.assertTrue(await until(pilot, lambda: any(
+                c[0] == "open" for c in acts.calls)))
             self.assertEqual([c[0] for c in acts.calls if c[0] == "open"], ["open"])
 
     async def test_digest_rows(self):

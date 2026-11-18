@@ -36,11 +36,15 @@ and logs every op for the audit screen. `D` drafts a reply (`draft_for_me`) and
 command) and `summarize` (one no-tools bridge call, cached on disk). Neither
 changes anything outside the inbox's own state files, so neither confirms.
 """
+import fnmatch
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
 from collections import namedtuple
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from . import acts as acts_mod
 from . import context, customactions, draftme, invites, items, mrkdwn, views
@@ -95,6 +99,9 @@ def safe_link(link):
     return link if items.valid_link(link) else None
 
 
+OPEN_BIN = "/usr/bin/open"   # macOS; an absolute path, never looked up on PATH
+
+
 class LocalActions:
     """Real backend for phase 1a: local marks only."""
 
@@ -104,13 +111,18 @@ class LocalActions:
                  base_dir=None, call_tools=None, context=None, summary=None,
                  complete=None, actions=None, send=None, react=None,
                  polish=None, copy=False, team=None, slack_open=None,
-                 acts=None, done_reaction=None, nudge_template=None):
+                 acts=None, done_reaction=None, nudge_template=None,
+                 open_with=None, runner=None):
         """`rsvp`, `save`, `context`, `summary`, `send`, `react` and `polish`
         are the validated settings blocks (None: not configured); `actions`
         the validated list. `call_tools` and `complete` replace the Claude
         bridge's two entry points (tests). `copy` (the top-level `copy:`
         setting) offers "Copy for Slack" without `send:`; `team` and
         `slack_open` build the URL `o` opens for a Slack item.
+
+        `open_with` is the validated `[{host, app}]` list: an https link whose
+        host matches a rule opens in that macOS app (`open -a`, run by
+        `runner`, default `subprocess.run`), else in the default browser.
 
         `acts` maps a command source's name to `{"argv", "timeout_s", "acts"}`
         for each source that listed `acts:` (None or empty: acts are off and
@@ -126,6 +138,8 @@ class LocalActions:
         self._send_lock = threading.Lock()   # one send runs at a time
         self.custom_actions = list(actions or [])
         self._open = opener or webbrowser.open
+        self.open_with = list(open_with or [])
+        self._run = runner or subprocess.run
         self.rsvp_cfg, self.save_cfg = rsvp, save
         self.context_cfg, self.summary_cfg = context, summary
         self.base_dir, self._call_tools = base_dir, call_tools
@@ -843,15 +857,63 @@ class LocalActions:
     def restore(self, item):
         self.store.restore(item.key)
 
+    def open_app_for(self, link):
+        """The app name of the first `open_with` rule that matches the host
+        of an https `link`, else None (any other scheme never matches). A URL
+        with userinfo (`user@host`) or a backslash in its authority is never
+        matched: browsers and `urlsplit` can disagree on its real host."""
+        if not self.open_with:
+            return None
+        try:
+            parts = urlsplit(link)
+            host = (parts.hostname or "").lower()
+            userinfo = parts.username is not None or parts.password is not None
+        except ValueError:
+            return None
+        if parts.scheme != "https" or not host or userinfo \
+                or "\\" in parts.netloc or "@" in parts.netloc:
+            return None
+        for rule in self.open_with:
+            if fnmatch.fnmatchcase(host, rule["host"].lower()):
+                return rule["app"]
+        return None
+
+    def _open_in_app(self, app, link):
+        """`(opened, reason)`: run `/usr/bin/open -a <app> <link>` without a
+        shell. `reason` says why it did not open."""
+        try:
+            done = self._run([OPEN_BIN, "-a", app, link], timeout=5,
+                             check=False, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return False, "timed out"
+        except OSError as exc:
+            return False, f"cannot run open: {exc.__class__.__name__}"
+        code = getattr(done, "returncode", 1)
+        return (True, "") if code == 0 else (False, f"exit {code}")
+
     def open_link(self, item):
         link = self.open_target(item)
         if link is None:
             return Result(False, "this item has no link")
+        # `open -a` exists on macOS only: elsewhere the rules are skipped
+        # silently and the browser path runs exactly as before.
+        app = self.open_app_for(link) if sys.platform == "darwin" else None
+        note = ""
+        if app:
+            opened, why = self._open_in_app(app, link)
+            if opened:
+                return Result(True, f"{link} (in {app})")
+            note = f"{app}: {why}"
         try:
             ok = self._open(link)
         except Exception as exc:  # webbrowser can raise on odd platforms
             return Result(False, f"cannot open: {exc}")
-        return Result(bool(ok), link if ok else "no browser available")
+        if ok:
+            return Result(True, f"{link} (browser; {note})" if note else link)
+        return Result(False, "no browser available"
+                      + (f" ({note})" if note else ""))
 
 
 @dataclass

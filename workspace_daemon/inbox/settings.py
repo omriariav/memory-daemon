@@ -24,7 +24,7 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
             "slack_open", "show_rsvp_replies", "feed", "health",
-            "done_reaction", "nudge_template")
+            "done_reaction", "nudge_template", "open_with")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -40,6 +40,11 @@ SLACK_OPEN_KEYS = ("url_template",)
 SLACK_OPEN_FIELDS = ("channel", "thread_ts", "message_ts", "team")
 SLACK_OPEN_SCHEMES = ("slack://", "https://")
 SLACK_OPEN_MAX = 500
+OPEN_WITH_KEYS = ("host", "app")
+OPEN_WITH_MAX = 20
+# \Z, not $: a trailing newline must not pass.
+OPEN_WITH_HOST = re.compile(r"^[A-Za-z0-9.*-]{1,253}\Z")
+OPEN_WITH_APP = re.compile(r"^[A-Za-z0-9 ._-]{1,64}\Z")
 TEAM_ID = re.compile(r"\A[T][A-Z0-9]{6,12}\Z")
 PRECHECK_KEYS = ("argv", "timeout_s")
 SEND_ARG_KEYS = ("channel", "thread_ts", "text")
@@ -115,6 +120,7 @@ DEFAULTS = {
     "show_rsvp_replies": False,   # true: list other people's RSVP answers
     "team": None,      # the Slack workspace id for slack_open (T...)
     "slack_open": None,   # no default: `o` opens the item's link
+    "open_with": [],   # no default: `o` uses the default browser
     "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
     "health": {"heartbeats": []},
 }
@@ -246,6 +252,7 @@ def validate(raw):
         out["team"] = team
     out["slack_open"] = _check_slack_open(raw.get("slack_open"), team,
                                           problems)
+    out["open_with"] = _check_open_with(raw.get("open_with"), problems)
 
     out["feed"] = _check_feed(raw.get("feed"), problems)
     out["health"] = _check_health(raw.get("health"), problems)
@@ -649,6 +656,42 @@ def _check_slack_open(raw, team, problems):
     if len(problems) > start:
         return None
     return {"url_template": tpl}
+
+
+def _check_open_with(raw, problems):
+    """The `open_with:` list as `[{host, app}]` (empty: off). `host` is a
+    glob of hostname characters and `*`; `app` is an application name for
+    `open -a`. Nothing else is accepted, so no flag or path can get in."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > OPEN_WITH_MAX:
+        problems.append(f"open_with must be a list of up to {OPEN_WITH_MAX} "
+                        "{host, app} entries")
+        return []
+    out, start = [], len(problems)
+    for i, entry in enumerate(raw):
+        label = f"open_with[{i}]"
+        if not isinstance(entry, dict):
+            problems.append(f"{label} must be a mapping with host and app")
+            continue
+        for key in entry:
+            if key not in OPEN_WITH_KEYS:
+                problems.append(f"{label}: unknown key '{key}'")
+        host, app = entry.get("host"), entry.get("app")
+        host_ok = isinstance(host, str) and bool(OPEN_WITH_HOST.match(host))
+        app_ok = (isinstance(app, str) and bool(OPEN_WITH_APP.match(app))
+                  and not app.startswith("-") and bool(app.strip(" .")))
+        if not host_ok:
+            problems.append(f"{label}.host must be a host name glob "
+                            "(letters, digits, . - and *), such as "
+                            "*.example-chat.com")
+        if not app_ok:
+            problems.append(f"{label}.app must be an application name "
+                            "(letters, digits, space . _ -, up to 64, not "
+                            "starting with '-', not only dots or spaces)")
+        if host_ok and app_ok:
+            out.append({"host": host, "app": app})
+    return [] if len(problems) > start else out
 
 
 def _check_send(raw, problems):

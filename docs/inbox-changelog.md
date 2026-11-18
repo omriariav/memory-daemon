@@ -7,6 +7,23 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+
+### Added
+
+- **`open_with`.** An optional top-level list of `{host, app}` rules in
+  `inbox.yaml`. `o` opens an `https` URL whose host matches a rule (`fnmatch`,
+  case insensitive, first match wins) in that macOS app with
+  `/usr/bin/open -a <app> <url>` (argv list, no shell, 5 s timeout), instead of
+  the default browser. The URL is still the one `open_target` chose. A non-zero
+  exit, a timeout or an `OSError` falls back to the browser, and the toast says
+  why; other platforms skip the rules silently. A URL with userinfo or a
+  backslash in its authority never matches, and `slack://` and `http://` URLs
+  never go to an app. The open runs in a worker thread, not on the UI loop.
+  `host` is a glob of hostname characters and `*`; `app` matches
+  `^[A-Za-z0-9 ._-]{1,64}$` and is not only dots or spaces; any other key is a
+  settings error. Off by default. See [inbox.md](inbox.md#draft-and-copy).
+
 ## [0.10.0] - 2026-11-17
 
 Comms control: the inbox can tell a command source what you did with a row,
