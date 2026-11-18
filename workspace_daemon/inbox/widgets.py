@@ -112,14 +112,82 @@ class Queue(OptionList):
         self.rows = []
         self.first_idx = {}
 
+    def scroll_to_highlight(self, top=False):
+        """As the list does, but the first row also shows its group header
+        (Home, g and PgUp stop on the first row, header above it)."""
+        super().scroll_to_highlight(top)
+        first = next((n for n, o in enumerate(self.options)
+                      if not o.disabled), None)
+        if first is not None and self.highlighted == first:
+            self.scroll_to(y=0, animate=False, immediate=True)
+
+    def on_resize(self, _event):
+        # A shorter pane can leave the cursor row below its edge.
+        self.call_after_refresh(self.scroll_to_highlight)
+
+    def action_first(self):
+        super().action_first()
+        self.scroll_to_highlight()      # also when the cursor was on it
+
+    def action_last(self):
+        super().action_last()
+        self.scroll_to_highlight()
+
+    def _restore_scroll(self, y):
+        """After a rebuild: the viewport where it was (a redraw must not move
+        what the reader scrolled to), then the least scrolling that shows the
+        cursor row."""
+        if not self.is_mounted:
+            return
+        self._update_lines()
+        self.scroll_to(y=min(max(0, y), self.max_scroll_y), animate=False,
+                       immediate=True)
+        hl = self.highlighted
+        if hl is None or hl not in self._index_to_line:
+            return
+        top = self._index_to_line[hl]
+        bottom = top + self._heights[hl] - 1
+        height = self.scrollable_content_region.height
+        cur = self.scroll_offset.y
+        if top < cur:
+            cur = top
+        elif bottom >= cur + height:
+            cur = bottom - height + 1
+        if cur != self.scroll_offset.y:
+            self.scroll_to(y=cur, animate=False, immediate=True)
+
+    def _page(self, step):
+        """PgUp/PgDn: a page of lines. A page that lands on a group header
+        (a disabled option) must not clear the cursor."""
+        before = self.highlighted
+        if step > 0:
+            super().action_page_down()
+        else:
+            super().action_page_up()
+        if self.highlighted is None and self.options:
+            enabled = [n for n, o in enumerate(self.options) if not o.disabled]
+            if enabled:
+                self.highlighted = enabled[-1 if step > 0 else 0]
+            elif before is not None:
+                self.highlighted = before
+
+    def action_page_up(self):
+        self._page(-1)
+
+    def action_page_down(self):
+        self._page(1)
+
     def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
-              ghost_at=None, visual=False, today=None):
+              ghost_at=None, visual=False, today=None, reset_scroll=False):
         """Draw `groups` (`views.Group`). A group with no rows is skipped,
         unless it is `keep_empty` (then a dash stands in). `ghost` is a row
         that just left `ghost_group` at position `ghost_at`. `today` (a
         `datetime.date`, default the local date) is what a task row's due cell
         counts from."""
         width = max(24, (self.size.width or 40) - 1)
+        # `reset_scroll`: another list (a view or a filter changed), so it
+        # starts at the top instead of at the old offset.
+        keep_y = self.scroll_y if self.options and not reset_scroll else None
         self.today = today or dt.date.today()
         opts = []
         self.rows = []
@@ -161,7 +229,14 @@ class Queue(OptionList):
                 target = None
         if target is None and self.rows:
             target = self.get_option_index(ITEM_PREFIX + self.rows[0].key)
+        if reset_scroll:
+            self.scroll_to(y=0, animate=False, immediate=True)
         self.highlighted = target
+        if keep_y is not None:
+            # clear_options and the highlight scroll the list on their own:
+            # put the viewport back at once (the new rows are already laid
+            # out), so no frame is painted at the snapped offset.
+            self._restore_scroll(keep_y)
 
     def _task_row(self, it, width, pal, visual):
         """A task: glyph, title, the due cell and the age on the first line,
@@ -244,6 +319,13 @@ class Queue(OptionList):
 
 class ThreadView(VerticalScroll):
     can_focus = True
+    _shown = None      # (item key, newest_first) of the last drawing
+
+    def _keep_place(self, before):
+        delta = self.virtual_size.height - before
+        if delta and self.scroll_y > 0:
+            self.scroll_to(y=max(0, self.scroll_y + delta), animate=False,
+                           immediate=True)
 
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
@@ -256,13 +338,24 @@ class ThreadView(VerticalScroll):
         `task_detail`)."""
         body = self.query_one("#thread-body", Static)
         width = max(30, (self.size.width or 60) - 4)
+        # A redraw of the same item (a refresh, a resize) keeps the scroll
+        # position; another item, or the other thread order, starts at the top.
+        shown = (None if item is None else item.key, newest_first)
+        fresh = shown != self._shown
+        self._shown = shown
+        if not fresh and newest_first and self.scroll_y > 0:
+            # Same item, newest message first: a new message lands on top.
+            # Keep the reader's place by the change in content height.
+            before = self.virtual_size.height
+            self.call_after_refresh(self._keep_place, before)
         if item is None:
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
             return
         if tasksmod.is_task(item):
             body.update(task_detail(item, pal, width, visual,
                                     today or dt.date.today()))
-            self.scroll_home(animate=False)
+            if fresh:
+                self.scroll_home(animate=False)
             return
         out = Text()
         out.append(vis(item.who, visual), Style(bold=True, color=pal["urgent"] if item.section == "urgent" else pal["primary"]))
@@ -305,7 +398,8 @@ class ThreadView(VerticalScroll):
             # the last message drawn is then not known to be the first.
             out.append("─ thread start ─\n", Style(color=pal["muted"], dim=True))
         body.update(out)
-        self.scroll_home(animate=False)
+        if fresh:
+            self.scroll_home(animate=False)
 
 
 def task_detail(item, pal, width, visual, today):

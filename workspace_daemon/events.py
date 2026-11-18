@@ -25,6 +25,10 @@ instance id) when one event stands for several instances of a series, and
 `kind` "diff" (source of the captured entry, e.g. zoom) means a capture of the
 same meeting disagrees with an earlier one: `details` is
 `{"entry_ids": [new, earlier], "differs": [one line each], "untrusted": true}`.
+`kind` "duplicate" means the memory store refused a capture as a near-duplicate:
+`memory_id` is the entry it matched (null when the store named none) and
+`details` is `{"untrusted": true, "duplicate_of"?: that id,
+"owner_actions_not_filed"?: [texts]}`. The inbox shows it as a REVIEW row.
 A capture of a meeting matched to a calendar event adds `details`
 `{"calendar_event_id": str, "attendee_count": int}` on "new" and "update":
 the event's human attendees including the owner, rooms excluded. The count is

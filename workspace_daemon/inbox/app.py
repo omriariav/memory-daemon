@@ -2,6 +2,7 @@
 import asyncio
 import datetime
 import inspect
+import shlex
 import sys
 import threading
 import time
@@ -107,6 +108,18 @@ def _takes_show_all(fetch):
         return False
     return "show_all" in params or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def review_cli_hint(source_id, title):
+    """The command line `D` copies on a REVIEW row. A template: run it in the
+    memory store directory and add --type, --date and the entry text (--body).
+    The event carries no body, so the inbox cannot write the entry itself."""
+    return ("# run in your memory store directory; add --type, --date and "
+            "--body (the entry text).\n"
+            "# npx may reach the network to fetch tsx.\n"
+            "npx tsx src/cli.ts add --force-new "
+            f"--source-ids={shlex.quote(source_id)} "
+            f"--title={shlex.quote(title)}")
 
 
 @dataclass
@@ -308,6 +321,7 @@ class InboxApp(App):
         self._list_started = {}            # units mode: source name -> when its list was last fetched (not re-evaluated)
         self._rows = {}                    # key -> row, digest and saved rows too
         self._groups_sig = None
+        self._list_sig = None              # (view, filters) the queue was last built for
         self.health_fetch = health
         self.health_snap = None
         self._health_loading = False
@@ -524,7 +538,8 @@ class InboxApp(App):
                                   now)
         for it in rows:
             it.feed, it.feed_label = "show", ""
-            if it.section == "fyi" and rules and not tasksmod.is_task(it):
+            if (it.section == "fyi" and rules and not tasksmod.is_task(it)
+                    and not views.is_review(it)):
                 action, rule = feedrules.classify(it, rules, now)
                 it.feed = action
                 if rule is not None:
@@ -787,9 +802,14 @@ class InboxApp(App):
         if empty:
             zero.update(self.zero_text())
         else:
+            list_sig = (self.view, self.filter_text, self.source_filter,
+                        self.feed_routine if self.view == "feed" else None)
+            reset = list_sig != self._list_sig
+            self._list_sig = list_sig
             q.build(groups, self.pal, now, keep=keep, ghost=ghost,
                     ghost_group=ghost_group, ghost_at=ghost_at,
-                    visual=self.bidi, today=self._today())
+                    visual=self.bidi, today=self._today(),
+                    reset_scroll=reset)
             # While the queue was hidden (the first poll still running) it
             # lost focus; give it back, or the arrows do nothing until a
             # click. Not while the terminal is in the background: Textual
@@ -971,8 +991,15 @@ class InboxApp(App):
                 keys.append(("s", "due date"))
             if self._acts_on(it, "drop"):
                 keys.append(("x", "drop"))
-            return base + keys + opn + [("u", "undo"), ("/", "filter"),
-                                        ("?", "help")]
+            if f is not None and f.id in ("thread", "draft-pane"):
+                # the card has the focus: its keys scroll it
+                return [("j/k", "scroll"), ("esc", "queue")] + keys + [
+                    ("?", "help")]
+            return base + keys + [("tab", "card")] + opn + [
+                ("u", "undo"), ("/", "filter"), ("?", "help")]
+        if views.is_review(it):
+            return base + [("d", "dismiss"), ("D", "copy save hint")] + opn + [
+                ("y", "copy"), ("u", "undo"), ("S", "saved"), ("?", "help")]
         if self._rsvp_on(it):
             tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
                 ("u", "undo"), ("S", "saved"), ("?", "help")]
@@ -1115,6 +1142,7 @@ class InboxApp(App):
         q = self.query_one("#queue", Queue)
         if f is not None and f.id == "queue" and q.rows:
             q.highlighted = q.get_option_index(ITEM_PREFIX + q.rows[-1 if end else 0].key)
+            q.scroll_to_highlight()    # also when the cursor was already there
         elif f is not None and f.id in ("thread", "context", "health"):
             f.scroll_end(animate=False) if end else f.scroll_home(animate=False)
 
@@ -2103,6 +2131,8 @@ class InboxApp(App):
         it = self.current
         if it is not None and tasksmod.is_task(it):
             return self._task_done(it, outcome=True)
+        if it is not None and views.is_review(it):
+            return self._review_save(it)
         if it is None or self._synthetic(it):
             return
         if "reply" not in it.actions and "nudge" not in it.actions:
@@ -2351,6 +2381,21 @@ class InboxApp(App):
             "Possible duplicate", rows, "Save anyway",
             "Saving anyway adds another memory.", self.bidi), after)
 
+    def _review_save(self, it):
+        """D on a REVIEW row: copy a command-line hint for saving the skipped
+        capture anyway. It never runs the `save:` command: that command gets
+        this row (the review text), not the captured content, and the event
+        does not carry the body. A real re-save needs the daemon to recapture
+        the source."""
+        title = str(it.meta.get("title") or it.who)
+        sid = str(it.meta.get("source_id") or "")
+        self.copy_to_clipboard(review_cli_hint(sid, title))
+        self.record("save", it, "duplicate review: CLI hint copied",
+                    "cancelled")
+        self.notify("Copied a save hint (a command template: it needs the "
+                    "entry text). Nothing was saved.", timeout=6,
+                    markup=False)
+
     def _confirm_thread_saved(self, it):
         """The item's Slack thread is already in memory, this message may not
         be: the same choice as a likely duplicate."""
@@ -2377,6 +2422,8 @@ class InboxApp(App):
             return
         if self._synthetic(it):
             return
+        if views.is_review(it):
+            return      # not bound here: D copies a save hint
         if it.memory_id:      # the daemon (or an earlier save) already did it
             self.notify(f"Already in memory ({it.memory_id})", timeout=4,
                         markup=False)
@@ -2553,7 +2600,7 @@ class InboxApp(App):
             emoji = (fn(it) if fn else None) or ""
         except Exception:
             emoji = ""
-        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' else 'Done'}: {it.who}",
+        self._enqueue("done", it, f"{'Dismissed' if it.kind == 'fyi' or views.is_review(it) else 'Done'}: {it.who}",
                       act=act, react=emoji)
 
     def action_snooze(self):
@@ -2868,8 +2915,11 @@ class InboxApp(App):
                pane.size.width)
         if sig == self._ctx_sig:
             return
+        try:
+            pane.show(view, self.pal, now, self.bidi)
+        except NoMatches:   # the pane's body is already gone (shutting down)
+            return
         self._ctx_sig = sig
-        pane.show(view, self.pal, now, self.bidi)
 
     def action_summary(self, force=False):
         """i: AI summary of the item (cached on disk); I: ask again."""

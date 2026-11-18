@@ -160,6 +160,10 @@ def _rule_matches(rule, event, kind, key, start_ts, now):
 def _map_source(event):
     src = event.get("source")
     kind = event.get("kind")
+    if kind == "duplicate":
+        # The store refused a capture as a near-duplicate (whatever its
+        # source): one "not saved" row for the owner to review.
+        return "memory"
     if src == "gmail":
         return "email"
     if src == "gcal" and kind in _CAL_KIND:
@@ -239,8 +243,8 @@ def memory_index(events):
     only with a clean one-line source id and a well-formed memory id."""
     best = {}
     for event in events:
-        if not isinstance(event, dict):
-            continue
+        if not isinstance(event, dict) or event.get("kind") == "duplicate":
+            continue    # a refused capture is not saved as its `memory_id`
         sid, mid = event.get("source_id"), event.get("memory_id")
         if (not isinstance(sid, str) or not sid or len(sid) > SOURCE_ID_MAX
                 or itm.clean_line(sid) != sid
@@ -353,8 +357,46 @@ def units_memory_index(units):
     return index
 
 
-def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
-    """One event line to an item, or None if the event is not shown."""
+DUPLICATE_ACTIONS_MAX = 10
+
+
+def _duplicate_parts(event, details, ts, match_titles):
+    """`(gist, thread, extra meta)` of a `duplicate` capture event: the
+    capture the store refused as a near-duplicate of `details.duplicate_of`.
+    `match_titles` maps a memory id to its title when an earlier event of the
+    stream names it. The thread lists the skipped title, its source id, the
+    matched entry and any owner actions that were not filed."""
+    title = _text(event.get("title")) or "(untitled)"
+    matched = _text(details.get("duplicate_of"))
+    matched_title = itm.truncate(_text((match_titles or {}).get(matched)),
+                                 itm.GIST_MAX) if matched else ""
+    target = matched_title or matched or "an existing entry"
+    gist = f"Not saved: near-duplicate of {target}"
+    entries = [("skipped", title),
+               ("source id", _text(event.get("source_id")) or "-"),
+               ("matched", (f"{matched} ({matched_title})" if matched_title
+                            else matched) if matched else "not named")]
+    actions = details.get("owner_actions_not_filed")
+    texts = [t for t in (_text(a) for a in actions[:DUPLICATE_ACTIONS_MAX])
+             if t] if isinstance(actions, list) else []
+    if texts:
+        lines = [f"- {t}" for t in texts]
+        more = len(actions) - DUPLICATE_ACTIONS_MAX
+        if more > 0:
+            lines.append(f"+{more} more")
+        entries.append(("owner actions not filed", "\n".join(lines)))
+    thread = [{"who": who, "ts": ts, "text": text} for who, text in entries]
+    extra = {"thread_fixed": True,
+             "duplicate_of": matched,
+             "matched_title": matched_title}
+    return itm.truncate(gist, itm.GIST_MAX), thread, extra
+
+
+def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0,
+                  match_titles=None):
+    """One event line to an item, or None if the event is not shown.
+    `match_titles` (memory id -> title) names the entry a `duplicate` event
+    matched."""
     if not isinstance(event, dict):
         return None
     source = _map_source(event)
@@ -386,10 +428,16 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
     elif source == "sheet":
         gist = title
         where = _text(event.get("routine")) or "sheet"
+    elif source == "memory":
+        gist, thread, dup_extra = _duplicate_parts(event, details, ts,
+                                                   match_titles)
+        where = "not saved"
     else:
         gist = title
         where = "daemon"
     sender = ", ".join(people[:3]) if people else where
+    if source == "memory":
+        sender = itm.truncate(title, itm.FIELD_MAX)
     if source == "email":
         mail_from = _mail_from(details.get("mail_from"))
         sender = mail_from or (", ".join(people[:3]) if people else "mail")
@@ -399,10 +447,18 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
                  for r in rules)
     if source == "alert" and _benign_only(_alert_issues(details)):
         urgent = False
-    link = _event_link(event, source, gmail_account)
+    if source == "memory":
+        urgent = False      # a refused capture is a review, never urgent
+    # A refused capture keeps the link of its own source (the mail), so `o`
+    # still opens it.
+    link = _event_link(
+        event, _map_source(dict(event, kind="")) if source == "memory"
+        else source, gmail_account)
     raw_memory_id = event.get("memory_id")
     memory_id = raw_memory_id if (isinstance(raw_memory_id, str)
                                   and MEMORY_ID.match(raw_memory_id)) else ""
+    if source == "memory":
+        memory_id = ""      # that id is the matched entry, not this item's
     actions = ["ack"] if source != "email" else []
     if link is not None:
         actions.append("open")  # nothing to open without a link
@@ -414,6 +470,8 @@ def event_to_item(event, now, rules=DEFAULT_URGENT_RULES, gmail_account=0):
         extra["title"] = itm.truncate(title, itm.GIST_MAX)
     if start_ts is not None:
         extra["starts"] = start_ts      # `starts_within_h` Feed rules
+    if source == "memory":
+        extra.update(dup_extra)
     if source == "alert":
         extra.update(_alert_fields(details))
         if _benign_only(_alert_issues(details)):
@@ -635,6 +693,20 @@ def _with_thread(item, event, key, since, runlog, now, item_id=None):
         return item
 
 
+def _match_titles(events):
+    """`{memory_id: title}` from the capture events (`new`, `update`), the
+    newest last: what a `duplicate` row calls the entry it matched."""
+    out = {}
+    for event in events:
+        if (isinstance(event, dict) and event.get("kind") in _SAVED_KINDS
+                and isinstance(event.get("memory_id"), str)
+                and event.get("memory_id")):
+            title = _text(event.get("title"))
+            if title:
+                out[event["memory_id"]] = title
+    return out
+
+
 def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 rules=DEFAULT_URGENT_RULES, name="events", gmail_account=0,
                 alert_max_age_h=DEFAULT_ALERT_MAX_AGE_H, email_routines=None,
@@ -669,6 +741,7 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
     active = recovery.active_since()
     runlog = runlog if runlog is not None else _RunLog(base_dir)
     cutoff = now - float(window_h) * 3600
+    match_titles = _match_titles(events)
     latest = {}  # one row per source_id: the newest event wins
     newest_active = {}  # active alert key -> its newest (item, event), any age
     for event in events:
@@ -677,7 +750,8 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 and event.get("kind") == "rsvp"):
             continue
         try:
-            item = event_to_item(event, now, rules, gmail_account)
+            item = event_to_item(event, now, rules, gmail_account,
+                                 match_titles)
         except (itm.ItemError, TypeError, ValueError):
             continue
         if item is None:
@@ -692,6 +766,8 @@ def load_events(base_dir, now=None, window_h=DEFAULT_WINDOW_H,
                 and event.get("routine") not in email_routines):
             continue
         sid = item["meta"].get("source_id") or item["id"]
+        if item["source"] == "memory":
+            sid = "duplicate:" + sid    # apart from the capture rows of that id
         prev = latest.get(sid)
         if prev is None or item["ts"] >= prev[0]["ts"]:
             latest[sid] = (item, event)

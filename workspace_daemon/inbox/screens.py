@@ -514,6 +514,10 @@ HELP = [
     ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
                      ("m", "save to memory by hand (save: in inbox.yaml; the daemon saves on its own, ◆ = already in memory, ◇ = its thread is); marks it done"),
                      ("", "both confirm first, then wait out the 5 s undo window")]),
+    ("Review (REVIEW in the Inbox)", [
+        ("", "a capture the memory store refused as a near-duplicate: Not saved: near-duplicate of ..."),
+        ("d", "dismiss: it is a duplicate, fine (a local mark)"),
+        ("D", "copy a command-line hint for saving it anyway (a template: it needs the entry text; nothing is saved from here)")]),
     ("Slack send / react / polish", [
         ("a / n", "reply or nudge: Draft in Slack (d), Send (y) or Copy for Slack (c) (send: / copy: in inbox.yaml)"),
         ("E", "react to the message with an emoji (react: in inbox.yaml)"),

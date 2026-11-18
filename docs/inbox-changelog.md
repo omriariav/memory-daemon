@@ -7,6 +7,46 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-18
+
+### Added
+
+- **Near-duplicate captures show as REVIEW rows.** When the memory store
+  refuses a capture as a near-duplicate, the daemon's `duplicate` event is now
+  a row in the Inbox's new `REVIEW` group (listed only when there is one):
+  `Not saved: near-duplicate of <matched title or id>`, with a detail pane of
+  the skipped title, source id, matched entry and any owner actions not filed.
+  `d` dismisses it (a local mark). `D` copies a command-line hint (a template
+  for the store's `add --force-new`) and saves nothing: the `save:` command
+  would receive the review text, not the captured content, so it is not used.
+  Rows age out with the events window and dedupe per source id (newest wins)
+  and by event id. A `duplicate` event of Gmail, Zoom or Mila used to show as an ordinary
+  mail or recording row; it now shows here. See
+  [Review rows](inbox.md#review-rows).
+
+### Fixed
+
+- **The Tasks view (and the thread pane) kept snapping back to the top.**
+  Every redraw of the same item (a refresh that changed a row, a terminal
+  resize) drew the detail card or thread again and scrolled it home, so a
+  long card could not be read. The pane now keeps its scroll position for the
+  same item and starts at the top for another item or the other thread order.
+- **A redraw no longer moves the list.** Every redraw (a refresh about every
+  30 s, a resize) rebuilt the queue and snapped its scroll to the cursor or
+  the top, so a list scrolled with the wheel or a half-read page jumped. The
+  viewport now stays where it was; only a hidden cursor row is brought into
+  view, with the least scrolling. In the thread pane (newest message first) a
+  new message on top no longer pushes the reader's place down.
+- **Task footer hints.** A task row lists `tab card`; with the card focused the
+  footer says `j/k scroll` and `esc queue`.
+- **Flaky teardown.** `context_tick` could raise `NoMatches '#context-body'`
+  while the app was closing; the render now returns when the pane is gone.
+- **Queue paging.** PgUp near the top cleared the cursor (the page landed on a
+  group header); it now stays on the first row. Home, `g` and PgUp to the
+  first row also show that row's group header (and reach the top when the
+  cursor is already there), and resizing the terminal
+  shorter keeps the cursor row in view.
+
 ## [0.12.1] - 2026-11-18
 
 Mostly a test and CI patch; one fix to the `?` screen.
