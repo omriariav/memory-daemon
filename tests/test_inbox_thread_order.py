@@ -115,7 +115,12 @@ async def settle(pilot, app):
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return bool(cond())
@@ -200,7 +205,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("v")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: order_of(thread_text(app)) == ["FIRST", "SECOND", "THIRD"]))
             text = thread_text(app)
             self.assertEqual(app.thread_order, "oldest")
             self.assertEqual(order_of(text), ["FIRST", "SECOND", "THIRD"])
@@ -208,9 +214,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("oldest first" in f"{n.message}"
                                 for n in app._notifications))
             await pilot.press("v")
-            await pilot.pause(0.2)
-            self.assertEqual(order_of(thread_text(app)),
-                             ["THIRD", "SECOND", "FIRST"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: order_of(thread_text(app)) == ["THIRD", "SECOND", "FIRST"]))
 
     async def test_the_note_and_header_stay_on_top_in_both_orders(self):
         app = make_app([thread_item()], InboxStore(None))
@@ -238,6 +243,7 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertIn("NOTE:", thread_text(app))
             await pilot.press("v")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertIn("NOTE:", thread_text(app))
 
@@ -262,6 +268,7 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             before = [i.key for i in app.visible()]
             await pilot.press("v")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual([i.key for i in app.visible()], before)
 
@@ -278,7 +285,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=SIZE) as pilot:
                 await settle(pilot, app)
                 await pilot.press("v")                 # newest -> oldest
-                await pilot.pause(0.2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: InboxStore(Path(tmp)).get_pref("thread_order") == "oldest"))
             self.assertEqual(
                 InboxStore(Path(tmp)).get_pref("thread_order"), "oldest")
             app = make_app([thread_item()], InboxStore(Path(tmp)))   # restart
@@ -302,8 +310,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("v")
-            await pilot.pause(0.2)
-            self.assertEqual(app.thread_order, "oldest")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.thread_order == "oldest"))
             self.assertTrue(any("Order not saved" in f"{n.message}"
                                 for n in app._notifications))
 
@@ -316,9 +324,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             titles = {c.title for c in app.get_system_commands(app.screen)}
             self.assertIn("Toggle thread order", titles)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIn("thread order",
-                          str(app.screen.query_one("#help-body").render()))
+            self.assertTrue(await wait_for(
+                pilot, lambda: "thread order" in str(app.screen.query_one("#help-body").render())))
 
     async def test_v_does_nothing_while_a_modal_is_open(self):
         app = make_app([thread_item()], InboxStore(None))
@@ -327,8 +334,8 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("question_mark")
             await pilot.pause(0.1)
             await pilot.press("v")
-            await pilot.pause(0.1)
-            self.assertEqual(app.thread_order, "newest")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.thread_order == "newest"))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")

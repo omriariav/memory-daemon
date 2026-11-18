@@ -529,7 +529,12 @@ class Fixed:
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -582,6 +587,7 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("P")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, PolishScreen)
             self.assertTrue(any("Polish not configured" in t for t in toasts(app)))
@@ -594,8 +600,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertNotIn(("P", "polish"), app.hints())
             await pilot.press("P")
-            await pilot.pause(0.1)
-            self.assertTrue(any("No draft to polish" in t for t in toasts(app)))
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("No draft to polish" in t for t in toasts(app))))
             self.assertEqual(acts.polished, [])
 
     async def test_review_shows_old_and_new_and_cancel_is_the_default(self):
@@ -603,8 +609,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         app = make_app([item(1)], acts)
         async with app.run_test(size=SIZE) as pilot:
             modal = await self.to_review(pilot, app)
-            await pilot.pause(0.15)
-            self.assertEqual(modal.focused.id, "cancel")
+            self.assertTrue(await wait_for(
+                pilot, lambda: modal.focused.id == "cancel"))
             self.assertIn("hey can u send the report",
                           str(modal.query_one("#polish-old").render()))
             self.assertIn("Thanks! Could you send it?",
@@ -612,8 +618,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(acts.polished, [("t:1", "hey can u send the report")])
             self.assertIn(("P", "polish"), app.hints())
             await pilot.press("escape")                   # cancel
-            await pilot.pause(0.2)
-            self.assertEqual(app.current.draft, "hey can u send the report")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.current.draft == "hey can u send the report"))
             self.assertEqual(acts.sent(), [])
             self.assertIn("cancelled", [r["status"] for r in app.audit])
 
@@ -623,8 +629,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_review(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.3)
-            self.assertNotIsInstance(app.screen, PolishScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not isinstance(app.screen, PolishScreen)))
             self.assertEqual(app.current.draft, "Thanks! Could you send it?")
             self.assertIn("Thanks! Could you send it?",
                           str(app.query_one("#draft-view").render()))
@@ -636,8 +642,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["status"], "accepted")
             # a normal approve now confirms the NEW text
             await pilot.press("a")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertEqual(app.screen.text, "Thanks! Could you send it?")
 
     async def test_edit_opens_the_editor_with_the_new_text(self):
@@ -646,16 +652,16 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_review(pilot, app)
             await pilot.press("e")
-            await pilot.pause(0.3)
-            self.assertNotIsInstance(app.screen, PolishScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not isinstance(app.screen, PolishScreen)))
             self.assertTrue(app.editing)
             self.assertEqual(app.query_one("#draft-edit").text,
                              "Thanks! Could you send it?")
             self.assertEqual(app.current.draft, "hey can u send the report")
             app.query_one("#draft-edit").text = "Thanks, could you send it today?"
             await pilot.press("ctrl+s")
-            await pilot.pause(0.2)
-            self.assertEqual(app.current.draft, "Thanks, could you send it today?")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.current.draft == "Thanks, could you send it today?"))
             self.assertEqual(acts.sent(), [])
 
     async def test_edit_works_without_send_configured(self):
@@ -668,8 +674,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_review(pilot, app)
             await pilot.press("e")
-            await pilot.pause(0.3)
-            self.assertTrue(app.editing)
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.editing and len(app.query("#draft-edit")) > 0))
             self.assertEqual(app.query_one("#draft-edit").text,
                              "Thanks! Could you send the report?")
 
@@ -709,6 +715,7 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
                 acts.gate.set()
                 await wait_for(pilot, lambda: not app._polish_running)
+                # negative check: it must not happen
                 await pilot.pause(0.3)
                 self.assertNotIsInstance(app.screen, PolishScreen)
                 self.assertEqual(app.current.draft, "hey can u send the report")
@@ -728,10 +735,11 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("P")
                 await pilot.pause(0.2)
                 app.action_polish()
-                await pilot.pause(0.1)
-                self.assertTrue(any("already running" in t for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("already running" in t for t in toasts(app))))
                 self.assertEqual(len(acts.polished), 1)
                 await pilot.press("ctrl+q")                # a modal hides plain q
+                # negative check: it must not happen
                 await pilot.pause(0.3)
                 self.assertFalse(app._exit)
                 self.assertTrue(any("polish still running" in t for t in toasts(app)))
@@ -767,9 +775,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await self.to_review(pilot, app)
                 app.current.draft = "changed while the review was open"
                 await pilot.press(key)
-                await pilot.pause(0.3)
-                self.assertEqual(app.current.draft,
-                                 "changed while the review was open", key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: app.current.draft == "changed while the review was open"), key)
                 self.assertFalse(app.editing, key)
                 self.assertTrue(any("discarded" in t for t in toasts(app)), key)
                 self.assertIn("discarded", [r["status"] for r in app.audit])
@@ -796,8 +803,8 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_review(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.3)
-            self.assertEqual(app.current.draft, "Thanks! Could you send the report?")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.current.draft == "Thanks! Could you send the report?"))
             self.assertEqual(len(tools), 1)
             self.assertFalse(store.is_hidden("t:1"))
 

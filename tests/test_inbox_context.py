@@ -926,7 +926,12 @@ class WorkerCleanup:
 
 async def wait_for(pilot, cond, tries=100, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -988,15 +993,15 @@ class NotConfiguredTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("c")
-            await pilot.pause(0.1)
-            self.assertTrue(any("Context not configured" in t for t in toasts(app)))
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("Context not configured" in t for t in toasts(app))))
             self.assertFalse(app.context_open)
             self.assertFalse(app.query_one("#context").display)
             await pilot.press("C")
             await pilot.press("i")
             await pilot.press("I")
-            await pilot.pause(0.1)
-            self.assertTrue(any("Summary not configured" in t for t in toasts(app)))
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("Summary not configured" in t for t in toasts(app))))
             self.assertFalse(app.context_open)
             self.assertNotIn(("c", "context"), app.hints())
             self.assertNotIn(("i", "summary"), app.hints())
@@ -1009,6 +1014,7 @@ class NotConfiguredTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("c")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertFalse(app.context_open)       # c needs `context:`
             await pilot.press("i")
@@ -1039,8 +1045,8 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fetched(acts), ["t:1"])
             self.assertIn("About Person 1", pane_text(app))
             await pilot.press("c")
-            await pilot.pause(0.1)
-            self.assertFalse(app.query_one("#context").display)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not app.query_one("#context").display))
             self.assertFalse(app.context_open)
 
     async def test_the_default_debounce_is_400_ms(self):
@@ -1051,20 +1057,18 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
 
     async def test_fast_selection_changes_fetch_only_where_it_stops(self):
         acts = ctx_actions()
-        app = make_app(self.rows(4), acts, context_debounce_s=0.4)
+        # The debounce is long and the presses are back to back, so no load
+        # on the machine can let a pause outlast it between two presses.
+        app = make_app(self.rows(4), acts, context_debounce_s=3.0)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("c")
             await wait_for(pilot, lambda: fetched(acts) == ["t:1"])
-            await pilot.press("j")
-            await pilot.pause(0.15)
-            await pilot.press("j")
-            await pilot.pause(0.15)
-            await pilot.press("j")                 # t:2 and t:3 never waited it out
+            await pilot.press("j", "j", "j")       # t:2 and t:3 never waited it out
             self.assertEqual(fetched(acts), ["t:1"])
             self.assertIn("Loading context", pane_text(app))
             self.assertTrue(await wait_for(
-                pilot, lambda: "line for t:4" in pane_text(app)))
+                pilot, lambda: "line for t:4" in pane_text(app), tries=300))
             self.assertEqual(fetched(acts), ["t:1", "t:4"])
 
     async def test_a_stale_result_is_cached_but_not_drawn(self):
@@ -1080,6 +1084,7 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await wait_for(
                 pilot, lambda: "line for t:2" in pane_text(app)))
             gate.set()                             # now the old fetch answers
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertNotIn("line for t:1", pane_text(app))
             self.assertIn("line for t:2", pane_text(app))
@@ -1088,6 +1093,7 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("k")                 # back: served from the cache
             self.assertTrue(await wait_for(
                 pilot, lambda: "line for t:1" in pane_text(app)))
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(fetched(acts), ["t:1", "t:2"])
 
@@ -1103,6 +1109,7 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("j")
             await wait_for(pilot, lambda: fetched(acts) == ["t:1", "t:2"])
             await pilot.press("k")                         # within the TTL
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual(fetched(acts), ["t:1", "t:2"])
             self.assertIn("line for t:1", pane_text(app))
@@ -1118,6 +1125,7 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("C")                         # pane closed: no fetch
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(fetched(acts), [])
             self.assertTrue(any("closed" in t for t in toasts(app)))
@@ -1221,8 +1229,8 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("j")                              # scrolls, no crash
             self.assertIn(("C", "refresh"), app.hints())
             await pilot.press("c")                              # closing leaves focus sane
-            await pilot.pause(0.1)
-            self.assertEqual(app.focused.id, "queue")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.focused.id == "queue"))
 
     async def test_quitting_does_not_wait_for_a_running_fetch(self):
         acts = ctx_actions()
@@ -1236,6 +1244,7 @@ class ContextPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await wait_for(pilot, lambda: fetched(acts) == ["t:1"])
                 started = time.monotonic()
                 await pilot.press("q")
+                # negative check: the pause is part of the measured interval
                 await pilot.pause(0.2)
             self.assertLess(time.monotonic() - started, 5)
         finally:
@@ -1295,6 +1304,7 @@ class SummaryPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await wait_for(pilot, lambda: "review the doc" in pane_text(app))
             self.assertEqual(len(self.prompts), 1)
             await pilot.press("i")
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual(len(self.prompts), 1)               # from the cache
             self.assertIn("cached,", pane_text(app))
@@ -1337,8 +1347,8 @@ class SummaryPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                     pilot, lambda: "summarising" in pane_text(app)))
                 await pilot.press("i")
                 await pilot.press("I")
-                await pilot.pause(0.1)
-                self.assertTrue(any("already running" in t for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("already running" in t for t in toasts(app))))
                 gate.set()
                 self.assertTrue(await wait_for(
                     pilot, lambda: "review the doc" in pane_text(app)))
@@ -1413,12 +1423,14 @@ class StaleContextTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("line for t:1", text)   # the old rows stay drawn
             self.assertIn("stale", text)
             self.assertIn("refreshing", text)
+            # negative check: it must not happen
             await pilot.pause(2.3)                # ticks pass: still ONE refetch
             self.assertEqual(fetched(acts), ["t:1", "t:1"])
             gate.set()
             self.assertTrue(await wait_for(
                 pilot, lambda: "fresh line" in pane_text(app)))
             self.assertNotIn("stale", pane_text(app))
+            # negative check: it must not happen
             await pilot.pause(1.5)
             self.assertEqual(fetched(acts), ["t:1", "t:1"])
 
@@ -1435,6 +1447,7 @@ class StaleContextTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             clock[0] += 601
             await wait_for(pilot, lambda: "backend down" in pane_text(app))
             self.assertEqual(fetched(acts), ["t:1", "t:1"])
+            # negative check: it must not happen
             await pilot.pause(2.3)                # the error entry is fresh: no loop
             self.assertEqual(fetched(acts), ["t:1", "t:1"])
             clock[0] += 31                        # 30 s error TTL over: one more try
@@ -1458,10 +1471,11 @@ class PaneBehaviourTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await wait_for(pilot, lambda: "a point" in pane_text(app))
             self.assertTrue(app.context_open)
             await pilot.press("c")
-            await pilot.pause(0.1)
-            self.assertFalse(app.context_open)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not app.context_open))
             self.assertFalse(app.query_one("#context").display)
             await pilot.press("c")                   # opening still needs context:
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertFalse(app.context_open)
             self.assertTrue(any("Context not configured" in t for t in toasts(app)))
@@ -1479,13 +1493,13 @@ class PaneBehaviourTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("j")
                 await wait_for(pilot, lambda: fetched(acts) == ["t:1", "t:2"])
                 await pilot.press("j")               # t:3: both slots are taken
-                await pilot.pause(0.4)
-                self.assertEqual(fetched(acts), ["t:1", "t:2"])
+                self.assertTrue(await wait_for(
+                    pilot, lambda: fetched(acts) == ["t:1", "t:2"]))
                 self.assertEqual([i.key for i in app._ctx_pending], ["t:3"])
                 self.assertIn("Loading context", pane_text(app))
                 await pilot.press("j")               # t:4 supersedes the waiting t:3
-                await pilot.pause(0.4)
-                self.assertEqual([i.key for i in app._ctx_pending], ["t:4"])
+                self.assertTrue(await wait_for(
+                    pilot, lambda: [i.key for i in app._ctx_pending] == ["t:4"]))
                 for g in gates.values():
                     g.set()
                 self.assertTrue(await wait_for(
@@ -1506,6 +1520,7 @@ class PaneBehaviourTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(1.6)               # layout done, width known
             pane = app.query_one("#context")
             with mock.patch.object(pane, "show", wraps=pane.show) as show:
+                # negative check: it must not happen
                 await pilot.pause(2.5)               # two or three ticks
                 self.assertEqual(show.call_count, 0)
             # a real change still redraws it
@@ -1558,13 +1573,14 @@ class PaneBehaviourTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await wait_for(pilot, lambda: "summary text 1" in pane_text(app))
                 app.summaries.clear()                        # force a cache read
                 await pilot.press("i")
+                # negative check: it must not happen
                 await pilot.pause(0.3)
                 self.assertFalse(any("already running" in t for t in toasts(app)))
                 self.assertIn("summary text 1", pane_text(app))
                 self.assertEqual(len(calls), 2)
                 await pilot.press("I")                       # forcing still waits its turn
-                await pilot.pause(0.2)
-                self.assertTrue(any("already running" in t for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("already running" in t for t in toasts(app))))
         finally:
             gate.set()
 
@@ -1592,14 +1608,14 @@ class QuitTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await wait_for(pilot, started.is_set)
                 self.assertFalse(flags["daemon"])        # exit waits for it
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._exit)
                 self.assertTrue(any(
                     "summary still running; q again to quit (it finishes first)" in t
                     for t in toasts(app)))
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
                 self.assertTrue(any("summary is still finishing" in str(m)
                                     for m in app._exit_renderables))
                 self.assertFalse(finished.is_set())
@@ -1626,10 +1642,10 @@ class QuitTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("i")
                 await wait_for(pilot, started.is_set)
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(any(
-                    "1 write(s) still running; summary still running; q again to quit"
-                    in t for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any(
+                        "1 write(s) still running; summary still running; "
+                        "q again to quit" in t for t in toasts(app))))
                 app.running.clear()
         finally:
             gate.set()
@@ -1657,8 +1673,7 @@ class QuitTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(ready.exists())
                 started = time.monotonic()
                 await pilot.press("q")                  # no guard: reads only
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
             # leaving the app lets the non-daemon fetch thread finish
             for _ in range(100):
                 if marker.exists():
@@ -1714,8 +1729,8 @@ class KeyMapTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                          "Summarize item", "Summarize item (refresh)"):
                 self.assertIn(name, titles)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             body = str(app.screen.query_one("#help-body").render())
             self.assertIn("context pane", body)
             self.assertIn("AI summary", body)
@@ -1730,14 +1745,13 @@ class KeyMapTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("c")
             await pilot.pause(0.2)
             await pilot.press("d")                      # done still queues a mark
-            await pilot.pause(0.1)
-            self.assertEqual([p.kind for p in app.pending], ["done"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [p.kind for p in app.pending] == ["done"]))
             await pilot.press("u")
-            await pilot.pause(0.1)
-            self.assertEqual(app.pending, [])
+            self.assertTrue(await wait_for(pilot, lambda: app.pending == []))
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")

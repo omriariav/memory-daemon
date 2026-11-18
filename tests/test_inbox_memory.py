@@ -14,6 +14,11 @@ from workspace_daemon.inbox import items as itm, settings, sources, writes
 from workspace_daemon.inbox.actions import FakeActions, LocalActions
 from workspace_daemon.inbox.store import InboxStore
 
+try:    # run by discovery (tests/ on sys.path) or by dotted module name
+    from test_inbox_draft import wait_for
+except ImportError:
+    from tests.test_inbox_draft import wait_for
+
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 if HAVE_TEXTUAL:
     from textual import events
@@ -344,17 +349,17 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             body = lambda: str(app.query_one("#thread-body").render())
             app.current_key = "t:1"
             app.redraw()
-            await pilot.pause(0.2)
-            self.assertIn("In memory: mem-one", body())
+            self.assertTrue(await wait_for(
+                pilot, lambda: "In memory: mem-one" in body()))
             app.current_key = "t:2"
             app.redraw()
-            await pilot.pause(0.2)
-            self.assertNotIn("In memory", body())
+            self.assertTrue(await wait_for(
+                pilot, lambda: "In memory" not in body()))
             self.assertNotIn("Thread in memory", body())
             app.current_key = "t:4"
             app.redraw()
-            await pilot.pause(0.2)
-            self.assertIn("Thread in memory: mem-root", body())
+            self.assertTrue(await wait_for(
+                pilot, lambda: "Thread in memory: mem-root" in body()))
             self.assertNotIn("\nIn memory", body())
 
     async def test_m_on_a_saved_item_toasts_and_runs_nothing(self):
@@ -368,9 +373,9 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = "t:1"
             await pilot.pause(0.1)
             await pilot.press("m")
-            await pilot.pause(0.2)
-            self.assertTrue(any("Already in memory (mem-one)" in t
-                                for t in toasts(app)), toasts(app))
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("Already in memory (mem-one)" in t
+                                   for t in toasts(app))), toasts(app))
             self.assertEqual(app.pending, [])
             self.assertNotEqual(type(app.screen).__name__, "ConfirmWrite")
 
@@ -382,15 +387,15 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = "t:4"
             await pilot.pause(0.1)
             await pilot.press("m")
-            await pilot.pause(0.2)
-            self.assertEqual(type(app.screen).__name__, "ConfirmWrite")
+            self.assertTrue(await wait_for(
+                pilot, lambda: type(app.screen).__name__ == "ConfirmWrite"))
             text = " ".join(str(w.render()) for w in app.screen.query("Static"))
             self.assertIn("Thread already in memory", text)
             self.assertIn("mem-root", text)
             await pilot.press("escape")
-            await pilot.pause(0.2)
-            self.assertTrue(any("thread is already in memory" in t
-                                for t in toasts(app)), toasts(app))
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("thread is already in memory" in t
+                                   for t in toasts(app))), toasts(app))
             self.assertEqual(app.pending, [])
 
     async def test_the_label_says_by_hand_when_save_is_configured(self):
@@ -406,13 +411,14 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             for key in ("t:1", "t:2"):
                 app.current_key = key
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertNotIn("m", [k for k, _ in app.hints()])
             titles = [c.title for c in app.get_system_commands(app.screen)]
             self.assertNotIn("Save item to memory", titles)
             await pilot.press("question_mark")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             self.assertFalse(app.screen.save_on)
             text = " ".join(str(w.render())
                             for w in app.screen.query("Static"))
@@ -427,7 +433,8 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("question_mark")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             text = " ".join(str(w.render())
                             for w in app.screen.query("Static"))
             self.assertIn("save to memory by hand", text)
@@ -462,8 +469,8 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(first)
             self.assertTrue(q.get_option_at_index(first).id.startswith("i:"))
             await pilot.press("down")
-            await pilot.pause(0.1)
-            self.assertIsNot(q.highlighted, None)
+            self.assertTrue(await wait_for(
+                pilot, lambda: q.highlighted is not None))
             self.assertNotEqual(q.highlighted, first)
             self.assertEqual(app.current_key,
                              q.get_option_at_index(q.highlighted).id[2:])
@@ -485,6 +492,7 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
             app.query_one("#thread").focus()
             await pilot.pause(0.1)
             app.redraw()
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertIs(app.focused, app.query_one("#thread"))
 
@@ -509,11 +517,12 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
                 app.post_message(events.AppBlur())
                 await pilot.pause(0.1)
                 app.redraw()   # a poll landing in the background
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertIsNot(app.focused, app.query_one("#queue"))
                 app.post_message(events.AppFocus())
-                await pilot.pause(0.2)
-                self.assertIs(app.focused, want, target)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: app.focused is want), target)
 
     async def test_items_arriving_while_blurred_focus_the_queue_on_regain(self):
         app = self.make(Slow([item(1), item(2), item(3)], 0.5))
@@ -522,12 +531,11 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             q = app.query_one("#queue", Queue)
             app.post_message(events.AppFocus())
-            await pilot.pause(0.3)
-            self.assertIs(app.focused, q)
+            self.assertTrue(await wait_for(pilot, lambda: app.focused is q))
             first = q.highlighted
             await pilot.press("down")
-            await pilot.pause(0.1)
-            self.assertNotEqual(q.highlighted, first)
+            self.assertTrue(await wait_for(
+                pilot, lambda: q.highlighted != first))
 
     async def test_hidden_then_shown_keeps_another_panes_focus(self):
         app = self.make(Fixed([item(1), item(2)]))
@@ -537,13 +545,13 @@ class StartupFocusTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             f = app.query_one("#filter")
             f.value = "zzz-no-match"      # zero items: the queue is hidden
-            await pilot.pause(0.2)
-            self.assertFalse(app.query_one("#queue").display)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not app.query_one("#queue").display))
             f.focus()
             await pilot.pause(0.1)
             f.value = ""                  # items are back: the queue shows
-            await pilot.pause(0.2)
-            self.assertTrue(app.query_one("#queue").display)
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.query_one("#queue").display))
             self.assertIs(app.focused, f)
 
 

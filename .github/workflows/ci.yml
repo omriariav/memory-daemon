@@ -74,11 +74,58 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python tools/check_inbox_version.py "$BASE_SHA"
 
-  inbox-ui:
+  changes:
+    # Decides whether the inbox UI tests must run, and checks that every inbox
+    # test module is in a CI job. Always runs: it is cheap.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      inbox: ${{ steps.filter.outputs.inbox }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the PR range needs history
+
+      - name: Every inbox test module is in a CI job
+        run: python3 tools/inbox_ui_shards.py --check
+
+      - name: Did the inbox, or anything it imports, change
+        id: filter
+        # A job-level `if` on this output, not a workflow-level `paths:`: a
+        # skipped job still reports, so the `inbox-ui` gate below always
+        # reports and could be a required check. The inbox tests import
+        # daemon.py and most of workspace_daemon/ (state, config, events,
+        # claude_bridge, ...), so that whole tree counts, not only inbox/.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "inbox=true" >> "$GITHUB_OUTPUT"   # pushes to main: always
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA...$HEAD_SHA" | grep -Eq \
+            '^(workspace_daemon/|daemon\.py$|tests/test_inbox_|tests/inbox_|tools/inbox_ui_shards\.py$|\.github/workflows/)'; then
+            echo "inbox=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "inbox=false" >> "$GITHUB_OUTPUT"
+            echo "No inbox-related change: the inbox UI tests are skipped."
+          fi
+
+  inbox-ui-shard:
     # The inbox UI is an optional extra: the job above runs without Textual
-    # (UI tests skip). This one installs it and runs the UI tests for real.
+    # (UI tests skip). This one installs it and runs the UI tests for real,
+    # split in 4 shards (module list and balance: tools/inbox_ui_shards.py).
+    needs: changes
+    if: needs.changes.outputs.inbox == 'true'
+    name: inbox-ui shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -90,4 +137,22 @@ jobs:
         run: pip install pyyaml 'textual>=8.2,<9' python-bidi
 
       - name: Inbox tests with Textual
-        run: python -m unittest tests.test_inbox_ui tests.test_inbox_items tests.test_inbox_sources tests.test_inbox_store tests.test_inbox_cli tests.test_inbox_writes tests.test_inbox_context tests.test_inbox_actions tests.test_inbox_thread_order tests.test_inbox_send tests.test_inbox_react tests.test_inbox_polish tests.test_inbox_draft tests.test_inbox_memory tests.test_inbox_views tests.test_inbox_views_ui tests.test_inbox_health tests.test_inbox_acts tests.test_inbox_acts_ui tests.test_inbox_open_with tests.test_inbox_tasks tests.test_inbox_tasks_ui -v
+        run: python -m unittest $(python tools/inbox_ui_shards.py --shard ${{ matrix.shard }} --of 4) -v
+
+  inbox-ui:
+    # The gate: one stable check name that always reports. Skipped shards
+    # (nothing inbox-related changed) count as success; a failed or cancelled
+    # shard, or a failed `changes` job, fails it.
+    needs: [changes, inbox-ui-shard]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Gate
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SHARDS: ${{ needs.inbox-ui-shard.result }}
+        run: |
+          echo "changes=$CHANGES shards=$SHARDS"
+          [ "$CHANGES" = "success" ] || exit 1
+          [ "$SHARDS" = "success" ] || [ "$SHARDS" = "skipped" ] || exit 1

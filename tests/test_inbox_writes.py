@@ -20,6 +20,11 @@ from workspace_daemon.inbox import (invites, items as itm, models, settings,
 from workspace_daemon.inbox.actions import FakeActions, LocalActions
 from workspace_daemon.inbox.store import InboxStore
 
+try:    # run by discovery (tests/ on sys.path) or by dotted module name
+    from test_inbox_draft import wait_for
+except ImportError:
+    from tests.test_inbox_draft import wait_for
+
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 if HAVE_TEXTUAL:
     from workspace_daemon.inbox.app import InboxApp
@@ -870,6 +875,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("X")
             await pilot.pause(0.1)
             await pilot.press("T")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmWrite)
             self.assertTrue(any("RSVP not configured" in t for t in toasts(app)))
@@ -877,8 +883,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             hints = " ".join(label for _k, label in app.hints())
             self.assertNotIn("decline", hints)
             await pilot.press("a")        # unchanged: still acknowledges an invite
-            await pilot.pause(0.1)
-            self.assertEqual([p.kind for p in app.pending], ["ack"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [p.kind for p in app.pending] == ["ack"]))
 
     async def test_confirm_modal_then_cancel_sends_nothing(self):
         store, calls = InboxStore(None), []
@@ -896,6 +902,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows["Answer"], "decline (declined)")
             self.assertEqual(modal.note, "")
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(app.pending, [])
             self.assertIn("invites:ev123abc", [i.key for i in app.items])
@@ -911,6 +918,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("T")
             await pilot.pause(0.1)
             await pilot.press("enter")     # Cancel is the focused button
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual(app.pending, [])
         self.assertEqual(calls, [])
@@ -924,11 +932,11 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("X")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(0.1)
-            self.assertNotIn("invites:ev123abc", [i.key for i in app.items])
+            self.assertTrue(await wait_for(
+                pilot, lambda: "invites:ev123abc" not in [i.key for i in app.items]))
             await pilot.press("u")
-            await pilot.pause(0.1)
-            self.assertIn("invites:ev123abc", [i.key for i in app.items])
+            self.assertTrue(await wait_for(
+                pilot, lambda: "invites:ev123abc" in [i.key for i in app.items]))
         self.assertEqual(calls, [])
         self.assertFalse(store.is_hidden("invites:ev123abc"))
         self.assertIn("undone", [r["status"] for r in app.audit])
@@ -944,6 +952,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause(0.1)
             await pilot.press("q")
+            # negative check: a refused answer sends nothing
             await pilot.pause(0.3)
         self.assertEqual(calls, [])
         self.assertFalse(store.is_hidden("invites:ev123abc"))
@@ -958,9 +967,9 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("X")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(1.0)
+            self.assertTrue(await wait_for(
+                pilot, lambda: any("Declined" in t for t in toasts(app))))
             self.assertNotIn("invites:ev123abc", [i.key for i in app.items])
-            self.assertTrue(any("Declined" in t for t in toasts(app)))
         (tools, kw), = calls
         self.assertEqual(tools, {TOOL: {"eid": EVENT, "cid": CAL, "resp": "declined"}})
         self.assertNotIn(HOSTILE, prompts[0])
@@ -976,8 +985,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=SIZE) as pilot:
                 await settle(pilot, app)
                 await pilot.press(key)
-                await pilot.pause(0.1)
-                self.assertIsInstance(app.screen, ConfirmWrite, key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmWrite)), key)
                 await pilot.press("y")
                 await pilot.pause(1.0)
             with self.subTest(key=key):
@@ -994,8 +1003,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("T")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(1.0)
-            self.assertIn("invites:ev123abc", [i.key for i in app.items])
+            self.assertTrue(await wait_for(
+                pilot, lambda: "invites:ev123abc" in [i.key for i in app.items]))
             self.assertTrue(any("rsvp failed" in t and "auth failed" in t
                                 for t in toasts(app)))
         self.assertFalse(store.is_hidden("invites:ev123abc"))
@@ -1024,9 +1033,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
             app.refilter()                    # a timer or poll while it runs
             self.assertNotIn("invites:ev123abc", [i.key for i in app.items])
             release.set()
-            await pilot.pause(1.0)
+            self.assertTrue(await wait_for(pilot, lambda: app.running == []))
             self.assertNotIn("invites:ev123abc", [i.key for i in app.items])
-            self.assertEqual(app.running, [])
 
     async def test_a_recurring_invite_says_it_answers_one_instance(self):
         store = InboxStore(None)
@@ -1035,8 +1043,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.1)
-            self.assertIn("next instance only", app.screen.note)
+            self.assertTrue(await wait_for(
+                pilot, lambda: "next instance only" in app.screen.note))
 
     async def test_x_and_t_on_other_items_do_nothing(self):
         store, calls = InboxStore(None), []
@@ -1044,6 +1052,7 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("X", "T")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmWrite)
             self.assertEqual(app.pending, [])
@@ -1057,11 +1066,12 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("X")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmWrite)
             await pilot.press("a")            # plain ack, as before
-            await pilot.pause(0.1)
-            self.assertEqual([p.kind for p in app.pending], ["ack"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [p.kind for p in app.pending] == ["ack"]))
         self.assertEqual(calls, [])
 
     async def test_footer_help_and_palette_list_the_keys(self):
@@ -1078,8 +1088,8 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
                          "Save item to memory"):
                 self.assertIn(name, titles)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             text = " ".join(str(w.render()) for w in app.screen.query("Static"))
             self.assertIn("accept / decline / tentative", text)
             self.assertIn("save to memory by hand", text)
@@ -1098,15 +1108,16 @@ class RsvpLifecycleTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("a")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(1.0)
+            self.assertTrue(await wait_for(
+                pilot, lambda: "invites:weekly" in store.marks))
             self.assertEqual(app.items, [])
             self.assertEqual(store.marks["invites:weekly"]["rsvp_event"],
                              "weekly_20301105T100000Z")
             fixed.results = [sources.SourceResult(
                 "t", [invite_item("weekly_20301112T100000Z")], False, None, None)]
             await pilot.press("r")
-            await pilot.pause(0.6)
-            self.assertEqual([i.key for i in app.items], ["invites:weekly"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [i.key for i in app.items] == ["invites:weekly"]))
             self.assertEqual(app.items[0].meta["event_id"], "weekly_20301112T100000Z")
 
     async def test_an_answer_the_calendar_never_confirmed_unhides_with_a_hint(self):
@@ -1149,13 +1160,13 @@ class QuitWhileWritingTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.05)
                 self.assertEqual(len(app.running), 1)
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._exit)                   # still running
                 self.assertTrue(any("1 write(s) still running; q again to quit"
                                     in t for t in toasts(app)))
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
                 self.assertTrue(any("1 write(s) still finishing" in str(m)
                                     for m in app._exit_renderables))
         finally:
@@ -1182,8 +1193,7 @@ class QuitWhileWritingTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.05)
                 app.call_from_thread = callbacks
                 await pilot.press("q", "q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._quitting)
+                self.assertTrue(await wait_for(pilot, lambda: app._quitting))
                 release.set()               # the write ends after the quit
                 await pilot.pause(0.6)
             callbacks.assert_not_called()
@@ -1211,8 +1221,7 @@ class QuitWhileWritingTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("q")
-            await pilot.pause(0.2)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -1226,6 +1235,7 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("m")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmWrite)
             self.assertTrue(any("Save not configured" in t for t in toasts(app)))
@@ -1244,6 +1254,7 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rows["Link"], "https://example.com/1")
                 self.assertIn("Slack", rows["Source"])
                 await pilot.press("escape")
+                # negative check: it must not happen
                 await pilot.pause(0.5)
                 self.assertEqual(app.pending, [])
         run.assert_not_called()
@@ -1258,6 +1269,7 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("m")
                     await pilot.pause(0.1)
                     await pilot.press("y")
+                    # negative check: it must not happen
                     await pilot.pause(0.1)
                     self.assertIn("t:1", [i.key for i in app.items])  # never hidden
                     await pilot.press(closer)
@@ -1278,7 +1290,7 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("m")
                 await pilot.pause(0.1)
                 await pilot.press("y")
-                await pilot.pause(1.0)
+                self.assertTrue(await wait_for(pilot, lambda: store.is_saved("t:1")))
                 self.assertIn("t:1", [i.key for i in app.items])
                 self.assertTrue(next(i for i in app.items if i.key == "t:1").saved)
                 self.assertTrue(any("Saved to memory" in t for t in toasts(app)))
@@ -1306,7 +1318,8 @@ class SaveFlowTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("m")
                     await pilot.pause(0.1)
                     await pilot.press("y")
-                    await pilot.pause(1.0)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: any(text in t for t in toasts(app))))
                     with self.subTest(text=text):
                         self.assertTrue(any(text in t for t in toasts(app)))
                         self.assertEqual(store.is_saved("t:1"), mark)
@@ -1367,6 +1380,7 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rows["Match id"], "m1")
                 self.assertFalse(any("Saved to memory" in t for t in toasts(app)))
                 await pilot.press("enter")        # the focused button: Cancel
+                # negative check: it must not happen
                 await pilot.pause(0.6)
                 self.assertEqual(len(self.sent), 1)          # nothing resent
                 self.assertFalse(self.store.is_saved("t:1"))
@@ -1383,8 +1397,8 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
                 await self.review(pilot, app)
                 self.assertIsInstance(app.screen, ConfirmWrite)
                 await pilot.press("y")                       # confirm: save anyway
-                await pilot.pause(1.0)
-                self.assertEqual(len(self.sent), 2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: len(self.sent) == 2))
                 self.assertTrue(self.store.is_saved("t:1"))
                 self.assertTrue(any("Saved to memory" in t for t in toasts(app)))
                 self.assertIn("t:1", [i.key for i in app.items])
@@ -1399,10 +1413,10 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
                 await self.start_save(pilot, app)
                 await self.review(pilot, app)
                 await pilot.press("y")
-                await pilot.pause(1.0)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("save failed" in t for t in toasts(app))))
                 self.assertNotIsInstance(app.screen, ConfirmWrite)
                 self.assertEqual(len(self.sent), 2)
-                self.assertTrue(any("save failed" in t for t in toasts(app)))
                 self.assertFalse(self.store.is_saved("t:1"))
 
     async def test_any_other_ok_false_is_an_error_never_success(self):
@@ -1418,7 +1432,9 @@ class SaveDuplicateFlowTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("m")
                     await pilot.pause(0.1)
                     await pilot.press("y")
-                    await pilot.pause(1.0)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: any("save failed: memory is down" in t
+                                           for t in toasts(app))))
                     with self.subTest(body=body):
                         self.assertNotIsInstance(app.screen, ConfirmWrite)
                         self.assertTrue(any("save failed: memory is down" in t
@@ -1451,6 +1467,7 @@ class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("y")
                     await pilot.pause(0.05)
                     await pilot.press("m")             # inside the undo window
+                    # negative check: it must not happen
                     await pilot.pause(0.1)
                     self.assertNotIsInstance(app.screen, ConfirmWrite)
                     for _ in range(100):
@@ -1458,6 +1475,7 @@ class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
                             break
                         await pilot.pause(0.05)
                     await pilot.press("m")             # while the command runs
+                    # negative check: it must not happen
                     await pilot.pause(0.1)
                     self.assertNotIsInstance(app.screen, ConfirmWrite)
                     self.assertGreaterEqual(sum("save already in progress" in t
@@ -1491,27 +1509,30 @@ class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
                             break
                         await pilot.pause(0.05)
                     await pilot.press("question_mark")      # the user is in the help
-                    await pilot.pause(0.1)
-                    self.assertIsInstance(app.screen, HelpScreen)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: isinstance(app.screen, HelpScreen)))
                     release.set()
+                    # negative check: it must not happen
                     await pilot.pause(0.8)
                     self.assertIsInstance(app.screen, HelpScreen)   # nothing stacked
                     await pilot.press("y")                           # a stray key
+                    # negative check: it must not happen
                     await pilot.pause(0.3)
                     self.assertEqual(mocked.call_count, 1)           # nothing resent
                     self.assertTrue(any("press m to review" in t for t in toasts(app)))
                     await pilot.press("escape")
-                    await pilot.pause(0.2)
-                    self.assertNotIsInstance(app.screen, ConfirmWrite)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: not isinstance(app.screen, ConfirmWrite)))
                     await pilot.press("m")                           # review it now
-                    await pilot.pause(0.2)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: isinstance(app.screen, ConfirmWrite)))
                     modal = app.screen
                     self.assertIsInstance(modal, ConfirmWrite)
                     self.assertEqual(modal.verb, "Save anyway")
                     self.assertEqual(modal.focused.id, "cancel")
                     await pilot.press("y")                           # confirm
-                    await pilot.pause(1.0)
-                    self.assertEqual(mocked.call_count, 2)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: mocked.call_count == 2))
                     self.assertTrue(self.store.is_saved("t:1"))
             finally:
                 release.set()
@@ -1525,14 +1546,14 @@ class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("m")
                 await pilot.pause(0.1)
                 await pilot.press("y")
-                await pilot.pause(1.0)
-                self.assertIn("t:1", app.dups)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: "t:1" in app.dups))
                 await pilot.press("m")
-                await pilot.pause(0.2)
-                self.assertIsInstance(app.screen, ConfirmWrite)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmWrite)))
                 await pilot.press("escape")
-                await pilot.pause(0.3)
-                self.assertNotIn("t:1", app.dups)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: "t:1" not in app.dups))
                 self.assertEqual(mocked.call_count, 1)
                 self.assertFalse(self.store.is_saved("t:1"))
 
@@ -1566,8 +1587,8 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("d")                       # done on the invite
-            await pilot.pause(0.1)
-            self.assertEqual([p.kind for p in app.pending], ["done"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [p.kind for p in app.pending] == ["done"]))
             await pilot.press("u")
             await pilot.pause(0.1)
             await pilot.press("4")                       # the Feed holds FYI rows
@@ -1576,8 +1597,8 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
             app.redraw(keep="t:2")
             await pilot.pause(0.1)
             await pilot.press("a")                       # still a plain ack
-            await pilot.pause(0.1)
-            self.assertEqual([p.kind for p in app.pending], ["ack"])
+            self.assertTrue(await wait_for(
+                pilot, lambda: [p.kind for p in app.pending] == ["ack"]))
             await pilot.press("u")
             await pilot.pause(0.1)
             await pilot.press("1")
@@ -1586,8 +1607,8 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
             app.redraw(keep="t:3")
             await pilot.pause(0.1)
             await pilot.press("a")                       # a reply still asks to confirm a send
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
 
     async def test_demo_invite_rsvp_hides_it_with_fake_actions(self):
         store = InboxStore(None)
@@ -1603,7 +1624,9 @@ class KeyMapTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("T")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(0.8)
+            self.assertTrue(await wait_for(
+                pilot, lambda: ("rsvp", "invites:demo-sync", "tentative")
+                in actions.calls))
             self.assertNotIn("invites:demo-sync", [i.key for i in app.items])
         self.assertIn(("rsvp", "invites:demo-sync", "tentative"), actions.calls)
 

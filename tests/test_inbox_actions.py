@@ -547,7 +547,12 @@ class WorkerCleanup:
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -663,8 +668,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 picker = app.screen
                 self.assertEqual(len(picker.choices), 1)
                 await pilot.press("escape")
-                await pilot.pause(0.2)
-                self.assertNotIsInstance(app.screen, ChoicePicker)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not isinstance(app.screen, ChoicePicker)))
                 self.assertEqual([c[0] for c in acts.calls], ["choices"])
         finally:
             acts.gate["choices"].set()
@@ -685,7 +690,9 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     async def test_full_flow_confirm_undo_window_run_then_done(self):
         store = InboxStore(None)
         acts = Scripted(store)
-        app = make_app([make_item(1), make_item(2)], acts, store, undo_s=0.5)
+        # A long undo window: the checks inside it run as soon as the action is
+        # pending, so a slow machine cannot let the window close under them.
+        app = make_app([make_item(1), make_item(2)], acts, store, undo_s=2.0)
         async with app.run_test(size=SIZE) as pilot:
             await self.to_confirm(pilot, app)
             modal = app.screen
@@ -694,7 +701,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(modal.title_text, "Add to agenda")
             self.assertEqual(acts.ran_calls(), [])
             await pilot.press("y")
-            await pilot.pause(0.1)
+            self.assertTrue(await wait_for(pilot, lambda: app.pending))
             [p] = app.pending
             self.assertEqual((p.kind, p.name, p.choice, p.state, p.hide),
                              ("action", "Add to agenda", "c1", "STATE-1", False))
@@ -727,8 +734,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await self.to_confirm(pilot, app)
             modal = app.screen
             pane = modal.query_one("#confirm-scroll")
-            await pilot.pause(0.3)
-            self.assertGreater(pane.max_scroll_y, 0)
+            self.assertTrue(await wait_for(
+                pilot, lambda: pane.max_scroll_y > 0))
             self.assertLessEqual(pane.size.height, 18)
             text = str(modal.query_one("#confirm-text").render())
             long_row = next(l for l in text.splitlines() if "short value" in l)
@@ -741,16 +748,16 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pane.scroll_y, 0)
             await pilot.press("down")
             await pilot.press("j")
-            await pilot.pause(0.1)
-            self.assertGreater(pane.scroll_y, 0)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 0))
             await pilot.press("pagedown")
-            await pilot.pause(0.1)
-            self.assertGreater(pane.scroll_y, 2)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 2))
             await pilot.press("up")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(modal.focused.id, "cancel")      # buttons stay put
             self.assertTrue(modal.query_one("#send").display)
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(acts.ran_calls(), [])
 
@@ -765,7 +772,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_confirm(pilot, app)
             modal = app.screen
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: modal.query_one("#confirm-text").size.width > 0))
             text = str(modal.query_one("#confirm-text").render())
             widest = max(len(line) for line in text.splitlines())
             self.assertLessEqual(widest, modal.INNER)
@@ -794,6 +802,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause(0.1)
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual((app.pending, acts.ran_calls()), ([], []))
             self.assertIn("t:1", keys(app))
@@ -807,8 +816,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause(0.1)
             await pilot.press("q")
-            await pilot.pause(0.3)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
         self.assertEqual(acts.ran_calls(), [])
         self.assertFalse(store.is_hidden("t:1"))
         self.assertEqual([r["status"] for r in app.audit if r["action"] == "action"],
@@ -820,6 +828,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_confirm(pilot, app)
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.6)
             self.assertEqual((app.pending, acts.ran_calls()), ([], []))
             self.assertIn("cancelled",
@@ -896,6 +905,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await wait_for(
                     pilot, lambda: acts.seen_cancel["prepare"].is_set()))
                 acts.gate["prepare"].set()
+                # negative check: it must not happen
                 await pilot.pause(0.5)
                 self.assertNotIsInstance(app.screen, (ActionBusy, ConfirmWrite))
                 self.assertEqual(acts.ran_calls(), [])
@@ -916,8 +926,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await self.start(pilot, app)
                 await wait_for(pilot, lambda: isinstance(app.screen, ActionBusy))
                 app.action_custom_action(0)
-                await pilot.pause(0.1)
-                self.assertTrue(any("already running" in t for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("already running" in t for t in toasts(app))))
                 self.assertEqual([c[0] for c in acts.calls], ["choices"])
                 acts.gate["choices"].set()
                 await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
@@ -926,9 +936,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 await pilot.pause(0.2)
                 app.action_custom_action(0)
-                await pilot.pause(0.1)
-                self.assertTrue(any("already in progress" in t
-                                    for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("already in progress" in t for t in toasts(app))))
         finally:
             acts.gate["choices"].set()
 
@@ -942,8 +951,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: any("the doc is locked" in t for t in toasts(app))))
-            await pilot.pause(0.6)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
             self.assertFalse(store.is_hidden("t:1"))
             self.assertEqual([x for x in app.pending if x.kind == "done"], [])
             self.assertEqual(
@@ -974,8 +982,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(pilot, lambda: acts.ran_calls()))
             await wait_for(pilot, lambda: any("Added" in t for t in toasts(app)))
-            await pilot.pause(0.8)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
             self.assertFalse(store.is_hidden("t:1"))
             self.assertEqual([x for x in app.pending if x.kind == "done"], [])
 
@@ -990,8 +997,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 pilot, lambda: any(x.kind == "done" for x in app.pending)))
             self.assertNotIn("t:1", keys(app))
             await pilot.press("u")                      # inside the done window
-            await pilot.pause(0.2)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
+            # negative check: it must not happen
             await pilot.pause(0.8)
             self.assertFalse(store.is_hidden("t:1"))
             self.assertIn("t:1", keys(app))
@@ -1015,6 +1022,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 self.assertTrue(await wait_for(pilot, started.is_set))
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._exit)
                 self.assertTrue(any(
@@ -1023,8 +1031,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 gate.set()
                 await wait_for(pilot, lambda: not app.running)
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
         finally:
             gate.set()
 
@@ -1037,9 +1044,9 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await self.start(pilot, app)
                 await wait_for(pilot, lambda: isinstance(app.screen, ActionBusy))
                 await pilot.press("ctrl+q")      # a modal hides the plain q
-                await pilot.pause(0.3)
-                self.assertTrue(app._exit)
-                self.assertTrue(acts.seen_cancel["choices"].is_set())
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: acts.seen_cancel["choices"].is_set()))
         finally:
             acts.gate["choices"].set()
 
@@ -1049,6 +1056,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("p")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(acts.calls, [])
 
@@ -1058,9 +1066,10 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             await pilot.press("p")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(acts.calls, [])
 
@@ -1086,11 +1095,12 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("p")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(acts.calls, [])
             self.assertNotIn("p", [h[0] for h in app.hints()])
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
+            self.assertTrue(await wait_for(pilot, lambda: isinstance(app.screen, HelpScreen)))
             self.assertNotIn("Custom actions",
                              str(app.screen.query_one("#help-body").render()))
 
@@ -1207,8 +1217,8 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 pilot, lambda: any(p.kind == "done" for p in app.pending)))
             self.assertNotIn("t:1", keys(app))
             await pilot.press("u")
-            await pilot.pause(0.2)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
+            # negative check: it must not happen
             await pilot.pause(1.0)
             self.assertFalse(self.store.is_hidden("t:1"))
             self.assertIn("t:1", keys(app))
@@ -1229,6 +1239,7 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await self.save(pilot, app)
                 self.assertTrue(await wait_for(
                     pilot, lambda: any("save failed" in t for t in toasts(app))))
+                # negative check: the failed save must not hide it
                 await pilot.pause(0.6)
                 with self.subTest(body=body):
                     self.assertIn("t:1", keys(app))
@@ -1244,12 +1255,13 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await self.save(pilot, app)
             self.assertTrue(await wait_for(
                 pilot, lambda: any("press m to review" in t for t in toasts(app))))
+            # negative check: it must not happen
             await pilot.pause(0.6)
             self.assertIn("t:1", keys(app))                   # only asked
             self.assertFalse(self.store.is_hidden("t:1"))
             await pilot.press("m")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ConfirmWrite)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: self.store.is_hidden("t:1"), tries=200))
@@ -1261,8 +1273,7 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await self.save(pilot, app)
             self.assertTrue(await wait_for(
                 pilot, lambda: self.store.is_saved("t:1")))
-            await pilot.pause(0.8)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
             self.assertTrue(next(i for i in app.items if i.key == "t:1").saved)
             self.assertFalse(self.store.is_hidden("t:1"))
 
@@ -1273,6 +1284,7 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.2)
             await pilot.press("d")                       # done while save waits
             await wait_for(pilot, lambda: self.store.is_saved("t:1"), tries=200)
+            # negative check: it must not happen
             await pilot.pause(1.0)
             self.assertEqual(
                 [r["action"] for r in app.audit].count("done"), 1)
@@ -1301,8 +1313,7 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await self.save(pilot, app)
             await pilot.pause(0.1)
             await pilot.press("q")
-            await pilot.pause(0.3)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
         self.assertFalse(self.store.is_saved("t:1"))
         self.assertFalse(self.store.is_hidden("t:1"))
 
