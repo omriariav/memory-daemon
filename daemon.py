@@ -387,6 +387,47 @@ def _retry_unconfirmed(args, routines):
         f"for retry: {', '.join(cleared) or 'none'}")
 
 
+def _fibery_block_fixes(args, routines):
+    """One-shot: settle a held Fibery task import, then run on.
+
+    `--resolve SHOWN=KEY` pins a shown block id to its checkpoint row;
+    `--mark-gone KEY` retires the row of a task deleted from Fibery. Both
+    write only the routine's checkpoint.
+    """
+    if not args.routine or args.dry_run:
+        raise config.RoutineError(
+            "--resolve/--mark-gone need --routine and cannot be a dry run"
+        )
+    routine = next((r for r in routines if r["id"] == args.routine), None)
+    if routine is None:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
+    maintenance_cfg = routine.get("maintenance")
+    if not (isinstance(maintenance_cfg, dict)
+            and maintenance_cfg.get("kind") == "fibery_tasks_inbound"):
+        raise config.RoutineError(
+            "--resolve/--mark-gone only apply to a fibery_tasks_inbound routine"
+        )
+    from workspace_daemon import fibery_tasks_inbound as inbound
+    path = Path(maintenance_cfg.get(
+        "checkpoint", inbound.DEFAULT_CHECKPOINT)).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    for pair in (args.resolve or "").split(","):
+        if pair.strip():
+            shown, sep, key = pair.strip().partition("=")
+            if not sep:
+                raise config.RoutineError(
+                    f"--resolve needs SHOWN=KEY pairs, got {pair.strip()!r}")
+            inbound.resolve_block(path, shown, key)
+            log(f"routine={args.routine} fibery_tasks_inbound: pinned "
+                f"{shown} to {key}")
+    for key in (args.mark_gone or "").split(","):
+        if key.strip():
+            inbound.mark_block_gone(path, key.strip())
+            log(f"routine={args.routine} fibery_tasks_inbound: marked "
+                f"{key.strip()} gone")
+
+
 def _has_pending_work(routines, active_ids):
     """Lock-free pre-check for trigger-driven runs (`run --if-pending`).
 
@@ -452,6 +493,8 @@ def cmd_run(args):
 
     if getattr(args, "retry_unconfirmed", None):
         _retry_unconfirmed(args, routines)
+    if getattr(args, "resolve", None) or getattr(args, "mark_gone", None):
+        _fibery_block_fixes(args, routines)
     mode = (
         " (dry-run — no LLM call, source mutation, or data/state write; "
         "operational log only)"
@@ -820,6 +863,16 @@ def main(argv=None):
                        help="one-shot, with --routine on a fibery_tasks_outbound "
                             "routine: forget those unconfirmed export attempts "
                             "(entry ids and/or the word heading) before the run")
+    p_run.add_argument("--resolve", metavar="SHOWN=KEY[,SHOWN=KEY...]",
+                       help="one-shot, with --routine on a fibery_tasks_inbound "
+                            "routine held on an ambiguous block id: pin the "
+                            "block id Fibery shows to its checkpoint row "
+                            "before the run (checkpoint only)")
+    p_run.add_argument("--mark-gone", metavar="KEY[,KEY...]",
+                       help="one-shot, with --routine on a fibery_tasks_inbound "
+                            "routine: retire the checkpoint row of a task "
+                            "deleted from Fibery before the run (no memory "
+                            "change)")
     p_run.add_argument("--ignore-pause", action="store_true",
                        help="run even though state/PAUSED exists (manual override)")
     p_run.add_argument("--wait-lock", type=float, default=0, metavar="SECONDS",

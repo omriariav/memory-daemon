@@ -131,11 +131,12 @@ class ShortAnchorTest(OutboundBase):
             {"success": True, "document": TREE_INBOX})
         write_entry(self.store, "a1")
 
-    def _inbound_checkpoint(self, *keys):
+    def _inbound_checkpoint(self, *keys, short="ab12", **extra):
         path = self.dir / "state" / "fibery-tasks.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = {k: {"hash": "h", "content": "c", "state": "TODO",
-                    "entry_id": None, "date": "2026-08-01", "transitions": 0}
+                    "entry_id": None, "date": "2026-08-01", "transitions": 0,
+                    "last_short": short, **extra}
                 for k in keys}
         path.write_text(json.dumps({"version": 1, "items": rows}))
 
@@ -152,16 +153,33 @@ class ShortAnchorTest(OutboundBase):
         self.assertEqual(self.writes(), [])
 
     def test_short_anchor_resolves_through_the_inbound_checkpoint(self):
-        self._inbound_checkpoint(FULL_ANCHOR, "ffff0000-0000-4000-8000-000000000002")
+        self._inbound_checkpoint(FULL_ANCHOR)
+        path = self.dir / "state" / "fibery-tasks.json"
+        data = json.loads(path.read_text())
+        data["items"]["ffff0000-0000-4000-8000-000000000002"] = dict(
+            data["items"][FULL_ANCHOR], last_short="ffff")
+        path.write_text(json.dumps(data))
         with self.assertRaises(RuntimeError):   # the fake doc never shows the marker
             self.run_once()
         pins = self.writes()[0][1][WTOOL]
         self.assertEqual(pins["inserts"][0]["after"], FULL_ANCHOR)
 
+    def test_gone_rows_and_rows_seen_under_another_id_never_resolve(self):
+        self._inbound_checkpoint(FULL_ANCHOR, gone=True)
+        self.assertTrue(self.run_once()["held_short_anchor"])
+        self._inbound_checkpoint(FULL_ANCHOR, short="ab12c")   # other display
+        self.assertTrue(self.run_once()["held_short_anchor"])
+        self._inbound_checkpoint(FULL_ANCHOR, short=None)       # never recorded
+        self.assertTrue(self.run_once()["held_short_anchor"])
+        self.assertEqual(self.writes(), [])
+
     def test_full_ids_pass_through_and_missing_heading_needs_no_anchor(self):
-        self.assertEqual(fto.full_anchor(FULL_ANCHOR, set()), FULL_ANCHOR)
-        self.assertIsNone(fto.full_anchor("ab12", set()))
-        self.assertIsNone(fto.full_anchor("", {FULL_ANCHOR}))
+        row = {"last_short": "ab12"}
+        self.assertEqual(fto.full_anchor(FULL_ANCHOR, {}), FULL_ANCHOR)
+        self.assertIsNone(fto.full_anchor("ab12", {}))
+        self.assertIsNone(fto.full_anchor("", {FULL_ANCHOR: row}))
+        self.assertEqual(fto.full_anchor("ab12", {FULL_ANCHOR: row}), FULL_ANCHOR)
+        self.assertIsNone(fto.full_anchor("ab12", {"ab12~2": row}))  # not a full id
         self.document = lambda: json.dumps(
             {"success": True, "document": "version: 1\n"
              "a1b2 paragraph parentId=null | nothing here"})

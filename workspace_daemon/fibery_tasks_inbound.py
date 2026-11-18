@@ -623,33 +623,121 @@ def _entry_task_keys(store):
     return keys
 
 
+def resolve_block(checkpoint_path, shown, key):
+    """One-shot operator action: the block shown as ``shown`` is row ``key``.
+
+    Pins the checkpoint row so a held run can go on. It writes only the
+    checkpoint (never memory, never Fibery); the pin ends by itself when the
+    block is shown under another id.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    items = checkpoint["items"]
+    if not ID_RE.fullmatch(shown or "") or key not in items:
+        raise RuntimeError(
+            f"cannot resolve {shown!r}={key!r}: no such checkpoint row")
+    if not _related(shown, key):
+        raise RuntimeError(
+            f"cannot resolve {shown!r}={key!r}: the id does not belong to "
+            "that row")
+    for row in items.values():
+        if row.get("pin") == shown:
+            del row["pin"]
+    items[key]["pin"] = shown
+    _save_checkpoint(checkpoint_path, checkpoint)
+
+
+def mark_block_gone(checkpoint_path, key):
+    """One-shot operator action: retire the row of a task deleted from Fibery.
+
+    Marks the row gone (no memory change, as for any block that leaves the
+    document). It matches again only if the same text returns.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    row = checkpoint["items"].get(key)
+    if row is None:
+        raise RuntimeError(f"cannot mark {key!r} gone: no such checkpoint row")
+    row["gone"] = True
+    row.pop("pin", None)
+    _save_checkpoint(checkpoint_path, checkpoint)
+
+
+def _hold_hint(shown, keys):
+    pick = " or ".join(f"--resolve {shown}={k}" for k in sorted(keys)[:3])
+    return (f"restore the old text of the task, or tell the importer which "
+            f"row it is: `daemon.py run --routine <this routine> {pick}` "
+            "(`--mark-gone <key>` retires the row of a task deleted from "
+            "Fibery)")
+
+
 def assign_keys(tasks, items, entry_keys=lambda: set()):
     """Set each task's ``block_id`` to its checkpoint key (in place).
 
-    A full id is its own key. A shortened id keeps matching the row it
-    stands for (``_fits``): an exact-base row wins, else the single related
-    row, else the one whose text matches. A task nothing matches is new and
-    gets a key no row or memory entry already relates to: its own short id,
-    or ``<short>~2``, ``~3``... when that would collide with a block that
-    left the document. When several tasks claim one row, the one whose text
-    matches keeps it and the others become new. Anything still undecidable
-    holds the run (FiberyHeld) before any write.
+    A full id is its own key. A shortened id stands for the one live row that
+    relates to it (``_fits``). When several live rows relate to one shown id,
+    rows another shown task accounts for are set aside; of the rest the one
+    whose text matches wins, and if the text does not decide the run is held
+    (FiberyHeld) before any write, naming the operator command that settles
+    it. A row pinned by ``--resolve`` is that shown id's row, full stop. A
+    row that left the document (gone) is only matched by unchanged text, and
+    only when no live row relates. A task nothing matches is new and gets a
+    key no row or memory entry already relates to: its own short id, or
+    ``<short>~2``, ``~3``... When several tasks claim one row, the one whose
+    text matches keeps it and the others become new.
     """
+    pins = {}
+    for key, row in items.items():
+        if row.get("pin"):
+            pins.setdefault(row["pin"], key)
     chosen = {}
+    live = {}
+    gone = {}
     for index, task in enumerate(tasks):
         short = task["block_id"]
         chash = _task_hashes(task)[1]
-        found = [k for k, row in items.items() if _fits(short, k, row, chash)]
-        tier = [k for k in found if _base(k) == short]
-        found = tier or found
-        if len(found) > 1:
-            found = [k for k in found if items[k].get("content") == chash] \
-                or found
+        if short in pins:
+            chosen[index] = pins[short]
+        elif UUID_RE.fullmatch(short) and short in items \
+                and _fits(short, short, items[short], chash):
+            chosen[index] = short       # a full id cannot collide
+        else:
+            related = [k for k, row in items.items()
+                       if _fits(short, k, row, chash)]
+            live[index] = [k for k in related if not items[k].get("gone")]
+            gone[index] = [k for k in related if items[k].get("gone")]
+    settled = set(chosen.values())
+    for index in live:
+        live[index] = [k for k in live[index] if k not in settled]
+        gone[index] = [k for k in gone[index] if k not in settled]
+    for index, found in live.items():
+        if len(found) == 1:
+            chosen[index] = found[0]
+            settled.add(found[0])
+    for index, found in live.items():
+        if index in chosen:
+            continue
+        task = tasks[index]
+        short = task["block_id"]
+        chash = _task_hashes(task)[1]
+        rest = [k for k in found if k not in settled]
+        if len(rest) > 1:
+            rest = [k for k in rest if items[k].get("content") == chash] \
+                or rest
+        if len(rest) > 1:
+            raise FiberyHeld(
+                f"Fibery import held: the shown block id {short} matches "
+                f"several checkpoint rows ({', '.join(sorted(rest))}) and "
+                f"the text does not tell which; {_hold_hint(short, rest)}")
+        if rest:
+            chosen[index] = rest[0]
+    for index, found in gone.items():
+        if index in chosen or live.get(index):
+            continue
         if len(found) > 1:
             raise FiberyHeld(
-                "Fibery import held: a block id matches several checkpoint "
-                f"rows ({', '.join(sorted(found))}); edit or restore one "
-                "of the tasks")
+                f"Fibery import held: the shown block id "
+                f"{tasks[index]['block_id']} matches several returned rows "
+                f"({', '.join(sorted(found))}); "
+                f"{_hold_hint(tasks[index]['block_id'], found)}")
         if found:
             chosen[index] = found[0]
     claims = {}
@@ -662,11 +750,12 @@ def assign_keys(tasks, items, entry_keys=lambda: set()):
         keep = [i for i in indexes
                 if _task_hashes(tasks[i])[1] == row.get("content")]
         if len(keep) != 1:
+            shown = ", ".join(tasks[i]["block_id"] for i in indexes)
             raise FiberyHeld(
-                f"Fibery import held: {len(indexes)} tasks share the "
-                f"block-id prefix of checkpoint row {key} and their text "
-                "does not tell which one it is; edit or restore one of "
-                "the tasks")
+                f"Fibery import held: {len(indexes)} tasks (shown as "
+                f"{shown}) share the block-id prefix of checkpoint row "
+                f"{key} and their text does not tell which one it is; "
+                f"{_hold_hint(tasks[indexes[0]]['block_id'], [key])}")
         for i in indexes:
             if i != keep[0]:
                 del chosen[i]
@@ -689,6 +778,7 @@ def assign_keys(tasks, items, entry_keys=lambda: set()):
         chosen[index] = key
         taken.add(key)
     for index, task in enumerate(tasks):
+        task["shown_id"] = task["block_id"]
         task["block_id"] = chosen[index]
     return tasks
 
@@ -1039,6 +1129,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
                "transitions": prior.get("transitions", 0)}
         if prior.get("linked"):
             row["linked"] = True
+        if prior.get("pin"):
+            row["pin"] = prior["pin"]
         row.update(extra)
         items[task["block_id"]] = row
         return row
@@ -1163,6 +1255,15 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         log(f"fibery_tasks_inbound: reopened block={task['block_id']}")
     for block_id in plan["gone"]:
         items[block_id]["gone"] = True
+    for task in tasks:
+        # How each live block is shown now: outbound resolves a short anchor
+        # only through a row last seen under exactly that id. A pin names
+        # the id as it was shown, so it ends when the display changes.
+        row = items.get(task["block_id"])
+        if row is not None and task.get("shown_id"):
+            row["last_short"] = task["shown_id"]
+            if row.get("pin") and row["pin"] != task["shown_id"]:
+                del row["pin"]
     report["gone"] = len(plan["gone"])
     if plan["gone"]:
         log(f"fibery_tasks_inbound: {len(plan['gone'])} item(s) gone from "

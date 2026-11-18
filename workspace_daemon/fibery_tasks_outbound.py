@@ -180,29 +180,33 @@ def inspect(text, heading):
     }
 
 
-def _inbound_ids(base_dir, cfg):
-    """Full block ids the inbound routine's checkpoint holds (best effort)."""
+def _inbound_rows(base_dir, cfg):
+    """The inbound routine's checkpoint rows by key (best effort)."""
     path = Path(cfg.get("inbound_checkpoint", INBOUND_CHECKPOINT)).expanduser()
     if not path.is_absolute():
         path = Path(base_dir) / path
     try:
         rows = json.loads(path.read_text())["items"]
-        return {k for k in rows if isinstance(k, str) and UUID_RE.fullmatch(k)}
-    except (OSError, ValueError, KeyError, TypeError):
-        return set()
+        return {k: r for k, r in rows.items() if isinstance(r, dict)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
 
 
-def full_anchor(anchor, known):
+def full_anchor(anchor, rows):
     """The full block id for an anchor as ``read_document`` shows it.
 
     ``read_document`` shortens ids to a prefix; ``insert_document_blocks``
-    types its anchors as full ids. A full id stays; a short one resolves
-    through the inbound checkpoint when exactly one full id starts with it;
-    otherwise None (the caller must not write).
+    types its anchors as full ids. A full id stays. A short one resolves
+    through the inbound checkpoint only to a live row (not ``gone``) with a
+    full id that the inbound routine last saw shown under exactly this short
+    id, and only when there is exactly one; otherwise None (the caller must
+    not write).
     """
     if UUID_RE.fullmatch(anchor or ""):
         return anchor
-    found = [k for k in known if k.startswith(anchor or "\0")]
+    found = [k for k, row in rows.items()
+             if anchor and UUID_RE.fullmatch(k) and not row.get("gone")
+             and row.get("last_short") == anchor]
     return found[0] if len(found) == 1 else None
 
 
@@ -435,7 +439,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
 
     if info["heading_id"] is not None:
         key = "anchor_id" if info["anchor_id"] else "heading_id"
-        resolved = full_anchor(info[key], _inbound_ids(base_dir, cfg))
+        resolved = full_anchor(info[key], _inbound_rows(base_dir, cfg))
         if resolved is None:
             # The write tool takes full ids; guessing one would be a blind
             # write into the document. Nothing is recorded or written.

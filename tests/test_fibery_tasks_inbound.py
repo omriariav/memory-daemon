@@ -1246,6 +1246,116 @@ class TreeFormatTest(RunBase):
         with self.assertRaises(fti.FiberyHeld):
             fti.assign_keys([self.task("ab12", "A")], items)
 
+    # -- a deleted twin must not hand its row to the survivor ----------------
+
+    def _twin_setup(self):
+        """T1 keyed ab12; T2 added (shown ab12c/ab12f) and keyed ab12f~2."""
+        t1 = "c3d4 bullet_list parentId=null"
+        first = TreeDoc([t1, "  ab12 list_item parentId=c3d4 state=TODO",
+                         "    0c0d paragraph parentId=ab12 | First task"]).text()
+        self.run_once(first)
+        both = TreeDoc([
+            t1,
+            "  ab12c list_item parentId=c3d4 state=TODO",
+            "    0c0d paragraph parentId=ab12c | First task",
+            "  ab12f list_item parentId=c3d4 state=TODO",
+            "    0c0e paragraph parentId=ab12f | Second task"]).text()
+        self.run_once(both)
+        self.assertEqual(set(self.items()), {"ab12", "ab12f~2"})
+        self.assertEqual(self.memory.count, 2)
+
+    def _survivor(self, state, text="Second task"):
+        return TreeDoc([
+            "c3d4 bullet_list parentId=null",
+            f"  ab12 list_item parentId=c3d4 state={state}",
+            f"    0c0e paragraph parentId=ab12 | {text}"]).text()
+
+    def test_deleted_twin_does_not_hand_over_its_row_todo(self):
+        self._twin_setup()
+        before = len(self.memory.calls)
+        report = self.run_once(self._survivor("TODO"))
+        self.assertEqual(len(self.memory.calls), before)   # no edit, no note
+        self.assertEqual((report["edited"], report["created"]), (0, 0))
+        self.assertTrue(self.items()["ab12"]["gone"])      # T1 is the gone one
+        self.assertNotIn("gone", self.items()["ab12f~2"])
+        self.assertEqual(self.items()["ab12f~2"]["last_short"], "ab12")
+
+    def test_deleted_twin_does_not_hand_over_its_row_done(self):
+        self._twin_setup()
+        before = len(self.memory.calls)
+        report = self.run_once(self._survivor("DONE"))
+        self.assertEqual(report["done"], 1)
+        notes = self.memory.calls[before:]
+        self.assertEqual(len(notes), 1)                    # one done note
+        self.assertEqual(notes[0][notes[0].index("--follows") + 1],
+                         self.items()["ab12f~2"]["entry_id"])
+        self.assertEqual(self.items()["ab12"]["state"], "TODO")
+        self.assertEqual(self.items()["ab12f~2"]["state"], "DONE")
+
+    def test_survivor_edited_in_the_same_window_holds_with_a_command(self):
+        self._twin_setup()
+        before = len(self.memory.calls)
+        with self.assertRaises(fti.FiberyHeld) as caught:
+            self.run_once(self._survivor("TODO", "Second task, reworded"))
+        message = str(caught.exception)
+        self.assertIn("--resolve ab12=ab12f~2", message)
+        self.assertIn("daemon.py run --routine", message)
+        self.assertIn("restore the old text", message)
+        self.assertEqual(len(self.memory.calls), before)   # nothing written
+
+    def test_resolve_pins_the_row_and_clears_the_hold(self):
+        self._twin_setup()
+        text = self._survivor("TODO", "Second task, reworded")
+        with self.assertRaises(fti.FiberyHeld):
+            self.run_once(text)
+        fti.resolve_block(self.checkpoint, "ab12", "ab12f~2")
+        report = self.run_once(text)
+        self.assertEqual(report["edited"], 1)
+        self.assertEqual(self.items()["ab12f~2"]["pin"], "ab12")
+        self.assertTrue(self.items()["ab12"]["gone"])
+        self.run_once(text)                                 # stays settled
+        # Shown under another id, the pin ends.
+        self.run_once(self._survivor("TODO", "Second task, reworded")
+                      .replace("ab12", "ab12f"))
+        self.assertNotIn("pin", self.items()["ab12f~2"])
+
+    def test_resolve_and_mark_gone_validate_and_write_only_the_checkpoint(self):
+        self._twin_setup()
+        calls = len(self.memory.calls)
+        for shown, key in (("ab12", "nope"), ("zzzz", "ab12f~2"),
+                           ("a b", "ab12")):
+            with self.subTest(shown=shown, key=key), self.assertRaises(RuntimeError):
+                fti.resolve_block(self.checkpoint, shown, key)
+        with self.assertRaises(RuntimeError):
+            fti.mark_block_gone(self.checkpoint, "nope")
+        fti.mark_block_gone(self.checkpoint, "ab12")
+        self.assertTrue(self.items()["ab12"]["gone"])
+        self.assertEqual(len(self.memory.calls), calls)
+        # With the twin retired, the survivor needs no pin even when reworded.
+        report = self.run_once(self._survivor("TODO", "Second task, reworded"))
+        self.assertEqual((report["edited"], report["created"]), (1, 0))
+
+    def test_live_row_wins_over_a_gone_row_with_identical_text(self):
+        old = "ab12cdef-0000-4000-8000-000000000001"
+        items = {old: self.row("Same", gone=True),
+                 "ab12~2": self.row("Same")}
+        tasks = [self.task("ab12", "Same")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], "ab12~2")
+
+    def test_rows_other_shown_tasks_account_for_are_set_aside(self):
+        items = {"ab12": self.row("Alpha"), "ab12f~2": self.row("Beta")}
+        tasks = [self.task("ab12c", "Alpha"), self.task("ab12f", "Beta 2")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual([t["block_id"] for t in tasks], ["ab12", "ab12f~2"])
+
+    def test_pin_beats_the_text_and_takes_the_row_from_other_tasks(self):
+        items = {"ab12": self.row("Alpha", pin="ab12c")}
+        tasks = [self.task("ab12c", "Beta"), self.task("ab12f", "Alpha")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], "ab12")
+        self.assertEqual(tasks[1]["block_id"], "ab12f~2")
+
     def test_run_keeps_existing_checkpoint_rows(self):
         """A checkpoint built from full ids still matches the short-id doc:
         nothing is created, closed or marked gone."""
@@ -1343,6 +1453,44 @@ class TreeFormatTest(RunBase):
         report = self.run_once(TreeDoc(TREE_LINES).text())
         self.assertEqual(report["created"], 1)
         self.assertIn("e5f6", self.items())
+
+
+class OperatorFixCliTest(RunBase):
+    """`run --routine X --resolve/--mark-gone` settle a held import."""
+
+    def _args(self, **over):
+        base = {"routine": "fib-in", "dry_run": False, "resolve": None,
+                "mark_gone": None}
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _routines(self, kind="fibery_tasks_inbound"):
+        return [{"id": "fib-in", "maintenance": {
+            "kind": kind, "checkpoint": str(self.checkpoint)}}]
+
+    def test_pairs_pin_rows_and_keys_retire_them(self):
+        import daemon
+        TreeFormatTest._twin_setup(self)
+        daemon._fibery_block_fixes(
+            self._args(resolve="ab12=ab12f~2", mark_gone="ab12"),
+            self._routines())
+        items = self.items()
+        self.assertEqual(items["ab12f~2"]["pin"], "ab12")
+        self.assertTrue(items["ab12"]["gone"])
+
+    def test_misuse_is_refused(self):
+        import daemon
+        from workspace_daemon import config as cfg_module
+        for args, routines in (
+            (self._args(routine=None, resolve="a=b"), self._routines()),
+            (self._args(dry_run=True, resolve="a=b"), self._routines()),
+            (self._args(routine="nope", resolve="a=b"), self._routines()),
+            (self._args(resolve="a=b"),
+             self._routines("fibery_tasks_outbound")),
+            (self._args(resolve="no-equals-sign"), self._routines()),
+        ):
+            with self.assertRaises(cfg_module.RoutineError):
+                daemon._fibery_block_fixes(args, routines)
 
 
 class FetchExactArgsTest(RunBase):
