@@ -108,18 +108,29 @@ class HelpScrollTest(unittest.IsolatedAsyncioTestCase):
                 body, 5, 5, 0, 0, 0, False, False, False))
             self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 0))
 
-    async def test_escape_and_question_mark_still_close(self):
+    async def test_the_last_lines_are_visible_after_end(self):
         app = make_app()
         async with app.run_test(size=SMALL) as pilot:
             await settle(pilot, app)
-            await open_help(pilot, app)
-            await pilot.press("escape")
+            pane = await open_help(pilot, app)
+            await pilot.press("end")
             self.assertTrue(await wait_for(
-                pilot, lambda: not isinstance(app.screen, HelpScreen)))
-            await open_help(pilot, app)
-            await pilot.press("question_mark")
+                pilot, lambda: pane.scroll_y == pane.max_scroll_y))
+            box = app.screen.query_one("#help")
+            # the pane (and so the last line of the reference) lies inside the
+            # box, not under its border or past the screen
             self.assertTrue(await wait_for(
-                pilot, lambda: not isinstance(app.screen, HelpScreen)))
+                pilot, lambda: box.content_region.contains_region(pane.region)))
+
+    async def test_escape_question_mark_and_q_close(self):
+        for key in ("escape", "question_mark", "q"):
+            app = make_app()
+            async with app.run_test(size=SMALL) as pilot:
+                await settle(pilot, app)
+                await open_help(pilot, app)
+                await pilot.press(key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not isinstance(app.screen, HelpScreen)), key)
 
     async def test_a_tall_screen_shows_it_all_without_scrolling(self):
         app = make_app()
@@ -128,8 +139,12 @@ class HelpScrollTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("question_mark")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, HelpScreen)))
+            body = app.screen.query_one("#help-body")
             pane = app.screen.query_one("#help-scroll")
-            await pilot.pause()
+            box = app.screen.query_one("#help")
+            self.assertTrue(await wait_for(pilot, lambda: body.size.height > 0))
+            self.assertTrue(await wait_for(
+                pilot, lambda: box.content_region.contains_region(pane.region)))
             self.assertEqual(pane.max_scroll_y, 0)
 
 

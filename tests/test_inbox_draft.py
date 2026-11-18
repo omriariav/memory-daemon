@@ -941,8 +941,9 @@ class ConfirmOptionsTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await settle(pilot, app)
                 modal = await open_confirm(pilot, app)
                 await pilot.press(dead)
-                self.assertTrue(await wait_for(
-                    pilot, lambda: app.screen is modal))
+                # negative check: the key leaves the modal as it is
+                await pilot.pause(0.3)
+                self.assertIs(app.screen, modal)
                 self.assertEqual((app.pending, calls), ([], []))
                 await pilot.press("escape")
                 await pilot.pause(0.2)
@@ -1297,8 +1298,9 @@ class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase
                         if modal.query("#confirm-warn") else "")
                 await pilot.press("y")                 # not offered
                 await pilot.press("d")                 # not offered
-                self.assertTrue(await wait_for(
-                    pilot, lambda: app.screen is modal))
+                # negative check: the keys leave the modal as it is
+                await pilot.pause(0.2)
+                self.assertIs(app.screen, modal)
                 await pilot.press("c")
                 self.assertTrue(await wait_for(
                     pilot, lambda: not isinstance(app.screen, ConfirmSend)))

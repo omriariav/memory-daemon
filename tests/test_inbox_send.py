@@ -1060,9 +1060,9 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("j")
             await pilot.press("pagedown")
             self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 2))
-            # buttons stay put
-            self.assertTrue(await wait_for(
-                pilot, lambda: modal.focused.id == "cancel"))
+            # negative check: buttons stay put
+            await pilot.pause(0.15)
+            self.assertEqual(modal.focused.id, "cancel")
             shown = str(modal.query_one("#confirm-text").render()).splitlines()
             self.assertEqual(shown, text.splitlines())          # all of it
             await pilot.press("escape")

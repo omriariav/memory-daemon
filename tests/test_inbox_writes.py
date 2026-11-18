@@ -1521,8 +1521,9 @@ class SaveInProgressTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(mocked.call_count, 1)           # nothing resent
                     self.assertTrue(any("press m to review" in t for t in toasts(app)))
                     await pilot.press("escape")
-                    self.assertTrue(await wait_for(
-                        pilot, lambda: not isinstance(app.screen, ConfirmWrite)))
+                    # negative check: closing the help stacks no confirm
+                    await pilot.pause(0.2)
+                    self.assertNotIsInstance(app.screen, ConfirmWrite)
                     await pilot.press("m")                           # review it now
                     self.assertTrue(await wait_for(
                         pilot, lambda: isinstance(app.screen, ConfirmWrite)))

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # by running each module alone on a laptop (2026-11-18); refresh them when a
 # module grows a lot. They only balance the shards.
 MODULES = {
-    "tests.test_inbox_help_scroll": 7.3,
+    "tests.test_inbox_help_scroll": 10.3,
     "tests.test_inbox_ui": 51.2,
     "tests.test_inbox_items": 0.1,
     "tests.test_inbox_sources": 7.6,
@@ -39,6 +39,7 @@ MODULES = {
     "tests.test_inbox_health": 0.1,
     "tests.test_inbox_acts": 4.7,
     "tests.test_inbox_acts_ui": 67.4,
+    "tests.test_inbox_invite_twins": 0.5,
     "tests.test_inbox_open_with": 0.8,
     "tests.test_inbox_tasks": 0.6,
     "tests.test_inbox_tasks_ui": 30.1,
@@ -48,7 +49,6 @@ MODULES = {
 PLAIN_ONLY = {
     "tests.test_inbox_alert_active",
     "tests.test_inbox_gaps",
-    "tests.test_inbox_invite_twins",
     "tests.test_inbox_readside",
     "tests.test_inbox_review",
     "tests.test_inbox_version",
@@ -62,6 +62,16 @@ def on_disk():
 
 def missing():
     return sorted(on_disk() - set(MODULES) - PLAIN_ONLY)
+
+
+def textual_in_plain():
+    """PLAIN_ONLY modules that skip without Textual (they reference
+    HAVE_TEXTUAL): the plain job would skip those tests, so they belong in
+    MODULES."""
+    return sorted(
+        m for m in PLAIN_ONLY
+        if "HAVE_TEXTUAL" in (ROOT / "tests" / (m.split(".")[1] + ".py"))
+        .read_text(encoding="utf-8"))
 
 
 def stale():
@@ -88,6 +98,7 @@ def main(argv=None):
     if args.check:
         bad = missing()
         gone = stale()
+        needs_textual = [m for m in textual_in_plain() if m not in gone]
         if bad:
             print("inbox_ui_shards: not run by any CI job (add to MODULES in "
                   "tools/inbox_ui_shards.py, or to PLAIN_ONLY if it needs no "
@@ -95,7 +106,11 @@ def main(argv=None):
         if gone:
             print("inbox_ui_shards: listed but missing on disk: "
                   + ", ".join(gone))
-        if bad or gone:
+        if needs_textual:
+            print("inbox_ui_shards: in PLAIN_ONLY but they use Textual (their "
+                  "UI tests would skip in the plain job); move to MODULES: "
+                  + ", ".join(needs_textual))
+        if bad or gone or needs_textual:
             return 1
         print(f"inbox_ui_shards: ok ({len(MODULES)} UI modules, "
               f"{len(PLAIN_ONLY)} plain-only)")

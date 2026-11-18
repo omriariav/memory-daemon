@@ -95,7 +95,8 @@ jobs:
         # skipped job still reports, so the `inbox-ui` gate below always
         # reports and could be a required check. The inbox tests import
         # daemon.py and most of workspace_daemon/ (state, config, events,
-        # claude_bridge, ...), so that whole tree counts, not only inbox/.
+        # claude_bridge, ...), so that whole tree counts, not only inbox/;
+        # two tests also read docs/inbox.md and inbox.example.yaml.
         env:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -105,8 +106,12 @@ jobs:
             echo "inbox=true" >> "$GITHUB_OUTPUT"   # pushes to main: always
             exit 0
           fi
-          if git diff --name-only "$BASE_SHA...$HEAD_SHA" | grep -Eq \
-            '^(workspace_daemon/|daemon\.py$|tests/test_inbox_|tests/inbox_|tools/inbox_ui_shards\.py$|\.github/workflows/)'; then
+          # Assigned on its own so a git error fails the step (bash -e); inside
+          # a pipe it would read as "no change" and silently skip the tests.
+          files=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          if grep -Eq \
+            '^(workspace_daemon/|daemon\.py$|tests/test_inbox_|tests/inbox_|tools/inbox_ui_shards\.py$|docs/inbox\.md$|inbox\.example\.yaml$|\.github/workflows/)' \
+            <<< "$files"; then
             echo "inbox=true" >> "$GITHUB_OUTPUT"
           else
             echo "inbox=false" >> "$GITHUB_OUTPUT"

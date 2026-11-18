@@ -618,8 +618,9 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(acts.polished, [("t:1", "hey can u send the report")])
             self.assertIn(("P", "polish"), app.hints())
             await pilot.press("escape")                   # cancel
-            self.assertTrue(await wait_for(
-                pilot, lambda: app.current.draft == "hey can u send the report"))
+            # negative check: cancelling leaves the draft as it was
+            await pilot.pause(0.2)
+            self.assertEqual(app.current.draft, "hey can u send the report")
             self.assertEqual(acts.sent(), [])
             self.assertIn("cancelled", [r["status"] for r in app.audit])
 

@@ -555,8 +555,9 @@ class DraftAndNudgeTest(Base):
             await pilot.press("n")
             await pilot.pause(0.3)
             await pilot.press("escape")
-            self.assertTrue(await until(
-                pilot, lambda: app.current.draft == ""))
+            # negative check: a cancelled nudge leaves no draft
+            await pilot.pause(0.2)
+            self.assertEqual(app.current.draft, "")
             await pilot.press("D")
             self.assertTrue(await until(pilot, lambda: app.current.draft))
             self.assertEqual(app.current.draft, "A real draft")
@@ -853,8 +854,9 @@ class ReviewFixesUITest(Base):
             await pilot.pause(0.2)                   # reopen) or the close:
             self.assertIsInstance(app.screen, OpsScreen)     # never a confirm
             await pilot.press("j", "u")
-            self.assertTrue(await until(
-                pilot, lambda: isinstance(app.screen, OpsScreen)))
+            # negative check: never a confirm
+            await pilot.pause(0.2)
+            self.assertIsInstance(app.screen, OpsScreen)
             self.assertEqual(len(self.src.requests()), 2)
 
     async def test_quit_waits_for_a_running_draft(self):
@@ -1052,8 +1054,9 @@ class ActsOffTest(Base):
             first = app.current_key
             await pilot.press("d")
             await until(pilot, lambda: self.store.is_hidden(first))
-            self.assertTrue(await until(
-                pilot, lambda: self.store.is_hidden(first)))
+            # negative check: a local mark writes nothing, past any window
+            await pilot.pause(0.5)
+            self.assertTrue(self.store.is_hidden(first))
             self.assertEqual(self.src.requests(), [])
             self.assertEqual(app.act_pending, 0)
             self.assertFalse(app.act_shadow)
@@ -1072,8 +1075,9 @@ class ActsOffTest(Base):
             await pilot.pause(0.2)
             await pilot.press("1")
             await until(pilot, lambda: self.store.snoozed_until("t:1"))
-            self.assertTrue(await until(
-                pilot, lambda: self.store.snoozed_until("t:1") is not None))
+            # negative check: a local snooze writes nothing, past any window
+            await pilot.pause(0.3)
+            self.assertIsNotNone(self.store.snoozed_until("t:1"))
             self.assertEqual(self.src.requests(), [])
 
     async def test_the_new_keys_only_say_acts_are_off(self):

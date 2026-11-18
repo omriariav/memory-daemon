@@ -951,7 +951,9 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: any("the doc is locked" in t for t in toasts(app))))
-            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
+            # negative check: the failed action leaves the row, past its window
+            await pilot.pause(0.6)
+            self.assertIn("t:1", keys(app))
             self.assertFalse(store.is_hidden("t:1"))
             self.assertEqual([x for x in app.pending if x.kind == "done"], [])
             self.assertEqual(
@@ -982,7 +984,9 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(pilot, lambda: acts.ran_calls()))
             await wait_for(pilot, lambda: any("Added" in t for t in toasts(app)))
-            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
+            # negative check: mark_done false never hides the row, past its window
+            await pilot.pause(0.8)
+            self.assertIn("t:1", keys(app))
             self.assertFalse(store.is_hidden("t:1"))
             self.assertEqual([x for x in app.pending if x.kind == "done"], [])
 
@@ -1273,7 +1277,9 @@ class SaveMarksDoneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await self.save(pilot, app)
             self.assertTrue(await wait_for(
                 pilot, lambda: self.store.is_saved("t:1")))
-            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
+            # negative check: mark_done false never hides the row, past its window
+            await pilot.pause(0.8)
+            self.assertIn("t:1", keys(app))
             self.assertTrue(next(i for i in app.items if i.key == "t:1").saved)
             self.assertFalse(self.store.is_hidden("t:1"))
 
