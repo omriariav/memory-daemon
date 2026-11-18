@@ -65,6 +65,7 @@ MAINTENANCE_ALLOWED_KEYS = {
         "kind", "document_secret", "read_tool", "write_tool", "write_mode",
         "model", "owner_slug", "checkpoint", "store", "outbound_since",
         "from_sources", "inbox_heading", "max_per_run", "exclude_tags",
+        "inbound_checkpoint",
     },
 }
 # Kinds that keep no checkpoint file; every other kind requires one.

@@ -1157,22 +1157,94 @@ class TreeFormatTest(RunBase):
             with self.subTest(line), self.assertRaises(fti.FiberyParseError):
                 fti.parse_document(f"version: 0\n{line}")
 
-    def test_short_ids_resolve_to_checkpoint_keys(self):
-        known = {"e5f6aaaa-0000-4000-8000-000000000001": 1,
-                 "0a0bbbbb-0000-4000-8000-000000000002": 1}
-        tasks = fti.parse_tasks(TreeDoc(TREE_LINES).text(), known)
-        self.assertEqual([t["block_id"] for t in tasks],
-                         ["e5f6aaaa-0000-4000-8000-000000000001",
-                          "0a0bbbbb-0000-4000-8000-000000000002"])
-        # An id that is already a key, or matches nothing, is left alone.
-        self.assertEqual(fti._full_id("zzzz", set(known)), "zzzz")
-        self.assertEqual(fti._full_id("e5f6", {"e5f6"}), "e5f6")
-        # A key that is a prefix of a lengthened id also resolves.
-        self.assertEqual(fti._full_id("e5f6cc", {"e5f6"}), "e5f6")
+    # -- checkpoint keys for shortened ids -----------------------------------
 
-    def test_ambiguous_short_id_fails(self):
-        with self.assertRaises(fti.FiberyParseError):
-            fti._full_id("e5f6", {"e5f6aa", "e5f6bb"})
+    @staticmethod
+    def row(text, state="TODO", gone=False, entry="entry-x", **extra):
+        full, content = fti._task_hashes(
+            {"text": text, "state": state, "section": None})
+        row = {"hash": full, "content": content, "state": state,
+               "entry_id": entry, "date": "2026-01-01", "transitions": 0}
+        if gone:
+            row["gone"] = True
+        row.update(extra)
+        return row
+
+    @staticmethod
+    def task(short, text, state="TODO"):
+        return {"block_id": short, "section": None, "text": text,
+                "state": state}
+
+    OLD = "ab12cdef-0000-4000-8000-000000000001"
+
+    def test_short_id_resolves_to_the_row_it_prefixes(self):
+        items = {self.OLD: self.row("Alpha"),
+                 "0a0bbbbb-0000-4000-8000-000000000002": self.row("Beta")}
+        tasks = [self.task("ab12", "Alpha"), self.task("0a0b", "Beta"),
+                 self.task("ffff", "Gamma")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual([t["block_id"] for t in tasks],
+                         [self.OLD, "0a0bbbbb-0000-4000-8000-000000000002",
+                          "ffff"])
+
+    def test_full_ids_and_exact_short_keys_stay(self):
+        items = {self.OLD: self.row("A"), "e5f6": self.row("B")}
+        tasks = [self.task(self.OLD, "A"), self.task("e5f6", "B")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual([t["block_id"] for t in tasks], [self.OLD, "e5f6"])
+
+    def test_a_lengthened_id_still_finds_its_short_key(self):
+        items = {"e5f6": self.row("B")}
+        tasks = [self.task("e5f6c0", "B")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], "e5f6")
+
+    def test_gone_row_is_not_taken_by_a_new_block_sharing_the_prefix(self):
+        items = {self.OLD: self.row("Old text", gone=True)}
+        tasks = [self.task("ab12", "A different new task")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], "ab12~2")
+        self.assertEqual(
+            fti.assign_keys([self.task("ab12", "A different new task")],
+                            {**items, "ab12~2": self.row("A different new task")}
+                            )[0]["block_id"], "ab12~2")   # and it is stable
+
+    def test_gone_row_comes_back_only_with_the_same_text(self):
+        items = {self.OLD: self.row("Same text", gone=True)}
+        tasks = [self.task("ab12", "Same text")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual(tasks[0]["block_id"], self.OLD)
+
+    def test_a_new_key_avoids_memory_entries_it_relates_to(self):
+        tasks = [self.task("ab12", "New")]
+        fti.assign_keys(tasks, {}, lambda: {self.OLD})
+        self.assertEqual(tasks[0]["block_id"], "ab12~2")
+        tasks = [self.task("ab12", "New")]
+        fti.assign_keys(tasks, {}, lambda: {"ab12"})   # crash recovery adopts
+        self.assertEqual(tasks[0]["block_id"], "ab12")
+
+    def test_two_tasks_for_one_row_are_told_apart_by_text(self):
+        items = {"ab12": self.row("Alpha")}
+        tasks = [self.task("ab12c", "Alpha"), self.task("ab12f", "Beta")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual([t["block_id"] for t in tasks],
+                         ["ab12", "ab12f~2"])
+        # Next run, the second is found again, even after it is edited.
+        items["ab12f~2"] = self.row("Beta")
+        tasks = [self.task("ab12c", "Alpha"), self.task("ab12f", "Beta 2")]
+        fti.assign_keys(tasks, items)
+        self.assertEqual([t["block_id"] for t in tasks],
+                         ["ab12", "ab12f~2"])
+
+    def test_undecidable_claims_hold_the_run_instead_of_failing(self):
+        items = {"ab12": self.row("Alpha")}
+        for texts in (("Beta", "Gamma"), ("Alpha", "Alpha")):
+            tasks = [self.task("ab12c", texts[0]), self.task("ab12f", texts[1])]
+            with self.subTest(texts), self.assertRaises(fti.FiberyHeld):
+                fti.assign_keys(tasks, items)
+        items = {"ab12c1": self.row("A"), "ab12c2": self.row("A")}
+        with self.assertRaises(fti.FiberyHeld):
+            fti.assign_keys([self.task("ab12", "A")], items)
 
     def test_run_keeps_existing_checkpoint_rows(self):
         """A checkpoint built from full ids still matches the short-id doc:
@@ -1192,6 +1264,80 @@ class TreeFormatTest(RunBase):
         self.assertEqual((report["created"], report["done"], report["gone"]),
                          (0, 0, 0))
         self.assertEqual(set(self.items()), full)
+
+    def _import_old(self, text="Old todo"):
+        doc = Doc()
+        doc.bullets([(TreeFormatTest.OLD, "TODO", [q(text)])])
+        self.run_once(doc.text())
+        self.assertEqual(self.memory.count, 1)
+
+    def _gone_old_row(self):
+        self._import_old()
+        report = self.run_once(TreeDoc(["a1b2 paragraph parentId=null | x"]).text())
+        self.assertEqual(report["gone"], 1)
+        self.assertTrue(self.items()[TreeFormatTest.OLD]["gone"])
+
+    def _only(self, state, text):
+        return TreeDoc([
+            "c3d4 bullet_list parentId=null",
+            f"  ab12 list_item parentId=c3d4 state={state}",
+            f"    0c0d paragraph parentId=ab12 | {text}"]).text()
+
+    def test_new_done_block_never_closes_a_gone_rows_todo(self):
+        self._gone_old_row()
+        before = len(self.memory.calls)
+        report = self.run_once(self._only("DONE", "Unrelated new task"))
+        self.assertEqual(len(self.memory.calls), before)   # no done note
+        self.assertEqual(report["skipped_done"], 1)
+        self.assertEqual(self.items()[TreeFormatTest.OLD]["state"], "TODO")
+        self.assertIn("ab12~2", self.items())
+
+    def test_new_todo_block_never_edits_a_gone_rows_todo(self):
+        self._gone_old_row()
+        report = self.run_once(self._only("TODO", "Unrelated new task"))
+        self.assertEqual((report["created"], report["edited"]), (1, 0))
+        self.assertEqual(len(self.memory.of("todo")), 2)
+        args = self.memory.of("todo")[-1]
+        self.assertEqual(args[args.index("--source-ids") + 1],
+                         "fibery:tasks:ab12~2")
+        again = self.run_once(self._only("TODO", "Unrelated new task"))
+        self.assertEqual((again["created"], again["edited"]), (0, 0))
+        self.assertEqual(len(self.memory.of("todo")), 2)
+
+    def test_a_gone_rows_block_that_returns_is_revived(self):
+        self._gone_old_row()
+        before = len(self.memory.calls)
+        self.run_once(self._only("TODO", "Old todo"))
+        self.assertEqual(len(self.memory.calls), before)
+        self.assertNotIn("gone", self.items()[TreeFormatTest.OLD])
+
+    def test_key_is_recorded_before_the_todo_is_created(self):
+        self._gone_old_row()
+        with mock.patch.object(fti, "_create_todo",
+                               side_effect=RuntimeError("store down")), \
+                self.assertRaises(RuntimeError):
+            self.run_once(self._only("TODO", "Unrelated new task"))
+        self.assertTrue(self.items()["ab12~2"]["pending_create"])
+        report = self.run_once(self._only("TODO", "Unrelated new task"))
+        self.assertEqual(report["created"], 1)
+        self.assertNotIn("pending_create", self.items()["ab12~2"])
+        self.assertEqual(len(self.memory.of("todo")), 2)
+
+    def test_two_claimants_of_one_row_do_not_wedge_the_run(self):
+        doc = Doc()
+        doc.bullets([("ab12", "TODO", [q("Alpha")])])
+        self.run_once(doc.text())
+        text = TreeDoc([
+            "c3d4 bullet_list parentId=null",
+            "  ab12c list_item parentId=c3d4 state=TODO",
+            "    0c0d paragraph parentId=ab12c | Alpha",
+            "  ab12f list_item parentId=c3d4 state=TODO",
+            "    0c0e paragraph parentId=ab12f | Beta"]).text()
+        report = self.run_once(text)
+        self.assertEqual((report["created"], report["edited"]), (1, 0))
+        self.assertEqual(set(self.items()), {"ab12", "ab12f~2"})
+        again = self.run_once(text)
+        self.assertEqual((again["created"], again["edited"]), (0, 0))
 
     def test_run_creates_a_new_short_id_task(self):
         report = self.run_once(TreeDoc(TREE_LINES).text())

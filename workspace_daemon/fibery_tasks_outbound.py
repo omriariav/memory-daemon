@@ -19,8 +19,9 @@ from pathlib import Path
 
 from . import claude_bridge, personal, sleepclock, state
 from .fibery_tasks_inbound import (
-    MEM_RE, OUTBOUND_CHECKPOINT, FiberyParseError, SECRET_RE, accepted_text, fetch, parse_document, pending_ids,
-    valid_read_tool, _document_text, _text_of,
+    DEFAULT_CHECKPOINT as INBOUND_CHECKPOINT, MEM_RE, OUTBOUND_CHECKPOINT,
+    UUID_RE, FiberyParseError, SECRET_RE, accepted_text, fetch,
+    parse_document, pending_ids, valid_read_tool, _document_text, _text_of,
 )
 from .google_tasks_sync import _load_memory_entries
 from .shell import log
@@ -177,6 +178,32 @@ def inspect(text, heading):
         "anchor_id": anchor,
         "pending_heading": pending_heading and heading_id is None,
     }
+
+
+def _inbound_ids(base_dir, cfg):
+    """Full block ids the inbound routine's checkpoint holds (best effort)."""
+    path = Path(cfg.get("inbound_checkpoint", INBOUND_CHECKPOINT)).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    try:
+        rows = json.loads(path.read_text())["items"]
+        return {k for k in rows if isinstance(k, str) and UUID_RE.fullmatch(k)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+
+
+def full_anchor(anchor, known):
+    """The full block id for an anchor as ``read_document`` shows it.
+
+    ``read_document`` shortens ids to a prefix; ``insert_document_blocks``
+    types its anchors as full ids. A full id stays; a short one resolves
+    through the inbound checkpoint when exactly one full id starts with it;
+    otherwise None (the caller must not write).
+    """
+    if UUID_RE.fullmatch(anchor or ""):
+        return anchor
+    found = [k for k in known if k.startswith(anchor or "\0")]
+    return found[0] if len(found) == 1 else None
 
 
 def build_inserts(lines, heading, info):
@@ -339,7 +366,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
     report = {"ok": True, "dry_run": bool(dry_run), "candidates": 0,
               "exported": 0, "already_present": 0, "held_pending_heading": False,
               "heading_created": False, "mode": cfg["write_mode"],
-              "unconfirmed": [], "held_unconfirmed": False}
+              "unconfirmed": [], "held_unconfirmed": False,
+              "held_short_anchor": False}
     store = cfg["store"]
     checkpoint = _load_checkpoint(checkpoint_path)
     items = checkpoint["items"]
@@ -405,6 +433,18 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False, extra_exclude=()):
     if not batch:
         return report
 
+    if info["heading_id"] is not None:
+        key = "anchor_id" if info["anchor_id"] else "heading_id"
+        resolved = full_anchor(info[key], _inbound_ids(base_dir, cfg))
+        if resolved is None:
+            # The write tool takes full ids; guessing one would be a blind
+            # write into the document. Nothing is recorded or written.
+            report["held_short_anchor"] = True
+            log("fibery_tasks_outbound: HELD short anchor: the insert "
+                "anchor shows only a shortened block id and no full id is "
+                "known for it; nothing written")
+            return report
+        info = dict(info, **{key: resolved})
     inserts = build_inserts([item_line(e) for e in batch], heading, info)
     ids = [e["id"] for e in batch]
     creating_heading = info["heading_id"] is None

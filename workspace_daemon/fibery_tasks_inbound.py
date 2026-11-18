@@ -490,28 +490,11 @@ def find_list_under_heading(blocks, heading_prefix, roots=None,
     return {"heading_id": heading_id, "list_id": list_id, "items": items}
 
 
-def _full_id(block_id, known_ids):
-    """The checkpoint key a shortened block id stands for.
-
-    The compact tree rendering shortens ids to a prefix of the full id, which
-    the checkpoint (and every memory link) still keys by. An id that is itself
-    a key stays; otherwise the one key it prefixes, or that prefixes it, wins.
-    Several candidates fail the run rather than guess; none means a new block.
-    """
-    if block_id in known_ids:
-        return block_id
-    found = [k for k in known_ids
-             if k.startswith(block_id) or block_id.startswith(k)]
-    if len(found) > 1:
-        raise FiberyParseError("block id matches several checkpoint ids")
-    return found[0] if found else block_id
-
-
-def parse_tasks(text, known_ids=()):
+def parse_tasks(text):
     """Return [{block_id, section, text, state, alert_id?}] in document order.
 
-    ``known_ids`` are the checkpoint keys: a shortened block id (compact tree
-    rendering) is reported under the full id it stands for (``_full_id``).
+    ``block_id`` is the id as the document shows it: shortened in the compact
+    tree rendering. ``assign_keys`` turns it into the checkpoint key.
     """
     roots, blocks, suggestions = parse_document(text)
     for block in blocks.values():
@@ -589,13 +572,124 @@ def parse_tasks(text, known_ids=()):
             section = _text_of(block).strip() or None
         elif block["type"] in CONTAINER_TYPES:
             walk(root, section, 0)
-    known = set(known_ids)
-    if known:
-        for task in tasks:
-            task["block_id"] = _full_id(task["block_id"], known)
     ids = [t["block_id"] for t in tasks]
     if len(ids) != len(set(ids)):
         raise FiberyParseError("duplicate task block id")
+    return tasks
+
+
+# --- checkpoint keys --------------------------------------------------------
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _base(key):
+    """A checkpoint key without its ``~N`` disambiguation suffix."""
+    return key.split("~", 1)[0]
+
+
+def _related(short, key):
+    base = _base(key)
+    return base.startswith(short) or short.startswith(base)
+
+
+def _fits(short, key, row, content_hash):
+    """Whether a document id may be the block a checkpoint row records.
+
+    Ids in the compact rendering are prefixes, so a prefix is only a hint: a
+    row for a block that left the document (``gone``) is matched by prefix
+    only when the text is also unchanged (a block that came back), never to a
+    different new block that merely shares the first characters.
+    """
+    if not _related(short, key):
+        return False
+    if not row.get("gone"):
+        return True
+    if key == short and UUID_RE.fullmatch(key):
+        return True    # a full id cannot collide
+    return row.get("content") == content_hash
+
+
+def _entry_task_keys(store):
+    """Block ids memory todos and notes of this importer were created under."""
+    if not (Path(store) / "memory" / "entries").is_dir():
+        return set()
+    keys = set()
+    for entry in _load_memory_entries(store).values():
+        for source_id in entry["source_ids"]:
+            if source_id.startswith(SOURCE_PREFIX):
+                keys.add(source_id[len(SOURCE_PREFIX):].split(":", 1)[0])
+    return keys
+
+
+def assign_keys(tasks, items, entry_keys=lambda: set()):
+    """Set each task's ``block_id`` to its checkpoint key (in place).
+
+    A full id is its own key. A shortened id keeps matching the row it
+    stands for (``_fits``): an exact-base row wins, else the single related
+    row, else the one whose text matches. A task nothing matches is new and
+    gets a key no row or memory entry already relates to: its own short id,
+    or ``<short>~2``, ``~3``... when that would collide with a block that
+    left the document. When several tasks claim one row, the one whose text
+    matches keeps it and the others become new. Anything still undecidable
+    holds the run (FiberyHeld) before any write.
+    """
+    chosen = {}
+    for index, task in enumerate(tasks):
+        short = task["block_id"]
+        chash = _task_hashes(task)[1]
+        found = [k for k, row in items.items() if _fits(short, k, row, chash)]
+        tier = [k for k in found if _base(k) == short]
+        found = tier or found
+        if len(found) > 1:
+            found = [k for k in found if items[k].get("content") == chash] \
+                or found
+        if len(found) > 1:
+            raise FiberyHeld(
+                "Fibery import held: a block id matches several checkpoint "
+                f"rows ({', '.join(sorted(found))}); edit or restore one "
+                "of the tasks")
+        if found:
+            chosen[index] = found[0]
+    claims = {}
+    for index, key in chosen.items():
+        claims.setdefault(key, []).append(index)
+    for key, indexes in claims.items():
+        if len(indexes) == 1:
+            continue
+        row = items[key]
+        keep = [i for i in indexes
+                if _task_hashes(tasks[i])[1] == row.get("content")]
+        if len(keep) != 1:
+            raise FiberyHeld(
+                f"Fibery import held: {len(indexes)} tasks share the "
+                f"block-id prefix of checkpoint row {key} and their text "
+                "does not tell which one it is; edit or restore one of "
+                "the tasks")
+        for i in indexes:
+            if i != keep[0]:
+                del chosen[i]
+    taken = set(items) | set(chosen.values())
+    known = None
+    for index, task in enumerate(tasks):
+        if index in chosen:
+            continue
+        if known is None:
+            known = set(entry_keys())
+        short = task["block_id"]
+        everything = taken | known
+        key = short
+        if short in items or any(_related(short, k) for k in everything
+                                 if k != short):
+            n = 2
+            while f"{short}~{n}" in everything:
+                n += 1
+            key = f"{short}~{n}"
+        chosen[index] = key
+        taken.add(key)
+    for index, task in enumerate(tasks):
+        task["block_id"] = chosen[index]
     return tasks
 
 
@@ -866,6 +960,8 @@ def _plan(items, tasks, cfg, linkable=frozenset()):
     current = {t["block_id"]: t for t in tasks}
     for task in tasks:
         row = items.get(task["block_id"])
+        if row is not None and row.get("pending_create"):
+            row = None   # the key is reserved; the todo is not made yet
         full, content = _task_hashes(task)
         if row is None:
             if _marker(task) in linkable:
@@ -909,7 +1005,8 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         return report
     checkpoint = _load_checkpoint(checkpoint_path)
     items = checkpoint["items"]
-    tasks = parse_tasks(fetch(cfg, base_dir), items)
+    tasks = parse_tasks(fetch(cfg, base_dir))
+    assign_keys(tasks, items, lambda: _entry_task_keys(cfg["store"]))
     report["tasks"] = len(tasks)
     linkable = _linkable_entries(
         cfg["store"], tasks, items, _outbound_ids(base_dir, cfg))
@@ -945,6 +1042,18 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         row.update(extra)
         items[task["block_id"]] = row
         return row
+
+    def reserve(task):
+        """Record the key before the todo exists, so a crash between the
+        memory write and the checkpoint cannot make the next run pick another
+        key (and a second todo) for the same block. A full id is its own key
+        and needs no reservation."""
+        key = task["block_id"]
+        if key not in items and not UUID_RE.fullmatch(key):
+            items[key] = {
+                "hash": "", "content": "", "state": "TODO", "entry_id": None,
+                "date": date, "transitions": 0, "pending_create": True}
+            save()
 
     def _write(fn, *args):
         try:
@@ -986,6 +1095,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         if created >= max_new:
             report["pending"] += 1
             continue
+        reserve(task)
         entry_id = _write(_create_todo, cfg, store, task, date)
         # Checkpoint as TODO until the done note lands, so a failed note is
         # retried through the normal TODO -> DONE path.
@@ -1032,6 +1142,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
             if created >= max_new:
                 report["pending"] += 1
                 continue
+            reserve(task)
             entry_id = _write(_create_todo, cfg, store, task, date)
             created += 1
             report["created"] += 1
