@@ -9,10 +9,14 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [0.12.1] - 2026-11-18
 
-A test-only patch: nothing the inbox does changes.
+Mostly a test and CI patch; one fix to the `?` screen.
 
 ### Fixed
 
+- **The `?` keyboard reference scrolls.** The reference is taller than most
+  terminals, but nothing inside it took focus, so only the mouse wheel moved
+  it. The body is now a focused scroll container: j/k, the arrow keys,
+  PgUp/PgDn, Home/End and the wheel all scroll it; esc and `?` still close.
 - **Flaky Textual tests.** The tests waited for state with a fixed
   `pilot.pause(N)` and then asserted, so a slow worker, timer or layout pass
   failed the CI `inbox-ui` job at random (for example the thread pane scroll

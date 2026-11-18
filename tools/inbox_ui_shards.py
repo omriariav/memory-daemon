@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # by running each module alone on a laptop (2026-11-18); refresh them when a
 # module grows a lot. They only balance the shards.
 MODULES = {
+    "tests.test_inbox_help_scroll": 7.3,
     "tests.test_inbox_ui": 51.2,
     "tests.test_inbox_items": 0.1,
     "tests.test_inbox_sources": 7.6,
