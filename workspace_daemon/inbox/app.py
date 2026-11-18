@@ -303,6 +303,7 @@ class InboxApp(App):
         self.today_fn = today or datetime.date.today
         self._due_marks = {}               # task key -> a due date set here, until the next refresh
         self._applying_since = None        # start of the fetch being applied
+        self._list_started = {}            # units mode: source name -> when its list was last fetched (not re-evaluated)
         self._rows = {}                    # key -> row, digest and saved rows too
         self._groups_sig = None
         self.health_fetch = health
@@ -570,9 +571,11 @@ class InboxApp(App):
         for g in self.feed_data.groups:
             for i in g.items:
                 self._rows.setdefault(i.key, i)
-        return tuple((v, tuple((g.key, tuple(i.key for i in g.items))
-                               for g in gs))
-                     for v, gs in self._views.items())
+        # The date is part of the signature: the due cells and ages redraw
+        # when midnight passes.
+        return (today, tuple(
+            (v, tuple((g.key, tuple(i.key for i in g.items)) for g in gs))
+            for v, gs in self._views.items()))
 
     def refilter(self, redraw=True):
         """Rebuild the views from the fetched rows: hide marked and pending
@@ -1611,7 +1614,8 @@ class InboxApp(App):
         who = (p.item.gist if tasksmod.is_task(p.item) else p.item.who)
         if res.sync == actsmod.CONFLICT:
             p.audit["status"] = "conflict"
-            self.notify(self._conflict_text(p.item.meta), title="Not applied",
+            self.notify(self._conflict_text(
+                {"task": tasksmod.is_task(p.item)}), title="Not applied",
                         severity="warning", timeout=8, markup=False)
         elif res.sync == actsmod.LOST:
             p.audit["status"] = "lost"
@@ -1631,7 +1635,9 @@ class InboxApp(App):
                 else "synced"
             self.notify(f"{word}: {what} · {who}", title="Source",
                         timeout=4, markup=False)
-            if p.kind == "waits_on" and self.polled_once:
+            if (p.kind == "waits_on" or (
+                    p.kind == "due" and res.sync == actsmod.OK)
+                    ) and self.polled_once:
                 self.poll(quiet=True, names=(
                     {p.item.origin} if self.units is not None else None))
         if res.note:
@@ -1640,15 +1646,26 @@ class InboxApp(App):
                         or "dropped" in res.note else "information")
 
     @staticmethod
-    def _conflict_text(meta):
-        return (TASK_CONFLICT_TOAST if isinstance(meta, dict)
-                and meta.get("kind") == tasksmod.KIND else CONFLICT_TOAST)
+    def _is_task_row(row):
+        """An ops-log row (or a pending entry's request) of a task op: the
+        row's own `task` flag, else the kind in its meta."""
+        meta = row.get("meta") if isinstance(row, dict) else None
+        return bool(isinstance(row, dict) and (
+            row.get("task") is True
+            or (isinstance(meta, dict) and meta.get("kind") == tasksmod.KIND)))
+
+    @staticmethod
+    def _conflict_text(row):
+        """The conflict toast for an ops-log row (or anything shaped like
+        one: a `task` flag, a `meta`)."""
+        return (TASK_CONFLICT_TOAST if InboxApp._is_task_row(row)
+                else CONFLICT_TOAST)
 
     # A due date set here shows at once and stays until the next list refresh
     # (the source's list is the truth after that).
     def _set_due_mark(self, it, date_str, p=None):
         self._due_marks[it.key] = {"due": (date_str,), "op": p,
-                                   "settled_at": None}
+                                   "origin": it.origin, "settled_at": None}
         self.refilter(redraw=False)
 
     def _clear_due_mark(self, key, redraw=True):
@@ -1656,16 +1673,45 @@ class InboxApp(App):
             self.refilter(redraw=redraw)
 
     def _due_settled(self, p, res):
-        """UI thread: the due op finished. A conflict or a failed op takes the
-        shown date back; otherwise the mark is kept (and stamped) until a list
-        fetched after it replaces it."""
+        """UI thread: the due op finished. A conflict, a failed op or a lost
+        one takes the shown date back. An op kept for a retry (not synced)
+        keeps the date, like a close keeps its mark, until the retry settles
+        (`_due_retried`). An ok is stamped: the mark goes once the source's
+        list was fetched after it (`_list_fresh`)."""
         entry = self._due_marks.get(p.item.key)
         if entry is None or entry.get("op") is not p:
             return
-        if not res.ok or res.sync == actsmod.CONFLICT:
+        if (not res.ok or res.sync in (actsmod.CONFLICT, actsmod.LOST)):
             self._clear_due_mark(p.item.key, redraw=False)
-        else:
+        elif res.sync != actsmod.PENDING:
             entry["settled_at"] = time.time()
+
+    def _due_retried(self, entry, out):
+        """A pending due op was retried: an ok stamps its mark, a conflict
+        takes the shown date back."""
+        key = entry.get("id")
+        mark = self._due_marks.get(key)
+        if mark is None or entry.get("action") != "due":
+            return
+        if out.status == actsmod.CONFLICT:
+            self._due_marks.pop(key, None)
+        elif out.status in (actsmod.OK, actsmod.SHADOW):
+            mark["settled_at"] = time.time()
+
+    def _list_fresh(self, mark, since):
+        """True when the list the mark's source answers with was fetched after
+        the mark was settled, so it already holds the new date. With units
+        that is the time the source's own unit last ran (a re-evaluation or a
+        poll of another unit proves nothing); otherwise the start of the fetch
+        being applied (`since`)."""
+        settled = mark.get("settled_at")
+        if settled is None:
+            return False
+        if self.units is not None:
+            fetched = self._list_started.get(mark.get("origin"))
+        else:
+            fetched = since
+        return fetched is not None and fetched >= settled
 
     def _retry_ops(self):
         """After a refresh: resend the ops that could not be delivered, in a
@@ -1692,14 +1738,22 @@ class InboxApp(App):
         done = [(e, o) for e, o in report.results
                 if o.status != actsmod.PENDING]
         for entry, out in report.results:
+            self._due_retried(entry, out)
             self.record("retry", _stub(entry), f"{entry.get('action')}: "
                         f"{out.message}", out.status)
             if out.status in (actsmod.OK, actsmod.SHADOW):
                 self.act_shadow = out.status == actsmod.SHADOW
         conflicts = [e for e, o in done if o.status == actsmod.CONFLICT]
         task_conflict = any(
-            (e.get("request") or {}).get("meta", {}).get("kind")
-            == tasksmod.KIND for e in conflicts)
+            self._is_task_row(e.get("request"))
+            or (e.get("log_extra") or {}).get("task") is True
+            for e in conflicts)
+        moved = {e.get("source") for e, o in done
+                 if e.get("action") == "due" and o.status == actsmod.OK}
+        if moved and self.polled_once:
+            # The source took a due move kept for a retry: fetch its list.
+            self.poll(quiet=True, names=(moved if self.units is not None
+                                         else None))
         if report.dropped:
             self.notify(f"{report.dropped} unsynced op(s) older than "
                         f"{actsmod.PENDING_MAX_AGE_S // 86400} days were "
@@ -3374,8 +3428,7 @@ class InboxApp(App):
             self.refilter(redraw=False)
             self.redraw(keep=self.current_key)
             if (row.get("action") in ("close", "drop", "due")
-                    and (row.get("meta") or {}).get("kind") == tasksmod.KIND
-                    and self.polled_once):
+                    and self._is_task_row(row) and self.polled_once):
                 # The list is the truth for tasks: fetch the reopened or
                 # moved one back.
                 src = str(row.get("source", ""))
@@ -3385,8 +3438,8 @@ class InboxApp(App):
                          else "✓ synced") + f": {action} · {row.get('who', '')}",
                         title="Source", timeout=4, markup=False)
         elif out is not None and out.status == actsmod.CONFLICT:
-            self.notify(self._conflict_text(row.get("meta")),
-                        severity="warning", timeout=6, markup=False)
+            self.notify(self._conflict_text(row), severity="warning",
+                        timeout=6, markup=False)
         else:
             self.notify(f"{action} not sent: {detail}", severity="warning",
                         timeout=6, markup=False)
@@ -3537,7 +3590,10 @@ class InboxApp(App):
                     batch = unit.reeval(now) if unit.reeval else None
                     batch = list(batch) if batch is not None else None
                 else:
+                    started = time.time()
                     batch = list(unit.run(now, show_all))
+                    for res in batch:
+                        self._list_started[res.name] = started
             except Exception as exc:  # a source bug must never end the session
                 batch = [SourceResult(unit.name, [], False, None,
                                       f"poll failed: {type(exc).__name__}: {exc}")]
@@ -3695,10 +3751,8 @@ class InboxApp(App):
         # A due date set here lasts until a list fetched after the source took
         # it replaces it (one fetched before it was settled is still stale).
         since = self._applying_since
-        self._due_marks = {
-            k: v for k, v in self._due_marks.items()
-            if v.get("settled_at") is None
-            or (since is not None and v["settled_at"] > since)}
+        self._due_marks = {k: v for k, v in self._due_marks.items()
+                           if not self._list_fresh(v, since)}
         rows = []
         for res in self.results:
             for raw in res.items:

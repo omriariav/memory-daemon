@@ -99,6 +99,18 @@ def act_meta(item):
     return meta
 
 
+def task_extra(item, action, meta):
+    """What an op's log row keeps beyond the (size-limited) request: `task`
+    for a task op, and for a due move `prev_due`, the date before it, taken
+    from the full meta so a big meta cannot make the move un-undoable."""
+    if not tasks_mod.is_task(item):
+        return None
+    extra = {"task": True}
+    if action == "due":
+        extra["prev_due"] = (meta or {}).get("due")
+    return extra
+
+
 def _cached(row):
     if row is None:
         return None
@@ -556,13 +568,14 @@ class LocalActions:
         if not self.act_enabled(item, action):
             return ActOutcome("unavailable", f"{action} is not enabled for "
                                              "this source")
+        meta = act_meta(item) if meta is None else meta
         request = acts_mod.build_request(
-            acts_mod.new_op_id(), action, item.key,
-            act_meta(item) if meta is None else meta, item.ts, args)
-        return self._deliver(item.origin, request, item.who, item.where)
+            acts_mod.new_op_id(), action, item.key, meta, item.ts, args)
+        return self._deliver(item.origin, request, item.who, item.where,
+                             extra=task_extra(item, action, meta))
 
     def _log_op(self, source, request, who, where, status, message,
-                inverse_of=None, retry=False):
+                inverse_of=None, retry=False, extra=None):
         if self._ops is None:
             return
         row = {"at": time.time(), "op_id": request["op_id"],
@@ -576,9 +589,8 @@ class LocalActions:
                "message": str(message)[:200]}
         if inverse_of:
             row["inverse_of"] = inverse_of
-        meta = request.get("meta") or {}
-        if request["action"] == "due" and not inverse_of and "due" in meta:
-            row["prev_due"] = meta["due"]      # what an undo puts back
+        if extra and not inverse_of:
+            row.update(extra)   # task, prev_due (see task_extra)
         if retry:
             row["retry"] = True
         try:
@@ -597,7 +609,8 @@ class LocalActions:
             status = acts_mod.PENDING
         return status, resp
 
-    def _deliver(self, source, request, who, where, inverse_of=None):
+    def _deliver(self, source, request, who, where, inverse_of=None,
+                 extra=None):
         """One act call. The op is written to the pending file BEFORE the call
         (so a crash or a kill during it leaves it for a retry with the same
         op_id) and removed once the source answers ok, shadow or conflict. An
@@ -611,6 +624,8 @@ class LocalActions:
                      "where": str(where)[:acts_mod.WHO_MAX],
                      "queued_at": now, "last_try": now, "tries": 1,
                      "message": "sent, no answer yet"}
+            if extra:
+                entry["log_extra"] = extra
             try:
                 dropped = sum(self._pending_ops.add(entry, now))
             except OSError:
@@ -627,7 +642,7 @@ class LocalActions:
         lost = status == acts_mod.PENDING and not kept and inverse_of is None
         self._log_op(source, request, who, where,
                      "failed" if lost else status, resp["message"],
-                     inverse_of)
+                     inverse_of, extra=extra)
         return ActOutcome(acts_mod.LOST if lost else status, resp["message"],
                           request["op_id"], dropped, resp["shadow"])
 
@@ -689,7 +704,8 @@ class LocalActions:
             self._log_op(source, request, entry.get("who", ""),
                          entry.get("where", ""),
                          "pending" if status == acts_mod.PENDING else status,
-                         resp["message"], retry=True)
+                         resp["message"], retry=True,
+                         extra=entry.get("log_extra"))
             results.append((entry, ActOutcome(
                 status, resp["message"], entry["op_id"], 0, resp["shadow"])))
         return RetryReport(results, dropped)
@@ -699,9 +715,10 @@ class LocalActions:
         quitting, so nothing may block). Returns True when it was stored."""
         if not self.act_enabled(item, action) or self._pending_ops is None:
             return False
+        meta = act_meta(item) if meta is None else meta
         request = acts_mod.build_request(
-            acts_mod.new_op_id(), action, item.key,
-            act_meta(item) if meta is None else meta, item.ts, args)
+            acts_mod.new_op_id(), action, item.key, meta, item.ts, args)
+        extra = task_extra(item, action, meta)
         now = time.time()
         entry = {"op_id": request["op_id"], "request": request,
                  "source": item.origin, "action": action, "id": item.key,
@@ -709,12 +726,14 @@ class LocalActions:
                  "where": str(item.where)[:acts_mod.WHO_MAX],
                  "queued_at": now, "last_try": 0, "tries": 0,
                  "message": "not sent: the inbox was closed"}
+        if extra:
+            entry["log_extra"] = extra
         try:
             self._pending_ops.add(entry, now)
         except OSError:
             return False
         self._log_op(item.origin, request, item.who, item.where, "pending",
-                     entry["message"])
+                     entry["message"], extra=extra)
         return True
 
     def ops_rows(self):
