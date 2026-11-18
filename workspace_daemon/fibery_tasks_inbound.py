@@ -34,6 +34,13 @@ MEM_RE = re.compile(r"(?<![A-Za-z0-9])mem:([a-z0-9]+(?:-[a-z0-9]+)*)")
 INS_RE = re.compile(r"<ins>.*?</ins>", re.DOTALL)
 DEL_TAG_RE = re.compile(r"</?del>")
 KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)(?:\[(\d+)\])?:(?: (.*))?$")
+# One block of the compact tree rendering of ``read_document``:
+# ``<id> <type> parentId=<id|null> [key=value ...] [| <text>]``, nested two
+# spaces per level, ids shortened to a unique prefix of the full block id.
+TREE_RE = re.compile(
+    r"^([A-Za-z0-9_-]+) ([a-z][a-z_]*) parentId=(\S+)"
+    r"((?: [A-Za-z][A-Za-z0-9]*=\S*)*)((?: \|(?: .*)?)?)$")
+TREE_ATTR_RE = re.compile(r" ([A-Za-z][A-Za-z0-9]*)=(\S*)")
 TITLE_LIMIT = 120
 DEFAULT_CHECKPOINT = "state/fibery-tasks.json"
 OUTBOUND_CHECKPOINT = "state/fibery-outbound.json"
@@ -76,8 +83,9 @@ def _scalar(raw, what):
 
 def _id_list(count, raw, what):
     raw = (raw or "").strip()
-    ids = [part.strip() for part in raw.split(",")] if raw else []
-    if len(ids) != int(count) or any(not ID_RE.fullmatch(i) for i in ids):
+    # TOON quotes a string that reads as a number (a short id such as "1e56").
+    ids = [_scalar(part, what) for part in raw.split(",")] if raw else []
+    if len(ids) != int(count) or any(not ID_RE.fullmatch(i or "") for i in ids):
         raise FiberyParseError(f"{what} does not match its declared length")
     return ids
 
@@ -128,6 +136,13 @@ def parse_document(text):
     The optional top-level ``comments`` section (inline comment threads, which
     ``read_document`` adds when a document has any) is skipped whole: comment
     text is never parsed or returned. Any other top-level key still fails.
+
+    The blocks come in one of two renderings that must not be mixed: the
+    ``rootBlockIds`` / ``blocks[N]:`` TOON list, or the compact tree (one
+    ``<id> <type> parentId=<id> [attrs] | <text>`` line per block, nested by
+    indentation, ids shortened to a prefix of the full block id). The tree has
+    no header: its roots are the top-level lines and its nesting is checked
+    against ``parentId``.
     """
     lines = [ln.rstrip("\r") for ln in _document_text(text).split("\n")]
     roots = None
@@ -139,6 +154,7 @@ def parse_document(text):
     in_suggestions = False
     in_comments = False
     seen_comments = False
+    tree = None             # {"roots": [...], "stack": [...]} once a tree starts
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -152,6 +168,17 @@ def parse_document(text):
             continue
         if indent > 0 and in_comments:
             continue    # an inline comment thread: not blocks, not read
+        if indent == 0 and not KEY_RE.match(body) and TREE_RE.match(body):
+            if seen_comments or suggestions_count is not None or in_suggestions:
+                raise FiberyParseError("block line after a document section")
+            tree = tree or {"roots": [], "stack": []}
+            _tree_node(line, indent, blocks, tree)
+            continue
+        if tree is not None and indent > 0:
+            if seen_comments or suggestions_count is not None or in_suggestions:
+                raise FiberyParseError("unexpected line in a document section")
+            _tree_node(line, indent, blocks, tree)
+            continue
         if indent == 0:
             in_suggestions = False
             in_comments = False
@@ -199,6 +226,10 @@ def parse_document(text):
             blocks[block["id"]] = block
             continue
         raise FiberyParseError("unexpected line outside a block")
+    if tree is not None:
+        if roots is not None or declared is not None:
+            raise FiberyParseError("tree blocks mixed with a blocks list")
+        roots, declared = tree["roots"], len(blocks)
     if not seen_version or roots is None or declared is None:
         raise FiberyParseError("document header is incomplete")
     if declared != len(blocks):
@@ -208,6 +239,39 @@ def parse_document(text):
         if any(b not in blocks for b in suggestion["blockIds"]):
             raise FiberyParseError("suggestion references an unknown block")
     return roots, blocks, suggestions
+
+
+def _tree_node(line, indent, blocks, tree):
+    """Add one compact-tree line to ``blocks``; nesting must match parentId."""
+    match = TREE_RE.match(line.strip())
+    if not match:
+        raise FiberyParseError("unrecognised block line")
+    block_id, block_type, parent_raw, attr_text, tail = match.groups()
+    if indent % 2:
+        raise FiberyParseError("unexpected block indentation")
+    level = indent // 2
+    stack = tree["stack"]
+    while stack and stack[-1][0] >= level:
+        stack.pop()
+    if level and (not stack or stack[-1][0] != level - 1):
+        raise FiberyParseError("unexpected block indentation")
+    parent = stack[-1][1] if stack else None
+    if _scalar(parent_raw, "parentId") != parent:
+        raise FiberyParseError("block nesting does not match its parentId")
+    if block_id in blocks:
+        raise FiberyParseError("duplicate block id")
+    block = {"id": block_id, "type": block_type, "parentId": parent,
+             "attrs": {key: _scalar(value, "attrs")
+                       for key, value in TREE_ATTR_RE.findall(attr_text)},
+             "childIds": []}
+    if tail:
+        block["content"] = tail[3:]    # text after " | "; empty after a bare " |"
+    blocks[block_id] = block
+    if parent is None:
+        tree["roots"].append(block_id)
+    else:
+        blocks[parent]["childIds"].append(block_id)
+    stack.append((level, block_id))
 
 
 def _suggestions_header(count, raw):
@@ -426,8 +490,29 @@ def find_list_under_heading(blocks, heading_prefix, roots=None,
     return {"heading_id": heading_id, "list_id": list_id, "items": items}
 
 
-def parse_tasks(text):
-    """Return [{block_id, section, text, state, alert_id?}] in document order."""
+def _full_id(block_id, known_ids):
+    """The checkpoint key a shortened block id stands for.
+
+    The compact tree rendering shortens ids to a prefix of the full id, which
+    the checkpoint (and every memory link) still keys by. An id that is itself
+    a key stays; otherwise the one key it prefixes, or that prefixes it, wins.
+    Several candidates fail the run rather than guess; none means a new block.
+    """
+    if block_id in known_ids:
+        return block_id
+    found = [k for k in known_ids
+             if k.startswith(block_id) or block_id.startswith(k)]
+    if len(found) > 1:
+        raise FiberyParseError("block id matches several checkpoint ids")
+    return found[0] if found else block_id
+
+
+def parse_tasks(text, known_ids=()):
+    """Return [{block_id, section, text, state, alert_id?}] in document order.
+
+    ``known_ids`` are the checkpoint keys: a shortened block id (compact tree
+    rendering) is reported under the full id it stands for (``_full_id``).
+    """
     roots, blocks, suggestions = parse_document(text)
     for block in blocks.values():
         for child in block["childIds"]:
@@ -504,6 +589,10 @@ def parse_tasks(text):
             section = _text_of(block).strip() or None
         elif block["type"] in CONTAINER_TYPES:
             walk(root, section, 0)
+    known = set(known_ids)
+    if known:
+        for task in tasks:
+            task["block_id"] = _full_id(task["block_id"], known)
     ids = [t["block_id"] for t in tasks]
     if len(ids) != len(set(ids)):
         raise FiberyParseError("duplicate task block id")
@@ -820,7 +909,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         return report
     checkpoint = _load_checkpoint(checkpoint_path)
     items = checkpoint["items"]
-    tasks = parse_tasks(fetch(cfg, base_dir))
+    tasks = parse_tasks(fetch(cfg, base_dir), items)
     report["tasks"] = len(tasks)
     linkable = _linkable_entries(
         cfg["store"], tasks, items, _outbound_ids(base_dir, cfg))
