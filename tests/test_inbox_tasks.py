@@ -353,6 +353,42 @@ class ActsTest(unittest.TestCase):
         self.assertTrue(retried["retry"] and retried["task"])
         self.assertEqual(retried["prev_due"], "2030-01-12")
 
+    def test_an_older_pending_due_is_never_retried_after_a_newer_one(self):
+        a = self.actions()
+        self.src.set_items([support.task_item(1, due="2030-01-12")])
+        self.src.configure("fail")
+        a.send_act(task(1, due="2030-01-12"), "due", {"date": "2030-01-15"})
+        (older,) = a._pending_ops.all()
+        self.src.configure("ok")
+        a.send_act(task(1, due="2030-01-12"), "due", {"date": "2030-01-20"})
+        self.assertEqual(a._pending_ops.all(), [])
+        report = a.retry_pending(now=older["queued_at"] + 10_000)
+        self.assertEqual(report.results, [])
+        self.assertEqual(self.src.items()[0]["meta"]["due"], "2030-01-20")
+        self.assertEqual([r["args"]["date"] for r in self.src.requests()
+                          if r["action"] == "due"],
+                         ["2030-01-15", "2030-01-20"])
+
+    def test_a_retry_that_read_the_list_before_the_newer_due_skips_it(self):
+        a = self.actions()
+        self.src.set_items([support.task_item(1, due="2030-01-12")])
+        self.src.configure("fail")
+        a.send_act(task(1, due="2030-01-12"), "due", {"date": "2030-01-15"})
+        (older,) = a._pending_ops.all()
+        stale_list = [older]                 # what a retry had already read
+        self.src.configure("ok")
+        a.send_act(task(1, due="2030-01-12"), "due", {"date": "2030-01-20"})
+        real_due = a._pending_ops.due
+        a._pending_ops.due = lambda now=None: stale_list
+        try:
+            report = a.retry_pending(now=older["queued_at"] + 10_000)
+        finally:
+            a._pending_ops.due = real_due
+        self.assertEqual(report.results, [])
+        self.assertEqual(self.src.items()[0]["meta"]["due"], "2030-01-20")
+        self.assertEqual(len([r for r in self.src.requests()
+                              if r["action"] == "due"]), 2)
+
     def test_a_source_without_acts_is_read_only(self):
         # a source with no `acts:` is left out of the config entirely
         a = LocalActions(self.store, base_dir=self.base, acts={})

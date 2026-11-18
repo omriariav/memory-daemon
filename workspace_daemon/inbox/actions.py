@@ -637,6 +637,12 @@ class LocalActions:
                     self._pending_ops.note(request["op_id"], resp["message"])
                 else:
                     self._pending_ops.remove(request["op_id"])
+                    if (request["action"] == "due"
+                            and status in (acts_mod.OK, acts_mod.SHADOW)):
+                        # Newer than any due still waiting for a retry: it
+                        # must never be overwritten by an older date.
+                        self._pending_ops.drop_action(
+                            request["id"], "due", keep_op=request["op_id"])
             except OSError:
                 pass
         lost = status == acts_mod.PENDING and not kept and inverse_of is None
@@ -683,7 +689,8 @@ class LocalActions:
             if source not in self.acts_cfg or not isinstance(request, dict):
                 continue
             try:     # stamp the try first: another pane skips it, a crash keeps it
-                self._pending_ops.touch(entry["op_id"], now, "retrying")
+                if not self._pending_ops.touch(entry["op_id"], now, "retrying"):
+                    continue    # replaced by a newer op since the list was read
             except OSError:
                 pass
             status, resp = self._call(source, request)

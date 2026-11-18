@@ -690,6 +690,32 @@ class PendingMoveTest(Base):
             self.assertEqual(self.src.items()[0]["meta"]["due"], day(1))
             self.assertEqual(section_of(app, "task:1"), "week")
 
+    async def test_a_newer_move_is_not_overwritten_by_an_older_pending_one(self):
+        from workspace_daemon.inbox import acts
+        self.src.configure("fail")
+        app = self.app()
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await pilot.press("s")
+            await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
+            await pilot.press("1")                           # A: Jan 11
+            self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 1))
+            self.src.configure("ok")
+            await pilot.press("s")
+            await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
+            await pilot.press("3")                           # B: Jan 17
+            self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 0
+                                           and len(self.src.requests()) == 2))
+            with mock.patch.object(acts, "RETRY_EVERY_S", 0):
+                app.poll(manual=True)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not app.polling and app._due_marks == {}))
+            dues = [r["args"]["date"] for r in self.src.requests()
+                    if r["action"] == "due"]
+            self.assertEqual(dues, [day(1), day(7)])         # A never again
+            self.assertEqual(self.src.items()[0]["meta"]["due"], day(7))
+            self.assertEqual(section_of(app, "task:1"), "week")
+
     async def test_a_conflict_on_the_retry_takes_the_date_back(self):
         from workspace_daemon.inbox import acts
         self.src.configure("fail")

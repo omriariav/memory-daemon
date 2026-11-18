@@ -308,6 +308,17 @@ class PendingOps(_Jsonl):
                 self._write(kept)
             return len(rows) - len(kept)
 
+    def drop_action(self, item_id, action, keep_op=None):
+        """Drop the pending ops of one action on an item (a newer due makes an
+        older one stale). Returns how many."""
+        with self._locked():
+            rows = self._read()
+            kept = [r for r in rows if r.get("op_id") == keep_op
+                    or r.get("id") != item_id or r.get("action") != action]
+            if len(kept) != len(rows):
+                self._write(kept)
+            return len(rows) - len(kept)
+
     def note(self, op_id, message):
         """Keep the reason of the latest failed try."""
         with self._locked():
@@ -325,15 +336,19 @@ class PendingOps(_Jsonl):
                 self._write(kept)
 
     def touch(self, op_id, now, message):
-        """One more failed try: stamp it and keep the reason."""
+        """One more failed try: stamp it and keep the reason. False when the
+        op is no longer pending (a newer op replaced it)."""
         with self._locked():
             rows = self._read()
+            found = False
             for row in rows:
                 if row.get("op_id") == op_id:
+                    found = True
                     row["last_try"] = now
                     row["tries"] = int(row.get("tries") or 0) + 1
                     row["message"] = str(message)[:200]
             self._write(rows)
+            return found
 
 
 # --- the nudge template (`nudge_template`) ----------------------------------
