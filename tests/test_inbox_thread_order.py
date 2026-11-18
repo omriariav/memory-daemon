@@ -113,6 +113,14 @@ async def settle(pilot, app):
     await pilot.pause(0.25)
 
 
+async def wait_for(pilot, cond, tries=120, step=0.05):
+    for _ in range(tries):
+        if cond():
+            return True
+        await pilot.pause(step)
+    return bool(cond())
+
+
 def start_view(rows):
     """The view a test opens in: the Feed when every row is an FYI row (the
     Inbox lists only what needs a move), else the Inbox."""
@@ -241,10 +249,10 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             pane = app.query_one("#thread")
             pane.scroll_end(animate=False)
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 0))
             self.assertGreater(pane.scroll_y, 0)
             await pilot.press("v")
-            await pilot.pause(0.3)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y == 0))
             self.assertEqual(pane.scroll_y, 0)
 
     async def test_the_queue_is_not_reordered(self):

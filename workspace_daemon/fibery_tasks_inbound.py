@@ -34,6 +34,13 @@ MEM_RE = re.compile(r"(?<![A-Za-z0-9])mem:([a-z0-9]+(?:-[a-z0-9]+)*)")
 INS_RE = re.compile(r"<ins>.*?</ins>", re.DOTALL)
 DEL_TAG_RE = re.compile(r"</?del>")
 KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)(?:\[(\d+)\])?:(?: (.*))?$")
+# One block of the compact tree rendering of ``read_document``:
+# ``<id> <type> parentId=<id|null> [key=value ...] [| <text>]``, nested two
+# spaces per level, ids shortened to a unique prefix of the full block id.
+TREE_RE = re.compile(
+    r"^([A-Za-z0-9_-]+) ([a-z][a-z_]*) parentId=(\S+)"
+    r"((?: [A-Za-z][A-Za-z0-9]*=\S*)*)((?: \|(?: .*)?)?)$")
+TREE_ATTR_RE = re.compile(r" ([A-Za-z][A-Za-z0-9]*)=(\S*)")
 TITLE_LIMIT = 120
 DEFAULT_CHECKPOINT = "state/fibery-tasks.json"
 OUTBOUND_CHECKPOINT = "state/fibery-outbound.json"
@@ -76,8 +83,9 @@ def _scalar(raw, what):
 
 def _id_list(count, raw, what):
     raw = (raw or "").strip()
-    ids = [part.strip() for part in raw.split(",")] if raw else []
-    if len(ids) != int(count) or any(not ID_RE.fullmatch(i) for i in ids):
+    # TOON quotes a string that reads as a number (a short id such as "1e56").
+    ids = [_scalar(part, what) for part in raw.split(",")] if raw else []
+    if len(ids) != int(count) or any(not ID_RE.fullmatch(i or "") for i in ids):
         raise FiberyParseError(f"{what} does not match its declared length")
     return ids
 
@@ -128,6 +136,13 @@ def parse_document(text):
     The optional top-level ``comments`` section (inline comment threads, which
     ``read_document`` adds when a document has any) is skipped whole: comment
     text is never parsed or returned. Any other top-level key still fails.
+
+    The blocks come in one of two renderings that must not be mixed: the
+    ``rootBlockIds`` / ``blocks[N]:`` TOON list, or the compact tree (one
+    ``<id> <type> parentId=<id> [attrs] | <text>`` line per block, nested by
+    indentation, ids shortened to a prefix of the full block id). The tree has
+    no header: its roots are the top-level lines and its nesting is checked
+    against ``parentId``.
     """
     lines = [ln.rstrip("\r") for ln in _document_text(text).split("\n")]
     roots = None
@@ -139,6 +154,7 @@ def parse_document(text):
     in_suggestions = False
     in_comments = False
     seen_comments = False
+    tree = None             # {"roots": [...], "stack": [...]} once a tree starts
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -152,6 +168,17 @@ def parse_document(text):
             continue
         if indent > 0 and in_comments:
             continue    # an inline comment thread: not blocks, not read
+        if indent == 0 and not KEY_RE.match(body) and TREE_RE.match(body):
+            if seen_comments or suggestions_count is not None or in_suggestions:
+                raise FiberyParseError("block line after a document section")
+            tree = tree or {"roots": [], "stack": []}
+            _tree_node(line, indent, blocks, tree)
+            continue
+        if tree is not None and indent > 0:
+            if seen_comments or suggestions_count is not None or in_suggestions:
+                raise FiberyParseError("unexpected line in a document section")
+            _tree_node(line, indent, blocks, tree)
+            continue
         if indent == 0:
             in_suggestions = False
             in_comments = False
@@ -199,6 +226,10 @@ def parse_document(text):
             blocks[block["id"]] = block
             continue
         raise FiberyParseError("unexpected line outside a block")
+    if tree is not None:
+        if roots is not None or declared is not None:
+            raise FiberyParseError("tree blocks mixed with a blocks list")
+        roots, declared = tree["roots"], len(blocks)
     if not seen_version or roots is None or declared is None:
         raise FiberyParseError("document header is incomplete")
     if declared != len(blocks):
@@ -208,6 +239,39 @@ def parse_document(text):
         if any(b not in blocks for b in suggestion["blockIds"]):
             raise FiberyParseError("suggestion references an unknown block")
     return roots, blocks, suggestions
+
+
+def _tree_node(line, indent, blocks, tree):
+    """Add one compact-tree line to ``blocks``; nesting must match parentId."""
+    match = TREE_RE.match(line.strip())
+    if not match:
+        raise FiberyParseError("unrecognised block line")
+    block_id, block_type, parent_raw, attr_text, tail = match.groups()
+    if indent % 2:
+        raise FiberyParseError("unexpected block indentation")
+    level = indent // 2
+    stack = tree["stack"]
+    while stack and stack[-1][0] >= level:
+        stack.pop()
+    if level and (not stack or stack[-1][0] != level - 1):
+        raise FiberyParseError("unexpected block indentation")
+    parent = stack[-1][1] if stack else None
+    if _scalar(parent_raw, "parentId") != parent:
+        raise FiberyParseError("block nesting does not match its parentId")
+    if block_id in blocks:
+        raise FiberyParseError("duplicate block id")
+    block = {"id": block_id, "type": block_type, "parentId": parent,
+             "attrs": {key: _scalar(value, "attrs")
+                       for key, value in TREE_ATTR_RE.findall(attr_text)},
+             "childIds": []}
+    if tail:
+        block["content"] = tail[3:]    # text after " | "; empty after a bare " |"
+    blocks[block_id] = block
+    if parent is None:
+        tree["roots"].append(block_id)
+    else:
+        blocks[parent]["childIds"].append(block_id)
+    stack.append((level, block_id))
 
 
 def _suggestions_header(count, raw):
@@ -427,7 +491,11 @@ def find_list_under_heading(blocks, heading_prefix, roots=None,
 
 
 def parse_tasks(text):
-    """Return [{block_id, section, text, state, alert_id?}] in document order."""
+    """Return [{block_id, section, text, state, alert_id?}] in document order.
+
+    ``block_id`` is the id as the document shows it: shortened in the compact
+    tree rendering. ``assign_keys`` turns it into the checkpoint key.
+    """
     roots, blocks, suggestions = parse_document(text)
     for block in blocks.values():
         for child in block["childIds"]:
@@ -507,6 +575,211 @@ def parse_tasks(text):
     ids = [t["block_id"] for t in tasks]
     if len(ids) != len(set(ids)):
         raise FiberyParseError("duplicate task block id")
+    return tasks
+
+
+# --- checkpoint keys --------------------------------------------------------
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _base(key):
+    """A checkpoint key without its ``~N`` disambiguation suffix."""
+    return key.split("~", 1)[0]
+
+
+def _related(short, key):
+    base = _base(key)
+    return base.startswith(short) or short.startswith(base)
+
+
+def _fits(short, key, row, content_hash):
+    """Whether a document id may be the block a checkpoint row records.
+
+    Ids in the compact rendering are prefixes, so a prefix is only a hint: a
+    row for a block that left the document (``gone``) is matched by prefix
+    only when the text is also unchanged (a block that came back), never to a
+    different new block that merely shares the first characters.
+    """
+    if not _related(short, key):
+        return False
+    if not row.get("gone"):
+        return True
+    if key == short and UUID_RE.fullmatch(key):
+        return True    # a full id cannot collide
+    return row.get("content") == content_hash
+
+
+def _entry_task_keys(store):
+    """Block ids memory todos and notes of this importer were created under."""
+    if not (Path(store) / "memory" / "entries").is_dir():
+        return set()
+    keys = set()
+    for entry in _load_memory_entries(store).values():
+        for source_id in entry["source_ids"]:
+            if source_id.startswith(SOURCE_PREFIX):
+                keys.add(source_id[len(SOURCE_PREFIX):].split(":", 1)[0])
+    return keys
+
+
+def resolve_block(checkpoint_path, shown, key):
+    """One-shot operator action: the block shown as ``shown`` is row ``key``.
+
+    Pins the checkpoint row so a held run can go on. It writes only the
+    checkpoint (never memory, never Fibery); the pin ends by itself when the
+    block is shown under another id.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    items = checkpoint["items"]
+    if not ID_RE.fullmatch(shown or "") or key not in items:
+        raise RuntimeError(
+            f"cannot resolve {shown!r}={key!r}: no such checkpoint row")
+    if not _related(shown, key):
+        raise RuntimeError(
+            f"cannot resolve {shown!r}={key!r}: the id does not belong to "
+            "that row")
+    for row in items.values():
+        if row.get("pin") == shown:
+            del row["pin"]
+    items[key]["pin"] = shown
+    _save_checkpoint(checkpoint_path, checkpoint)
+
+
+def mark_block_gone(checkpoint_path, key):
+    """One-shot operator action: retire the row of a task deleted from Fibery.
+
+    Marks the row gone (no memory change, as for any block that leaves the
+    document). It matches again only if the same text returns.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    row = checkpoint["items"].get(key)
+    if row is None:
+        raise RuntimeError(f"cannot mark {key!r} gone: no such checkpoint row")
+    row["gone"] = True
+    row.pop("pin", None)
+    _save_checkpoint(checkpoint_path, checkpoint)
+
+
+def _hold_hint(shown, keys):
+    pick = " or ".join(f"--resolve {shown}={k}" for k in sorted(keys)[:3])
+    return (f"restore the old text of the task, or tell the importer which "
+            f"row it is: `daemon.py run --routine <this routine> {pick}` "
+            "(`--mark-gone <key>` retires the row of a task deleted from "
+            "Fibery)")
+
+
+def assign_keys(tasks, items, entry_keys=lambda: set()):
+    """Set each task's ``block_id`` to its checkpoint key (in place).
+
+    A full id is its own key. A shortened id stands for the one live row that
+    relates to it (``_fits``). When several live rows relate to one shown id,
+    rows another shown task accounts for are set aside; of the rest the one
+    whose text matches wins, and if the text does not decide the run is held
+    (FiberyHeld) before any write, naming the operator command that settles
+    it. A row pinned by ``--resolve`` is that shown id's row, full stop. A
+    row that left the document (gone) is only matched by unchanged text, and
+    only when no live row relates. A task nothing matches is new and gets a
+    key no row or memory entry already relates to: its own short id, or
+    ``<short>~2``, ``~3``... When several tasks claim one row, the one whose
+    text matches keeps it and the others become new.
+    """
+    pins = {}
+    for key, row in items.items():
+        if row.get("pin") and not row.get("gone"):
+            pins.setdefault(row["pin"], key)
+    chosen = {}
+    live = {}
+    gone = {}
+    for index, task in enumerate(tasks):
+        short = task["block_id"]
+        chash = _task_hashes(task)[1]
+        if short in pins:
+            chosen[index] = pins[short]
+        elif UUID_RE.fullmatch(short) and short in items \
+                and _fits(short, short, items[short], chash):
+            chosen[index] = short       # a full id cannot collide
+        else:
+            related = [k for k, row in items.items()
+                       if _fits(short, k, row, chash)]
+            live[index] = [k for k in related if not items[k].get("gone")]
+            gone[index] = [k for k in related if items[k].get("gone")]
+    settled = set(chosen.values())
+    for index in live:
+        live[index] = [k for k in live[index] if k not in settled]
+        gone[index] = [k for k in gone[index] if k not in settled]
+    for index, found in live.items():
+        if len(found) == 1:
+            chosen[index] = found[0]
+            settled.add(found[0])
+    for index, found in live.items():
+        if index in chosen:
+            continue
+        task = tasks[index]
+        short = task["block_id"]
+        chash = _task_hashes(task)[1]
+        rest = [k for k in found if k not in settled]
+        if len(rest) > 1:
+            rest = [k for k in rest if items[k].get("content") == chash] \
+                or rest
+        if len(rest) > 1:
+            raise FiberyHeld(
+                f"Fibery import held: the shown block id {short} matches "
+                f"several checkpoint rows ({', '.join(sorted(rest))}) and "
+                f"the text does not tell which; {_hold_hint(short, rest)}")
+        if rest:
+            chosen[index] = rest[0]
+    for index, found in gone.items():
+        if index in chosen or live.get(index):
+            continue
+        if len(found) > 1:
+            raise FiberyHeld(
+                f"Fibery import held: the shown block id "
+                f"{tasks[index]['block_id']} matches several returned rows "
+                f"({', '.join(sorted(found))}); "
+                f"{_hold_hint(tasks[index]['block_id'], found)}")
+        if found:
+            chosen[index] = found[0]
+    claims = {}
+    for index, key in chosen.items():
+        claims.setdefault(key, []).append(index)
+    for key, indexes in claims.items():
+        if len(indexes) == 1:
+            continue
+        row = items[key]
+        keep = [i for i in indexes
+                if _task_hashes(tasks[i])[1] == row.get("content")]
+        if len(keep) != 1:
+            shown = ", ".join(tasks[i]["block_id"] for i in indexes)
+            raise FiberyHeld(
+                f"Fibery import held: {len(indexes)} tasks (shown as "
+                f"{shown}) share the block-id prefix of checkpoint row "
+                f"{key} and their text does not tell which one it is; "
+                f"{_hold_hint(tasks[indexes[0]]['block_id'], [key])}")
+        for i in indexes:
+            if i != keep[0]:
+                del chosen[i]
+    taken = set(items) | set(chosen.values())
+    known = None
+    for index, task in enumerate(tasks):
+        if index in chosen:
+            continue
+        if known is None:
+            known = set(entry_keys())
+        short = task["block_id"]
+        everything = taken | known
+        key = short
+        if short in items or any(_related(short, k) for k in everything
+                                 if k != short):
+            n = 2
+            while f"{short}~{n}" in everything:
+                n += 1
+            key = f"{short}~{n}"
+        chosen[index] = key
+        taken.add(key)
+    for index, task in enumerate(tasks):
+        task["shown_id"] = task["block_id"]
+        task["block_id"] = chosen[index]
     return tasks
 
 
@@ -777,6 +1050,8 @@ def _plan(items, tasks, cfg, linkable=frozenset()):
     current = {t["block_id"]: t for t in tasks}
     for task in tasks:
         row = items.get(task["block_id"])
+        if row is not None and row.get("pending_create"):
+            row = None   # the key is reserved; the todo is not made yet
         full, content = _task_hashes(task)
         if row is None:
             if _marker(task) in linkable:
@@ -821,6 +1096,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
     checkpoint = _load_checkpoint(checkpoint_path)
     items = checkpoint["items"]
     tasks = parse_tasks(fetch(cfg, base_dir))
+    assign_keys(tasks, items, lambda: _entry_task_keys(cfg["store"]))
     report["tasks"] = len(tasks)
     linkable = _linkable_entries(
         cfg["store"], tasks, items, _outbound_ids(base_dir, cfg))
@@ -853,9 +1129,23 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
                "transitions": prior.get("transitions", 0)}
         if prior.get("linked"):
             row["linked"] = True
+        if prior.get("pin"):
+            row["pin"] = prior["pin"]
         row.update(extra)
         items[task["block_id"]] = row
         return row
+
+    def reserve(task):
+        """Record the key before the todo exists, so a crash between the
+        memory write and the checkpoint cannot make the next run pick another
+        key (and a second todo) for the same block. A full id is its own key
+        and needs no reservation."""
+        key = task["block_id"]
+        if key not in items and not UUID_RE.fullmatch(key):
+            items[key] = {
+                "hash": "", "content": "", "state": "TODO", "entry_id": None,
+                "date": date, "transitions": 0, "pending_create": True}
+            save()
 
     def _write(fn, *args):
         try:
@@ -897,6 +1187,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         if created >= max_new:
             report["pending"] += 1
             continue
+        reserve(task)
         entry_id = _write(_create_todo, cfg, store, task, date)
         # Checkpoint as TODO until the done note lands, so a failed note is
         # retried through the normal TODO -> DONE path.
@@ -943,6 +1234,7 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
             if created >= max_new:
                 report["pending"] += 1
                 continue
+            reserve(task)
             entry_id = _write(_create_todo, cfg, store, task, date)
             created += 1
             report["created"] += 1
@@ -963,6 +1255,16 @@ def run(cfg, base_dir, checkpoint_path, dry_run=False):
         log(f"fibery_tasks_inbound: reopened block={task['block_id']}")
     for block_id in plan["gone"]:
         items[block_id]["gone"] = True
+        items[block_id].pop("pin", None)    # a pin never outlives its block
+    for task in tasks:
+        # How each live block is shown now: outbound resolves a short anchor
+        # only through a row last seen under exactly that id. A pin names
+        # the id as it was shown, so it ends when the display changes.
+        row = items.get(task["block_id"])
+        if row is not None and task.get("shown_id"):
+            row["last_short"] = task["shown_id"]
+            if row.get("pin") and row["pin"] != task["shown_id"]:
+                del row["pin"]
     report["gone"] = len(plan["gone"])
     if plan["gone"]:
         log(f"fibery_tasks_inbound: {len(plan['gone'])} item(s) gone from "
