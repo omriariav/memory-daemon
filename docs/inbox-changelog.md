@@ -7,6 +7,20 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-18
+
+### Fixed
+
+- **The Tasks view (and the thread pane) kept snapping back to the top.**
+  Every redraw of the same item (a refresh that changed a row, a terminal
+  resize) drew the detail card or thread again and scrolled it home, so a
+  long card could not be read. The pane now keeps its scroll position for the
+  same item and starts at the top for another item or the other thread order.
+- **Queue paging.** PgUp near the top cleared the cursor (the page landed on a
+  group header); it now stays on the first row. Home, `g` and PgUp to the
+  first row also show that row's group header, and resizing the terminal
+  shorter keeps the cursor row in view.
+
 ## [0.12.1] - 2026-11-18
 
 Mostly a test and CI patch; one fix to the `?` screen.

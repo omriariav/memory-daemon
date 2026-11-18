@@ -112,6 +112,40 @@ class Queue(OptionList):
         self.rows = []
         self.first_idx = {}
 
+    def scroll_to_highlight(self, top=False):
+        """As the list does, but the first row also shows its group header
+        (Home, g and PgUp stop on the first row, header above it)."""
+        super().scroll_to_highlight(top)
+        first = next((n for n, o in enumerate(self.options)
+                      if not o.disabled), None)
+        if first is not None and self.highlighted == first:
+            self.scroll_to(y=0, animate=False, immediate=True)
+
+    def on_resize(self, _event):
+        # A shorter pane can leave the cursor row below its edge.
+        self.call_after_refresh(self.scroll_to_highlight)
+
+    def _page(self, step):
+        """PgUp/PgDn: a page of lines. A page that lands on a group header
+        (a disabled option) must not clear the cursor."""
+        before = self.highlighted
+        if step > 0:
+            super().action_page_down()
+        else:
+            super().action_page_up()
+        if self.highlighted is None and self.options:
+            enabled = [n for n, o in enumerate(self.options) if not o.disabled]
+            if enabled:
+                self.highlighted = enabled[-1 if step > 0 else 0]
+            elif before is not None:
+                self.highlighted = before
+
+    def action_page_up(self):
+        self._page(-1)
+
+    def action_page_down(self):
+        self._page(1)
+
     def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
               ghost_at=None, visual=False, today=None):
         """Draw `groups` (`views.Group`). A group with no rows is skipped,
@@ -244,6 +278,7 @@ class Queue(OptionList):
 
 class ThreadView(VerticalScroll):
     can_focus = True
+    _shown = None      # (item key, newest_first) of the last drawing
 
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
@@ -256,13 +291,19 @@ class ThreadView(VerticalScroll):
         `task_detail`)."""
         body = self.query_one("#thread-body", Static)
         width = max(30, (self.size.width or 60) - 4)
+        # A redraw of the same item (a refresh, a resize) keeps the scroll
+        # position; another item, or the other thread order, starts at the top.
+        shown = (None if item is None else item.key, newest_first)
+        fresh = shown != self._shown
+        self._shown = shown
         if item is None:
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
             return
         if tasksmod.is_task(item):
             body.update(task_detail(item, pal, width, visual,
                                     today or dt.date.today()))
-            self.scroll_home(animate=False)
+            if fresh:
+                self.scroll_home(animate=False)
             return
         out = Text()
         out.append(vis(item.who, visual), Style(bold=True, color=pal["urgent"] if item.section == "urgent" else pal["primary"]))
@@ -305,7 +346,8 @@ class ThreadView(VerticalScroll):
             # the last message drawn is then not known to be the first.
             out.append("─ thread start ─\n", Style(color=pal["muted"], dim=True))
         body.update(out)
-        self.scroll_home(animate=False)
+        if fresh:
+            self.scroll_home(animate=False)
 
 
 def task_detail(item, pal, width, visual, today):
