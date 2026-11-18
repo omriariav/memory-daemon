@@ -324,6 +324,35 @@ class ActsTest(unittest.TestCase):
         self.assertEqual(listed["task:1"]["meta"]["due"], "2030-01-12")
         self.assertIn("task:2", listed)
 
+    def test_a_task_with_a_big_meta_is_still_flagged_and_undoable(self):
+        a = self.actions()
+        it = task(1, due="2030-01-12", evidence="x" * 1900,
+                  extra_blob="y" * 9000)         # over both meta limits
+        out = a.send_act(it, "due", {"date": "2030-01-20"})
+        self.assertEqual(out.status, acts.OK)
+        (logged,) = a.ops_rows()
+        self.assertEqual(logged["meta"], {})          # trimmed in the log
+        self.assertIs(logged["task"], True)
+        self.assertEqual(logged["prev_due"], "2030-01-12")
+        self.assertEqual(a.invertible(logged), "due")
+        a.send_inverse(logged)
+        self.assertEqual(self.src.requests()[1]["args"],
+                         {"date": "2030-01-12"})
+
+    def test_a_pending_task_op_keeps_its_log_extra_for_the_retry(self):
+        a = self.actions()
+        self.src.configure("fail")
+        a.send_act(task(1, due="2030-01-12"), "due", {"date": "2030-01-20"})
+        (entry,) = a._pending_ops.all()
+        self.assertEqual(entry["log_extra"],
+                         {"task": True, "prev_due": "2030-01-12"})
+        self.src.configure("ok")
+        report = a.retry_pending(now=entry["queued_at"] + 10_000)
+        self.assertEqual(report.results[0][1].status, acts.OK)
+        retried = [r for r in a.ops_rows() if r["result"] == "ok"][0]
+        self.assertTrue(retried["retry"] and retried["task"])
+        self.assertEqual(retried["prev_due"], "2030-01-12")
+
     def test_a_source_without_acts_is_read_only(self):
         # a source with no `acts:` is left out of the config entirely
         a = LocalActions(self.store, base_dir=self.base, acts={})
