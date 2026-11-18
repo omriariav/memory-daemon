@@ -866,6 +866,14 @@ class Fixed:
         return self.results
 
 
+def warn_text(app):
+    """The #confirm-warn text, or '' while the modal's children are unmounted."""
+    try:
+        return str(app.screen.query_one("#confirm-warn").render())
+    except Exception:
+        return ""
+
+
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
         if cond():
@@ -1117,8 +1125,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 # 0.7.0: never a send or a draft; only Copy for Slack is offered
                 self.assertIsInstance(app.screen, ConfirmSend, key)
                 self.assertEqual(app.screen.options, ("copy",), key)
-                self.assertIn("a channel post without a thread is off",
-                              str(app.screen.query_one("#confirm-warn").render()))
+                self.assertTrue(await wait_for(pilot, lambda: "a channel post without a thread is off" in warn_text(app)), key)
+                self.assertIn("a channel post without a thread is off", warn_text(app))
                 await pilot.press("escape")
                 await pilot.pause(0.2)
             self.assertEqual((app.pending, calls), ([], []))
@@ -1157,8 +1165,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                     pilot, lambda: isinstance(app.screen, ConfirmSend)))
                 # 0.7.0: only Copy for Slack is offered, with the reason
                 self.assertEqual(app.screen.options, ("copy",))
-                self.assertIn("no valid meta.reply_to", str(
-                    app.screen.query_one("#confirm-warn").render()))
+                self.assertTrue(await wait_for(pilot, lambda: "no valid meta.reply_to" in warn_text(app)))
+                self.assertIn("no valid meta.reply_to", warn_text(app))
                 await pilot.press("escape")
                 await pilot.pause(0.2)
                 self.assertEqual(app.pending, [])
@@ -1421,7 +1429,8 @@ class PrecheckFlowTest(WorkerCleanup, PrecheckBase, unittest.IsolatedAsyncioTest
             modal = app.screen
             self.assertTrue(await wait_for(pilot, lambda: modal.focused is not None))
             self.assertEqual(modal.focused.id, "cancel")
-            warn = str(modal.query_one("#confirm-warn").render())
+            self.assertTrue(await wait_for(pilot, lambda: "⚠ You already replied at 16:40" in warn_text(app)))
+            warn = warn_text(app)
             self.assertIn("⚠ You already replied at 16:40", warn)
             self.assertEqual(modal.text, "Thanks, on it.")
             self.assertEqual(self.stdin()["text"], "Thanks, on it.")
@@ -1440,8 +1449,10 @@ class PrecheckFlowTest(WorkerCleanup, PrecheckBase, unittest.IsolatedAsyncioTest
                 await pilot.press("a")
                 self.assertTrue(await wait_for(
                     pilot, lambda: isinstance(app.screen, ConfirmSend), tries=200))
-                self.assertIn("couldn't check for a newer reply", str(
-                    app.screen.query_one("#confirm-warn").render()), mode)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: "couldn't check for a newer reply" in warn_text(app),
+                    tries=200), mode)
+                self.assertIn("couldn't check for a newer reply", warn_text(app), mode)
                 self.assertTrue(await wait_for(
                     pilot, lambda: app.screen.focused is not None))
                 self.assertEqual(app.screen.focused.id, "cancel")
