@@ -135,11 +135,13 @@ def inbox_groups(items, today=None):
                  key=tasks.sort_key)
     overdue = any(tasks.due_of(i) < today for i in due)
     review = sorted((i for i in items if is_review(i)), key=lambda i: -i.ts)
-    return [Group("urgent", "URGENT", urgent, hot=True, keep_empty=True),
-            Group("owe", "I OWE", owe, keep_empty=True),
-            Group("nudge", "NUDGE DUE", nudge, keep_empty=True),
-            Group("due_today", "DUE TODAY", due, hot=overdue),
-            Group("review", "REVIEW", review)]
+    groups = [Group("urgent", "URGENT", urgent, hot=True, keep_empty=True),
+              Group("owe", "I OWE", owe, keep_empty=True),
+              Group("nudge", "NUDGE DUE", nudge, keep_empty=True),
+              Group("due_today", "DUE TODAY", due, hot=overdue)]
+    if review:
+        groups.append(Group("review", "REVIEW", review))
+    return groups
 
 
 # --- 3 Tasks ----------------------------------------------------------------

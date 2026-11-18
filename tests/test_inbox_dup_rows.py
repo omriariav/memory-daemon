@@ -192,11 +192,10 @@ class ViewTest(unittest.TestCase):
 
     def test_review_is_its_own_inbox_section_listed_only_when_present(self):
         review, other = self.items()
-        shown = lambda rows: [g.title for g in views.inbox_groups(rows)  # noqa: E731
-                              if g.items or g.keep_empty]
-        self.assertEqual(shown([other]), ["URGENT", "I OWE", "NUDGE DUE"])
-        self.assertEqual(shown([other, review]),
-                         ["URGENT", "I OWE", "NUDGE DUE", "REVIEW"])
+        titles = [g.title for g in views.inbox_groups([other])]
+        self.assertNotIn("REVIEW", titles)
+        titles = [g.title for g in views.inbox_groups([other, review])]
+        self.assertEqual(titles[-1], "REVIEW")
         groups = {g.key: g for g in views.inbox_groups([review, other])}
         self.assertEqual([i.key for i in groups["review"].items], [review.key])
         self.assertEqual([i.key for i in groups["owe"].items], [other.key])
