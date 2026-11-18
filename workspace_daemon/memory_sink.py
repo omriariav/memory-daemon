@@ -1669,6 +1669,7 @@ def capture(routine, item, summary, dry_run=False):
     _commit_store(store, f"memory: {rid} auto-capture")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
     anchored_todo = None if retry else _open_todo_root_refusal(r, item, source_id)
+    duplicate_of = None
     if r.returncode == 0 and m:
         verdict, entry_id = m.group(1), m.group(2)
     elif anchored_todo:
@@ -1690,6 +1691,17 @@ def capture(routine, item, summary, dry_run=False):
             log(
                 f"routine={rid} memory WARN ambiguous CLI result was "
                 f"verified on disk for source_id={source_id}"
+            )
+        elif _near_duplicate_refusal(r, out):
+            # The store already holds this content under another entry. The
+            # refusal is deterministic: retrying can never succeed, and the
+            # content is captured, so this is neither an error nor a retry.
+            verdict, entry_id = "duplicate_skipped", None
+            duplicate_of = _near_duplicate_match(out)
+            log(
+                f"routine={rid} memory: near-duplicate of "
+                f"{duplicate_of or 'an existing entry'}; already captured, "
+                f"nothing added for source_id={source_id}"
             )
         elif r.returncode != 0:
             raise RuntimeError(
@@ -1728,12 +1740,15 @@ def capture(routine, item, summary, dry_run=False):
         "memory_source_id": source_id,
         "memory_personal": bool(ptag) and ptag in tags,
     }
+    if duplicate_of:
+        outcome["memory_duplicate_of"] = duplicate_of
     if thread_source_id:
         # The reply has its own id, but earlier failures of this thread are
         # recorded under the root id; the runner clears them by this one.
         outcome["memory_thread_source_id"] = thread_source_id
     if (
         etype == "meeting" and extraction_succeeded and source_id
+        and verdict != "duplicate_skipped"
         and not owner_attention_denied
         and owner_todos.enabled(routine) and owner_todos.is_meeting_item(item)
     ):
@@ -1742,6 +1757,27 @@ def capture(routine, item, summary, dry_run=False):
             bool(ptag) and ptag in tags,
         ))
     return outcome
+
+
+_NEAR_DUP_RE = re.compile(r"✗ this looks like a near-duplicate of:")
+_NEAR_DUP_MATCH_RE = re.compile(r"^[ \t]+\d+\.\d+[ \t]+([A-Za-z0-9][\w.-]*)", re.M)
+
+
+def _near_duplicate_refusal(result, out):
+    """Whether the store refused an add as a near-duplicate of an entry it holds.
+
+    Only the store's own refusal counts: exit 2 plus its "✗ this looks like a
+    near-duplicate of:" line. Any other failure, including a different exit
+    code with that text, stays an error.
+    """
+    return result.returncode == 2 and bool(_NEAR_DUP_RE.search(out))
+
+
+def _near_duplicate_match(out):
+    """Id of the best-matching existing entry named in the refusal, or None."""
+    refusal = _NEAR_DUP_RE.search(out)
+    hit = _NEAR_DUP_MATCH_RE.search(out, refusal.end()) if refusal else None
+    return hit.group(1) if hit else None
 
 
 _OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open \S+ (\S+) —")

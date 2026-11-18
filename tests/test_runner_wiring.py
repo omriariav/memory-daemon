@@ -1010,6 +1010,28 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(self.applied, ["archive"])
         self.assertNotIn("memory_error", self.ledger()["m1"])
 
+    def test_near_duplicate_outcome_is_not_an_error_and_is_not_retried(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        outcome = {"memory": "duplicate_skipped", "memory_entry_id": None,
+                   "memory_duplicate_of": "2026-01-02-example-entry-one"}
+        with mock.patch.object(
+            memory_sink, "capture", return_value=outcome
+        ) as capture:
+            first = runner.run(self.base, [r])
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 1)     # the ledger settles it
+        record = self.ledger()["m1"]
+        self.assertNotIn("memory_error", record)
+        self.assertEqual(record["memory"], "duplicate_skipped")
+        self.assertEqual(self.applied, ["archive"])
+
     def test_incomplete_drive_expansion_withholds_gmail_actions_and_retries(self):
         r = routine(self.vault, actions=["archive"])
         original_fetch = runner.SOURCES["gmail"]
