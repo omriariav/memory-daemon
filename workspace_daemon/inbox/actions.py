@@ -51,6 +51,7 @@ from . import context, customactions, draftme, invites, items, mrkdwn, views
 from . import polish as polish_mod
 from . import sources, writes
 from . import summary as summary_mod
+from . import tasks as tasks_mod
 from .models import to_v1
 
 
@@ -85,6 +86,29 @@ def _invite_event(item):
     event = meta.get("event_id") if isinstance(meta, dict) else None
     return event if (str(getattr(item, "key", "")).startswith("invites:")
                      and isinstance(event, str)) else None
+
+
+def act_meta(item):
+    """The meta an act request carries. For a task it holds the due date the
+    user saw, a move made here and not yet in a list refresh included (so the
+    source checks, and the ops log keeps, what was on screen)."""
+    meta = item.meta
+    if tasks_mod.is_task(item):
+        due = tasks_mod.due_of(item)
+        meta = dict(meta, due=due.isoformat() if due else None)
+    return meta
+
+
+def task_extra(item, action, meta):
+    """What an op's log row keeps beyond the (size-limited) request: `task`
+    for a task op, and for a due move `prev_due`, the date before it, taken
+    from the full meta so a big meta cannot make the move un-undoable."""
+    if not tasks_mod.is_task(item):
+        return None
+    extra = {"task": True}
+    if action == "due":
+        extra["prev_due"] = (meta or {}).get("due")
+    return extra
 
 
 def _cached(row):
@@ -535,19 +559,23 @@ class LocalActions:
     def act_enabled(self, item, action):
         return action in self.act_names(item)
 
-    def send_act(self, item, action, args=None):
+    def send_act(self, item, action, args=None, meta=None):
         """Tell the item's source (blocks: call from a worker): one `act`
         call with a fresh op_id. A failure keeps the op in the pending file
-        for a retry; a conflict is not retried. An `ActOutcome`."""
+        for a retry; a conflict is not retried. `meta` is the request's meta
+        when it was fixed earlier (a task's due move: the date shown before
+        the move). An `ActOutcome`."""
         if not self.act_enabled(item, action):
             return ActOutcome("unavailable", f"{action} is not enabled for "
                                              "this source")
+        meta = act_meta(item) if meta is None else meta
         request = acts_mod.build_request(
-            acts_mod.new_op_id(), action, item.key, item.meta, item.ts, args)
-        return self._deliver(item.origin, request, item.who, item.where)
+            acts_mod.new_op_id(), action, item.key, meta, item.ts, args)
+        return self._deliver(item.origin, request, item.who, item.where,
+                             extra=task_extra(item, action, meta))
 
     def _log_op(self, source, request, who, where, status, message,
-                inverse_of=None, retry=False):
+                inverse_of=None, retry=False, extra=None):
         if self._ops is None:
             return
         row = {"at": time.time(), "op_id": request["op_id"],
@@ -561,6 +589,8 @@ class LocalActions:
                "message": str(message)[:200]}
         if inverse_of:
             row["inverse_of"] = inverse_of
+        if extra and not inverse_of:
+            row.update(extra)   # task, prev_due (see task_extra)
         if retry:
             row["retry"] = True
         try:
@@ -579,7 +609,8 @@ class LocalActions:
             status = acts_mod.PENDING
         return status, resp
 
-    def _deliver(self, source, request, who, where, inverse_of=None):
+    def _deliver(self, source, request, who, where, inverse_of=None,
+                 extra=None):
         """One act call. The op is written to the pending file BEFORE the call
         (so a crash or a kill during it leaves it for a retry with the same
         op_id) and removed once the source answers ok, shadow or conflict. An
@@ -593,6 +624,8 @@ class LocalActions:
                      "where": str(where)[:acts_mod.WHO_MAX],
                      "queued_at": now, "last_try": now, "tries": 1,
                      "message": "sent, no answer yet"}
+            if extra:
+                entry["log_extra"] = extra
             try:
                 dropped = sum(self._pending_ops.add(entry, now))
             except OSError:
@@ -604,12 +637,18 @@ class LocalActions:
                     self._pending_ops.note(request["op_id"], resp["message"])
                 else:
                     self._pending_ops.remove(request["op_id"])
+                    if (request["action"] == "due"
+                            and status in (acts_mod.OK, acts_mod.SHADOW)):
+                        # Newer than any due still waiting for a retry: it
+                        # must never be overwritten by an older date.
+                        self._pending_ops.drop_action(
+                            request["id"], "due", keep_op=request["op_id"])
             except OSError:
                 pass
         lost = status == acts_mod.PENDING and not kept and inverse_of is None
         self._log_op(source, request, who, where,
                      "failed" if lost else status, resp["message"],
-                     inverse_of)
+                     inverse_of, extra=extra)
         return ActOutcome(acts_mod.LOST if lost else status, resp["message"],
                           request["op_id"], dropped, resp["shadow"])
 
@@ -650,7 +689,8 @@ class LocalActions:
             if source not in self.acts_cfg or not isinstance(request, dict):
                 continue
             try:     # stamp the try first: another pane skips it, a crash keeps it
-                self._pending_ops.touch(entry["op_id"], now, "retrying")
+                if not self._pending_ops.touch(entry["op_id"], now, "retrying"):
+                    continue    # replaced by a newer op since the list was read
             except OSError:
                 pass
             status, resp = self._call(source, request)
@@ -662,7 +702,7 @@ class LocalActions:
             except OSError:
                 pass
             if status == acts_mod.CONFLICT and request["action"] in (
-                    "close", "snooze", "mute"):
+                    "close", "snooze", "mute", "drop"):
                 try:    # a mark made after the op was queued is a newer decision
                     self.store.restore_unless_newer(
                         request["id"], entry.get("queued_at") or now)
@@ -671,18 +711,21 @@ class LocalActions:
             self._log_op(source, request, entry.get("who", ""),
                          entry.get("where", ""),
                          "pending" if status == acts_mod.PENDING else status,
-                         resp["message"], retry=True)
+                         resp["message"], retry=True,
+                         extra=entry.get("log_extra"))
             results.append((entry, ActOutcome(
                 status, resp["message"], entry["op_id"], 0, resp["shadow"])))
         return RetryReport(results, dropped)
 
-    def queue_act(self, item, action, args=None):
+    def queue_act(self, item, action, args=None, meta=None):
         """Keep an op for a later retry without calling the source (the app is
         quitting, so nothing may block). Returns True when it was stored."""
         if not self.act_enabled(item, action) or self._pending_ops is None:
             return False
+        meta = act_meta(item) if meta is None else meta
         request = acts_mod.build_request(
-            acts_mod.new_op_id(), action, item.key, item.meta, item.ts, args)
+            acts_mod.new_op_id(), action, item.key, meta, item.ts, args)
+        extra = task_extra(item, action, meta)
         now = time.time()
         entry = {"op_id": request["op_id"], "request": request,
                  "source": item.origin, "action": action, "id": item.key,
@@ -690,12 +733,14 @@ class LocalActions:
                  "where": str(item.where)[:acts_mod.WHO_MAX],
                  "queued_at": now, "last_try": 0, "tries": 0,
                  "message": "not sent: the inbox was closed"}
+        if extra:
+            entry["log_extra"] = extra
         try:
             self._pending_ops.add(entry, now)
         except OSError:
             return False
         self._log_op(item.origin, request, item.who, item.where, "pending",
-                     entry["message"])
+                     entry["message"], extra=extra)
         return True
 
     def ops_rows(self):
@@ -714,9 +759,10 @@ class LocalActions:
         return rows
 
     def invertible(self, row):
-        """The act that undoes a logged op, or None: only a `close` or a `mute`
-        that reached the source (ok or shadow) has one, and only while its
-        source still lists the act."""
+        """The act that undoes a logged op, or None: only a `close`, `drop`,
+        `due` or `mute` that reached the source (ok or shadow) has one, and
+        only while its source still lists the act. A `due` needs the date it
+        had before (`prev_due`)."""
         action = acts_mod.INVERSE.get(row.get("action"))
         cfg = self.acts_cfg.get(row.get("source"))
         if (action is None or cfg is None or row.get("inverse_of")
@@ -724,6 +770,11 @@ class LocalActions:
                 or row.get("result") not in (acts_mod.OK, acts_mod.SHADOW)
                 or row.get("action") not in cfg["acts"]):
             return None
+        if row.get("action") == "due":
+            prev = row.get("prev_due", False)
+            if prev is False or (prev is not None
+                                 and tasks_mod.parse_day(prev) is None):
+                return None
         return action
 
     def send_inverse(self, row):
@@ -735,12 +786,13 @@ class LocalActions:
                                              "was already undone)")
         request = acts_mod.build_request(
             acts_mod.new_op_id(), action, row["id"], row.get("meta") or {},
-            time.time(), {})
+            time.time(), acts_mod.inverse_args(row))
         out = self._deliver(row["source"], request, row.get("who", ""),
                             row.get("where", ""), inverse_of=row["op_id"])
         if out.status in (acts_mod.OK, acts_mod.SHADOW):
             try:
-                self.store.restore(row["id"])
+                if row.get("action") != "due":     # a due move has no mark
+                    self.store.restore(row["id"])
                 if self._pending_ops is not None:   # a pending op is stale now
                     self._pending_ops.drop_for_id(row["id"])
             except OSError:

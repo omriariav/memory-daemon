@@ -1,5 +1,6 @@
 """The inbox TUI app. Needs Textual; import it only through `cli.run`."""
 import asyncio
+import datetime
 import inspect
 import sys
 import threading
@@ -23,13 +24,15 @@ from . import health as healthmod
 from . import items as itm_items
 from . import draftme as draftme_mod
 from . import polish as polishmod
+from . import tasks as tasksmod
 from . import writes as writes_mod
 from . import summary as summod
-from .actions import Result
+from .actions import Result, act_meta
 from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
                      copy_section_text, from_v1)
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
-                      ConfirmWrite, HelpScreen, NoteScreen, OpsScreen,
+                      ConfirmWrite, DateScreen, HelpScreen, NoteScreen,
+                      OpsScreen,
                       PolishScreen, RulesScreen, SnoozePicker)
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
@@ -69,15 +72,23 @@ RSVP_KEYS = {
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
 EXTERNAL_KINDS = ("send", "nudge", "draft", "rsvp", "save", "action", "react",
-                  "waits_on", "relay")
+                  "waits_on", "relay", "due")
 # 0.10.0 acts. `done`, `snooze` and `mute` write a local mark and then tell the
 # source (quitting commits the mark and keeps the op for a retry: it never
 # calls the source); `waits_on` and `relay` have no local mark (they are in
-# EXTERNAL_KINDS: quitting cancels them).
-ACT_MARK_KINDS = ("done", "snooze", "mute")
+# EXTERNAL_KINDS: quitting cancels them). 0.12.0 (tasks): `drop` is a mark kind
+# like `done`; `due` has no store mark (the new date shows at once, kept in
+# memory until the next list refresh) and, like `waits_on`, is cancelled by
+# quitting inside the undo window.
+ACT_MARK_KINDS = ("done", "snooze", "mute", "drop")
+NO_MARK_ACT_KINDS = ("waits_on", "relay", "due")
+ACT_KINDS = ACT_MARK_KINDS + NO_MARK_ACT_KINDS
 ACTS_OFF = ("Acts are not enabled for this source (set acts: on its command "
             "source in inbox.yaml)")
 CONFLICT_TOAST = "New message since you looked; refresh"
+TASK_CONFLICT_TOAST = "The task changed since you looked; refresh"
+TASK_KEYS_TOAST = ("A task: d done, D outcome, s due date, x drop, o open")
+DECISION_REQUIRED = "A decision needs its text. Nothing sent."
 SHADOW_WORD = "shadow"
 
 
@@ -100,7 +111,7 @@ def _takes_show_all(fetch):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | draft | done | ack | snooze | mute | waits_on | relay | rsvp | save | action | react
+    kind: str                 # send | nudge | draft | done | ack | snooze | mute | drop | due | waits_on | relay | rsvp | save | action | react
     item: Item
     text: str = ""
     until: float = 0.0
@@ -117,6 +128,7 @@ class Pending:
     mark_done: bool = False   # action: a successful run marks the item done
     act: str = ""             # 0.10.0: the act to send after the mark (close, snooze, ...)
     act_args: dict = field(default_factory=dict)   # its args
+    act_meta: object = None   # 0.12.0: the request meta fixed at enqueue (a due move: the date shown before it)
     react: str = ""           # 0.10.0: done reaction emoji sent after the act
 
 
@@ -165,7 +177,6 @@ class InboxApp(App):
     #strip { height: 1; }
     #main { height: 1fr; }
     #routines { width: 26; border: round $panel; border-title-color: $text-muted; padding: 0 1; display: none; }
-    #tasks { height: 1fr; content-align: center middle; text-align: center; display: none; }
     #health { height: 1fr; border: round $panel; border-title-color: $text-muted; padding: 0 1; display: none; scrollbar-size-vertical: 1; }
     #health:focus { border: round $primary; border-title-color: $primary; }
     #left { width: 42%; min-width: 38; max-width: 76; border: round $panel; border-title-color: $text-muted; }
@@ -193,7 +204,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, OpsScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, DateScreen, OpsScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-warn { margin: 1 0 0 0; }
@@ -240,7 +251,7 @@ class InboxApp(App):
                  undo_s=5.0, leave_s=0.18, stream_delay=0.012, poll_s=None,
                  saved=None, saved_days=None, units=None,
                  context_debounce_s=CONTEXT_DEBOUNCE_S, context_cache=None,
-                 health=None, view="inbox"):
+                 health=None, view="inbox", today=None):
         """`fetch()` blocks and returns a list of SourceResult (it runs in a
         worker thread). `store` holds done/ack/snooze marks. A `fetch` that
         takes a `show_all` argument gets the state of the A toggle.
@@ -248,7 +259,9 @@ class InboxApp(App):
         memory" routine (S jumps to it); None leaves that routine out.
         `health()` blocks and returns a health snapshot (see health.py); it
         runs in a worker thread, every 30 s; None leaves the health strip and
-        the Health view empty. `view` is the view the app starts in.
+        the Health view empty. `view` is the view the app starts in. `today()`
+        returns the local date a task's due date is counted from (default
+        `datetime.date.today`; tests inject a fixed one).
 
         `units` (a list of `sources.Unit`) switches on change-driven refresh:
         every `watch_interval_s` the files each unit depends on are
@@ -286,7 +299,11 @@ class InboxApp(App):
         self._event_origins = tuple(
             s["name"] for s in settings.get("sources") or []
             if s.get("type") == "events") or views.EVENT_ORIGINS
-        self._views = {"inbox": [], "waiting": [], "feed": []}
+        self._views = {"inbox": [], "waiting": [], "tasks": [], "feed": []}
+        self.today_fn = today or datetime.date.today
+        self._due_marks = {}               # task key -> a due date set here, until the next refresh
+        self._applying_since = None        # start of the fetch being applied
+        self._list_started = {}            # units mode: source name -> when its list was last fetched (not re-evaluated)
         self._rows = {}                    # key -> row, digest and saved rows too
         self._groups_sig = None
         self.health_fetch = health
@@ -378,7 +395,6 @@ class InboxApp(App):
                 yield ThreadView(id="thread")
                 yield ContextPane(id="context")
                 yield DraftPane(id="draft-pane")
-        yield Static("Tasks arrive in 0.11", id="tasks")
         yield HealthView(id="health")
         yield HintBar(id="hints")
 
@@ -485,8 +501,16 @@ class InboxApp(App):
         filters); Health counts what needs you."""
         return {"inbox": len(views.view_rows(self._views["inbox"])),
                 "waiting": len(views.view_rows(self._views["waiting"])),
+                "tasks": tasksmod.due_count(self.items, self._today()),
                 "feed": self.feed_data.total,
                 "health": self.health_badge()}
+
+    def _today(self):
+        """The local date task due dates are counted from."""
+        try:
+            return self.today_fn()
+        except Exception:      # an injected clock must never end the session
+            return datetime.date.today()
 
     def _ui_rules(self):
         fn = getattr(self.store, "feed_rules", None)
@@ -498,7 +522,7 @@ class InboxApp(App):
                                   now)
         for it in rows:
             it.feed, it.feed_label = "show", ""
-            if it.section == "fyi" and rules:
+            if it.section == "fyi" and rules and not tasksmod.is_task(it):
                 action, rule = feedrules.classify(it, rules, now)
                 it.feed = action
                 if rule is not None:
@@ -529,8 +553,10 @@ class InboxApp(App):
                 self.items, now, window_h=self.feed_cfg["window_h"],
                 show_all=self.show_all, saved=saved,
                 windowed=self._event_origins)
-        inbox = views.inbox_groups(self.items)
+        today = self._today()
+        inbox = views.inbox_groups(self.items, today)
         waiting = views.waiting_groups(self.items, now)
+        tasks = views.task_groups(self.items, today)
         data = feed()
         shown = (views.view_rows(inbox) + views.view_rows(waiting)
                  + [m for r in views.view_rows(data.groups)
@@ -539,15 +565,17 @@ class InboxApp(App):
         if saved:
             data = feed(saved)
         self.feed_data = data
-        self._views = {"inbox": inbox, "waiting": waiting,
+        self._views = {"inbox": inbox, "waiting": waiting, "tasks": tasks,
                        "feed": data.groups}
         self._rows = {i.key: i for i in self.items}
         for g in self.feed_data.groups:
             for i in g.items:
                 self._rows.setdefault(i.key, i)
-        return tuple((v, tuple((g.key, tuple(i.key for i in g.items))
-                               for g in gs))
-                     for v, gs in self._views.items())
+        # The date is part of the signature: the due cells and ages redraw
+        # when midnight passes.
+        return (today, tuple(
+            (v, tuple((g.key, tuple(i.key for i in g.items)) for g in gs))
+            for v, gs in self._views.items()))
 
     def refilter(self, redraw=True):
         """Rebuild the views from the fetched rows: hide marked and pending
@@ -555,6 +583,7 @@ class InboxApp(App):
         busy_keys = self._busy_keys()
         now = time.time()
         for i in self.all_rows:
+            i.local_due = self._due_marks.get(i.key, {}).get("due")
             # One mark for "this is in memory": saved here with `m`, or
             # saved by the daemon (meta.memory_id).
             i.saved = self.store.is_saved(i.key) or bool(i.memory_id)
@@ -719,11 +748,10 @@ class InboxApp(App):
     # ---------- rendering ----------
     def _sync_panes(self):
         """Show the widgets of the open view (the queue and thread, the
-        Feed's routine list, the Tasks placeholder or the Health pane)."""
+        Feed's routine list, or the Health pane)."""
         queue_view = self.view in views.QUEUE_VIEWS
         self.query_one("#main").display = queue_view
         self.query_one("#routines").display = self.view == "feed"
-        self.query_one("#tasks").display = self.view == "tasks"
         self.query_one("#health").display = self.view == "health"
 
     def _focus_view(self):
@@ -759,7 +787,7 @@ class InboxApp(App):
         else:
             q.build(groups, self.pal, now, keep=keep, ghost=ghost,
                     ghost_group=ghost_group, ghost_at=ghost_at,
-                    visual=self.bidi)
+                    visual=self.bidi, today=self._today())
             # While the queue was hidden (the first poll still running) it
             # lost focus; give it back, or the arrows do nothing until a
             # click. Not while the terminal is in the background: Textual
@@ -803,6 +831,12 @@ class InboxApp(App):
             t.append("Polling…\n\n", Style(bold=True, color=p["fg"]))
             t.append("r  poll now      ctrl+p  commands      ?  help", Style(color=p["muted"]))
             return t
+        if self.view == "tasks":
+            t.append("No open tasks\n\n", Style(bold=True, color=p["fg"]))
+            t.append("A command source lists tasks with meta.kind: task.\n",
+                     Style(color=p["muted"]))
+            t.append("r  poll now", Style(color=p["muted"]))
+            return t
         if self.view == "waiting":
             t.append("Nobody owes you a reply\n\n", Style(bold=True, color=p["fg"]))
             t.append("Nothing you asked for is still open.", Style(color=p["muted"]))
@@ -842,9 +876,14 @@ class InboxApp(App):
         self.context_sync()
 
     def show_thread_only(self):
+        it = self.current
+        task = it is not None and tasksmod.is_task(it)
+        # A task has a detail card, not a thread, and nothing to draft.
+        self.query_one("#thread").border_title = "Detail" if task else "Thread"
+        self.query_one("#draft-pane").display = not task
         self.query_one("#thread", ThreadView).show(
-            self.current, self.pal, time.time(), self.bidi,
-            self.thread_order == "newest")
+            it, self.pal, time.time(), self.bidi,
+            self.thread_order == "newest", today=self._today())
 
     def show_item(self):
         self.show_thread_only()
@@ -907,9 +946,6 @@ class InboxApp(App):
         if self.view == "health":
             return [("r", "refresh"), ("1-5", "views"), ("ctrl+p", "commands"),
                     ("?", "help"), ("q", "quit")]
-        if self.view == "tasks":
-            return [("1-5", "views"), ("ctrl+p", "commands"), ("?", "help"),
-                    ("q", "quit")]
         it = self.current
         if (self.view == "feed" and it is not None and not self._rsvp_on(it)
                 and (self.focused is None or self.focused.id == "queue")):
@@ -923,6 +959,18 @@ class InboxApp(App):
         base = [("j/k", "move")]
         opn = [("o", "open")] if it.link else []
         save = [("m", "save by hand")] if self.actions_save_on else []
+        if tasksmod.is_task(it):
+            keys = []
+            if self._acts_on(it, "close"):
+                keys.append(("d", "done"))
+                if tasksmod.task_type(it) == tasksmod.TODO:
+                    keys.append(("D", "outcome"))
+            if self._acts_on(it, "due"):
+                keys.append(("s", "due date"))
+            if self._acts_on(it, "drop"):
+                keys.append(("x", "drop"))
+            return base + keys + opn + [("u", "undo"), ("/", "filter"),
+                                        ("?", "help")]
         if self._rsvp_on(it):
             tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
                 ("u", "undo"), ("S", "saved"), ("?", "help")]
@@ -1117,7 +1165,8 @@ class InboxApp(App):
         panes = [self.query_one("#queue"), self.query_one("#thread")]
         if self.context_open:
             panes.append(self.query_one("#context"))
-        return panes + [self.query_one("#draft-pane")]
+        draft = self.query_one("#draft-pane")
+        return panes + ([draft] if draft.display else [])
 
     def action_focus_next(self):
         self._cycle(1)
@@ -1140,7 +1189,7 @@ class InboxApp(App):
                 self.query_one("#queue").display is False:
             panes = panes[1:]
             idx = max(0, idx - 1)
-        if self.view == "tasks" or not panes:
+        if not panes:
             return
         panes[(idx + d) % len(panes)].focus()
 
@@ -1205,7 +1254,11 @@ class InboxApp(App):
         """True (with a notice) for a row the views made: a saved-to-memory
         row takes o, d, s and y; a digest row takes d and s (on its rows), o
         (when its rows share one link), y, and x or - (a rule from its newest
-        row). Nothing else acts on them."""
+        row). Nothing else acts on them. A task row (0.12.0) takes only its
+        own keys (d, D, s, x, o)."""
+        if it is not None and tasksmod.is_task(it):
+            self.notify(TASK_KEYS_TOAST, timeout=3, markup=False)
+            return True
         if it is None or not views.is_synthetic(it):
             return False
         self.notify("A saved-to-memory row: only o, d, s and y work on it"
@@ -1285,11 +1338,12 @@ class InboxApp(App):
 
     def _enqueue(self, kind, it, toast, text="", until=0.0, detail="",
                  answer="", hide=True, force=False, name="", choice="",
-                 state="", mark_done=False, act="", act_args=None, react=""):
+                 state="", mark_done=False, act="", act_args=None, react="",
+                 meta=None):
         p = Pending(kind=kind, item=it, text=text, until=until, label=toast,
                     answer=answer, hide=hide, force=force, name=name,
                     choice=choice, state=state, mark_done=mark_done, act=act,
-                    act_args=dict(act_args or {}), react=react)
+                    act_args=dict(act_args or {}), react=react, act_meta=meta)
         p.audit = self.record(kind, it, detail, "queued")
         self.pending.append(p)
         if hide:
@@ -1299,12 +1353,13 @@ class InboxApp(App):
         self.notify(f"{toast}\nu to undo ({int(self.undo_s)}s)", timeout=self.undo_s,
                     title="Queued", markup=False)
         self.redraw()
+        return p
 
     def _count(self, kind, step):
         """Session tallies shown on the empty screen (a save hides nothing)."""
         if kind in ("send", "nudge"):
             self.stats["sent"] += step
-        elif kind in ("done", "ack", "rsvp"):
+        elif kind in ("done", "ack", "rsvp", "drop"):
             self.stats["done"] += step
         elif kind == "snooze":
             self.stats["snoozed"] += step
@@ -1334,7 +1389,9 @@ class InboxApp(App):
         if p.kind == "mute":
             res = (a.snooze(it, p.until) if p.until else a.mark_done(it))
             return self._after_mark(p, res, send)
-        if p.kind in ("waits_on", "relay"):
+        if p.kind == "drop":
+            return self._after_mark(p, self._each(it, a.mark_done), send)
+        if p.kind in NO_MARK_ACT_KINDS:
             return self._after_mark(p, Result(), send)
         if p.kind == "ack":
             return self._each(it, a.ack)
@@ -1359,12 +1416,12 @@ class InboxApp(App):
         a, it = self.actions, p.item
         if not send:                      # quitting: nothing may block
             if p.act:
-                a.queue_act(it, p.act, p.act_args)
+                a.queue_act(it, p.act, p.act_args, p.act_meta)
             return res
         note, out = [], None
         if p.act:
             started = time.time()
-            out = a.send_act(it, p.act, p.act_args)
+            out = a.send_act(it, p.act, p.act_args, p.act_meta)
             if out.dropped:
                 note.append(f"{out.dropped} unsynced op(s) older than "
                             f"{actsmod.PENDING_MAX_AGE_S // 86400} days or "
@@ -1418,8 +1475,7 @@ class InboxApp(App):
             self._late_report(p, res)
             return
         if p.kind in ("action", "send", "nudge", "draft", "react") or (
-                p.kind in ACT_MARK_KINDS + ("waits_on", "relay")
-                and (p.act or p.react)):
+                p.kind in ACT_KINDS and (p.act or p.react)):
             # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
             return
@@ -1450,8 +1506,9 @@ class InboxApp(App):
         p.audit["status"] = "committed" if res.ok else "failed"
         p.audit["detail"] = (p.audit["detail"] + " · " + res.detail).strip(" ·")
         self.last_committed = p
-        if res.ok and (res.sync or res.note) and p.kind in (
-                ACT_MARK_KINDS + ("waits_on", "relay")):
+        if p.kind == "due":
+            self._due_settled(p, res)
+        if res.ok and (res.sync or res.note) and p.kind in ACT_KINDS:
             self._synced(p, res)
         elif p.kind == "save" and not res.ok and res.duplicate and not p.force:
             # Not a failure: the command found a likely duplicate. A modal
@@ -1554,10 +1611,12 @@ class InboxApp(App):
         self.redraw(keep=p.item.key if res.sync == actsmod.CONFLICT
                     else self.current_key)
         what = p.act or p.kind
+        who = (p.item.gist if tasksmod.is_task(p.item) else p.item.who)
         if res.sync == actsmod.CONFLICT:
             p.audit["status"] = "conflict"
-            self.notify(CONFLICT_TOAST, title="Not applied", severity="warning",
-                        timeout=8, markup=False)
+            self.notify(self._conflict_text(
+                {"task": tasksmod.is_task(p.item)}), title="Not applied",
+                        severity="warning", timeout=8, markup=False)
         elif res.sync == actsmod.LOST:
             p.audit["status"] = "lost"
             self.notify(f"{what}: not synced AND not saved for a retry "
@@ -1574,15 +1633,85 @@ class InboxApp(App):
             word = SHADOW_WORD if res.sync == actsmod.SHADOW else "✓ synced"
             p.audit["status"] = "shadow" if res.sync == actsmod.SHADOW \
                 else "synced"
-            self.notify(f"{word}: {what} · {p.item.who}", title="Source",
+            self.notify(f"{word}: {what} · {who}", title="Source",
                         timeout=4, markup=False)
-            if p.kind == "waits_on" and self.polled_once:
+            if (p.kind == "waits_on" or (
+                    p.kind == "due" and res.sync == actsmod.OK)
+                    ) and self.polled_once:
                 self.poll(quiet=True, names=(
                     {p.item.origin} if self.units is not None else None))
         if res.note:
             self.notify(res.note, timeout=6, markup=False,
                         severity="warning" if "ailed" in res.note
                         or "dropped" in res.note else "information")
+
+    @staticmethod
+    def _is_task_row(row):
+        """An ops-log row (or a pending entry's request) of a task op: the
+        row's own `task` flag, else the kind in its meta."""
+        meta = row.get("meta") if isinstance(row, dict) else None
+        return bool(isinstance(row, dict) and (
+            row.get("task") is True
+            or (isinstance(meta, dict) and meta.get("kind") == tasksmod.KIND)))
+
+    @staticmethod
+    def _conflict_text(row):
+        """The conflict toast for an ops-log row (or anything shaped like
+        one: a `task` flag, a `meta`)."""
+        return (TASK_CONFLICT_TOAST if InboxApp._is_task_row(row)
+                else CONFLICT_TOAST)
+
+    # A due date set here shows at once and stays until the next list refresh
+    # (the source's list is the truth after that).
+    def _set_due_mark(self, it, date_str, p=None):
+        self._due_marks[it.key] = {"due": (date_str,), "op": p,
+                                   "origin": it.origin, "settled_at": None}
+        self.refilter(redraw=False)
+
+    def _clear_due_mark(self, key, redraw=True):
+        if self._due_marks.pop(key, None) is not None:
+            self.refilter(redraw=redraw)
+
+    def _due_settled(self, p, res):
+        """UI thread: the due op finished. A conflict, a failed op or a lost
+        one takes the shown date back. An op kept for a retry (not synced)
+        keeps the date, like a close keeps its mark, until the retry settles
+        (`_due_retried`). An ok is stamped: the mark goes once the source's
+        list was fetched after it (`_list_fresh`)."""
+        entry = self._due_marks.get(p.item.key)
+        if entry is None or entry.get("op") is not p:
+            return
+        if (not res.ok or res.sync in (actsmod.CONFLICT, actsmod.LOST)):
+            self._clear_due_mark(p.item.key, redraw=False)
+        elif res.sync != actsmod.PENDING:
+            entry["settled_at"] = time.time()
+
+    def _due_retried(self, entry, out):
+        """A pending due op was retried: an ok stamps its mark, a conflict
+        takes the shown date back."""
+        key = entry.get("id")
+        mark = self._due_marks.get(key)
+        if mark is None or entry.get("action") != "due":
+            return
+        if out.status == actsmod.CONFLICT:
+            self._due_marks.pop(key, None)
+        elif out.status in (actsmod.OK, actsmod.SHADOW):
+            mark["settled_at"] = time.time()
+
+    def _list_fresh(self, mark, since):
+        """True when the list the mark's source answers with was fetched after
+        the mark was settled, so it already holds the new date. With units
+        that is the time the source's own unit last ran (a re-evaluation or a
+        poll of another unit proves nothing); otherwise the start of the fetch
+        being applied (`since`)."""
+        settled = mark.get("settled_at")
+        if settled is None:
+            return False
+        if self.units is not None:
+            fetched = self._list_started.get(mark.get("origin"))
+        else:
+            fetched = since
+        return fetched is not None and fetched >= settled
 
     def _retry_ops(self):
         """After a refresh: resend the ops that could not be delivered, in a
@@ -1609,11 +1738,22 @@ class InboxApp(App):
         done = [(e, o) for e, o in report.results
                 if o.status != actsmod.PENDING]
         for entry, out in report.results:
+            self._due_retried(entry, out)
             self.record("retry", _stub(entry), f"{entry.get('action')}: "
                         f"{out.message}", out.status)
             if out.status in (actsmod.OK, actsmod.SHADOW):
                 self.act_shadow = out.status == actsmod.SHADOW
         conflicts = [e for e, o in done if o.status == actsmod.CONFLICT]
+        task_conflict = any(
+            self._is_task_row(e.get("request"))
+            or (e.get("log_extra") or {}).get("task") is True
+            for e in conflicts)
+        moved = {e.get("source") for e, o in done
+                 if e.get("action") == "due" and o.status == actsmod.OK}
+        if moved and self.polled_once:
+            # The source took a due move kept for a retry: fetch its list.
+            self.poll(quiet=True, names=(moved if self.units is not None
+                                         else None))
         if report.dropped:
             self.notify(f"{report.dropped} unsynced op(s) older than "
                         f"{actsmod.PENDING_MAX_AGE_S // 86400} days were "
@@ -1621,8 +1761,9 @@ class InboxApp(App):
         if conflicts:
             self.refilter(redraw=False)
             self.redraw(keep=self.current_key)
-            self.notify(CONFLICT_TOAST, title="Not applied", severity="warning",
-                        timeout=8, markup=False)
+            self.notify(TASK_CONFLICT_TOAST if task_conflict else CONFLICT_TOAST,
+                        title="Not applied", severity="warning", timeout=8,
+                        markup=False)
         elif done:
             self.notify(f"✓ synced {len(done)} earlier op(s)", timeout=4,
                         markup=False)
@@ -1654,6 +1795,8 @@ class InboxApp(App):
         if p.hide:
             self._count(p.kind, -1)
         p.audit["status"] = "undone"
+        if p.kind == "due":
+            self._clear_due_mark(it.key, redraw=False)
         self.record("undo", it, p.kind, "ok")
         self.current_key = it.key
         self.refilter(redraw=False)
@@ -1956,6 +2099,8 @@ class InboxApp(App):
         unchanged item shows it again). It fills the Draft pane and never
         sends."""
         it = self.current
+        if it is not None and tasksmod.is_task(it):
+            return self._task_done(it, outcome=True)
         if it is None or self._synthetic(it):
             return
         if "reply" not in it.actions and "nudge" not in it.actions:
@@ -2394,6 +2539,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if tasksmod.is_task(it):
+            return self._task_done(it, outcome=False)
         # 0.10.0: a row whose source lists `close` also closes there, and with
         # `done_reaction:` the message gets its emoji. Neither runs before the
         # undo window ends; with neither configured this is the old `d`.
@@ -2411,6 +2558,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if tasksmod.is_task(it):
+            return self._task_due(it)
 
         def after(res):
             if res:
@@ -2429,6 +2578,9 @@ class InboxApp(App):
         for that item, whatever is selected now. `open -a` can take seconds,
         so the open runs in a worker thread, never on the UI loop."""
         if it is None:
+            return
+        if tasksmod.is_task(it) and not it.link:
+            self.notify("no link", timeout=3, markup=False)
             return
         self.run_worker(lambda: self._open_in_thread(it), thread=True,
                         group="open")
@@ -2880,6 +3032,8 @@ class InboxApp(App):
         this routine, titles like this), then for how long. The rule is saved
         in the inbox state, never in inbox.yaml."""
         cur = self.current
+        if cur is not None and tasksmod.is_task(cur):
+            return self._task_drop(cur)
         conv = cur is not None and self._acts_on(cur, "mute")
         if conv and not (self.view == "feed" and not views.is_saved_row(cur)):
             # Not a Feed row: only the source's conversation mute is offered.
@@ -2989,6 +3143,127 @@ class InboxApp(App):
                           hide=False, detail=choice["label"], act="waits_on",
                           act_args={"who": who[:actsmod.WHO_MAX]})
         self.push_screen(ChoicePicker("Waits on", choices, self.bidi), picked)
+
+    # ---------- tasks (0.12.0) ----------
+    def _task_gate(self, it, action):
+        """True when the task row may take the act: its source lists it and
+        no other act on the row is waiting or running. Otherwise the reason is
+        toasted (a source with no `acts:` is read-only)."""
+        if it is None:
+            return False
+        if not self._acts_on(it, action):
+            listed = getattr(self.actions, "act_names", lambda _i: ())(it)
+            self.notify(ACTS_OFF if not listed else
+                        f"This source does not list the {action} act",
+                        timeout=4, severity="warning", markup=False)
+            return False
+        live = [p for p in self.pending if not p.done] + list(self.running)
+        if any(p.item.key == it.key and p.kind in ACT_KINDS for p in live):
+            self.notify("An act on this task is already in progress",
+                        timeout=3, markup=False)
+            return False
+        return True
+
+    def _task_done(self, it, outcome):
+        """d: a todo closes at once (note ""), a decision asks for its text
+        (required). D: a todo asks for the outcome (optional) and a decision
+        asks for its text, like d."""
+        if not self._task_gate(it, "close"):
+            return
+        decision = tasksmod.task_type(it) == tasksmod.DECISION
+        if not decision and not outcome:
+            return self._task_close(it, "")
+
+        def noted(note):
+            if note is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2,
+                            markup=False)
+                return
+            note = actsmod.clean_note(note)
+            if decision and not note:
+                self.notify(DECISION_REQUIRED, timeout=3,
+                            severity="warning", markup=False)
+                return
+            self._task_close(it, note)
+        if decision:
+            screen = NoteScreen(
+                "Decision:", it.gist, actsmod.NOTE_MAX,
+                placeholder="required: the decision, one line  (enter to send)",
+                hint="enter send  ·  esc cancel  ·  required")
+        else:
+            screen = NoteScreen(
+                "Outcome:", it.gist, actsmod.NOTE_MAX,
+                placeholder="the outcome, one line  (enter to close)",
+                hint="enter close  ·  esc cancel")
+        self.push_screen(screen, noted)
+
+    def _task_close(self, it, note):
+        if not self._task_gate(it, "close"):
+            return
+        word = "Decided" if tasksmod.task_type(it) == tasksmod.DECISION \
+            else "Done"
+        self._enqueue("done", it, f"{word}: {it.gist}", detail=note[:60],
+                      act="close", act_args={"note": note})
+
+    def _task_drop(self, it):
+        """x: drop the task, with an optional one-line reason."""
+        if not self._task_gate(it, "drop"):
+            return
+
+        def noted(note):
+            if note is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2,
+                            markup=False)
+                return
+            note = actsmod.clean_note(note)
+            if self._task_gate(it, "drop"):
+                self._enqueue("drop", it, f"Dropped: {it.gist}",
+                              detail=note[:60] or "no reason", act="drop",
+                              act_args={"note": note})
+        self.push_screen(NoteScreen(
+            "Reason:", it.gist, actsmod.NOTE_MAX,
+            placeholder="optional one-line reason  (enter drops)",
+            hint="enter drop  ·  esc cancel"), noted)
+
+    def _task_due(self, it):
+        """s: the due date picker (tomorrow, next Sunday, +1 week, a typed
+        date, no date). Sends `due`; the row moves at once."""
+        if not self._task_gate(it, "due"):
+            return
+        today = self._today()
+        options = tasksmod.due_choices(today)
+        by_id = {o[0]: o for o in options}
+        choices = [{"id": key, "label": label, "detail": ""}
+                   for key, label, _day in options]
+
+        def send(day):
+            if not self._task_gate(it, "due"):
+                return
+            date_str = day.isoformat() if day else None
+            label = date_str or "no date"
+            p = self._enqueue(
+                "due", it, f"Due {label}: {it.gist}", hide=False,
+                detail=label, act="due", act_args={"date": date_str},
+                meta=act_meta(it))     # the date shown before this move
+            self._set_due_mark(it, date_str, p)
+            self.redraw(keep=it.key)
+
+        def typed(text):
+            if text is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2,
+                            markup=False)
+                return
+            send(tasksmod.parse_day(text))
+
+        def picked(choice):
+            if choice is None:
+                self.notify("Cancelled. Nothing sent.", timeout=2,
+                            markup=False)
+            elif choice["id"] == "pick":
+                self.push_screen(DateScreen("Due date", it.gist), typed)
+            else:
+                send(by_id[choice["id"]][2])
+        self.push_screen(ChoicePicker("Due date", choices, self.bidi), picked)
 
     def action_relay(self):
         """!: hand the item to your work session, with an optional one-line
@@ -3109,7 +3384,10 @@ class InboxApp(App):
         rows = [("Item", str(row.get("who", ""))),
                 ("Where", str(row.get("where", ""))),
                 ("Was", f"{row.get('action')} ({row.get('result')})"),
-                ("Send", action), ("To source", str(row.get("source", "")))]
+                ("Send", action)]
+        if row.get("action") == "due":
+            rows.append(("Back to", str(row.get("prev_due") or "no date")))
+        rows.append(("To source", str(row.get("source", ""))))
 
         def after(ok):
             if not ok:
@@ -3146,14 +3424,22 @@ class InboxApp(App):
         self.record(action, stub, detail, status)
         if out is not None and out.status in (actsmod.OK, actsmod.SHADOW):
             self.act_shadow = bool(out.shadow)
+            self._due_marks.pop(str(row.get("id", "")), None)
             self.refilter(redraw=False)
             self.redraw(keep=self.current_key)
+            if (row.get("action") in ("close", "drop", "due")
+                    and self._is_task_row(row) and self.polled_once):
+                # The list is the truth for tasks: fetch the reopened or
+                # moved one back.
+                src = str(row.get("source", ""))
+                self.poll(quiet=True, names=(
+                    {src} if self.units is not None else None))
             self.notify(("shadow" if out.status == actsmod.SHADOW
                          else "✓ synced") + f": {action} · {row.get('who', '')}",
                         title="Source", timeout=4, markup=False)
         elif out is not None and out.status == actsmod.CONFLICT:
-            self.notify(CONFLICT_TOAST, severity="warning", timeout=6,
-                        markup=False)
+            self.notify(self._conflict_text(row), severity="warning",
+                        timeout=6, markup=False)
         else:
             self.notify(f"{action} not sent: {detail}", severity="warning",
                         timeout=6, markup=False)
@@ -3256,8 +3542,7 @@ class InboxApp(App):
             parts.append(f"{len(self.running)} write(s) still finishing; the process "
                          "exits when they end.")
         for p in self.running:
-            if p.kind in ACT_MARK_KINDS + ("waits_on", "relay") and (
-                    p.act or p.react):
+            if p.kind in ACT_KINDS and (p.act or p.react):
                 p.audit["status"] = "running at quit"
                 parts.append(f"{p.label}: still running; it may already have "
                              "reached the source" + (
@@ -3305,7 +3590,10 @@ class InboxApp(App):
                     batch = unit.reeval(now) if unit.reeval else None
                     batch = list(batch) if batch is not None else None
                 else:
+                    started = time.time()
                     batch = list(unit.run(now, show_all))
+                    for res in batch:
+                        self._list_started[res.name] = started
             except Exception as exc:  # a source bug must never end the session
                 batch = [SourceResult(unit.name, [], False, None,
                                       f"poll failed: {type(exc).__name__}: {exc}")]
@@ -3412,12 +3700,14 @@ class InboxApp(App):
     async def _poll_worker(self, manual, quiet=False, show_all=False, names=None,
                            reeval=False):
         self.busy += 1
+        started = time.time()
         try:
             results = await asyncio.to_thread(self._safe_fetch, show_all, names, reeval)
         finally:
             self.busy -= 1
             self.polling = False
         stamp = time.time()
+        self._applying_since = started
         if reeval:
             pass                    # no file was read: nothing became fresher
         elif self.units is not None:
@@ -3428,6 +3718,7 @@ class InboxApp(App):
             for res in results:
                 self.updated_at[res.name] = stamp
         self.apply_results(results, manual=manual, quiet=quiet)
+        self._applying_since = None
         queued, self._queued = self._queued, None
         if queued:
             self.poll(quiet=queued["quiet"], names=queued["names"])
@@ -3457,6 +3748,11 @@ class InboxApp(App):
         self.last_poll_at = time.time()
         self.next_poll_at = self.last_poll_at + self.poll_s
         old = {i.key: i for i in self.all_rows}
+        # A due date set here lasts until a list fetched after the source took
+        # it replaces it (one fetched before it was settled is still stale).
+        since = self._applying_since
+        self._due_marks = {k: v for k, v in self._due_marks.items()
+                           if not self._list_fresh(v, since)}
         rows = []
         for res in self.results:
             for raw in res.items:
@@ -3470,7 +3766,8 @@ class InboxApp(App):
                 rows.append(it)
         self.all_rows = rows
         fresh = [i for i in rows if i.key not in self.known_ids
-                 and i.section == "urgent" and not self.store.is_hidden(i.key, meta=i.meta)]
+                 and i.section == "urgent" and not tasksmod.is_task(i)
+                 and not self.store.is_hidden(i.key, meta=i.meta)]
         self.known_ids.update(i.key for i in rows)
         if self._acts_any():
             self._refresh_act_count()

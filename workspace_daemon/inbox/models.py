@@ -22,6 +22,7 @@ SOURCES = {
     "alert": ("▲", "warn", "Alert"),
     "drive": ("▤", "accent", "Drive"),
     "sheet": ("▦", "accent", "Sheet"),
+    "memory": ("◈", "mine", "Memory"),
     "other": ("•", "muted", "Other"),
 }
 
@@ -68,6 +69,7 @@ class Item:
     origin: str = ""               # UI-only: the name of the source that listed it
     feed: str = "show"             # UI-only: the Feed rule outcome (show/digest/hide/inbox)
     feed_label: str = ""           # UI-only: what the matching rule says (muted list)
+    local_due: Optional[tuple] = None   # UI-only (tasks): `(date or None,)`, a due date set here that the list has not caught up with yet
     members: List["Item"] = field(default_factory=list, repr=False,
                                   compare=False)   # UI-only: a digest row's items
     raw: Optional[dict] = field(default=None, repr=False, compare=False)

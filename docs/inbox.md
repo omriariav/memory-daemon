@@ -335,10 +335,12 @@ sources:
     acts: [close, snooze, mute, waits_on, relay]   # what the source may be told
 ```
 
-`acts` lists any of `close`, `snooze`, `mute`, `waits_on`, `relay` (each once;
-omitted or `[]` means none). Each act is active only on rows of the source that
+`acts` lists any of `close`, `snooze`, `mute`, `waits_on`, `relay`, `drop`,
+`due` (each once; omitted or `[]` means none; `drop` and `due` are for
+[tasks](#tasks)). Each act is active only on rows of the source that
 lists it. `reopen` and `unmute` are never listed: they are the inverses of
-`close` and `mute`, sent from the ops log (below). Rows the views make (the
+`close`, `drop` and `mute`, sent from the ops log (below); the inverse of `due`
+is `due` with the date it had. Rows the views make (the
 digest and the saved-to-memory rows) never send acts.
 
 ### The request
@@ -447,8 +449,9 @@ With any source listing acts, `L` opens the ops log: one row per op the inbox
 sent (time, action, item, result, message), newest first, from
 `state/inbox-ops-log.jsonl` (capped at 500 rows, mode 0600). The result is `ok`,
 `shadow`, `conflict` or `not synced`; a row kept for a retry shows `(retry)`
-when it was resent. `u` on a `close` or `mute` that reached the source (ok or
-shadow) asks to confirm, then sends the inverse (`reopen` or `unmute`, with
+when it was resent. `u` on a `close`, `drop`, `due` or `mute` that reached the
+source (ok or shadow) asks to confirm, then sends the inverse (`reopen`,
+`unmute`, or `due` with `{"date": <the previous date or null>}`, with
 `seen.ts` set to now) and drops the local mark, so the row returns; there is no
 undo window and the inverse is not retried. A row an inverse already undid
 offers no second `u`; a failed inverse leaves it undoable. Other rows have no
@@ -1452,7 +1455,7 @@ A `command` source takes `argv` (list), `timeout_s` (1 to 120),
 `watch` (list of paths, default none; see "Change-driven refresh"),
 `supports_all` (`true` or `false`, default `false`): declare it only if
 `<argv> list --all` works, and `acts` (a list of `close`, `snooze`, `mute`,
-`waits_on`, `relay`, default none; see [Acts](#acts); `timeout_s` is also the
+`waits_on`, `relay`, `drop`, `due`, default none; see [Acts](#acts); `timeout_s` is also the
 timeout of an `act` call).
 
 `rsvp:` (no default; omit it and RSVP is off):
@@ -1530,15 +1533,15 @@ The inbox is organised by whose move it is. A tab bar and a one-line health
 strip sit on top; `1` to `5` switch the view.
 
 ```
- inbox 0.11.0  [1 Inbox 7]  2 Waiting 6   3 Tasks   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ inbox 0.12.0  [1 Inbox 7]  2 Waiting 6   3 Tasks 4   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
  slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
 ```
 
 | View | What it lists |
 | --- | --- |
-| `1` Inbox | `URGENT` (urgent rows, and Feed rows a rule promotes), `I OWE` (`needs_reply` rows, pending invites included, soonest invite first) and `NUDGE DUE` (waiting rows that can be nudged and have a stored nudge draft). The three groups are always listed, with a dash when empty. |
+| `1` Inbox | `URGENT` (urgent rows, and Feed rows a rule promotes), `I OWE` (`needs_reply` rows, pending invites included, soonest invite first) and `NUDGE DUE` (waiting rows that can be nudged and have a stored nudge draft). The three groups are always listed, with a dash when empty. A fourth, `DUE TODAY`, follows them when there are overdue or due-today [tasks](#tasks) (todos and decisions, by due date). |
 | `2` Waiting | the `waiting` rows by person (the item's `sender`, compared without case), the person with the oldest open ask first and each person's oldest ask first. A group header reads `NAME  3 open · oldest 2d`. A bookmark (`meta.via` starting with `track_reaction`, or `meta.cls` `bookmarked`) goes to a last group, `TRACKING`. |
-| `3` Tasks | nothing yet: "Tasks arrive in 0.11". The tab is kept so the keys stay stable. |
+| `3` Tasks | the task rows of the command sources, by due date (see [Tasks](#tasks)). The tab counts the overdue and due-today ones: `3 Tasks 4`. |
 | `4` Feed | every `fyi` row, by routine (see [Feed](#feed)). |
 | `5` Health | the daemon's state (see [Health](#health)). |
 
@@ -1556,6 +1559,70 @@ exists, and the badge should not stay quiet over a red cell.
 
 `[` and `]` jump to the first row of the previous and next group (a section in
 the Inbox, a person in Waiting, a routine in the Feed).
+
+### Tasks
+
+A command source may list open tasks next to its other rows. A task is an
+ordinary v1 item (any valid `source`, `section` and `urgency`; `gist` is the
+title) whose `meta` says so:
+
+| `meta` key | |
+| --- | --- |
+| `kind` | `"task"` (this is what makes the row a task) |
+| `task_type` | `"todo"` or `"decision"` (anything else reads as `todo`) |
+| `due` | `"YYYY-MM-DD"` or `null` |
+| `date` | `"YYYY-MM-DD"`, when the task was created (else the day of `ts`) |
+| `people` | `[names]` |
+| `evidence` | a string or `null` |
+| `source_ids` | `[strings]` |
+
+`link` is the item's own field. Task rows never appear in the Feed, in Waiting
+or in the Inbox's URGENT, I OWE and NUDGE DUE. Their text is untrusted display
+text and is cleaned like any other.
+
+The Tasks view has six sections, empty ones hidden: `OVERDUE` (a todo due
+before today), `DUE TODAY`, `THIS WEEK` (due in the next 7 days), `LATER`,
+`DECIDE` (every decision, with or without a due date) and `NO DATE` (a todo
+with no due date). Inside a section rows go by due date, then creation date.
+"Today" is the local date and is recomputed on every refresh (and every 30 s),
+so the sections are right across midnight. The tab shows the number of tasks
+(todos and decisions) that are overdue or due today. The same tasks are in the
+Inbox's `DUE TODAY` section.
+
+A row reads `☐ title` (a todo) or `◇ title` (a decision), the due cell (`today`,
+`2d late`, `Thu` for the next six days, `21 Nov`, `-`), the age in days since
+`date`, and under it the people (up to two first names, then `+n`). An
+overdue row is drawn like an urgent one. The detail pane (replacing the thread
+and draft panes) shows the title, type, due date, created date, people, the
+evidence (wrapped) and the source ids. `o` opens `link`, or says "no link".
+
+Keys on a task row (they use the [acts](#acts) protocol: the 5 s undo window,
+the pending retry, the ops log `L`; the source must list the act in `acts:`,
+and a source with no `acts:` is read-only: the keys say so):
+
+| Key | Does | Sends |
+| --- | --- | --- |
+| `d` | a todo: closes it at once; a decision: asks `Decision:` (required, an empty or cancelled prompt sends nothing), then closes it | `close` `{"note": ""}` / `{"note": <decision>}` |
+| `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
+| `s` | due date: Tomorrow, Next Sunday, +1 week, Pick date (`YYYY-MM-DD`, checked), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
+| `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
+
+After an `ok` the row leaves the list (`close`, `drop`: a local done mark) or
+moves section (`due`: the new date is kept in memory until the next list
+refresh, which is the source's truth). A conflict, a failure and a shadow
+answer behave as for any act; a conflict takes the date or the mark back with
+the toast "The task changed since you looked; refresh". In the ops log `u` on a
+`close` or `drop` sends `reopen`; on a `due` it sends `due` with the date the
+row had before. The `act` request for a task carries `meta` with the `due` the
+user saw. Example source:
+
+```yaml
+sources:
+  - name: tasks
+    type: command
+    argv: ["~/bin/my-task-source"]
+    acts: [close, drop, due]
+```
 
 ### Feed
 
@@ -1685,7 +1752,7 @@ At most 10 heartbeats. The files are only `stat`ed.
 ## Keys
 
 `1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
-group, `tab` switches pane,
+group, `tab` switches pane, on a task row `d`, `D`, `s`, `x` and `o` (see [Tasks](#tasks)),
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`, in a desktop app with `open_with:`), `u` undo, on a pending invite
 `a`/`X`/`T` accept, decline or answer tentative (needs `rsvp:`), `m` save to
@@ -1785,6 +1852,10 @@ header and the help overlay show the inbox version.
   as JSON on stdin; a retry reuses the op id and never runs on the UI thread.
   `D` makes a no-tools bridge call over the thread and never sends;
   `done_reaction` uses the pinned react call.
+- Task keys (0.12.0) use the same acts path: a task source with no `acts:` is
+  read-only, a write goes out only after the undo window and `L` can undo it
+  (`reopen`, or `due` with the old date). The inbox has no shadow mode for
+  tasks of its own; a source may still answer `shadow`.
 - `open` launches plain `http(s)` links, and with `slack_open` the template's
   `slack://` or `https://` URL (built only from validated ids). With
   `open_with`, a matching `https` URL runs `open -a <app> <url>` as an argv

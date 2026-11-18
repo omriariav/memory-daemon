@@ -138,10 +138,10 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             shown = lambda: {w: app.query_one(w).display for w in
-                             ("#main", "#routines", "#tasks", "#health")}
+                             ("#main", "#routines", "#health")}
             self.assertEqual(app.view, "inbox")
             self.assertEqual(shown(), {"#main": True, "#routines": False,
-                                       "#tasks": False, "#health": False})
+                                       "#health": False})
             expect = {"2": "waiting", "3": "tasks", "4": "feed",
                       "5": "health", "1": "inbox"}
             for key, name in expect.items():
@@ -150,17 +150,17 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.view, name, key)
             await pilot.press("3")
             await pilot.pause(0.1)
-            self.assertEqual(shown(), {"#main": False, "#routines": False,
-                                       "#tasks": True, "#health": False})
-            self.assertIn("0.11", str(app.query_one("#tasks").render()))
+            # Tasks is a queue view now (0.12.0): the list and detail panes
+            self.assertEqual(shown(), {"#main": True, "#routines": False,
+                                       "#health": False})
             await pilot.press("4")
             await pilot.pause(0.1)
             self.assertEqual(shown(), {"#main": True, "#routines": True,
-                                       "#tasks": False, "#health": False})
+                                       "#health": False})
             await pilot.press("5")
             await pilot.pause(0.1)
             self.assertEqual(shown(), {"#main": False, "#routines": False,
-                                       "#tasks": False, "#health": True})
+                                       "#health": True})
 
     async def test_each_view_lists_its_own_rows(self):
         app, _ = make_app(mixed_rows(), health=lambda: snapshot())

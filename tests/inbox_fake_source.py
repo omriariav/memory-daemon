@@ -15,6 +15,11 @@ Like a real source it is idempotent on `op_id`: the first ok or conflict
 answer for an op_id is stored in `<state-dir>/results.json` and replayed for
 a repeat, without applying anything twice (`applied.jsonl` lists what was
 applied). A failure is never stored, so a retry of the same op_id can succeed.
+
+Task items (0.12.0): when `<state-dir>/items.json` holds the item with the
+request's id, a fresh ok answer also changes that list the way a task source
+would: `close` and `drop` take the item out (kept in `closed.json`), `reopen`
+puts it back, `due` sets `meta.due` to `args.date`, so `list` shows the effect.
 """
 import json
 import os
@@ -28,6 +33,33 @@ def _load(path, default):
             return json.load(handle)
     except (OSError, ValueError):
         return default
+
+
+def _apply_task(root, request):
+    """Change `items.json` for a close, drop, reopen or due (only for an id
+    that is in it, or in `closed.json` for a reopen)."""
+    items_path = os.path.join(root, "items.json")
+    closed_path = os.path.join(root, "closed.json")
+    items, closed = _load(items_path, []), _load(closed_path, [])
+    item_id, action = request.get("id"), request.get("action")
+    if action in ("close", "drop"):
+        gone = [i for i in items if i["id"] == item_id]
+        items = [i for i in items if i["id"] != item_id]
+        closed += gone
+    elif action == "reopen":
+        back = [i for i in closed if i["id"] == item_id]
+        closed = [i for i in closed if i["id"] != item_id]
+        items += back
+    elif action == "due":
+        for i in items:
+            if i["id"] == item_id:
+                i["meta"]["due"] = (request.get("args") or {}).get("date")
+    else:
+        return
+    with open(items_path, "w") as handle:
+        json.dump(items, handle)
+    with open(closed_path, "w") as handle:
+        json.dump(closed, handle)
 
 
 def main(argv):
@@ -70,6 +102,7 @@ def main(argv):
         with open(os.path.join(root, "applied.jsonl"), "a") as handle:
             handle.write(json.dumps({"op_id": op_id,
                                      "action": request.get("action")}) + "\n")
+        _apply_task(root, request)
     results[op_id] = answer
     with open(results_path, "w") as handle:
         json.dump(results, handle)

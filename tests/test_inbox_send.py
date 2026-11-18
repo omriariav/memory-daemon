@@ -929,7 +929,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             app.redraw(keep=target.key)
             await pilot.pause(0.1)
             await pilot.press("a")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertIsInstance(app.screen, ConfirmSend)
             self.assertEqual(app.screen.destination, target.destination)
             await pilot.press("y")
@@ -970,7 +971,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 pilot, lambda: any("Sent to Slack" in t for t in toasts(app))))
             self.assertNotIn(first, keys(app))
             row = next(r for r in app.audit if r["action"] == "send")
-            self.assertEqual(row["status"], "committed")
+            self.assertTrue(await wait_for(
+                pilot, lambda: row["status"] == "committed"))
             self.assertIn("#launch (thread)", row["detail"])
             self.assertIn("Thanks, on it.", row["detail"])
 
@@ -1010,7 +1012,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+s")
             await pilot.pause(0.1)
             await pilot.press("a")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertIsInstance(app.screen, ConfirmSend)
             self.assertEqual(app.screen.text, "edited line one\n\nedited line two")
             shown = str(app.screen.query_one("#confirm-text").render())
@@ -1091,8 +1094,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertEqual(app.current.draft, "safe text here\nnext")
             await pilot.press("a")
-            await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertEqual(app.screen.text, "safe text here\nnext")
 
     async def test_a_channel_post_without_a_thread_is_refused_by_default(self):
@@ -1150,9 +1153,9 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=SIZE) as pilot:
                 await settle(pilot, app)
                 await pilot.press("a")
-                await pilot.pause(0.2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmSend)))
                 # 0.7.0: only Copy for Slack is offered, with the reason
-                self.assertIsInstance(app.screen, ConfirmSend)
                 self.assertEqual(app.screen.options, ("copy",))
                 self.assertIn("no valid meta.reply_to", str(
                     app.screen.query_one("#confirm-warn").render()))
@@ -1329,7 +1332,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.3)
                 app.current_key = app.items[0].key
                 await pilot.press("a")
-                await pilot.pause(0.2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmSend)))
                 self.assertIsInstance(app.screen, ConfirmSend)     # free again
         finally:
             gate.set()
@@ -1355,8 +1359,9 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("t:1", keys(app))
             self.assertFalse(store.is_hidden("t:1"))
-            self.assertEqual(next(r for r in app.audit
-                                  if r["action"] == "send")["status"], "failed")
+            sent = next(r for r in app.audit if r["action"] == "send")
+            self.assertTrue(await wait_for(
+                pilot, lambda: sent["status"] == "failed"))
             note = next(n for n in app._notifications if "auth failed" in n.message)
             self.assertEqual(note.severity, "error")
 
@@ -1384,15 +1389,17 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("n")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertIsInstance(app.screen, ConfirmSend)
             self.assertEqual(app.screen.verb, "Send nudge")
             await pilot.press("y")
             self.assertTrue(await wait_for(pilot, lambda: calls))
             self.assertEqual(calls[0][1][TOOL]["txt"], "Any update?")
             self.assertTrue(await wait_for(pilot, lambda: store.is_hidden("t:1")))
-            self.assertEqual(next(r for r in app.audit
-                                  if r["action"] == "nudge")["status"], "committed")
+            nudge = next(r for r in app.audit if r["action"] == "nudge")
+            self.assertTrue(await wait_for(
+                pilot, lambda: nudge["status"] == "committed"))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -1458,7 +1465,8 @@ class PrecheckFlowTest(WorkerCleanup, PrecheckBase, unittest.IsolatedAsyncioTest
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertIsInstance(app.screen, ConfirmSend)
             self.assertEqual(len(app.screen.query("#confirm-warn")), 0)
             self.assertFalse([t for t in threading.enumerate()
