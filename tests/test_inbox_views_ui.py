@@ -63,7 +63,12 @@ async def settle(pilot, app):
 
 async def until(pilot, cond, tries=100, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -146,21 +151,18 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
                       "5": "health", "1": "inbox"}
             for key, name in expect.items():
                 await pilot.press(key)
-                await pilot.pause(0.15)
-                self.assertEqual(app.view, name, key)
+                self.assertTrue(await until(
+                    pilot, lambda: app.view == name), key)
             await pilot.press("3")
-            await pilot.pause(0.1)
             # Tasks is a queue view now (0.12.0): the list and detail panes
-            self.assertEqual(shown(), {"#main": True, "#routines": False,
-                                       "#health": False})
+            self.assertTrue(await until(
+                pilot, lambda: shown() == {"#main": True, "#routines": False, "#health": False}))
             await pilot.press("4")
-            await pilot.pause(0.1)
-            self.assertEqual(shown(), {"#main": True, "#routines": True,
-                                       "#health": False})
+            self.assertTrue(await until(
+                pilot, lambda: shown() == {"#main": True, "#routines": True, "#health": False}))
             await pilot.press("5")
-            await pilot.pause(0.1)
-            self.assertEqual(shown(), {"#main": False, "#routines": False,
-                                       "#health": True})
+            self.assertTrue(await until(
+                pilot, lambda: shown() == {"#main": False, "#routines": False, "#health": True}))
 
     async def test_each_view_lists_its_own_rows(self):
         app, _ = make_app(mixed_rows(), health=lambda: snapshot())
@@ -169,11 +171,11 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
             rows = lambda: [r.key for r in app.query_one("#queue", Queue).rows]
             self.assertEqual(rows(), ["t:1", "t:2", "t:3", "t:4"])
             await pilot.press("2")
-            await pilot.pause(0.15)
-            self.assertEqual(sorted(rows()), ["t:4", "t:5"])
+            self.assertTrue(await until(
+                pilot, lambda: sorted(rows()) == ["t:4", "t:5"]))
             await pilot.press("4")
-            await pilot.pause(0.15)
-            self.assertEqual(sorted(rows()), ["t:6", "t:7", "t:8"])
+            self.assertTrue(await until(
+                pilot, lambda: sorted(rows()) == ["t:6", "t:7", "t:8"]))
 
     async def test_the_tab_bar_counts_each_view(self):
         rows = mixed_rows() + [alert_item(9, "attention:zoom-meetings",
@@ -185,7 +187,8 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await until(pilot, lambda: app.health_snap is not None)
-            await pilot.pause(0.2)
+            self.assertTrue(await until(
+                pilot, lambda: "[1 Inbox 5]" in str(app.query_one("#hdr").render())))
             head = str(app.query_one("#hdr").render())
             self.assertIn(__version__, head)
             self.assertIn("[1 Inbox 5]", head)      # urgent x2, owe x2, nudge
@@ -194,8 +197,8 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("4 Feed 3", head)
             self.assertIn("5 Health ⚠1", head)
             await pilot.press("4")
-            await pilot.pause(0.15)
-            self.assertIn("[4 Feed 3]", str(app.query_one("#hdr").render()))
+            self.assertTrue(await until(
+                pilot, lambda: "[4 Feed 3]" in str(app.query_one("#hdr").render())))
 
     async def test_marks_and_undo_work_in_every_view(self):
         app, store = make_app(mixed_rows(), undo_s=5)
@@ -208,11 +211,11 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
                 app.redraw(keep=row_key)
                 await pilot.pause(0.05)
                 await pilot.press("d")
-                await pilot.pause(0.05)
-                self.assertNotIn(row_key, [i.key for i in app.items])
+                self.assertTrue(await until(
+                    pilot, lambda: row_key not in [i.key for i in app.items]))
                 await pilot.press("u")
-                await pilot.pause(0.1)
-                self.assertIn(row_key, [i.key for i in app.items])
+                self.assertTrue(await until(
+                    pilot, lambda: row_key in [i.key for i in app.items]))
                 self.assertFalse(store.is_hidden(row_key))
             # a done mark in one view hides the very same row in the others
             app.undo_s = 0.1
@@ -221,12 +224,10 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = "t:4"
             app.redraw(keep="t:4")
             await pilot.press("d")
-            await pilot.pause(0.6)
-            self.assertTrue(store.is_hidden("t:4"))
+            self.assertTrue(await until(pilot, lambda: store.is_hidden("t:4")))
             await pilot.press("2")
-            await pilot.pause(0.15)
-            self.assertEqual([r.key for r in app.query_one("#queue", Queue).rows],
-                             ["t:5"])
+            self.assertTrue(await until(
+                pilot, lambda: [r.key for r in app.query_one("#queue", Queue).rows] == ["t:5"]))
 
     async def test_snooze_and_pending_hold_in_the_waiting_view(self):
         app, store = make_app(mixed_rows())
@@ -236,8 +237,8 @@ class ViewSwitchTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.15)
             key = app.current_key
             await pilot.press("s", "1")
-            await pilot.pause(0.5)
-            self.assertIsNotNone(store.snoozed_until(key))
+            self.assertTrue(await until(
+                pilot, lambda: store.snoozed_until(key) is not None))
             self.assertNotIn(key, [i.key for i in app.items])
 
 
@@ -249,20 +250,20 @@ class GroupJumpTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertEqual(app.current_key, "t:1")            # URGENT
             await pilot.press("right_square_bracket")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:2")            # I OWE
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:2"))  # I OWE
             await pilot.press("j")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:3")
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:3"))
             await pilot.press("right_square_bracket")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:4")            # NUDGE DUE
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:4"))  # NUDGE DUE
             await pilot.press("left_square_bracket")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:2")            # first of I OWE
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:2"))  # first of I OWE
             await pilot.press("left_square_bracket", "left_square_bracket")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:1")            # stays at the top
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:1"))  # stays at the top
 
     async def test_brackets_jump_between_people_and_routines(self):
         rows = [item(1, "waiting", actions=("nudge",), ago_min=600,
@@ -276,17 +277,17 @@ class GroupJumpTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("2")
-            await pilot.pause(0.15)
-            self.assertEqual(app.current_key, "t:1")            # Ann, oldest ask
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:1"))  # Ann, oldest ask
             await pilot.press("right_square_bracket")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current_key, "t:2")            # Bo
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key == "t:2"))  # Bo
             await pilot.press("4")
             await pilot.pause(0.15)
             first = app.current_key
             await pilot.press("right_square_bracket")
-            await pilot.pause(0.1)
-            self.assertNotEqual(app.current_key, first)
+            self.assertTrue(await until(
+                pilot, lambda: app.current_key != first))
 
     async def test_the_old_section_keys_no_longer_exist(self):
         keys = {k for b in InboxApp.BINDINGS for k in b.key.split(",")}
@@ -318,8 +319,7 @@ class StartupFocusInEveryViewTest(unittest.IsolatedAsyncioTestCase):
             first = q.highlighted
             self.assertIsNotNone(first)
             await pilot.press("down")
-            await pilot.pause(0.1)
-            self.assertNotEqual(q.highlighted, first)
+            self.assertTrue(await until(pilot, lambda: q.highlighted != first))
             self.assertEqual(app.current_key,
                              q.get_option_at_index(q.highlighted).id[2:])
 
@@ -345,11 +345,11 @@ class StartupFocusInEveryViewTest(unittest.IsolatedAsyncioTestCase):
                 if app.view in ("inbox", "waiting", "feed"):
                     self.assertIs(app.focused, app.query_one("#queue"), key)
                     await pilot.press("down")
-                    await pilot.pause(0.05)
-                    self.assertIsNotNone(app.query_one("#queue").highlighted)
+                    self.assertTrue(await until(
+                        pilot, lambda: app.query_one("#queue").highlighted is not None))
             await pilot.press("5")
-            await pilot.pause(0.15)
-            self.assertIs(app.focused, app.query_one("#health"))
+            self.assertTrue(await until(
+                pilot, lambda: app.focused is app.query_one("#health")))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -402,13 +402,14 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("f")
-            await pilot.pause(0.1)
-            self.assertIsNotNone(app.feed_routine)
+            self.assertTrue(await until(
+                pilot, lambda: app.feed_routine is not None))
             self.assertEqual(len(app.visible()), 1)
             await pilot.press("f", "f")
-            await pilot.pause(0.1)
-            self.assertIsNone(app.feed_routine)
+            self.assertTrue(await until(
+                pilot, lambda: app.feed_routine is None))
             await pilot.press("f", "escape")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertIsNone(app.feed_routine)
             self.assertEqual(len(app.visible()), 2)
@@ -440,10 +441,9 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = digest.key
             app.redraw(keep=digest.key)
             await pilot.press("d")
-            await pilot.pause(0.6)
-            self.assertEqual(
-                sorted(k for k in ("t:4", "t:5") if app.store.is_hidden(k)),
-                ["t:4", "t:5"])
+            self.assertTrue(await until(
+                pilot, lambda: all(app.store.is_hidden(k)
+                                   for k in ("t:4", "t:5"))))
 
     async def test_old_rows_age_out_and_a_shows_them(self):
         rows = [feed_item(1, "cal", ago_min=60),
@@ -453,8 +453,8 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertEqual([r.key for r in app.visible()], ["t:1"])
             await pilot.press("A")
-            await pilot.pause(0.4)
-            self.assertEqual(sorted(r.key for r in app.visible()), ["t:1", "t:2"])
+            self.assertTrue(await until(
+                pilot, lambda: sorted(r.key for r in app.visible()) == ["t:1", "t:2"]))
 
     async def test_the_mute_picker_writes_a_ui_rule(self):
         rows = [feed_item(1, "cal", "rsvp"), feed_item(2, "cal", "update")]
@@ -467,14 +467,14 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
                 app.current_key = "t:1"
                 app.redraw(keep="t:1")
                 await pilot.press("x")
-                await pilot.pause(0.2)
-                self.assertIsInstance(app.screen, ChoicePicker)
+                self.assertTrue(await until(
+                    pilot, lambda: isinstance(app.screen, ChoicePicker)))
                 await pilot.press("1")                # this kind from cal
-                await pilot.pause(0.2)
-                self.assertIsInstance(app.screen, ChoicePicker)
+                self.assertTrue(await until(
+                    pilot, lambda: isinstance(app.screen, ChoicePicker)))
                 await pilot.press("1")                # for 1 day
-                await pilot.pause(0.3)
-                self.assertEqual(len(app.screen_stack), 1)
+                self.assertTrue(await until(
+                    pilot, lambda: len(app.screen_stack) == 1))
                 (rule,) = InboxStore(Path(base)).feed_rules()
                 self.assertEqual((rule["routine"], rule["kind"],
                                   rule["action"]), ("cal", "rsvp", "hide"))
@@ -498,7 +498,7 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             app.current_key = "t:1"
             app.redraw(keep="t:1")
             await pilot.press("minus")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(pilot, lambda: len(store.feed_rules()) == 1))
             (rule,) = store.feed_rules()
             self.assertEqual((rule["action"], rule["kind"], rule["until"]),
                              ("digest", "update", None))
@@ -511,6 +511,7 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("x")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(len(app.screen_stack), 1)
             self.assertEqual(store.feed_rules(), [])
@@ -529,7 +530,8 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertEqual([r.key for r in app.visible()], ["t:2"])
             await pilot.press("M")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, RulesScreen)))
             screen = app.screen
             self.assertIsInstance(screen, RulesScreen)
             table = screen.query_one("#rules-table")
@@ -540,31 +542,31 @@ class FeedUiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([str(c) for c in table.get_row_at(1)][0],
                              "inbox.yaml")
             await pilot.press("space")                     # switch it off
-            await pilot.pause(0.3)
-            self.assertFalse(store.feed_rules()[0]["enabled"])
+            self.assertTrue(await until(
+                pilot, lambda: not store.feed_rules()[0]["enabled"]))
             self.assertEqual(sorted(r.key for r in app.visible()),
                              ["t:1", "t:2"])
             self.assertEqual(str(table.get_row_at(0)[1]), "no")
             await pilot.press("j", "space")                # file rule: refused
-            await pilot.pause(0.2)
-            self.assertEqual(len(store.feed_rules()), 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(store.feed_rules()) == 1))
             await pilot.press("k", "delete")               # remove it
-            await pilot.pause(0.3)
-            self.assertEqual(store.feed_rules(), [])
+            self.assertTrue(await until(
+                pilot, lambda: store.feed_rules() == []))
             await pilot.press("M")                         # M closes it too
-            await pilot.pause(0.2)
-            self.assertEqual(len(app.screen_stack), 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(app.screen_stack) == 1))
 
     async def test_M_toggle_opens_and_closes(self):
         app, _ = make_app([feed_item(1)], view="feed")
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("M")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, RulesScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, RulesScreen)))
             await pilot.press("escape")
-            await pilot.pause(0.2)
-            self.assertEqual(len(app.screen_stack), 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(app.screen_stack) == 1))
 
 
 SAVED = [{"id": "s1", "source": "slack", "kind": "new", "ts": time.time() - 600,
@@ -594,8 +596,8 @@ class FeedPinningTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([r.key for r in app.visible()], ["t:1"])
             self.assertEqual(app.view_counts()["feed"], 1)
             await pilot.press("a")                        # ack it
-            await pilot.pause(0.5)
-            self.assertIn("ack", store.marks["t:1"])
+            self.assertTrue(await until(
+                pilot, lambda: "ack" in store.marks["t:1"]))
             self.assertEqual(app.visible(), [])
 
     async def test_an_active_alert_stays_when_a_rule_digests_its_routine(self):
@@ -659,8 +661,7 @@ class DigestFilterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sorted(m.key for m in app.current.members),
                              ["t:1", "t:3"])
             await pilot.press("d")
-            await pilot.pause(0.6)
-            self.assertTrue(store.is_hidden("t:1"))
+            self.assertTrue(await until(pilot, lambda: store.is_hidden("t:1")))
             self.assertTrue(store.is_hidden("t:3"))
             self.assertFalse(store.is_hidden("t:2"))          # not shown: untouched
 
@@ -677,8 +678,8 @@ class DigestFilterTest(unittest.IsolatedAsyncioTestCase):
             app.redraw()
             await pilot.pause(0.1)
             await pilot.press("s", "1")
-            await pilot.pause(0.6)
-            self.assertIsNotNone(store.snoozed_until("t:1"))
+            self.assertTrue(await until(
+                pilot, lambda: store.snoozed_until("t:1") is not None))
             self.assertIsNotNone(store.snoozed_until("t:3"))
             self.assertIsNone(store.snoozed_until("t:2"))
 
@@ -688,8 +689,7 @@ class DigestFilterTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             app.filter_text = "zzz"
             app.redraw()
-            await pilot.pause(0.1)
-            self.assertEqual(app.visible(), [])
+            self.assertTrue(await until(pilot, lambda: app.visible() == []))
             self.assertIsNone(app.current)
 
 
@@ -715,8 +715,10 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
     async def press_all(self, pilot, app, store, acts):
         for key in self.KEYS:
             await pilot.press(key)
+            # negative check: it must not happen
             await pilot.pause(0.05)
             self.assertEqual(len(app.screen_stack), 1, key)   # no picker, no modal
+        # negative check: it must not happen
         await pilot.pause(0.2)
         self.assertEqual(app.pending, [])
         self.assertEqual(store.marks, {})
@@ -730,8 +732,8 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertTrue(app.current.key.startswith("saved:"))
+            self.assertTrue(await until(
+                pilot, lambda: app.current.key.startswith("saved:")))
             await self.press_all(pilot, app, store, acts)
             self.assertEqual(store.feed_rules(), [])
             await pilot.press("y")              # copy still works
@@ -755,14 +757,15 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
             keys = [k for k in self.KEYS if k not in ("x", "minus")]
             for key in keys:
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.05)
                 self.assertEqual(len(app.screen_stack), 1, key)
             self.assertEqual(app.pending, [])
             self.assertEqual(store.marks, {})
             self.assertEqual([c for c in acts.calls if c[0] != "draft"], [])
             await pilot.press("x")              # a rule from its newest row works
-            await pilot.pause(0.2)
-            self.assertEqual(type(app.screen).__name__, "ChoicePicker")
+            self.assertTrue(await until(
+                pilot, lambda: type(app.screen).__name__ == "ChoicePicker"))
 
     async def test_a_digest_opens_the_one_link_its_rows_share(self):
         cfg = dict(DEFAULTS, feed={"window_h": 48.0, "rules": [
@@ -783,16 +786,18 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(
+                pilot, lambda: (app.current_key or "").startswith("saved:")))
             first = app.current_key
             self.assertTrue(first.startswith("saved:"))
             await pilot.press("d")
-            await pilot.pause(0.2)
-            self.assertNotIn(first, [r.key for r in app.visible()])   # undo window
+            # undo window
+            self.assertTrue(await until(
+                pilot, lambda: first not in [r.key for r in app.visible()]))
             self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 1)
             await pilot.press("u")
-            await pilot.pause(0.2)
-            self.assertIn(first, [r.key for r in app.visible()])
+            self.assertTrue(await until(
+                pilot, lambda: first in [r.key for r in app.visible()]))
 
     async def test_a_saved_row_is_dropped_only_while_the_mail_row_shows(self):
         row = item(1, "fyi", "email", ("ack",), meta={
@@ -804,8 +809,8 @@ class SyntheticRowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 1)
             store.done("t:1")                   # the mail row is gone
             app.refilter()
-            await pilot.pause(0.1)
-            self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 2)
+            self.assertTrue(await until(
+                pilot, lambda: dict(app.feed_data.counts)["saved to memory"] == 2))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -818,8 +823,8 @@ class ViewDetailsTest(unittest.IsolatedAsyncioTestCase):
             app.source_filter = "slack"
             app.redraw()
             await pilot.press("4")
-            await pilot.pause(0.2)
-            self.assertIsNone(app.source_filter)
+            self.assertTrue(await until(
+                pilot, lambda: app.source_filter is None))
             self.assertEqual(len(app.visible()), 2)
 
     async def test_the_rules_screen_survives_a_failing_write(self):
@@ -839,6 +844,7 @@ class ViewDetailsTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("space")
             await pilot.pause(0.2)
             await pilot.press("delete")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertIsInstance(app.screen, RulesScreen)        # still open
             told = [n.message for n in app._notifications]
@@ -890,7 +896,8 @@ class HealthUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await until(pilot, lambda: app.health_snap is not None)
             await pilot.press("5")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(
+                pilot, lambda: "NEEDS YOU 1" in str(app.query_one("#health-body").render())))
             body = str(app.query_one("#health-body").render())
             self.assertIn("NEEDS YOU 1", body)
             self.assertIn("zoom-meetings", body)
@@ -921,7 +928,8 @@ class HealthUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await until(pilot, lambda: app.health_snap is not None)
             await pilot.press("5")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(
+                pilot, lambda: "NEEDS YOU 1" in str(app.query_one("#health-body").render())))
             body = str(app.query_one("#health-body").render())
             self.assertIn("NEEDS YOU 1", body)
             self.assertIn("gist 1", body)                    # the alert's title
@@ -955,9 +963,8 @@ class HealthUiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seen, [False])
             self.assertIn("health read failed", app.health_snap["error"])
             await pilot.press("5")
-            await pilot.pause(0.2)
-            self.assertIn("health read failed",
-                          str(app.query_one("#health-body").render()))
+            self.assertTrue(await until(
+                pilot, lambda: "health read failed" in str(app.query_one("#health-body").render())))
 
     async def test_r_refreshes_the_health_snapshot(self):
         calls = []
@@ -980,8 +987,8 @@ class HealthUiTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertFalse(app.query_one("#strip").display)
             await pilot.press("5")
-            await pilot.pause(0.2)
-            self.assertIn("Reading", str(app.query_one("#health-body").render()))
+            self.assertTrue(await until(
+                pilot, lambda: "Reading" in str(app.query_one("#health-body").render())))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -991,8 +998,8 @@ class HelpAndPaletteTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("question_mark")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             body = str(app.screen.query_one("#help-body").render())
             for needle in ("Inbox · Waiting · Tasks · Feed · Health",
                            "[ / ]", "mute this row", "less like this",

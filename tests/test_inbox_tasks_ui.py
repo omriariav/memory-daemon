@@ -24,7 +24,7 @@ import inbox_acts_support as support  # noqa: E402
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 
 if HAVE_TEXTUAL:
-    from workspace_daemon.inbox import items as itm, sources, views
+    from workspace_daemon.inbox import __version__, items as itm, sources, views
     from workspace_daemon.inbox.actions import LocalActions
     from workspace_daemon.inbox.app import (ACTS_OFF, DECISION_REQUIRED,
                                             TASK_CONFLICT_TOAST,
@@ -71,7 +71,12 @@ class FromSource:
 
 async def wait_for(pilot, cond, tries=200, step=0.03):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -157,7 +162,7 @@ class ViewTest(Base):
             self.assertEqual(keys_of(app), ["task:1", "task:2", "task:3",
                                             "task:6", "task:4", "task:5"])
             self.assertIn("3 Tasks 2", self.header(app))    # overdue + today
-            self.assertIn("0.12.0", self.header(app))
+            self.assertIn(__version__, self.header(app))
             self.assertEqual(app.query_one("#left").border_title, "Tasks")
 
     async def test_row_text_and_the_detail_card(self):
@@ -500,6 +505,7 @@ class DueTest(Base):
                 pilot, lambda: isinstance(app.screen, DateScreen)))
             await type_text(pilot, "2030-02-30")             # not a real day
             await pilot.press("enter")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertIsInstance(app.screen, DateScreen)
             self.assertEqual(self.src.requests(), [])

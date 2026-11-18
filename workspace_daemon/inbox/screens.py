@@ -551,7 +551,12 @@ HELP = [
 
 
 class HelpScreen(ModalScreen):
-    BINDINGS = [Binding("escape,question_mark,q", "close", "Close")]
+    # The reference is taller than most terminals: the body is a focused
+    # scroll container (arrows, PgUp/PgDn, Home/End from VerticalScroll; the
+    # mouse wheel too), and j/k scroll a line like everywhere else.
+    BINDINGS = [Binding("escape,question_mark,q", "close", "Close"),
+                Binding("j", "scroll(1)", show=False),
+                Binding("k", "scroll(-1)", show=False)]
 
     def __init__(self, extra=None, save_on=True):
         """`extra` is a list of (key, label) for the `actions:` of inbox.yaml.
@@ -589,7 +594,15 @@ class HelpScreen(ModalScreen):
         head.append("  keyboard reference  (esc to close)", Style(dim=True))
         with Vertical(id="help"):
             yield Static(head, id="help-title")
-            yield Static(t, id="help-body")
+            with VerticalScroll(id="help-scroll"):
+                yield Static(t, id="help-body")
+
+    def on_mount(self):
+        self.query_one("#help-scroll").focus()
+
+    def action_scroll(self, step: int):
+        pane = self.query_one("#help-scroll")
+        pane.scroll_down(animate=False) if step > 0 else pane.scroll_up(animate=False)
 
     def action_close(self):
         self.dismiss(None)

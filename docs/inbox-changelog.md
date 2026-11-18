@@ -7,6 +7,31 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-18
+
+Mostly a test and CI patch; one fix to the `?` screen.
+
+### Fixed
+
+- **The `?` keyboard reference scrolls.** The reference is taller than most
+  terminals, but nothing inside it took focus, so only the mouse wheel moved
+  it. The body is now a focused scroll container: j/k, the arrow keys,
+  PgUp/PgDn, Home/End and the wheel all scroll it; esc and `?` still close.
+- **Flaky Textual tests.** The tests waited for state with a fixed
+  `pilot.pause(N)` and then asserted, so a slow worker, timer or layout pass
+  failed the CI `inbox-ui` job at random (for example the thread pane scroll
+  after a toggle). They now wait for the state itself with `wait_for` or
+  `until`; a short pause stays only where a test checks that something does
+  not happen. Undo windows that a test must act inside are long, so a slow
+  machine cannot close them early.
+
+### Changed
+
+- **Faster CI.** The `inbox-ui` job runs in 4 shards (the module list and its
+  balance are in `tools/inbox_ui_shards.py`, which also fails CI when a new
+  inbox test module is in no job) and is skipped when a pull request changes
+  nothing the inbox imports. The `inbox-ui` check still always reports.
+
 ## [0.12.0] - 2026-11-18
 
 The Tasks view: a command source can list open tasks, and the inbox shows,

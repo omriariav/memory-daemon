@@ -828,7 +828,12 @@ class Fixed:
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -936,6 +941,7 @@ class ConfirmOptionsTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await settle(pilot, app)
                 modal = await open_confirm(pilot, app)
                 await pilot.press(dead)
+                # negative check: the key leaves the modal as it is
                 await pilot.pause(0.3)
                 self.assertIs(app.screen, modal)
                 self.assertEqual((app.pending, calls), ([], []))
@@ -952,8 +958,8 @@ class ConfirmOptionsTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await open_confirm(pilot, app)
             await pilot.press("escape")
-            await pilot.pause(0.3)
-            self.assertNotIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await wait_for(
+                pilot, lambda: not isinstance(app.screen, ConfirmSend)))
             self.assertEqual((app.pending, calls), ([], []))
             self.assertTrue(any("Nothing sent, drafted or copied" in t
                                 for t in toasts(app)))
@@ -1046,14 +1052,15 @@ class DraftFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         store = InboxStore(None)
         app = make_app([reply_item(1)],
                        acts_for(store, good_call(calls), send=cfg(mode="draft")),
-                       store, undo_s=0.5)
+                       store, undo_s=1.5)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await open_confirm(pilot, app)
             await pilot.press("d")
-            await pilot.pause(0.1)
+            self.assertTrue(await wait_for(pilot, lambda: app.pending))
             await pilot.press("u")
-            await pilot.pause(0.7)
+            # negative check: it must not happen (waits out the whole window)
+            await pilot.pause(2.0)
             self.assertEqual((app.pending, calls), ([], []))
             self.assertIn("t:1", keys(app))
 
@@ -1069,8 +1076,7 @@ class DraftFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("d")
             await pilot.pause(0.1)
             await pilot.press("q")
-            await pilot.pause(0.3)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
         self.assertEqual(calls, [])
         self.assertEqual([r["status"] for r in app.audit
                           if r["action"] == "draft"], ["cancelled on quit"])
@@ -1134,6 +1140,7 @@ class DraftFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 app.current_key = "t:2"
                 app.redraw(keep="t:2")
                 await pilot.press("a")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertNotIsInstance(app.screen, ConfirmSend)
                 self.assertTrue(any("already in progress" in t
@@ -1165,11 +1172,11 @@ class DraftFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                     await pilot.press("d")
                     self.assertTrue(await wait_for(pilot, started.is_set))
                     await pilot.press("q")
+                    # negative check: it must not happen
                     await pilot.pause(0.2)
                     self.assertFalse(app._exit)
                     await pilot.press("q")
-                    await pilot.pause(0.3)
-                    self.assertTrue(app._exit)
+                    self.assertTrue(await wait_for(pilot, lambda: app._exit))
                     row = next(r for r in app.audit if r["action"] == "draft")
                     self.assertEqual(row["status"], "running at quit")
                     said = " ".join(str(x) for x in app._exit_renderables)
@@ -1197,7 +1204,8 @@ class CopyFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                                    side_effect=clip.append):
                 await open_confirm(pilot, app)
                 await pilot.press("c")
-                await pilot.pause(0.3)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not isinstance(app.screen, ConfirmSend)))
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertEqual(app.pending, [])               # no undo window
             self.assertIn("t:1", keys(app))                 # not done
@@ -1240,7 +1248,9 @@ class CopyFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(app, "copy_to_clipboard"):
                 await open_confirm(pilot, app)
                 await pilot.press("c")
-                await pilot.pause(0.3)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("Copied for Slack: open the conversation"
+                                       in t for t in toasts(app))))
             self.assertFalse(any("open it with o" in t for t in toasts(app)))
             self.assertTrue(any("Copied for Slack: open the conversation" in t
                                 for t in toasts(app)))
@@ -1255,8 +1265,8 @@ class CopyFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await open_confirm(pilot, app)
             await pilot.press("c")
-            await pilot.pause(0.3)
-            self.assertEqual(app.clipboard, "*x*")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.clipboard == "*x*"))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -1288,10 +1298,12 @@ class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase
                         if modal.query("#confirm-warn") else "")
                 await pilot.press("y")                 # not offered
                 await pilot.press("d")                 # not offered
+                # negative check: the keys leave the modal as it is
                 await pilot.pause(0.2)
                 self.assertIs(app.screen, modal)
                 await pilot.press("c")
-                await pilot.pause(0.3)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not isinstance(app.screen, ConfirmSend)))
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertEqual((app.pending, app.running), ([], []))
             self.assertIn("t:1", keys(app))
@@ -1340,6 +1352,7 @@ class CopyWithoutDestinationTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase
             async with app.run_test(size=SIZE) as pilot:
                 await settle(pilot, app)
                 await pilot.press("a")
+                # negative check: it must not happen
                 await pilot.pause(0.3)
                 self.assertNotIsInstance(app.screen, ConfirmSend)
                 self.assertTrue(any(needle in t for t in toasts(app)), needle)
@@ -1371,7 +1384,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 40)) as pilot:
             await settle(pilot, app)
             modal = await open_confirm(pilot, app)
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: modal.query_one("#confirm").region.width > 0))
             box = modal.query_one("#confirm").region
             self.assertLessEqual(box.right, 80)
             self.assertTrue(modal.query_one("#confirm").has_class("narrow"))
@@ -1442,8 +1456,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             modal = await open_confirm(pilot, app)
             app.all_rows = [r for r in app.all_rows if r.key != target]
             app.refilter()
-            await pilot.pause(0.1)
-            self.assertNotIn(target, [i.key for i in app.items])
+            self.assertTrue(await wait_for(
+                pilot, lambda: target not in [i.key for i in app.items]))
             # the queue moved on to the other item (the old `o` opened that)
             self.assertNotEqual(app.current_key, target)
             await pilot.press("o")
@@ -1484,7 +1498,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 async with app.run_test(size=size) as pilot:
                     await settle(pilot, app)
                     modal = await open_confirm(pilot, app)
-                    await pilot.pause(0.4)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: modal.query_one("#confirm").region.width > 0))
                     w, h = size
                     for wid in ("#confirm-title", "#confirm-dest"):
                         r = modal.query_one(wid).region
@@ -1503,7 +1518,8 @@ class ConfirmLayoutTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(80, 40)) as pilot:
                 await settle(pilot, app)
                 modal = await open_confirm(pilot, app)
-                await pilot.pause(0.2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: modal.query_one("#confirm").region.width > 0))
                 box = modal.query_one("#confirm").region
                 for b in modal.query("#confirm-buttons Button"):
                     self.assertGreaterEqual(b.region.x, box.x, b.id)

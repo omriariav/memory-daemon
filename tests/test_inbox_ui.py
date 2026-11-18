@@ -99,8 +99,8 @@ class DemoTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             before = len(app.items)
             await pilot.press("r")
-            await pilot.pause(0.3)
-            self.assertEqual(len(app.items), before + 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(app.items) == (before + 1)))
             self.assertTrue(any(r["action"] == "poll" for r in app.audit))
 
 
@@ -116,11 +116,11 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             first = app.current_key
             await pilot.press("d")
-            await pilot.pause(0.1)
-            self.assertNotIn(first, [i.key for i in app.items])
+            self.assertTrue(await until(
+                pilot, lambda: first not in [i.key for i in app.items]))
             await pilot.press("u")
-            await pilot.pause(0.1)
-            self.assertIn(first, [i.key for i in app.items])
+            self.assertTrue(await until(
+                pilot, lambda: first in [i.key for i in app.items]))
             self.assertFalse(store.is_hidden(first))
             self.assertEqual(actions.calls.count(("mark_done", first)), 0)
 
@@ -130,9 +130,9 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             first = app.current_key
             await pilot.press("d")
-            await pilot.pause(0.6)
-            self.assertTrue(store.is_hidden(first))
+            self.assertTrue(await until(pilot, lambda: store.is_hidden(first)))
             await pilot.press("r")          # a poll must not bring it back
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertNotIn(first, [i.key for i in app.items])
 
@@ -143,6 +143,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             first = app.current_key
             await pilot.press("d")
             await pilot.press("r")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertNotIn(first, [i.key for i in app.items])
 
@@ -152,8 +153,8 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             key = app.current_key
             await pilot.press("a")
-            await pilot.pause(0.6)
-            self.assertIn("ack", store.marks[key])
+            self.assertTrue(await until(
+                pilot, lambda: "ack" in store.marks[key]))
 
     async def test_snooze_hides_then_wakes(self):
         clock = [time.time()]
@@ -163,17 +164,16 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             key = app.current_key
             await pilot.press("s")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, SnoozePicker)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, SnoozePicker)))
             await pilot.press("1")                     # one hour
-            await pilot.pause(0.6)
-            self.assertEqual(app.items, [])
+            self.assertTrue(await until(pilot, lambda: app.items == []))
             self.assertIsNotNone(store.snoozed_until(key))
             clock[0] += 3700                           # past the snooze
             with mock.patch("workspace_daemon.inbox.app.time.time", lambda: clock[0]):
                 app.refilter()
-            await pilot.pause(0.1)
-            self.assertEqual([i.key for i in app.items], [key])
+            self.assertTrue(await until(
+                pilot, lambda: [i.key for i in app.items] == [key]))
 
     async def test_confirm_modal_defaults_to_cancel_and_sends_nothing(self):
         row = item(1, "needs_reply", "slack", actions=("reply",), draft="hello there")
@@ -181,10 +181,11 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertEqual(app.screen.focused.id, "cancel")
             await pilot.press("enter")                 # Cancel is the default
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(actions.sent(), [])
             self.assertEqual(len(app.items), 1)
@@ -198,11 +199,9 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("a")
             await pilot.pause(0.1)
             await pilot.press("y")
-            await pilot.pause(0.1)
-            self.assertEqual(app.items, [])
+            self.assertTrue(await until(pilot, lambda: app.items == []))
             await pilot.press("u")
-            await pilot.pause(0.1)
-            self.assertEqual(len(app.items), 1)
+            self.assertTrue(await until(pilot, lambda: len(app.items) == 1))
             self.assertEqual(actions.sent(), [])
 
     async def test_quit_cancels_pending_send_but_commits_done(self):
@@ -221,6 +220,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             done_key = app.pending[-1].item.key
             await pilot.press("q")
+            # negative check: the cancelled send must not run
             await pilot.pause(0.3)
         self.assertEqual(actions.sent(), [])
         self.assertTrue(store.is_hidden(done_key))
@@ -234,6 +234,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertEqual(len(app.items), 1)
@@ -286,8 +287,7 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             with mock.patch.object(app, "notify", wraps=app.notify) as note:
                 await pilot.press("r")             # starts the slow poll
-                await pilot.pause(0.2)
-                self.assertTrue(app.polling)
+                self.assertTrue(await until(pilot, lambda: app.polling))
                 await pilot.press("r", "r")        # manual: told, not queued
                 await pilot.pause(0.2)
                 app.poll()                         # timer-driven: queued, silent
@@ -296,12 +296,13 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(told.count("Poll already running"), 2)
                 self.assertEqual(len(calls), 2)    # no extra fetches started
                 gate.set()
-                await pilot.pause(0.6)
+                self.assertTrue(await until(
+                    pilot, lambda: not app.polling))
             self.assertFalse(app.polling)
             self.assertEqual(len(calls), 3)        # the queued one ran, once
             await pilot.press("r")
-            await pilot.pause(0.4)
-            self.assertEqual(len(calls), 4)        # polling works again
+            # polling works again
+            self.assertTrue(await until(pilot, lambda: len(calls) == 4))
 
     async def test_each_poll_reloads_marks_written_by_another_pane(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,8 +316,8 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(app.items), 2)
                 other.done("t:1")                  # the other pane marks it
                 await pilot.press("r")
-                await pilot.pause(0.4)
-                self.assertEqual([i.key for i in app.items], ["t:2"])
+                self.assertTrue(await until(
+                    pilot, lambda: [i.key for i in app.items] == ["t:2"]))
 
     async def test_source_filter_and_text_filter(self):
         rows = [item(1, "urgent", "alert"),
@@ -330,25 +331,25 @@ class KeysTest(unittest.IsolatedAsyncioTestCase):
             shown = {i.source for i in app.visible()}
             self.assertEqual(len(shown), 1)
             await pilot.press("escape")
-            await pilot.pause(0.1)
-            self.assertEqual(len(app.visible()), 3)
+            self.assertTrue(await until(
+                pilot, lambda: len(app.visible()) == 3))
             await pilot.press("slash", "P", "e", "r", "s", "o", "n", "space", "2")
-            await pilot.pause(0.1)
-            self.assertEqual([i.key for i in app.visible()], ["t:2"])
+            self.assertTrue(await until(
+                pilot, lambda: [i.key for i in app.visible()] == ["t:2"]))
 
     async def test_help_audit_and_palette_open(self):
         app, _, _ = make_app(self.rows())
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             self.assertIn(f"v{__version__}", str(app.screen.query_one("#help-title").render()))
             self.assertIn(__version__, str(app.query_one("#hdr").render()))
             await pilot.press("escape")
             await pilot.press("L")
-            await pilot.pause(0.1)
-            self.assertEqual(type(app.screen).__name__, "AuditScreen")
+            self.assertTrue(await until(
+                pilot, lambda: type(app.screen).__name__ == "AuditScreen"))
             await pilot.press("escape")
             cmds = [c.title for c in app.get_system_commands(app.screen)]
             self.assertIn("Poll now", cmds)
@@ -472,13 +473,13 @@ class CopyTest(unittest.IsolatedAsyncioTestCase):
             await pilot.mouse_down("#thread-body", offset=(0, 2))
             await pilot.hover("#thread-body", offset=(8, 2))
             await pilot.mouse_up("#thread-body", offset=(8, 2))
-            await pilot.pause(0.1)
-            self.assertTrue(app.screen.get_selected_text())
+            self.assertTrue(await until(
+                pilot, lambda: app.screen.get_selected_text()))
             with mock.patch("workspace_daemon.inbox.app.bidi.available",
                             return_value=True):
                 await pilot.press("b")
-            await pilot.pause(0.1)
-            self.assertEqual(app.bidi_mode, "visual")
+            self.assertTrue(await until(
+                pilot, lambda: app.bidi_mode == "visual"))
             self.assertFalse(app.screen.get_selected_text())
 
     async def test_copy_is_logical_text_even_in_visual_bidi_mode(self):
@@ -555,17 +556,15 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:3"])
             self.assertEqual(app.resolved_hidden, 1)
             await pilot.press("R")
-            await pilot.pause(0.1)
-            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:2", "t:3"])
+            self.assertTrue(await until(
+                pilot, lambda: sorted(i.key for i in app.items) == ["t:1", "t:2", "t:3"]))
             self.assertEqual(app.resolved_hidden, 0)
             await pilot.press("4")
-            await pilot.pause(0.1)
-            self.assertEqual(
-                [i.key for i in app.query_one("#queue", Queue).rows],
-                ["t:2", "t:3"])
+            self.assertTrue(await until(
+                pilot, lambda: [i.key for i in app.query_one("#queue", Queue).rows] == ["t:2", "t:3"]))
             await pilot.press("R")
-            await pilot.pause(0.1)
-            self.assertEqual(sorted(i.key for i in app.items), ["t:1", "t:3"])
+            self.assertTrue(await until(
+                pilot, lambda: sorted(i.key for i in app.items) == ["t:1", "t:3"]))
 
     async def test_header_counts_hidden_resolved_alerts(self):
         app, _, _ = make_app(self.rows())
@@ -574,8 +573,8 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
             header = lambda: str(app.query_one("#hdr").render())
             self.assertIn("\u2713 1 resolved (R)", header())
             await pilot.press("R")
-            await pilot.pause(0.1)
-            self.assertNotIn("resolved (R)", header())
+            self.assertTrue(await until(
+                pilot, lambda: "resolved (R)" not in header()))
             await pilot.press("4")
             await pilot.pause(0.1)
             rows = app.query_one("#queue", Queue).rows
@@ -598,8 +597,8 @@ class ResolvedAlertsTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("R")
-            await pilot.pause(0.1)
-            self.assertEqual(sum(1 for i in app.items if i.section == "urgent"), 1)
+            self.assertTrue(await until(
+                pilot, lambda: sum(1 for i in app.items if i.section == "urgent") == 1))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -613,8 +612,8 @@ class SafetyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")         # confirm modal shows the destination
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, ConfirmSend)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             await pilot.press("escape")
             await pilot.press("d")
             await pilot.pause(0.2)
@@ -822,8 +821,8 @@ class ShowAllKeyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("A")
-            await pilot.pause(0.4)
-            self.assertTrue(app.show_all)
+            self.assertTrue(await until(
+                pilot, lambda: app.show_all and [i.key for i in app.items] == ["t:1"]))
             self.assertEqual([i.key for i in app.items], ["t:1"])
 
     async def test_real_collect_passes_all_only_to_declaring_sources(self):
@@ -890,9 +889,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertEqual(app.view, "inbox")
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertEqual((app.view, app.feed_routine),
-                             ("feed", "saved to memory"))
+            self.assertTrue(await until(
+                pilot, lambda: (app.view, app.feed_routine) == ("feed", "saved to memory")))
             self.assertEqual(len(app.screen_stack), 1)
             rows = app.query_one("#queue", Queue).rows
             self.assertEqual([r.gist for r in rows],
@@ -902,8 +900,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(r.saved for r in rows))
             self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 2)
             await pilot.press("escape")
-            await pilot.pause(0.2)
-            self.assertIsNone(app.feed_routine)
+            self.assertTrue(await until(
+                pilot, lambda: app.feed_routine is None))
             self.assertEqual({r.gist for r in app.query_one("#queue", Queue).rows},
                              {"gist 1", "Launch checklist thread",
                               "Contract terms [b]x[/b]"})
@@ -913,8 +911,9 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertNotIn(("o", "open"), app.hints())   # first row: no link
+            # first row: no link
+            self.assertTrue(await until(
+                pilot, lambda: ("o", "open") not in app.hints()))
             await pilot.press("j", "o")       # second row: has a link
             self.assertTrue(await until(pilot, lambda: any(
                 r["action"] == "open" for r in app.audit)))
@@ -927,6 +926,7 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("S")
             await pilot.pause(0.3)
             await pilot.press("a", "n", "e", "x", "minus")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(len(app.screen_stack), 1)   # no picker opened
             self.assertEqual(app.pending, [])
@@ -950,8 +950,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertTrue(app.query_one("#zero").display)
+            self.assertTrue(await until(
+                pilot, lambda: app.query_one("#zero").display))
             self.assertIn("saved to memory", str(app.query_one("#zero").render()))
             await pilot.press("o")            # nothing to open: no crash
             await pilot.pause(0.1)
@@ -960,8 +960,8 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertIn("denied", str(app.query_one("#zero").render()))
+            self.assertTrue(await until(
+                pilot, lambda: "denied" in str(app.query_one("#zero").render())))
 
     async def test_a_failing_reader_does_not_end_the_session(self):
         store = InboxStore(None)
@@ -974,15 +974,16 @@ class SavedKeyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
-            self.assertEqual(app.view, "feed")
-            self.assertIn("RuntimeError", str(app.query_one("#zero").render()))
+            self.assertTrue(await until(
+                pilot, lambda: app.view == "feed"
+                and "RuntimeError" in str(app.query_one("#zero").render())))
 
     async def test_without_a_reader_s_only_says_so(self):
         app, _, _ = self.make()
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(len(app.screen_stack), 1)
             self.assertEqual(app.view, "inbox")      # nothing to show: stays
@@ -1039,7 +1040,12 @@ def unit_app(units, poll_s=300.0, watch_s=0.05, debounce_s=0.0, saved=None,
 
 async def until(pilot, cond, tries=150, step=0.04):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -1066,6 +1072,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((a.runs, b.runs), (1, 1))
             (self.dir / "a.txt").write_text("changed, and longer")
             self.assertTrue(await until(pilot, lambda: a.runs == 2))
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual((a.runs, b.runs), (2, 1))
             # b's rows are still listed from its cached result
@@ -1077,6 +1084,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
         app = unit_app([a, b])
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
+            # negative check: it must not happen
             await pilot.pause(0.8)          # ~15 watch ticks
             self.assertEqual((a.runs, b.runs), (1, 1))
 
@@ -1134,6 +1142,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
         app = unit_app([a])
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(a.runs, 1)
             later.write_text("hello")
@@ -1150,6 +1159,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
 
             app.watcher._stat = boom
             app.watcher.commit()            # baseline: every path now errors
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(a.runs, 1)
             self.assertTrue(app.is_running)
@@ -1218,6 +1228,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await pilot.press("A")
             self.assertTrue(await until(pilot, lambda: wide.runs == 2))
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual((plain.runs, wide.alls), (1, [False, True]))
 
@@ -1230,7 +1241,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             (self.dir / "a.txt").write_text("changed, longer")
             self.assertTrue(await until(pilot, lambda: a.runs == 2))
-            await pilot.pause(0.3)
+            self.assertTrue(await until(pilot, lambda: not app.polling))
             self.assertEqual([i.key for i in app.items], ["dup:1"])
             self.assertTrue(any("duplicate id" in p for p in app.source_problems()))
 
@@ -1249,10 +1260,13 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
         app = unit_app([CountingUnit("a", [str(events_file)])], saved=saved)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            await pilot.pause(0.3)
-            self.assertEqual(len(calls), 1)         # the first refresh
+            # the first refresh
+            self.assertTrue(await until(
+                pilot, lambda: len(calls) == 1
+                and dict(app.feed_data.counts).get("saved to memory") == 3))
             self.assertEqual(dict(app.feed_data.counts)["saved to memory"], 3)
             before = len(calls)
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(len(calls), before)    # no change: no reads
             events_file.write_text("one two")       # the events file changed
@@ -1273,6 +1287,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             app.poll()
             self.assertEqual(a.runs, 2)            # nothing extra started
             await until(pilot, lambda: a.runs == 3 and not app.polling, tries=200)
+            # negative check: it must not happen
             await pilot.pause(0.6)
             self.assertEqual((a.runs, b.runs), (3, 3))   # one queued full refresh
 
@@ -1287,6 +1302,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("A")                 # subset, queued
             app.poll()                             # full, merges and wins
             await until(pilot, lambda: wide.runs == 3 and not app.polling, tries=200)
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual((wide.runs, plain.runs), (3, 3))
             self.assertEqual(wide.alls[-1], True)
@@ -1313,6 +1329,7 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             app.watcher.commit()                   # last_run = now
             app.updated_at["a"] -= 300
             (self.dir / "a.txt").write_text("changed, longer")
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
             self.assertEqual(a.runs, 1)
@@ -1336,14 +1353,14 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
             app.updated_at["a"] -= 300
             app.reeval()
             await until(pilot, lambda: calls and not app.polling)
-            await pilot.pause(0.3)
-            self.assertEqual([i.key for i in app.items], ["a:first"])
+            self.assertTrue(await until(
+                pilot, lambda: [i.key for i in app.items] == ["a:first"]))
             self.assertEqual(a.runs, 1)            # no source was run
             self.assertGreaterEqual(time.time() - app.updated_at["a"], 299)
             app.reeval()
             await until(pilot, lambda: len(calls) == 2 and not app.polling)
-            await pilot.pause(0.3)
-            self.assertEqual([i.key for i in app.items], ["a:later"])
+            self.assertTrue(await until(
+                pilot, lambda: [i.key for i in app.items] == ["a:later"]))
 
     async def test_a_unit_without_reeval_is_left_alone(self):
         a = CountingUnit("a", [])
@@ -1351,8 +1368,8 @@ class ChangeDrivenRefreshTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             app.reeval()
-            await pilot.pause(0.3)
-            self.assertEqual((a.runs, [i.key for i in app.items]), (1, ["a:1"]))
+            self.assertTrue(await until(
+                pilot, lambda: (a.runs, [i.key for i in app.items]) == (1, ["a:1"])))
 
     async def test_invites_list_soonest_first_after_the_replies(self):
         now = time.time()

@@ -876,7 +876,12 @@ def warn_text(app):
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -915,12 +920,14 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             for key in ("a", "e"):
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertNotIsInstance(app.screen, ConfirmSend)
                 self.assertTrue(any(NOT_YET in t for t in toasts(app)))
             app.current_key = "t:2"
             app.redraw(keep="t:2")
             await pilot.press("n")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertEqual(app.pending, [])
@@ -954,11 +961,12 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             first = app.current_key
             await pilot.press("a")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             modal = app.screen
             self.assertIsInstance(modal, ConfirmSend)
-            await pilot.pause(0.15)
-            self.assertEqual(modal.focused.id, "cancel")        # Cancel default
+            self.assertTrue(await wait_for(
+                pilot, lambda: modal.focused.id == "cancel"))  # Cancel default
             self.assertEqual(modal.destination, "#launch (thread)")
             self.assertEqual(modal.text, "Thanks, on it.")
             self.assertEqual(calls, [])
@@ -1040,7 +1048,9 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.3)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)
+                and app.screen.query_one("#confirm-scroll").max_scroll_y > 0))
             modal = app.screen
             pane = modal.query_one("#confirm-scroll")
             self.assertGreater(pane.max_scroll_y, 0)
@@ -1049,13 +1059,14 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.press("j")
             await pilot.press("pagedown")
-            await pilot.pause(0.1)
-            self.assertGreater(pane.scroll_y, 2)
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 2))
+            # negative check: buttons stay put
             await pilot.pause(0.15)
-            self.assertEqual(modal.focused.id, "cancel")        # buttons stay put
+            self.assertEqual(modal.focused.id, "cancel")
             shown = str(modal.query_one("#confirm-text").render()).splitlines()
             self.assertEqual(shown, text.splitlines())          # all of it
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(app.pending, [])
 
@@ -1067,6 +1078,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertTrue(any(
@@ -1081,7 +1093,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
-            await pilot.pause(0.3)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             route = str(app.screen.query_one("#confirm-route").render())
             self.assertIn(CHANNEL, route)
             self.assertIn(f"thread {THREAD}", route)
@@ -1099,8 +1112,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             app.query_one("#draft-edit").text = "safe\u202e text\x07 here\r\nnext"
             await pilot.press("ctrl+s")
-            await pilot.pause(0.1)
-            self.assertEqual(app.current.draft, "safe text here\nnext")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.current.draft == "safe text here\nnext"))
             await pilot.press("a")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, ConfirmSend)))
@@ -1121,14 +1134,17 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 app.redraw(keep=key)
                 await pilot.pause(0.1)
                 await pilot.press("n" if key == "t:3" else "a")
-                await pilot.pause(0.2)
                 # 0.7.0: never a send or a draft; only Copy for Slack is offered
-                self.assertIsInstance(app.screen, ConfirmSend, key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmSend)), key)
                 self.assertEqual(app.screen.options, ("copy",), key)
-                self.assertTrue(await wait_for(pilot, lambda: "a channel post without a thread is off" in warn_text(app)), key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: "a channel post without a thread is off"
+                    in warn_text(app)), key)
                 self.assertIn("a channel post without a thread is off", warn_text(app))
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: not isinstance(app.screen, ConfirmSend)))
             self.assertEqual((app.pending, calls), ([], []))
 
     async def test_a_dm_without_a_thread_and_an_opted_in_channel_post_are_allowed(self):
@@ -1146,8 +1162,8 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 app.redraw(keep=key)
                 await pilot.pause(0.1)
                 await pilot.press("a")
-                await pilot.pause(0.3)
-                self.assertIsInstance(app.screen, ConfirmSend, key)
+                self.assertTrue(await wait_for(
+                    pilot, lambda: isinstance(app.screen, ConfirmSend)), key)
                 self.assertEqual(app.screen.destination, label)
                 await pilot.press("escape")
                 await pilot.pause(0.2)
@@ -1168,6 +1184,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await wait_for(pilot, lambda: "no valid meta.reply_to" in warn_text(app)))
                 self.assertIn("no valid meta.reply_to", warn_text(app))
                 await pilot.press("escape")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertEqual(app.pending, [])
 
@@ -1178,6 +1195,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertTrue(any("No draft" in t for t in toasts(app)))
@@ -1192,6 +1210,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("a")
             await pilot.pause(0.2)
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual((app.pending, calls), ([], []))
             self.assertIn("cancelled", [r["status"] for r in app.audit])
@@ -1207,9 +1226,10 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("a")
             await pilot.pause(0.2)
             await pilot.press("y")
-            await pilot.pause(0.1)
-            self.assertNotIn("t:1", keys(app))
+            self.assertTrue(await wait_for(
+                pilot, lambda: "t:1" not in keys(app)))
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual((app.pending, calls), ([], []))
             self.assertIn("t:1", keys(app))
@@ -1226,8 +1246,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause(0.1)
             await pilot.press("q")
-            await pilot.pause(0.3)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
         self.assertEqual(calls, [])
         self.assertFalse(store.is_hidden("t:1"))
         self.assertEqual([r["status"] for r in app.audit if r["action"] == "send"],
@@ -1251,6 +1270,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 self.assertTrue(await wait_for(pilot, started.is_set))
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._exit)
                 self.assertTrue(any(
@@ -1259,8 +1279,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 gate.set()
                 await wait_for(pilot, lambda: not app.running)
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
         finally:
             gate.set()
 
@@ -1288,8 +1307,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                     await pilot.press("q")
                     await pilot.pause(0.2)
                     await pilot.press("q")              # quit with the send running
-                    await pilot.pause(0.3)
-                    self.assertTrue(app._exit)
+                    self.assertTrue(await wait_for(pilot, lambda: app._exit))
                     row = next(r for r in app.audit if r["action"] == "send")
                     self.assertEqual(row["status"], "running at quit")
                     self.assertIn("may have been sent", row["detail"])
@@ -1325,6 +1343,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 # waiting out its undo window
                 app.current_key = app.items[0].key
                 await pilot.press("a")
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertNotIsInstance(app.screen, ConfirmSend)
                 self.assertTrue(any("already in progress" in t for t in toasts(app)))
@@ -1332,6 +1351,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 # and while it runs
                 app.current_key = app.items[0].key
                 app.action_approve()
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertNotIsInstance(app.screen, ConfirmSend)
                 self.assertEqual(len(calls), 1)
@@ -1363,6 +1383,7 @@ class SendFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: any("auth failed" in t for t in toasts(app))))
+            # negative check: it must not happen
             await pilot.pause(0.6)
             self.assertEqual(len(calls), 1)
             self.assertIn("t:1", keys(app))
@@ -1489,13 +1510,14 @@ class PrecheckFlowTest(WorkerCleanup, PrecheckBase, unittest.IsolatedAsyncioTest
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("a")
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertNotIsInstance(app.screen, ConfirmSend)     # still checking
             await pilot.press("escape")
-            await pilot.pause(0.3)
             self.assertTrue(await wait_for(
                 pilot, lambda: not [t for t in threading.enumerate()
                                     if t.name == "inbox-precheck"], tries=200))
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertNotIsInstance(app.screen, ConfirmSend)
             self.assertEqual((app.pending, calls), ([], []))
@@ -1510,8 +1532,7 @@ class PrecheckFlowTest(WorkerCleanup, PrecheckBase, unittest.IsolatedAsyncioTest
             await pilot.press("a")
             await pilot.pause(0.5)
             await pilot.press("ctrl+q")                 # a modal hides plain q
-            await pilot.pause(0.3)
-            self.assertTrue(app._exit)
+            self.assertTrue(await wait_for(pilot, lambda: app._exit))
         self.assertEqual(calls, [])
 
     async def test_a_draft_changed_while_checking_discards_the_send(self):

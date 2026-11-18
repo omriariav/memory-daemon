@@ -75,7 +75,12 @@ async def settle(pilot, app):
 
 async def until(pilot, cond, tries=150, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -146,6 +151,7 @@ class SendTest(Base):
             await pilot.press("d")
             await pilot.pause(0.2)
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual(self.src.requests(), [])
             self.assertFalse(self.store.is_hidden("t:1"))
@@ -161,10 +167,11 @@ class SendTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("d")
-            await pilot.pause(0.5)                  # the act is now running
-            self.assertTrue(app.running)
+            # the act is now running
+            self.assertTrue(await until(pilot, lambda: app.running))
             started = time.monotonic()
             await pilot.press("j")                  # the UI still answers
+            # negative check: a timing bound, not a state wait
             await pilot.pause(0.05)
             self.assertLess(time.monotonic() - started, 0.5)
             self.assertTrue(await until(pilot, lambda: not app.running,
@@ -179,6 +186,7 @@ class SendTest(Base):
             await pilot.press("d")
             self.assertTrue(await until(pilot, lambda: any(
                 r["status"] == "conflict" for r in app.audit)))
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertFalse(self.store.is_hidden(first))
             self.assertIn(first, [i.key for i in app.items])
@@ -196,8 +204,7 @@ class SendTest(Base):
             self.assertTrue(await until(pilot, lambda: app.act_pending == 1))
             self.assertTrue(self.store.is_hidden(first))
             strip = app.query_one("#strip", HealthStrip)
-            await pilot.pause(0.4)
-            self.assertTrue(strip.display)
+            self.assertTrue(await until(pilot, lambda: strip.display))
             self.assertIn("1 not synced",
                           strip.render_strip(app, app.pal, 120).plain)
 
@@ -210,6 +217,7 @@ class SendTest(Base):
             self.assertTrue(await until(pilot, lambda: app.act_pending == 1))
             self.src.configure("ok")
             await pilot.press("r")                  # too soon: 5 minutes
+            # negative check: it must not happen
             await pilot.pause(0.6)
             self.assertEqual(len(self.src.requests()), 1)
             with mock.patch.object(acts, "RETRY_EVERY_S", 0):
@@ -233,6 +241,7 @@ class SendTest(Base):
             with mock.patch.object(acts, "RETRY_EVERY_S", 0):
                 await pilot.press("r")
                 self.assertTrue(await until(pilot, lambda: app.act_pending == 0))
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertFalse(self.store.is_hidden(first))
             self.assertIn(CONFLICT_TOAST, toasts(app))
@@ -246,9 +255,8 @@ class SendTest(Base):
             await pilot.press("d")
             self.assertTrue(await until(pilot, lambda: app.act_shadow))
             self.assertTrue(self.store.is_hidden(first))
-            await pilot.pause(0.4)
             strip = app.query_one("#strip", HealthStrip)
-            self.assertTrue(strip.display)
+            self.assertTrue(await until(pilot, lambda: strip.display))
             self.assertIn("shadow", strip.render_strip(app, app.pal, 120).plain)
             self.assertTrue(any(t.startswith("shadow:") for t in toasts(app)))
             self.src.configure("ok")                 # the marker follows the
@@ -264,6 +272,7 @@ class SendTest(Base):
             await pilot.press("d")
             await pilot.pause(0.2)
             await pilot.press("q")
+            # negative check: the quit must not wait for the act
             await pilot.pause(0.5)
         self.assertEqual(self.src.requests(), [])        # the app never blocks
         self.assertTrue(InboxStore(self.base).is_hidden(first))
@@ -283,8 +292,8 @@ class PickerTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("w")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ChoicePicker)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             self.assertEqual([c["label"] for c in app.screen.choices],
                              ["Me", "Ada Example", "Bo Sample",
                               "Nobody (FYI)"])
@@ -305,6 +314,7 @@ class PickerTest(Base):
                 await pilot.press(key)
                 self.assertTrue(await until(pilot, lambda: len(
                     self.src.requests()) == (1 if who == "me" else 2)))
+                # negative check: no further request may follow
                 await pilot.pause(0.3)
             self.assertEqual([r["args"] for r in self.src.requests()],
                              [{"who": "me"}, {"who": "nobody"}])
@@ -318,6 +328,7 @@ class PickerTest(Base):
             await pilot.press("1")
             await pilot.pause(0.2)
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(self.src.requests(), [])
 
@@ -327,8 +338,8 @@ class PickerTest(Base):
             await settle(pilot, app)
             first = app.current_key
             await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ChoicePicker)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             self.assertEqual([c["label"] for c in app.screen.choices], [
                 "Mute this conversation: 1 day",
                 "Mute this conversation: 1 week",
@@ -360,7 +371,8 @@ class PickerTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("x")
-            await pilot.pause(0.2)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             labels = [c["label"] for c in app.screen.choices]
             self.assertEqual(labels[:3], ["This kind from cal",
                                           "Everything from cal",
@@ -370,12 +382,12 @@ class PickerTest(Base):
                 "Mute this conversation: 1 week",
                 "Mute this conversation: untrack"])
             await pilot.press("2")                   # a Feed rule: the old path
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ChoicePicker)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             self.assertEqual(app.screen.title_text, "Mute: for how long")
             await pilot.press("1")
-            await pilot.pause(0.3)
-            self.assertEqual(len(self.store.feed_rules()), 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(self.store.feed_rules()) == 1))
             self.assertEqual(self.src.requests(), [])
 
     async def test_bang_relays_with_a_note(self):
@@ -383,8 +395,8 @@ class PickerTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("exclamation_mark")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, NoteScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, NoteScreen)))
             await pilot.press(*"look at  this", "enter")
             self.assertTrue(await until(pilot, lambda: self.src.requests()))
             (req,) = self.src.requests()
@@ -399,6 +411,7 @@ class PickerTest(Base):
             await pilot.press("exclamation_mark")
             await pilot.pause(0.2)
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(self.src.requests(), [])
             await pilot.press("exclamation_mark")
@@ -414,10 +427,12 @@ class PickerTest(Base):
             await settle(pilot, app)
             for key in ("w", "exclamation_mark"):
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertEqual(len(app.screen_stack), 1)
             self.assertTrue(any("does not list" in t for t in toasts(app)))
             await pilot.press("x")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertEqual(len(app.screen_stack), 1)   # not in the Feed
             self.assertEqual(self.src.requests(), [])
@@ -480,8 +495,8 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("D")
-            await pilot.pause(0.4)
-            self.assertEqual(app.current.draft, "the source's draft")
+            self.assertTrue(await until(
+                pilot, lambda: app.current.draft == "the source's draft"))
             self.assertEqual(calls, [])
 
     async def test_D_needs_summary_or_polish_and_a_replyable_row(self):
@@ -489,8 +504,8 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("D")
-            await pilot.pause(0.2)
-            self.assertTrue(any("summary: or polish:" in t for t in toasts(app)))
+            self.assertTrue(await until(
+                pilot, lambda: any("summary: or polish:" in t for t in toasts(app))))
             self.assertEqual(app.current.draft, "")
 
     async def test_D_failure_is_a_toast_and_leaves_the_row_alone(self):
@@ -515,12 +530,14 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("n")
-            await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, ConfirmSend)       # the normal path
+            # the normal path
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
             self.assertEqual(app.screen.text,
                              "Hi Ada, any news on the rollout plan?")
             self.assertEqual(app.screen.verb, "Send nudge")
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(self.src.requests(), [])
             # Cancelled: the template is not left behind as the row's draft.
@@ -538,6 +555,7 @@ class DraftAndNudgeTest(Base):
             await pilot.press("n")
             await pilot.pause(0.3)
             await pilot.press("escape")
+            # negative check: a cancelled nudge leaves no draft
             await pilot.pause(0.2)
             self.assertEqual(app.current.draft, "")
             await pilot.press("D")
@@ -552,9 +570,8 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("n")
-            await pilot.pause(0.3)
-            self.assertEqual(app.screen.text,
-                             "Ping Ada Example: the rollout plan")
+            self.assertTrue(await until(
+                pilot, lambda: app.screen.text == "Ping Ada Example: the rollout plan"))
 
     async def test_n_with_a_stored_draft_sends_that_draft(self):
         row = item(1, "waiting", "slack", ("nudge",), draft="Stored nudge text")
@@ -562,8 +579,8 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("n")
-            await pilot.pause(0.3)
-            self.assertEqual(app.screen.text, "Stored nudge text")
+            self.assertTrue(await until(
+                pilot, lambda: app.screen.text == "Stored nudge text"))
 
     async def test_n_without_acts_is_not_due_as_before(self):
         app = self.app([self.waiting()], view="waiting",
@@ -571,6 +588,7 @@ class DraftAndNudgeTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("n")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(len(app.screen_stack), 1)
             self.assertTrue(any("Nudge not due yet" in t for t in toasts(app)))
@@ -589,12 +607,14 @@ class DoneReactionTest(Base):
 
     async def test_done_reaction_on_reacts_after_the_window(self):
         calls = []
-        app = self.app([item(1), item(2)], undo_s=0.4,
+        # A long undo window: the in-window check runs as soon as the done is
+        # pending, so a slow machine cannot let the window close under it.
+        app = self.app([item(1), item(2)], undo_s=2.0,
                        actions=self.react_actions(calls, "white_check_mark"))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("d")
-            await pilot.pause(0.15)
+            self.assertTrue(await until(pilot, lambda: app.pending))
             self.assertEqual(calls, [])              # still inside the window
             self.assertTrue(await until(pilot, lambda: calls))
             (pins,) = calls
@@ -611,6 +631,7 @@ class DoneReactionTest(Base):
             await settle(pilot, app)
             await pilot.press("d")
             await until(pilot, lambda: self.src.requests())
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(calls, [])
 
@@ -623,6 +644,7 @@ class DoneReactionTest(Base):
             self.assertEqual(app.current_key, "t:1")
             await pilot.press("d")
             await until(pilot, lambda: self.src.requests())
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(calls, [])
 
@@ -639,6 +661,7 @@ class DoneReactionTest(Base):
             self.assertEqual(app.current_key, "t:1")
             await pilot.press("d")
             await until(pilot, lambda: self.src.requests())
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(calls, [])
             self.assertEqual(self.src.requests()[0]["action"], "close")
@@ -723,6 +746,7 @@ class DoneReactionTest(Base):
             await pilot.press("d")
             await pilot.pause(0.2)
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual((calls, self.src.requests()), ([], []))
 
@@ -735,6 +759,7 @@ class DoneReactionTest(Base):
             await pilot.press("d")
             await until(pilot, lambda: any(
                 r["status"] == "conflict" for r in app.audit))
+            # negative check: it must not happen
             await pilot.pause(0.3)
             self.assertEqual(calls, [])
 
@@ -785,9 +810,8 @@ class ReviewFixesUITest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             self.assertTrue(app.act_shadow)
-            await pilot.pause(0.4)
             strip = app.query_one("#strip", HealthStrip)
-            self.assertTrue(strip.display)
+            self.assertTrue(await until(pilot, lambda: strip.display))
             self.assertIn("shadow", strip.render_strip(app, app.pal, 120).plain)
 
     async def test_a_lost_op_is_an_error_toast(self):
@@ -816,18 +840,21 @@ class ReviewFixesUITest(Base):
             await pilot.press("y")
             self.assertTrue(await until(pilot, lambda: len(
                 self.src.requests()) == 2))
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(len(app.screen_stack), 1)
             await pilot.press("L")
-            await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, OpsScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, OpsScreen)))
             close_row = next(r for r in app.screen.rows
                              if r["action"] == "close")
             self.assertTrue(close_row.get("undone"))
             await pilot.press("u")                   # on the newest row (the
+            # negative check: it must not happen
             await pilot.pause(0.2)                   # reopen) or the close:
             self.assertIsInstance(app.screen, OpsScreen)     # never a confirm
             await pilot.press("j", "u")
+            # negative check: never a confirm
             await pilot.pause(0.2)
             self.assertIsInstance(app.screen, OpsScreen)
             self.assertEqual(len(self.src.requests()), 2)
@@ -848,6 +875,7 @@ class ReviewFixesUITest(Base):
                 await pilot.press("D")
                 await until(pilot, lambda: app._draft_running)
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._quitting)           # asked first
                 self.assertTrue(any("draft for me still running" in t
@@ -872,6 +900,7 @@ class ReviewFixesUITest(Base):
             await pilot.press("y")
             await until(pilot, lambda: app._inverse_running)
             await pilot.press("q")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertFalse(app._quitting)
             self.assertTrue(any("undo in the source still running" in t
@@ -901,14 +930,15 @@ class AuditTest(Base):
             self.assertTrue(await until(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
             await pilot.press("L")
-            await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, OpsScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, OpsScreen)))
             (row,) = app.screen.rows
             self.assertEqual((row["action"], row["id"], row["result"]),
                              ("close", first, "ok"))
             await pilot.press("u")
-            await pilot.pause(0.3)
-            self.assertIsInstance(app.screen, ConfirmWrite)     # a confirm
+            # a confirm
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
             self.assertEqual(len(self.src.requests()), 1)
             await pilot.press("y")
             self.assertTrue(await until(pilot, lambda: len(
@@ -931,6 +961,7 @@ class AuditTest(Base):
             await pilot.press("L")
             await pilot.pause(0.3)
             await pilot.press("u")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertIsInstance(app.screen, OpsScreen)         # no confirm
             self.assertEqual(len(self.src.requests()), 1)
@@ -940,17 +971,17 @@ class AuditTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("L")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, OpsScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, OpsScreen)))
             await pilot.press("a")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, AuditScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, AuditScreen)))
             await pilot.press("escape")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, OpsScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, OpsScreen)))
             await pilot.press("escape")
-            await pilot.pause(0.2)
-            self.assertEqual(len(app.screen_stack), 1)
+            self.assertTrue(await until(
+                pilot, lambda: len(app.screen_stack) == 1))
 
 
 class SyntheticRowsTest(Base):
@@ -964,11 +995,12 @@ class SyntheticRowsTest(Base):
             self.assertTrue(app.current.key.startswith("digest:"))
             for key in ("w", "exclamation_mark", "D"):
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertEqual(len(app.screen_stack), 1, key)
             await pilot.press("x")                   # a rule, never a mute act
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ChoicePicker)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             self.assertFalse(any("conversation" in c["label"]
                                  for c in app.screen.choices))
             await pilot.press("escape")
@@ -977,6 +1009,7 @@ class SyntheticRowsTest(Base):
             await pilot.press("d")                   # a local dismiss still works
             await until(pilot, lambda: all(
                 self.store.is_hidden(r["id"]) for r in rows))
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual(self.src.requests(), [])
             self.assertEqual(app.actions.ops_rows(), [])
@@ -990,16 +1023,19 @@ class SyntheticRowsTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("S")
-            await pilot.pause(0.3)
+            self.assertTrue(await until(
+                pilot, lambda: app.current is not None and app.current.key.startswith("saved:")))
             row = app.current
             self.assertTrue(row.key.startswith("saved:"))
             row.origin = "src"          # even claiming a source that lists acts
             self.assertEqual(app.actions.act_names(row), ())
             for key in ("w", "exclamation_mark", "D", "x"):
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertEqual(len(app.screen_stack), 1, key)
             await pilot.press("d")                   # local only
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(self.src.requests(), [])
             self.assertEqual(app.actions.ops_rows(), [])
@@ -1018,6 +1054,7 @@ class ActsOffTest(Base):
             first = app.current_key
             await pilot.press("d")
             await until(pilot, lambda: self.store.is_hidden(first))
+            # negative check: a local mark writes nothing, past any window
             await pilot.pause(0.5)
             self.assertTrue(self.store.is_hidden(first))
             self.assertEqual(self.src.requests(), [])
@@ -1038,6 +1075,7 @@ class ActsOffTest(Base):
             await pilot.pause(0.2)
             await pilot.press("1")
             await until(pilot, lambda: self.store.snoozed_until("t:1"))
+            # negative check: a local snooze writes nothing, past any window
             await pilot.pause(0.3)
             self.assertIsNotNone(self.store.snoozed_until("t:1"))
             self.assertEqual(self.src.requests(), [])
@@ -1048,6 +1086,7 @@ class ActsOffTest(Base):
             await settle(pilot, app)
             for key in ("w", "exclamation_mark"):
                 await pilot.press(key)
+                # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertEqual(len(app.screen_stack), 1, key)
             self.assertTrue(any("Acts are not enabled" in t
@@ -1061,6 +1100,7 @@ class ActsOffTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("x")
+            # negative check: it must not happen
             await pilot.pause(0.2)
             self.assertEqual(len(app.screen_stack), 1)
             self.assertTrue(any("x and - work on a row of the Feed" in t
@@ -1072,9 +1112,8 @@ class ActsOffTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertEqual([c["id"] for c in app.screen.choices],
-                             ["kind", "routine", "title"])
+            self.assertTrue(await until(
+                pilot, lambda: [c["id"] for c in app.screen.choices] == ["kind", "routine", "title"]))
 
     async def test_L_is_the_session_audit_log_and_there_is_no_strip(self):
         app = self.app([item(1)], actions=self.plain())
@@ -1082,8 +1121,8 @@ class ActsOffTest(Base):
             await settle(pilot, app)
             self.assertFalse(app.query_one("#strip", HealthStrip).display)
             await pilot.press("L")
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, AuditScreen)
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, AuditScreen)))
 
     async def test_hints_do_not_mention_the_new_keys(self):
         app = self.app([item(1)], actions=self.plain())

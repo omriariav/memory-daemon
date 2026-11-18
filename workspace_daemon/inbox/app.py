@@ -234,8 +234,10 @@ class InboxApp(App):
     #picker-hint { margin-top: 1; color: $text-muted; }
     #actbusy { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #actbusy-hint { margin-top: 1; color: $text-muted; }
-    #help { width: 66; max-width: 94%; height: auto; max-height: 94%; overflow-y: auto; border: heavy $primary; background: $surface; padding: 1 2; }
-    #help-title { margin-bottom: 1; }
+    #help { width: 66; max-width: 94%; height: auto; max-height: 94%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #help-title { dock: top; margin-bottom: 1; }
+    #help-scroll { height: auto; max-height: 100%; scrollbar-size-vertical: 1; }
+    #help-body { height: auto; }
     #audit { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }
     #audit-table { height: 1fr; }
     #ops { width: 96%; height: 80%; border: heavy $primary; background: $surface; padding: 1 2; }

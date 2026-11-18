@@ -307,7 +307,12 @@ class Fixed:
 
 async def wait_for(pilot, cond, tries=120, step=0.05):
     for _ in range(tries):
-        if cond():
+        try:
+            ok = cond()
+        except Exception:                # not built yet; the last try raises
+            ok = False
+        if ok:
+            await pilot.pause()          # run what the change queued (compose)
             return True
         await pilot.pause(step)
     return cond()
@@ -353,6 +358,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ChoicePicker)
             self.assertTrue(any("React not configured" in t for t in toasts(app)))
@@ -364,6 +370,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
+            # negative check: it must not happen
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ChoicePicker)
             self.assertTrue(any("no message to react to" in t for t in toasts(app)))
@@ -377,7 +384,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             self.assertIn(("E", "react"), app.hints())
             await pilot.press("E")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             picker = app.screen
             self.assertIsInstance(picker, ChoicePicker)
             self.assertEqual([c["id"] for c in picker.choices],
@@ -385,8 +393,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertEqual([c["label"] for c in picker.choices],
                              [":tada:", ":+1:", ":pray:"])
             await pilot.press("2")                       # quick key
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ConfirmWrite)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
             self.assertEqual(dict(app.screen.rows)["Reaction"], ":+1:")
 
     async def test_a_suggested_reaction_is_preselected_but_needs_confirmation(self):
@@ -399,7 +407,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             picker = app.screen
             self.assertIsInstance(picker, ChoicePicker)
             lst = picker.query_one("#picker-list")
@@ -409,12 +418,13 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 ["", "suggested", "", ""])
             self.assertEqual(calls, [])                  # nothing yet
             await pilot.press("enter")                   # picks the highlighted one
-            await pilot.pause(0.2)
-            self.assertIsInstance(app.screen, ConfirmWrite)   # still must confirm
+            # still must confirm
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmWrite)))
             self.assertEqual(dict(app.screen.rows)["Reaction"], ":white_check_mark:")
             self.assertEqual(calls, [])
-            await pilot.pause(0.15)
-            self.assertEqual(app.screen.focused.id, "cancel")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.screen.focused.id == "cancel"))
             await pilot.press("y")
             self.assertTrue(await wait_for(pilot, lambda: calls))
             self.assertEqual(calls[0][1][TOOL]["nm"], "white_check_mark")
@@ -427,7 +437,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             picker = app.screen
             self.assertEqual([c["id"] for c in picker.choices],
                              ["eyes", "white_check_mark", "+1", "pray"])
@@ -444,7 +455,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
-            await pilot.pause(0.2)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
             picker = app.screen
             self.assertEqual(picker.choices[0]["id"], "tada")
             self.assertEqual(picker.query_one("#picker-list").highlighted, 0)
@@ -456,8 +468,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             await pilot.press("E")
-            await pilot.pause(0.2)
-            self.assertEqual({c["detail"] for c in app.screen.choices}, {""})
+            self.assertTrue(await wait_for(
+                pilot, lambda: {c["detail"] for c in app.screen.choices} == {""}))
             self.assertIsNone(app.screen.selected)
             await pilot.press("escape")
 
@@ -470,6 +482,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("E")
             await pilot.pause(0.2)
             await pilot.press("escape")
+            # negative check: it must not happen
             await pilot.pause(0.4)
             self.assertEqual((app.pending, calls), ([], []))
             self.assertNotIsInstance(app.screen, (ChoicePicker, ConfirmWrite))
@@ -482,8 +495,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await self.to_confirm(pilot, app, "1")
             modal = app.screen
-            await pilot.pause(0.15)
-            self.assertEqual(modal.focused.id, "cancel")        # Cancel default
+            self.assertTrue(await wait_for(
+                pilot, lambda: modal.focused.id == "cancel"))  # Cancel default
             rows = dict(modal.rows)
             self.assertEqual((rows["Reaction"], rows["Time stamp"], rows["Where"]),
                              (":eyes:", MESSAGE, "#launch"))
@@ -530,8 +543,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await wait_for(pilot, lambda: calls))
             await wait_for(pilot, lambda: any(
                 "Reaction sent" in t for t in toasts(app)))
-            await pilot.pause(0.6)
-            self.assertIn("t:1", keys(app))
+            self.assertTrue(await wait_for(pilot, lambda: "t:1" in keys(app)))
             self.assertFalse(store.is_hidden("t:1"))
             self.assertEqual([x for x in app.pending if x.kind == "done"], [])
 
@@ -549,6 +561,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                     await pilot.press("y")
                     await pilot.pause(0.1)
                     await pilot.press("u" if how == "undo" else "q")
+                # negative check: it must not happen
                 await pilot.pause(0.3)
                 self.assertEqual(calls, [], how)
                 self.assertEqual(bool(app._exit), how == "quit")
@@ -572,6 +585,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             self.assertTrue(await wait_for(
                 pilot, lambda: any("auth failed" in t for t in toasts(app))))
+            # negative check: it must not happen
             await pilot.pause(0.5)
             self.assertEqual(len(calls), 1)
             self.assertIn("t:1", keys(app))
@@ -594,10 +608,10 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 self.assertTrue(await wait_for(pilot, started.is_set))
                 await pilot.press("E")
-                await pilot.pause(0.1)
-                self.assertTrue(any("react already in progress" in t
-                                    for t in toasts(app)))
+                self.assertTrue(await wait_for(
+                    pilot, lambda: any("react already in progress" in t for t in toasts(app))))
                 await pilot.press("q")
+                # negative check: it must not happen
                 await pilot.pause(0.2)
                 self.assertFalse(app._exit)
                 self.assertTrue(any("1 write(s) still running" in t
@@ -605,8 +619,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                 gate.set()
                 await wait_for(pilot, lambda: not app.running)
                 await pilot.press("q")
-                await pilot.pause(0.2)
-                self.assertTrue(app._exit)
+                self.assertTrue(await wait_for(pilot, lambda: app._exit))
         finally:
             gate.set()
 
@@ -619,8 +632,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("React to message", titles)
             self.assertIn("Polish draft", titles)
             await pilot.press("question_mark")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, HelpScreen)
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, HelpScreen)))
             body = str(app.screen.query_one("#help-body").render())
             self.assertIn("react to the message", body)
             self.assertIn("polish the draft", body)

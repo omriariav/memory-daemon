@@ -322,6 +322,7 @@ class OpenOffTheUiThreadTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("o")
                     self.assertTrue(await wait_for(pilot, started.is_set))
                     # the open is still running and the UI still answers
+                    # negative check: it must not happen
                     await pilot.pause(0.1)
                     self.assertEqual(
                         [r for r in app.audit if r["action"] == "open"], [])
