@@ -1010,6 +1010,47 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(self.applied, ["archive"])
         self.assertNotIn("memory_error", self.ledger()["m1"])
 
+    def test_near_duplicate_outcome_is_not_an_error_and_is_not_retried(self):
+        r = routine(
+            self.vault,
+            memory={"store": "/store", "type": "note"},
+            actions=["archive"],
+        )
+        outcome = {"memory": "duplicate_skipped", "memory_entry_id": None,
+                   "memory_duplicate_of": "2026-01-02-example-entry-one"}
+        with mock.patch.object(
+            memory_sink, "capture", return_value=outcome
+        ) as capture:
+            first = runner.run(self.base, [r])
+            second = runner.run(self.base, [r])
+
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(capture.call_count, 1)     # the ledger settles it
+        record = self.ledger()["m1"]
+        self.assertNotIn("memory_error", record)
+        self.assertEqual(record["memory"], "duplicate_skipped")
+        self.assertEqual(self.applied, ["archive"])
+
+    def test_gmail_followup_predecessor_falls_back_to_the_duplicate_match(self):
+        claim = {"candidate": {"id": "gmail:m9", "raw": {}},
+                 "source": {"kind": "gmail"}}
+        row = {"memory_entry_id": None, "memory_source_id": "gmail:t1",
+               "memory_duplicate_of": "2026-01-02-example-entry-one",
+               "processed_at": "2026-01-03T00:00:00Z"}
+        self.assertEqual(
+            runner._gmail_followup_predecessor({}, claim, existing=row),
+            "2026-01-02-example-entry-one")
+        with mock.patch.object(runner, "_claim_source_id",
+                               return_value="gmail:t1"):
+            self.assertEqual(
+                runner._gmail_followup_predecessor({"m1": row}, claim),
+                "2026-01-02-example-entry-one")
+            row["memory_entry_id"] = "2026-01-04-own-entry"
+            self.assertEqual(
+                runner._gmail_followup_predecessor({"m1": row}, claim),
+                "2026-01-04-own-entry")
+
     def test_incomplete_drive_expansion_withholds_gmail_actions_and_retries(self):
         r = routine(self.vault, actions=["archive"])
         original_fetch = runner.SOURCES["gmail"]

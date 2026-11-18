@@ -56,6 +56,8 @@ Every alert's details may also say why (all optional; see `cause_of`):
 A recording still being matched to a calendar meeting ("meeting match") and
 a memory sink issue whose every stored error (last day) is a near-duplicate
 are review items, not failures: they never raise `attention:` by themselves.
+A near-duplicate the sink now skips (outcome `duplicate_skipped`) is no error
+at all: it shows as a `duplicate` event and an Info line in `status`.
 A recording whose match is final, seen in the last day, was not captured and
 does raise it ("N meeting not captured").
 

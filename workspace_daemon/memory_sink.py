@@ -327,6 +327,22 @@ def _cli(store, args, stdin_text=None, timeout=120):
     )
 
 
+# Warnings the embedder prints to stderr before the CLI's own verdict. They
+# are not the failure, and ahead of the real line they push it out of the
+# stored excerpt (and past what the alert diagnosis reads).
+_CLI_NOISE_RE = re.compile(
+    r"^\s*(?:dtype not specified for\b|Using the default dtype\b"
+    r"|huggingface/tokenizers:|.*\b(?:User|Future|Deprecation|Runtime)Warning\b"
+    r"|\s*warnings\.warn\()", re.I)
+
+
+def _strip_cli_noise(output):
+    """CLI output without the embedder's warning lines."""
+    return "\n".join(
+        line for line in (output or "").split("\n")
+        if not _CLI_NOISE_RE.match(line))
+
+
 def _head_and_tail(output, limit=300):
     """Failure-report excerpt of CLI output: first and last `limit` chars.
 
@@ -334,9 +350,10 @@ def _head_and_tail(output, limit=300):
     them (a native crash once surfaced as nothing but the embedder's fp32
     warning). No-output deaths are called out explicitly.
     """
-    text = (output or "").strip()
+    text = _strip_cli_noise(output).strip()
     if not text:
-        return "(no output)"
+        return ("(no output besides embedder warnings)"
+                if (output or "").strip() else "(no output)")
     if len(text) <= 2 * limit:
         return text
     return f"{text[:limit]} … {text[-limit:]}"
@@ -1669,6 +1686,7 @@ def capture(routine, item, summary, dry_run=False):
     _commit_store(store, f"memory: {rid} auto-capture")
     m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
     anchored_todo = None if retry else _open_todo_root_refusal(r, item, source_id)
+    duplicate_of = None
     if r.returncode == 0 and m:
         verdict, entry_id = m.group(1), m.group(2)
     elif anchored_todo:
@@ -1691,6 +1709,17 @@ def capture(routine, item, summary, dry_run=False):
                 f"routine={rid} memory WARN ambiguous CLI result was "
                 f"verified on disk for source_id={source_id}"
             )
+        elif _near_duplicate_refusal(r, out):
+            # The store already holds this content under another entry. The
+            # refusal is deterministic: retrying can never succeed, and the
+            # content is captured, so this is neither an error nor a retry.
+            verdict, entry_id = "duplicate_skipped", None
+            duplicate_of = _near_duplicate_match(out)
+            log(
+                f"routine={rid} memory: near-duplicate of "
+                f"{duplicate_of or 'an existing entry'} (not written) "
+                f"source_id={source_id}"
+            )
         elif r.returncode != 0:
             raise RuntimeError(
                 f"memory add failed (exit {r.returncode}): "
@@ -1705,6 +1734,20 @@ def capture(routine, item, summary, dry_run=False):
         f"routine={rid} memory {verdict} {entry_id or ''} "
         f"source_id={source_id}"
     )
+    unfiled_actions = []
+    if verdict == "duplicate_skipped":
+        unfiled_actions = _unfiled_owner_actions(
+            routine, cfg, item, entry, etype, extraction_succeeded,
+            owner_attention_denied)
+        details = {"untrusted": True}
+        if duplicate_of:
+            details["duplicate_of"] = duplicate_of
+        if unfiled_actions:
+            details["owner_actions_not_filed"] = unfiled_actions
+        _emit_capture_event(
+            rid, "duplicate", duplicate_of, source_id, title, people,
+            details=details,
+        )
     if verdict in ("created", "updated", "verified"):
         _emit_capture_event(
             rid, "new" if verdict == "created" else "update",
@@ -1728,12 +1771,17 @@ def capture(routine, item, summary, dry_run=False):
         "memory_source_id": source_id,
         "memory_personal": bool(ptag) and ptag in tags,
     }
+    if duplicate_of:
+        outcome["memory_duplicate_of"] = duplicate_of
+    if unfiled_actions:
+        outcome["memory_owner_todos_unfiled"] = len(unfiled_actions)
     if thread_source_id:
         # The reply has its own id, but earlier failures of this thread are
         # recorded under the root id; the runner clears them by this one.
         outcome["memory_thread_source_id"] = thread_source_id
     if (
         etype == "meeting" and extraction_succeeded and source_id
+        and verdict != "duplicate_skipped"
         and not owner_attention_denied
         and owner_todos.enabled(routine) and owner_todos.is_meeting_item(item)
     ):
@@ -1742,6 +1790,27 @@ def capture(routine, item, summary, dry_run=False):
             bool(ptag) and ptag in tags,
         ))
     return outcome
+
+
+_NEAR_DUP_RE = re.compile(r"✗ this looks like a near-duplicate of:")
+_NEAR_DUP_MATCH_RE = re.compile(r"^[ \t]+\d+\.\d+[ \t]+([A-Za-z0-9][\w.-]*)", re.M)
+
+
+def _near_duplicate_refusal(result, out):
+    """Whether the store refused an add as a near-duplicate of an entry it holds.
+
+    Only the store's own refusal counts: exit 2 plus its "✗ this looks like a
+    near-duplicate of:" line. Any other failure, including a different exit
+    code with that text, stays an error.
+    """
+    return result.returncode == 2 and bool(_NEAR_DUP_RE.search(out))
+
+
+def _near_duplicate_match(out):
+    """Id of the best-matching existing entry named in the refusal, or None."""
+    refusal = _NEAR_DUP_RE.search(out)
+    hit = _NEAR_DUP_MATCH_RE.search(out, refusal.end()) if refusal else None
+    return hit.group(1) if hit else None
 
 
 _OPEN_ANCHOR_RE = re.compile(r"✗ (\S+) already anchors the open \S+ (\S+) —")
@@ -1945,6 +2014,26 @@ def existing_action_titles(store, meeting_source_id):
         e["title"] for e in entries.values()
         if any(s.startswith(prefix) for s in e["source_ids"])
     ]
+
+
+def _unfiled_owner_actions(routine, cfg, item, entry, etype,
+                           extraction_succeeded, owner_attention_denied):
+    """Owner actions a skipped near-duplicate meeting would have filed.
+
+    They are not filed (the meeting was not written, so there is no entry to
+    follow) and not dropped silently: the duplicate event lists them for the
+    owner to review. Same eligibility as a live capture; best effort.
+    """
+    if not (etype == "meeting" and extraction_succeeded
+            and not owner_attention_denied and owner_todos.enabled(routine)
+            and owner_todos.is_meeting_item(item)):
+        return []
+    actions, _dropped = owner_todos.validate_actions(
+        entry.get("owner_actions"), require_ts=True)
+    texts = [a["text"] for a in actions or []][:owner_todos.max_per_item(routine)]
+    if personal.redact_enabled(cfg):
+        texts = [personal.redact(text)[0] for text in texts]
+    return texts
 
 
 def _file_live_owner_todos(routine, item, entry, source_id, entry_id,

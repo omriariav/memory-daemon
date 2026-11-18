@@ -592,6 +592,128 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIsInstance(out, RuntimeError)
 
+    def _run_add(self, result):
+        """capture() with one fake `add` result; returns (outcome or error, calls)."""
+        calls = []
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls.append(list(args))
+            return result
+
+        with mock.patch.object(memory_sink, "_extract", return_value=None), \
+                mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+                mock.patch.object(memory_sink, "_authenticated_identity",
+                                  return_value={"email": None, "person": None,
+                                                "safe": False}), \
+                mock.patch.object(memory_sink.subprocess, "run",
+                                  return_value=FakeResult()), \
+                mock.patch.object(memory_sink, "log") as log:
+            try:
+                out = memory_sink.capture(self.routine, self.item, "s")
+            except RuntimeError as exc:
+                out = exc
+        return out, calls, log
+
+    NEAR_DUP = (
+        'dtype not specified for "model". Using the default dtype (fp32) '
+        "for this device (cpu).\n"
+        "✗ this looks like a near-duplicate of:\n"
+        "  0.931  2026-01-02-example-entry-one — an unrelated example title\n"
+        "  0.904  2026-01-03-example-entry-two — another example title\n"
+        "Resolve: re-run with --update <id> to revise it, or --force-new\n")
+
+    def test_near_duplicate_is_already_captured_not_an_error(self):
+        out, calls, log = self._run_add(
+            FakeResult("", returncode=2, stderr=self.NEAR_DUP))
+        self.assertNotIsInstance(out, RuntimeError)
+        self.assertEqual(len(calls), 1)             # no retry inside the add
+        self.assertNotIn("--force-new", calls[0])   # the guard still wins
+        self.assertEqual(out["memory"], "duplicate_skipped")
+        self.assertEqual(out["memory_duplicate_of"], "2026-01-02-example-entry-one")
+        self.assertIsNone(out["memory_entry_id"])
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("2026-01-02-example-entry-one", logged)
+        self.assertNotIn("ERROR", logged)
+
+    def test_near_duplicate_without_a_listed_match_is_still_skipped(self):
+        out, _, _ = self._run_add(FakeResult(
+            "", returncode=2, stderr="✗ this looks like a near-duplicate of:\n"))
+        self.assertEqual(out["memory"], "duplicate_skipped")
+        self.assertNotIn("memory_duplicate_of", out)
+
+    def test_near_duplicate_surfaces_as_an_event_not_an_error(self):
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            out, _, log = self._run_add(
+                FakeResult("", returncode=2, stderr=self.NEAR_DUP))
+        emit.assert_called_once()
+        args, kwargs = emit.call_args
+        self.assertEqual(args[1], "duplicate")
+        self.assertEqual(args[2], "2026-01-02-example-entry-one")
+        self.assertEqual(args[3], out["memory_source_id"])
+        self.assertTrue(args[4])  # the capture title
+        self.assertEqual(kwargs["details"],
+                         {"untrusted": True,
+                          "duplicate_of": "2026-01-02-example-entry-one"})
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("near-duplicate of 2026-01-02-example-entry-one "
+                      "(not written)", logged)
+
+    def test_errors_and_writes_emit_no_duplicate_event(self):
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            self._run_add(FakeResult("", returncode=1, stderr="boom\n"))
+            self._run_add(FakeResult("✓ created 2026-01-05-new\n"))
+        self.assertNotIn("duplicate", [c.args[1] for c in emit.call_args_list])
+
+    def test_skipped_meeting_lists_its_owner_actions_for_review(self):
+        routine = {"id": "r", "memory": {"store": "/store",
+                                         "owner_todos": {"enabled": True}}}
+        entry = {"owner_actions": [
+            {"text": "Send the example summary", "evidence_ts": "00:01"},
+            {"text": "not valid", "bogus": 1}]}
+        with mock.patch.object(memory_sink.owner_todos, "is_meeting_item",
+                               return_value=True):
+            texts = memory_sink._unfiled_owner_actions(
+                routine, {}, {}, entry, "meeting", True, False)
+            self.assertEqual(texts, ["Send the example summary"])
+            for args in (("note", True, False), ("meeting", False, False),
+                         ("meeting", True, True)):
+                self.assertEqual(memory_sink._unfiled_owner_actions(
+                    routine, {}, {}, entry, *args), [])
+
+    def test_embedder_warnings_do_not_hide_the_real_error(self):
+        noise = ('dtype not specified for "model". Using the default dtype '
+                 "(fp32) for this device (cpu).\n"
+                 "/x/y.py:1: UserWarning: something deprecated\n"
+                 "  warnings.warn(msg)\n")
+        out, _, _ = self._run_add(FakeResult(
+            "", returncode=1, stderr=noise + "✗ store is locked\n"))
+        self.assertIsInstance(out, RuntimeError)
+        self.assertEqual(str(out), "memory add failed (exit 1): "
+                                   "✗ store is locked")
+        from workspace_daemon import alerts
+        self.assertEqual(alerts.cause_of(str(out)), "unknown")
+        # Warnings alone are still reported, never turned into "no output".
+        self.assertIn("embedder warnings",
+                      memory_sink._head_and_tail(noise))
+        self.assertEqual(memory_sink._head_and_tail(""), "(no output)")
+
+    def test_other_failures_are_still_errors(self):
+        for name, result in {
+            "exit 2 without the refusal": FakeResult(
+                "", returncode=2, stderr="usage: memory add [options]\n"),
+            "exit 1 with duplicate text": FakeResult(
+                "", returncode=1, stderr=self.NEAR_DUP),
+            "exit 1": FakeResult("", returncode=1, stderr="store locked\n"),
+            "exit 3": FakeResult("", returncode=3, stderr="boom\n"),
+            "exit 0 without a verdict": FakeResult("ok\n"),
+            "refusal-like text but a different shape": FakeResult(
+                "", returncode=2, stderr="✗ this looks like a duplicate\n"),
+        }.items():
+            with self.subTest(name):
+                out, calls, _ = self._run_add(result)
+                self.assertIsInstance(out, RuntimeError)
+                self.assertEqual(len(calls), 1)
+
     def test_invalid_type_falls_back_to_config(self):
         out, calls = self._run_capture(
             {"worthy": True, "type": "diary", "title": "T", "people": [],
