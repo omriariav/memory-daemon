@@ -41,9 +41,11 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
   `<person> waits on you`, the thread-in-memory line and then the thread from
   its first message, often your own old root post, so the message you owe a
   reply to was far below. The pane now starts with a `YOU OWE` block: who
-  waits and since when, the message that creates the obligation (the newest
-  message from someone else after your last reply, the item's sender first;
-  the gist when there is none), quoted and cut at four lines, and
+  waits and since when, the message that creates the obligation (the first
+  substantive message after your last reply from the item's sender, matched
+  loosely by name, else from someone else, whose name then heads the block;
+  a short nudge such as `?` or `any update` is skipped and noted as
+  `+ nudged 2d later`; the gist when there is none), quoted and cut at four lines, and
   `To do: ...`. The action is the first of `meta.task`, `meta.todo` and
   `meta.ask` that is set, else `RSVP` for an invite, else the drafted reply,
   else `acknowledge` for an ack-only row, else `Reply to <person>`. The full

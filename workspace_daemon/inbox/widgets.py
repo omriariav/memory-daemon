@@ -436,8 +436,11 @@ def owe_block(item, pal, now, width, visual):
     since when, the message that creates the obligation (quoted, a few lines)
     and what is to be done. The full thread follows it."""
     out = Text()
-    who, ts, text = owe_message(item)
-    person = vis(item.who, visual)
+    owed = owe_message(item)
+    who, ts, text = owed.who, owed.ts, owed.text
+    # Who waits: the item's sender, or the author of the message when that is
+    # someone else (the sender said nothing after your reply).
+    person = vis(item.who if owed.by_sender else who, visual)
     head = Style(bold=True, color=pal["warn"])
     out.append("YOU OWE", head)
     if (item.meta.get("kind") if isinstance(item.meta, dict) else None) \
@@ -451,9 +454,13 @@ def owe_block(item, pal, now, width, visual):
         line = f"  {person} waits on you · asked {ago(now, ts)}"
     out.append(line + "\n", Style(color=pal["muted"]))
     if text.strip():
-        if who != item.who:
-            out.append(f"  {vis(who, visual)}\n", Style(bold=True))
         out.append_text(_quote(item, text, pal, width, visual))
+    if owed.nudges:
+        gap = owed.nudges[-1] - ts
+        later = "right after" if gap < 60 else f"{fmt_age(gap)} later"
+        count = "" if len(owed.nudges) == 1 else f" {len(owed.nudges)} times, last"
+        out.append(f"  + nudged{count} {later}\n",
+                   Style(color=pal["muted"], dim=True))
     action = owe_action(item) or f"Reply to {person}"
     out.append("  To do: ", Style(bold=True, color=pal["fg"]))
     out.append(vis(action, visual) + "\n", Style(color=pal["fg"]))

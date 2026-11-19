@@ -92,33 +92,57 @@ class RealTerminalTest(unittest.TestCase):
         buf = bytearray()
         alive = [True]
 
-        def pump(seconds):
-            end = time.time() + seconds
+        def pump(seconds=0.0, until=None, timeout=30.0):
+            """Read for `seconds`, or (with `until`) until `until(buf)` is
+            true, at most `timeout` seconds; returns whether it was met."""
+            end = time.time() + (timeout if until else seconds)
             while time.time() < end and alive[0]:
+                if until and until(buf):
+                    return True
                 ready, _, _ = select.select([fd], [], [], 0.05)
                 if ready:
                     try:
                         chunk = os.read(fd, 65536)
                     except OSError:
                         alive[0] = False
-                        return
+                        break
                     if not chunk:
                         alive[0] = False
-                        return
+                        break
                     buf.extend(chunk)
+            return bool(until and until(buf))
+
+        def drawn(b):
+            return b"\x1b[?1049h" in b and b"\x1b[1;1H" in b
+
+        def repainted(start, rows):
+            """A frame that runs from the top row to the new bottom row has
+            arrived after byte `start`."""
+            def check(b):
+                top = b.find(b"\x1b[1;1H", start)
+                return top >= 0 and b.find(
+                    b"\x1b[%d;1H" % rows, top) >= 0
+            return check
+
+        def resize(rows):
+            """Resize, then wait for a frame to come after it."""
+            before = len(buf)
+            setsize(fd, rows, 100)
+            os.kill(pid, signal.SIGWINCH)
+            self.assertTrue(pump(until=repainted(before, rows)),
+                            f"no repaint after resizing to {rows} rows")
 
         try:
             setsize(fd, 30, 100)
-            pump(2.5)
+            self.assertTrue(pump(until=drawn), "the app never drew a frame")
             for rows in (20, 40, 25, 18):
-                setsize(fd, rows, 100)
-                os.kill(pid, signal.SIGWINCH)
-                pump(1.0)
+                resize(rows)
             for key in (b"j", b"2", b"1"):
+                before = len(buf)
                 os.write(fd, key)
-                pump(0.3)
+                pump(until=lambda b: len(b) > before)
             os.write(fd, b"q")
-            pump(2.0)
+            pump(until=lambda b: b"\x1b[?1049l" in b)
         finally:
             try:
                 os.kill(pid, signal.SIGKILL)

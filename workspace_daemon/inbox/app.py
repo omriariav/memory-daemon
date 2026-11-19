@@ -1011,7 +1011,8 @@ class InboxApp(App):
                          else "remind me"))
             if f is not None and f.id in ("thread", "draft-pane"):
                 # the card has the focus: its keys scroll it
-                return [("j/k", "scroll"), ("esc", "queue")] + keys + [
+                return [("j/k", "scroll"), ("esc", "close" if self.remind_key
+                                            == it.key else "queue")] + keys + [
                     ("?", "help")]
             return base + keys + [("tab", "card")] + opn + [
                 ("u", "undo"), ("/", "filter"), ("?", "help")]
@@ -1284,8 +1285,9 @@ class InboxApp(App):
             self._focus_view()
             return
         if self.remind_key is not None:      # leave the "Remind me" card
-            self.remind_key = None
+            self.remind_key = None           # (one esc: closed, back on the queue)
             self.show_thread_only()
+            self._focus_view()
             self.update_hints()
             return
         f = self.query_one("#filter", Input)

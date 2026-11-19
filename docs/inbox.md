@@ -1544,12 +1544,18 @@ YOU OWE  Dana Example waits on you · asked 1h27m ago
 ────────────────────────────────────────
 ```
 
-- **The message** is the newest message from someone else after your last
-  reply (a thread entry whose `who` is `You`, `you` or `me` is yours); a
-  message from the item's `sender` wins over a bystander's. It is quoted, cut
-  at four lines (or 400 characters) with `…`. With no such message (an empty
-  thread, or you replied last) the item's `gist` is quoted instead. An invite
-  quotes its gist and says `starts in 20h`.
+- **The message** is the first substantive message after your last reply (a
+  thread entry whose `who` is `You`, `you` or `me` is yours) from the item's
+  `sender`, else from someone else. The sender match ignores case and accepts
+  a first-name or display-name-prefix match (`Dana` is `Dana Example`). A very
+  short nudge (at most three words that are only nudge words or punctuation:
+  `?`, `ping`, `any update`) is skipped when choosing, and a dim
+  `+ nudged 2d later` line says it came after; the header's `asked` age is
+  that of the quoted message. When the author is not the sender (the sender
+  said nothing since your reply) the header names the author. It is quoted,
+  cut at four lines (or 400 characters) with `…`. With no message after your
+  reply (an empty thread, or you replied last) the item's `gist` is quoted
+  instead. An invite quotes its gist and says `starts in 20h`.
 - **`To do:`** is the first of `meta.task`, `meta.todo` and `meta.ask` that is a
   non-blank string (cleaned to one line, up to 200 characters); else `RSVP` for
   an invite; else `reply:` and the first line of the `draft`; else
@@ -1680,7 +1686,8 @@ and a source with no `acts:` is read-only: the keys say so):
 
 `m` on a task (or `Remind me` in the command palette, `ctrl+p`) fills the Detail
 pane with the task's context. It is read-only: nothing is sent, marked or
-saved. `m` or `esc` closes it, and moving to another task does too. (On any
+saved. `m` or `esc` closes it (one `esc`, even from the card, and focus is back
+on the list), and moving to another task does too. (On any
 other row `m` still saves to memory.)
 
 - **Source**: what each `source_ids` entry points at (`Slack thread`,

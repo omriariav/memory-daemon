@@ -37,8 +37,8 @@ def channel_thread():
     message (Ravi, a bystander, spoke after her)."""
     return [msg("You", 300, ROOT),
             msg("Dana Example", 280, "I can look at it"),
+            msg("Dana Example", 240, "Notes are in the doc"),
             msg("You", 200, "Thanks Dana, please share notes"),
-            msg("Dana Example", 120, "Notes are in the doc"),
             msg("Dana Example", 87, OBLIGE),
             msg("Ravi Example", 80, "BYSTANDER: unrelated chatter")]
 
@@ -72,29 +72,77 @@ class OweModelTest(unittest.TestCase):
         return models.from_v1(owe_item(**kw))
 
     def test_the_message_is_the_senders_newest_after_your_last_reply(self):
-        who, _ts, text = models.owe_message(self.view())
-        self.assertEqual(who, "Dana Example")
-        self.assertTrue(text.startswith("OBLIGE"))
+        owed = models.owe_message(self.view())
+        self.assertEqual(owed.who, "Dana Example")
+        self.assertTrue(owed.text.startswith("OBLIGE"))
+        self.assertTrue(owed.by_sender)
 
     def test_without_a_message_from_the_sender_another_sender_counts(self):
         thread = [msg("You", 50, "Any news?"),
                   msg("Ravi Example", 10, "RAVI-ANSWER please decide")]
-        who, _ts, text = models.owe_message(self.view(thread=thread))
-        self.assertEqual((who, text), ("Ravi Example",
-                                       "RAVI-ANSWER please decide"))
+        owed = models.owe_message(self.view(thread=thread))
+        self.assertEqual((owed.who, owed.text, owed.by_sender), (
+            "Ravi Example", "RAVI-ANSWER please decide", False))
 
     def test_nothing_after_your_reply_falls_back_to_the_gist(self):
         thread = [msg("Dana Example", 90, "old ask"), msg("You", 5, "on it")]
-        who, _ts, text = models.owe_message(self.view(thread=thread))
-        self.assertEqual((who, text), ("Dana Example", "GIST-LINE for row"))
+        owed = models.owe_message(self.view(thread=thread))
+        self.assertEqual((owed.who, owed.text), ("Dana Example",
+                                                 "GIST-LINE for row"))
 
     def test_an_empty_thread_falls_back_to_the_gist(self):
-        _who, _ts, text = models.owe_message(self.view(thread=[]))
-        self.assertEqual(text, "GIST-LINE for row")
+        owed = models.owe_message(self.view(thread=[]))
+        self.assertEqual(owed.text, "GIST-LINE for row")
 
     def test_an_invite_is_its_gist(self):
-        _who, _ts, text = models.owe_message(models.from_v1(invite_item()))
-        self.assertTrue(text.startswith("Acme sync"))
+        owed = models.owe_message(models.from_v1(invite_item()))
+        self.assertTrue(owed.text.startswith("Acme sync"))
+
+    def test_short_nudges_are_not_asks(self):
+        for text in ("?", "??", "ping", "Ping!", "any update", "Any update?",
+                     "bump", "still there?", "hi", "gentle ping"):
+            self.assertTrue(models.is_nudge(text), text)
+        for text in ("approve the budget", "Can you approve it?",
+                     "send the Acme deck please now", "yes", "", "thanks Dana"):
+            self.assertFalse(models.is_nudge(text), text)
+
+    def test_the_first_substantive_message_is_quoted_not_the_nudge(self):
+        day = 24 * 60
+        thread = [msg("You", 6 * day, "on it"),
+                  msg("Dana Example", 4 * day, "ASK-MONDAY can you approve "
+                      "the Acme budget line before the review?"),
+                  msg("Dana Example", 2 * day, "?")]
+        owed = models.owe_message(self.view(thread=thread))
+        self.assertTrue(owed.text.startswith("ASK-MONDAY"))
+        self.assertAlmostEqual(owed.ts, time.time() - 4 * day * MIN, delta=5)
+        self.assertEqual(len(owed.nudges), 1)
+        self.assertAlmostEqual(owed.nudges[0], time.time() - 2 * day * MIN,
+                               delta=5)
+
+    def test_only_nudges_quote_the_newest_one(self):
+        thread = [msg("You", 600, "on it"), msg("Dana Example", 300, "ping"),
+                  msg("Dana Example", 100, "any update?")]
+        owed = models.owe_message(self.view(thread=thread))
+        self.assertEqual((owed.text, owed.nudges), ("any update?", []))
+
+    def test_names_match_loosely(self):
+        same = models.same_person
+        self.assertTrue(same("dana example", "Dana Example"))
+        self.assertTrue(same("Dana", "Dana Example"))
+        self.assertTrue(same("Dana Example", "Dana"))
+        self.assertTrue(same("Dana E.", "Dana Example"))       # first name
+        self.assertTrue(same("  DANA   EXAMPLE ", "Dana Example"))
+        self.assertFalse(same("Danielle Other", "Dana Example"))
+        self.assertFalse(same("Ravi Example", "Dana Example"))
+        self.assertFalse(same("", "Dana Example"))
+
+    def test_a_loosely_named_sender_still_wins_over_a_bystander(self):
+        thread = [msg("You", 300, "on it"),
+                  msg("dana", 120, "DANA-ASK please approve the Acme line"),
+                  msg("Ravi Example", 80, "RAVI-CHATTER something unrelated")]
+        owed = models.owe_message(self.view(thread=thread))
+        self.assertEqual((owed.who, owed.by_sender), ("dana", True))
+        self.assertTrue(owed.text.startswith("DANA-ASK"))
 
     def test_the_action_comes_from_task_then_todo_then_ask(self):
         for meta, want in (
@@ -182,6 +230,33 @@ class OwePaneTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(part, thread)
                 self.assertNotIn("← Dana Example waits on you", text)
 
+    async def test_a_nudge_after_the_ask_does_not_replace_it(self):
+        day = 24 * 60
+        thread = [msg("You", 6 * day, "on it"),
+                  msg("Dana Example", 4 * day, "ASK-MONDAY please approve "
+                      "the Acme budget line"),
+                  msg("Dana Example", 2 * day, "?")]
+        app = make_app([owe_item(thread=thread)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            block = thread_text(app).partition("─ thread ─")[0]
+            self.assertIn("ASK-MONDAY please approve", block)
+            self.assertIn("asked 4d ago", block)
+            self.assertIn("+ nudged 2d later", block)
+            self.assertNotIn("│ ?", block)
+
+    async def test_a_bystander_is_named_in_the_header(self):
+        thread = [msg("You", 300, "on it"),
+                  msg("Ravi Example", 40, "RAVI-ASK can you confirm the date?")]
+        app = make_app([owe_item(thread=thread)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            block = thread_text(app).partition("─ thread ─")[0]
+            self.assertIn("Ravi Example waits on you · asked 40m ago", block)
+            self.assertNotIn("Dana Example waits on you", block)
+            self.assertIn("To do: Reply to Ravi Example", block)
+            self.assertIn("RAVI-ASK", block)
+
     async def test_no_known_action_reads_reply_to_the_person(self):
         app = make_app([owe_item()])
         async with app.run_test(size=SIZE) as pilot:
@@ -204,7 +279,8 @@ class OwePaneTest(unittest.IsolatedAsyncioTestCase):
                           thread_text(app))
 
     async def test_a_dm_quotes_the_newest_message(self):
-        thread = [msg("Dana Example", 50, "DM-ONE first"),
+        thread = [msg("Dana Example", 90, "DM-ONE an old ask"),
+                  msg("You", 60, "on it"),
                   msg("Dana Example", 30, "DM-TWO can you send the deck?")]
         app = make_app([owe_item(where="DM", thread=thread)])
         async with app.run_test(size=SIZE) as pilot:

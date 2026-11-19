@@ -252,6 +252,24 @@ class RemindPaneTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await wait_for(
                 pilot, lambda: "REMIND ME" not in detail(app)))
 
+    async def test_one_esc_from_the_card_closes_it_and_returns_to_the_queue(self):
+        app, actions = make_app([full_task(1)])
+        actions.gate.set()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("m")
+            self.assertTrue(await wait_for(
+                pilot, lambda: "REMIND ME" in detail(app)))
+            await pilot.press("tab")                  # focus the card
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.focused is not None
+                and app.focused.id in ("thread", "draft-pane")))
+            self.assertIn(("esc", "close"), app.hints())
+            await pilot.press("escape")
+            self.assertTrue(await wait_for(
+                pilot, lambda: "REMIND ME" not in detail(app)))
+            self.assertEqual(app.focused.id, "queue")
+
     async def test_one_lookup_is_shared_and_cached(self):
         app, actions = make_app([full_task(1)])
         actions.gate.set()
