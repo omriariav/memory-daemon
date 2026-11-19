@@ -331,7 +331,8 @@ class ThreadView(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
 
-    def show(self, item, pal, now, visual, newest_first=False, today=None):
+    def show(self, item, pal, now, visual, newest_first=False, today=None,
+             remind=None):
         """Draw the item and its thread. The thread is stored oldest first;
         with `newest_first` the latest message is drawn first (the note and
         the item header stay on top) and a dim marker closes the list at the
@@ -341,7 +342,8 @@ class ThreadView(VerticalScroll):
         width = max(30, (self.size.width or 60) - 4)
         # A redraw of the same item (a refresh, a resize) keeps the scroll
         # position; another item, or the other thread order, starts at the top.
-        shown = (None if item is None else item.key, newest_first)
+        shown = (None if item is None else item.key, newest_first,
+                 remind is not None)
         fresh = shown != self._shown
         self._shown = shown
         if not fresh and newest_first and self.scroll_y > 0:
@@ -353,8 +355,10 @@ class ThreadView(VerticalScroll):
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
             return
         if tasksmod.is_task(item):
-            body.update(task_detail(item, pal, width, visual,
-                                    today or dt.date.today()))
+            today = today or dt.date.today()
+            body.update(remind_card(item, pal, width, visual, today, now,
+                                    remind) if remind is not None else
+                        task_detail(item, pal, width, visual, today))
             if fresh:
                 self.scroll_home(animate=False)
             return
@@ -501,6 +505,108 @@ def task_detail(item, pal, width, visual, today):
         field("Link", item.link, Style(color=pal["link"]))
     else:
         field("Link", "none")
+    return out
+
+
+def remind_card(item, pal, width, visual, today, now, view):
+    """"Remind me" for a task (read-only): where it came from, when, who was
+    involved, the original words, the last activity and the related items the
+    context command found. A missing piece says `not recorded`, never a blank.
+    `view` is `{"ctx": {"state": off|loading|ready|error, "sections": [...],
+    "message": str}}`."""
+    out = Text()
+    muted = Style(color=pal["muted"])
+    head = Style(bold=True, color=pal["accent"])
+    due = tasksmod.due_of(item)
+    overdue = due is not None and due < today
+    kind = tasksmod.task_type(item)
+    out.append(f"{tasksmod.GLYPHS[kind]} ", Style(
+        color=pal["urgent"] if overdue else pal["primary"], bold=True))
+    for line in bidi.visual_lines(item.gist, max(10, width - 2), visual) or [""]:
+        out.append(line + "\n", Style(bold=True))
+    out.append(f"REMIND ME  {kind} · due {tasksmod.due_words(due, today)}\n",
+               head)
+    out.append("─" * min(width, 60) + "\n", muted)
+
+    def label(text):
+        out.append(f"{text:<10}", muted)
+
+    def missing(what):
+        out.append(f"{what} not recorded\n", Style(color=pal["warn"], italic=True))
+    label("Source")
+    sources_ = tasksmod.source_lines(item)
+    if sources_:
+        for n, (what, sid) in enumerate(sources_):
+            if n:
+                label("")
+            out.append(f"{what} · {vis(sid, visual)}\n")
+    else:
+        missing("source")
+    if item.memory_id:
+        label("")
+        out.append(f"{SAVED_GLYPH} In memory: {item.memory_id}\n",
+                   Style(color=pal["ok"]))
+    label("Date")
+    created = tasksmod.created_of(item)
+    if tasksmod.has_created(item) and created is not None:
+        out.append(f"{created.isoformat()} "
+                   f"({tasksmod.age_label(created, today)} ago)\n")
+    else:
+        missing("date")
+    label("People")
+    people = tasksmod.people_of(item)
+    if people:
+        out.append(vis(", ".join(people), visual) + "\n")
+    else:
+        missing("people")
+    label("Activity")
+    last = tasksmod.last_activity_of(item)
+    if last:
+        out.append(vis(last, visual) + "\n")
+    else:
+        missing("last activity")
+    out.append("\nOriginal words\n", head)
+    evidence = tasksmod.evidence_of(item)
+    if evidence:
+        lines = evidence.split("\n")
+        cut = len(lines) > tasksmod.REMIND_QUOTE_LINES
+        for line in lines[:tasksmod.REMIND_QUOTE_LINES]:
+            for wrapped in (bidi.visual_lines(line, max(10, width - 4), visual)
+                            or [""]):
+                out.append("  │ ", Style(color=pal["warn"]))
+                out.append(wrapped + "\n")
+        if cut:
+            out.append("  │ …\n", Style(color=pal["warn"]))
+    else:
+        out.append("  ", muted)
+        missing("original words")
+    out.append("\nRelated\n", head)
+    ctx = view.get("ctx") or {"state": "off"}
+    state = ctx.get("state")
+    if state == "off":
+        out.append("  Related items unavailable: context is not configured "
+                   "(set context: in inbox.yaml)\n", muted)
+    elif state == "loading":
+        out.append("  " + SPINNER[int(now * 10) % len(SPINNER)]
+                   + " Loading related items…\n", muted)
+    elif state == "error":
+        _wrapped(out, "! Related items unavailable: "
+                 + (ctx.get("message") or "the context command failed"),
+                 width, visual, Style(color=pal["warn"], bold=True), "  ")
+    else:
+        sections = [sec for sec in ctx.get("sections", []) if sec["lines"]]
+        if not sections:
+            out.append("  No related items found\n", muted)
+        for sec in sections:
+            _wrapped(out, sec["title"], width, visual,
+                     Style(bold=True), "  ")
+            for line in sec["lines"]:
+                _wrapped(out, line, width, visual, None, "    ")
+    if item.link:
+        out.append("\n")
+        label("Link")
+        out.append(item.link + "\n", Style(color=pal["link"]))
+    out.append("\nm closes this view\n", Style(color=pal["muted"], dim=True))
     return out
 
 

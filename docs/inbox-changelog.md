@@ -9,6 +9,19 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [0.12.3] - 2026-11-19
 
+### Added
+
+- **Remind me on a task (`m`).** The Tasks detail card did not say enough to
+  know what a task was about. `m` (or `Remind me` in the command palette)
+  fills the Detail pane with where the task came from (each source id as
+  `Slack thread`, `meeting recording`, `memory entry`, ...), its date, the
+  people, the original words (quoted, up to six lines), the last activity
+  (`meta.last_activity`, `meta.updated` or `meta.last_seen_ts`) and the
+  related items from the existing context command (a worker, a loading line,
+  the Context pane's cache). Anything missing says so (`source not recorded`).
+  Read-only; `m` or `esc` closes it. On other rows `m` still saves to memory.
+  See [Remind me](inbox.md#remind-me).
+
 ### Fixed
 
 - **Stacked header rows in the terminal scrollback.** Scrolling above the

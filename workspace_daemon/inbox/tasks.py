@@ -11,6 +11,8 @@ that holds the title) whose `meta` says what it is:
     people      [names]
     evidence    str | null
     source_ids  [str]
+    last_activity  str | null       (0.12.3, read by "Remind me": one line)
+    updated     "YYYY-MM-DD" | epoch seconds | null   (same, when no line)
 
 Task items never show in the Feed, Waiting or the Slack-style sections of the
 Inbox; they have their own view (3 Tasks) and, when overdue or due today, the
@@ -219,3 +221,67 @@ def due_choices(today):
             ("week", f"+1 week  {fmt(week)}", week),
             ("pick", "Pick date…  YYYY-MM-DD", None),
             ("none", "No date", None)]
+
+
+# --- "Remind me" (0.12.3) ----------------------------------------------------
+# What a source id says about where a task came from. The first matching
+# prefix wins; a bare memory id (`2030-01-02-some-title`) is a memory entry.
+SOURCE_KINDS = (
+    (("slack:", "slack_mcp:", "slack_discovery:"), "Slack thread"),
+    (("gcal:",), "calendar event"),
+    (("gmail:", "gmail_mcp:"), "email"),
+    (("zoom:", "mila:"), "meeting recording"),
+    (("gdrive:", "fibery_doc_cache:"), "doc"),
+    (("fibery:", "fibery_tasks_inbound:", "fibery_tasks_outbound:"),
+     "Fibery"),
+)
+NOT_RECORDED = "not recorded"
+REMIND_QUOTE_LINES = 6
+LAST_ACTIVITY_MAX = 200
+
+
+def source_kind(source_id):
+    """A word for where `source_id` points: `Slack thread`, `meeting
+    recording`, `memory entry`, ... or `source` for an id it does not know."""
+    low = source_id.lower()
+    for prefixes, label in SOURCE_KINDS:
+        if low.startswith(prefixes):
+            return label
+    if itm.MEMORY_ID.match(source_id):
+        return "memory entry"
+    return "source"
+
+
+def source_lines(item):
+    """`[(kind, id)]` for every source id of the task (up to 20)."""
+    return [(source_kind(sid), sid) for sid in source_ids_of(item)]
+
+
+def last_activity_of(item):
+    """The task's last activity as one line, or "" when the source did not
+    say: `meta.last_activity` (a line), else `meta.updated` (a day or epoch
+    seconds), else `meta.last_seen_ts` (epoch seconds)."""
+    meta = item.meta if isinstance(item.meta, dict) else {}
+    line = meta.get("last_activity")
+    if isinstance(line, str):
+        line = itm.truncate(itm.clean_line(line), LAST_ACTIVITY_MAX)
+        if line:
+            return line
+    for key in ("updated", "last_seen_ts"):
+        value = meta.get(key)
+        day = parse_day(value)
+        if day is None and isinstance(value, (int, float)) \
+                and not isinstance(value, bool):
+            try:
+                day = dt.date.fromtimestamp(float(value))
+            except (OverflowError, OSError, ValueError):
+                day = None
+        if day is not None:
+            return day.isoformat()
+    return ""
+
+
+def has_created(item):
+    """True when the source gave the creation day (`meta.date`)."""
+    return parse_day(item.meta.get("date") if isinstance(item.meta, dict)
+                     else None) is not None

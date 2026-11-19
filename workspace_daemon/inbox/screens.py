@@ -538,6 +538,7 @@ HELP = [
         ("s", "due date: tomorrow, next Sunday, +1 week, a date (YYYY-MM-DD) or none"),
         ("x", "drop it, with an optional reason (enter alone drops with none)"),
         ("o", "open the task's link (none: says so)"),
+        ("m", "remind me: fills the Detail pane with the source, date, people, original words, last activity and related items (read-only; m or esc closes)"),
         ("", "needs acts: [close, drop, due] on the source; without it the keys only say so"),
         ("", "all of them wait out the 5 s undo window; L can undo one afterwards")]),
     ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),

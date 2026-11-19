@@ -1642,6 +1642,8 @@ title) whose `meta` says so:
 | `people` | `[names]` |
 | `evidence` | a string or `null` |
 | `source_ids` | `[strings]` |
+| `last_activity` | optional one line (up to 200 characters): the task's last activity, read by [Remind me](#remind-me) |
+| `updated` | optional `"YYYY-MM-DD"` or epoch seconds: used for the last activity when there is no `last_activity` (`meta.last_seen_ts` is the next fallback) |
 
 `link` is the item's own field. Task rows never appear in the Feed, in Waiting
 or in the Inbox's URGENT, I OWE and NUDGE DUE. Their text is untrusted display
@@ -1673,6 +1675,31 @@ and a source with no `acts:` is read-only: the keys say so):
 | `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
 | `s` | due date: Tomorrow, Next Sunday, +1 week, Pick date (`YYYY-MM-DD`, checked), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
 | `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
+
+### Remind me
+
+`m` on a task (or `Remind me` in the command palette, `ctrl+p`) fills the Detail
+pane with the task's context. It is read-only: nothing is sent, marked or
+saved. `m` or `esc` closes it, and moving to another task does too. (On any
+other row `m` still saves to memory.)
+
+- **Source**: what each `source_ids` entry points at (`Slack thread`,
+  `calendar event`, `email`, `meeting recording`, `doc`, `Fibery`, `memory
+  entry`, else `source`), with the id; and `In memory: <id>` when the task is
+  already in memory.
+- **Date**: the creation day (`meta.date`) and its age. **People**:
+  `meta.people`. **Activity**: `meta.last_activity`, else `meta.updated`, else
+  `meta.last_seen_ts`.
+- **Original words**: `meta.evidence`, quoted in up to six lines.
+- **Related**: the answer of the [context command](#context-pane-c) for the task, run
+  in a worker with a `Loading related items…` line and cached with the Context
+  pane's cache (the two share one fetch). Without `context:` the card says so;
+  a failed command shows its one-line reason; an answer with no lines says
+  `No related items found`.
+
+A part the source did not send is named, never left blank: `source not
+recorded`, `date not recorded`, `people not recorded`, `last activity not
+recorded`, `original words not recorded`.
 
 After an `ok` the row leaves the list (`close`, `drop`: a local done mark) or
 moves section (`due`: the new date is kept in memory until the next list
