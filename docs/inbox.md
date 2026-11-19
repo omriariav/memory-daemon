@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read, and `meta.task`, `meta.todo` and `meta.ask` (strings: what the owner is to do, shown as `To do:` in an I OWE item's Thread pane, see [Thread pane of an I OWE item](#thread-pane-of-an-i-owe-item)) (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -1530,6 +1530,33 @@ always carries oldest first).
 in `state/inbox-state.json` (a `prefs` entry beside the marks, 0600), and once
 you have pressed `v` the saved choice wins over `inbox.yaml` after a restart.
 (`b`, the Hebrew toggle, is per session and is not saved.)
+
+### Thread pane of an I OWE item
+
+A row of the Inbox's I OWE group (a `needs_reply` item that is not a task) opens
+its Thread pane with a `YOU OWE` block, and the full thread (in the thread
+order above) follows a dim `thread` line below it:
+
+```
+YOU OWE  Dana Example waits on you · asked 1h27m ago
+  │ can you approve the Acme budget line?
+  To do: Reply to Dana Example
+────────────────────────────────────────
+```
+
+- **The message** is the newest message from someone else after your last
+  reply (a thread entry whose `who` is `You`, `you` or `me` is yours); a
+  message from the item's `sender` wins over a bystander's. It is quoted, cut
+  at four lines (or 400 characters) with `…`. With no such message (an empty
+  thread, or you replied last) the item's `gist` is quoted instead. An invite
+  quotes its gist and says `starts in 20h`.
+- **`To do:`** is the first of `meta.task`, `meta.todo` and `meta.ask` that is a
+  non-blank string (cleaned to one line, up to 200 characters); else `RSVP` for
+  an invite; else `reply:` and the first line of the `draft`; else
+  `acknowledge` for a row that only takes an ack; else `Reply to <sender>`.
+- The `! hint`, `In memory` and thread-note lines follow the block. The list
+  rows are unchanged (the second line is the item's `gist`). Urgent, Waiting,
+  FYI and task rows keep their own header line.
 
 ### Hebrew and RTL
 

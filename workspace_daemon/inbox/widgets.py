@@ -13,7 +13,8 @@ from textual.widgets.option_list import Option
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
 from . import tasks as tasksmod
-from .models import SOURCES, fmt_age, thread_fixed, thread_note
+from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
+                     owe_action, owe_message, owes, thread_fixed, thread_note)
 from .views import VIEWS
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -363,7 +364,10 @@ class ThreadView(VerticalScroll):
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
         out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
-        if item.direction == "←":
+        owing = owes(item)
+        if owing:   # I OWE: what is owed first, the thread below it
+            out.append_text(owe_block(item, pal, now, width, visual))
+        elif item.direction == "←":
             out.append(f"← {vis(item.who, visual)} waits on you · asked "
                        f"{ago(now, item.ts)}\n", Style(color=pal["muted"]))
         elif item.direction == "→":
@@ -387,6 +391,8 @@ class ThreadView(VerticalScroll):
         newest_first = newest_first and not thread_fixed(item)
         messages = list(reversed(item.messages)) if newest_first \
             else item.messages
+        if owing and messages:
+            out.append("─ thread ─\n", Style(color=pal["muted"], dim=True))
         for m in messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")
             out.append(f"{vis(m.who, visual)}", Style(bold=True, color=pal["mine"] if m.mine else pal["fg"]))
@@ -400,6 +406,55 @@ class ThreadView(VerticalScroll):
         body.update(out)
         if fresh:
             self.scroll_home(animate=False)
+
+
+def _quote(item, text, pal, width, visual):
+    """`text` (a message) trimmed to a few lines, drawn after a bar."""
+    lines = text.strip().split("\n")
+    cut = len(lines) > OWE_QUOTE_LINES
+    text = "\n".join(lines[:OWE_QUOTE_LINES])
+    if len(text) > OWE_QUOTE_CHARS:
+        text, cut = text[:OWE_QUOTE_CHARS].rstrip(), True
+    if cut:
+        text += " …"
+    body = body_text(item, text, pal, max(20, width - 4), visual)
+    bar = Style(color=pal["warn"])
+    out = Text()
+    for line in body.split("\n", allow_blank=True):
+        out.append("  │ ", bar)
+        out.append_text(line)
+        out.append("\n")
+    return out
+
+
+def owe_block(item, pal, now, width, visual):
+    """The block that opens the Thread pane of an I OWE item: who waits and
+    since when, the message that creates the obligation (quoted, a few lines)
+    and what is to be done. The full thread follows it."""
+    out = Text()
+    who, ts, text = owe_message(item)
+    person = vis(item.who, visual)
+    head = Style(bold=True, color=pal["warn"])
+    out.append("YOU OWE", head)
+    if (item.meta.get("kind") if isinstance(item.meta, dict) else None) \
+            == "invite":
+        when = ("starts " + rel(now, ts) if ts > now + 60
+                else "started " + rel(now, ts))
+        line = f"  an RSVP is due · {when}"
+        if item.who and item.who != "calendar invite":
+            line = f"  {person} is waiting for your RSVP · {when}"
+    else:
+        line = f"  {person} waits on you · asked {ago(now, ts)}"
+    out.append(line + "\n", Style(color=pal["muted"]))
+    if text.strip():
+        if who != item.who:
+            out.append(f"  {vis(who, visual)}\n", Style(bold=True))
+        out.append_text(_quote(item, text, pal, width, visual))
+    action = owe_action(item) or f"Reply to {person}"
+    out.append("  To do: ", Style(bold=True, color=pal["fg"]))
+    out.append(vis(action, visual) + "\n", Style(color=pal["fg"]))
+    out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
+    return out
 
 
 def task_detail(item, pal, width, visual, today):

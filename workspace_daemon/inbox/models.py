@@ -164,6 +164,66 @@ def thread_note(item):
     return truncate(clean_line(note), THREAD_NOTE_MAX)
 
 
+OWE_ACTION_KEYS = ("task", "todo", "ask")   # `meta` keys, first one set wins
+OWE_ACTION_MAX = 200
+OWE_DRAFT_MAX = 100
+OWE_QUOTE_LINES = 4          # logical lines of the quoted message
+OWE_QUOTE_CHARS = 400        # and a cap in characters (before wrapping)
+
+
+def owes(item):
+    """True for a row of the Inbox's I OWE group that has something to show:
+    a `needs_reply` item that is not a task and not a fixed-entry thread."""
+    return (item.section == "needs_reply"
+            and not (isinstance(item.meta, dict)
+                     and (item.meta.get("kind") == "task"
+                          or item.meta.get("thread_fixed") is True)))
+
+
+def owe_message(item):
+    """The message that creates the obligation of an I OWE item: the newest
+    message from someone else after your last reply (the item's own sender
+    first), as `(who, ts, text)`. With no such message in the thread it is the
+    item's gist (`who`, `ts` of the item), the source's own account of what is
+    waiting. An invite has no message: its gist is the invitation."""
+    if (item.meta.get("kind") if isinstance(item.meta, dict) else None) \
+            == "invite":
+        return item.who, item.ts, item.gist
+    last_mine = max((n for n, m in enumerate(item.messages) if m.mine),
+                    default=-1)
+    after = [m for m in item.messages[last_mine + 1:] if not m.mine
+             and m.text.strip()]
+    if after:
+        sender = item.who.strip().lower()
+        from_sender = [m for m in after if m.who.strip().lower() == sender]
+        m = (from_sender or after)[-1]
+        return m.who, m.ts, m.text
+    return item.who, item.ts, item.gist
+
+
+def owe_action(item):
+    """What is to be done, as one line, or "" when the item does not say: the
+    first of `meta.task`, `meta.todo` and `meta.ask` that is a non-blank
+    string, else `RSVP` for an invite, else the drafted reply (its first
+    line), else `acknowledge` for an item that only takes an ack."""
+    from .items import clean_line, truncate
+    meta = item.meta if isinstance(item.meta, dict) else {}
+    for key in OWE_ACTION_KEYS:
+        value = meta.get(key)
+        if isinstance(value, str):
+            line = truncate(clean_line(value), OWE_ACTION_MAX)
+            if line:
+                return line
+    if meta.get("kind") == "invite":
+        return "RSVP"
+    if item.draft and item.draft.strip():
+        first = next((ln for ln in item.draft.split("\n") if ln.strip()), "")
+        return "reply: " + truncate(clean_line(first), OWE_DRAFT_MAX)
+    if "reply" not in item.actions and "ack" in item.actions:
+        return "acknowledge"
+    return ""
+
+
 def thread_fixed(item):
     """True when `meta.thread_fixed` is set: the thread is a fixed list of
     labelled entries (an alert's), shown top-down in either thread order."""

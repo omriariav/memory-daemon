@@ -7,6 +7,36 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-11-19
+
+### Fixed
+
+- **Stacked header rows in the terminal scrollback.** Scrolling above the
+  inbox in iTerm2 showed many copies of the header, the status bar and the
+  pane titles, one per resize. Textual draws a frame row by row with a `\n`
+  after each row but the last; when the terminal gets shorter, a frame built
+  for the old height is still in flight, its extra rows land on the new
+  bottom row, and the `\n` there scrolls the alternate screen. iTerm2's
+  default "Save lines to scrollback in alternate screen mode" keeps every
+  line that scrolls off the top. The app was always full screen (no inline
+  mode, nothing written to stdout before or after the alternate screen). The
+  driver is now wrapped so each `\n` becomes cursor-down plus column 1, which
+  moves the same way but stops at the bottom row; a stale frame is painted
+  over by the resize repaint. A regression test runs the demo on a pty that
+  shrinks and grows and checks that no linefeed is written.
+- **An I OWE item's Thread pane leads with what you owe.** It opened on
+  `<person> waits on you`, the thread-in-memory line and then the thread from
+  its first message, often your own old root post, so the message you owe a
+  reply to was far below. The pane now starts with a `YOU OWE` block: who
+  waits and since when, the message that creates the obligation (the newest
+  message from someone else after your last reply, the item's sender first;
+  the gist when there is none), quoted and cut at four lines, and
+  `To do: ...`. The action is the first of `meta.task`, `meta.todo` and
+  `meta.ask` that is set, else `RSVP` for an invite, else the drafted reply,
+  else `acknowledge` for an ack-only row, else `Reply to <person>`. The full
+  thread follows under a dim `thread` line; the list rows are unchanged. See
+  [Thread pane of an I OWE item](inbox.md#thread-pane-of-an-i-owe-item).
+
 ## [0.12.2] - 2026-11-18
 
 ### Added

@@ -38,6 +38,7 @@ from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
+from .term import no_scroll_driver
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HealthStrip,
                       HealthView, HintBar, Queue, RoutinePane, StatusHeader,
@@ -148,6 +149,13 @@ class Pending:
 class InboxApp(App):
     TITLE = "inbox"
     ENABLE_COMMAND_PALETTE = True
+
+    def get_driver_class(self):
+        """The platform driver, wrapped so no write ever scrolls the screen
+        (a frame that outlives a shrinking resize would push the header rows
+        into the terminal scrollback; see term.py)."""
+        return no_scroll_driver(super().get_driver_class())
+
     BINDINGS = [
         Binding("j,down", "move(1)", "Down", show=False),
         Binding("k,up", "move(-1)", "Up", show=False),
