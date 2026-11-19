@@ -224,6 +224,21 @@ class SourceIdTest(unittest.TestCase):
             self._write_entry(directory, "two", "note-two", "note", "slack:C1:1.1")
             self.assertIsNone(self._verify_note(directory))
 
+    def test_verification_rejects_partial_retype_across_graphs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "e", "entry-e", "decision", "slack:C1:1.1")
+            graph_entries = (
+                Path(directory) / "memory-graphs" / "team" / "entries" / "2026" / "08"
+            )
+            graph_entries.mkdir(parents=True)
+            (graph_entries / "e.md").write_text(
+                "---\nid: entry-e\ndate: 2026-08-02\ntype: note\n"
+                "title: Durable update\npeople: [jane-doe]\n"
+                "tags: [auto-captured]\nsource_ids: [slack:C1:1.1]\n---\n"
+                "The exact durable body.\n"
+            )
+            self.assertIsNone(self._verify_note(directory))
+
     def test_verification_rejects_only_other_type_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             self._write_entry(

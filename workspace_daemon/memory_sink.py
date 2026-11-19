@@ -367,8 +367,8 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     an endless retry, while trusting any file carrying the source id could hide
     a failed update. Verify the complete payload in every materialization of
     the one matching id before treating the write as successful. A source id
-    may also be carried by an entry of another type, so only entries of
-    `etype` count toward the single match.
+    may also be carried by an entry of another type, so only ids with an
+    `etype` materialization count toward the single match.
     """
     if not source_id:
         return None
@@ -410,8 +410,6 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
                 continue
             if source_id not in source_ids:
                 continue
-            if frontmatter.get("type") != etype:
-                continue
             stored_people = frontmatter.get("people") or []
             stored_tags = frontmatter.get("tags") or []
             if not isinstance(stored_people, list) or not isinstance(
@@ -421,14 +419,25 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
             entry_id = frontmatter.get("id")
             valid = bool(
                 isinstance(entry_id, str)
+                and frontmatter.get("type") == etype
                 and frontmatter.get("title") == title
                 and expected_people.issubset(set(stored_people))
                 and expected_tags.issubset(set(stored_tags))
                 and parts[2].strip() == body.strip()
             )
-            matches.setdefault(entry_id, []).append(valid)
+            matches.setdefault(entry_id, []).append(
+                (frontmatter.get("type") == etype, valid)
+            )
     except (OSError, UnicodeError, yaml.YAMLError, TypeError):
         return None
+    # An id counts when any of its materializations has the expected type; a
+    # sibling entry of another type is ignored, but every materialization of a
+    # counted id (including a half-retyped one) must still be valid.
+    matches = {
+        key: [valid for _, valid in found]
+        for key, found in matches.items()
+        if any(typed for typed, _ in found)
+    }
     if len(matches) != 1:
         return None
     entry_id, materializations = next(iter(matches.items()))
