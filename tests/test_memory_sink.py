@@ -186,6 +186,51 @@ class SourceIdTest(unittest.TestCase):
                 )
             )
 
+    def _write_entry(self, directory, name, entry_id, etype, source_id,
+                     body="The exact durable body."):
+        entry_dir = Path(directory) / "memory" / "entries" / "2026" / "08"
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        (entry_dir / f"{name}.md").write_text(
+            "---\n"
+            f"id: {entry_id}\n"
+            "date: 2026-08-02\n"
+            f"type: {etype}\n"
+            "title: Durable update\n"
+            "people: [jane-doe]\n"
+            "tags: [auto-captured]\n"
+            f"source_ids: [{source_id}]\n"
+            "---\n"
+            f"{body}\n"
+        )
+
+    def _verify_note(self, directory):
+        return memory_sink._verify_written_entry(
+            directory, "slack:C1:1.1", "note", "Durable update",
+            ["jane-doe"], ["auto-captured"], "The exact durable body.",
+        )
+
+    def test_verification_ignores_other_type_sibling_with_same_source_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "note", "the-note", "note", "slack:C1:1.1")
+            self._write_entry(
+                directory, "decision", "the-decision", "decision", "slack:C1:1.1",
+                body="A different body.",
+            )
+            self.assertEqual(self._verify_note(directory), "the-note")
+
+    def test_verification_rejects_two_same_type_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "one", "note-one", "note", "slack:C1:1.1")
+            self._write_entry(directory, "two", "note-two", "note", "slack:C1:1.1")
+            self.assertIsNone(self._verify_note(directory))
+
+    def test_verification_rejects_only_other_type_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(
+                directory, "decision", "the-decision", "decision", "slack:C1:1.1",
+            )
+            self.assertIsNone(self._verify_note(directory))
+
 
 class ValidateTest(unittest.TestCase):
     def test_relative_store_rejected(self):

@@ -366,7 +366,9 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     a later indexing or rule step fails). Trusting only the exit status causes
     an endless retry, while trusting any file carrying the source id could hide
     a failed update. Verify the complete payload in every materialization of
-    the one matching id before treating the write as successful.
+    the one matching id before treating the write as successful. A source id
+    may also be carried by an entry of another type, so only entries of
+    `etype` count toward the single match.
     """
     if not source_id:
         return None
@@ -408,6 +410,8 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
                 continue
             if source_id not in source_ids:
                 continue
+            if frontmatter.get("type") != etype:
+                continue
             stored_people = frontmatter.get("people") or []
             stored_tags = frontmatter.get("tags") or []
             if not isinstance(stored_people, list) or not isinstance(
@@ -417,7 +421,6 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
             entry_id = frontmatter.get("id")
             valid = bool(
                 isinstance(entry_id, str)
-                and frontmatter.get("type") == etype
                 and frontmatter.get("title") == title
                 and expected_people.issubset(set(stored_people))
                 and expected_tags.issubset(set(stored_tags))
