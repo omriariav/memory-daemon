@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read, and `meta.task`, `meta.todo` and `meta.ask` (strings: what the owner is to do, shown as `To do:` in an I OWE item's Thread pane, see [Thread pane of an I OWE item](#thread-pane-of-an-i-owe-item)) (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -1531,6 +1531,39 @@ in `state/inbox-state.json` (a `prefs` entry beside the marks, 0600), and once
 you have pressed `v` the saved choice wins over `inbox.yaml` after a restart.
 (`b`, the Hebrew toggle, is per session and is not saved.)
 
+### Thread pane of an I OWE item
+
+A row of the Inbox's I OWE group (a `needs_reply` item that is not a task) opens
+its Thread pane with a `YOU OWE` block, and the full thread (in the thread
+order above) follows a dim `thread` line below it:
+
+```
+YOU OWE  Dana Example waits on you · asked 1h27m ago
+  │ can you approve the Acme budget line?
+  To do: Reply to Dana Example
+────────────────────────────────────────
+```
+
+- **The message** is the first substantive message after your last reply (a
+  thread entry whose `who` is `You`, `you` or `me` is yours) from the item's
+  `sender`, else from someone else. The sender match ignores case and accepts
+  a first-name or display-name-prefix match (`Dana` is `Dana Example`). A very
+  short nudge (at most three words that are only nudge words or punctuation:
+  `?`, `ping`, `any update`) is skipped when choosing, and a dim
+  `+ nudged 2d later` line says it came after; the header's `asked` age is
+  that of the quoted message. When the author is not the sender (the sender
+  said nothing since your reply) the header names the author. It is quoted,
+  cut at four lines (or 400 characters) with `…`. With no message after your
+  reply (an empty thread, or you replied last) the item's `gist` is quoted
+  instead. An invite quotes its gist and says `starts in 20h`.
+- **`To do:`** is the first of `meta.task`, `meta.todo` and `meta.ask` that is a
+  non-blank string (cleaned to one line, up to 200 characters); else `RSVP` for
+  an invite; else `reply:` and the first line of the `draft`; else
+  `acknowledge` for a row that only takes an ack; else `Reply to <sender>`.
+- The `! hint`, `In memory` and thread-note lines follow the block. The list
+  rows are unchanged (the second line is the item's `gist`). Urgent, Waiting,
+  FYI and task rows keep their own header line.
+
 ### Hebrew and RTL
 
 `bidi_mode`: `logical` passes text through (the terminal runs bidi),
@@ -1615,6 +1648,8 @@ title) whose `meta` says so:
 | `people` | `[names]` |
 | `evidence` | a string or `null` |
 | `source_ids` | `[strings]` |
+| `last_activity` | optional one line (up to 200 characters): the task's last activity, read by [Remind me](#remind-me) |
+| `updated` | optional `"YYYY-MM-DD"` or epoch seconds: used for the last activity when there is no `last_activity` (`meta.last_seen_ts` is the next fallback) |
 
 `link` is the item's own field. Task rows never appear in the Feed, in Waiting
 or in the Inbox's URGENT, I OWE and NUDGE DUE. Their text is untrusted display
@@ -1646,6 +1681,32 @@ and a source with no `acts:` is read-only: the keys say so):
 | `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
 | `s` | due date: Tomorrow, Next Sunday, +1 week, Pick date (`YYYY-MM-DD`, checked), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
 | `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
+
+### Remind me
+
+`m` on a task (or `Remind me` in the command palette, `ctrl+p`) fills the Detail
+pane with the task's context. It is read-only: nothing is sent, marked or
+saved. `m` or `esc` closes it (one `esc`, even from the card, and focus is back
+on the list), and moving to another task does too. (On any
+other row `m` still saves to memory.)
+
+- **Source**: what each `source_ids` entry points at (`Slack thread`,
+  `calendar event`, `email`, `meeting recording`, `doc`, `Fibery`, `memory
+  entry`, else `source`), with the id; and `In memory: <id>` when the task is
+  already in memory.
+- **Date**: the creation day (`meta.date`) and its age. **People**:
+  `meta.people`. **Activity**: `meta.last_activity`, else `meta.updated`, else
+  `meta.last_seen_ts`.
+- **Original words**: `meta.evidence`, quoted in up to six lines.
+- **Related**: the answer of the [context command](#context-pane-c) for the task, run
+  in a worker with a `Loading related items…` line and cached with the Context
+  pane's cache (the two share one fetch). Without `context:` the card says so;
+  a failed command shows its one-line reason; an answer with no lines says
+  `No related items found`.
+
+A part the source did not send is named, never left blank: `source not
+recorded`, `date not recorded`, `people not recorded`, `last activity not
+recorded`, `original words not recorded`.
 
 After an `ok` the row leaves the list (`close`, `drop`: a local done mark) or
 moves section (`due`: the new date is kept in memory until the next list

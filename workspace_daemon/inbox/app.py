@@ -38,6 +38,7 @@ from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
+from .term import no_scroll_driver
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HealthStrip,
                       HealthView, HintBar, Queue, RoutinePane, StatusHeader,
@@ -88,7 +89,9 @@ ACTS_OFF = ("Acts are not enabled for this source (set acts: on its command "
             "source in inbox.yaml)")
 CONFLICT_TOAST = "New message since you looked; refresh"
 TASK_CONFLICT_TOAST = "The task changed since you looked; refresh"
-TASK_KEYS_TOAST = ("A task: d done, D outcome, s due date, x drop, o open")
+TASK_KEYS_TOAST = ("A task: d done, D outcome, s due date, x drop, o open, "
+                   "m remind me")
+REMIND_TASK_ONLY = "Remind me works on a task (the 3 Tasks view)"
 DECISION_REQUIRED = "A decision needs its text. Nothing sent."
 SHADOW_WORD = "shadow"
 
@@ -148,6 +151,13 @@ class Pending:
 class InboxApp(App):
     TITLE = "inbox"
     ENABLE_COMMAND_PALETTE = True
+
+    def get_driver_class(self):
+        """The platform driver, wrapped so no write ever scrolls the screen
+        (a frame that outlives a shrinking resize would push the header rows
+        into the terminal scrollback; see term.py)."""
+        return no_scroll_driver(super().get_driver_class())
+
     BINDINGS = [
         Binding("j,down", "move(1)", "Down", show=False),
         Binding("k,up", "move(-1)", "Up", show=False),
@@ -373,6 +383,7 @@ class InboxApp(App):
         self._ctx_pending = []             # items waiting for a fetch slot
         self._ctx_sig = None               # what the pane last drew
         self._cancel = threading.Event()   # set on quit: stops context commands
+        self.remind_key = None             # m on a task: its "Remind me" card is showing
         self._custom = list(getattr(actions, "custom_actions", None) or [])
         self._act_op = None                # the running choices/prepare lookup
         self._act_gen = 0                  # bumped on every lookup
@@ -892,6 +903,8 @@ class InboxApp(App):
                 key = opt.id[len(ITEM_PREFIX):]
         if key != self.current_key or key is None:
             self.current_key = key
+            if self.remind_key != key:
+                self.remind_key = None     # "Remind me" belongs to one task
             self.show_item()
         else:
             self.show_thread_only()
@@ -903,9 +916,12 @@ class InboxApp(App):
         # A task has a detail card, not a thread, and nothing to draft.
         self.query_one("#thread").border_title = "Detail" if task else "Thread"
         self.query_one("#draft-pane").display = not task
+        remind = (self._remind_view(it) if task and self.remind_key == it.key
+                  else None)
         self.query_one("#thread", ThreadView).show(
             it, self.pal, time.time(), self.bidi,
-            self.thread_order == "newest", today=self._today())
+            self.thread_order == "newest", today=self._today(),
+            remind=remind)
 
     def show_item(self):
         self.show_thread_only()
@@ -991,9 +1007,12 @@ class InboxApp(App):
                 keys.append(("s", "due date"))
             if self._acts_on(it, "drop"):
                 keys.append(("x", "drop"))
+            keys.append(("m", "close remind" if self.remind_key == it.key
+                         else "remind me"))
             if f is not None and f.id in ("thread", "draft-pane"):
                 # the card has the focus: its keys scroll it
-                return [("j/k", "scroll"), ("esc", "queue")] + keys + [
+                return [("j/k", "scroll"), ("esc", "close" if self.remind_key
+                                            == it.key else "queue")] + keys + [
                     ("?", "help")]
             return base + keys + [("tab", "card")] + opn + [
                 ("u", "undo"), ("/", "filter"), ("?", "help")]
@@ -1264,6 +1283,12 @@ class InboxApp(App):
         if self.editing:
             self.end_edit(save=True)
             self._focus_view()
+            return
+        if self.remind_key is not None:      # leave the "Remind me" card
+            self.remind_key = None           # (one esc: closed, back on the queue)
+            self.show_thread_only()
+            self._focus_view()
+            self.update_hints()
             return
         f = self.query_one("#filter", Input)
         routine = self.view == "feed" and self.feed_routine
@@ -2420,6 +2445,8 @@ class InboxApp(App):
         it = self.current
         if it is None:
             return
+        if tasksmod.is_task(it):      # a task is not saved: m reminds
+            return self.action_remind()
         if self._synthetic(it):
             return
         if views.is_review(it):
@@ -2800,11 +2827,47 @@ class InboxApp(App):
         while self._ctx_pending and len(self._ctx_loading) < CONTEXT_MAX_FETCHES:
             nxt = self._ctx_pending.pop(0)
             nid = self._ident(nxt)
-            if (self.context_open and nid == shown
+            if (((self.context_open and nid == shown)
+                 or self.remind_key == nid[0])
                     and self.ctx_cache.get(*nid) is None
                     and nid not in self._ctx_loading):
                 self._ctx_spawn(nxt, nid)
+        if self.remind_key == ident[0] and self.current_key == ident[0]:
+            self.show_thread_only()      # the "Remind me" card has its answer
         self.context_render()
+
+    # ---------- "Remind me" on a task (0.12.3, read-only) ----------
+    def action_remind(self):
+        """m on a task: fill the Detail pane with where the task came from,
+        the original words, the last activity and the related items (the
+        context command, in a worker, with a loading line). m or esc closes."""
+        it = self.current
+        if it is None or not tasksmod.is_task(it):
+            self.notify(REMIND_TASK_ONLY, timeout=3, markup=False)
+            return
+        if self.remind_key == it.key:
+            self.remind_key = None
+        else:
+            self.remind_key = it.key
+        self.show_thread_only()
+        self.update_hints()
+
+    def _remind_view(self, it):
+        """What the "Remind me" card draws: the related items' state. The
+        context command is read-only; its answer is cached like the Context
+        pane's (so the pane and this card share one fetch)."""
+        if not self._ctx_on():
+            return {"ctx": {"state": "off"}}
+        ident = self._ident(it)
+        if (self.ctx_cache.get(*ident) is None
+                and ident not in self._ctx_loading
+                and not any(self._ident(p) == ident for p in self._ctx_pending)):
+            self._ctx_start(it)
+        entry = self.ctx_cache.get(*ident, stale=True)
+        if entry is None:
+            return {"ctx": {"state": "loading"}}
+        return {"ctx": dict(entry, state="ready" if entry["ok"] else "error",
+                            message=entry["message"] or "")}
 
     def context_tick(self):
         """Every second: an entry of the shown item that has expired is
@@ -3864,6 +3927,7 @@ class InboxApp(App):
             ("Draft for me", "D: write a reply from the thread, never sends (needs summary: or polish:)", self.action_draft_me),
             ("Waits on…", "w: who the next move is with (needs acts: waits_on on the source)", self.action_waits_on),
             ("Relay to work session…", "!: hand the item over with a note (needs acts: relay on the source)", self.action_relay),
+            ("Remind me", "m on a task: where it came from, the original words, related items (read-only)", self.action_remind),
             ("Toggle context pane", "c: context for the selected item (needs context: in inbox.yaml)", self.action_context),
             ("Refresh context", "C (or r inside the pane): fetch the context again", self.action_context_refresh),
             ("Summarize item", "i: AI summary in the context pane (needs summary: in inbox.yaml)", lambda: self.action_summary(False)),

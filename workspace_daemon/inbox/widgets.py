@@ -13,7 +13,8 @@ from textual.widgets.option_list import Option
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
 from . import tasks as tasksmod
-from .models import SOURCES, fmt_age, thread_fixed, thread_note
+from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
+                     owe_action, owe_message, owes, thread_fixed, thread_note)
 from .views import VIEWS
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -330,7 +331,8 @@ class ThreadView(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield SelectableText("", id="thread-body")
 
-    def show(self, item, pal, now, visual, newest_first=False, today=None):
+    def show(self, item, pal, now, visual, newest_first=False, today=None,
+             remind=None):
         """Draw the item and its thread. The thread is stored oldest first;
         with `newest_first` the latest message is drawn first (the note and
         the item header stay on top) and a dim marker closes the list at the
@@ -340,7 +342,8 @@ class ThreadView(VerticalScroll):
         width = max(30, (self.size.width or 60) - 4)
         # A redraw of the same item (a refresh, a resize) keeps the scroll
         # position; another item, or the other thread order, starts at the top.
-        shown = (None if item is None else item.key, newest_first)
+        shown = (None if item is None else item.key, newest_first,
+                 remind is not None)
         fresh = shown != self._shown
         self._shown = shown
         if not fresh and newest_first and self.scroll_y > 0:
@@ -352,8 +355,10 @@ class ThreadView(VerticalScroll):
             body.update(Text("Nothing selected.", Style(color=pal["muted"], italic=True)))
             return
         if tasksmod.is_task(item):
-            body.update(task_detail(item, pal, width, visual,
-                                    today or dt.date.today()))
+            today = today or dt.date.today()
+            body.update(remind_card(item, pal, width, visual, today, now,
+                                    remind) if remind is not None else
+                        task_detail(item, pal, width, visual, today))
             if fresh:
                 self.scroll_home(animate=False)
             return
@@ -363,7 +368,10 @@ class ThreadView(VerticalScroll):
         out.append("  " + glyph + " ", Style(color=pal[scol], bold=True))
         out.append(f"{label} · {item.where}  ·  {rel(now, item.ts)}\n", Style(color=pal["muted"]))
         out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
-        if item.direction == "←":
+        owing = owes(item)
+        if owing:   # I OWE: what is owed first, the thread below it
+            out.append_text(owe_block(item, pal, now, width, visual))
+        elif item.direction == "←":
             out.append(f"← {vis(item.who, visual)} waits on you · asked "
                        f"{ago(now, item.ts)}\n", Style(color=pal["muted"]))
         elif item.direction == "→":
@@ -387,6 +395,8 @@ class ThreadView(VerticalScroll):
         newest_first = newest_first and not thread_fixed(item)
         messages = list(reversed(item.messages)) if newest_first \
             else item.messages
+        if owing and messages:
+            out.append("─ thread ─\n", Style(color=pal["muted"], dim=True))
         for m in messages:
             when = dt.datetime.fromtimestamp(m.ts).strftime("%H:%M")
             out.append(f"{vis(m.who, visual)}", Style(bold=True, color=pal["mine"] if m.mine else pal["fg"]))
@@ -400,6 +410,62 @@ class ThreadView(VerticalScroll):
         body.update(out)
         if fresh:
             self.scroll_home(animate=False)
+
+
+def _quote(item, text, pal, width, visual):
+    """`text` (a message) trimmed to a few lines, drawn after a bar."""
+    lines = text.strip().split("\n")
+    cut = len(lines) > OWE_QUOTE_LINES
+    text = "\n".join(lines[:OWE_QUOTE_LINES])
+    if len(text) > OWE_QUOTE_CHARS:
+        text, cut = text[:OWE_QUOTE_CHARS].rstrip(), True
+    if cut:
+        text += " …"
+    body = body_text(item, text, pal, max(20, width - 4), visual)
+    bar = Style(color=pal["warn"])
+    out = Text()
+    for line in body.split("\n", allow_blank=True):
+        out.append("  │ ", bar)
+        out.append_text(line)
+        out.append("\n")
+    return out
+
+
+def owe_block(item, pal, now, width, visual):
+    """The block that opens the Thread pane of an I OWE item: who waits and
+    since when, the message that creates the obligation (quoted, a few lines)
+    and what is to be done. The full thread follows it."""
+    out = Text()
+    owed = owe_message(item)
+    who, ts, text = owed.who, owed.ts, owed.text
+    # Who waits: the item's sender, or the author of the message when that is
+    # someone else (the sender said nothing after your reply).
+    person = vis(item.who if owed.by_sender else who, visual)
+    head = Style(bold=True, color=pal["warn"])
+    out.append("YOU OWE", head)
+    if (item.meta.get("kind") if isinstance(item.meta, dict) else None) \
+            == "invite":
+        when = ("starts " + rel(now, ts) if ts > now + 60
+                else "started " + rel(now, ts))
+        line = f"  an RSVP is due · {when}"
+        if item.who and item.who != "calendar invite":
+            line = f"  {person} is waiting for your RSVP · {when}"
+    else:
+        line = f"  {person} waits on you · asked {ago(now, ts)}"
+    out.append(line + "\n", Style(color=pal["muted"]))
+    if text.strip():
+        out.append_text(_quote(item, text, pal, width, visual))
+    if owed.nudges:
+        gap = owed.nudges[-1] - ts
+        later = "right after" if gap < 60 else f"{fmt_age(gap)} later"
+        count = "" if len(owed.nudges) == 1 else f" {len(owed.nudges)} times, last"
+        out.append(f"  + nudged{count} {later}\n",
+                   Style(color=pal["muted"], dim=True))
+    action = owe_action(item) or f"Reply to {person}"
+    out.append("  To do: ", Style(bold=True, color=pal["fg"]))
+    out.append(vis(action, visual) + "\n", Style(color=pal["fg"]))
+    out.append("─" * min(width, 60) + "\n", Style(color=pal["muted"]))
+    return out
 
 
 def task_detail(item, pal, width, visual, today):
@@ -446,6 +512,108 @@ def task_detail(item, pal, width, visual, today):
         field("Link", item.link, Style(color=pal["link"]))
     else:
         field("Link", "none")
+    return out
+
+
+def remind_card(item, pal, width, visual, today, now, view):
+    """"Remind me" for a task (read-only): where it came from, when, who was
+    involved, the original words, the last activity and the related items the
+    context command found. A missing piece says `not recorded`, never a blank.
+    `view` is `{"ctx": {"state": off|loading|ready|error, "sections": [...],
+    "message": str}}`."""
+    out = Text()
+    muted = Style(color=pal["muted"])
+    head = Style(bold=True, color=pal["accent"])
+    due = tasksmod.due_of(item)
+    overdue = due is not None and due < today
+    kind = tasksmod.task_type(item)
+    out.append(f"{tasksmod.GLYPHS[kind]} ", Style(
+        color=pal["urgent"] if overdue else pal["primary"], bold=True))
+    for line in bidi.visual_lines(item.gist, max(10, width - 2), visual) or [""]:
+        out.append(line + "\n", Style(bold=True))
+    out.append(f"REMIND ME  {kind} · due {tasksmod.due_words(due, today)}\n",
+               head)
+    out.append("─" * min(width, 60) + "\n", muted)
+
+    def label(text):
+        out.append(f"{text:<10}", muted)
+
+    def missing(what):
+        out.append(f"{what} not recorded\n", Style(color=pal["warn"], italic=True))
+    label("Source")
+    sources_ = tasksmod.source_lines(item)
+    if sources_:
+        for n, (what, sid) in enumerate(sources_):
+            if n:
+                label("")
+            out.append(f"{what} · {vis(sid, visual)}\n")
+    else:
+        missing("source")
+    if item.memory_id:
+        label("")
+        out.append(f"{SAVED_GLYPH} In memory: {item.memory_id}\n",
+                   Style(color=pal["ok"]))
+    label("Date")
+    created = tasksmod.created_of(item)
+    if tasksmod.has_created(item) and created is not None:
+        out.append(f"{created.isoformat()} "
+                   f"({tasksmod.age_label(created, today)} ago)\n")
+    else:
+        missing("date")
+    label("People")
+    people = tasksmod.people_of(item)
+    if people:
+        out.append(vis(", ".join(people), visual) + "\n")
+    else:
+        missing("people")
+    label("Activity")
+    last = tasksmod.last_activity_of(item)
+    if last:
+        out.append(vis(last, visual) + "\n")
+    else:
+        missing("last activity")
+    out.append("\nOriginal words\n", head)
+    evidence = tasksmod.evidence_of(item)
+    if evidence:
+        lines = evidence.split("\n")
+        cut = len(lines) > tasksmod.REMIND_QUOTE_LINES
+        for line in lines[:tasksmod.REMIND_QUOTE_LINES]:
+            for wrapped in (bidi.visual_lines(line, max(10, width - 4), visual)
+                            or [""]):
+                out.append("  │ ", Style(color=pal["warn"]))
+                out.append(wrapped + "\n")
+        if cut:
+            out.append("  │ …\n", Style(color=pal["warn"]))
+    else:
+        out.append("  ", muted)
+        missing("original words")
+    out.append("\nRelated\n", head)
+    ctx = view.get("ctx") or {"state": "off"}
+    state = ctx.get("state")
+    if state == "off":
+        out.append("  Related items unavailable: context is not configured "
+                   "(set context: in inbox.yaml)\n", muted)
+    elif state == "loading":
+        out.append("  " + SPINNER[int(now * 10) % len(SPINNER)]
+                   + " Loading related items…\n", muted)
+    elif state == "error":
+        _wrapped(out, "! Related items unavailable: "
+                 + (ctx.get("message") or "the context command failed"),
+                 width, visual, Style(color=pal["warn"], bold=True), "  ")
+    else:
+        sections = [sec for sec in ctx.get("sections", []) if sec["lines"]]
+        if not sections:
+            out.append("  No related items found\n", muted)
+        for sec in sections:
+            _wrapped(out, sec["title"], width, visual,
+                     Style(bold=True), "  ")
+            for line in sec["lines"]:
+                _wrapped(out, line, width, visual, None, "    ")
+    if item.link:
+        out.append("\n")
+        label("Link")
+        out.append(item.link + "\n", Style(color=pal["link"]))
+    out.append("\nm closes this view\n", Style(color=pal["muted"], dim=True))
     return out
 
 

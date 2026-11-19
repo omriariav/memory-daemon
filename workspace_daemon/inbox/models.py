@@ -1,4 +1,5 @@
 """UI row model built from item format v1 dicts (no Textual import)."""
+from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -162,6 +163,112 @@ def thread_note(item):
     if not isinstance(note, str):
         return ""
     return truncate(clean_line(note), THREAD_NOTE_MAX)
+
+
+OWE_ACTION_KEYS = ("task", "todo", "ask")   # `meta` keys, first one set wins
+OWE_ACTION_MAX = 200
+OWE_DRAFT_MAX = 100
+OWE_QUOTE_LINES = 4          # logical lines of the quoted message
+OWE_QUOTE_CHARS = 400        # and a cap in characters (before wrapping)
+
+
+def owes(item):
+    """True for a row of the Inbox's I OWE group that has something to show:
+    a `needs_reply` item that is not a task and not a fixed-entry thread."""
+    return (item.section == "needs_reply"
+            and not (isinstance(item.meta, dict)
+                     and (item.meta.get("kind") == "task"
+                          or item.meta.get("thread_fixed") is True)))
+
+
+Owed = namedtuple("Owed", "who ts text by_sender nudges")
+# Words that make a very short message a nudge, not an ask ("any update?").
+NUDGE_WORDS = frozenset((
+    "ping", "pinging", "bump", "bumping", "any", "update", "updates", "news",
+    "thoughts", "hello", "hi", "hey", "still", "there", "anyone", "reminder",
+    "gentle", "friendly", "nudge", "again", "please", "pls", "thanks", "thx"))
+NUDGE_MAX_WORDS = 3
+
+
+def is_nudge(text):
+    """True for a very short message with no content of its own: at most
+    three words, each a nudge word or without letters or digits (`?`, `ping`,
+    `any update?`). A three-word ask such as `approve the budget` is not."""
+    words = text.split()
+    if not words or len(words) > NUDGE_MAX_WORDS:
+        return False
+    for word in words:
+        bare = "".join(c for c in word.lower() if c.isalnum())
+        if bare and bare not in NUDGE_WORDS:
+            return False
+    return True
+
+
+def same_person(a, b):
+    """True when two display names are the same person: equal without case,
+    or one is a prefix of the other (`Dana` and `Dana Example`), or the first
+    names match."""
+    a, b = " ".join(a.lower().split()), " ".join(b.lower().split())
+    if not a or not b:
+        return False
+    if a == b or a.startswith(b + " ") or b.startswith(a + " "):
+        return True
+    return a.split(" ")[0] == b.split(" ")[0] and len(a.split(" ")[0]) >= 2
+
+
+def owe_message(item):
+    """The message that creates the obligation of an I OWE item, an `Owed`
+    `(who, ts, text, by_sender, nudges)`: the first substantive message after
+    your last reply from the item's sender (the match is loose, see
+    `same_person`), else from anyone else. A very short nudge (`?`, `ping`,
+    `any update`) is skipped when choosing; the nudges that came after the
+    chosen message are `nudges`, a list of their times. With only nudges the
+    newest one is chosen. With no message after your reply it is the item's
+    gist (`who`, `ts` of the item), the source's own account of what is
+    waiting. An invite has no message: its gist is the invitation.
+    `by_sender` is False when the author is not the item's sender."""
+    if (item.meta.get("kind") if isinstance(item.meta, dict) else None) \
+            == "invite":
+        return Owed(item.who, item.ts, item.gist, True, [])
+    last_mine = max((n for n, m in enumerate(item.messages) if m.mine),
+                    default=-1)
+    after = [m for m in item.messages[last_mine + 1:] if not m.mine
+             and m.text.strip()]
+    if not after:
+        return Owed(item.who, item.ts, item.gist, True, [])
+    from_sender = [m for m in after if same_person(m.who, item.who)]
+    pool = from_sender or after
+    substantive = [m for m in pool if not is_nudge(m.text)]
+    if substantive:
+        chosen = substantive[0]
+        nudges = [m.ts for m in pool[pool.index(chosen) + 1:]
+                  if is_nudge(m.text)]
+    else:
+        chosen, nudges = pool[-1], []
+    return Owed(chosen.who, chosen.ts, chosen.text, bool(from_sender), nudges)
+
+
+def owe_action(item):
+    """What is to be done, as one line, or "" when the item does not say: the
+    first of `meta.task`, `meta.todo` and `meta.ask` that is a non-blank
+    string, else `RSVP` for an invite, else the drafted reply (its first
+    line), else `acknowledge` for an item that only takes an ack."""
+    from .items import clean_line, truncate
+    meta = item.meta if isinstance(item.meta, dict) else {}
+    for key in OWE_ACTION_KEYS:
+        value = meta.get(key)
+        if isinstance(value, str):
+            line = truncate(clean_line(value), OWE_ACTION_MAX)
+            if line:
+                return line
+    if meta.get("kind") == "invite":
+        return "RSVP"
+    if item.draft and item.draft.strip():
+        first = next((ln for ln in item.draft.split("\n") if ln.strip()), "")
+        return "reply: " + truncate(clean_line(first), OWE_DRAFT_MAX)
+    if "reply" not in item.actions and "ack" in item.actions:
+        return "acknowledge"
+    return ""
 
 
 def thread_fixed(item):
