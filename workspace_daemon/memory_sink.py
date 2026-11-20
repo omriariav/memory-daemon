@@ -387,6 +387,8 @@ def _store_entries(store, needles=()):
     ]
     for path in paths:
         raw = path.read_text(encoding="utf-8")
+        # Matches the raw text, so a source id that YAML writes escaped would
+        # be missed; accepted for slack, gmail and gdrive ids.
         if needles and not any(needle in raw for needle in needles):
             continue
         if not raw.startswith("---"):
@@ -433,15 +435,23 @@ def capture_guard(store, source_id, etype, rid=None):
     captures always carry it, so an entry without it counts as hand-logged,
     and removing the tag from a daemon entry moves later captures to `:auto`.
 
-    The CLI refreshes a same-type match of the source id in place and retypes
-    a plain note when every match is a note; it never overwrites any other
-    type, and it protects an open todo / pending decision itself. So:
-    - an open todo or pending decision carrying the id leaves everything to
-      the CLI (a closing reply still links with --follows);
-    - otherwise a hand-logged entry the CLI would overwrite (same type, or a
-      note retyped beside only notes) forces `:auto`;
-    - once an auto-captured entry carries `<id>:auto`, `:auto` stays in use
-      whatever the type, so the thread never splits across two ids.
+    The rules follow the CLI's own order when a capture carries a source id
+    (plain matches are the entries carrying `<id>`):
+    a. A same-type match is refreshed in place. An untagged (hand-logged) one
+       forces `:auto`; all-tagged matches keep the plain id (the daemon
+       refreshes its own entry). Exception: an untagged same-type match that
+       is itself an open todo / pending decision keeps the plain id; the CLI
+       refreshes it with a warning, which is accepted.
+    b. Otherwise an open todo / pending decision among the matches is the
+       CLI's target and it errors; keep the plain id so the existing
+       open-item and --follows path handles it.
+    c. Otherwise, once an auto-captured entry carries `<id>:auto`, `:auto`
+       stays in use whatever the type, so the thread never splits across ids.
+    d. Otherwise, when every match is a note, one is hand-logged and the type
+       differs, the CLI would retype that note in place: use `:auto`.
+    e. Otherwise the plain id (the CLI splits off a new entry).
+    "Open" means no entry follows the item, as in the CLI's chain index.
+    The hand-logged ids come back whenever the result is `:auto`.
     An unreadable store fails open (the CLI stays the authority).
     """
     if not source_id:
@@ -459,26 +469,40 @@ def capture_guard(store, source_id, etype, rid=None):
                 entry_id = frontmatter.get("id")
                 if isinstance(entry_id, str):
                     plain.append((entry_id, frontmatter.get("type"), tagged))
-        if sticky:
-            return True, []
-        open_candidates = [
+        candidates = [
             entry_id for entry_id, kind, _ in plain
             if kind in OPEN_ITEM_TYPES
         ]
-        if open_candidates and set(open_candidates) - _followed_ids(
-                store, open_candidates):
-            return False, []
+        open_ids = (set(candidates) - _followed_ids(store, candidates)
+                    if candidates else set())
     except (OSError, UnicodeError, yaml.YAMLError, TypeError):
         log(f"routine={rid} memory WARN: could not read the store to check "
             f"for hand-logged entries on source_id={source_id}; "
             "capturing under the plain id")
         return False, []
-    only_notes = all(kind == "note" for _, kind, _ in plain)
-    hand_logged = sorted({
-        entry_id for entry_id, kind, tagged in plain
-        if not tagged and (kind == etype or (kind == "note" and only_notes))
-    })
-    return bool(hand_logged), hand_logged
+    untagged = sorted({
+        entry_id for entry_id, _, tagged in plain if not tagged})
+    same = [(entry_id, tagged) for entry_id, kind, tagged in plain
+            if kind == etype]
+    if same:
+        hand_same = sorted({
+            entry_id for entry_id, tagged in same
+            if not tagged and entry_id not in open_ids})
+        if hand_same:
+            return True, hand_same
+        if all(tagged or entry_id in open_ids for entry_id, tagged in same):
+            return False, []
+    if open_ids:
+        return False, []
+    if sticky:
+        return True, untagged
+    if (plain and etype != "note"
+            and all(kind == "note" for _, kind, _ in plain)):
+        hand_notes = sorted({
+            entry_id for entry_id, _, tagged in plain if not tagged})
+        if hand_notes:
+            return True, hand_notes
+    return False, []
 
 
 def auto_source_id_for(source_id):

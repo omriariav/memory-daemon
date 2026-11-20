@@ -1944,16 +1944,76 @@ class HandLoggedGuardTest(unittest.TestCase):
         self.assertEqual(out["memory_entry_id"], "open-todo")
         self.assertEqual(out["memory_source_id"], self.SID)
 
-    def test_open_todo_beside_a_hand_logged_note_skips_the_guard(self):
+    def test_open_todo_beside_a_hand_logged_note_still_guards_a_note(self):
+        # Scenario A: the CLI refreshes the same-type note in place even
+        # though an open todo carries the id, so the daemon must divert.
         self._write("open", "open-todo", "todo", ["manual"])
-        self._write("hand", "hand-note", "note", ["manual"])
+        path = self._write("hand", "hand-note", "note", ["manual"])
+        before = path.read_text()
         out, calls, log = self._capture("note")
-        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
         self.assertNotIn("--sources", calls[0])
-        self.assertEqual(out["memory_source_id"], self.SID)
-        self.assertNotIn("memory_thread_source_id", out)
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+        self.assertEqual(path.read_text(), before)
         logged = " ".join(str(c.args[0]) for c in log.call_args_list)
-        self.assertNotIn("hand-logged", logged)
+        self.assertIn("hand-logged hand-note carries", logged)
+
+    def test_open_todo_beside_a_hand_logged_decision_guards_a_decision(self):
+        # Scenario B.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        out, calls, _ = self._capture("decision")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+
+    def test_open_todo_beside_a_hand_logged_other_type_keeps_plain_id(self):
+        # No same-type match: the open todo is the CLI's target (it errors
+        # and the open-item path takes over), so the plain id stays.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_hand_logged_open_todo_with_a_todo_capture_keeps_plain_id(self):
+        # Accepted: the CLI refreshes an open same-type match with a warning.
+        self._write("open", "open-todo", "todo", ["manual"])
+        out, calls, _ = self._capture("todo")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_hand_logged_closed_todo_with_a_todo_capture_is_guarded(self):
+        self._write("todo", "closed-todo", "todo", ["manual"])
+        self._write_follower("closed-todo")
+        _, calls, _ = self._capture("todo")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+
+    def test_open_todo_outranks_the_sticky_derived_id(self):
+        # Rule b before c: a reply that closes a hand-logged open todo is
+        # not diverted to :auto.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["auto-captured"], source_id="slack:C1:1.0:auto")
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_all_auto_tagged_same_type_matches_keep_the_plain_id(self):
+        self._write("auto", "auto-note", "note", ["auto-captured"])
+        self._write("open", "open-todo", "todo", ["manual"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+
+    def _write_follower(self, target_id):
+        Path(self.store, "memory", "entries", "2026", "07",
+             "outcome.md").write_text(
+            "---\nid: outcome\ndate: 2026-07-21\ntype: decision\n"
+            "title: Outcome\npeople: []\ntags: [manual]\n"
+            f"follows: [{target_id}]\nsource_ids: [slack:C1:1.0:9.9]\n---\n"
+            "Done.\n")
 
     def test_a_followed_todo_is_closed_and_no_longer_skips_the_guard(self):
         self._write("todo", "closed-todo", "todo", ["manual"])
