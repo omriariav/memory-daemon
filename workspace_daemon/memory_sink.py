@@ -1684,12 +1684,14 @@ def capture(routine, item, summary, dry_run=False):
     if hand_logged:
         # A hand-written entry already carries this source id. A capture
         # under the same id would refresh it in place, so the daemon writes
-        # its own entry under a derived id and links to the hand-logged ones.
+        # its own entry under a derived id. No `--sources`: that field is for
+        # summary entries and would block remove/promote of the hand-logged
+        # ones; the derived id keeps the link recoverable.
         original_source_id = source_id
         source_id = auto_source_id_for(source_id)
         log(
             f"routine={rid} memory: hand-logged {', '.join(hand_logged)} "
-            "carries this source id; capturing as a separate linked entry"
+            "carries this source id; capturing under a derived id"
         )
 
     args = ["add", "--type", etype, "--title", title, "--date", item.get("date", "")]
@@ -1698,8 +1700,6 @@ def capture(routine, item, summary, dry_run=False):
     args += ["--tags", ",".join(dict.fromkeys(tags))]
     if source_id:
         args += ["--source-ids", source_id]
-        if hand_logged:
-            args += ["--sources", ",".join(hand_logged)]
     else:
         # No canonical id -> the store's near-dup guard may interject; force-new
         # would risk duplicates, so let the guard win and report it.

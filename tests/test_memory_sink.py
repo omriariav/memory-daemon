@@ -1896,7 +1896,7 @@ class HandLoggedGuardTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self._arg(calls[0], "--source-ids"),
                          "slack:C1:1.0:auto")
-        self.assertEqual(self._arg(calls[0], "--sources"), f"hand-{etype}")
+        self.assertNotIn("--sources", calls[0])
         self.assertEqual(out["memory_source_id"], "slack:C1:1.0:auto")
         self.assertEqual(out["memory_thread_source_id"], self.SID)
         self.assertEqual(path.read_text(), before)
@@ -1904,10 +1904,10 @@ class HandLoggedGuardTest(unittest.TestCase):
         self.assertIn(f"routine=r memory: hand-logged hand-{etype}", logged)
         return calls
 
-    def test_hand_logged_decision_gets_a_separate_linked_capture(self):
+    def test_hand_logged_decision_gets_a_separate_capture(self):
         self._check_split("decision")
 
-    def test_hand_logged_note_gets_a_separate_linked_capture(self):
+    def test_hand_logged_note_gets_a_separate_capture(self):
         self._check_split("note")
 
     def test_auto_captured_entry_keeps_the_source_id(self):
@@ -1947,7 +1947,7 @@ class HandLoggedGuardTest(unittest.TestCase):
         _, calls, _ = self._capture("note")
         self.assertEqual(self._arg(calls[0], "--source-ids"),
                          "slack:C1:1.0:auto")
-        self.assertEqual(self._arg(calls[0], "--sources"), "hand-note")
+        self.assertNotIn("--sources", calls[0])
 
     def test_no_entry_keeps_the_source_id(self):
         out, calls, _ = self._capture("note")
@@ -1959,7 +1959,7 @@ class HandLoggedGuardTest(unittest.TestCase):
         self._write("hand", "hand-note", "note", ["manual"], graph="team")
         self._write("auto", "auto-decision", "decision", ["auto-captured"])
         _, calls, _ = self._capture("decision")
-        self.assertEqual(self._arg(calls[0], "--sources"), "hand-note")
+        self.assertNotIn("--sources", calls[0])
 
     def test_a_second_capture_derives_the_same_id(self):
         self._write("hand", "hand-decision", "decision", ["manual"])
@@ -1970,7 +1970,7 @@ class HandLoggedGuardTest(unittest.TestCase):
         second = self._capture("decision")[1][0]
         self.assertEqual(self._arg(first, "--source-ids"),
                          self._arg(second, "--source-ids"))
-        self.assertEqual(self._arg(second, "--sources"), "hand-decision")
+        self.assertNotIn("--sources", second)
 
     def test_verification_uses_the_derived_id(self):
         self._write("hand", "hand-note", "note", ["manual"])
