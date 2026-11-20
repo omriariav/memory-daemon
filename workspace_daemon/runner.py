@@ -1740,7 +1740,8 @@ def _latest_memory_record(processed, source_id):
     matching = [
         (entry.get("processed_at") or "", item_id, entry)
         for item_id, entry in processed.items()
-        if entry.get("memory_source_id") == source_id
+        if source_id in (entry.get("memory_source_id"),
+                         entry.get("memory_thread_source_id"))
     ]
     return max(matching, default=(None, None, None))[-1]
 

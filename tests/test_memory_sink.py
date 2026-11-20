@@ -1832,6 +1832,135 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertIn("active Chat follow-up", log.call_args.args[0])
 
 
+class HandLoggedGuardTest(unittest.TestCase):
+    """A capture never rewrites an entry the daemon did not write."""
+
+    SID = "slack:C1:1.0"
+
+    def setUp(self):
+        memory_sink._slug_cache.clear()
+        contacts.clear_cache()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = self.tmp.name
+        memory_sink._slug_cache[self.store] = {"jane-doe"}
+        self.item = {"id": self.SID, "title": "t", "date": "2026-07-27",
+                     "frontmatter": {}}
+
+    def _write(self, name, entry_id, etype, tags, source_id=None, graph=None):
+        base = Path(self.store)
+        entries = (base / "memory-graphs" / graph / "entries" if graph
+                   else base / "memory" / "entries") / "2026" / "07"
+        entries.mkdir(parents=True, exist_ok=True)
+        path = entries / f"{name}.md"
+        path.write_text(
+            "---\n"
+            f"id: {entry_id}\n"
+            "date: 2026-07-20\n"
+            f"type: {etype}\n"
+            "title: Hand written\n"
+            "people: [jane-doe]\n"
+            f"tags: [{', '.join(tags)}]\n"
+            f"source_ids: [{source_id or self.SID}]\n"
+            "---\n"
+            "Hand written body.\n"
+        )
+        return path
+
+    def _capture(self, etype, result=None):
+        routine = {"id": "r", "memory": {"store": self.store, "type": etype,
+                                         "extract": False}}
+        calls = []
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls.append(list(args))
+            return result or FakeResult("✓ created 2026-07-27-capture\n")
+
+        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+                mock.patch.object(memory_sink, "_authenticated_identity",
+                                  return_value={"email": None, "person": None,
+                                                "safe": False}), \
+                mock.patch.object(memory_sink.subprocess, "run",
+                                  return_value=FakeResult()), \
+                mock.patch.object(memory_sink, "log") as log:
+            out = memory_sink.capture(routine, self.item, "s")
+        return out, calls, log
+
+    def _arg(self, args, flag):
+        return args[args.index(flag) + 1]
+
+    def _check_split(self, etype):
+        path = self._write("hand", f"hand-{etype}", etype, ["manual"])
+        before = path.read_text()
+        out, calls, log = self._capture(etype)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(self._arg(calls[0], "--sources"), f"hand-{etype}")
+        self.assertEqual(out["memory_source_id"], "slack:C1:1.0:auto")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+        self.assertEqual(path.read_text(), before)
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn(f"routine=r memory: hand-logged hand-{etype}", logged)
+        return calls
+
+    def test_hand_logged_decision_gets_a_separate_linked_capture(self):
+        self._check_split("decision")
+
+    def test_hand_logged_note_gets_a_separate_linked_capture(self):
+        self._check_split("note")
+
+    def test_auto_captured_entry_keeps_the_source_id(self):
+        self._write("auto", "auto-note", "note", ["auto-captured", "x"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("--sources", calls[0])
+        self.assertEqual(out["memory_source_id"], self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_no_entry_keeps_the_source_id(self):
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("--sources", calls[0])
+
+    def test_a_graph_copy_counts_once_and_a_mixed_set_is_guarded(self):
+        self._write("hand", "hand-note", "note", ["manual"])
+        self._write("hand", "hand-note", "note", ["manual"], graph="team")
+        self._write("auto", "auto-decision", "decision", ["auto-captured"])
+        _, calls, _ = self._capture("decision")
+        self.assertEqual(self._arg(calls[0], "--sources"), "hand-note")
+
+    def test_a_second_capture_derives_the_same_id(self):
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        first = self._capture("decision")[1][0]
+        # The daemon entry now exists under the derived id.
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["auto-captured"], source_id="slack:C1:1.0:auto")
+        second = self._capture("decision")[1][0]
+        self.assertEqual(self._arg(first, "--source-ids"),
+                         self._arg(second, "--source-ids"))
+        self.assertEqual(self._arg(second, "--sources"), "hand-decision")
+
+    def test_verification_uses_the_derived_id(self):
+        self._write("hand", "hand-note", "note", ["manual"])
+        # The CLI exits non-zero after writing; the daemon entry sits on disk
+        # under the derived id, next to the untouched hand-logged one.
+        entry = (
+            Path(self.store) / "memory" / "entries" / "2026" / "07"
+            / "daemon.md"
+        )
+        entry.write_text(
+            "---\nid: daemon-note\ndate: 2026-07-27\ntype: note\n"
+            "title: t\npeople: []\ntags: [auto-captured]\n"
+            "source_ids: [slack:C1:1.0:auto]\n---\ns\n"
+        )
+        out, calls, _ = self._capture(
+            "note", result=FakeResult("late failure", returncode=1))
+        self.assertEqual(out["memory"], "verified")
+        self.assertEqual(out["memory_entry_id"], "daemon-note")
+        self.assertEqual(out["memory_source_id"], "slack:C1:1.0:auto")
+
+
 class FollowupResolutionTest(unittest.TestCase):
     def test_resolution_creates_idempotent_timeline_successor(self):
         calls = {}

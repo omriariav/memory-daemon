@@ -359,6 +359,80 @@ def _head_and_tail(output, limit=300):
     return f"{text[:limit]} … {text[-limit:]}"
 
 
+def _store_entries(store):
+    """Yield (frontmatter, body) for every entry file in the default store and
+    every graph store. Files without a readable frontmatter mapping are skipped.
+    Raises OSError, UnicodeError or yaml.YAMLError on an unreadable file."""
+    root = Path(store)
+    entry_roots = [root / "memory" / "entries"]
+    graphs = root / "memory-graphs"
+    if graphs.is_dir():
+        entry_roots.extend(
+            path / "entries"
+            for path in graphs.iterdir()
+            if path.is_dir()
+        )
+    paths = [
+        path
+        for entry_root in entry_roots
+        if entry_root.is_dir()
+        for path in entry_root.rglob("*.md")
+        if path.is_file()
+    ]
+    for path in paths:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.startswith("---"):
+            continue
+        parts = raw.split("---", 2)
+        if len(parts) != 3:
+            continue
+        frontmatter = yaml.safe_load(parts[1]) or {}
+        if not isinstance(frontmatter, dict):
+            continue
+        yield frontmatter, parts[2]
+
+
+def _carries_source_id(frontmatter, source_id):
+    source_ids = frontmatter.get("source_ids") or []
+    return (
+        isinstance(source_ids, list)
+        and all(isinstance(value, str) for value in source_ids)
+        and source_id in source_ids
+    )
+
+
+def hand_logged_entry_ids(store, source_id):
+    """Ids of entries carrying `source_id` that the daemon did not write.
+
+    Daemon captures always carry AUTO_TAG; an entry without it was logged by
+    hand. An unreadable store yields no ids: the CLI stays the authority.
+    """
+    if not source_id:
+        return []
+    found = set()
+    try:
+        for frontmatter, _ in _store_entries(store):
+            if not _carries_source_id(frontmatter, source_id):
+                continue
+            tags = frontmatter.get("tags")
+            entry_id = frontmatter.get("id")
+            if (
+                isinstance(entry_id, str)
+                and not (isinstance(tags, list) and AUTO_TAG in tags)
+            ):
+                found.add(entry_id)
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        return []
+    return sorted(found)
+
+
+def auto_source_id_for(source_id):
+    """Stable source id for a daemon capture of a thread that a hand-logged
+    entry already carries, so the capture never rewrites that entry. Same
+    `scheme:rest` shape as the other derived ids (`...:followup-open`)."""
+    return f"{source_id}:auto"
+
+
 def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     """Return the exact persisted entry id after an ambiguous CLI result.
 
@@ -372,43 +446,12 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     """
     if not source_id:
         return None
-    root = Path(store)
-    entry_roots = [root / "memory" / "entries"]
-    graphs = root / "memory-graphs"
-    if graphs.is_dir():
-        entry_roots.extend(
-            path / "entries"
-            for path in graphs.iterdir()
-            if path.is_dir()
-        )
-
     expected_people = set(people)
     expected_tags = set(tags)
     matches = {}
     try:
-        paths = [
-            path
-            for entry_root in entry_roots
-            if entry_root.is_dir()
-            for path in entry_root.rglob("*.md")
-            if path.is_file()
-        ]
-        for path in paths:
-            raw = path.read_text(encoding="utf-8")
-            if not raw.startswith("---"):
-                continue
-            parts = raw.split("---", 2)
-            if len(parts) != 3:
-                continue
-            frontmatter = yaml.safe_load(parts[1]) or {}
-            if not isinstance(frontmatter, dict):
-                continue
-            source_ids = frontmatter.get("source_ids") or []
-            if not isinstance(source_ids, list) or any(
-                not isinstance(value, str) for value in source_ids
-            ):
-                continue
-            if source_id not in source_ids:
+        for frontmatter, entry_body in _store_entries(store):
+            if not _carries_source_id(frontmatter, source_id):
                 continue
             stored_people = frontmatter.get("people") or []
             stored_tags = frontmatter.get("tags") or []
@@ -423,7 +466,7 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
                 and frontmatter.get("title") == title
                 and expected_people.issubset(set(stored_people))
                 and expected_tags.issubset(set(stored_tags))
-                and parts[2].strip() == body.strip()
+                and entry_body.strip() == body.strip()
             )
             matches.setdefault(entry_id, []).append(
                 (frontmatter.get("type") == etype, valid)
@@ -1631,12 +1674,27 @@ def capture(routine, item, summary, dry_run=False):
         if followup_line not in body:
             body = f"{followup_line}\n\n{body}"
 
+    hand_logged = hand_logged_entry_ids(store, source_id)
+    original_source_id = None
+    if hand_logged:
+        # A hand-written entry already carries this source id. A capture
+        # under the same id would refresh it in place, so the daemon writes
+        # its own entry under a derived id and links to the hand-logged ones.
+        original_source_id = source_id
+        source_id = auto_source_id_for(source_id)
+        log(
+            f"routine={rid} memory: hand-logged {', '.join(hand_logged)} "
+            "carries this source id; capturing as a separate linked entry"
+        )
+
     args = ["add", "--type", etype, "--title", title, "--date", item.get("date", "")]
     if people:
         args += ["--people", ",".join(people)]
     args += ["--tags", ",".join(dict.fromkeys(tags))]
     if source_id:
         args += ["--source-ids", source_id]
+        if hand_logged:
+            args += ["--sources", ",".join(hand_logged)]
     else:
         # No canonical id -> the store's near-dup guard may interject; force-new
         # would risk duplicates, so let the guard win and report it.
@@ -1682,7 +1740,9 @@ def capture(routine, item, summary, dry_run=False):
         return {"memory": "dry_run"}
 
     r = _cli(store, args, stdin_text=body, timeout=300)
-    thread_source_id = None
+    # Failures of this thread are recorded under the id the item derives, so
+    # the runner clears them by that id once the derived capture succeeds.
+    thread_source_id = original_source_id
     retry = _open_todo_outcome_retry(args, r, item, source_id)
     if retry:
         thread_source_id = source_id
