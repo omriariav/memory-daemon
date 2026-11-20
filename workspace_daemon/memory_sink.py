@@ -47,6 +47,9 @@ MEMORY_TYPES = {
     "incident", "achievement", "feedback", "meeting", "note", "summary",
 }
 AUTO_TAG = "auto-captured"
+# The CLI never rewrites these in place (it refuses and asks for a linked
+# outcome entry), so the hand-logged guard leaves them on the regular path.
+OPEN_ITEM_TYPES = {"todo", "pending-decision"}
 # Marks a capture that a model classified as the owner's action but that was
 # downgraded to a note for lack of ownership evidence. Briefing and triage
 # flows must treat entries carrying it as FYI, never as "waiting on me".
@@ -359,17 +362,13 @@ def _head_and_tail(output, limit=300):
     return f"{text[:limit]} … {text[-limit:]}"
 
 
-def _verify_written_entry(store, source_id, etype, title, people, tags, body):
-    """Return the exact persisted entry id after an ambiguous CLI result.
-
-    personal-memory can exit non-zero after its durable write (for example if
-    a later indexing or rule step fails). Trusting only the exit status causes
-    an endless retry, while trusting any file carrying the source id could hide
-    a failed update. Verify the complete payload in every materialization of
-    the one matching id before treating the write as successful.
-    """
-    if not source_id:
-        return None
+def _store_entries(store, needles=()):
+    """Yield (frontmatter, body) for every entry file in the default store and
+    every graph store. Files without a readable frontmatter mapping are skipped.
+    With `needles`, a file whose raw text contains none of them is skipped
+    before YAML parsing (callers match the exact value afterwards, so the
+    result is the same, only cheaper).
+    Raises OSError, UnicodeError or yaml.YAMLError on an unreadable file."""
     root = Path(store)
     entry_roots = [root / "memory" / "entries"]
     graphs = root / "memory-graphs"
@@ -379,34 +378,160 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
             for path in graphs.iterdir()
             if path.is_dir()
         )
+    paths = [
+        path
+        for entry_root in entry_roots
+        if entry_root.is_dir()
+        for path in entry_root.rglob("*.md")
+        if path.is_file()
+    ]
+    for path in paths:
+        raw = path.read_text(encoding="utf-8")
+        # Matches the raw text, so a source id that YAML writes escaped would
+        # be missed; accepted for slack, gmail and gdrive ids.
+        if needles and not any(needle in raw for needle in needles):
+            continue
+        if not raw.startswith("---"):
+            continue
+        parts = raw.split("---", 2)
+        if len(parts) != 3:
+            continue
+        frontmatter = yaml.safe_load(parts[1]) or {}
+        if not isinstance(frontmatter, dict):
+            continue
+        yield frontmatter, parts[2]
 
+
+def _carries_source_id(frontmatter, source_id):
+    source_ids = frontmatter.get("source_ids") or []
+    return (
+        isinstance(source_ids, list)
+        and all(isinstance(value, str) for value in source_ids)
+        and source_id in source_ids
+    )
+
+
+def _followed_ids(store, entry_ids):
+    """The subset of `entry_ids` that some entry lists in its `follows`.
+
+    The CLI's chain index calls an open todo / pending decision resolved once
+    any entry follows it, so that is what "open" means here too (the status
+    is not stored in the frontmatter).
+    """
+    wanted = set(entry_ids)
+    followed = set()
+    for frontmatter, _ in _store_entries(store, needles=wanted):
+        follows = frontmatter.get("follows") or []
+        if isinstance(follows, list):
+            followed.update(wanted.intersection(
+                value for value in follows if isinstance(value, str)))
+    return followed
+
+
+def capture_guard(store, source_id, etype, rid=None):
+    """Decide whether a capture of `etype` must use the derived `:auto` id.
+
+    Returns (use_auto, hand_logged_ids). The guard keys on AUTO_TAG: daemon
+    captures always carry it, so an entry without it counts as hand-logged,
+    and removing the tag from a daemon entry moves later captures to `:auto`.
+
+    The rules follow the CLI's own order when a capture carries a source id
+    (plain matches are the entries carrying `<id>`):
+    a. A same-type match is refreshed in place. An untagged (hand-logged) one
+       forces `:auto`; all-tagged matches keep the plain id (the daemon
+       refreshes its own entry). Exception: an untagged same-type match that
+       is itself an open todo / pending decision keeps the plain id; the CLI
+       refreshes it with a warning, which is accepted.
+    b. Otherwise an open todo / pending decision among the matches is the
+       CLI's target and it errors; keep the plain id so the existing
+       open-item and --follows path handles it.
+    c. Otherwise, once an auto-captured entry carries `<id>:auto`, `:auto`
+       stays in use whatever the type, so the thread never splits across ids.
+    d. Otherwise, when every match is a note, one is hand-logged and the type
+       differs, the CLI would retype that note in place: use `:auto`.
+    e. Otherwise the plain id (the CLI splits off a new entry).
+    "Open" means no entry follows the item, as in the CLI's chain index.
+    The hand-logged ids come back whenever the result is `:auto`.
+    An unreadable store fails open (the CLI stays the authority).
+    """
+    if not source_id:
+        return False, []
+    auto_id = auto_source_id_for(source_id)
+    plain = []
+    sticky = False
+    try:
+        for frontmatter, _ in _store_entries(store, needles=(source_id,)):
+            tags = frontmatter.get("tags")
+            tagged = isinstance(tags, list) and AUTO_TAG in tags
+            if _carries_source_id(frontmatter, auto_id):
+                sticky = sticky or tagged
+            if _carries_source_id(frontmatter, source_id):
+                entry_id = frontmatter.get("id")
+                if isinstance(entry_id, str):
+                    plain.append((entry_id, frontmatter.get("type"), tagged))
+        candidates = [
+            entry_id for entry_id, kind, _ in plain
+            if kind in OPEN_ITEM_TYPES
+        ]
+        open_ids = (set(candidates) - _followed_ids(store, candidates)
+                    if candidates else set())
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        log(f"routine={rid} memory WARN: could not read the store to check "
+            f"for hand-logged entries on source_id={source_id}; "
+            "capturing under the plain id")
+        return False, []
+    untagged = sorted({
+        entry_id for entry_id, _, tagged in plain if not tagged})
+    same = [(entry_id, tagged) for entry_id, kind, tagged in plain
+            if kind == etype]
+    if same:
+        hand_same = sorted({
+            entry_id for entry_id, tagged in same
+            if not tagged and entry_id not in open_ids})
+        if hand_same:
+            return True, hand_same
+        if all(tagged or entry_id in open_ids for entry_id, tagged in same):
+            return False, []
+    if open_ids:
+        return False, []
+    if sticky:
+        return True, untagged
+    if (plain and etype != "note"
+            and all(kind == "note" for _, kind, _ in plain)):
+        hand_notes = sorted({
+            entry_id for entry_id, _, tagged in plain if not tagged})
+        if hand_notes:
+            return True, hand_notes
+    return False, []
+
+
+def auto_source_id_for(source_id):
+    """Stable source id for a daemon capture of a thread that a hand-logged
+    entry already carries, so the capture never rewrites that entry. Same
+    `scheme:rest` shape as the other derived ids (`...:followup-open`)."""
+    return f"{source_id}:auto"
+
+
+def _verify_written_entry(store, source_id, etype, title, people, tags, body):
+    """Return the exact persisted entry id after an ambiguous CLI result.
+
+    personal-memory can exit non-zero after its durable write (for example if
+    a later indexing or rule step fails). Trusting only the exit status causes
+    an endless retry, while trusting any file carrying the source id could hide
+    a failed update. Verify the complete payload in every materialization of
+    the one matching id before treating the write as successful. A source id
+    may also be carried by an entry of another type, so only ids with an
+    `etype` materialization count toward the single match.
+    """
+    if not source_id:
+        return None
     expected_people = set(people)
     expected_tags = set(tags)
     matches = {}
     try:
-        paths = [
-            path
-            for entry_root in entry_roots
-            if entry_root.is_dir()
-            for path in entry_root.rglob("*.md")
-            if path.is_file()
-        ]
-        for path in paths:
-            raw = path.read_text(encoding="utf-8")
-            if not raw.startswith("---"):
-                continue
-            parts = raw.split("---", 2)
-            if len(parts) != 3:
-                continue
-            frontmatter = yaml.safe_load(parts[1]) or {}
-            if not isinstance(frontmatter, dict):
-                continue
-            source_ids = frontmatter.get("source_ids") or []
-            if not isinstance(source_ids, list) or any(
-                not isinstance(value, str) for value in source_ids
-            ):
-                continue
-            if source_id not in source_ids:
+        for frontmatter, entry_body in _store_entries(
+                store, needles=(source_id,)):
+            if not _carries_source_id(frontmatter, source_id):
                 continue
             stored_people = frontmatter.get("people") or []
             stored_tags = frontmatter.get("tags") or []
@@ -421,11 +546,21 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
                 and frontmatter.get("title") == title
                 and expected_people.issubset(set(stored_people))
                 and expected_tags.issubset(set(stored_tags))
-                and parts[2].strip() == body.strip()
+                and entry_body.strip() == body.strip()
             )
-            matches.setdefault(entry_id, []).append(valid)
+            matches.setdefault(entry_id, []).append(
+                (frontmatter.get("type") == etype, valid)
+            )
     except (OSError, UnicodeError, yaml.YAMLError, TypeError):
         return None
+    # An id counts when any of its materializations has the expected type; a
+    # sibling entry of another type is ignored, but every materialization of a
+    # counted id (including a half-retyped one) must still be valid.
+    matches = {
+        key: [valid for _, valid in found]
+        for key, found in matches.items()
+        if any(typed for typed, _ in found)
+    }
     if len(matches) != 1:
         return None
     entry_id, materializations = next(iter(matches.items()))
@@ -1619,6 +1754,26 @@ def capture(routine, item, summary, dry_run=False):
         if followup_line not in body:
             body = f"{followup_line}\n\n{body}"
 
+    use_auto, hand_logged = capture_guard(store, source_id, etype, rid)
+    original_source_id = None
+    if use_auto:
+        # A hand-written entry the CLI would overwrite carries this source id
+        # (or an earlier capture already moved to the derived id). The daemon
+        # writes its own entry under a derived id. No `--sources`: that field
+        # is for summary entries and would block remove/promote of the
+        # hand-logged ones; the derived id keeps the link recoverable.
+        # The first derived capture has no source-id match, so the store's
+        # near-duplicate guard may refuse it as duplicate_skipped when it
+        # resembles the hand-logged entry. That is intended (the hand-logged
+        # entry already covers the thread), so --force-new is never added. The
+        # refusal is an ordinary duplicate_skipped: the ledger settles the
+        # item, so it is not retried and emits one `duplicate` event.
+        original_source_id = source_id
+        source_id = auto_source_id_for(source_id)
+        reason = (f"hand-logged {', '.join(hand_logged)} carries this source id"
+                  if hand_logged else "an earlier capture used the derived id")
+        log(f"routine={rid} memory: {reason}; capturing under a derived id")
+
     args = ["add", "--type", etype, "--title", title, "--date", item.get("date", "")]
     if people:
         args += ["--people", ",".join(people)]
@@ -1670,10 +1825,12 @@ def capture(routine, item, summary, dry_run=False):
         return {"memory": "dry_run"}
 
     r = _cli(store, args, stdin_text=body, timeout=300)
-    thread_source_id = None
+    # Failures of this thread are recorded under the id the item derives, so
+    # the runner clears them by that id once the derived capture succeeds.
+    thread_source_id = original_source_id
     retry = _open_todo_outcome_retry(args, r, item, source_id)
     if retry:
-        thread_source_id = source_id
+        thread_source_id = original_source_id or source_id
         args, source_id, todo_id = retry
         log(
             f"routine={rid} memory: {todo_id} is an open todo anchored on "

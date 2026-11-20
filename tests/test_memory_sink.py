@@ -186,6 +186,66 @@ class SourceIdTest(unittest.TestCase):
                 )
             )
 
+    def _write_entry(self, directory, name, entry_id, etype, source_id,
+                     body="The exact durable body."):
+        entry_dir = Path(directory) / "memory" / "entries" / "2026" / "08"
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        (entry_dir / f"{name}.md").write_text(
+            "---\n"
+            f"id: {entry_id}\n"
+            "date: 2026-08-02\n"
+            f"type: {etype}\n"
+            "title: Durable update\n"
+            "people: [jane-doe]\n"
+            "tags: [auto-captured]\n"
+            f"source_ids: [{source_id}]\n"
+            "---\n"
+            f"{body}\n"
+        )
+
+    def _verify_note(self, directory):
+        return memory_sink._verify_written_entry(
+            directory, "slack:C1:1.1", "note", "Durable update",
+            ["jane-doe"], ["auto-captured"], "The exact durable body.",
+        )
+
+    def test_verification_ignores_other_type_sibling_with_same_source_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "note", "the-note", "note", "slack:C1:1.1")
+            self._write_entry(
+                directory, "decision", "the-decision", "decision", "slack:C1:1.1",
+                body="A different body.",
+            )
+            self.assertEqual(self._verify_note(directory), "the-note")
+
+    def test_verification_rejects_two_same_type_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "one", "note-one", "note", "slack:C1:1.1")
+            self._write_entry(directory, "two", "note-two", "note", "slack:C1:1.1")
+            self.assertIsNone(self._verify_note(directory))
+
+    def test_verification_rejects_partial_retype_across_graphs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(directory, "e", "entry-e", "decision", "slack:C1:1.1")
+            graph_entries = (
+                Path(directory) / "memory-graphs" / "team" / "entries" / "2026" / "08"
+            )
+            graph_entries.mkdir(parents=True)
+            (graph_entries / "e.md").write_text(
+                "---\nid: entry-e\ndate: 2026-08-02\ntype: note\n"
+                "title: Durable update\npeople: [jane-doe]\n"
+                "tags: [auto-captured]\nsource_ids: [slack:C1:1.1]\n---\n"
+                "The exact durable body.\n"
+            )
+            self.assertIsNone(self._verify_note(directory))
+
+    def test_verification_rejects_only_other_type_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_entry(
+                directory, "decision", "the-decision", "decision", "slack:C1:1.1",
+            )
+            self.assertIsNone(self._verify_note(directory))
+
 
 class ValidateTest(unittest.TestCase):
     def test_relative_store_rejected(self):
@@ -1770,6 +1830,371 @@ class CaptureValidationTest(unittest.TestCase):
         cli.assert_not_called()
         self.assertIn("type=todo", log.call_args.args[0])
         self.assertIn("active Chat follow-up", log.call_args.args[0])
+
+
+class HandLoggedGuardTest(unittest.TestCase):
+    """A capture never rewrites an entry the daemon did not write."""
+
+    SID = "slack:C1:1.0"
+
+    def setUp(self):
+        memory_sink._slug_cache.clear()
+        contacts.clear_cache()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = self.tmp.name
+        memory_sink._slug_cache[self.store] = {"jane-doe"}
+        self.item = {"id": self.SID, "title": "t", "date": "2026-07-27",
+                     "frontmatter": {}}
+
+    def _write(self, name, entry_id, etype, tags, source_id=None, graph=None):
+        base = Path(self.store)
+        entries = (base / "memory-graphs" / graph / "entries" if graph
+                   else base / "memory" / "entries") / "2026" / "07"
+        entries.mkdir(parents=True, exist_ok=True)
+        path = entries / f"{name}.md"
+        path.write_text(
+            "---\n"
+            f"id: {entry_id}\n"
+            "date: 2026-07-20\n"
+            f"type: {etype}\n"
+            "title: Hand written\n"
+            "people: [jane-doe]\n"
+            f"tags: [{', '.join(tags)}]\n"
+            f"source_ids: [{source_id or self.SID}]\n"
+            "---\n"
+            "Hand written body.\n"
+        )
+        return path
+
+    def _capture(self, etype, result=None, results=None):
+        routine = {"id": "r", "memory": {"store": self.store, "type": etype,
+                                         "extract": False}}
+        calls = []
+        queue = list(results or [])
+
+        def fake_cli(store, args, stdin_text=None, timeout=120):
+            calls.append(list(args))
+            if queue:
+                return queue.pop(0)
+            return result or FakeResult("✓ created 2026-07-27-capture\n")
+
+        with mock.patch.object(memory_sink, "_cli", side_effect=fake_cli), \
+                mock.patch.object(memory_sink, "_authenticated_identity",
+                                  return_value={"email": None, "person": None,
+                                                "safe": False}), \
+                mock.patch.object(memory_sink.subprocess, "run",
+                                  return_value=FakeResult()), \
+                mock.patch.object(memory_sink, "log") as log:
+            out = memory_sink.capture(routine, self.item, "s")
+        return out, calls, log
+
+    def _arg(self, args, flag):
+        return args[args.index(flag) + 1]
+
+    def _check_split(self, etype):
+        path = self._write("hand", f"hand-{etype}", etype, ["manual"])
+        before = path.read_text()
+        out, calls, log = self._capture(etype)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertNotIn("--sources", calls[0])
+        self.assertEqual(out["memory_source_id"], "slack:C1:1.0:auto")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+        self.assertEqual(path.read_text(), before)
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn(f"routine=r memory: hand-logged hand-{etype}", logged)
+        return calls
+
+    def test_hand_logged_decision_gets_a_separate_capture(self):
+        self._check_split("decision")
+
+    def test_hand_logged_note_gets_a_separate_capture(self):
+        self._check_split("note")
+
+    def test_auto_captured_entry_keeps_the_source_id(self):
+        self._write("auto", "auto-note", "note", ["auto-captured", "x"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("--sources", calls[0])
+        self.assertEqual(out["memory_source_id"], self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_open_todo_and_pending_decision_keep_the_regular_path(self):
+        for etype in ("todo", "pending-decision"):
+            self._write("open", f"open-{etype}", etype, ["manual"])
+            out, calls, _ = self._capture("note")
+            self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+            self.assertNotIn("--sources", calls[0])
+            self.assertEqual(out["memory_source_id"], self.SID)
+            Path(self.store, "memory", "entries", "2026", "07",
+                 "open.md").unlink()
+
+    def test_open_todo_refusal_is_still_already_captured(self):
+        self._write("open", "open-todo", "todo", ["manual"])
+        refusal = FakeResult(
+            f"↻ matches existing open-todo via {self.SID}\n", returncode=1,
+            stderr=(f"✗ {self.SID} already anchors the open todo open-todo "
+                    "— log the outcome as a new entry with --follows "
+                    "open-todo\n"))
+        out, calls, _ = self._capture("note", result=refusal)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["memory"], "unchanged")
+        self.assertEqual(out["memory_entry_id"], "open-todo")
+        self.assertEqual(out["memory_source_id"], self.SID)
+
+    def test_open_todo_beside_a_hand_logged_note_still_guards_a_note(self):
+        # Scenario A: the CLI refreshes the same-type note in place even
+        # though an open todo carries the id, so the daemon must divert.
+        self._write("open", "open-todo", "todo", ["manual"])
+        path = self._write("hand", "hand-note", "note", ["manual"])
+        before = path.read_text()
+        out, calls, log = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertNotIn("--sources", calls[0])
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+        self.assertEqual(path.read_text(), before)
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("hand-logged hand-note carries", logged)
+
+    def test_open_todo_beside_a_hand_logged_decision_guards_a_decision(self):
+        # Scenario B.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        out, calls, _ = self._capture("decision")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+
+    def test_open_todo_beside_a_hand_logged_other_type_keeps_plain_id(self):
+        # No same-type match: the open todo is the CLI's target (it errors
+        # and the open-item path takes over), so the plain id stays.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_hand_logged_open_todo_with_a_todo_capture_keeps_plain_id(self):
+        # Accepted: the CLI refreshes an open same-type match with a warning.
+        self._write("open", "open-todo", "todo", ["manual"])
+        out, calls, _ = self._capture("todo")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_hand_logged_closed_todo_with_a_todo_capture_is_guarded(self):
+        self._write("todo", "closed-todo", "todo", ["manual"])
+        self._write_follower("closed-todo")
+        _, calls, _ = self._capture("todo")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+
+    def test_open_todo_outranks_the_sticky_derived_id(self):
+        # Rule b before c: a reply that closes a hand-logged open todo is
+        # not diverted to :auto.
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["auto-captured"], source_id="slack:C1:1.0:auto")
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_all_auto_tagged_same_type_matches_keep_the_plain_id(self):
+        self._write("auto", "auto-note", "note", ["auto-captured"])
+        self._write("open", "open-todo", "todo", ["manual"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+
+    def _write_follower(self, target_id):
+        Path(self.store, "memory", "entries", "2026", "07",
+             "outcome.md").write_text(
+            "---\nid: outcome\ndate: 2026-07-21\ntype: decision\n"
+            "title: Outcome\npeople: []\ntags: [manual]\n"
+            f"follows: [{target_id}]\nsource_ids: [slack:C1:1.0:9.9]\n---\n"
+            "Done.\n")
+
+    def test_a_followed_todo_is_closed_and_no_longer_skips_the_guard(self):
+        self._write("todo", "closed-todo", "todo", ["manual"])
+        self._write("hand", "hand-note", "note", ["manual"])
+        follower = Path(self.store, "memory", "entries", "2026", "07",
+                        "outcome.md")
+        follower.write_text(
+            "---\nid: outcome\ndate: 2026-07-21\ntype: decision\n"
+            "title: Outcome\npeople: []\ntags: [manual]\n"
+            "follows: [closed-todo]\nsource_ids: [slack:C1:1.0:9.9]\n---\n"
+            "Done.\n")
+        _, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+
+    def test_closed_hand_logged_todo_of_the_same_type_is_guarded(self):
+        self._write("todo", "closed-todo", "todo", ["manual"])
+        Path(self.store, "memory", "entries", "2026", "07",
+             "outcome.md").write_text(
+            "---\nid: outcome\ndate: 2026-07-21\ntype: decision\n"
+            "title: Outcome\npeople: []\ntags: [manual]\n"
+            "follows: [closed-todo]\nsource_ids: [slack:C1:1.0:9.9]\n---\n"
+            "Done.\n")
+        out, calls, _ = self._capture("todo")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+
+    def test_hand_logged_entry_of_another_type_needs_no_guard(self):
+        self._write("auto", "auto-note", "note", ["auto-captured"])
+        first = self._capture("note")[1][0]
+        self.assertEqual(self._arg(first, "--source-ids"), self.SID)
+        # A hand-logged decision on the same id appears later: the CLI
+        # never overwrites it, so the note capture keeps the plain id.
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("--sources", calls[0])
+        self.assertEqual(out["memory_source_id"], self.SID)
+        self.assertNotIn("memory_thread_source_id", out)
+
+    def test_a_note_beside_only_notes_would_be_retyped_so_it_is_guarded(self):
+        # The CLI retypes a note in place when every match is a note.
+        path = self._write("hand", "hand-note", "note", ["manual"])
+        before = path.read_text()
+        out, calls, _ = self._capture("decision")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(path.read_text(), before)
+
+    def test_the_derived_id_is_sticky_whatever_the_type(self):
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["auto-captured"], source_id="slack:C1:1.0:auto")
+        for etype in ("note", "decision", "meeting"):
+            out, calls, _ = self._capture(etype)
+            self.assertEqual(self._arg(calls[0], "--source-ids"),
+                             "slack:C1:1.0:auto", etype)
+            self.assertEqual(out["memory_thread_source_id"], self.SID)
+
+    def test_a_derived_entry_without_the_auto_tag_is_not_sticky(self):
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["manual"], source_id="slack:C1:1.0:auto")
+        _, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+
+    def test_an_unreadable_store_fails_open_and_warns(self):
+        entries = Path(self.store, "memory", "entries", "2026", "07")
+        entries.mkdir(parents=True)
+        (entries / "bad.md").write_text(
+            f"---\nid: [unclosed\nsource_ids: [{self.SID}]\n---\nx\n")
+        out, calls, log = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        warned = [str(c.args[0]) for c in log.call_args_list
+                  if "WARN" in str(c.args[0]) and "hand-logged" in
+                  str(c.args[0])]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("routine=r", warned[0])
+        self.assertIn(self.SID, warned[0])
+        self.assertNotIn("Hand written", warned[0])
+
+    def test_files_without_the_source_id_are_not_parsed(self):
+        self._write("hand", "hand-note", "note", ["manual"],
+                    source_id="slack:C9:9.9")
+        entries = Path(self.store, "memory", "entries", "2026", "07")
+        # Unparseable YAML that does not mention the id is skipped unread.
+        (entries / "other.md").write_text(
+            "---\nid: [unclosed\nsource_ids: [slack:C9:9.9]\n---\nx\n")
+        with mock.patch.object(memory_sink.yaml, "safe_load",
+                               wraps=memory_sink.yaml.safe_load) as load:
+            self.assertEqual(
+                memory_sink.capture_guard(self.store, self.SID, "note"),
+                (False, []))
+        load.assert_not_called()
+
+    def test_derived_capture_refused_as_a_near_duplicate_is_ordinary(self):
+        # The first `:auto` capture has no source-id match, so the store's
+        # near-duplicate guard may refuse it. That refusal is accepted: no
+        # --force-new, one duplicate event, nothing to retry.
+        self._write("hand", "hand-note", "note", ["manual"])
+        refusal = FakeResult(
+            "", returncode=2,
+            stderr=("✗ this looks like a near-duplicate of:\n"
+                    "  0.93  hand-note — Hand written\n"))
+        with mock.patch.object(memory_sink, "_emit_capture_event") as emit:
+            out, calls, _ = self._capture("note", result=refusal)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--force-new", calls[0])
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(out["memory"], "duplicate_skipped")
+        self.assertEqual(out["memory_duplicate_of"], "hand-note")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+        emit.assert_called_once()
+        self.assertEqual(emit.call_args.args[1], "duplicate")
+        self.assertNotIn("owner_actions_not_filed", emit.call_args.kwargs
+                         .get("details", {}))
+
+    def test_open_todo_retry_from_a_derived_id_keeps_the_plain_thread_id(self):
+        self._write("hand", "hand-note", "note", ["manual"])
+        self.item["id"] = "slack:C1:1.0@2.5"
+        refusal = FakeResult(
+            "", returncode=1,
+            stderr=("✗ slack:C1:1.0:auto already anchors the open todo "
+                    "2026-07-20-open-todo — log the outcome as a new entry "
+                    "with --follows 2026-07-20-open-todo\n"))
+        out, calls, _ = self._capture(
+            "note",
+            results=[refusal, FakeResult("✓ created 2026-07-27-outcome\n")])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self._arg(calls[1], "--source-ids"),
+                         "slack:C1:1.0:auto:2.5")
+        self.assertEqual(out["memory"], "created")
+        self.assertEqual(out["memory_thread_source_id"], self.SID)
+
+    def test_no_entry_keeps_the_source_id(self):
+        out, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+        self.assertNotIn("--sources", calls[0])
+
+    def test_a_graph_copy_counts_once_and_a_mixed_set_is_guarded(self):
+        self._write("hand", "hand-note", "note", ["manual"])
+        self._write("hand", "hand-note", "note", ["manual"], graph="team")
+        self._write("auto", "auto-decision", "decision", ["auto-captured"])
+        _, calls, log = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertNotIn("--sources", calls[0])
+        logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("hand-logged hand-note carries", logged)
+
+    def test_a_second_capture_derives_the_same_id(self):
+        self._write("hand", "hand-decision", "decision", ["manual"])
+        first = self._capture("decision")[1][0]
+        # The daemon entry now exists under the derived id.
+        self._write("daemon", "2026-07-27-capture", "decision",
+                    ["auto-captured"], source_id="slack:C1:1.0:auto")
+        second = self._capture("decision")[1][0]
+        self.assertEqual(self._arg(first, "--source-ids"),
+                         self._arg(second, "--source-ids"))
+        self.assertNotIn("--sources", second)
+
+    def test_verification_uses_the_derived_id(self):
+        self._write("hand", "hand-note", "note", ["manual"])
+        # The CLI exits non-zero after writing; the daemon entry sits on disk
+        # under the derived id, next to the untouched hand-logged one.
+        entry = (
+            Path(self.store) / "memory" / "entries" / "2026" / "07"
+            / "daemon.md"
+        )
+        entry.write_text(
+            "---\nid: daemon-note\ndate: 2026-07-27\ntype: note\n"
+            "title: t\npeople: []\ntags: [auto-captured]\n"
+            "source_ids: [slack:C1:1.0:auto]\n---\ns\n"
+        )
+        out, calls, _ = self._capture(
+            "note", result=FakeResult("late failure", returncode=1))
+        self.assertEqual(out["memory"], "verified")
+        self.assertEqual(out["memory_entry_id"], "daemon-note")
+        self.assertEqual(out["memory_source_id"], "slack:C1:1.0:auto")
 
 
 class FollowupResolutionTest(unittest.TestCase):
