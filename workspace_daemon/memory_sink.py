@@ -362,9 +362,12 @@ def _head_and_tail(output, limit=300):
     return f"{text[:limit]} … {text[-limit:]}"
 
 
-def _store_entries(store):
+def _store_entries(store, needles=()):
     """Yield (frontmatter, body) for every entry file in the default store and
     every graph store. Files without a readable frontmatter mapping are skipped.
+    With `needles`, a file whose raw text contains none of them is skipped
+    before YAML parsing (callers match the exact value afterwards, so the
+    result is the same, only cheaper).
     Raises OSError, UnicodeError or yaml.YAMLError on an unreadable file."""
     root = Path(store)
     entry_roots = [root / "memory" / "entries"]
@@ -384,6 +387,8 @@ def _store_entries(store):
     ]
     for path in paths:
         raw = path.read_text(encoding="utf-8")
+        if needles and not any(needle in raw for needle in needles):
+            continue
         if not raw.startswith("---"):
             continue
         parts = raw.split("---", 2)
@@ -404,31 +409,76 @@ def _carries_source_id(frontmatter, source_id):
     )
 
 
-def hand_logged_entry_ids(store, source_id):
-    """Ids of entries carrying `source_id` that the daemon did not write.
+def _followed_ids(store, entry_ids):
+    """The subset of `entry_ids` that some entry lists in its `follows`.
 
-    Daemon captures always carry AUTO_TAG; an entry without it was logged by
-    hand. Open todos and pending decisions are skipped: the CLI protects them
-    itself. An unreadable store yields no ids: the CLI stays the authority.
+    The CLI's chain index calls an open todo / pending decision resolved once
+    any entry follows it, so that is what "open" means here too (the status
+    is not stored in the frontmatter).
+    """
+    wanted = set(entry_ids)
+    followed = set()
+    for frontmatter, _ in _store_entries(store, needles=wanted):
+        follows = frontmatter.get("follows") or []
+        if isinstance(follows, list):
+            followed.update(wanted.intersection(
+                value for value in follows if isinstance(value, str)))
+    return followed
+
+
+def capture_guard(store, source_id, etype, rid=None):
+    """Decide whether a capture of `etype` must use the derived `:auto` id.
+
+    Returns (use_auto, hand_logged_ids). The guard keys on AUTO_TAG: daemon
+    captures always carry it, so an entry without it counts as hand-logged,
+    and removing the tag from a daemon entry moves later captures to `:auto`.
+
+    The CLI refreshes a same-type match of the source id in place and retypes
+    a plain note when every match is a note; it never overwrites any other
+    type, and it protects an open todo / pending decision itself. So:
+    - an open todo or pending decision carrying the id leaves everything to
+      the CLI (a closing reply still links with --follows);
+    - otherwise a hand-logged entry the CLI would overwrite (same type, or a
+      note retyped beside only notes) forces `:auto`;
+    - once an auto-captured entry carries `<id>:auto`, `:auto` stays in use
+      whatever the type, so the thread never splits across two ids.
+    An unreadable store fails open (the CLI stays the authority).
     """
     if not source_id:
-        return []
-    found = set()
+        return False, []
+    auto_id = auto_source_id_for(source_id)
+    plain = []
+    sticky = False
     try:
-        for frontmatter, _ in _store_entries(store):
-            if not _carries_source_id(frontmatter, source_id):
-                continue
+        for frontmatter, _ in _store_entries(store, needles=(source_id,)):
             tags = frontmatter.get("tags")
-            entry_id = frontmatter.get("id")
-            if (
-                isinstance(entry_id, str)
-                and frontmatter.get("type") not in OPEN_ITEM_TYPES
-                and not (isinstance(tags, list) and AUTO_TAG in tags)
-            ):
-                found.add(entry_id)
+            tagged = isinstance(tags, list) and AUTO_TAG in tags
+            if _carries_source_id(frontmatter, auto_id):
+                sticky = sticky or tagged
+            if _carries_source_id(frontmatter, source_id):
+                entry_id = frontmatter.get("id")
+                if isinstance(entry_id, str):
+                    plain.append((entry_id, frontmatter.get("type"), tagged))
+        if sticky:
+            return True, []
+        open_candidates = [
+            entry_id for entry_id, kind, _ in plain
+            if kind in OPEN_ITEM_TYPES
+        ]
+        if open_candidates and set(open_candidates) - _followed_ids(
+                store, open_candidates):
+            return False, []
     except (OSError, UnicodeError, yaml.YAMLError, TypeError):
-        return []
-    return sorted(found)
+        log(f"routine={rid} memory WARN: could not read the store to check "
+            f"for hand-logged entries on source_id={source_id}; "
+            "capturing under the plain id")
+        return False, []
+    only_notes = all(kind == "note" for _, kind, _ in plain)
+    hand_logged = sorted({
+        entry_id for entry_id, kind, tagged in plain
+        if not tagged and (kind == etype or (kind == "note" and only_notes))
+    })
+    return bool(hand_logged), hand_logged
 
 
 def auto_source_id_for(source_id):
@@ -455,7 +505,8 @@ def _verify_written_entry(store, source_id, etype, title, people, tags, body):
     expected_tags = set(tags)
     matches = {}
     try:
-        for frontmatter, entry_body in _store_entries(store):
+        for frontmatter, entry_body in _store_entries(
+                store, needles=(source_id,)):
             if not _carries_source_id(frontmatter, source_id):
                 continue
             stored_people = frontmatter.get("people") or []
@@ -1679,20 +1730,25 @@ def capture(routine, item, summary, dry_run=False):
         if followup_line not in body:
             body = f"{followup_line}\n\n{body}"
 
-    hand_logged = hand_logged_entry_ids(store, source_id)
+    use_auto, hand_logged = capture_guard(store, source_id, etype, rid)
     original_source_id = None
-    if hand_logged:
-        # A hand-written entry already carries this source id. A capture
-        # under the same id would refresh it in place, so the daemon writes
-        # its own entry under a derived id. No `--sources`: that field is for
-        # summary entries and would block remove/promote of the hand-logged
-        # ones; the derived id keeps the link recoverable.
+    if use_auto:
+        # A hand-written entry the CLI would overwrite carries this source id
+        # (or an earlier capture already moved to the derived id). The daemon
+        # writes its own entry under a derived id. No `--sources`: that field
+        # is for summary entries and would block remove/promote of the
+        # hand-logged ones; the derived id keeps the link recoverable.
+        # The first derived capture has no source-id match, so the store's
+        # near-duplicate guard may refuse it as duplicate_skipped when it
+        # resembles the hand-logged entry. That is intended (the hand-logged
+        # entry already covers the thread), so --force-new is never added. The
+        # refusal is an ordinary duplicate_skipped: the ledger settles the
+        # item, so it is not retried and emits one `duplicate` event.
         original_source_id = source_id
         source_id = auto_source_id_for(source_id)
-        log(
-            f"routine={rid} memory: hand-logged {', '.join(hand_logged)} "
-            "carries this source id; capturing under a derived id"
-        )
+        reason = (f"hand-logged {', '.join(hand_logged)} carries this source id"
+                  if hand_logged else "an earlier capture used the derived id")
+        log(f"routine={rid} memory: {reason}; capturing under a derived id")
 
     args = ["add", "--type", etype, "--title", title, "--date", item.get("date", "")]
     if people:
@@ -1750,7 +1806,7 @@ def capture(routine, item, summary, dry_run=False):
     thread_source_id = original_source_id
     retry = _open_todo_outcome_retry(args, r, item, source_id)
     if retry:
-        thread_source_id = source_id
+        thread_source_id = original_source_id or source_id
         args, source_id, todo_id = retry
         log(
             f"routine={rid} memory: {todo_id} is an open todo anchored on "
