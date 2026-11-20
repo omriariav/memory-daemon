@@ -47,6 +47,9 @@ MEMORY_TYPES = {
     "incident", "achievement", "feedback", "meeting", "note", "summary",
 }
 AUTO_TAG = "auto-captured"
+# The CLI never rewrites these in place (it refuses and asks for a linked
+# outcome entry), so the hand-logged guard leaves them on the regular path.
+OPEN_ITEM_TYPES = {"todo", "pending-decision"}
 # Marks a capture that a model classified as the owner's action but that was
 # downgraded to a note for lack of ownership evidence. Briefing and triage
 # flows must treat entries carrying it as FYI, never as "waiting on me".
@@ -405,7 +408,8 @@ def hand_logged_entry_ids(store, source_id):
     """Ids of entries carrying `source_id` that the daemon did not write.
 
     Daemon captures always carry AUTO_TAG; an entry without it was logged by
-    hand. An unreadable store yields no ids: the CLI stays the authority.
+    hand. Open todos and pending decisions are skipped: the CLI protects them
+    itself. An unreadable store yields no ids: the CLI stays the authority.
     """
     if not source_id:
         return []
@@ -418,6 +422,7 @@ def hand_logged_entry_ids(store, source_id):
             entry_id = frontmatter.get("id")
             if (
                 isinstance(entry_id, str)
+                and frontmatter.get("type") not in OPEN_ITEM_TYPES
                 and not (isinstance(tags, list) and AUTO_TAG in tags)
             ):
                 found.add(entry_id)

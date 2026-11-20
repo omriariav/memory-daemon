@@ -1051,6 +1051,19 @@ class RunnerWiringTest(unittest.TestCase):
                 runner._gmail_followup_predecessor({"m1": row}, claim),
                 "2026-01-04-own-entry")
 
+    def test_gmail_followup_predecessor_sees_a_derived_capture(self):
+        claim = {"candidate": {"id": "gmail:m9", "raw": {}},
+                 "source": {"kind": "gmail"}}
+        row = {"memory_entry_id": "2026-01-04-own-entry",
+               "memory_source_id": "gmail:t1:auto",
+               "memory_thread_source_id": "gmail:t1",
+               "processed_at": "2026-01-03T00:00:00Z"}
+        with mock.patch.object(runner, "_claim_source_id",
+                               return_value="gmail:t1"):
+            self.assertEqual(
+                runner._gmail_followup_predecessor({"m1": row}, claim),
+                "2026-01-04-own-entry")
+
     def test_incomplete_drive_expansion_withholds_gmail_actions_and_retries(self):
         r = routine(self.vault, actions=["archive"])
         original_fetch = runner.SOURCES["gmail"]

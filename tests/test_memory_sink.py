@@ -1918,6 +1918,37 @@ class HandLoggedGuardTest(unittest.TestCase):
         self.assertEqual(out["memory_source_id"], self.SID)
         self.assertNotIn("memory_thread_source_id", out)
 
+    def test_open_todo_and_pending_decision_keep_the_regular_path(self):
+        for etype in ("todo", "pending-decision"):
+            self._write("open", f"open-{etype}", etype, ["manual"])
+            out, calls, _ = self._capture("note")
+            self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)
+            self.assertNotIn("--sources", calls[0])
+            self.assertEqual(out["memory_source_id"], self.SID)
+            Path(self.store, "memory", "entries", "2026", "07",
+                 "open.md").unlink()
+
+    def test_open_todo_refusal_is_still_already_captured(self):
+        self._write("open", "open-todo", "todo", ["manual"])
+        refusal = FakeResult(
+            f"↻ matches existing open-todo via {self.SID}\n", returncode=1,
+            stderr=(f"✗ {self.SID} already anchors the open todo open-todo "
+                    "— log the outcome as a new entry with --follows "
+                    "open-todo\n"))
+        out, calls, _ = self._capture("note", result=refusal)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["memory"], "unchanged")
+        self.assertEqual(out["memory_entry_id"], "open-todo")
+        self.assertEqual(out["memory_source_id"], self.SID)
+
+    def test_hand_logged_note_beside_an_open_todo_is_still_guarded(self):
+        self._write("open", "open-todo", "todo", ["manual"])
+        self._write("hand", "hand-note", "note", ["manual"])
+        _, calls, _ = self._capture("note")
+        self.assertEqual(self._arg(calls[0], "--source-ids"),
+                         "slack:C1:1.0:auto")
+        self.assertEqual(self._arg(calls[0], "--sources"), "hand-note")
+
     def test_no_entry_keeps_the_source_id(self):
         out, calls, _ = self._capture("note")
         self.assertEqual(self._arg(calls[0], "--source-ids"), self.SID)

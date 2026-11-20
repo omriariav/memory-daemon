@@ -2207,7 +2207,8 @@ def _gmail_followup_predecessor(processed, claim, existing=None):
          entry.get("memory_entry_id") or entry["memory_duplicate_of"])
         for item_id, entry in processed.items()
         if (
-            entry.get("memory_source_id") == source_id
+            source_id in (entry.get("memory_source_id"),
+                          entry.get("memory_thread_source_id"))
             and entry.get("gmail_manual_chat_followup") is not True
             and (entry.get("memory_entry_id")
                  or entry.get("memory_duplicate_of"))
