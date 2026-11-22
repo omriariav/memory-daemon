@@ -28,7 +28,31 @@ CHOICE_LABELS = {"draft": "Draft in Slack", "send": None,
 CHOICE_KEYS = {"draft": "d", "send": "y", "copy": "c"}
 
 
-class ConfirmSend(ModalScreen):
+class WheelAnywhere:
+    """A modal screen whose box has one scroll pane (`WHEEL_TARGET`, a
+    selector). The box is narrower than the screen, so a wheel turned over the
+    backdrop, the border, the padding or a title never reaches the pane: it
+    lands on the screen. Here the pane takes it. A wheel over the pane itself
+    is handled by the pane and never gets here."""
+
+    WHEEL_TARGET = ""
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown):
+        event.stop()
+        self._wheel(1)
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp):
+        event.stop()
+        self._wheel(-1)
+
+    def _wheel(self, sign: int):
+        # immediate: a burst of notches must add up, not queue behind one
+        self.query_one(self.WHEEL_TARGET).scroll_relative(
+            y=sign * self.app.scroll_sensitivity_y, animate=False,
+            immediate=True)
+
+
+class ConfirmSend(WheelAnywhere, ModalScreen):
     """Shows the exact destination and text. Cancel is focused by default.
 
     The text is shown line by line as it will be sent (only wrapped to the
@@ -43,6 +67,7 @@ class ConfirmSend(ModalScreen):
     `o` will open, shown under the route."""
 
     AUTO_FOCUS = "#cancel"
+    WHEEL_TARGET = "#confirm-scroll"
     BINDINGS = [Binding("escape", "cancel", "Cancel"),
                 Binding("y", "choose('send')", "Send"),
                 Binding("d", "choose('draft')", "Draft", show=False),
@@ -186,12 +211,13 @@ class ConfirmSend(ModalScreen):
             pane.scroll_up(animate=False) if step == -1 else pane.scroll_page_up(animate=False)
 
 
-class ConfirmWrite(ModalScreen):
+class ConfirmWrite(WheelAnywhere, ModalScreen):
     """Confirm an action that leaves the inbox (an RSVP, a save). Shows what
     will happen as label/value rows, in plain Text so item text can never
     restyle the screen. Cancel is focused by default; `y` confirms."""
 
     AUTO_FOCUS = "#cancel"
+    WHEEL_TARGET = "#confirm-scroll"
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("y", "confirm", "Confirm"),
                 Binding("left,right", "toggle_focus", show=False),
                 Binding("down,j", "scroll(1)", show=False),
@@ -556,7 +582,8 @@ HELP = [
 ]
 
 
-class HelpScreen(ModalScreen):
+class HelpScreen(WheelAnywhere, ModalScreen):
+    WHEEL_TARGET = "#help-scroll"
     # The reference is taller than most terminals: the body is a focused
     # scroll container (arrows, PgUp/PgDn, Home/End from VerticalScroll; the
     # mouse wheel too), and j/k scroll a line like everywhere else.
@@ -609,22 +636,6 @@ class HelpScreen(ModalScreen):
     def action_scroll(self, step: int):
         pane = self.query_one("#help-scroll")
         pane.scroll_down(animate=False) if step > 0 else pane.scroll_up(animate=False)
-
-    # The box is 66 wide and the rest of the screen is the modal backdrop, so a
-    # wheel turned there, or over the border, padding or title, never reaches
-    # the scroll pane. It lands here (bubbled from the box, or posted to the
-    # screen); the pane takes it.
-    def on_mouse_scroll_down(self, event: events.MouseScrollDown):
-        event.stop()
-        self._wheel(1)
-
-    def on_mouse_scroll_up(self, event: events.MouseScrollUp):
-        event.stop()
-        self._wheel(-1)
-
-    def _wheel(self, sign: int):
-        self.query_one("#help-scroll").scroll_relative(
-            y=sign * self.app.scroll_sensitivity_y, animate=False)
 
     def action_close(self):
         self.dismiss(None)
