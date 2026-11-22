@@ -26,9 +26,12 @@ lists a message that only carries a file, and the `## Files` section is never
 requested or parsed. With `comms_inbox.all_dms` and `read_channel_tool` set,
 active DMs and group DMs (a hit this run, or an inbox line within
 `file_scan_lookback_days`) are read through channel history and every message
-with `files` becomes an inbox row with `files: [{name, filetype,
-size}]` (the Files line carries no permalink). Caps: `max_file_reads_per_run` (default 5, 0 = off), one read
-per conversation per `file_scan_minutes` unless it had a hit this run.
+with `files` becomes an inbox row with `files: [{id, name, filetype,
+size}]` (the Files line carries the file id but no permalink). Caps:
+`max_file_reads_per_run` (default 5, 0 = off), one read per conversation per
+`file_scan_minutes` unless it had a hit this run or the inbox holds a message
+from a person newer than its last scan (a deferred or failed scan; then every
+run, ahead of the rest).
 Excluded channels and self-DMs are never read.
 
 The watch file may also list `save_reactions: [<emoji name>, ...]` (at most 3;
@@ -855,6 +858,7 @@ def _parse_files_line(line):
         if not m:
             return out, False
         entry = {
+            "id": m.group("id"),
             "name": m.group("name").strip()[:200],
             "filetype": m.group("mime").strip()[:120],
         }
@@ -2403,6 +2407,8 @@ def _load_file_state():
             out["fails"][str(channel)] = {
                 "n": int(item["n"]), "wait": int(item["wait"]),
             }
+            if "at" in item:  # when it last failed; absent in older state
+                out["fails"][str(channel)]["at"] = float(item["at"])
         except (TypeError, ValueError, KeyError):
             continue
     if data.get("alt") in ("hot", "cold"):
@@ -2440,8 +2446,13 @@ def _file_rows(cfg, found, now):
     group DM that is active (a hit this run, or an inbox line within
     `file_scan_lookback_days`) is read with `read_channel_tool`, and the
     messages that carry files become rows. A conversation with a hit this run
-    is read every run; the rest at most every `file_scan_minutes`. Excluded
-    channels are never read.
+    is read every run; the rest at most every `file_scan_minutes`. A
+    conversation is also hot while the inbox holds a message from a person
+    (not the owner, not a bot) that is newer than its scan mark: a DM the cap
+    deferred, or whose scan did not run or failed, stays due every run until
+    a read completes, and ranks ahead of the cold ones. (A file-only message
+    is not in the inbox until a scan writes it, so it cannot make its DM hot;
+    it waits for the cold scan or a hit.) Excluded channels are never read.
 
     At most `max_file_reads_per_run` pages are read per run; a truncated page
     is followed by its cursor while budget is left. A read still truncated
@@ -2467,12 +2478,28 @@ def _file_rows(cfg, found, now):
     saved = _load_file_state()
     marks, backfill, fails = saved["marks"], saved["backfill"], saved["fails"]
     skip = excluded_channels(cfg)
+    # Hot by the inbox: a message from a person other than the owner that is
+    # newer than the scan mark (a DM the cap deferred, or whose scan did not
+    # run or failed, stays hot and goes first next run).
+    peer = comms_inbox.dm_peer_latest(_base_dir, lookback)
+    fresh = {c for c, ts in peer.items() if ts > marks.get(c, 0.0)}
+    hot |= fresh
+    gap = cfg["file_scan_minutes"] * 60
     # A failing channel backs off for min(2**n, 48) runs and ranks after
-    # healthy ones, so it cannot hold the quiet slot every run.
+    # healthy ones, so it cannot hold the quiet slot every run. A channel
+    # hot by the inbox skips the wait at most once per scan interval: only
+    # when the message that made it hot is newer than its last failure
+    # (`at`) and that failure is at least `file_scan_minutes` old. A busy DM
+    # that keeps failing is therefore read once per interval, not every run
+    # (a failure moves `at` up).
     waiting = {c for c, f in fails.items() if f["wait"] > 0}
     for channel in waiting:
         fails[channel]["wait"] -= 1
-    gap = cfg["file_scan_minutes"] * 60
+    waiting = {
+        c for c in waiting
+        if not (c in fresh and peer[c] > fails[c].get("at", 0.0)
+                and now - fails[c].get("at", 0.0) >= gap)
+    }
     ranked = sorted(
         (channel not in hot, channel in fails, marks.get(channel, 0.0),
          channel)
@@ -2495,6 +2522,10 @@ def _file_rows(cfg, found, now):
         due = hot_due[:cap - 1] + cold_due[:1]
     else:
         due = (hot_due + cold_due)[:cap]
+    deferred = len(hot_due) - sum(1 for r in due if not r[0])
+    if deferred > 0:
+        log(f"slack_mcp: comms inbox file scan: {deferred} hot channel(s) "
+            f"deferred by the cap of {cap} read(s) per run")
     if not due:
         if waiting:
             _save_file_state(marks, backfill, alt, fails, now, cfg)
@@ -2595,7 +2626,7 @@ def _file_rows(cfg, found, now):
     for channel, w in plan.items():
         if w.get("failed") == "parse":
             n = fails.get(channel, {"n": 0})["n"] + 1
-            fails[channel] = {"n": n, "wait": min(2 ** n, 48)}
+            fails[channel] = {"n": n, "wait": min(2 ** n, 48), "at": now}
         elif not w.get("failed"):
             fails.pop(channel, None)
         if w.get("failed") or w["cursor"]:

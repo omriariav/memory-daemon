@@ -410,19 +410,42 @@ def _size(value):
     return int(float(found.group(1)) * scale)
 
 
-def clean_files(files):
-    """`files` as [{name, filetype, size, permalink}] (what is known), capped.
+FILE_ID = re.compile(r"F[A-Z0-9]+")
+MAX_FILE_ID = 40
 
-    `permalink` is kept only when the source supplies one; slack_mcp does not.
+
+def _file_id(value):
+    """A Slack file id (`F` + capitals/digits) as text, else None."""
+    if isinstance(value, str):
+        value = value.strip()
+        if len(value) <= MAX_FILE_ID and FILE_ID.fullmatch(value):
+            return value
+    return None
+
+
+def clean_files(files):
+    """`files` as [{id, name, filetype, size, permalink}] (what is known), capped.
+
+    `id` (the Slack file id) is kept only when it has the `F...` shape, so a
+    reader can name the file without a permalink; a row stored before ids
+    were kept has none. `permalink` is kept only when the source supplies one;
+    slack_mcp does not.
 
     At most MAX_FILES entries; each text field is secret-redacted and cut.
-    Entries without any usable field are dropped.
+    Entries without any usable field are dropped, and an entry repeating an
+    id already listed is dropped.
     """
-    out = []
+    out, seen = [], set()
     for item in files if isinstance(files, (list, tuple)) else ():
         if not isinstance(item, dict):
             continue
         entry = {}
+        fid = _file_id(item.get("id"))
+        if fid:
+            if fid in seen:
+                continue
+            seen.add(fid)
+            entry["id"] = fid
         for key, limit in (("name", 200), ("filetype", 120), ("permalink", 300)):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
@@ -435,6 +458,33 @@ def clean_files(files):
         if len(out) >= MAX_FILES:
             break
     return out
+
+
+def _gain_file_ids(old, new):
+    """Copy the id of a freshly read file onto the stored entry that lacks
+    one (same name and type; the entry whose size also matches is preferred;
+    each fresh entry used once). An id the stored list already has is never
+    copied again. True if any id was set."""
+    have = {e.get("id") for e in old if isinstance(e, dict) and e.get("id")}
+    spare = [f for f in new if f.get("id") and f["id"] not in have]
+    changed = False
+    for entry in old:
+        if not isinstance(entry, dict) or entry.get("id"):
+            continue
+        same = [
+            f for f in spare
+            if f.get("name") == entry.get("name")
+            and f.get("filetype") == entry.get("filetype")
+        ]
+        best = next(
+            (f for f in same if f.get("size") == entry.get("size")),
+            same[0] if same else None,
+        )
+        if best is not None:
+            entry["id"] = best["id"]
+            spare.remove(best)
+            changed = True
+    return changed
 
 
 def message_row(hit, self_user_id):
@@ -470,6 +520,24 @@ def dm_channels(base_dir, since):
         old = out.get(row["channel_id"])
         if old is None or ts > old[1]:
             out[row["channel_id"]] = (row["channel_type"], ts)
+    return out
+
+
+def dm_peer_latest(base_dir, since):
+    """{channel: newest ts} of IM/group-DM messages from a person other than
+    the owner, at or after epoch `since` (reactions, the owner's own messages
+    and messages of a bot, an app or Slackbot do not count)."""
+    out = {}
+    for row in _load(path(base_dir)):
+        if row.get("channel_type") not in ("im", "mpim") \
+                or row.get("type", "message") != "message" \
+                or row.get("is_owner") or row.get("is_bot") \
+                or row.get("peer_is_bot") \
+                or row.get("user_id") == SLACKBOT:
+            continue
+        ts = float(row["ts"])
+        if ts >= since and ts > out.get(row["channel_id"], 0.0):
+            out[row["channel_id"]] = ts
     return out
 
 
@@ -553,10 +621,17 @@ def record(base_dir, rows, retention_days, now=None, exclude_channels=(),
         if _key(row) in known:
             # A message first stored without its files (seen by search)
             # gains them when a channel read later reports them.
+            # Files already stored are never added to or reordered, so the
+            # same patch twice changes nothing; a stored entry from before
+            # ids were kept only gains its id.
             old = by_key.get(_key(row))
-            if old is not None and row.get("files") and not old.get("files"):
-                old["files"] = row["files"]
-                patched = True
+            if old is not None and row.get("files"):
+                if not old.get("files"):
+                    old["files"] = row["files"]
+                    patched = True
+                elif isinstance(old["files"], list) \
+                        and _gain_file_ids(old["files"], row["files"]):
+                    patched = True
             if (
                 old is not None and row.get("type", "message") == "message"
                 and row.get("text") and not old.get("text")

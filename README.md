@@ -2554,8 +2554,18 @@ One JSON object per line, oldest message first:
   a config error) lifts the exclusion for a false-positive self-DM.
 - File shares: with `comms_inbox.all_dms` and `read_channel_tool` set, active DMs
   and group DMs are read through channel history and every message with files
-  becomes a `message` row carrying `files: [{"name", "filetype", "size"}]`
-  (what the `Files:` line shows; no permalink). Source keys bound the scan:
+  becomes a `message` row carrying `files: [{"id", "name", "filetype", "size"}]`
+  (what the `Files:` line shows, incl. the Slack file id `F...`; no permalink;
+  rows stored before ids were kept have no `id` and gain it when the file is
+  read again). A DM stays hot (scanned every run until a read completes, ahead
+  of the quiet ones) while the inbox holds a message from a person (not the
+  owner, not a bot) newer than its last scan: a DM the cap deferred, or whose
+  scan did not run or failed. A file-only message is not in the inbox until a
+  scan writes it, so it cannot make its DM hot; it waits for the cold scan or
+  a hit. A backed-off hot DM is retried at most once per `file_scan_minutes`,
+  and only for a message newer than its last failure. Hot DMs still count
+  against the cap; the log counts those it deferred.
+  Source keys bound the scan:
   `max_file_reads_per_run` (default 5, 0 turns it off, max 50),
   `file_scan_lookback_days` (default 3, 1 to 30) and `file_scan_minutes`
   (default 30, 1 to 1440; one read per conversation per interval unless it had

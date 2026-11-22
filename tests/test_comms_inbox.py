@@ -1237,12 +1237,15 @@ ZIP = ["Files: report-q3.zip (ID: F0AAAAAAA01, application/zip, 2 KB)"]
 
 
 class FileShareTest(InboxTestCase):
-    def seed_dm(self, channel=DM, kind="im", at=5):
-        comms_inbox.record(self.tmp.name, [{
+    def seed_dm(self, channel=DM, kind="im", at=5, peer=True, **extra):
+        """Store one earlier message; `peer=False` makes it the owner's, so
+        the conversation is not hot by the inbox (only quiet)."""
+        comms_inbox.record(self.tmp.name, [dict({
             "type": "message", "channel_id": channel, "thread_ts": ts_at(at),
-            "ts": ts_at(at), "user_id": BOB, "is_owner": False,
+            "ts": ts_at(at), "user_id": BOB if peer else ME,
+            "is_owner": not peer,
             "is_bot": False, "text": "earlier", "channel_type": kind,
-        }], 90, now=NOW)
+        }, **extra)], 90, now=NOW)
 
     def src(self, **over):
         cfg = dict(
@@ -1279,8 +1282,8 @@ class FileShareTest(InboxTestCase):
         self.assertFalse(row["is_owner"])
         self.assertEqual(row["channel_type"], "im")
         self.assertEqual(row["files"], [{
-            "name": "report-q3.zip", "filetype": "application/zip",
-            "size": 2048,
+            "id": "F0AAAAAAA01", "name": "report-q3.zip",
+            "filetype": "application/zip", "size": 2048,
         }])
 
     def test_hit_this_run_is_read_and_group_dm_keeps_its_type(self):
@@ -1362,6 +1365,121 @@ class FileShareTest(InboxTestCase):
         comms_inbox.record(self.tmp.name, [row], 90, now=NOW)
         self.assertEqual(self.rows()[0]["files"], [{"name": "a.pdf"}])
 
+    def test_clean_files_keeps_only_a_well_formed_file_id(self):
+        got = comms_inbox.clean_files([
+            {"id": "F0000TEST1", "name": "a.pdf"},
+            {"id": " F0000TEST2 ", "name": "b.pdf"},
+            {"id": "f0000test3", "name": "c.pdf"},
+            {"id": "X0000TEST4", "name": "d.pdf"},
+            {"id": "F" + "A" * 80, "name": "e.pdf"},
+            {"id": 12345, "name": "f.pdf"},
+            {"name": "old.pdf"},  # a row from before ids were kept
+        ])
+        self.assertEqual(
+            [f.get("id") for f in got],
+            ["F0000TEST1", "F0000TEST2", None, None, None, None, None])
+        self.assertEqual(got[-1], {"name": "old.pdf"})
+        again = comms_inbox.clean_files(got)
+        self.assertEqual(again, got)
+        # The same id listed twice is one file.
+        twice = comms_inbox.clean_files([
+            {"id": "F0000TEST1", "name": "a.pdf"},
+            {"id": "F0000TEST1", "name": "a.pdf"}])
+        self.assertEqual(len(twice), 1)
+
+    def stored_dm_message(self, files=None, at=10):
+        row = {
+            "type": "message", "channel_id": DM, "thread_ts": ts_at(at),
+            "ts": ts_at(at), "user_id": BOB, "text": "x",
+            "channel_type": "im",
+        }
+        if files:
+            row["files"] = files
+        comms_inbox.record(self.tmp.name, [row], 90, now=NOW)
+
+    def late_patch(self, files):
+        return {"type": "message", "channel_id": DM, "ts": ts_at(10),
+                "thread_ts": ts_at(10), "user_id": BOB, "files": files}
+
+    def test_late_file_patch_is_idempotent_and_never_duplicates(self):
+        self.stored_dm_message()
+        patch = self.late_patch([{"id": "F0000TEST1", "name": "a.pdf"}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        first = comms_inbox.path(self.tmp.name).read_text()
+        for _ in range(3):
+            comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(comms_inbox.path(self.tmp.name).read_text(), first)
+        self.assertEqual(len(self.rows()), 1)
+        # A different list for a message that already has files is ignored.
+        other = self.late_patch([{"id": "F0000TEST2", "name": "b.pdf"}])
+        comms_inbox.record(self.tmp.name, [other], 90, now=NOW)
+        self.assertEqual(
+            self.rows()[0]["files"], [{"id": "F0000TEST1", "name": "a.pdf"}])
+
+    def test_stored_file_without_an_id_gains_it_once(self):
+        self.stored_dm_message(files=[
+            {"name": "a.pdf", "filetype": "application/pdf"},
+            {"name": "a.pdf", "filetype": "application/pdf"},
+            {"name": "b.pdf"}])
+        patch = self.late_patch([
+            {"id": "F0000TEST1", "name": "a.pdf",
+             "filetype": "application/pdf"},
+            {"id": "F0000TEST2", "name": "a.pdf",
+             "filetype": "application/pdf"},
+            {"id": "F0000TEST3", "name": "c.pdf"}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        files = self.rows()[0]["files"]
+        self.assertEqual(
+            [(f.get("id"), f["name"]) for f in files],
+            [("F0000TEST1", "a.pdf"), ("F0000TEST2", "a.pdf"),
+             (None, "b.pdf")])  # no entry added, none reordered
+        first = comms_inbox.path(self.tmp.name).read_text()
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(comms_inbox.path(self.tmp.name).read_text(), first)
+
+    def test_id_already_stored_is_not_copied_onto_a_second_entry(self):
+        # The same name and type twice: the first entry has its id, so the
+        # fresh entry carrying that id must not be copied onto the second.
+        self.stored_dm_message(files=[
+            {"id": "F0000TEST1", "name": "a.pdf"}, {"name": "a.pdf"}])
+        patch = self.late_patch([
+            {"id": "F0000TEST1", "name": "a.pdf"},
+            {"id": "F0000TEST2", "name": "a.pdf"}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(
+            [f.get("id") for f in self.rows()[0]["files"]],
+            ["F0000TEST1", "F0000TEST2"])
+        # Only the stored id on offer: nothing is copied, no duplicate.
+        self.stored_dm_message(files=[
+            {"id": "F0000TEST1", "name": "a.pdf"}, {"name": "a.pdf"}], at=11)
+        only = dict(self.late_patch([{"id": "F0000TEST1", "name": "a.pdf"}]),
+                    ts=ts_at(11), thread_ts=ts_at(11))
+        comms_inbox.record(self.tmp.name, [only], 90, now=NOW)
+        second = [r for r in self.rows() if r["ts"] == ts_at(11)][0]
+        self.assertEqual(
+            [f.get("id") for f in second["files"]], ["F0000TEST1", None])
+
+    def test_id_backfill_prefers_the_entry_with_the_same_size(self):
+        self.stored_dm_message(files=[
+            {"name": "a.pdf", "size": 200}, {"name": "a.pdf", "size": 100}])
+        patch = self.late_patch([
+            {"id": "F0000TEST1", "name": "a.pdf", "size": 100},
+            {"id": "F0000TEST2", "name": "a.pdf", "size": 200}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(
+            [(f["size"], f["id"]) for f in self.rows()[0]["files"]],
+            [(200, "F0000TEST2"), (100, "F0000TEST1")])
+
+    def test_old_rows_without_an_id_are_kept_as_they_are(self):
+        self.stored_dm_message(files=[{"name": "a.pdf", "size": 10}])
+        comms_inbox.record(self.tmp.name, [self.late_patch(
+            [{"name": "a.pdf", "size": 10}])], 90, now=NOW)
+        self.assertEqual(
+            self.rows()[0]["files"], [{"name": "a.pdf", "size": 10}])
+        self.assertEqual(
+            comms_inbox.dm_peer_latest(self.tmp.name, 0.0),
+            {DM: float(ts_at(10))})
+
     def test_message_row_cleans_and_caps_files(self):
         hit = {"channel": DM, "root": ts_at(1), "ts": ts_at(1), "user": BOB,
                "is_bot": False, "text": "", "label": "DM",
@@ -1401,7 +1519,8 @@ class FileShareTest(InboxTestCase):
     def test_files_line_without_size_is_accepted(self):
         got = self.parse([], "hi\nFiles: a.zip (ID: F0AAAAAAA01, application/zip)")
         self.assertEqual(got["files"], [{
-            "name": "a.zip", "filetype": "application/zip"}])
+            "id": "F0AAAAAAA01", "name": "a.zip",
+            "filetype": "application/zip"}])
         self.assertEqual(got["text"], "hi")
 
     def test_files_line_must_be_last_or_the_only_content(self):
@@ -1510,9 +1629,130 @@ class FileShareTest(InboxTestCase):
                 slack_mcp.parse_channel(
                     page(body, pag), ts_at(0), ts_at(9), DM, allow_empty=True)
 
+    def reads_of(self):
+        return [a["channel_id"] for a in self.reads()]
+
+    def test_dm_with_a_new_message_from_someone_else_is_scanned_first(self):
+        cold1, cold2, hot = "D0EXAMPLE01", "D0EXAMPLE02", "D0EXAMPLE09"
+        self.seed_dm(cold1, at=1, peer=False)
+        self.seed_dm(cold2, at=2, peer=False)
+        self.seed_dm(hot, at=3)
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(self.reads_of(), [hot, cold1])
+
+    def test_a_new_peer_message_makes_the_dm_due_inside_the_interval(self):
+        self.seed_dm()
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])  # nothing new: not due
+        self.seed_dm(DM, at=100_010, peer=False)  # the owner's own message
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        self.seed_dm(DM, at=100_020)  # newer than the scan mark, from Bob
+        with mock.patch.object(slack_mcp, "_now", return_value=NOW + 100):
+            slack_mcp.candidates(self.src())
+            self.assertEqual(self.reads_of(), [DM, DM])
+            # The read completed past that message: not hot again.
+            slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM, DM])
+
+    def failing_dm(self, state):
+        path = slack_mcp._file_scan_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"marks": {}, "fails": {DM: state}}))
+        self.connector.channel = lambda args: (
+            self.reads_log.append((READ_CHANNEL, args)) or "not json")
+
+    def test_hot_dm_skips_backoff_once_per_new_message(self):
+        self.seed_dm(at=-50 + 100_000)  # a peer message just before "now"
+        # Failed (at an unknown time) and backed off for 5 more runs.
+        self.failing_dm({"n": 2, "wait": 5})
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        fails = slack_mcp._load_file_state()["fails"][DM]
+        self.assertEqual(
+            (fails["n"], fails["wait"], fails["at"]), (3, 8, NOW))
+        # Failing again: the message is older than the failure, so the
+        # backoff holds however often it runs.
+        for _ in range(2):
+            slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        self.assertEqual(slack_mcp._load_file_state()["fails"][DM]["wait"], 6)
+        # A newer message inside the scan interval of the failure is not
+        # enough: at most one override per interval.
+        self.seed_dm(DM, at=100_020)
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        # Once the interval has passed, that message gets one more attempt.
+        with mock.patch.object(slack_mcp, "_now", return_value=NOW + 1800):
+            slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM, DM])
+        fails = slack_mcp._load_file_state()["fails"][DM]
+        self.assertEqual((fails["n"], fails["at"]), (4, NOW + 1800))
+        # ... and a still newer one inside the new interval does not.
+        self.seed_dm(DM, at=100_030)
+        with mock.patch.object(slack_mcp, "_now", return_value=NOW + 1900):
+            slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM, DM])
+
+    def test_bot_and_slackbot_dms_are_never_hot_but_a_group_dm_is(self):
+        bot, app, peerbot, group = (
+            "D0EXAMPLE01", "D0EXAMPLE02", "D0EXAMPLE03", "G0EXAMPLE04")
+        self.seed_dm(bot, is_bot=True)
+        self.seed_dm(app, user_id=comms_inbox.SLACKBOT)
+        # peer_is_bot is derived on write, so put a line that has it in by hand.
+        with comms_inbox.path(self.tmp.name).open("a") as out:
+            out.write(json.dumps({
+                "type": "message", "channel_id": peerbot, "ts": ts_at(5),
+                "thread_ts": ts_at(5), "user_id": BOB, "is_owner": False,
+                "is_bot": False, "text": "x", "channel_type": "im",
+                "peer_is_bot": True}) + "\n")
+        self.seed_dm(group, kind="mpim")
+        peers = comms_inbox.dm_peer_latest(self.tmp.name, 0.0)
+        self.assertEqual(peers, {group: float(ts_at(5))})
+        # Hot goes first: the group DM beats the bot DMs that sort before it.
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(self.reads_of()[0], group)
+
+    def test_excluded_channel_hot_by_the_inbox_is_not_read(self):
+        self.seed_dm(DM)
+        self.seed_dm("D0EXAMPLE02")
+        slack_mcp.candidates(self.src(exclude_channels=[DM]))
+        self.assertEqual(self.reads_of(), ["D0EXAMPLE02"])
+
+    def test_backed_off_dm_with_no_new_message_stays_backed_off(self):
+        self.seed_dm()  # an old peer message
+        self.failing_dm({"n": 1, "wait": 2, "at": NOW})
+        slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [])
+
+    def test_hot_dms_are_capped_and_the_deferral_is_logged_by_count(self):
+        hot = [f"D0EXAMPLE1{n}" for n in range(3)]
+        for n, channel in enumerate(hot):
+            self.seed_dm(channel, at=n + 1)
+        with mock.patch.object(slack_mcp, "log") as log:
+            slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(len(self.reads()), 2)
+        lines = [c.args[0] for c in log.call_args_list]
+        deferred = [l for l in lines if "deferred by the cap" in l]
+        self.assertEqual(len(deferred), 1)
+        self.assertIn("1 hot channel(s) deferred by the cap of 2", deferred[0])
+        self.assertFalse(any(c in l for l in deferred for c in hot))
+        # The deferred one is still hot and goes first next run.
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(len(set(self.reads_of())), 3)
+
+    def test_no_deferral_log_when_every_hot_dm_fits(self):
+        self.seed_dm()
+        with mock.patch.object(slack_mcp, "log") as log:
+            slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertFalse(any(
+            "deferred by the cap" in c.args[0] for c in log.call_args_list))
+
     def test_cap_one_alternates_hot_and_quiet_channels(self):
         quiet = "D0EXAMPLE99"
-        self.seed_dm(quiet, at=1)
+        self.seed_dm(quiet, at=1, peer=False)
         hit = {"ch": DM, "dm": True, "people": [BOB, ME],
                "ts": ts_at(10), "text": "hi"}
         self.connector.search = by_filter({f"with:<@{ME}>": [hit]})
@@ -1546,7 +1786,9 @@ class FileShareTest(InboxTestCase):
         slack_mcp.candidates(self.src(max_file_reads_per_run=1))
         self.assertEqual([a["channel_id"] for a in self.reads()], [bad])
         fails = slack_mcp._load_file_state()["fails"]
-        self.assertEqual(fails[bad], {"n": 1, "wait": 2})
+        self.assertEqual(
+            {k: fails[bad][k] for k in ("n", "wait")}, {"n": 1, "wait": 2})
+        self.assertEqual(fails[bad]["at"], slack_mcp._now())
         # Next run: bad is backed off, good is scanned.
         self.reads_log.clear()
         with mock.patch.object(slack_mcp, "_now",
@@ -1639,7 +1881,7 @@ class FileShareTest(InboxTestCase):
 
     def test_hot_channels_do_not_starve_the_quiet_one(self):
         quiet = "D0EXAMPLE99"
-        self.seed_dm(quiet, at=1)
+        self.seed_dm(quiet, at=1, peer=False)
         hits = [{"ch": f"D0EXAMPLE1{n}", "dm": True, "people": [BOB, ME],
                  "ts": ts_at(10 + n), "text": "hi"} for n in range(3)]
         self.connector.search = by_filter({f"with:<@{ME}>": hits})
@@ -1704,7 +1946,7 @@ class RealChannelFilesLayoutTest(unittest.TestCase):
         self.assertEqual([f["name"] for f in first["files"]], ["a, b.zip", "c - d .docx"])
         self.assertEqual(first["files"][0]["filetype"], "application/zip")
         self.assertEqual(second["text"], "")
-        self.assertEqual(second["files"], [{"name": "only.pdf", "filetype": "application/pdf", "size": "20 KB"}])
+        self.assertEqual(second["files"], [{"id": "F0AAAAAAA03", "name": "only.pdf", "filetype": "application/pdf", "size": "20 KB"}])
 
     def test_plain_files_text_stays_body(self):
         import json
