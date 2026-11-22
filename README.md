@@ -1944,8 +1944,8 @@ back does not count) degrades the listing the same way, with instructions,
 instead of being skipped silently.
 
 **Never a smaller day.** When a chat-day is fetched for analysis, the ids of
-its messages are recorded in the daemon's state
-(`state/whatsapp/captures.json`, last 3 versions per day). A later version of
+its messages are recorded in `captures.json` in the identity directory (the
+version its last settled capture used, plus the 5 newest others). A later version of
 that day is offered again only once it holds every message of its last
 settled capture. In normal operation it always does; a new or relocated
 archive rebuilt from what is left in the spool may hold only the end of a
@@ -1957,15 +1957,31 @@ overrides this.
 outcome for this source, so a chat's identity never comes from `chat_key` (a
 row key of WhatsApp's database, reused after a reinstall). The archive chat
 id is `c` plus 16 hex digits of HMAC-SHA256 of the record's `chat_jid`, keyed
-with a random secret the daemon creates once in
-`state/whatsapp/chat-id.key` (0600, next to the ledger, never in the archive
-or a log). It does not depend on the order messages are seen in, so a
-rebuilt archive gets the same ids. `chat_key` only links: when a batch
+with a random secret, `chat-id.key` (0600, never in the archive or a log),
+kept in the identity directory: `identity_dir` on the source (an absolute,
+private folder outside every git work tree, for example next to the
+archive, so it survives a re-clone of this repository), else the daemon's
+`state/whatsapp/`. It does not depend on the order messages are seen in, so
+a rebuilt archive gets the same ids. The key is created only for a new
+archive and an empty ledger: when either already holds WhatsApp chats, a
+missing key (state/ not carried to a new checkout, `git clean -x`, a partial
+restore) degrades the source with "restore it" instead of minting a new one,
+because a new key would give every chat a new identity and capture each
+chat-day again. The archive records a fingerprint of its key
+(`identity-fingerprint.json`, an HMAC under the key, never the key itself)
+and refuses any other key: a second checkout running against the same
+`archive_dir` with its own state, or a wrong key restored from a backup. A
+corrupt identity or capture-ids file degrades the source the same way.
+While degraded, nothing is ingested or offered, and the spool keeps pruning,
+so restore within its `keep_days`. **Back up the identity directory
+(`chat-id.key`, `identity.json`, `captures.json`) together with the
+archive.** `chat_key` only links: when a batch
 carries a `store_id` and a record's (store_id, chat_key) already belongs to
 chat X while its JID-derived id is new, the new id becomes an alias of X (a
 chat moving from a phone-number JID to an `@lid` one within one database);
 two chats that both exist are never merged. Without a `store_id` there is no
-key-based linking at all. Aliases live in `state/whatsapp/identity.json`. A
+key-based linking at all. Aliases live in `identity.json` in the identity
+directory. A
 record without a `chat_jid` (the forwarder writes `null` when WhatsApp's
 chat row has no JID) has no safe identity: it is not archived, and the run
 logs how many. The forwarder's `chat_id` is kept on each record but never
@@ -2045,8 +2061,8 @@ the configured `analyze` provider, like any other source's body, and the
 entry (summary plus the verbatim block) is written to the memory store.
 Media files, phone numbers and JIDs are never sent: JIDs are not even kept
 in the archive. The spool, the archive and the cached transcripts stay on
-this Mac, as do the identity secret, aliases and capture ids in
-`state/whatsapp/`; the archive holds message text and media for as long as
+this Mac, as do the identity secret, aliases and capture ids in the
+identity directory; the archive holds message text and media for as long as
 `archive_keep_days` allows (unset: forever). With it set, captured
 chat-days older than that many days are deleted with their media and
 transcripts (a small tombstone keeps a late record from starting a partial

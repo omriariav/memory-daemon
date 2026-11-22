@@ -68,9 +68,12 @@ source:
   # update them (the daemon warns about listed keys it no longer sees).
   # Labels are the spool's chat_label.
   #
-  # Chat identity needs no setting: the daemon keys a hash of each chat's
-  # JID with a secret it creates in state/whatsapp/chat-id.key (keep it with
-  # the ledger; a new secret renames every chat).
+  # Chat ids are a keyed hash of each chat's JID. The secret (chat-id.key),
+  # aliases and capture ids live in this private folder, outside every git
+  # work tree; without it, in the daemon's state/whatsapp. Back it up with
+  # the archive: a lost key is never re-created while the archive or the
+  # ledger holds chats (the source reports it until it is restored).
+  identity_dir: /absolute/path/to/private/whatsapp-identity
   exclude_chat_labels:
     - Example muted group
 

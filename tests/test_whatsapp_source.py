@@ -1532,6 +1532,158 @@ class RetentionTest(Base):
         self.assertTrue(any("expired=1" in line for line in self.logs))
 
 
+class IdentityKeyTest(Base):
+    """A lost or foreign chat-id key degrades the source; it never re-mints."""
+
+    def key_path(self):
+        return whatsapp_source.state_dir() / "chat-id.key"
+
+    def first_run(self, store_id=None):
+        ledger = {}
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")],
+                         store_id=store_id)
+        found = self.listing(processed=ledger)
+        for candidate in found:
+            whatsapp_source.fetch({}, self.source(), candidate)
+            ledger[candidate["id"]] = {
+                "source_kind": "whatsapp",
+                "source_id": candidate["raw"]["source_id"],
+                "processed_at": "2026-11-22T20:00:00Z", "memory": "created"}
+        return ledger
+
+    def chat_dirs(self):
+        return sorted(p.name for p in (self.archive / "chats").iterdir()
+                      if p.is_dir())
+
+    def test_lost_key_degrades_instead_of_minting_new_ids(self):
+        for store_id, lost in ((None, ["chat-id.key"]),
+                               ("was1-" + "1" * 32,
+                                ["chat-id.key", "identity.json"])):
+            with self.subTest(store_id=store_id):
+                self.setUp()
+                ledger = self.first_run(store_id)
+                before = self.chat_dirs()
+                saved = self.key_path().read_bytes()
+                for name in lost:
+                    (whatsapp_source.state_dir() / name).unlink()
+                self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "pm")],
+                                 store_id=store_id)
+                self.logs.clear()
+                found = self.listing(processed=ledger)
+                self.assertEqual(list(found), [])
+                self.assertIn("chat-id key is missing", found.degraded)
+                self.assertIn("restore it", found.degraded)
+                self.assertFalse(self.key_path().exists())
+                self.assertEqual(self.chat_dirs(), before)
+                self.assertTrue(any(line.startswith("whatsapp ERROR:")
+                                    for line in self.logs))
+                # Restoring the key (and its identity file) heals it.
+                self.key_path().write_bytes(saved)
+                os.chmod(self.key_path(), 0o600)
+                if "identity.json" in lost:
+                    continue
+                found = self.listing(processed=ledger)
+                self.assertIsNone(found.degraded)
+                self.assertEqual(self.chat_dirs(), before)
+                self.assertEqual([c["raw"]["source_id"] for c in found], [sid()])
+
+    def test_ledger_with_chats_also_forbids_minting(self):
+        ledger = {"whatsapp:c0000000000000000:2026-11-20@0123456789abcdef": {
+            "source_kind": "whatsapp", "memory": "created",
+            "source_id": "whatsapp:c0000000000000000:2026-11-20",
+            "processed_at": "2026-11-20T20:00:00Z"}}
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        found = self.listing(processed=ledger)
+        self.assertIn("chat-id key is missing", found.degraded)
+        self.assertFalse(self.key_path().exists())
+
+    def test_a_different_key_is_refused_by_the_archive_fingerprint(self):
+        ledger = self.first_run()
+        self.key_path().write_text("ab" * 32 + "\n")  # a wrong backup
+        found = self.listing(processed=ledger)
+        self.assertEqual(list(found), [])
+        self.assertIn("different chat-id key", found.degraded)
+        fingerprint = json.loads(
+            (self.archive / "identity-fingerprint.json").read_text())
+        self.assertNotIn("ab" * 32, json.dumps(fingerprint))
+
+    def test_a_second_checkout_with_its_own_state_is_refused(self):
+        self.first_run()
+        other = self.root / "other-checkout"
+        whatsapp_source.configure(other)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b")])
+        found = self.listing()
+        self.assertIn("chat-id key is missing", found.degraded)
+        # Even with its own key and identity file it cannot write here.
+        whatsapp_source._identity_key(whatsapp_source.state_dir(), False)
+        shutil.copy(self.root / "daemon" / "state" / "whatsapp" / "identity.json",
+                    whatsapp_source.state_dir() / "identity.json")
+        found = self.listing()
+        self.assertIn("different chat-id key", found.degraded)
+
+    def test_corrupt_identity_or_captures_file_degrades_by_kind(self):
+        ledger = self.first_run()
+        for name, kind in (("identity.json", "identity file"),
+                           ("captures.json", "capture-ids file")):
+            with self.subTest(name=name):
+                path = whatsapp_source.state_dir() / name
+                good = path.read_text()
+                path.write_text('{"secret text": ')
+                found = self.listing(processed=ledger)
+                self.assertIn(f"the {kind} is not valid JSON", found.degraded)
+                self.assertNotIn("secret text", found.degraded)
+                self.assertFalse(any("secret text" in line for line in self.logs))
+                path.write_text(good)
+                self.assertIsNone(self.listing(processed=ledger).degraded)
+
+    def test_identity_dir_keeps_the_key_next_to_the_archive(self):
+        keys = self.root / "identity"
+        ledger = {}
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        found = self.listing(processed=ledger, identity_dir=str(keys))
+        whatsapp_source.fetch({}, self.source(identity_dir=str(keys)), found[0])
+        self.assertEqual(sorted(p.name for p in keys.iterdir()),
+                         ["captures.json", "chat-id.key", "identity.json"])
+        self.assertEqual(stat.S_IMODE(os.stat(keys).st_mode), 0o700)
+        self.assertFalse((whatsapp_source.state_dir() / "chat-id.key").exists())
+        # A re-cloned daemon (new, empty state) still has its identity.
+        whatsapp_source.configure(self.root / "fresh-clone")
+        found = self.listing(identity_dir=str(keys))
+        self.assertIsNone(found.degraded)
+
+    def test_identity_dir_is_validated_like_the_archive(self):
+        routine = {"id": "wa", "enabled": True,
+                   "analyze": {"provider": "gemini", "model": "m",
+                               "instruction": "x"}}
+        repo = self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        open_dir = self.root / "open"
+        open_dir.mkdir(mode=0o755)
+        os.chmod(open_dir, 0o755)
+        for value, needle in (("relative/keys", "must be an absolute path"),
+                              (str(repo / "keys"), "inside a git work tree"),
+                              (str(open_dir), "identity_dir is accessible"),
+                              (str(self.spool.dir / "keys"),
+                               "outside spool_dir")):
+            routine["source"] = self.source(identity_dir=value)
+            problems = "\n".join(config.validate(routine))
+            self.assertIn(needle, problems, value)
+
+    def test_the_settled_version_survives_many_unsettled_fetches(self):
+        ledger = self.first_run()
+        settled_digest = next(iter(ledger)).split("@")[1]
+        for n in range(whatsapp_source.CAPTURE_VERSIONS + 3):
+            self.spool.batch(iso(10, n), [record(f"m{n}", iso(9, n), "x")])
+            found = self.listing(processed=ledger)
+            for candidate in found:
+                whatsapp_source.fetch({}, self.source(), candidate)  # fails later
+        captures = json.loads(
+            (whatsapp_source.state_dir() / "captures.json").read_text())
+        versions = captures["days"][sid()]["versions"]
+        self.assertIn(settled_digest, versions)
+        self.assertEqual(len(versions), whatsapp_source.CAPTURE_VERSIONS + 1)
+
+
 class FakeResult:
     def __init__(self, stdout="", returncode=0, stderr=""):
         self.stdout, self.returncode, self.stderr = stdout, returncode, stderr

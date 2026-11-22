@@ -101,7 +101,7 @@ DEFAULTS = {
     "chat_labels": [],
     "exclude_chat_labels": [],
 }
-SOURCE_KEYS = set(DEFAULTS) | {"spool_dir", "archive_dir"}
+SOURCE_KEYS = set(DEFAULTS) | {"spool_dir", "archive_dir", "identity_dir"}
 
 PDF_TIMEOUT_SECONDS = 60
 EXTRACT_MAX_ATTEMPTS = 3
@@ -140,6 +140,7 @@ def settings(source):
     cfg.update({key: value for key, value in source.items() if key in DEFAULTS})
     cfg["spool_dir"] = source.get("spool_dir")
     cfg["archive_dir"] = source.get("archive_dir")
+    cfg["identity_dir"] = source.get("identity_dir")
     return cfg
 
 
@@ -226,6 +227,16 @@ def path_problems(source):
                 "archive_dir is inside a git work tree; message text and "
                 "media must stay out of every repository"
             )
+    identity_dir = source.get("identity_dir")
+    if isinstance(identity_dir, str) and identity_dir.startswith("/"):
+        problem = _private_dir_problem(identity_dir, "identity_dir")
+        if problem:
+            problems.append(problem)
+        if _git_tree(identity_dir) is not None:
+            problems.append(
+                "identity_dir is inside a git work tree; the chat-id key "
+                "must stay out of every repository"
+            )
     return problems
 
 
@@ -237,6 +248,17 @@ def validate(prefix, source, routine=None):
     for key, value in (("spool_dir", spool), ("archive_dir", archive)):
         if not isinstance(value, str) or not value.startswith("/"):
             problems.append(f"{prefix}.{key} must be an absolute path")
+    identity_dir = source.get("identity_dir")
+    if identity_dir is not None:
+        if not isinstance(identity_dir, str) or not identity_dir.startswith("/"):
+            problems.append(f"{prefix}.identity_dir must be an absolute path")
+        elif isinstance(spool, str) and spool.startswith("/") and _inside(
+            Path(os.path.normpath(identity_dir)), Path(os.path.normpath(spool))
+        ):
+            problems.append(
+                f"{prefix}.identity_dir must be outside spool_dir (the spool "
+                "is never written)"
+            )
     if (
         isinstance(spool, str) and isinstance(archive, str)
         and spool.startswith("/") and archive.startswith("/")
@@ -521,7 +543,16 @@ def configure(base_dir):
     _base_dir = base_dir
 
 
-def state_dir():
+def state_dir(cfg=None):
+    """Where the chat-id key, aliases and capture ids live.
+
+    ``identity_dir`` on the source when set (so the key can sit next to the
+    archive and survive a re-clone of this repository), else the daemon's
+    ``state/whatsapp``.
+    """
+    explicit = (cfg or {}).get("identity_dir")
+    if explicit:
+        return Path(explicit)
     if _base_dir is None:
         raise RuntimeError(
             "whatsapp source needs the daemon's state directory "
@@ -530,25 +561,48 @@ def state_dir():
     return Path(_base_dir) / "state" / "whatsapp"
 
 
-def _identity_key(directory, dry_run):
-    """The random secret behind archive chat ids, created once (0600).
+class IdentityProblem(RuntimeError):
+    """The chat identity state cannot be trusted; nothing is ingested.
 
-    It lives in the daemon's state directory next to the ledger, never in
-    the archive and never in a log. Losing it changes every chat id, which
-    is why it sits with the ledger: losing one without the other is the
-    case the capture-ids check (see candidates) guards against.
+    The message names the file kind and what to do, never its content.
+    """
+
+
+_RESTORE = (
+    "restore it from the backup taken with the archive (a new key would "
+    "give every chat a new identity and capture each chat-day again under "
+    "it); the spool keeps batches only for a few days"
+)
+_FINGERPRINT_LABEL = b"memory-daemon whatsapp archive fingerprint v1"
+
+
+def _identity_key(directory, dry_run, may_mint=True):
+    """The random secret behind archive chat ids (0600).
+
+    Created only for a brand-new archive and ledger: when either already
+    holds chats, a missing key is an error to fix (restore it), never a
+    reason to mint another, because every chat would get a new identity.
+    The archive also carries a fingerprint of the key (see
+    _check_fingerprint), which catches a different key (another checkout
+    with its own state, or a wrong backup).
     """
     path = directory / "chat-id.key"
     try:
         value = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        value = None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise IdentityProblem(
+            f"the chat-id key cannot be read ({type(exc).__name__})") from None
+    if value is not None:
         if re.fullmatch(r"[0-9a-f]{64}", value):
             return bytes.fromhex(value)
-        raise RuntimeError(
-            "whatsapp identity key state/whatsapp/chat-id.key is malformed; "
-            "restore it from a backup (a new key renames every chat)"
+        raise IdentityProblem(f"the chat-id key is malformed; {_RESTORE}")
+    if not may_mint:
+        raise IdentityProblem(
+            "the chat-id key is missing while the archive or the ledger "
+            f"already holds WhatsApp chats; {_RESTORE}"
         )
-    except FileNotFoundError:
-        pass
     key = secrets.token_bytes(32)
     if dry_run:
         return key  # a preview only; nothing is written
@@ -556,7 +610,7 @@ def _identity_key(directory, dry_run):
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        return _identity_key(directory, dry_run)
+        return _identity_key(directory, dry_run, may_mint)
     with os.fdopen(fd, "w") as handle:
         handle.write(key.hex() + "\n")
         handle.flush()
@@ -578,11 +632,16 @@ class _Identity:
     no key-based linking at all.
     """
 
-    def __init__(self, directory, dry_run):
+    def __init__(self, directory, dry_run, may_mint=True):
         self.path = directory / "identity.json"
         self.dry_run = dry_run
-        self.key = _identity_key(directory, dry_run)
-        data = _read_json(self.path, None)
+        self.key = _identity_key(directory, dry_run, may_mint)
+        data = _read_state_json(self.path, "identity file")
+        if data is None and not may_mint:
+            raise IdentityProblem(
+                "the identity file (chat aliases) is missing while the "
+                f"archive already holds chats; {_RESTORE}"
+            )
         if not isinstance(data, dict) or data.get("v") != 1:
             data = {"v": 1, "keys": {}, "aliases": {}, "chats": [],
                     "stores": []}
@@ -590,6 +649,10 @@ class _Identity:
         self.known = set(data["chats"])
         self.dirty = False
         self.conflicts = 0
+
+    def fingerprint(self):
+        return hmac.new(self.key, _FINGERPRINT_LABEL,
+                        hashlib.sha256).hexdigest()[:32]
 
     def own_id(self, jid):
         digest = hmac.new(
@@ -655,14 +718,44 @@ def _id_prefix(message_id):
     return message_id[4:20]
 
 
-def _load_captures():
-    data = _read_json(state_dir() / "captures.json", None)
+def _read_state_json(path, kind):
+    """A state file's JSON, None when missing; corrupt is an IdentityProblem."""
+    try:
+        return _read_json(path, None)
+    except (ValueError, UnicodeDecodeError):
+        raise IdentityProblem(
+            f"the {kind} is not valid JSON; restore it from the backup taken "
+            "with the archive") from None
+
+
+def _load_captures(cfg):
+    data = _read_state_json(state_dir(cfg) / "captures.json", "capture-ids file")
     if not isinstance(data, dict) or not isinstance(data.get("days"), dict):
         data = {"v": 1, "days": {}}
     return data
 
 
-def _record_capture(source_id, digest, message_ids):
+# Versions of one chat-day kept besides the one its last settled capture
+# used (that one is kept however many unsettled fetches follow it).
+CAPTURE_VERSIONS = 5
+
+
+def _pin_settled(cfg, data, last_capture):
+    """Mark each day's settled version so pruning never drops it."""
+    changed = False
+    for source_id, (_at, item_id) in last_capture.items():
+        entry = data["days"].get(source_id)
+        digest = item_id.split("@")[-1]
+        if entry and digest in entry.get("versions", {}) and (
+            entry.get("settled") != digest
+        ):
+            entry["settled"] = digest
+            changed = True
+    if changed:
+        _write_json(state_dir(cfg) / "captures.json", data)
+
+
+def _record_capture(cfg, source_id, digest, message_ids):
     """Remember which messages a capture of this chat-day contains.
 
     Written when the item is fetched for analysis, keyed by its digest; the
@@ -671,13 +764,15 @@ def _record_capture(source_id, digest, message_ids):
     capture (it might otherwise be a partial day rebuilt from what is left
     in the spool).
     """
-    data = _load_captures()
-    versions = data["days"].setdefault(source_id, {})
+    data = _load_captures(cfg)
+    entry = data["days"].setdefault(source_id, {"versions": {}})
+    versions = entry["versions"]
     versions.pop(digest, None)
     versions[digest] = sorted(_id_prefix(m) for m in message_ids)
-    while len(versions) > 3:
-        versions.pop(next(iter(versions)))
-    _write_json(state_dir() / "captures.json", data)
+    prunable = [d for d in versions if d != entry.get("settled")]
+    while len(prunable) > CAPTURE_VERSIONS:
+        versions.pop(prunable.pop(0))
+    _write_json(state_dir(cfg) / "captures.json", data)
 
 
 # --- media copies ----------------------------------------------------------------
@@ -1539,13 +1634,53 @@ def _check_runtime_paths(cfg, dry_run):
         state.ensure_private_dir(archive)
 
 
+def _archive_has_data(archive):
+    index = _read_json(Path(archive) / "chats" / "index.json", None) \
+        if (Path(archive) / "chats" / "index.json").exists() else None
+    if isinstance(index, dict) and index.get("days"):
+        return True
+    return any((Path(archive) / "chats").glob("*/*.json"))
+
+
+def _ledger_has_chats(processed):
+    return processed is not None and any(
+        entry.get("source_kind") == "whatsapp"
+        for _item_id, entry in processed.items()
+    )
+
+
+def _check_fingerprint(archive, ident, dry_run):
+    """Bind the archive to its chat-id key; refuse any other key."""
+    path = Path(archive) / "identity-fingerprint.json"
+    try:
+        recorded = _read_json(path, None)
+    except (ValueError, UnicodeDecodeError):
+        raise IdentityProblem(
+            "the archive's key fingerprint file is not valid JSON") from None
+    current = ident.fingerprint()
+    if isinstance(recorded, dict) and recorded.get("fingerprint"):
+        if recorded["fingerprint"] != current:
+            raise IdentityProblem(
+                "archive_dir was written with a different chat-id key (a "
+                "second checkout with its own state, or a wrong backup); "
+                "point identity_dir at the key this archive belongs to"
+            )
+        return
+    if not dry_run:
+        _write_json(path, {"v": 1, "fingerprint": current})
+
+
 def ingest(source):
     """Read new spool batches into the archive; returns the ingest state."""
     cfg = settings(source)
     dry_run = bool(source.get("_dry_run") or source.get("_count_only"))
     _check_runtime_paths(cfg, dry_run)
     now = _now()
-    ident = _Identity(state_dir(), dry_run)
+    archive = Path(cfg["archive_dir"])
+    may_mint = not _archive_has_data(archive) and not _ledger_has_chats(
+        source.get("_processed"))
+    ident = _Identity(state_dir(cfg), dry_run, may_mint)
+    _check_fingerprint(archive, ident, dry_run)
     work = _Ingest(cfg, dry_run, ident)
     if not dry_run:
         work.sweep_temp(now)
@@ -1640,7 +1775,17 @@ def candidates(source):
     """One candidate per chat-day with uncaptured content; see the docstring."""
     cfg = settings(source)
     processed = source.get("_processed")
-    work = ingest(source)
+    try:
+        work = ingest(source)
+        last_capture = _last_captures(processed)
+        captures = _load_captures(cfg) if last_capture else {"days": {}}
+    except IdentityProblem as exc:
+        # Nothing is ingested or offered until it is fixed: a new identity
+        # would capture every chat-day again under new ids.
+        log(f"whatsapp ERROR: {exc}")
+        listing = Listing()
+        listing.degraded = str(exc)
+        return listing
     now = _now()
     expired = work.expire(cfg["archive_keep_days"], processed, now)
     if expired:
@@ -1649,8 +1794,9 @@ def candidates(source):
             f"older than {cfg['archive_keep_days']} days")
     quiet = cfg["quiet_minutes"] * 60
     max_wait = cfg["max_wait_hours"] * 3600
-    last_capture = _last_captures(processed)
-    captured_ids = _load_captures()["days"] if last_capture else {}
+    if not work.dry_run and last_capture:
+        _pin_settled(cfg, captures, last_capture)
+    captured_ids = captures["days"]
     ready, waiting = [], []
     settled = shrinking = 0
     for key, meta in sorted(work.index["days"].items()):
@@ -1668,7 +1814,8 @@ def candidates(source):
         day = work.day(chat, meta["date"])
         since, last_id = last_capture.get(key, (0, None))
         if last_id and not cfg["recapture_after_rebuild"]:
-            before = (captured_ids.get(key) or {}).get(last_id.split("@")[-1])
+            before = ((captured_ids.get(key) or {}).get("versions") or {}).get(
+                last_id.split("@")[-1])
             present = {_id_prefix(m) for m in day["messages"]}
             if before is not None and not set(before) <= present:
                 # This day holds fewer messages than its last capture (an
@@ -1938,7 +2085,7 @@ def fetch(_routine, source, candidate):
                 _write_json(work.index_path, work.index)
     messages = sorted(day["messages"].values(), key=_order)
     if not dry_run:
-        _record_capture(raw["source_id"], raw.get("digest"),
+        _record_capture(cfg, raw["source_id"], raw.get("digest"),
                         [m["id"] for m in messages])
     prompt_lines, verbatim_lines = _render(messages, archive, cfg)
     chat = raw["chat"]
