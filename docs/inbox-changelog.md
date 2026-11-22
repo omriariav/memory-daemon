@@ -7,6 +7,18 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-11-22
+
+### Fixed
+
+- **The mouse wheel did not scroll the `?` keyboard reference or a long
+  confirmation.** The box is narrow; the rest of the screen is the dimmed
+  backdrop. The wheel scrolled only with the pointer over the text or its
+  scrollbar. Over the backdrop, the border, the padding or a title it did
+  nothing, and on a wide terminal that is most of the screen. The help screen
+  and the send and write confirmations now take any wheel event and scroll
+  their text. The keys were not affected.
+
 ## [0.12.3] - 2026-11-19
 
 ### Added
