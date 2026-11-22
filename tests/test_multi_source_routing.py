@@ -50,6 +50,24 @@ class MultiSourceValidationTest(unittest.TestCase):
     def test_valid_multi_source_routine(self):
         self.assertEqual(config.validate(multi_routine(self.tmp.name)), [])
 
+    def test_gmail_list_timeout_seconds_validation(self):
+        for good in (1, 600, 3600):
+            routine = multi_routine(self.tmp.name)
+            routine["sources"][0]["list_timeout_seconds"] = good
+            self.assertEqual(config.validate(routine), [], good)
+        for bad in (0, 3601, -1, 1.5, "600", True):
+            routine = multi_routine(self.tmp.name)
+            routine["sources"][0]["list_timeout_seconds"] = bad
+            self.assertTrue(
+                any("list_timeout_seconds" in p
+                    for p in config.validate(routine)), bad)
+
+    def test_list_timeout_seconds_is_gmail_only(self):
+        routine = multi_routine(self.tmp.name)
+        routine["sources"][1]["list_timeout_seconds"] = 600
+        self.assertTrue(any("only supported by gmail" in p
+                            for p in config.validate(routine)))
+
     def test_legacy_single_source_remains_valid(self):
         routine = multi_routine(self.tmp.name)
         routine["source"] = routine.pop("sources")[0]

@@ -524,6 +524,25 @@ catch_up_overlap: 1h
 catch_up_after: "2026-08-01T00:00:00Z"
 ```
 
+A Gmail listing is one `gws gmail list` process call that pages through the
+whole result, so a first catch-up over many weeks can take minutes. The call is
+bounded by 120 seconds for a capped source (`max_results` above 0) and by 600
+seconds for `max_results: 0`. Set `list_timeout_seconds` (integer, 1 to 3600,
+gmail sources only) to raise or lower that bound for one source:
+
+```yaml
+kind: gmail
+query: '{in:inbox in:sent}'
+max_results: 0
+catch_up: true
+catch_up_after: "2026-08-01T00:00:00Z"
+list_timeout_seconds: 900   # optional; default 120, or 600 with max_results: 0
+```
+
+The setting changes only how long the daemon waits. A listing that still times
+out, exits non-zero or returns invalid JSON raises exactly as before, the
+source's scope fails, and its cursor and the connector watermark are held.
+
 Slack supports the same durable queue for explicitly configured channels and
 workspace-wide mentions. Use `direct_channels` for public or private channels
 that should be read through Slack's history API, rather than summarized by Ada:

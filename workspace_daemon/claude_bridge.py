@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zoneinfo
 from pathlib import Path
@@ -520,6 +521,15 @@ def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
     ] + no_tools + servers
 
 
+def _feed_stdin(stream, text):
+    try:
+        stream.write(text)
+        stream.close()
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
 def _spawn(cmd, prompt, cwd, timeout, connect_delay):
     """Run claude with the prompt on stdin; kill its whole process group on timeout.
 
@@ -541,10 +551,17 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(cmd, timeout)
-        # The write is inside communicate so a child that never reads stdin
-        # still hits the timeout instead of blocking on a full pipe. A child
-        # that exited early is a broken pipe communicate already swallows.
-        stdout, _ = proc.communicate(input=message + "\n", timeout=remaining)
+        # A child that never reads stdin must still hit the timeout instead of
+        # blocking on a full pipe. communicate(input=...) does not guarantee
+        # that: on macOS its blocking write outlives the timeout until the
+        # child exits. So a thread feeds stdin and communicate() only reads;
+        # killing the group on timeout breaks the pipe and ends the thread. A
+        # child that exited early is a broken pipe the thread swallows.
+        stdin, proc.stdin = proc.stdin, None
+        feeder = threading.Thread(
+            target=_feed_stdin, args=(stdin, message + "\n"), daemon=True)
+        feeder.start()
+        stdout, _ = proc.communicate(timeout=remaining)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)

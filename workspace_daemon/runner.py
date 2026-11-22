@@ -925,7 +925,10 @@ def _gmail_candidates(source):
             f"({queue_query}) OR ({windowed})"
             if queue_query else windowed
         )
-    threads = gmail.search(query, source.get("max_results", 20))
+    options = {}
+    if "list_timeout_seconds" in source:
+        options["timeout"] = source["list_timeout_seconds"]
+    threads = gmail.search(query, source.get("max_results", 20), **options)
     candidates = []
     seen = set()
     for thread in threads:
