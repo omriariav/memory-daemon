@@ -13,12 +13,20 @@ so the task-inbox export can see it:
         owner_slug: me-example
         owner_name: Me Example         # fail closed without a known name
         owner_names: [Me E.]           # optional aliases / other scripts
+        mode: file                     # or review: one review todo + queue row
+        review_queue: /path/queue.jsonl  # review mode; default state dir
+
+A meeting is recognized by its source (`is_meeting_item`), never by the entry
+type the model chose. In `review` mode the actions are not filed one by one:
+one `needs-review` todo lists every candidate (verified or not) and one JSON
+line per meeting goes to a candidates queue (see `action_review_queue.py`).
 
 Pure helpers live here (config, prompt text, strict validation, deterministic
 grounding, stable keys); writing goes through memory_sink so the store CLI
 stays the only writer.
 """
 import hashlib
+import os
 import re
 
 MEETING_KINDS = {"mila", "whisper", "transcripts", "meeting-notes", "zoom"}
@@ -29,6 +37,15 @@ EVIDENCE_REASON = "meeting-owner-action"
 TEXT_LIMIT = 140
 TITLE_LIMIT = 120
 ACTION_ID_PREFIX = "#action-"
+REVIEW_ID_SUFFIX = ":review"
+REVIEW_TAG = "needs-review"
+REVIEW_EVIDENCE = "meeting-owner-action-review"
+MODES = ("file", "review")
+DEFAULT_MODE = "file"
+DEFAULT_QUEUE_NAME = "meeting-action-candidates.jsonl"
+QUOTE_LIMIT = 240
+CANDIDATE_TEXT_LIMIT = 200
+MEETING_SOURCE_PREFIXES = tuple(f"{k}:" for k in sorted(MEETING_KINDS))
 NOISE_TAGS = {
     "meeting", "meetings", "transcription", "transcript", "transcripts",
     "mila", "whisper", "meeting-notes", "recording",
@@ -81,6 +98,30 @@ def tag(routine):
         else DEFAULT_TAG
 
 
+def mode(routine):
+    value = cfg(routine).get("mode", DEFAULT_MODE)
+    return value if value in MODES else DEFAULT_MODE
+
+
+def review_mode(routine):
+    return mode(routine) == "review"
+
+
+def review_queue_path(routine, base_dir):
+    """Candidates queue file: `memory.owner_todos.review_queue` (relative
+    paths resolve against the daemon base dir) or `<base>/state/<default>`;
+    None when neither is known."""
+    value = cfg(routine).get("review_queue")
+    if isinstance(value, str) and value.strip():
+        path = os.path.expanduser(value.strip())
+        if os.path.isabs(path):
+            return path
+        return os.path.join(base_dir, path) if base_dir else None
+    if not base_dir:
+        return None
+    return os.path.join(base_dir, "state", DEFAULT_QUEUE_NAME)
+
+
 def is_meeting_item(item):
     meta = item.get("frontmatter") or {}
     return item.get("source_kind") in MEETING_KINDS or bool(
@@ -102,7 +143,7 @@ def validate(memory_cfg, rid):
     problems = []
     unknown = set(block) - {
         "enabled", "max_per_item", "tag", "owner_slug", "owner_name",
-        "owner_names",
+        "owner_names", "mode", "review_queue",
     }
     if unknown:
         problems.append(
@@ -129,6 +170,18 @@ def validate(memory_cfg, rid):
     if "owner_name" in block and not _name_ok(block["owner_name"]):
         problems.append(
             f"{rid}: memory.owner_todos.owner_name must be a non-empty string"
+        )
+    if "mode" in block and block["mode"] not in MODES:
+        problems.append(
+            f"{rid}: memory.owner_todos.mode must be one of "
+            f"{', '.join(MODES)}"
+        )
+    if "review_queue" in block and not (
+        isinstance(block["review_queue"], str)
+        and block["review_queue"].strip()
+    ):
+        problems.append(
+            f"{rid}: memory.owner_todos.review_queue must be a non-empty path"
         )
     names = block.get("owner_names")
     if "owner_names" in block and not (
@@ -207,29 +260,69 @@ def validate_actions(raw, require_ts=False):
     return unique, dropped
 
 
-def _clean_row(row, require_ts):
-    if not isinstance(row, dict) or set(row) - _KEYS:
-        return None
+def _check_row(row, require_ts):
+    """(clean row, None) or (None, reason); a reason never quotes the row."""
+    if not isinstance(row, dict):
+        return None, "not an object"
+    if set(row) - _KEYS:
+        return None, "unexpected field"
     text = row.get("text")
     if not isinstance(text, str) or not " ".join(text.split()):
-        return None
+        return None, "missing text"
     text = " ".join(text.split())
     if len(text) > TEXT_LIMIT:
-        return None
+        return None, "text too long"
     out = {"text": text}
     due = row.get("due")
     if due is not None:
         if not isinstance(due, str) or not _DATE_RE.fullmatch(due):
-            return None
+            return None, "bad due date"
         out["due"] = due
     ts = row.get("evidence_ts")
     if ts is not None:
         if not isinstance(ts, str) or not _TS_RE.fullmatch(ts.strip()):
-            return None
+            return None, "bad timestamp"
         out["evidence_ts"] = ts.strip()
     if require_ts and "evidence_ts" not in out:
+        return None, "missing timestamp"
+    return out, None
+
+
+def _clean_row(row, require_ts):
+    return _check_row(row, require_ts)[0]
+
+
+def classify_actions(raw, require_ts=False):
+    """Every candidate the model returned, valid or not.
+
+    Returns None when `raw` is not a list, else a list of
+    `{"text", "status": "valid"|"invalid", "reason", ...}`; valid rows keep
+    `due` / `evidence_ts` and are de-duplicated like `validate_actions`
+    (a repeat is not a candidate). An invalid row keeps a readable, capped
+    `text` when it has one; its reason never quotes it."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
         return None
-    return out
+    rows, seen = [], set()
+    for row in raw:
+        out, reason = _check_row(row, require_ts)
+        if out is None:
+            text = ""
+            if isinstance(row, dict) and isinstance(row.get("text"), str):
+                text = " ".join(row["text"].split())[:CANDIDATE_TEXT_LIMIT]
+            bad = {"text": text, "status": "invalid", "reason": reason}
+            ts = row.get("evidence_ts") if isinstance(row, dict) else None
+            if isinstance(ts, str) and _TS_RE.fullmatch(ts.strip()):
+                bad["evidence_ts"] = ts.strip()
+            rows.append(bad)
+            continue
+        key = action_key(out["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(dict(out, status="valid", reason=None))
+    return rows
 
 
 # --- deterministic grounding -------------------------------------------------
@@ -259,9 +352,11 @@ def _name_match(label, names):
     )
 
 
-def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
-    """True when `evidence_ts` heads a transcript line (rendered as
-    `[ts] Speaker: text`) spoken by the owner.
+def ground_in_transcript(body, evidence_ts, names, mapped_names=()):
+    """(grounded, owner line). `grounded` is True when `evidence_ts` heads a
+    transcript line (rendered as `[ts] Speaker: text`) spoken by the owner.
+    The line is the MATCHED line (speaker kept, capped), never another line
+    that shares the second; None when not grounded or the line is empty.
 
     When the owner is mapped to a speaker in this recording (a line in the body
     carries an owner name, or `mapped_names` lists one) only the owner's own
@@ -270,7 +365,7 @@ def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
     non-owner fails and an unnamed or missing label passes."""
     want = _norm_ts(evidence_ts or "")
     if want is None:
-        return False
+        return False, None
     rows = []
     for line in str(body or "").splitlines():
         m = _LINE_RE.match(line.strip())
@@ -278,35 +373,62 @@ def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
             continue
         who = _SPEAKER_RE.match(m.group("rest"))
         rows.append((_norm_ts(m.group("ts")),
-                     who.group("who").strip() if who else None))
+                     who.group("who").strip() if who else None,
+                     " ".join(m.group("rest").split())[:QUOTE_LIMIT] or None))
     owner_mapped = any(_name_match(n, names) for n in mapped_names) or any(
-        label and _name_match(label, names) for _, label in rows
+        label and _name_match(label, names) for _, label, _ in rows
     )
-    for ts, label in rows:
+    for ts, label, rest in rows:
         if ts != want:
             continue
         if label and _name_match(label, names):
-            return True
+            return True, rest
         if not owner_mapped and (not label or _GENERIC_SPEAKER_RE.match(label)):
-            return True
-    return False
+            return True, rest
+    return False, None
 
 
-def grounded_in_body(body, text, names):
-    """Backfill check: an owner name shares a sentence or bullet with the
-    action (most of its significant words appear there). Weaker than the
-    transcript check: the stored body is a model summary, not the source."""
+def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
+    return ground_in_transcript(body, evidence_ts, names, mapped_names)[0]
+
+
+def transcript_quote(body, evidence_ts):
+    """The first transcript line (`Speaker: text`, speaker kept) at
+    `evidence_ts`, capped, whoever spoke it; None when no line carries that
+    timestamp. Context for a candidate that did not ground, never a quote."""
+    want = _norm_ts(evidence_ts or "")
+    if want is None:
+        return None
+    for line in str(body or "").splitlines():
+        m = _LINE_RE.match(line.strip())
+        if m and _norm_ts(m.group("ts")) == want:
+            rest = " ".join(m.group("rest").split())
+            return rest[:QUOTE_LIMIT] or None
+    return None
+
+
+def body_quote(body, text, names):
+    """Backfill grounding: the sentence or bullet of the stored body where an
+    owner name shares most of the action's significant words (capped), or
+    None. Weaker than the transcript check: the stored body is a model
+    summary, not the source."""
     # Compare 4-letter stems so "send" matches "sends".
     words = {w[:4] for w in normalize(text).split() if len(w) >= 4}
     if not words:
-        return False
+        return None
     for seg in re.split(r"[\n.;!?]+", str(body or "")):
         seg_norm = normalize(seg)
         if not any(normalize(n) and normalize(n) in seg_norm for n in names):
             continue
         if len(words & {w[:4] for w in seg_norm.split()}) >= 0.6 * len(words):
-            return True
-    return False
+            return " ".join(seg.split())[:QUOTE_LIMIT]
+    return None
+
+
+def grounded_in_body(body, text, names):
+    """Backfill check: an owner name shares a sentence or bullet with the
+    action (most of its significant words appear there)."""
+    return body_quote(body, text, names) is not None
 
 
 def todo_title(text):
@@ -330,3 +452,75 @@ def todo_tags(routine, routine_tags, personal_tag=None, personal=False):
     if personal and personal_tag:
         tags.append(personal_tag)
     return list(dict.fromkeys(tags))
+
+
+# --- review mode -------------------------------------------------------------
+
+def review_source_id(meeting_source_id):
+    return f"{meeting_source_id}{REVIEW_ID_SUFFIX}"
+
+
+def review_title(meeting_title):
+    return todo_title(f"Review action items: {meeting_title or 'meeting'}")
+
+
+def review_tags(routine, routine_tags, personal_tag=None, personal=False):
+    return list(dict.fromkeys(
+        todo_tags(routine, routine_tags, personal_tag, personal)
+        + [REVIEW_TAG]))
+
+
+def _flag(candidate):
+    status = candidate["status"]
+    if status == "ungrounded":
+        return " [unverified: ungrounded]"
+    if status == "invalid":
+        return f" [invalid: {candidate.get('reason') or 'unknown'}]"
+    return ""
+
+
+def review_body(meeting_entry_id, date, candidates, redact=None):
+    """Body of the one review todo: the meeting link and one bullet per
+    candidate, its grounding quote if any, a marker when unverified."""
+    redact = redact or (lambda text: text)
+    head = (f"From meeting {meeting_entry_id or 'unknown'} "
+            f"(evidence: {REVIEW_EVIDENCE}); due {date}.")
+    lines = [head, "Review each candidate; file the real ones, then close "
+             "this todo.", ""]
+    for c in candidates:
+        text = redact(c.get("text") or "") or "(unreadable candidate)"
+        line = f"- {text}{_flag(c)}"
+        if c.get("due"):
+            line += f" (due {c['due']})"
+        if c.get("quote"):
+            line += f'\n  quote: "{redact(c["quote"])}"'
+        elif c.get("line_at_ts"):
+            line += f'\n  line at timestamp: "{redact(c["line_at_ts"])}"'
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def candidate_row(candidate, owner_slug, redact=None):
+    redact = redact or (lambda text: text)
+    row = {
+        "text": redact(candidate.get("text") or ""),
+        "quote": redact(candidate["quote"]) if candidate.get("quote") else None,
+    }
+    if candidate.get("line_at_ts"):
+        row["line_at_ts"] = redact(candidate["line_at_ts"])
+    if candidate.get("due"):
+        row["due"] = candidate["due"]
+    row.update(owner=owner_slug, status=candidate["status"],
+               reason=candidate.get("reason"))
+    return row
+
+
+def cap_candidates(candidates, limit):
+    """Order valid, then ungrounded, then invalid, and cap at `limit` without
+    ever dropping a valid candidate: only the flagged tail is trimmed (to the
+    slots the valid ones leave). Returns (kept, dropped count)."""
+    rank = {"valid": 0, "ungrounded": 1, "invalid": 2}
+    ordered = sorted(candidates, key=lambda c: rank[c["status"]])
+    valid = sum(1 for c in ordered if c["status"] == "valid")
+    keep = max(limit, valid)
+    return ordered[:keep], len(ordered) - keep if len(ordered) > keep else 0

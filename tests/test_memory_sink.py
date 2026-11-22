@@ -735,10 +735,17 @@ class CaptureValidationTest(unittest.TestCase):
             texts = memory_sink._unfiled_owner_actions(
                 routine, {}, {}, entry, "meeting", True, False)
             self.assertEqual(texts, ["Send the example summary"])
-            for args in (("note", True, False), ("meeting", False, False),
-                         ("meeting", True, True)):
+            # The source decides, not the type the model chose.
+            self.assertEqual(memory_sink._unfiled_owner_actions(
+                routine, {}, {}, entry, "note", True, False),
+                ["Send the example summary"])
+            for args in (("meeting", False, False), ("meeting", True, True)):
                 self.assertEqual(memory_sink._unfiled_owner_actions(
                     routine, {}, {}, entry, *args), [])
+        with mock.patch.object(memory_sink.owner_todos, "is_meeting_item",
+                               return_value=False):
+            self.assertEqual(memory_sink._unfiled_owner_actions(
+                routine, {}, {}, entry, "meeting", True, False), [])
 
     def test_embedder_warnings_do_not_hide_the_real_error(self):
         noise = ('dtype not specified for "model". Using the default dtype '

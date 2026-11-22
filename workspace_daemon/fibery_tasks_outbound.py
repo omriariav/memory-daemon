@@ -36,7 +36,9 @@ DEFAULT_MAX_PER_RUN = 5
 DEFAULT_WRITE_MODE = "suggest"
 WRITE_MODES = ("suggest", "apply")
 TITLE_LIMIT = 120
-DEFAULT_EXCLUDE_TAGS = ["personal", "no-fibery", "no-owner-action"]
+DEFAULT_EXCLUDE_TAGS = [
+    "personal", "no-fibery", "no-owner-action", "needs-review",
+]
 ENTRY_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 WRITE_TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__insert_document_blocks$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")

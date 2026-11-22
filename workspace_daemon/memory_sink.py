@@ -34,13 +34,14 @@ from pathlib import Path
 
 import yaml
 
+from . import action_review_queue
 from . import claude_bridge
 from . import identity as identity_providers
 from . import owner_todos
 from . import person_resolver
 from . import personal
 from . import triviality
-from .shell import log, npx_bin
+from .shell import log, npx_bin, utc_now_iso
 
 MEMORY_TYPES = {
     "event", "decision", "todo", "pending-decision", "1on1", "hiring",
@@ -1937,14 +1938,14 @@ def capture(routine, item, summary, dry_run=False):
         # recorded under the root id; the runner clears them by this one.
         outcome["memory_thread_source_id"] = thread_source_id
     if (
-        etype == "meeting" and extraction_succeeded and source_id
+        extraction_succeeded and source_id
         and verdict != "duplicate_skipped"
         and not owner_attention_denied
         and owner_todos.enabled(routine) and owner_todos.is_meeting_item(item)
     ):
         outcome.update(_file_live_owner_todos(
             routine, item, entry, source_id, entry_id, identity,
-            bool(ptag) and ptag in tags,
+            bool(ptag) and ptag in tags, title=title,
         ))
     return outcome
 
@@ -2181,7 +2182,7 @@ def _unfiled_owner_actions(routine, cfg, item, entry, etype,
     follow) and not dropped silently: the duplicate event lists them for the
     owner to review. Same eligibility as a live capture; best effort.
     """
-    if not (etype == "meeting" and extraction_succeeded
+    if not (extraction_succeeded
             and not owner_attention_denied and owner_todos.enabled(routine)
             and owner_todos.is_meeting_item(item)):
         return []
@@ -2194,12 +2195,19 @@ def _unfiled_owner_actions(routine, cfg, item, entry, etype,
 
 
 def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
-                           identity, is_personal):
+                           identity, is_personal, title=""):
     """Validate, ground and file owner actions from a live capture.
+
+    In `review` mode the candidates (verified or not) go to one review todo
+    and the candidates queue instead of one todo each.
 
     Never raises for ordinary failures: the meeting entry is already durable
     and a raise would make the runner retry the whole paid capture.
     """
+    if owner_todos.review_mode(routine):
+        return _review_live_owner_actions(
+            routine, item, entry, source_id, entry_id, identity, is_personal,
+            title)
     rid = routine.get("id")
     actions, dropped = owner_todos.validate_actions(
         entry.get("owner_actions"), require_ts=True
@@ -2235,6 +2243,175 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
         date=item.get("date", ""), actions=grounded, owner_slug=owner_slug,
         is_personal=is_personal,
     )
+
+
+def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
+                               identity, is_personal, title):
+    rid = routine.get("id")
+    candidates = owner_todos.classify_actions(
+        entry.get("owner_actions"), require_ts=True)
+    if candidates is None:
+        log(f"routine={rid} owner-todos review: invalid owner_actions, "
+            "nothing filed")
+        return {}
+    if not candidates:
+        log(f"routine={rid} owner-todos review: 0 candidates, "
+            "no review todo and no queue row")
+        return {}
+    names = owner_todos.owner_names(routine, _verified_owner_name(identity))
+    owner_slug = _owner_slug(routine, identity)
+    if not owner_slug or not names:
+        log(f"routine={rid} owner-todos review: owner slug or name unknown "
+            "(set memory.owner_todos.owner_slug and owner_name), "
+            f"{len(candidates)} candidate(s) not filed")
+        return {}
+    body = item.get("body", "")
+    mapped = (item.get("frontmatter") or {}).get("mila_speaker_names") or ()
+    for c in candidates:
+        ts = c.get("evidence_ts")
+        if c["status"] == "valid":
+            grounded, quote = owner_todos.ground_in_transcript(
+                body, ts, names, mapped)
+            if grounded:
+                c["quote"] = quote
+                continue
+            c["status"] = "ungrounded"
+            c["reason"] = "no owner-spoken transcript line at the timestamp"
+        if ts:
+            c["line_at_ts"] = owner_todos.transcript_quote(body, ts)
+    meta = item.get("frontmatter") or {}
+    return file_action_review(
+        routine, meeting_source_id=source_id, meeting_entry_id=entry_id,
+        source_kind=item.get("source_kind") or "",
+        recording_id=meta.get("mila_recording_id"),
+        title=title or item.get("title") or "", date=item.get("date", ""),
+        candidates=candidates, owner_slug=owner_slug, is_personal=is_personal,
+    )
+
+
+def _add_owner_todo(routine, store, sid, title, date, owner_slug, tags, body):
+    """One stable-id todo write. Returns (verdict, entry id or None); the
+    verdict is created/updated/unchanged/verified/duplicate_skipped/error.
+    Never raises for store trouble (guard stops propagate)."""
+    rid = routine.get("id")
+    args = [
+        "add", "--type", "todo", "--title", title, "--date", date,
+        "--people", owner_slug, "--tags", ",".join(tags),
+        "--source-ids", sid,
+    ]
+    try:
+        r = _cli(store, args, stdin_text=body, timeout=300)
+        out = (r.stdout or "") + (r.stderr or "")
+        _commit_store(store, f"memory: {rid} owner todo")
+    except claude_bridge.GUARD_STOPS:
+        raise
+    except Exception as exc:
+        log(f"routine={rid} owner-todos WARN add failed: "
+            f"{type(exc).__name__}")
+        return "error", None
+    m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
+    if r.returncode == 0 and m:
+        return m.group(1), m.group(2)
+    verified = _verify_written_entry(
+        store, sid, "todo", title, [owner_slug], tags, body)
+    if verified:
+        return "verified", verified
+    if r.returncode == 2 or "near-duplicate" in out.lower() \
+            or "near duplicate" in out.lower():
+        return "duplicate_skipped", None
+    log(f"routine={rid} owner-todos WARN add failed (exit {r.returncode})")
+    return "error", None
+
+
+def file_action_review(routine, meeting_source_id, meeting_entry_id,
+                       source_kind, recording_id, title, date, candidates,
+                       owner_slug, is_personal=False, dry_run=False):
+    """File ONE review todo for a meeting's owner-action candidates and
+    upsert one candidates-queue row. Never raises for store or queue trouble.
+
+    `candidates` come from owner_todos.classify_actions with `status` set to
+    valid / ungrounded / invalid and an optional `quote`. The todo id is
+    `<meeting source id>:review` (through the capture guard, so a hand-logged
+    entry carrying it is never overwritten), stable across re-runs; the queue
+    keeps one row per meeting entry. Logs carry counts and ids only.
+    Returns `memory_owner_review` (0/1) plus `memory_owner_review_candidates`,
+    `memory_owner_review_queue` and, on trouble, `memory_owner_review_error`.
+    """
+    cfg = memory_cfg(routine)
+    rid = routine.get("id")
+    store = cfg["store"]
+    limit = owner_todos.max_per_item(routine)
+    candidates, trimmed = owner_todos.cap_candidates(candidates, limit)
+    if trimmed:
+        log(f"routine={rid} owner-todos review: cap {limit}, dropped "
+            f"{trimmed} flagged candidate(s) (valid ones are never dropped)")
+    redact = (lambda text: personal.redact(text)[0]) \
+        if personal.redact_enabled(cfg) else None
+    ptag = personal.personal_tag(cfg)
+    tags = list(dict.fromkeys(owner_todos.review_tags(
+        routine, cfg.get("tags") or [], ptag, is_personal) + [AUTO_TAG]))
+    todo_title = owner_todos.review_title(
+        redact(title) if redact else title)
+    body = owner_todos.review_body(
+        meeting_entry_id, date, candidates, redact)
+    sid = owner_todos.review_source_id(meeting_source_id)
+    counts = {s: sum(1 for c in candidates if c["status"] == s)
+              for s in ("valid", "ungrounded", "invalid")}
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items())
+    result = {"memory_owner_review": 0,
+              "memory_owner_review_candidates": len(candidates)}
+    if dry_run:
+        log(f"routine={rid} [dry-run] would file review todo "
+            f"source_id={sid} candidates={len(candidates)} ({summary})")
+        result["memory_owner_review_queue"] = "dry_run"
+        return result
+    use_auto, _hand = capture_guard(store, sid, "todo", rid)
+    if use_auto:
+        sid = auto_source_id_for(sid)
+    verdict, todo_id = _add_owner_todo(
+        routine, store, sid, todo_title, date, owner_slug, tags, body)
+    log(f"routine={rid} owner-todos review: {verdict} "
+        f"{todo_id or ''} source_id={sid} candidates={len(candidates)} "
+        f"({summary})")
+    if verdict == "error":
+        result["memory_owner_review_error"] = 1
+        return result
+    if verdict != "duplicate_skipped":
+        result["memory_owner_review"] = 1
+    result["memory_owner_review_id"] = todo_id
+    base_dir = llm_base_dir()
+    path = owner_todos.review_queue_path(routine, base_dir)
+    if not path:
+        log(f"routine={rid} owner-todos review WARN: no queue path "
+            "(set memory.owner_todos.review_queue); row not written")
+        result["memory_owner_review_queue"] = "no_path"
+        return result
+    row = action_review_queue.build_row(
+        meeting_entry_id=meeting_entry_id, review_todo_id=todo_id,
+        source_id=meeting_source_id, source_kind=source_kind,
+        recording_id=recording_id,
+        title=redact(title) if redact else title, date=date,
+        at=utc_now_iso(),
+        candidates=[owner_todos.candidate_row(c, owner_slug, redact)
+                    for c in candidates],
+    )
+    try:
+        outcome = action_review_queue.upsert(path, row)
+    except (OSError, ValueError) as exc:
+        log(f"routine={rid} owner-todos review WARN: queue write failed: "
+            f"{type(exc).__name__}")
+        result["memory_owner_review_error"] = 1
+        result["memory_owner_review_queue"] = "error"
+        return result
+    log(f"routine={rid} owner-todos review: queue row {outcome} "
+        f"meeting={meeting_entry_id or meeting_source_id}")
+    result["memory_owner_review_queue"] = outcome
+    return result
+
+
+def llm_base_dir():
+    from . import llm  # late import to avoid cycles
+    return llm.base_dir()
 
 
 def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
@@ -2273,35 +2450,8 @@ def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
             log(f"routine={rid} [dry-run] would file owner todo "
                 f"source_id={sid}")
             continue
-        args = [
-            "add", "--type", "todo", "--title", title, "--date", date,
-            "--people", owner_slug, "--tags", ",".join(tags),
-            "--source-ids", sid,
-        ]
-        try:
-            r = _cli(store, args, stdin_text=body, timeout=300)
-            out = (r.stdout or "") + (r.stderr or "")
-            _commit_store(store, f"memory: {rid} owner todo")
-        except claude_bridge.GUARD_STOPS:
-            raise
-        except Exception as exc:
-            counts["error"] = counts.get("error", 0) + 1
-            log(f"routine={rid} owner-todos WARN add failed: "
-                f"{type(exc).__name__}")
-            continue
-        m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
-        if r.returncode == 0 and m:
-            verdict = m.group(1)
-        elif _verify_written_entry(store, sid, "todo", title, [owner_slug],
-                                   tags, body):
-            verdict = "verified"
-        elif r.returncode == 2 or "near-duplicate" in out.lower() \
-                or "near duplicate" in out.lower():
-            verdict = "duplicate_skipped"
-        else:
-            verdict = "error"
-            log(f"routine={rid} owner-todos WARN add failed "
-                f"(exit {r.returncode})")
+        verdict, _todo_id = _add_owner_todo(
+            routine, store, sid, title, date, owner_slug, tags, body)
         counts[verdict] = counts.get(verdict, 0) + 1
     log(f"routine={rid} owner-todos: "
         + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -2315,37 +2465,9 @@ def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
     return result
 
 
-def backfill_owner_todos(routine, entry_id, dry_run=False):
-    """Re-run owner-action extraction over a stored meeting entry body.
-
-    Works from the entry body (which already lists the meeting's action
-    items), so no recording transcript or source access is needed. The
-    grounding is weaker than a live capture: an owner name must share a
-    sentence or bullet with the action in the stored (summarized) body.
-    Creates the same stable-id todos a live capture would. Returns the outcome
-    dict of create_owner_todos (with `dry_run`, `memory_owner_todos` counts
-    the actions found).
-    """
-    from . import llm  # late import to avoid cycles
-    from .google_tasks_sync import _load_memory_entries
-
-    cfg = memory_cfg(routine)
-    if not cfg:
-        raise RuntimeError("routine has no memory block")
-    if not owner_todos.cfg(routine):
-        raise RuntimeError("routine has no memory.owner_todos block")
+def _backfill_owner(routine, cfg):
+    """(owner slug, display names) for a backfill; RuntimeError when unknown."""
     rid = routine.get("id")
-    entry = _load_memory_entries(cfg["store"]).get(entry_id)
-    if entry is None:
-        raise RuntimeError(f"memory entry {entry_id!r} not found")
-    if entry["type"] != "meeting":
-        raise RuntimeError(f"memory entry {entry_id!r} is not a meeting")
-    meeting_sids = [
-        value for value in entry["source_ids"]
-        if owner_todos.ACTION_ID_PREFIX not in value
-    ]
-    if not meeting_sids:
-        raise RuntimeError(f"memory entry {entry_id!r} has no source id")
     block = owner_todos.cfg(routine)
     identity = (
         {"safe": False}
@@ -2360,10 +2482,17 @@ def backfill_owner_todos(routine, entry_id, dry_run=False):
         raise RuntimeError(
             "owner unknown: set memory.owner_todos.owner_slug and owner_name"
         )
+    return owner_slug, names
+
+
+def _backfill_answer(routine, cfg, entry, meeting_sid, names):
+    """The model's raw answer for a stored entry body (LLM errors propagate)."""
+    from . import llm  # late import to avoid cycles
+
     prompt = owner_todos.BACKFILL_PROMPT.format(
         section=owner_todos.prompt_section(
             routine, names,
-            existing_action_titles(cfg["store"], meeting_sids[0]),
+            existing_action_titles(cfg["store"], meeting_sid),
             require_ts=False,
         ),
         title=entry["title"], date=entry["date"], body=entry["body"],
@@ -2372,13 +2501,51 @@ def backfill_owner_todos(routine, entry_id, dry_run=False):
     model = cfg.get("extract_model")
     if isinstance(model, str) and model.strip():
         kwargs["model"] = model.strip()
-    answer = llm.analyze(routine, prompt, **kwargs)
+    return llm.analyze(routine, prompt, **kwargs)
+
+
+def _parse_backfill_answer(answer):
+    """The raw `owner_actions` value of an answer; ValueError on bad JSON."""
+    raw = re.sub(r"^```(json)?|```$", "", answer.strip(), flags=re.M)
+    data = json.loads(raw.strip())
+    return data.get("owner_actions") if isinstance(data, dict) else None
+
+
+def backfill_owner_todos(routine, entry_id, dry_run=False):
+    """Re-run owner-action extraction over a stored meeting entry body.
+    The entry is told to be a meeting by its source id, not its type.
+
+    Works from the entry body (which already lists the meeting's action
+    items), so no recording transcript or source access is needed. The
+    grounding is weaker than a live capture: an owner name must share a
+    sentence or bullet with the action in the stored (summarized) body.
+    Creates the same stable-id todos a live capture would. Returns the outcome
+    dict of create_owner_todos (with `dry_run`, `memory_owner_todos` counts
+    the actions found). In `review` mode use backfill_action_review instead.
+    """
+    from .google_tasks_sync import _load_memory_entries
+
+    cfg = memory_cfg(routine)
+    if not cfg:
+        raise RuntimeError("routine has no memory block")
+    if not owner_todos.cfg(routine):
+        raise RuntimeError("routine has no memory.owner_todos block")
+    if owner_todos.review_mode(routine):
+        raise RuntimeError(
+            "memory.owner_todos.mode is review: use backfill-action-review")
+    rid = routine.get("id")
+    entry = _load_memory_entries(cfg["store"]).get(entry_id)
+    if entry is None:
+        raise RuntimeError(f"memory entry {entry_id!r} not found")
+    meeting_sid = _meeting_source_id(entry)
+    if meeting_sid is None:
+        raise RuntimeError(
+            f"memory entry {entry_id!r} has no meeting source id")
+    owner_slug, names = _backfill_owner(routine, cfg)
+    answer = _backfill_answer(routine, cfg, entry, meeting_sid, names)
     try:
-        raw = re.sub(r"^```(json)?|```$", "", answer.strip(), flags=re.M)
-        data = json.loads(raw.strip())
         actions, dropped = owner_todos.validate_actions(
-            data.get("owner_actions") if isinstance(data, dict) else None
-        )
+            _parse_backfill_answer(answer))
     except ValueError:
         actions = None
     if actions is None:
@@ -2392,11 +2559,171 @@ def backfill_owner_todos(routine, entry_id, dry_run=False):
         f"{dropped} invalid dropped")
     ptag = personal.personal_tag(cfg)
     return create_owner_todos(
-        routine, meeting_source_id=meeting_sids[0],
+        routine, meeting_source_id=meeting_sid,
         meeting_entry_id=entry_id, date=entry["date"], actions=grounded,
         owner_slug=owner_slug, dry_run=dry_run,
         is_personal=bool(ptag) and ptag in entry["tags"],
     )
+
+
+def _base_source_id(sid):
+    """A meeting source id without the derived `:auto` capture suffix."""
+    suffix = auto_source_id_for("")
+    return sid[:-len(suffix)] if sid.endswith(suffix) else sid
+
+
+def _meeting_source_id(entry):
+    """The stored meeting's own source id: a meeting-source prefix, not a
+    derived action / review id. None for any other entry (and for todos)."""
+    if entry["type"] == "todo":
+        return None
+    for value in entry["source_ids"]:
+        if (value.startswith(owner_todos.MEETING_SOURCE_PREFIXES)
+                and owner_todos.ACTION_ID_PREFIX not in value
+                and not value.endswith(owner_todos.REVIEW_ID_SUFFIX)
+                and not value.endswith(owner_todos.REVIEW_ID_SUFFIX
+                                       + ":auto")):
+            return value
+    return None
+
+
+def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
+                           redo=False):
+    """Re-run owner-action extraction over stored meeting entries, whatever
+    their type, and send each through the review path (one review todo plus
+    one queue row). Meetings are told by their source id, never their type.
+
+    Select with `entry_ids` and / or `since` (YYYY-MM-DD, entries dated on or
+    after it). Idempotent: a meeting that already has its review todo is
+    skipped without a model call unless `redo`; a redo or a re-run updates the
+    same todo and the same queue row in place. `dry_run` calls the model,
+    writes nothing. Logs carry counts and ids only. Returns counts plus the
+    entry ids that have candidates (`entry_ids`).
+    """
+    from .google_tasks_sync import _load_memory_entries
+
+    cfg = memory_cfg(routine)
+    if not cfg:
+        raise RuntimeError("routine has no memory block")
+    if not owner_todos.cfg(routine):
+        raise RuntimeError("routine has no memory.owner_todos block")
+    if not entry_ids and not since:
+        raise RuntimeError("give --entry ID (repeatable) and/or --since DATE")
+    if since:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+                raise ValueError(since)
+            datetime.date.fromisoformat(since)
+        except ValueError:
+            raise RuntimeError("--since must be a real date, YYYY-MM-DD")
+    rid = routine.get("id")
+    entries = _load_memory_entries(cfg["store"])
+    wanted = list(dict.fromkeys(entry_ids or ()))
+    counts = {"selected": 0, "reviewed": 0, "queued": 0, "no_actions": 0,
+              "already_reviewed": 0, "skipped": 0, "duplicates": 0,
+              "errors": 0, "candidates": 0}
+    reviewed_ids, picked = [], []
+    for entry_id in wanted:
+        if entry_id not in entries:
+            log(f"routine={rid} action-review: entry {entry_id} not found")
+            counts["skipped"] += 1
+        elif _meeting_source_id(entries[entry_id]) is None:
+            log(f"routine={rid} action-review: entry {entry_id} has no "
+                "meeting source id, skipped")
+            counts["skipped"] += 1
+        else:
+            picked.append(entry_id)
+    if since:
+        picked += [
+            e["id"] for e in sorted(entries.values(), key=lambda e: e["id"])
+            if e["date"] >= since and e["id"] not in picked
+            and _meeting_source_id(e) is not None
+        ]
+    # One meeting, one review: entries sharing a source id (a hand-logged one
+    # and its `:auto` capture, or two captures) collapse to one, preferring
+    # the daemon's own (AUTO_TAG) entry.
+    groups = {}
+    for entry_id in picked:
+        base = _base_source_id(_meeting_source_id(entries[entry_id]))
+        groups.setdefault(base, []).append(entry_id)
+    picked = []
+    for base, ids in groups.items():
+        ids.sort(key=lambda i: AUTO_TAG not in entries[i]["tags"])
+        picked.append(ids[0])
+        counts["duplicates"] += len(ids) - 1
+    counts["selected"] = len(picked)
+    if not picked:
+        log(f"routine={rid} action-review: no meeting entries selected")
+        return dict(counts, entry_ids=[])
+    owner_slug, names = _backfill_owner(routine, cfg)
+    carried = {sid for e in entries.values() for sid in e["source_ids"]}
+    queue = owner_todos.review_queue_path(routine, llm_base_dir())
+    ptag = personal.personal_tag(cfg)
+    for entry_id in picked:
+        entry = entries[entry_id]
+        sid = _meeting_source_id(entry)
+        base = _base_source_id(sid)
+        review_sids = [owner_todos.review_source_id(b)
+                       for b in (base, auto_source_id_for(base))]
+        done = any(r in carried or auto_source_id_for(r) in carried
+                   for r in review_sids) or bool(queue) and any(
+            action_review_queue.has_row(queue, key)
+            for key in (entry_id, base, auto_source_id_for(base)))
+        if not redo and done:
+            counts["already_reviewed"] += 1
+            continue
+        try:
+            answer = _backfill_answer(routine, cfg, entry, sid, names)
+        except claude_bridge.GUARD_STOPS:
+            raise
+        except Exception as exc:
+            log(f"routine={rid} action-review: entry {entry_id} extraction "
+                f"failed: {type(exc).__name__}")
+            counts["errors"] += 1
+            continue
+        try:
+            candidates = owner_todos.classify_actions(
+                _parse_backfill_answer(answer))
+        except ValueError:
+            candidates = None
+        if candidates is None:
+            log(f"routine={rid} action-review: entry {entry_id} model "
+                "returned invalid owner_actions")
+            counts["errors"] += 1
+            continue
+        if not candidates:
+            log(f"routine={rid} action-review: entry {entry_id} 0 "
+                "candidates, no review todo and no queue row")
+            counts["no_actions"] += 1
+            continue
+        for c in candidates:
+            if c["status"] != "valid":
+                continue
+            quote = owner_todos.body_quote(entry["body"], c["text"], names)
+            c["quote"] = quote
+            if quote is None:
+                c["status"] = "ungrounded"
+                c["reason"] = "no owner name beside the action in the entry body"
+        prefix, _, rest = base.partition(":")
+        out = file_action_review(
+            routine, meeting_source_id=sid, meeting_entry_id=entry_id,
+            source_kind=prefix, recording_id=rest if prefix == "mila" else None,
+            title=entry["title"], date=entry["date"], candidates=candidates,
+            owner_slug=owner_slug, dry_run=dry_run,
+            is_personal=bool(ptag) and ptag in entry["tags"],
+        )
+        carried.add(owner_todos.review_source_id(sid))
+        reviewed_ids.append(entry_id)
+        counts["candidates"] += out.get("memory_owner_review_candidates", 0)
+        counts["reviewed"] += 1 if dry_run else out.get(
+            "memory_owner_review", 0)
+        if out.get("memory_owner_review_queue") in ("added", "replaced"):
+            counts["queued"] += 1
+        if out.get("memory_owner_review_error"):
+            counts["errors"] += 1
+    log(f"routine={rid} action-review backfill: "
+        + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return dict(counts, entry_ids=reviewed_ids)
 
 
 def resolve_followup(routine, memory_entry_id, thread_id, title,
