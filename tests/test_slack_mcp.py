@@ -192,6 +192,16 @@ class BridgeTestCase(unittest.TestCase):
 
 
 class ParserTest(unittest.TestCase):
+    def test_files_line_keeps_each_slack_file_id(self):
+        line = ("Files: one.zip (ID: F0000TEST1, application/zip, 1.5 MB), "
+                "two, copy.pdf (ID: F0000TEST2, application/pdf)")
+        files, complete = slack_mcp._parse_files_line(line)
+        self.assertTrue(complete)
+        self.assertEqual(
+            [(f["id"], f["name"]) for f in files],
+            [("F0000TEST1", "one.zip"), ("F0000TEST2", "two, copy.pdf")])
+        self.assertEqual(files[0]["size"], "1.5 MB")
+
     def test_search_hits_fields_thread_root_and_dm(self):
         text = search_text([
             {"ts": LATE, "root": ROOT, "text": "reply"},
