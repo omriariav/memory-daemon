@@ -173,6 +173,30 @@ def source_header_lines(item):
                 "Coverage warning: the upstream Slack summary reached its message cap."
             )
 
+    if item.get("source_kind") == "whatsapp" or meta.get("whatsapp_chat_ref"):
+        lines.append("Source: WhatsApp (one chat, one local day)")
+        if meta.get("whatsapp_chat_label"):
+            lines.append(f"Chat: {meta['whatsapp_chat_label']}")
+        if meta.get("whatsapp_chat_type"):
+            lines.append(f"Conversation type: {meta['whatsapp_chat_type']}")
+        if meta.get("whatsapp_participants"):
+            lines.append(
+                "Participants in supplied messages: "
+                + ", ".join(meta["whatsapp_participants"])
+            )
+        if meta.get("message_count") is not None:
+            lines.append(f"Messages in supplied window: {meta['message_count']}")
+        if meta.get("first_message_at"):
+            lines.append(f"First supplied message: {meta['first_message_at']}")
+        if meta.get("latest_message_at"):
+            lines.append(f"Latest supplied message: {meta['latest_message_at']}")
+        lines.append(
+            "Lines are [HH:MM] sender: text in the chat's local time; a "
+            "sender marked [owner] is the memory owner. Attachment "
+            "transcripts and PDF excerpts were extracted locally by machine "
+            "and may contain errors."
+        )
+
     if meta.get("email_from"):
         lines.append(f"From: {meta['email_from']}")
     if meta.get("email_to"):

@@ -1896,6 +1896,96 @@ When the paired `.m4a` still exists, its ffprobe duration upgrades matching to
 full interval overlap; without it, matching uses start proximity and title
 tokens.
 
+### WhatsApp forwarder spool
+
+`source.kind: whatsapp` captures WhatsApp messages, with their media, as one
+memory per chat per local day. The daemon never reads WhatsApp: a separate
+local forwarder writes new messages and copies of their files into a private
+spool folder (`b<seq>-<UTC stamp>/batch.json` plus `media/`, format
+`whatsapp-forwarder-spool` version 1) and deletes its batches after a few
+days, read or not. This source is a read-only consumer of that folder. See
+`routines/_example-whatsapp-to-memory.yaml`.
+
+**Ingest.** Each listing reads the batches after the last one it finished,
+in name order, and upserts every message by its stable `id` into
+`archive_dir`, a required private folder: `chats/chat-<chat key>/<date>.json`
+holds a chat-day's merged messages, and every spooled file with status
+`copied` is copied to `media/<date>/<message id>.<ext>`. A later record with
+a known id is a newer version: an `update: "media"` record adds the file that
+arrived late, and a re-sent duplicate changes nothing (it does not restart the
+quiet period). Files are copied before the batch position is saved and long
+before the ledger settles the day, so a crash or the forwarder's pruning never
+loses a file or shrinks a conversation already seen. A copy that fails for a
+transient reason is retried while the spool still has the file, and once
+more just before capture. Nothing in the spool is ever written. Folders are
+0700, files 0600. `archive_dir` has no default: it must be outside every git
+work tree (the memory store's own folders are git repositories and the
+daemon commits them with `git add -A`), outside the spool, and not open to
+group or others. A batch in an unknown format version stops the listing with
+an error and keeps the position, so nothing is skipped silently. Use one
+`archive_dir` per WhatsApp source.
+
+**Unit and identity.** The memory source id is
+`whatsapp:chat-<chat key>:<YYYY-MM-DD>`: the forwarder's numeric chat key and
+the message's local date (the spool's timezone), never a phone number or JID.
+The candidate id adds a digest of the day's content, so new messages, a late
+file or a newly stored copy update the same entry. Earlier days of the same
+chat are offered to the model as related memories, like Google Chat.
+
+**Quiet period.** The forwarder writes every few minutes; a chat-day is
+analyzed only once nothing in it changed for `quiet_minutes` (default 60), or
+once its oldest change since the last capture has waited `max_wait_hours`
+(default 6, at most 72), whichever comes first. Until then it is listed as
+deferred, so no other routine claims it. A longer quiet period means fewer
+model calls per busy day (each capture re-reads the whole day); the maximum
+wait keeps an all-day conversation from going uncaptured until midnight. A
+failed capture is retried on the next run without waiting.
+
+**Body and entry.** The model sees `[HH:MM] sender: text` lines (the owner's
+own marked `[owner]`), an `attachment:` line per file, and, under the
+message, a locally made transcript or PDF excerpt. Sender display names are
+listed as the participants; the extraction maps them to known person slugs
+and drops unknown names as usual (no new people are created). The stored
+entry is the model's summary followed by a `## WhatsApp messages (verbatim)`
+block: per message `- <ISO time> · <sender as given> · <message id>`
+(` · from_me` for the owner's own), the text on `  > ` lines exactly as sent
+(strip the prefix to get it back), the attachment's kind, name, type, size
+and stored path, and the transcript or excerpt. Secrets are redacted in both
+(`redact_secrets`), and ID numbers too when `memory.redact_ids` is on.
+
+**Text from media, locally.** With `transcribe_audio: true`, voice notes and
+audio are converted by `ffmpeg` to 16 kHz mono WAV and transcribed by
+whisper.cpp's `whisper-cli` with `whisper_model` (a ggml model file) and
+`whisper_language` (`auto` or a code such as `he`); `whisper_threads` and
+`transcribe_timeout_seconds` are optional. PDFs (`pdf_text`, default on) give
+a `pdftotext` excerpt of the first `pdf_max_pages` pages, at most
+`pdf_max_chars` characters; there is no OCR and no image description yet (a
+vision step would be one more entry in `whatsapp_source._EXTRACTORS`, cached
+and rendered like a transcript). Results are cached next to the stored file;
+a failure is remembered and the entry says `transcript: none (<reason>)`. A
+missing tool or model is not remembered, so installing it later works. Tools
+are found like the other binaries: `WORKSPACE_DAEMON_FFMPEG_BIN`,
+`WORKSPACE_DAEMON_WHISPER_CLI_BIN` and `WORKSPACE_DAEMON_PDFTOTEXT_BIN`, then
+`PATH`, then `/opt/homebrew/bin` and `/usr/local/bin`.
+
+**Other settings.** `copy_media` (default true), `max_file_mb` (100) and
+`max_total_mb` (10240, the archive's media) limit copies; a file over a limit
+is listed with its reason. `max_body_chars` (60000) bounds the prompt (the
+newest lines are kept; the stored entry keeps every message). `chat_keys` /
+`chat_labels` include and `exclude_chat_keys` / `exclude_chat_labels` exclude
+chats; filters apply when a batch is read, so an excluded chat never reaches
+the archive. `daemon.py validate` checks that `spool_dir` exists and is
+private and that `archive_dir` is safe, for enabled routines.
+
+**What leaves the machine.** The day's message text, sender display names,
+the chat label and type, attachment facts (kind, file name, type, size, local
+path), and the local transcripts and PDF excerpts go to the configured
+`analyze` provider, like any other source's body, and the entry (summary plus
+the verbatim block) is written to the memory store. Media files, phone
+numbers and JIDs are never sent: JIDs are not even kept in the archive. The
+spool, the archive and the cached transcripts stay on this Mac. Logs carry
+counts, batch names, opaque chat-day ids and error classes only.
+
 ### One routine, several report streams
 
 When a routine covers several recurring reports that differ only in what they
@@ -3400,6 +3490,7 @@ workspace_daemon/
   mila_source.py           read-only Mila + Calendar matching (rules, local model)
   local_llm.py             on-device Ollama JSON chat (stdlib urllib)
   whisper_source.py        read-only Whisper pipeline outputs + Calendar matching
+  whatsapp_source.py       WhatsApp forwarder spool consumer: archive, chat-day capture
   transcripts.py           shared transcript-source Calendar gate + receipts
   google_tasks_sync.py     deterministic Google Tasks ↔ memory todo sync
   calendar_cache.py        rolling calendar cache (text + JSON) via the Claude bridge

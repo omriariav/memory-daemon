@@ -64,6 +64,30 @@ def claude_bin():
         raise
 
 
+_OPTIONAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def optional_bin(name, env_var):
+    """An optional local tool, or None when it is not installed.
+
+    Same order as the required binaries (explicit env override, then PATH,
+    which the LaunchAgent sets), plus the two Homebrew prefixes so a job
+    started without them on PATH still finds the tool. An override that
+    points nowhere counts as missing: callers degrade instead of failing.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return override if Path(override).is_file() else None
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _OPTIONAL_BIN_DIRS:
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def ada_bin():
     return _resolve(
         "ada", "WORKSPACE_DAEMON_ADA_BIN",

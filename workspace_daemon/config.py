@@ -17,7 +17,7 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {
     "gmail", "gmail_mcp", "drive_docs", "slack", "slack_mcp", "gchat", "mila",
-    "whisper", "zoom",
+    "whisper", "zoom", "whatsapp",
 }
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
@@ -690,16 +690,36 @@ def cross_problems(routines):
         and r["maintenance"].get("kind") == "fibery_tasks_outbound"
     }
     found = {}
-    sources = {}
+    archives = {}
+    for r in routines:
+        if r.get("enabled", True) is False:
+            continue
+        for source in sources(r):
+            folder = (
+                source.get("archive_dir") if isinstance(source, dict) else None
+            )
+            if isinstance(folder, str) and source.get("kind") == "whatsapp":
+                archives.setdefault(_norm_path(folder), []).append(
+                    r.get("id", "<missing id>"))
+    for ids in archives.values():
+        if len(ids) > 1:
+            for rid in ids:
+                found.setdefault(rid, []).append(
+                    f"{rid}: whatsapp archive_dir is shared with "
+                    f"{', '.join(i for i in ids if i != rid) or 'another source of this routine'}; "
+                    "each WhatsApp source needs its own archive (it keeps "
+                    "the spool position and the filtered messages)"
+                )
+    sources_by_name = {}
     for r in routines:
         m = r.get("maintenance")
         if (
             isinstance(m, dict) and m.get("kind") == "external_events"
             and r.get("enabled", True) and isinstance(m.get("source"), str)
         ):
-            sources.setdefault(m["source"], []).append(
+            sources_by_name.setdefault(m["source"], []).append(
                 r.get("id", "<missing id>"))
-    for source, ids in sources.items():
+    for source, ids in sources_by_name.items():
         if len(ids) > 1:
             for rid in ids:
                 found.setdefault(rid, []).append(
@@ -2368,8 +2388,11 @@ def _validate_mila_match(source, prefix):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    from . import gmail_mcp, slack_mcp, zoom_source
+    from . import gmail_mcp, slack_mcp, whatsapp_source, zoom_source
     allowed = SOURCE_KEYS | (
+        whatsapp_source.SOURCE_KEYS if source.get("kind") == "whatsapp"
+        else set()
+    ) | (
         zoom_source.SOURCE_KEYS if source.get("kind") == "zoom" else set()
     ) | (
         slack_mcp.SOURCE_KEYS if source.get("kind") == "slack_mcp" else set()
@@ -2684,6 +2707,8 @@ def _validate_source(routine, source, prefix):
         problems.extend(_validate_gmail_mcp(prefix, source))
     if kind == "zoom":
         problems.extend(_validate_zoom(prefix, source))
+    if kind == "whatsapp":
+        problems.extend(whatsapp_source.validate(prefix, source, routine))
     if kind == "gchat":
         spaces = source.get("spaces")
         all_spaces = source.get("all_spaces", False)
@@ -2938,7 +2963,9 @@ def _validate_source(routine, source, prefix):
             )
 
     max_results = source.get("max_results", 20)
-    unlimited_source = kind in {"gmail", "gchat", "slack", "mila", "whisper"}
+    unlimited_source = kind in {
+        "gmail", "gchat", "slack", "mila", "whisper", "whatsapp",
+    }
     if (
         not isinstance(max_results, int)
         or isinstance(max_results, bool)

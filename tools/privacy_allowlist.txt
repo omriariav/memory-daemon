@@ -46,3 +46,8 @@ tests/test_calendar_events.py :: re:[a-z0-9_-]+@(resource|group)\.calendar\.goog
 docs/inbox.md :: CONNECTORS
 workspace_daemon/inbox/widgets.py :: CONNECTORS
 tests/test_inbox_views_ui.py :: CONNECTORS
+
+# Invented WhatsApp JIDs in the spool fixtures: a zero-padded group id and a
+# fictional 555 number (not addresses)
+tests/test_whatsapp_source.py :: 120363000000000001@g.us
+tests/test_whatsapp_source.py :: 15550000001@s.whatsapp.net

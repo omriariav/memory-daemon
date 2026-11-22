@@ -201,7 +201,7 @@ Never reproduce credentials, secrets, or unrelated sensitive personal data.
 # Source-id prefixes of captured entries; the operator-confirmed pattern is
 # built from them.
 CAPTURE_SOURCE_ID_PREFIXES = (
-    "gmail", "gchat", "slack", "gdrive", "mila", "whisper",
+    "gmail", "gchat", "slack", "gdrive", "mila", "whisper", "whatsapp",
 )
 # Every `source` the daemon's own producers write to the event stream (capture
 # prefixes above, plus zoom, calendar, alerts and person briefs). An
@@ -318,7 +318,7 @@ def validate(routine):
         problems.append(
             f"{rid}: memory.operator_confirmed_source_ids must be a list "
             "of canonical source ids (gmail:, gchat:, slack:, gdrive:, "
-            "mila:, or whisper:)"
+            "mila:, whisper:, or whatsapp:)"
         )
     return problems
 
@@ -1747,6 +1747,19 @@ def capture(routine, item, summary, dry_run=False):
         if n:
             log(f"routine={rid} memory: redacted {n} ID-like value(s) "
                 "from the entry body")
+    appendix = item.get("memory_appendix")
+    if isinstance(appendix, str) and appendix.strip():
+        # The source's own verbatim record (WhatsApp: every message with its
+        # time, sender, id and stored attachment path), appended after the
+        # model's distillation so original text survives the paraphrase. The
+        # source already redacted secrets; ID numbers follow memory.redact_ids
+        # like the rest of the entry.
+        if personal.redact_enabled(cfg):
+            appendix, n = personal.redact(appendix)
+            if n:
+                log(f"routine={rid} memory: redacted {n} ID-like value(s) "
+                    "from the verbatim source block")
+        body = f"{body.rstrip()}\n\n{appendix.strip()}\n"
     if active_chat_followup:
         followup_line = (
             "The memory owner manually forwarded this Chat conversation to "

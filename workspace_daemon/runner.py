@@ -13,7 +13,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whatsapp_source, whisper_source
 from .count_only import report as count_report
 from . import gmail_mcp, person_resolver, slack_mcp, sleepclock, zoom_source
 from .shell import log, utc_now_iso
@@ -1477,6 +1477,7 @@ SOURCES = {
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
     "zoom": (zoom_source.candidates, zoom_source.fetch),
+    "whatsapp": (whatsapp_source.candidates, whatsapp_source.fetch),
 }
 
 # Transcript connectors share one protocol beyond enumeration: a Calendar
@@ -1506,6 +1507,8 @@ def _scope(source):
         return "Zoom meeting summaries"
     if source.get("kind") == "whisper":
         return source.get("transcriptions_dir") or "Whisper transcripts"
+    if source.get("kind") == "whatsapp":
+        return "WhatsApp forwarder spool"
     slack_channels = [
         channel
         for key in (
@@ -1547,6 +1550,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "mila": 0,
     "whisper": 0,
     "zoom": 0,
+    "whatsapp": 0,
 }
 
 
@@ -1700,8 +1704,10 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
-    if source.get("kind") in ("slack_mcp", "gmail_mcp", "zoom"):
-        return None  # the source reports watermarks, not a hold
+    if source.get("kind") in ("slack_mcp", "gmail_mcp", "zoom", "whatsapp"):
+        # These keep their own position (watermarks, or the WhatsApp spool
+        # cursor), not a hold.
+        return None
     if source.get("max_results") != 0:
         return f"bounded max_results={source.get('max_results')!r}"
     if (
@@ -1842,6 +1848,10 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         if kind in ("slack_mcp", "gmail_mcp"):
             # Listing skips threads the ledger already holds, so the cap and
             # settle window apply to new work only.
+            listing_source = dict(listing_source, _processed=processed)
+        if kind == "whatsapp":
+            # The ledger says when a chat-day was last captured, which
+            # starts its quiet period and maximum wait afresh.
             listing_source = dict(listing_source, _processed=processed)
         if kind == "zoom":
             # The ledger settles a meeting; the store links transcripts.
@@ -2603,13 +2613,19 @@ def _attach_related_memories(routine, source, item):
     discarded, losing the state transition of an already-captured request.
     Enrichment only: any lookup failure leaves the item unchanged.
     """
-    if source.get("kind") != "gchat":
+    kind = source.get("kind")
+    if kind not in ("gchat", "whatsapp"):
         return
     cfg = memory_sink.memory_cfg(routine)
-    space = (item.get("frontmatter") or {}).get("gchat_space")
+    if kind == "whatsapp":
+        # Earlier days of the same chat (opaque chat reference, no name).
+        space = (item.get("frontmatter") or {}).get("whatsapp_chat_ref")
+        prefix = f"whatsapp:{space}:"
+    else:
+        space = (item.get("frontmatter") or {}).get("gchat_space")
+        prefix = f"gchat:{str(space).split('/')[-1]}:"
     if not cfg or not space:
         return
-    prefix = f"gchat:{space.split('/')[-1]}:"
     try:
         related = memory_sink.recent_entries_for_prefix(
             cfg["store"], prefix, exclude_source_id=item.get("source_id"),
