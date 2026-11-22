@@ -462,19 +462,28 @@ def clean_files(files):
 
 def _gain_file_ids(old, new):
     """Copy the id of a freshly read file onto the stored entry that lacks
-    one (same name and type, each fresh entry used once). True if any was set."""
+    one (same name and type; the entry whose size also matches is preferred;
+    each fresh entry used once). An id the stored list already has is never
+    copied again. True if any id was set."""
+    have = {e.get("id") for e in old if isinstance(e, dict) and e.get("id")}
+    spare = [f for f in new if f.get("id") and f["id"] not in have]
     changed = False
-    spare = [f for f in new if f.get("id")]
     for entry in old:
         if not isinstance(entry, dict) or entry.get("id"):
             continue
-        for fresh in spare:
-            if fresh.get("name") == entry.get("name") \
-                    and fresh.get("filetype") == entry.get("filetype"):
-                entry["id"] = fresh["id"]
-                spare.remove(fresh)
-                changed = True
-                break
+        same = [
+            f for f in spare
+            if f.get("name") == entry.get("name")
+            and f.get("filetype") == entry.get("filetype")
+        ]
+        best = next(
+            (f for f in same if f.get("size") == entry.get("size")),
+            same[0] if same else None,
+        )
+        if best is not None:
+            entry["id"] = best["id"]
+            spare.remove(best)
+            changed = True
     return changed
 
 
@@ -515,14 +524,16 @@ def dm_channels(base_dir, since):
 
 
 def dm_peer_latest(base_dir, since):
-    """{channel: newest ts} of IM/group-DM messages from someone other than
-    the owner, at or after epoch `since` (reactions and the owner's own
-    messages do not count)."""
+    """{channel: newest ts} of IM/group-DM messages from a person other than
+    the owner, at or after epoch `since` (reactions, the owner's own messages
+    and messages of a bot, an app or Slackbot do not count)."""
     out = {}
     for row in _load(path(base_dir)):
         if row.get("channel_type") not in ("im", "mpim") \
                 or row.get("type", "message") != "message" \
-                or row.get("is_owner"):
+                or row.get("is_owner") or row.get("is_bot") \
+                or row.get("peer_is_bot") \
+                or row.get("user_id") == SLACKBOT:
             continue
         ts = float(row["ts"])
         if ts >= since and ts > out.get(row["channel_id"], 0.0):

@@ -1237,15 +1237,15 @@ ZIP = ["Files: report-q3.zip (ID: F0AAAAAAA01, application/zip, 2 KB)"]
 
 
 class FileShareTest(InboxTestCase):
-    def seed_dm(self, channel=DM, kind="im", at=5, peer=True):
+    def seed_dm(self, channel=DM, kind="im", at=5, peer=True, **extra):
         """Store one earlier message; `peer=False` makes it the owner's, so
         the conversation is not hot by the inbox (only quiet)."""
-        comms_inbox.record(self.tmp.name, [{
+        comms_inbox.record(self.tmp.name, [dict({
             "type": "message", "channel_id": channel, "thread_ts": ts_at(at),
             "ts": ts_at(at), "user_id": BOB if peer else ME,
             "is_owner": not peer,
             "is_bot": False, "text": "earlier", "channel_type": kind,
-        }], 90, now=NOW)
+        }, **extra)], 90, now=NOW)
 
     def src(self, **over):
         cfg = dict(
@@ -1436,6 +1436,39 @@ class FileShareTest(InboxTestCase):
         first = comms_inbox.path(self.tmp.name).read_text()
         comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
         self.assertEqual(comms_inbox.path(self.tmp.name).read_text(), first)
+
+    def test_id_already_stored_is_not_copied_onto_a_second_entry(self):
+        # The same name and type twice: the first entry has its id, so the
+        # fresh entry carrying that id must not be copied onto the second.
+        self.stored_dm_message(files=[
+            {"id": "F0000TEST1", "name": "a.pdf"}, {"name": "a.pdf"}])
+        patch = self.late_patch([
+            {"id": "F0000TEST1", "name": "a.pdf"},
+            {"id": "F0000TEST2", "name": "a.pdf"}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(
+            [f.get("id") for f in self.rows()[0]["files"]],
+            ["F0000TEST1", "F0000TEST2"])
+        # Only the stored id on offer: nothing is copied, no duplicate.
+        self.stored_dm_message(files=[
+            {"id": "F0000TEST1", "name": "a.pdf"}, {"name": "a.pdf"}], at=11)
+        only = dict(self.late_patch([{"id": "F0000TEST1", "name": "a.pdf"}]),
+                    ts=ts_at(11), thread_ts=ts_at(11))
+        comms_inbox.record(self.tmp.name, [only], 90, now=NOW)
+        second = [r for r in self.rows() if r["ts"] == ts_at(11)][0]
+        self.assertEqual(
+            [f.get("id") for f in second["files"]], ["F0000TEST1", None])
+
+    def test_id_backfill_prefers_the_entry_with_the_same_size(self):
+        self.stored_dm_message(files=[
+            {"name": "a.pdf", "size": 200}, {"name": "a.pdf", "size": 100}])
+        patch = self.late_patch([
+            {"id": "F0000TEST1", "name": "a.pdf", "size": 100},
+            {"id": "F0000TEST2", "name": "a.pdf", "size": 200}])
+        comms_inbox.record(self.tmp.name, [patch], 90, now=NOW)
+        self.assertEqual(
+            [(f["size"], f["id"]) for f in self.rows()[0]["files"]],
+            [(200, "F0000TEST2"), (100, "F0000TEST1")])
 
     def test_old_rows_without_an_id_are_kept_as_they_are(self):
         self.stored_dm_message(files=[{"name": "a.pdf", "size": 10}])
@@ -1646,11 +1679,47 @@ class FileShareTest(InboxTestCase):
             slack_mcp.candidates(self.src())
         self.assertEqual(self.reads_of(), [DM])
         self.assertEqual(slack_mcp._load_file_state()["fails"][DM]["wait"], 6)
-        # A newer message from someone else gets one more attempt.
+        # A newer message inside the scan interval of the failure is not
+        # enough: at most one override per interval.
         self.seed_dm(DM, at=100_020)
         slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM])
+        # Once the interval has passed, that message gets one more attempt.
+        with mock.patch.object(slack_mcp, "_now", return_value=NOW + 1800):
+            slack_mcp.candidates(self.src())
         self.assertEqual(self.reads_of(), [DM, DM])
-        self.assertEqual(slack_mcp._load_file_state()["fails"][DM]["n"], 4)
+        fails = slack_mcp._load_file_state()["fails"][DM]
+        self.assertEqual((fails["n"], fails["at"]), (4, NOW + 1800))
+        # ... and a still newer one inside the new interval does not.
+        self.seed_dm(DM, at=100_030)
+        with mock.patch.object(slack_mcp, "_now", return_value=NOW + 1900):
+            slack_mcp.candidates(self.src())
+        self.assertEqual(self.reads_of(), [DM, DM])
+
+    def test_bot_and_slackbot_dms_are_never_hot_but_a_group_dm_is(self):
+        bot, app, peerbot, group = (
+            "D0EXAMPLE01", "D0EXAMPLE02", "D0EXAMPLE03", "G0EXAMPLE04")
+        self.seed_dm(bot, is_bot=True)
+        self.seed_dm(app, user_id=comms_inbox.SLACKBOT)
+        # peer_is_bot is derived on write, so put a line that has it in by hand.
+        with comms_inbox.path(self.tmp.name).open("a") as out:
+            out.write(json.dumps({
+                "type": "message", "channel_id": peerbot, "ts": ts_at(5),
+                "thread_ts": ts_at(5), "user_id": BOB, "is_owner": False,
+                "is_bot": False, "text": "x", "channel_type": "im",
+                "peer_is_bot": True}) + "\n")
+        self.seed_dm(group, kind="mpim")
+        peers = comms_inbox.dm_peer_latest(self.tmp.name, 0.0)
+        self.assertEqual(peers, {group: float(ts_at(5))})
+        # Hot goes first: the group DM beats the bot DMs that sort before it.
+        slack_mcp.candidates(self.src(max_file_reads_per_run=2))
+        self.assertEqual(self.reads_of()[0], group)
+
+    def test_excluded_channel_hot_by_the_inbox_is_not_read(self):
+        self.seed_dm(DM)
+        self.seed_dm("D0EXAMPLE02")
+        slack_mcp.candidates(self.src(exclude_channels=[DM]))
+        self.assertEqual(self.reads_of(), ["D0EXAMPLE02"])
 
     def test_backed_off_dm_with_no_new_message_stays_backed_off(self):
         self.seed_dm()  # an old peer message

@@ -30,7 +30,8 @@ with `files` becomes an inbox row with `files: [{id, name, filetype,
 size}]` (the Files line carries the file id but no permalink). Caps:
 `max_file_reads_per_run` (default 5, 0 = off), one read per conversation per
 `file_scan_minutes` unless it had a hit this run or the inbox holds a message
-from someone else newer than its last scan (then every run, ahead of the rest).
+from a person newer than its last scan (a deferred or failed scan; then every
+run, ahead of the rest).
 Excluded channels and self-DMs are never read.
 
 The watch file may also list `save_reactions: [<emoji name>, ...]` (at most 3;
@@ -2446,11 +2447,12 @@ def _file_rows(cfg, found, now):
     `file_scan_lookback_days`) is read with `read_channel_tool`, and the
     messages that carry files become rows. A conversation with a hit this run
     is read every run; the rest at most every `file_scan_minutes`. A
-    conversation is also hot while the inbox holds a message from someone
-    other than the owner that is newer than its scan mark (the message the
-    scan has not yet looked behind, such as a file-only one): it is due every
-    run until a read completes, and ranks ahead of the cold ones. Excluded
-    channels are never read.
+    conversation is also hot while the inbox holds a message from a person
+    (not the owner, not a bot) that is newer than its scan mark: a DM the cap
+    deferred, or whose scan did not run or failed, stays due every run until
+    a read completes, and ranks ahead of the cold ones. (A file-only message
+    is not in the inbox until a scan writes it, so it cannot make its DM hot;
+    it waits for the cold scan or a hit.) Excluded channels are never read.
 
     At most `max_file_reads_per_run` pages are read per run; a truncated page
     is followed by its cursor while budget is left. A read still truncated
@@ -2476,23 +2478,28 @@ def _file_rows(cfg, found, now):
     saved = _load_file_state()
     marks, backfill, fails = saved["marks"], saved["backfill"], saved["fails"]
     skip = excluded_channels(cfg)
-    # Hot by the inbox: a message from someone else newer than the scan mark.
+    # Hot by the inbox: a message from a person other than the owner that is
+    # newer than the scan mark (a DM the cap deferred, or whose scan did not
+    # run or failed, stays hot and goes first next run).
     peer = comms_inbox.dm_peer_latest(_base_dir, lookback)
     fresh = {c for c, ts in peer.items() if ts > marks.get(c, 0.0)}
     hot |= fresh
+    gap = cfg["file_scan_minutes"] * 60
     # A failing channel backs off for min(2**n, 48) runs and ranks after
     # healthy ones, so it cannot hold the quiet slot every run. A channel
-    # hot by the inbox skips the wait when the message that made it hot is
-    # newer than its last failure: one retry per new message, so a channel
-    # that keeps failing is not read every run (its failure time moves up).
+    # hot by the inbox skips the wait at most once per scan interval: only
+    # when the message that made it hot is newer than its last failure
+    # (`at`) and that failure is at least `file_scan_minutes` old. A busy DM
+    # that keeps failing is therefore read once per interval, not every run
+    # (a failure moves `at` up).
     waiting = {c for c, f in fails.items() if f["wait"] > 0}
     for channel in waiting:
         fails[channel]["wait"] -= 1
     waiting = {
         c for c in waiting
-        if not (c in fresh and peer[c] > fails[c].get("at", 0.0))
+        if not (c in fresh and peer[c] > fails[c].get("at", 0.0)
+                and now - fails[c].get("at", 0.0) >= gap)
     }
-    gap = cfg["file_scan_minutes"] * 60
     ranked = sorted(
         (channel not in hot, channel in fails, marks.get(channel, 0.0),
          channel)
