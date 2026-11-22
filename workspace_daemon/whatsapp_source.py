@@ -8,31 +8,33 @@ whether or not anyone read them. This adapter is a spool *consumer*:
 
 * Ingest (during listing). New batches are read in name order. Every message
   is upserted by its stable ``id`` into a private, durable archive
-  (``archive_dir``): ``chats/chat-<chat_key>/<date>.json`` holds the merged
-  records of one chat-day, and each spooled file with status ``copied`` is
-  copied to ``media/<date>/<message id><ext>`` (0600, directories 0700). The
-  last finished batch is remembered, so a restart resumes after it. Because
-  copies and records land in the archive before the cursor moves, and long
-  before any ledger entry exists, the spool's pruning can never lose a file
-  or shrink a conversation that was already seen. The spool itself is never
-  written.
-* Capture unit. One candidate per chat per local day (the spool's
-  timezone). Its memory source id ``whatsapp:chat-<chat_key>:<date>`` is
-  opaque (the forwarder's chat key, never a phone number or JID), so later
-  messages, a late file (``update: "media"``) or a re-sent duplicate update
-  the same memory entry. The candidate id adds a digest of the chat-day's
-  content, so only changed content is reconsidered.
-* Quiet period. A chat-day is offered for analysis only once it had no new
-  or changed message for ``quiet_minutes``, or once its oldest uncaptured
-  change has waited ``max_wait_hours``; until then it stays listed as
-  deferred so no other routine claims it.
-* Text from media, locally. Voice notes and audio are transcribed with
-  whisper.cpp (``whisper-cli``) after ffmpeg converts them to 16 kHz mono
-  WAV; PDFs give a bounded ``pdftotext`` excerpt. Results are cached next to
-  the stored file; any failure degrades to "no transcript".
+  (``archive_dir``): ``chats/<chat>/<date>.json`` holds the merged records of
+  one chat-day, and each spooled file with status ``copied`` is copied to
+  ``media/<date>/<message id><ext>`` (0600, folders 0700). Voice notes and
+  PDFs then get local text extraction under a per-run time budget. The last
+  finished batch is remembered, so a restart resumes after it. Copies and
+  records land in the archive before the position moves and long before the
+  ledger settles a day, so the spool's pruning can never lose a file or
+  shrink a conversation that was already seen. The spool is never written.
+* Chat identity. ``chat_key`` is a database row key (it changes when
+  WhatsApp is reinstalled or re-linked) and the forwarder's ``chat_id`` is a
+  hash of the chat JID (it changes when a chat moves from a phone-number JID
+  to an ``@lid`` one). Neither is stable alone, so the archive keeps its own
+  chat ids in ``chats/registry.json``: each archive chat collects the
+  ``(store_id, chat_key)`` pairs and ``chat_id`` values seen for it, and a
+  message joins an existing chat when either one is already known.
+* Capture unit. One candidate per archive chat per local day (the spool's
+  timezone), memory source id ``whatsapp:<chat>:<date>``: opaque, never a
+  phone number or JID. Later messages, a late file, a finished transcript or
+  a re-sent message update the same memory; the candidate id adds a digest of
+  the day's content so only changed content is reconsidered.
+* Quiet period. A chat-day is offered for analysis once it had no change for
+  ``quiet_minutes`` and no media text is still pending, or once its oldest
+  uncaptured change has waited ``max_wait_hours``. Until then it is listed
+  as deferred so no other routine claims it.
 
-Logs carry counts, opaque ids and error classes only: never message text,
-names, chat labels, JIDs or file names.
+Logs carry counts, batch names, opaque ids and error classes only: never
+message text, names, chat labels, JIDs or file names.
 """
 import datetime
 import hashlib
@@ -41,6 +43,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -51,23 +54,29 @@ from .shell import log, optional_bin, run
 
 FORMAT = "whatsapp-forwarder-spool"
 VERSION = 1
-ARCHIVE_VERSION = 1
+ARCHIVE_VERSION = 2
 
 BATCH_RE = re.compile(r"^b[0-9]{10}-[0-9]{8}T[0-9]{6}Z$")
 MESSAGE_ID_RE = re.compile(r"^wa1-[0-9a-f]{40}$")
+CHAT_ID_RE = re.compile(r"^wac1-[0-9a-f]{32}$")
+STORE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+LOCAL_CHAT_RE = re.compile(r"^c[0-9a-f]{10}(?:-[0-9]{1,4})?$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # media.path is relative to the spool: "<batch>/media/wa-<row key>.<ext>".
 MEDIA_PATH_RE = re.compile(
     r"^(?P<batch>b[0-9]{10}-[0-9]{8}T[0-9]{6}Z)/media/"
     r"(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,120})$"
 )
+STORED_MEDIA_RE = re.compile(r"^wa1-[0-9a-f]{40}\.[A-Za-z0-9]{1,10}$")
 EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 MEDIA_KINDS = ("image", "video", "audio", "document", "gif", "sticker")
 SPOOL_STATUSES = (
     "copied", "not_selected", "too_large", "not_downloaded", "unreadable",
-    "blocked_type",
+    "blocked_type", "gave_up",
 )
 UNKNOWN_SENDER_RE = re.compile(r"^Unknown(?:-\d{1,6})?$")
+UNKNOWN_STORE = "unknown"
 
 DEFAULTS = {
     "quiet_minutes": 60,
@@ -79,12 +88,15 @@ DEFAULTS = {
     "whisper_model": None,
     "whisper_language": "auto",
     "whisper_threads": None,
-    "transcribe_timeout_seconds": 900,
+    "transcribe_timeout_seconds": 300,
     "transcript_max_chars": 8000,
     "pdf_text": True,
     "pdf_max_pages": 20,
     "pdf_max_chars": 4000,
+    "extract_budget_seconds": 300,
     "max_body_chars": 60000,
+    "archive_keep_days": None,
+    "recapture_after_rebuild": False,
     "chat_keys": [],
     "exclude_chat_keys": [],
     "chat_labels": [],
@@ -92,11 +104,32 @@ DEFAULTS = {
 }
 SOURCE_KEYS = set(DEFAULTS) | {"spool_dir", "archive_dir"}
 
-# Text from media. Each extractor maps a stored file to (text, None) or
-# (None, reason). A later image or video description step (a vision model)
-# plugs in here as another entry, e.g. "image": _describe_image, and is
-# cached and rendered exactly like a transcript.
+PDF_TIMEOUT_SECONDS = 60
+EXTRACT_MAX_ATTEMPTS = 3
+EXTRACT_BACKOFF_SECONDS = 15 * 60
+STALE_TEMP_SECONDS = 2 * 3600
+MEDIA_RECOUNT_SECONDS = 24 * 3600
+
+# Copy outcomes that are retried while the spool still holds the file. A
+# limit (too_large, archive_full) is retried too, so raising a limit takes
+# effect; "missing" (a batch is complete when it appears, so the file was
+# pruned), a bad path and a non-regular file are final.
+_RETRY_COPY = ("", "changed", "copy_failed", "sha_mismatch", "too_large",
+               "archive_full")
+
+# Text from media. Each extractor maps a stored file to
+# (text, reason, transient). A later image or video description step (a
+# vision model) plugs in here as another entry, e.g. "image":
+# _describe_image, plus one line in _extraction_kind; it is budgeted, cached,
+# retried and rendered exactly like a transcript.
 _CACHE_SUFFIX = {"transcript": ".transcript.txt", "pdf": ".pdf.txt"}
+# A missing tool or model is an installation state, not a property of the
+# file: such messages are retried once the tool is there.
+_UNAVAILABLE = {"tool_missing", "model_missing"}
+_EXTRACT_FINAL = ("done", "failed")
+
+# Seconds of extraction spent by this process (one daemon tick).
+_extract_spent = 0.0
 
 
 def _now():
@@ -109,6 +142,13 @@ def settings(source):
     cfg["spool_dir"] = source.get("spool_dir")
     cfg["archive_dir"] = source.get("archive_dir")
     return cfg
+
+
+class Listing(list):
+    """Candidates of one listing. ``degraded`` names a problem that left the
+    listing incomplete (the runner logs it as an error and keeps lower-ranked
+    routines away), while the chat-days it could offer are still offered."""
+    degraded = None
 
 
 # --- validation ----------------------------------------------------------------
@@ -182,8 +222,7 @@ def path_problems(source):
         problem = _private_dir_problem(archive, "archive_dir")
         if problem:
             problems.append(problem)
-        tree = _git_tree(archive)
-        if tree is not None:
+        if _git_tree(archive) is not None:
             problems.append(
                 "archive_dir is inside a git work tree; message text and "
                 "media must stay out of every repository"
@@ -222,16 +261,23 @@ def validate(prefix, source, routine=None):
         ("quiet_minutes", 0, 1440),
         ("max_file_mb", 1, 2048),
         ("max_total_mb", 1, 1048576),
-        ("transcribe_timeout_seconds", 10, 7200),
+        ("transcribe_timeout_seconds", 10, 1800),
         ("transcript_max_chars", 200, 200000),
         ("pdf_max_pages", 1, 500),
         ("pdf_max_chars", 200, 200000),
+        ("extract_budget_seconds", 0, 3600),
         ("max_body_chars", 2000, 500000),
     ):
         if key in source and not _bounded_number(source[key], lower, upper):
             problems.append(
                 f"{prefix}.{key} must be an integer from {lower} to {upper}"
             )
+    keep = source.get("archive_keep_days")
+    if keep is not None and not _bounded_number(keep, 1, 36500):
+        problems.append(
+            f"{prefix}.archive_keep_days must be an integer from 1 to 36500 "
+            "(leave it out to keep the archive)"
+        )
     if "max_wait_hours" in source and not _bounded_number(
         source["max_wait_hours"], 0.25, 72, integer=False
     ):
@@ -247,7 +293,8 @@ def validate(prefix, source, routine=None):
         problems.append(
             f"{prefix}.quiet_minutes must not exceed max_wait_hours"
         )
-    for key in ("copy_media", "transcribe_audio", "pdf_text"):
+    for key in ("copy_media", "transcribe_audio", "pdf_text",
+                "recapture_after_rebuild"):
         if key in source and not isinstance(source[key], bool):
             problems.append(f"{prefix}.{key} must be true or false")
     if source.get("transcribe_audio") is True:
@@ -301,14 +348,13 @@ def validate(prefix, source, routine=None):
     return problems
 
 
-# --- archive -------------------------------------------------------------------
+# --- archive files ---------------------------------------------------------------
 
 def _private_tree(directory):
     """Create ``directory`` and any missing parents, each one 0700.
 
     ``Path.mkdir(parents=True, mode=...)`` applies the mode to the last
-    folder only; the intermediate ones (``media/``, ``chats/``) would get
-    the umask's 0755.
+    folder only; the intermediate ones would get the umask's 0755.
     """
     directory = Path(directory)
     missing = []
@@ -337,25 +383,32 @@ def _read_json(path, default):
 
 def _cursor_path(archive, spool):
     digest = hashlib.sha256(
-        os.path.normpath(spool).encode("utf-8")
+        os.path.normpath(str(spool)).encode("utf-8")
     ).hexdigest()[:12]
     return Path(archive) / f"spool-cursor-{digest}.json"
 
 
-def chat_ref(chat_key):
-    return f"chat-{int(chat_key)}"
+def identity(chat, date):
+    return f"whatsapp:{chat}:{date}"
 
 
-def identity(chat_key, date):
-    return f"whatsapp:{chat_ref(chat_key)}:{date}"
-
-
-def _day_relpath(chat_key, date):
-    return f"chats/{chat_ref(chat_key)}/{date}.json"
+def _day_relpath(chat, date):
+    return f"chats/{chat}/{date}.json"
 
 
 def _media_relpath(message_id, date, extension):
     return f"media/{date}/{message_id}{extension}"
+
+
+def _stamp_epoch(batch_name):
+    """UTC creation time from a batch name, as Unix seconds."""
+    return int(datetime.datetime.strptime(
+        batch_name[12:], "%Y%m%dT%H%M%SZ"
+    ).replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _order(message):
+    return (message.get("epoch") or 0, message.get("id") or "")
 
 
 def _content_digest(day):
@@ -363,6 +416,7 @@ def _content_digest(day):
     rows = []
     for message in sorted(day["messages"].values(), key=_order):
         media = message.get("media") or None
+        extract = message.get("extract") or {}
         rows.append([
             message["id"], message.get("timestamp"), message.get("epoch"),
             message.get("sender"), bool(message.get("from_me")),
@@ -373,14 +427,11 @@ def _content_digest(day):
                 media.get("size"),
             ],
             bool(message.get("stored_path")),
+            extract.get("state"),
         ])
     return hashlib.sha256(
         json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()[:16]
-
-
-def _order(message):
-    return (message.get("epoch") or 0, message.get("id") or "")
 
 
 def _clean_record(message):
@@ -390,7 +441,8 @@ def _clean_record(message):
     if isinstance(media, dict):
         kept_media = {
             key: media.get(key)
-            for key in ("kind", "status", "path", "original_name", "mime", "size")
+            for key in ("kind", "status", "path", "original_name", "mime",
+                        "size", "sha256")
         }
     return {
         "id": message["id"],
@@ -434,18 +486,151 @@ def _valid_message(message):
     return media is None or isinstance(media, dict)
 
 
-def _wanted(cfg, chat_key, label):
-    """Whether a chat passes the source's include and exclude filters."""
+def _wanted(cfg, chat_keys, label):
+    """Whether a chat passes the include and exclude filters.
+
+    ``chat_keys`` are every chat key the archive chat has had (one per
+    WhatsApp store); a chat linked across a reinstall keeps its inclusion.
+    """
     include_keys, include_labels = cfg["chat_keys"], cfg["chat_labels"]
     if (include_keys or include_labels) and not (
-        chat_key in include_keys or label in include_labels
+        set(chat_keys) & set(include_keys) or label in include_labels
     ):
         return False
     return not (
-        chat_key in cfg["exclude_chat_keys"]
+        set(chat_keys) & set(cfg["exclude_chat_keys"])
         or label in cfg["exclude_chat_labels"]
     )
 
+
+# --- chat identity -------------------------------------------------------------
+
+class _Registry:
+    """The archive's own chat ids, linked to every identity seen for them."""
+
+    def __init__(self, path):
+        self.path = path
+        data = _read_json(path, None)
+        if not isinstance(data, dict) or not isinstance(data.get("chats"), dict):
+            data = {"v": 1, "chats": {}, "stores": [], "unknown_store": None}
+        self.data = data
+        self.chats = data["chats"]
+        self.dirty = False
+        self.conflicts = 0
+        self.by_key, self.by_chat_id = {}, {}
+        for local, chat in self.chats.items():
+            for key in chat.get("keys", []):
+                self.by_key[key] = local
+            for chat_id in chat.get("chat_ids", []):
+                self.by_chat_id[chat_id] = local
+
+    def _store_keys(self, store, chat_key):
+        """The store-qualified keys a message may match.
+
+        Batches written before the forwarder knew its store id use the
+        "unknown" namespace, which is the same database as the first store
+        id seen next to it; any other store never matches on chat_key.
+        """
+        alias = self.data.get("unknown_store")
+        if store == UNKNOWN_STORE:
+            stores = [UNKNOWN_STORE] + ([alias] if alias else [])
+        else:
+            stores = [store] + ([UNKNOWN_STORE] if store == alias else [])
+        return [f"{name}|{chat_key}" for name in stores]
+
+    def note_store(self, store):
+        stores = self.data.setdefault("stores", [])
+        if store != UNKNOWN_STORE and store not in stores:
+            stores.append(store)
+            self.dirty = True
+        if self.data.get("unknown_store") is None:
+            has_unknown = any(
+                key.startswith(f"{UNKNOWN_STORE}|") for key in self.by_key
+            )
+            if store != UNKNOWN_STORE and has_unknown:
+                self.data["unknown_store"] = store
+                self.dirty = True
+            elif store == UNKNOWN_STORE and stores:
+                self.data["unknown_store"] = stores[-1]
+                self.dirty = True
+
+    def peek(self, store, chat_key, chat_id):
+        """The archive chat a message belongs to, without recording anything."""
+        found = self.by_chat_id.get(chat_id) if chat_id else None
+        if found:
+            return found
+        for key in self._store_keys(store, chat_key):
+            if key in self.by_key:
+                return self.by_key[key]
+        return None
+
+    def resolve(self, store, chat_key, chat_id, label):
+        self.note_store(store)
+        by_id = self.by_chat_id.get(chat_id) if chat_id else None
+        by_key = next(
+            (self.by_key[key] for key in self._store_keys(store, chat_key)
+             if key in self.by_key),
+            None,
+        )
+        own_key = f"{store}|{chat_key}"
+        if by_id and by_key and by_id != by_key:
+            # Two archive chats turned out to be one: the stronger identity
+            # (chat_id) wins this key from now on; earlier days stay where
+            # they are.
+            self.conflicts += 1
+            keys = self.chats[by_key]["keys"]
+            if own_key in keys:
+                keys.remove(own_key)
+        local = by_id or by_key
+        if local is None:
+            seed = f"id:{chat_id}" if chat_id else f"key:{own_key}"
+            local = "c" + hashlib.sha256(seed.encode()).hexdigest()[:10]
+            base, n = local, 1
+            while local in self.chats:
+                n += 1
+                local = f"{base}-{n}"
+            self.chats[local] = {"keys": [], "chat_ids": [], "chat_keys": []}
+            self.dirty = True
+        chat = self.chats[local]
+        if own_key not in chat["keys"]:
+            chat["keys"].append(own_key)
+            self.by_key[own_key] = local
+            self.dirty = True
+        if chat_key not in chat.setdefault("chat_keys", []):
+            chat["chat_keys"].append(chat_key)
+            self.dirty = True
+        if chat_id and chat_id not in chat["chat_ids"]:
+            chat["chat_ids"].append(chat_id)
+            self.by_chat_id[chat_id] = local
+            self.dirty = True
+        if chat.get("label") != label:
+            chat["label"] = label
+            self.dirty = True
+        return local
+
+    def chat_keys(self, local):
+        return list((self.chats.get(local) or {}).get("chat_keys") or [])
+
+    def label(self, local):
+        return str((self.chats.get(local) or {}).get("label") or "")
+
+    def keys_in_current_store(self):
+        stores = self.data.get("stores") or []
+        if len(stores) < 2:
+            return None  # no store change seen
+        current = stores[-1]
+        return {
+            int(key.split("|", 1)[1]) for key in self.by_key
+            if key.split("|", 1)[0] == current
+        }
+
+    def save(self):
+        if self.dirty:
+            _write_json(self.path, self.data)
+            self.dirty = False
+
+
+# --- media copies ----------------------------------------------------------------
 
 class _MediaSkip(Exception):
     """A spooled file that is not copied; ``code`` says why."""
@@ -475,12 +660,29 @@ def _spool_file(spool, relpath):
     return path, info.st_size
 
 
-def _copy_file(source_path, size, destination):
-    """Copy byte for byte into ``destination`` (0600), atomically."""
+def _sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_file(source_path, size, destination, expected_sha=None):
+    """Copy byte for byte into ``destination`` (0600), atomically.
+
+    Returns (copied, size of the file it replaced). With ``expected_sha`` a
+    copy whose content does not match is thrown away (``sha_mismatch``).
+    """
+    replaced = 0
     if destination.exists():
-        if destination.stat().st_size == size:
+        current = destination.stat().st_size
+        if current == size and (
+            not expected_sha or _sha256_of(destination) == expected_sha
+        ):
             os.chmod(destination, 0o600)
-            return False
+            return False, 0
+        replaced = current
     _private_tree(destination.parent)
     temp = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -488,14 +690,19 @@ def _copy_file(source_path, size, destination):
     try:
         target_fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
+            digest = hashlib.sha256()
             with os.fdopen(source_fd, "rb", closefd=False) as reader, \
                     os.fdopen(target_fd, "wb") as writer:
-                shutil.copyfileobj(reader, writer, 1024 * 1024)
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    writer.write(chunk)
                 writer.flush()
                 os.fsync(writer.fileno())
             os.chmod(temp, 0o600)
             if temp.stat().st_size != size:
                 raise _MediaSkip("changed")
+            if expected_sha and digest.hexdigest() != expected_sha:
+                raise _MediaSkip("sha_mismatch")
             os.replace(temp, destination)
         except BaseException:
             try:
@@ -505,46 +712,215 @@ def _copy_file(source_path, size, destination):
             raise
     finally:
         os.close(source_fd)
-    return True
+    return True, replaced
 
 
-# A copy that failed for one of these reasons is retried while the spool
-# still holds the file. The others are final: size and quota limits, a bad
-# path, and "missing" (a batch is complete when it appears, so a file that is
-# not there was pruned).
-_RETRY_COPY = ("changed", "copy_failed")
-_LOCAL_FIELDS = ("first_epoch", "changed_epoch", "stored_path", "store_note")
-
-
-def _content(record):
-    """A record without local bookkeeping or the batch-specific file path."""
-    value = {k: v for k, v in record.items() if k not in _LOCAL_FIELDS}
-    value.pop("backfill", None)
-    if isinstance(value.get("media"), dict):
-        value["media"] = {
-            k: v for k, v in value["media"].items() if k != "path"
-        }
-    return value
+def _note_code(record):
+    return str(record.get("store_note") or "").split(":")[0]
 
 
 def _retry_copy(record):
-    note = str(record.get("store_note") or "")
     return (
         (record.get("media") or {}).get("status") == "copied"
         and not record.get("stored_path")
-        and (not note or note.split(":")[0] in _RETRY_COPY)
+        and _note_code(record) in _RETRY_COPY
     )
 
 
-def _index_entry(day, copy_media):
-    messages = day["messages"].values()
+# --- media text ------------------------------------------------------------------
+
+def ffmpeg_bin():
+    return optional_bin("ffmpeg", "WORKSPACE_DAEMON_FFMPEG_BIN")
+
+
+def whisper_cli_bin():
+    return optional_bin("whisper-cli", "WORKSPACE_DAEMON_WHISPER_CLI_BIN")
+
+
+def pdftotext_bin():
+    return optional_bin("pdftotext", "WORKSPACE_DAEMON_PDFTOTEXT_BIN")
+
+
+def _tool(command, timeout, label):
+    """Run one tool; (result, None) or (None, (reason, transient)).
+
+    A non-zero exit is a property of the input (deterministic); a timeout,
+    a kill by signal or an OS error (no memory, too many files) is not.
+    """
+    try:
+        result = run(command, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, (f"{label}_timeout", True)
+    except (OSError, MemoryError) as exc:
+        return None, (f"{label}_error:{type(exc).__name__}", True)
+    if result.returncode < 0:
+        return None, (f"{label}_killed", True)
+    if result.returncode != 0:
+        return None, (f"{label}_failed", False)
+    return result, None
+
+
+def _transcribe(cfg, path, workdir):
+    ffmpeg, whisper = ffmpeg_bin(), whisper_cli_bin()
+    if not ffmpeg or not whisper:
+        return None, "tool_missing", False
+    model = cfg.get("whisper_model")
+    if not model or not Path(model).is_file():
+        return None, "model_missing", False
+    timeout = cfg["transcribe_timeout_seconds"]
+    wav = workdir / "audio.wav"
+    _result, problem = _tool([
+        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(path), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+        str(wav),
+    ], timeout, "convert")
+    if problem:
+        return None, problem[0], problem[1]
+    command = [
+        whisper, "-m", str(model), "-l", cfg["whisper_language"],
+        "-f", str(wav), "-nt", "-np", "-otxt", "-of", str(workdir / "out"),
+    ]
+    if cfg.get("whisper_threads"):
+        command += ["-t", str(cfg["whisper_threads"])]
+    _result, problem = _tool(command, timeout, "transcribe")
+    if problem:
+        return None, problem[0], problem[1]
+    try:
+        text = (workdir / "out.txt").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return None, f"transcribe_output:{type(exc).__name__}", True
+    return (text, None, False) if text else (None, "empty", False)
+
+
+def _pdf_text(cfg, path, _workdir):
+    binary = pdftotext_bin()
+    if not binary:
+        return None, "tool_missing", False
+    result, problem = _tool([
+        binary, "-q", "-enc", "UTF-8", "-l", str(cfg["pdf_max_pages"]),
+        str(path), "-",
+    ], PDF_TIMEOUT_SECONDS, "pdf")
+    if problem:
+        return None, problem[0], problem[1]
+    text = re.sub(r"[ \t]+\n", "\n", result.stdout or "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return (text[:200000], None, False) if text else (None, "no_text", False)
+
+
+_EXTRACTORS = {"transcript": _transcribe, "pdf": _pdf_text}
+
+
+def _extraction_kind(cfg, message):
+    media = message.get("media") or {}
+    if media.get("kind") == "audio" and cfg["transcribe_audio"]:
+        return "transcript"
+    if media.get("kind") == "document" and cfg["pdf_text"]:
+        name = str(media.get("original_name") or message.get("stored_path") or "")
+        if media.get("mime") == "application/pdf" or name.lower().endswith(".pdf"):
+            return "pdf"
+    return None
+
+
+def _tools_ready(cfg):
+    model = cfg.get("whisper_model")
     return {
-        "chat_key": day["chat_key"],
+        "transcript": bool(
+            cfg["transcribe_audio"] and ffmpeg_bin() and whisper_cli_bin()
+            and model and Path(model).is_file()
+        ),
+        "pdf": bool(cfg["pdf_text"] and pdftotext_bin()),
+    }
+
+
+def _extract_paths(archive, message, kind):
+    stored = Path(archive) / message["stored_path"]
+    return (
+        stored,
+        stored.with_name(stored.name + _CACHE_SUFFIX[kind]),
+        stored.with_name(stored.name + f".{kind}.failed"),
+        stored.with_name(stored.name + f".{kind}.attempts"),
+    )
+
+
+def _run_extraction(cfg, archive, message, kind, now, counts):
+    """The extraction state of one stored file, running it when due."""
+    global _extract_spent
+    stored, cache, failed, attempts_path = _extract_paths(archive, message, kind)
+    if cache.exists():
+        return {"kind": kind, "state": "done"}
+    if failed.exists():
+        reason = failed.read_text(encoding="utf-8").strip() or "failed"
+        return {"kind": kind, "state": "failed", "reason": reason}
+    if not stored.is_file():
+        return {"kind": kind, "state": "failed", "reason": "stored_file_missing"}
+    attempts = _read_json(attempts_path, {})
+    attempts = attempts if isinstance(attempts, dict) else {}
+    count = int(attempts.get("count") or 0)
+    if count and now - float(attempts.get("last") or 0) < (
+        EXTRACT_BACKOFF_SECONDS * 2 ** (count - 1)
+    ):
+        return {"kind": kind, "state": "pending",
+                "reason": str(attempts.get("reason") or "retry")}
+    if _extract_spent >= cfg["extract_budget_seconds"]:
+        counts["deferred"] += 1
+        return {"kind": kind, "state": "pending", "reason": "budget"}
+    scratch = Path(archive) / ".tmp"
+    _private_tree(scratch)
+    workdir = Path(tempfile.mkdtemp(dir=scratch))
+    started = time.monotonic()
+    try:
+        text, reason, transient = _EXTRACTORS[kind](cfg, stored, workdir)
+    except Exception as exc:  # an extractor bug must not fail the listing
+        text, reason, transient = None, f"error:{type(exc).__name__}", True
+    finally:
+        _extract_spent += time.monotonic() - started
+        shutil.rmtree(workdir, ignore_errors=True)
+    if text:
+        state.write_atomic(cache, text + "\n", mode=0o600)
+        try:
+            attempts_path.unlink()
+        except FileNotFoundError:
+            pass
+        counts[kind] += 1
+        return {"kind": kind, "state": "done"}
+    if reason in _UNAVAILABLE:
+        counts["unavailable"] += 1
+        return {"kind": kind, "state": "unavailable", "reason": reason}
+    counts["failed"] += 1
+    if transient and count + 1 < EXTRACT_MAX_ATTEMPTS:
+        _write_json(attempts_path, {
+            "count": count + 1, "last": now, "reason": reason,
+        })
+        return {"kind": kind, "state": "pending", "reason": reason}
+    final = reason if not transient else f"gave_up:{reason}"
+    state.write_atomic(failed, final + "\n", mode=0o600)
+    try:
+        attempts_path.unlink()
+    except FileNotFoundError:
+        pass
+    return {"kind": kind, "state": "failed", "reason": final}
+
+
+# --- ingest ----------------------------------------------------------------------
+
+class _BatchError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _index_entry(chat, day):
+    messages = list(day["messages"].values())
+    states = [(m.get("extract") or {}).get("state") for m in messages]
+    return {
+        "chat": chat,
         "date": day["date"],
         "label": day.get("chat_label", ""),
         "digest": _content_digest(day),
         "changed": max((m.get("changed_epoch") or 0) for m in messages),
-        "pending_copies": copy_media and any(_retry_copy(m) for m in messages),
+        "pending_copies": any(_retry_copy(m) for m in messages),
+        "pending_extract": "pending" in states,
+        "unavailable_extract": "unavailable" in states,
     }
 
 
@@ -556,36 +932,113 @@ class _Ingest:
         self.dry_run = dry_run
         self.spool = Path(cfg["spool_dir"])
         self.archive = Path(cfg["archive_dir"])
-        self.index_path = self.archive / "chats" / "index.json"
+        self.chats_dir = self.archive / "chats"
+        self.index_path = self.chats_dir / "index.json"
         index = _read_json(self.index_path, {})
         self.index = index if isinstance(index, dict) else {}
         self.index.setdefault("v", ARCHIVE_VERSION)
         self.index.setdefault("days", {})
         self.index.setdefault("media_bytes", 0)
+        self.registry = _Registry(self.chats_dir / "registry.json")
+        self.cursor_path = _cursor_path(self.archive, self.spool)
+        cursor = _read_json(self.cursor_path, None)
+        # A new archive: no position and no chat-day files yet (deleting only
+        # the cursor to re-read the spool does not make an archive new).
+        self.fresh = not isinstance(cursor, dict) and not any(
+            self.chats_dir.glob("*/*.json"))
+        self.cursor = cursor if isinstance(cursor, dict) else {}
         self.days = {}
-        self.last_merged = None
+        self.touched = set()  # chat-days whose index entry is recomputed
         self.dirty = set()    # chat-days to write back
         self.changed = set()  # chat-days whose content changed
+        self.index_dirty = False
+        self.batch_error = None
+        self.last_merged = None
+        self.store = UNKNOWN_STORE
         self.counts = dict.fromkeys((
             "batches", "messages", "new", "updated", "duplicates", "invalid",
-            "filtered", "copied", "reused", "too_large", "archive_full",
-            "copy_failed",
+            "filtered", "expired", "copied", "reused", "too_large",
+            "archive_full", "copy_failed", "transcript", "pdf", "failed",
+            "unavailable", "deferred",
         ), 0)
 
-    def day(self, chat_key, date):
-        key = identity(chat_key, date)
+    # -- days --
+    def day(self, chat, date):
+        key = identity(chat, date)
         if key not in self.days:
-            loaded = _read_json(self.archive / _day_relpath(chat_key, date), None)
+            loaded = _read_json(self.archive / _day_relpath(chat, date), None)
             if not isinstance(loaded, dict) or not isinstance(
                 loaded.get("messages"), dict
             ):
                 loaded = {
-                    "v": ARCHIVE_VERSION, "chat_key": chat_key, "date": date,
+                    "v": ARCHIVE_VERSION, "chat": chat, "date": date,
                     "messages": {},
                 }
             self.days[key] = loaded
         return self.days[key]
 
+    def reconcile(self):
+        """Index every day file the index does not know (or has stale).
+
+        The index is derived data: a crash between writing a day file and
+        the index must never hide that day.
+        """
+        days = self.index["days"]
+        seen = set()
+        for path in self.chats_dir.glob("*/*.json"):
+            chat, date = path.parent.name, path.stem
+            if not LOCAL_CHAT_RE.match(chat) or not DATE_RE.match(date):
+                continue
+            key = identity(chat, date)
+            seen.add(key)
+            if key not in days:
+                self.day(chat, date)
+                self.touched.add(key)
+        for key, meta in list(days.items()):
+            if key not in seen and not meta.get("expired"):
+                # Its file is gone (a retention run interrupted between the
+                # day file and the index): keep a tombstone, so a late record
+                # cannot start a partial day under the same source id.
+                days[key] = {"chat": meta.get("chat"), "date": meta.get("date"),
+                             "expired": True}
+                self.index_dirty = True
+
+    # -- housekeeping --
+    def sweep_temp(self, now):
+        """Remove temp files and extraction folders a killed run left."""
+        if not self.archive.is_dir():
+            return
+        for path in self.archive.rglob(".*.tmp"):
+            try:
+                if path.is_file() and now - path.stat().st_mtime > STALE_TEMP_SECONDS:
+                    path.unlink()
+            except OSError:
+                pass
+        scratch = self.archive / ".tmp"
+        if scratch.is_dir():
+            for path in scratch.iterdir():
+                try:
+                    if now - path.stat().st_mtime > STALE_TEMP_SECONDS:
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+
+    def recount_media(self, now):
+        """Recount the archive's media bytes now and then (self-correcting)."""
+        if now - float(self.index.get("media_counted") or 0) < MEDIA_RECOUNT_SECONDS:
+            return
+        total = 0
+        media = self.archive / "media"
+        if media.is_dir():
+            for path in media.rglob("wa1-*"):
+                if STORED_MEDIA_RE.match(path.name) and path.is_file():
+                    total += path.stat().st_size
+        if total != self.index.get("media_bytes"):
+            self.index["media_bytes"] = total
+        self.index["media_counted"] = now
+        self.index_dirty = True
+
+    # -- copies --
     def copy(self, record, date):
         """Copy one spooled file into the archive. True when now stored."""
         media = record.get("media") or {}
@@ -609,7 +1062,12 @@ class _Ingest:
             relpath = _media_relpath(record["id"], date, extension)
             if self.dry_run:
                 return False
-            copied = _copy_file(source_path, size, self.archive / relpath)
+            expected = media.get("sha256")
+            expected = expected if isinstance(expected, str) and (
+                SHA256_RE.match(expected)) else None
+            copied, replaced = _copy_file(
+                source_path, size, self.archive / relpath, expected,
+            )
         except _MediaSkip as skip:
             record["store_note"] = skip.code
             key = skip.code if skip.code in self.counts else "copy_failed"
@@ -622,22 +1080,64 @@ class _Ingest:
         record["stored_path"] = relpath
         record.pop("store_note", None)
         if copied:
-            self.index["media_bytes"] += size
+            self.index["media_bytes"] += size - replaced
+            self.index_dirty = True
             self.counts["copied"] += 1
         else:
             self.counts["reused"] += 1
         return True
 
+    def retry_copies(self):
+        """Retry copies that may succeed now (transient, or a raised limit)."""
+        if not self.cfg["copy_media"]:
+            return
+        for key, meta in list(self.index["days"].items()):
+            if not meta.get("pending_copies") or meta.get("expired"):
+                continue
+            day = self.day(meta["chat"], meta["date"])
+            self.touched.add(key)
+            for record in day["messages"].values():
+                if not _retry_copy(record):
+                    continue
+                note = record.get("store_note")
+                if self.copy(record, meta["date"]):
+                    record["changed_epoch"] = int(_now())
+                    self.changed.add(key)
+                if record.get("store_note") != note or record.get("stored_path"):
+                    self.dirty.add(key)
+
+    # -- merge --
     def merge(self, message, batch_epoch, timezone):
-        """Upsert one spool record by id; a later record is a newer version."""
+        chat_id = message.get("chat_id")
+        chat_id = chat_id if isinstance(chat_id, str) and CHAT_ID_RE.match(
+            chat_id) else None
+        label = str(message.get("chat_label") or "")
+        known = self.registry.peek(self.store, message["chat_key"], chat_id)
+        chat_keys = set(self.registry.chat_keys(known)) if known else set()
+        if not _wanted(self.cfg, chat_keys | {message["chat_key"]}, label):
+            self.counts["filtered"] += 1
+            return
+        chat = self.registry.resolve(
+            self.store, message["chat_key"], chat_id, label
+        )
         record = _clean_record(message)
         date = record["timestamp"][:10]
-        key = identity(record["chat_key"], date)
-        day = self.day(record["chat_key"], date)
-        day["chat_label"] = record["chat_label"]
-        day["chat_type"] = record["chat_type"]
-        if timezone:
-            day["timezone"] = timezone
+        key = identity(chat, date)
+        if (self.index["days"].get(key) or {}).get("expired"):
+            # Removed by archive_keep_days after its capture: a late record
+            # must not start a partial day that overwrites the stored entry.
+            self.counts["expired"] += 1
+            return
+        day = self.day(chat, date)
+        self.touched.add(key)
+        for field, value in (
+            ("chat_label", record["chat_label"]),
+            ("chat_type", record["chat_type"]),
+            ("timezone", timezone),
+        ):
+            if value and day.get(field) != value:
+                day[field] = value
+                self.dirty.add(key)
         existing = day["messages"].get(record["id"])
         if existing is None:
             record["first_epoch"] = record["changed_epoch"] = batch_epoch
@@ -648,8 +1148,7 @@ class _Ingest:
             self.dirty.add(key)
             return
         if message.get("update") == "media":
-            # Only the file is news. The contract does not promise that the
-            # follow-up repeats text, sender and time, so keep ours.
+            # Only the file is news: keep our text, sender and time.
             new_media = record["media"]
             record = {
                 k: v for k, v in existing.items()
@@ -657,21 +1156,26 @@ class _Ingest:
             }
             record["media"] = new_media
         older_media = existing.get("media") or {}
+        newer_media = record.get("media") or {}
         if existing.get("stored_path") and (
-            (record.get("media") or {}).get("status") != "copied"
-            or (record.get("media") or {}).get("size") == older_media.get("size")
+            newer_media.get("status") != "copied"
+            or newer_media.get("size") == older_media.get("size")
         ):
-            # A re-sent record never loses a copy we already hold.
+            # A re-sent or gave-up record never loses a copy we hold.
             record["media"] = older_media
             record["stored_path"] = existing["stored_path"]
+        if existing.get("extract") and record.get("stored_path") == existing.get(
+            "stored_path"
+        ):
+            record["extract"] = existing["extract"]
         record["first_epoch"] = existing.get("first_epoch", batch_epoch)
         same = _content(record) == _content(existing)
         if same and not _retry_copy(existing):
             self.counts["duplicates"] += 1
             return
         if same:
-            # The same message again (a re-send) whose file we still lack:
-            # take the fresh spool path and try once more.
+            # The same message again whose file we still lack: take the
+            # fresh spool path and try once more.
             record["changed_epoch"] = existing.get("changed_epoch", batch_epoch)
             record["store_note"] = existing.get("store_note")
             record.pop("stored_path", None)
@@ -689,14 +1193,36 @@ class _Ingest:
         self.changed.add(key)
         self.dirty.add(key)
 
+    # -- batches --
+    def check_sequence(self, names):
+        """Refuse a spool whose batch sequence went backwards."""
+        last = self.cursor.get("last_batch")
+        if not last or not names or not BATCH_RE.match(str(last)):
+            return
+        last_epoch = self.cursor.get("last_created_epoch") or _stamp_epoch(last)
+        older_but_later = [
+            name for name in names
+            if name < last and _stamp_epoch(name) > last_epoch
+        ]
+        gone_and_behind = last not in names and names[-1] < last
+        if older_but_later or gone_and_behind:
+            raise RuntimeError(
+                "whatsapp spool batch sequence went backwards (the newest "
+                f"batch is numbered below the last one read, {last[:11]}); "
+                "the forwarder's state was probably reset. Check it, then "
+                f"delete {self.cursor_path.name} in archive_dir to read the "
+                "spool from its start (messages already archived are "
+                "matched by id)"
+            )
+
     def read_batches(self):
         """Merge every batch after the cursor; returns the last one merged."""
-        cursor = _read_json(_cursor_path(self.archive, self.spool), {})
-        last = cursor.get("last_batch") if isinstance(cursor, dict) else None
+        last = self.cursor.get("last_batch")
         names = sorted(
             entry.name for entry in os.scandir(self.spool)
             if BATCH_RE.match(entry.name) and entry.is_dir(follow_symlinks=False)
         )
+        self.check_sequence(names)
         pending = [name for name in names if last is None or name > last]
         if last and pending and not any(name <= last for name in names):
             if int(pending[0][1:11]) - int(last[1:11]) > 1:
@@ -706,30 +1232,54 @@ class _Ingest:
                     "before they were read?)"
                 )
         for name in pending:
-            self._merge_batch(name)
+            try:
+                created = self._merge_batch(name)
+            except _BatchError as exc:
+                # Hold the position here; days already archived still flow.
+                self.batch_error = f"batch {name} not read ({exc.code})"
+                log(
+                    f"whatsapp spool ERROR: batch {name} not read "
+                    f"({exc.code}); position held before it"
+                )
+                break
             self.counts["batches"] += 1
-            self.last_merged = last = name
-        return last
+            self.last_merged = (name, created)
+        return self.last_merged
 
     def _merge_batch(self, name):
-        payload = json.loads(
-            (self.spool / name / "batch.json").read_text(encoding="utf-8")
-        )
+        path = self.spool / name / "batch.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise _BatchError(f"unreadable:{type(exc).__name__}") from None
+        except UnicodeDecodeError:
+            raise _BatchError("bad_encoding") from None
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            raise _BatchError("bad_json") from None
         if not isinstance(payload, dict) or payload.get("format") != FORMAT:
-            raise RuntimeError(f"whatsapp spool batch {name} is not a {FORMAT} file")
+            raise _BatchError("not_a_spool_batch")
         if payload.get("version") != VERSION:
-            raise RuntimeError(
-                f"whatsapp spool batch {name} has format version "
-                f"{payload.get('version')!r}; this reader supports {VERSION}"
+            version = payload.get("version")
+            raise _BatchError(
+                f"unsupported_version_{version}"
+                if isinstance(version, int) else "unsupported_version"
             )
         batch_epoch = payload.get("created_epoch")
         messages = payload.get("messages")
         if isinstance(batch_epoch, bool) or not isinstance(batch_epoch, int) or (
             not isinstance(messages, list)
         ):
-            raise RuntimeError(
-                f"whatsapp spool batch {name} has no created_epoch or messages"
-            )
+            raise _BatchError("bad_header")
+        store = payload.get("store_id")
+        self.store = (
+            store if isinstance(store, str) and STORE_ID_RE.match(store)
+            and store != UNKNOWN_STORE else UNKNOWN_STORE
+        )
+        # Recorded per batch, so a store change is known even when every
+        # message of the new store is filtered out.
+        self.registry.note_store(self.store)
         timezone = payload.get("timezone")
         timezone = timezone if isinstance(timezone, str) else None
         for message in messages:
@@ -737,46 +1287,149 @@ class _Ingest:
             if not _valid_message(message):
                 self.counts["invalid"] += 1
                 continue
-            if not _wanted(
-                self.cfg, message["chat_key"], str(message.get("chat_label") or "")
-            ):
-                self.counts["filtered"] += 1
-                continue
             self.merge(message, batch_epoch, timezone)
+        return batch_epoch
 
-    def retry_copies(self):
-        """Retry earlier failed copies whose spool file may still exist."""
-        for key, meta in list(self.index["days"].items()):
-            if not meta.get("pending_copies"):
-                continue
-            day = self.day(meta["chat_key"], meta["date"])
-            for record in day["messages"].values():
-                if not _retry_copy(record):
-                    continue
-                self.dirty.add(key)  # persist the new outcome either way
-                if self.copy(record, meta["date"]):
-                    record["changed_epoch"] = int(_now())
-                    self.changed.add(key)
-
-    def save(self, last):
-        """Persist chat-days, then the index, then the cursor (in that order)."""
-        for key in sorted(self.dirty):
-            day = self.days[key]
-            self.index["days"][key] = _index_entry(day, self.cfg["copy_media"])
-            if not self.dry_run:
-                _write_json(
-                    self.archive / _day_relpath(day["chat_key"], day["date"]),
-                    day,
-                )
+    # -- media text --
+    def extract_texts(self, now):
+        """Local text extraction for stored media, within the time budget."""
         if self.dry_run:
             return
-        if self.dirty or not self.index_path.exists():
+        ready = _tools_ready(self.cfg)
+        keys = set(self.touched) | {
+            key for key, meta in self.index["days"].items()
+            if not meta.get("expired") and (
+                meta.get("pending_extract")
+                or (meta.get("unavailable_extract") and any(ready.values()))
+            )
+        }
+        for key in sorted(keys, key=lambda k: k.rsplit(":", 1)[-1]):
+            meta = self.index["days"].get(key)
+            chat, date = key.split(":")[1], key.rsplit(":", 1)[1]
+            if not meta and key not in self.days:
+                continue
+            day = self.day(chat, date)
+            # Recompute its index entry even when nothing changes now: an
+            # earlier run may have written the day and died before the index.
+            self.touched.add(key)
+            for record in sorted(day["messages"].values(), key=_order):
+                kind = _extraction_kind(self.cfg, record)
+                if not kind or not record.get("stored_path"):
+                    continue
+                current = record.get("extract") or {}
+                if current.get("state") in _EXTRACT_FINAL:
+                    continue
+                if current.get("state") == "unavailable" and not ready[kind]:
+                    continue
+                result = _run_extraction(
+                    self.cfg, self.archive, record, kind, now, self.counts,
+                )
+                if result != current:
+                    record["extract"] = result
+                    self.touched.add(key)
+                    self.dirty.add(key)
+
+    # -- retention --
+    def expire(self, keep_days, processed, now):
+        """Delete captured chat-days (and their media) older than keep_days."""
+        if keep_days is None or processed is None or self.dry_run:
+            return 0
+        cutoff = (
+            datetime.date.fromtimestamp(now) - datetime.timedelta(days=keep_days)
+        ).isoformat()
+        removed = 0
+        for key, meta in sorted(self.index["days"].items()):
+            if meta.get("expired") or meta.get("date", "9999") >= cutoff:
+                continue
+            entry = processed.get(f"{key}@{meta.get('digest')}")
+            if not _settled(entry):
+                continue  # never delete a day whose content is not captured
+            day = self.day(meta["chat"], meta["date"])
+            for record in day["messages"].values():
+                if not record.get("stored_path"):
+                    continue
+                stored = self.archive / record["stored_path"]
+                for path in [stored] + [
+                    stored.with_name(stored.name + suffix)
+                    for suffix in (".transcript.txt", ".pdf.txt",
+                                   ".transcript.failed", ".pdf.failed",
+                                   ".transcript.attempts", ".pdf.attempts")
+                ]:
+                    try:
+                        size = path.stat().st_size
+                        path.unlink()
+                    except FileNotFoundError:
+                        continue
+                    if path == stored:
+                        self.index["media_bytes"] = max(
+                            0, self.index["media_bytes"] - size)
+                try:
+                    stored.parent.rmdir()
+                except OSError:
+                    pass
+            try:
+                (self.archive / _day_relpath(meta["chat"], meta["date"])).unlink()
+            except FileNotFoundError:
+                pass
+            self.index["days"][key] = {
+                "chat": meta["chat"], "date": meta["date"], "expired": True,
+            }
+            self.days.pop(key, None)
+            self.touched.discard(key)
+            self.dirty.discard(key)
+            self.index_dirty = True
+            removed += 1
+        return removed
+
+    # -- persistence --
+    def save(self):
+        """Persist registry, chat-days, the index, then the cursor.
+
+        The index is recomputed for every day touched this run (duplicates
+        included), so a crash anywhere before the cursor moves is healed by
+        reading the same batches again.
+        """
+        for key in sorted(self.touched):
+            day = self.days.get(key)
+            if day is None or not day["messages"]:
+                continue
+            chat = key.split(":")[1]
+            entry = _index_entry(chat, day)
+            if self.index["days"].get(key) != entry:
+                self.index["days"][key] = entry
+                self.index_dirty = True
+        if self.dry_run:
+            return
+        self.registry.save()
+        for key in sorted(self.dirty):
+            day = self.days[key]
+            _write_json(self.archive / _day_relpath(key.split(":")[1],
+                                                    day["date"]), day)
+        if self.index_dirty or not self.index_path.exists():
             _write_json(self.index_path, self.index)
-        if last is not None:
-            _write_json(_cursor_path(self.archive, self.spool), {
+            self.index_dirty = False
+        if self.last_merged is not None:
+            name, created = self.last_merged
+            _write_json(self.cursor_path, {
                 "spool": os.path.normpath(str(self.spool)),
-                "last_batch": last,
+                "last_batch": name,
+                "last_created_epoch": created,
             })
+            self.cursor = {"last_batch": name, "last_created_epoch": created}
+
+
+def _content(record):
+    """A record without local bookkeeping or the batch-specific file path."""
+    value = {
+        k: v for k, v in record.items()
+        if k not in ("first_epoch", "changed_epoch", "stored_path",
+                     "store_note", "backfill", "extract")
+    }
+    if isinstance(value.get("media"), dict):
+        value["media"] = {
+            k: v for k, v in value["media"].items() if k != "path"
+        }
+    return value
 
 
 def _check_runtime_paths(cfg, dry_run):
@@ -794,35 +1447,76 @@ def _check_runtime_paths(cfg, dry_run):
         state.ensure_private_dir(archive)
 
 
+def _rebuild_guard(work, processed):
+    """Source ids captured before this archive existed (item: rebuilt archive).
+
+    A new or relocated archive rebuilt from what is left in the spool can
+    hold only part of a day that was captured in full; re-capturing it would
+    overwrite the stored entry with the partial day.
+    """
+    path = work.archive / "rebuild-guard.json"
+    guard = _read_json(path, None)
+    if isinstance(guard, dict):
+        return set(guard.get("protected") or [])
+    if not work.fresh or processed is None:
+        return set()
+    protected = sorted({
+        entry.get("source_id") for _id, entry in processed.items()
+        if entry.get("source_kind") == "whatsapp" and _settled(entry)
+        and isinstance(entry.get("source_id"), str)
+    })
+    if protected and not work.dry_run:
+        _write_json(path, {"protected": protected, "at": int(_now())})
+    return set(protected)
+
+
 def ingest(source):
     """Read new spool batches into the archive; returns the ingest state."""
     cfg = settings(source)
     dry_run = bool(source.get("_dry_run") or source.get("_count_only"))
     _check_runtime_paths(cfg, dry_run)
+    now = _now()
     work = _Ingest(cfg, dry_run)
+    work.protected = _rebuild_guard(work, source.get("_processed"))
+    if not dry_run:
+        work.sweep_temp(now)
+        work.recount_media(now)
+    work.reconcile()
     work.retry_copies()
-    last = None
     try:
-        last = work.read_batches()
+        work.read_batches()
     except Exception:
-        # Keep what the earlier batches of this run already merged (their
-        # copies exist); the failing batch is read again on the next run.
-        work.save(work.last_merged)
+        # Keep what earlier batches of this run merged (their copies
+        # exist); the position stays before the failing point.
+        work.save()
         raise
-    work.save(last)
+    work.extract_texts(now)
+    work.save()
     counts = work.counts
-    if counts["batches"] or work.dirty:
+    if work.dirty or any(counts.values()):
+        last = work.last_merged[0] if work.last_merged else None
         log(
             "whatsapp spool: "
             + " ".join(f"{key}={value}" for key, value in counts.items())
             + f" chat_days_changed={len(work.changed)}"
             + (f" last_batch={last}" if last else "")
+            + (f" identity_conflicts={work.registry.conflicts}"
+               if work.registry.conflicts else "")
             + (" [dry-run]" if dry_run else "")
         )
+    current = work.registry.keys_in_current_store()
+    if current is not None:
+        for key in cfg["chat_keys"]:
+            if key not in current:
+                log(
+                    f"whatsapp WARN: chat_keys entry {key} has not appeared "
+                    "since the WhatsApp store changed (chat keys are per "
+                    "store; check the forwarder's --list-conversations)"
+                )
     return work
 
 
-# --- listing -------------------------------------------------------------------
+# --- listing ---------------------------------------------------------------------
 
 def _settled(entry):
     return isinstance(entry, dict) and not (
@@ -857,27 +1551,36 @@ def _last_captures(processed):
 def candidates(source):
     """One candidate per chat-day with uncaptured content; see the docstring."""
     cfg = settings(source)
-    work = ingest(source)
     processed = source.get("_processed")
-    dry_run = work.dry_run
+    work = ingest(source)
     now = _now()
+    expired = work.expire(cfg["archive_keep_days"], processed, now)
+    if expired:
+        work.save()
+        log(f"whatsapp archive: removed {expired} captured chat-day(s) "
+            f"older than {cfg['archive_keep_days']} days")
     quiet = cfg["quiet_minutes"] * 60
     max_wait = cfg["max_wait_hours"] * 3600
     last_capture = _last_captures(processed)
     ready, waiting = [], []
-    settled = 0
+    settled = protected = 0
     for key, meta in sorted(work.index["days"].items()):
-        if not _wanted(cfg, meta.get("chat_key"), meta.get("label", "")):
+        if meta.get("expired"):
+            continue
+        chat = meta["chat"]
+        if not _wanted(cfg, work.registry.chat_keys(chat),
+                       meta.get("label") or work.registry.label(chat)):
             continue
         candidate_id = f"{key}@{meta['digest']}"
         existing = processed.get(candidate_id) if processed is not None else None
         if existing is not None and _settled(existing):
             settled += 1
             continue
-        day = work.day(meta["chat_key"], meta["date"])
-        changes = [
-            m.get("changed_epoch") or 0 for m in day["messages"].values()
-        ]
+        if key in work.protected and not cfg["recapture_after_rebuild"]:
+            protected += 1
+            continue
+        day = work.day(chat, meta["date"])
+        changes = [m.get("changed_epoch") or 0 for m in day["messages"].values()]
         if not changes:
             continue
         since = last_capture.get(key, 0)
@@ -886,19 +1589,19 @@ def candidates(source):
         waited = now - min(uncaptured)
         due = (
             existing is not None  # a failed capture retries without waiting
-            or quiet_for >= quiet
+            or (quiet_for >= quiet and not meta.get("pending_extract"))
             or waited >= max_wait
         )
         candidate = {
             "id": candidate_id,
             # Logged by the runner: never a chat label or a name.
-            "title": f"WhatsApp {chat_ref(meta['chat_key'])} {meta['date']}",
+            "title": f"WhatsApp {chat} {meta['date']}",
             "raw": {
                 "source_id": key,
-                "chat_key": meta["chat_key"],
+                "chat": chat,
                 "date": meta["date"],
                 "digest": meta["digest"],
-                "_dry_run": dry_run,
+                "_dry_run": work.dry_run,
                 # The merged chat-day travels with the candidate so a dry run
                 # (which writes nothing) and the real run read the same data.
                 "_day": day,
@@ -906,128 +1609,25 @@ def candidates(source):
         }
         (ready if due else waiting).append(candidate)
     limit = int(source.get("max_results") or 0)
-    ready.sort(key=lambda c: (c["raw"]["date"], c["raw"]["chat_key"]))
+    ready.sort(key=lambda c: (c["raw"]["date"], c["raw"]["chat"]))
     if limit and len(ready) > limit:
         waiting.extend(ready[limit:])
         ready = ready[:limit]
     for candidate in waiting:
         candidate["raw"]["_deferred"] = True
+    if protected:
+        log(
+            f"whatsapp WARN: {protected} chat-day(s) captured before this "
+            "archive existed are not captured again (it may hold only part "
+            "of them); set recapture_after_rebuild: true to allow"
+        )
     log(
         f"whatsapp: chat_days ready={len(ready)} waiting={len(waiting)} "
         f"settled={settled}"
     )
-    return ready + waiting
-
-
-# --- text from media -------------------------------------------------------------
-
-def ffmpeg_bin():
-    return optional_bin("ffmpeg", "WORKSPACE_DAEMON_FFMPEG_BIN")
-
-
-def whisper_cli_bin():
-    return optional_bin("whisper-cli", "WORKSPACE_DAEMON_WHISPER_CLI_BIN")
-
-
-def pdftotext_bin():
-    return optional_bin("pdftotext", "WORKSPACE_DAEMON_PDFTOTEXT_BIN")
-
-
-def _transcribe(cfg, path, workdir):
-    ffmpeg, whisper = ffmpeg_bin(), whisper_cli_bin()
-    if not ffmpeg or not whisper:
-        return None, "tool_missing"
-    model = cfg.get("whisper_model")
-    if not model or not Path(model).is_file():
-        return None, "model_missing"
-    timeout = cfg["transcribe_timeout_seconds"]
-    wav = workdir / "audio.wav"
-    try:
-        run([
-            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(path), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-            str(wav),
-        ], timeout=timeout)
-    except Exception as exc:
-        return None, f"convert_failed:{type(exc).__name__}"
-    command = [
-        whisper, "-m", str(model), "-l", cfg["whisper_language"],
-        "-f", str(wav), "-nt", "-np", "-otxt", "-of", str(workdir / "out"),
-    ]
-    if cfg.get("whisper_threads"):
-        command += ["-t", str(cfg["whisper_threads"])]
-    try:
-        run(command, timeout=timeout)
-        text = (workdir / "out.txt").read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        return None, f"transcribe_failed:{type(exc).__name__}"
-    return (text, None) if text else (None, "empty")
-
-
-def _pdf_text(cfg, path, _workdir):
-    binary = pdftotext_bin()
-    if not binary:
-        return None, "tool_missing"
-    try:
-        result = run([
-            binary, "-q", "-enc", "UTF-8", "-l", str(cfg["pdf_max_pages"]),
-            str(path), "-",
-        ], timeout=120)
-    except Exception as exc:
-        return None, f"pdf_failed:{type(exc).__name__}"
-    text = re.sub(r"[ \t]+\n", "\n", result.stdout or "")
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return (text[:200000], None) if text else (None, "no_text")
-
-
-_EXTRACTORS = {"transcript": _transcribe, "pdf": _pdf_text}
-# Missing tools and models are an installation state, not a property of the
-# file: they are retried on the next capture instead of being remembered.
-_RETRYABLE = {"tool_missing", "model_missing"}
-
-
-def _extraction_kind(cfg, message):
-    media = message.get("media") or {}
-    if media.get("kind") == "audio" and cfg["transcribe_audio"]:
-        return "transcript"
-    if media.get("kind") == "document" and cfg["pdf_text"]:
-        name = str(media.get("original_name") or message.get("stored_path") or "")
-        if media.get("mime") == "application/pdf" or name.lower().endswith(".pdf"):
-            return "pdf"
-    return None
-
-
-def _extract(cfg, archive, message, dry_run, counts):
-    """(kind, text, reason) for one message's stored file; cached on disk."""
-    kind = _extraction_kind(cfg, message)
-    if kind is None or not message.get("stored_path"):
-        return None, None, None
-    stored = archive / message["stored_path"]
-    cache = stored.with_name(stored.name + _CACHE_SUFFIX[kind])
-    failed = stored.with_name(stored.name + f".{kind}.failed")
-    if cache.exists():
-        return kind, cache.read_text(encoding="utf-8"), None
-    if failed.exists():
-        return kind, None, failed.read_text(encoding="utf-8").strip() or "failed"
-    if dry_run:
-        return kind, None, "dry_run"
-    if not stored.is_file():
-        return kind, None, "stored_file_missing"
-    scratch = archive / ".tmp"
-    _private_tree(scratch)
-    workdir = Path(tempfile.mkdtemp(dir=scratch))
-    try:
-        text, reason = _EXTRACTORS[kind](cfg, stored, workdir)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-    if text:
-        state.write_atomic(cache, text + "\n", mode=0o600)
-        counts[kind] += 1
-        return kind, text, None
-    counts["failed"] += 1
-    if reason not in _RETRYABLE:
-        state.write_atomic(failed, reason + "\n", mode=0o600)
-    return kind, None, reason
+    listing = Listing(ready + waiting)
+    listing.degraded = work.batch_error
+    return listing
 
 
 # --- fetch -----------------------------------------------------------------------
@@ -1049,11 +1649,10 @@ def _size_label(size):
     return f"{max(1, round(size / 1024))} KB"
 
 
-def _attachment_facts(message, archive, exact=False):
+def _attachment_facts(message, name, archive, exact=False):
     media = message.get("media") or {}
     kind = media.get("kind")
     facts = [kind if kind in MEDIA_KINDS else "file"]
-    name = " ".join(str(media.get("original_name") or "").split())[:120]
     if name:
         facts.append(f'"{name}"')
     mime = media.get("mime")
@@ -1064,12 +1663,14 @@ def _attachment_facts(message, archive, exact=False):
         facts.append(f"{size} bytes")
     elif _size_label(size):
         facts.append(_size_label(size))
+    status = media.get("status")
     if message.get("stored_path"):
-        where = f"stored at {archive / message['stored_path']}"
-    elif media.get("status") == "copied":
+        where = f"stored at {Path(archive) / message['stored_path']}"
+    elif status == "copied":
         where = f"not stored ({message.get('store_note') or 'pending copy'})"
+    elif status == "gave_up":
+        where = "not available (the forwarder stopped waiting for the file)"
     else:
-        status = media.get("status")
         status = status if status in SPOOL_STATUSES else "unknown"
         where = f"not copied by the forwarder ({status})"
     return facts, where
@@ -1088,41 +1689,77 @@ _EXTRACT_LABEL = {
 }
 
 
-def _render(messages, extracted, archive, cfg):
-    """(prompt body, verbatim block) for one chat-day."""
+def _redacted_view(message, archive, cfg):
+    """The message's text, file name and extracted text, each redacted once.
+
+    Both the prompt and the stored verbatim block are rendered from these,
+    so they can never disagree about what was redacted (a pattern spanning a
+    line break is caught on the raw text, before any prefix is added).
+    """
+    media = message.get("media") or {}
+    name = " ".join(str(media.get("original_name") or "").split())[:120]
+    extract = message.get("extract") or {}
+    extracted = None
+    if extract.get("state") == "done" and message.get("stored_path"):
+        _stored, cache, _f, _a = _extract_paths(archive, message, extract["kind"])
+        try:
+            extracted = redact_secrets(cache.read_text(encoding="utf-8"))
+        except OSError:
+            extract = {"kind": extract["kind"], "state": "failed",
+                       "reason": "cache_missing"}
+    return {
+        "text": redact_secrets(message.get("text") or ""),
+        "name": redact_secrets(name) if name else "",
+        "extract": extract,
+        "extracted": extracted,
+    }
+
+
+def _render(messages, archive, cfg):
+    """(prompt lines, verbatim lines) for one chat-day."""
     prompt, verbatim = [], []
     for message in messages:
-        text = message.get("text") or ""
-        prompt.append(f"[{_hhmm(message)}] {_sender(message)}: {text}")
+        view = _redacted_view(message, archive, cfg)
+        text = view["text"]
+        lines = text.split("\n")
+        # Continuation lines are indented, so a line inside a message that
+        # looks like "[12:00] Someone: ..." never reads as its own message.
+        prompt.append(f"[{_hhmm(message)}] {_sender(message)}: {lines[0]}")
+        prompt.extend(f"    {line}" for line in lines[1:])
         sender = " ".join(str(message.get("sender") or "").split())
         verbatim.append(
             f"- {message['timestamp']} · {sender} · {message['id']}"
             + (" · from_me" if message.get("from_me") else "")
         )
         if text:
-            verbatim.extend(f"  > {line}" for line in text.split("\n"))
+            verbatim.extend(f"  > {line}" for line in lines)
         if message.get("media"):
-            facts, where = _attachment_facts(message, archive)
+            facts, where = _attachment_facts(message, view["name"], archive)
             prompt.append(
                 f"  attachment: {', '.join(facts)}"
                 + (", stored" if message.get("stored_path") else f", {where}")
             )
-            exact_facts, _where = _attachment_facts(message, archive, exact=True)
-            verbatim.append(f"  attachment: {' · '.join(exact_facts)} · {where}")
-        kind, extract, reason = extracted.get(message["id"], (None, None, None))
-        if kind and extract:
+            exact, _where = _attachment_facts(
+                message, view["name"], archive, exact=True)
+            verbatim.append(f"  attachment: {' · '.join(exact)} · {where}")
+        extract = view["extract"]
+        kind = extract.get("kind")
+        if not kind:
+            continue
+        if view["extracted"]:
             limit = (
                 cfg["transcript_max_chars"] if kind == "transcript"
                 else cfg["pdf_max_chars"]
             )
-            shown, cut = _bounded(extract, limit)
+            shown, cut = _bounded(view["extracted"], limit)
             label = _EXTRACT_LABEL[kind] + (" (truncated)" if cut else "")
             prompt.append(f"  {label}:")
             prompt.extend(f"    {line}" for line in shown.split("\n"))
             verbatim.append(f"  {label}:")
             verbatim.extend(f"  | {line}" for line in shown.split("\n"))
-        elif kind and reason:
-            note = f"  {kind}: none ({reason})"
+        else:
+            word = "pending" if extract.get("state") == "pending" else "none"
+            note = f"  {kind}: {word} ({extract.get('reason') or 'unknown'})"
             prompt.append(note)
             verbatim.append(note)
     return prompt, verbatim
@@ -1166,43 +1803,30 @@ def fetch(_routine, source, candidate):
     dry_run = bool(raw.get("_dry_run"))
     day = raw.get("_day")
     if not isinstance(day, dict):
-        day = _read_json(archive / _day_relpath(raw["chat_key"], raw["date"]), None)
+        day = _read_json(archive / _day_relpath(raw["chat"], raw["date"]), None)
         if not isinstance(day, dict):
-            raise RuntimeError(f"whatsapp archive has no record of {raw['source_id']}")
+            raise RuntimeError(
+                f"whatsapp archive has no record of {raw['source_id']}")
     messages = sorted(day["messages"].values(), key=_order)
-    if not dry_run and any(_retry_copy(m) for m in messages):
+    if not dry_run and cfg["copy_media"] and any(
+        _retry_copy(m) for m in messages
+    ):
         # Last chance before the ledger settles this chat-day: a file the
         # listing could not copy is retried while the spool still has it.
-        # The index digest is left alone on purpose: this capture already
-        # shows the stored file, so it must not count as a new change.
+        # The index is left alone on purpose: this capture already shows the
+        # stored file, so it must not count as a new change.
         work = _Ingest(cfg, dry_run=False)
         stored = [work.copy(m, raw["date"]) for m in messages if _retry_copy(m)]
         if any(stored):
-            _write_json(archive / _day_relpath(raw["chat_key"], raw["date"]), day)
+            _write_json(archive / _day_relpath(raw["chat"], raw["date"]), day)
             _write_json(work.index_path, work.index)
-    counts = {"transcript": 0, "pdf": 0, "failed": 0}
-    extracted = {}
-    for message in messages:
-        kind, text, reason = _extract(cfg, archive, message, dry_run, counts)
-        if kind:
-            extracted[message["id"]] = (kind, text, reason)
-    if extracted:
-        reasons = sorted({
-            reason for _k, _t, reason in extracted.values() if reason
-        })
-        log(
-            f"whatsapp {raw['source_id']} media text: "
-            f"transcribed={counts['transcript']} pdf={counts['pdf']} "
-            f"failed={counts['failed']}"
-            + (f" unavailable={','.join(reasons)}" if reasons else "")
-        )
-    prompt_lines, verbatim_lines = _render(messages, extracted, archive, cfg)
+    prompt_lines, verbatim_lines = _render(messages, archive, cfg)
+    chat = raw["chat"]
     label = " ".join(str(day.get("chat_label") or "").split())[:120]
     chat_type = str(day.get("chat_type") or "other")
     timezone = str(day.get("timezone") or "")
     header = (
-        f"Chat: {label or chat_ref(raw['chat_key'])} · {chat_type} · "
-        f"{chat_ref(raw['chat_key'])} · {raw['date']}"
+        f"Chat: {label or chat} · {chat_type} · {chat} · {raw['date']}"
         + (f" ({timezone})" if timezone else "")
     )
     verbatim = (
@@ -1212,7 +1836,6 @@ def fetch(_routine, source, candidate):
         "as sent, then attachments and locally extracted text.\n\n"
         f"{header}\n\n" + "\n".join(verbatim_lines)
     )
-    participants = _participants(messages)
     attachments = [
         {
             "message_id": message["id"],
@@ -1229,24 +1852,22 @@ def fetch(_routine, source, candidate):
         "id": candidate["id"],
         "source_id": raw["source_id"],
         "source_kind": "whatsapp",
-        "title": f"WhatsApp: {label or chat_ref(raw['chat_key'])} {raw['date']}",
+        "title": f"WhatsApp: {label or chat} {raw['date']}",
         "date": raw["date"],
-        # Chats can carry pasted codes and tokens: redact before the model,
-        # the store or a vault note sees the text.
-        "body": redact_secrets(
-            _bounded_prompt(prompt_lines, cfg["max_body_chars"])
-        ),
+        # Every field was redacted once in _redacted_view (chats carry codes
+        # and tokens); the joined views are not redacted again.
+        "body": _bounded_prompt(prompt_lines, cfg["max_body_chars"]),
         # Appended verbatim to the stored entry by the memory sink, after the
         # model's summary, so original text survives the paraphrase.
-        "memory_appendix": redact_secrets(verbatim),
+        "memory_appendix": verbatim,
         "frontmatter": {
-            "whatsapp_chat_ref": chat_ref(raw["chat_key"]),
+            "whatsapp_chat_ref": chat,
             "whatsapp_chat_label": label,
             "whatsapp_chat_type": chat_type,
             "whatsapp_date": raw["date"],
             "whatsapp_timezone": timezone or None,
             "whatsapp_message_ids": [message["id"] for message in messages],
-            "whatsapp_participants": participants,
+            "whatsapp_participants": _participants(messages),
             "whatsapp_attachments": attachments,
             "whatsapp_content_hash": raw.get("digest"),
             "message_count": len(messages),

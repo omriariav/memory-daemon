@@ -9,7 +9,9 @@ import datetime
 import hashlib
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +37,20 @@ def iso(hour, minute=0, day=22):
     return datetime.datetime(2026, 11, day, hour, minute, tzinfo=ZONE)
 
 
+def local(store="unknown", key=1265, chat_id=None):
+    """The archive chat id the source derives for a chat seen first like this."""
+    seed = f"id:{chat_id}" if chat_id else f"key:{store}|{key}"
+    return "c" + hashlib.sha256(seed.encode()).hexdigest()[:10]
+
+
+def sid(date=DAY, **kwargs):
+    return f"whatsapp:{local(**kwargs)}:{date}"
+
+
+def chat_id(seed):
+    return "wac1-" + hashlib.sha256(f"chat:{seed}".encode()).hexdigest()[:32]
+
+
 def message_id(seed):
     return "wa1-" + hashlib.sha256(str(seed).encode()).hexdigest()[:40]
 
@@ -42,7 +58,7 @@ def message_id(seed):
 def record(seed, when, text="", *, chat_key=1265, chat_jid=GROUP_JID,
            label=GROUP_LABEL, chat_type="group", sender=PARENT,
            sender_jid=MEMBER_JID, from_me=False, kind="text", media=None,
-           update=None, row_key=None):
+           update=None, row_key=None, chat_id=None):
     return {
         "id": message_id(seed),
         "id_source": "stanza",
@@ -64,6 +80,7 @@ def record(seed, when, text="", *, chat_key=1265, chat_jid=GROUP_JID,
         "type": kind,
         "text": text,
         "media": media,
+        **({"chat_id": chat_id} if chat_id else {}),
     }
 
 
@@ -76,7 +93,7 @@ class Spool:
         os.chmod(self.dir, 0o700)
         self.seq = 40
 
-    def batch(self, created, messages, files=None):
+    def batch(self, created, messages, files=None, store_id=None):
         self.seq += 1
         stamp = created.astimezone(datetime.timezone.utc).strftime(
             "%Y%m%dT%H%M%SZ")
@@ -102,6 +119,8 @@ class Spool:
             "timezone": "Asia/Jerusalem",
             "messages": messages,
         }
+        if store_id:
+            payload["store_id"] = store_id
         target = folder / "batch.json"
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                           encoding="utf-8")
@@ -137,6 +156,7 @@ class Base(unittest.TestCase):
             whatsapp_source, "_now", side_effect=lambda: self.now)
         patcher.start()
         self.addCleanup(patcher.stop)
+        whatsapp_source._extract_spent = 0.0
         self.logs = []
         log_patch = mock.patch.object(
             whatsapp_source, "log", side_effect=self.logs.append)
@@ -179,15 +199,13 @@ class GroupingAndIdentityTest(Base):
         ])
         found = self.listing()
         ids = sorted(c["raw"]["source_id"] for c in found)
-        self.assertEqual(ids, [
-            "whatsapp:chat-1265:2026-11-22",
-            "whatsapp:chat-1265:2026-11-23",
-            "whatsapp:chat-2001:2026-11-22",
-        ])
+        self.assertEqual(ids, sorted([
+            sid(), sid("2026-11-23"), sid(key=2001),
+        ]))
         for candidate in found:
             self.assertRegex(
                 candidate["id"],
-                r"^whatsapp:chat-\d+:\d{4}-\d{2}-\d{2}@[0-9a-f]{16}$")
+                r"^whatsapp:c[0-9a-f]{10}:\d{4}-\d{2}-\d{2}@[0-9a-f]{16}$")
             self.assertNotIn(GROUP_LABEL, candidate["title"])
         # No phone number or JID anywhere in the archive, names or content.
         for path in self.archive.rglob("*"):
@@ -233,22 +251,10 @@ class GroupingAndIdentityTest(Base):
                    chat_jid=DIRECT_JID, label=DIRECT_LABEL, chat_type="direct"),
         ])
         found = self.listing(exclude_chat_labels=[DIRECT_LABEL])
-        self.assertEqual([c["raw"]["chat_key"] for c in found], [1265])
-        self.assertFalse((self.archive / "chats" / "chat-2001").exists())
-
-    def test_unsupported_version_fails_loudly_and_keeps_position(self):
-        self.spool.batch(iso(9, 0), [record("a", iso(8, 12), "ok")])
-        name = self.spool.batch(iso(10, 0), [record("b", iso(9, 12), "new")])
-        path = self.spool.dir / name / "batch.json"
-        payload = json.loads(path.read_text())
-        payload["version"] = 2
-        path.write_text(json.dumps(payload))
-        with self.assertRaisesRegex(RuntimeError, "format version 2"):
-            self.listing()
-        cursor = json.loads(
-            next(self.archive.glob("spool-cursor-*.json")).read_text())
-        # The good first batch is kept; the bad one is read again next run.
-        self.assertTrue(cursor["last_batch"].startswith("b0000000041-"))
+        self.assertEqual([c["raw"]["chat"] for c in found], [local()])
+        self.assertFalse((self.archive / "chats" / local(key=2001)).exists())
+        registry = (self.archive / "chats" / "registry.json").read_text()
+        self.assertNotIn(DIRECT_LABEL, registry)  # excluded: never recorded
 
     def test_invalid_records_are_counted_not_ingested(self):
         bad_id = record("x", iso(8, 0), "bad id")
@@ -490,19 +496,28 @@ class MediaTest(Base):
 
 
 class MediaTextTest(Base):
+    """Local text extraction runs at listing time, budgeted and cached."""
+
     def setUp(self):
         super().setUp()
         self.calls = []
+        self.model = self.root / "ggml-model.bin"
+        self.model.write_bytes(b"model")
 
-    def fake_run(self, outputs):
+    def fake_run(self, outputs, fail=None):
         def run(cmd, timeout=120, check=True):
             self.calls.append(cmd)
             binary = Path(cmd[0]).name
+            if fail and binary in fail:
+                problem = fail[binary]
+                if isinstance(problem, BaseException):
+                    raise problem
+                return mock.Mock(returncode=problem, stdout="", stderr="")
             if binary == "whisper-cli":
                 out = Path(cmd[cmd.index("-of") + 1]).with_suffix(".txt")
                 out.write_text(outputs.get("whisper", ""), encoding="utf-8")
-            result = mock.Mock(stdout=outputs.get(binary, ""), stderr="")
-            return result
+            return mock.Mock(returncode=0, stdout=outputs.get(binary, ""),
+                             stderr="")
         return run
 
     def tools(self, present=("ffmpeg", "whisper-cli", "pdftotext")):
@@ -511,30 +526,36 @@ class MediaTextTest(Base):
             side_effect=lambda name, _env: (
                 f"/opt/tools/{name}" if name in present else None))
 
-    def voice_candidate(self, **overrides):
+    def voice_source(self, **overrides):
+        values = dict(transcribe_audio=True, whisper_model=str(self.model),
+                      whisper_language="he")
+        values.update(overrides)
+        return self.source(**values)
+
+    def add_voice(self, seed="voice", when=None):
         message, files = self.spool.media_message(
-            "voice", iso(8, 12), "audio", b"OggS", ".opus", mime="audio/ogg")
+            seed, when or iso(8, 12), "audio", b"OggS", ".opus",
+            mime="audio/ogg")
         self.spool.batch(iso(9, 0), [message], files)
-        model = self.root / "ggml-model.bin"
-        model.write_bytes(b"model")
-        source = self.source(transcribe_audio=True,
-                             whisper_model=str(model),
-                             whisper_language="he", **overrides)
-        return source, whatsapp_source.candidates(source)[0]
+
+    def listing_with(self, source, run_effect, present=None):
+        tools = self.tools() if present is None else self.tools(present)
+        with tools, mock.patch.object(whatsapp_source, "run",
+                                      side_effect=run_effect):
+            return whatsapp_source.candidates(source)
 
     def test_voice_note_is_transcribed_locally_and_cached(self):
-        source, candidate = self.voice_candidate(whisper_threads=4)
+        self.add_voice()
+        source = self.voice_source(whisper_threads=4)
         transcript = "שלום, נפגשים מחר בשמונה"
-        with self.tools(), mock.patch.object(
-                whatsapp_source, "run",
-                side_effect=self.fake_run({"whisper": transcript})):
-            item = whatsapp_source.fetch({}, source, candidate)
+        found = self.listing_with(source, self.fake_run({"whisper": transcript}))
         ffmpeg, whisper = self.calls
         self.assertEqual(Path(ffmpeg[0]).name, "ffmpeg")
         self.assertIn("16000", ffmpeg)
         self.assertEqual(ffmpeg[ffmpeg.index("-ac") + 1], "1")
         self.assertEqual(whisper[whisper.index("-l") + 1], "he")
         self.assertEqual(whisper[whisper.index("-t") + 1], "4")
+        item = whatsapp_source.fetch({}, source, found[0])
         self.assertIn(transcript, item["body"])
         self.assertIn(f"  | {transcript}", item["memory_appendix"])
         cached = next((self.archive / "media" / DAY).glob("*.transcript.txt"))
@@ -542,38 +563,102 @@ class MediaTextTest(Base):
         self.assertEqual(list((self.archive / ".tmp").iterdir()), [])
         self.calls.clear()
         with self.tools(), mock.patch.object(whatsapp_source, "run") as run:
-            again = whatsapp_source.fetch({}, source, candidate)
+            again = whatsapp_source.candidates(source)
+            whatsapp_source.fetch({}, source, again[0])
         run.assert_not_called()
-        self.assertIn(transcript, again["body"])
         self.assertFalse(any(transcript in line for line in self.logs))
 
-    def test_transcription_failure_degrades_and_is_remembered(self):
-        source, candidate = self.voice_candidate()
-        with self.tools(), mock.patch.object(
-                whatsapp_source, "run",
-                side_effect=RuntimeError("command failed: secret words")):
-            item = whatsapp_source.fetch({}, source, candidate)
-        self.assertIn("transcript: none (convert_failed:RuntimeError)",
-                      item["body"])
-        self.assertTrue(any("failed=1" in line for line in self.logs))
-        self.assertFalse(any("secret words" in line for line in self.logs))
+    def test_nonzero_exit_is_deterministic_and_remembered(self):
+        self.add_voice()
+        source = self.voice_source()
+        found = self.listing_with(
+            source, self.fake_run({}, fail={"ffmpeg": 1}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        self.assertIn("transcript: none (convert_failed)", item["body"])
+        self.assertTrue(
+            next((self.archive / "media" / DAY).glob("*.transcript.failed")))
+        self.now += 10 * 86400
         with self.tools(), mock.patch.object(whatsapp_source, "run") as run:
-            whatsapp_source.fetch({}, source, candidate)
+            whatsapp_source.candidates(source)
         run.assert_not_called()
 
-    def test_missing_tools_or_model_degrade_and_retry_later(self):
-        source, candidate = self.voice_candidate()
-        with self.tools(present=("ffmpeg",)), \
-                mock.patch.object(whatsapp_source, "run") as run:
-            item = whatsapp_source.fetch({}, source, candidate)
-        run.assert_not_called()
+    def test_transient_failures_retry_with_backoff_then_give_up(self):
+        self.add_voice()
+        source = self.voice_source()
+        timeout = subprocess.TimeoutExpired(["whisper-cli"], 300)
+        for attempt, error in enumerate(
+            (timeout, OSError(24, "Too many open files"), -9), start=1
+        ):
+            self.calls.clear()
+            found = self.listing_with(
+                source, self.fake_run({}, fail={"whisper-cli": error}))
+            self.assertEqual(len(self.calls), 2, attempt)
+            record = found[0]["raw"]["_day"]["messages"][message_id("voice")]
+            if attempt < 3:
+                self.assertEqual(record["extract"]["state"], "pending")
+                # Not retried before the backoff has passed.
+                self.calls.clear()
+                self.listing_with(source, self.fake_run({}))
+                self.assertEqual(self.calls, [])
+                self.now += whatsapp_source.EXTRACT_BACKOFF_SECONDS * 2 ** attempt
+            else:
+                self.assertEqual(record["extract"]["state"], "failed")
+                self.assertEqual(record["extract"]["reason"],
+                                 "gave_up:transcribe_killed")
+        self.assertFalse(
+            list((self.archive / "media" / DAY).glob("*.attempts")))
+
+    def test_transient_failure_then_success_updates_the_capture(self):
+        self.add_voice()
+        source = self.voice_source(max_wait_hours=24)
+        timeout = subprocess.TimeoutExpired(["whisper-cli"], 300)
+        first = self.listing_with(
+            source, self.fake_run({}, fail={"whisper-cli": timeout}))
+        # Pending media text holds the capture until max_wait.
+        self.assertTrue(first[0]["raw"].get("_deferred"))
+        self.now += whatsapp_source.EXTRACT_BACKOFF_SECONDS + 1
+        second = self.listing_with(source, self.fake_run({"whisper": "ok now"}))
+        self.assertNotEqual(first[0]["id"], second[0]["id"])
+        self.assertFalse(second[0]["raw"].get("_deferred"))
+        item = whatsapp_source.fetch({}, source, second[0])
+        self.assertIn("ok now", item["body"])
+
+    def test_extraction_budget_leaves_the_rest_for_the_next_run(self):
+        self.add_voice("v1", iso(8, 0))
+        self.add_voice("v2", iso(8, 5))
+        source = self.voice_source(extract_budget_seconds=0)
+        found = self.listing_with(source, self.fake_run({"whisper": "t"}))
+        self.assertEqual(self.calls, [])
+        states = {r["extract"]["reason"] for r in
+                  found[0]["raw"]["_day"]["messages"].values()}
+        self.assertEqual(states, {"budget"})
+        self.assertTrue(any("deferred=2" in line for line in self.logs))
+        whatsapp_source._extract_spent = 0.0
+        found = self.listing_with(self.voice_source(),
+                                  self.fake_run({"whisper": "t"}))
+        states = {r["extract"]["state"] for r in
+                  found[0]["raw"]["_day"]["messages"].values()}
+        self.assertEqual(states, {"done"})
+
+    def test_missing_tools_or_model_degrade_and_retry_once_installed(self):
+        self.add_voice()
+        source = self.voice_source()
+        found = self.listing_with(source, self.fake_run({}),
+                                  present=("ffmpeg",))
+        self.assertEqual(self.calls, [])
+        item = whatsapp_source.fetch({}, source, found[0])
         self.assertIn("transcript: none (tool_missing)", item["body"])
-        self.assertEqual(list((self.archive / "media" / DAY).glob("*.failed")), [])
-        Path(source["whisper_model"]).unlink()
-        with self.tools(), mock.patch.object(whatsapp_source, "run") as run:
-            item = whatsapp_source.fetch({}, source, candidate)
-        self.assertIn("transcript: none (model_missing)", item["body"])
-        run.assert_not_called()
+        self.assertFalse(found[0]["raw"].get("_deferred"))
+        self.assertEqual(
+            list((self.archive / "media" / DAY).glob("*.failed")), [])
+        self.model.unlink()
+        self.listing_with(source, self.fake_run({}))
+        self.assertEqual(self.calls, [])
+        self.model.write_bytes(b"model")
+        found = self.listing_with(source, self.fake_run({"whisper": "now"}))
+        self.assertEqual(len(self.calls), 2)
+        record = found[0]["raw"]["_day"]["messages"][message_id("voice")]
+        self.assertEqual(record["extract"]["state"], "done")
 
     def test_pdf_excerpt_is_bounded(self):
         message, files = self.spool.media_message(
@@ -581,14 +666,11 @@ class MediaTextTest(Base):
             mime="application/pdf", original_name="schedule.pdf")
         self.spool.batch(iso(9, 0), [message], files)
         source = self.source(pdf_max_chars=200, pdf_max_pages=3)
-        candidate = whatsapp_source.candidates(source)[0]
         text = "Line of the schedule. " * 100
-        with self.tools(), mock.patch.object(
-                whatsapp_source, "run",
-                side_effect=self.fake_run({"pdftotext": text})):
-            item = whatsapp_source.fetch({}, source, candidate)
+        found = self.listing_with(source, self.fake_run({"pdftotext": text}))
         command = self.calls[0]
         self.assertEqual(command[command.index("-l") + 1], "3")
+        item = whatsapp_source.fetch({}, source, found[0])
         self.assertIn("PDF text excerpt (truncated):", item["body"])
         self.assertIn('"schedule.pdf"', item["memory_appendix"])
         excerpt = item["body"].split("PDF text excerpt (truncated):")[1]
@@ -599,11 +681,24 @@ class MediaTextTest(Base):
             "img", iso(8, 0), "image", b"jpg", ".jpg")
         self.spool.batch(iso(9, 0), [message], files)
         source = self.source(transcribe_audio=False)
-        candidate = whatsapp_source.candidates(source)[0]
-        with self.tools(), mock.patch.object(whatsapp_source, "run") as run:
-            item = whatsapp_source.fetch({}, source, candidate)
-        run.assert_not_called()
+        found = self.listing_with(source, self.fake_run({}))
+        self.assertEqual(self.calls, [])
+        item = whatsapp_source.fetch({}, source, found[0])
         self.assertIn("attachment: image", item["body"])
+
+    def test_transcript_codes_are_redacted_in_both_views(self):
+        self.add_voice()
+        source = self.voice_source()
+        found = self.listing_with(source, self.fake_run(
+            {"whisper": "your verification code\n909090 thanks"}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        self.assertNotIn("909090", item["body"])
+        self.assertNotIn("909090", item["memory_appendix"])
+
+    def test_default_timeout_suits_voice_notes(self):
+        self.assertEqual(
+            whatsapp_source.DEFAULTS["transcribe_timeout_seconds"], 300)
+        self.assertLessEqual(whatsapp_source.PDF_TIMEOUT_SECONDS, 60)
 
 
 class BodyTest(Base):
@@ -640,8 +735,8 @@ class BodyTest(Base):
         self.assertEqual(meta["whatsapp_message_ids"],
                          [message_id("img"), message_id("b"), message_id("c")])
         self.assertEqual(meta["whatsapp_participants"], [PARENT, OTHER_PARENT])
-        self.assertEqual(meta["whatsapp_chat_ref"], "chat-1265")
-        self.assertEqual(item["source_id"], "whatsapp:chat-1265:2026-11-22")
+        self.assertEqual(meta["whatsapp_chat_ref"], local())
+        self.assertEqual(item["source_id"], sid())
         self.assertEqual(item["date"], DAY)
         header = "\n".join(llm.source_header_lines(item))
         self.assertIn("Source: WhatsApp", header)
@@ -729,11 +824,15 @@ class ValidationTest(Base):
             quiet_minutes=-1, max_wait_hours=100, transcribe_audio=True,
             whisper_language="Hebrew", chat_keys=["x"], max_file_mb=0,
             copy_media="yes", query="anything", unknown_key=1,
+            archive_keep_days=0, extract_budget_seconds=-1,
+            recapture_after_rebuild="no", transcribe_timeout_seconds=7200,
         ))
         text = "\n".join(problems)
         for needle in ("quiet_minutes", "max_wait_hours", "whisper_model",
                        "whisper_language", "chat_keys", "max_file_mb",
-                       "copy_media", "query is not supported", "unknown_key"):
+                       "copy_media", "query is not supported", "unknown_key",
+                       "archive_keep_days", "extract_budget_seconds",
+                       "recapture_after_rebuild", "transcribe_timeout_seconds"):
             self.assertIn(needle, text)
         problems = config.validate(self.routine(quiet_minutes=600,
                                                 max_wait_hours=2))
@@ -761,7 +860,7 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(runner._SOURCE_DEFAULT_LIMITS["whatsapp"], 0)
         self.assertIn("whatsapp", memory_sink.CAPTURE_SOURCE_ID_PREFIXES)
         self.assertTrue(memory_sink.OPERATOR_CONFIRMED_SOURCE_ID_RE.fullmatch(
-            "whatsapp:chat-1265:2026-11-22"))
+            sid()))
         self.assertTrue(triviality.is_chat_kind("whatsapp"))
 
     def test_small_talk_day_is_trivial_but_an_attachment_is_not(self):
@@ -779,21 +878,432 @@ class RelatedMemoriesTest(unittest.TestCase):
             entries.mkdir(parents=True)
             today = datetime.date.today()
             for name, source_id in (
-                ("same-chat", f"whatsapp:chat-1265:{today - datetime.timedelta(days=1)}"),
-                ("this-day", f"whatsapp:chat-1265:{today}"),
-                ("other-chat", f"whatsapp:chat-2001:{today}"),
+                ("same-chat", sid(today - datetime.timedelta(days=1))),
+                ("this-day", sid(today)),
+                ("other-chat", sid(today, key=2001)),
             ):
                 (entries / f"{name}.md").write_text(
                     f"---\nid: {name}\ndate: {today}\ntype: note\n"
                     f"title: {name}\nsource_ids: [{source_id}]\n---\nbody\n")
             routine = {"id": "r", "memory": {"store": tmp}}
-            item = {"id": "x", "source_id": f"whatsapp:chat-1265:{today}",
-                    "frontmatter": {"whatsapp_chat_ref": "chat-1265"}}
+            item = {"id": "x", "source_id": sid(today),
+                    "frontmatter": {"whatsapp_chat_ref": local()}}
             with mock.patch.object(runner, "log"):
                 runner._attach_related_memories(
                     routine, {"kind": "whatsapp"}, item)
             related = item["frontmatter"]["related_memory_entries"]
             self.assertEqual([entry["id"] for entry in related], ["same-chat"])
+
+
+class IndexCrashTest(Base):
+    """Finding 1: the index can always be rebuilt from the day files."""
+
+    def env(self, name):
+        root = self.root / name
+        root.mkdir()
+        spool = Spool(root)
+        return spool, self.source(spool_dir=str(spool.dir),
+                                  archive_dir=str(root / "archive"))
+
+    def second_batch(self, spool):
+        spool.batch(iso(10, 0), [
+            record("a", iso(8, 12), "first"),           # duplicate
+            record("b", iso(9, 30), "second"),          # same day, new
+            record("c", iso(9, 0, day=23), "other", chat_key=7),  # new day
+        ])
+
+    def ids(self, source):
+        return {c["raw"]["source_id"]: c["id"]
+                for c in whatsapp_source.candidates(source)}
+
+    def test_a_crash_at_any_write_of_save_never_hides_a_chat_day(self):
+        spool, baseline = self.env("baseline")
+        spool.batch(iso(9, 0), [record("a", iso(8, 12), "first")])
+        self.ids(baseline)
+        self.second_batch(spool)
+        real = whatsapp_source._write_json
+        calls = []
+        with mock.patch.object(
+                whatsapp_source, "_write_json",
+                side_effect=lambda p, d: (calls.append(p.name), real(p, d))):
+            expected = self.ids(baseline)
+        self.assertEqual(len(expected), 2)
+        self.assertGreaterEqual(len(calls), 4)  # days, index, cursor
+        for step in range(1, len(calls) + 1):
+            spool, source = self.env(f"crash{step}")
+            spool.batch(iso(9, 0), [record("a", iso(8, 12), "first")])
+            self.ids(source)
+            self.second_batch(spool)
+            counter = {"n": 0}
+
+            def crashing(path, payload):
+                counter["n"] += 1
+                if counter["n"] == step:
+                    raise OSError(28, "No space left on device")
+                return real(path, payload)
+
+            with mock.patch.object(whatsapp_source, "_write_json",
+                                   side_effect=crashing):
+                with self.assertRaises(OSError):
+                    whatsapp_source.candidates(source)
+            self.ids(source)
+            self.assertEqual(self.ids(source), expected, f"crash at {step}")
+
+    def test_a_lost_index_is_rebuilt_from_the_day_files(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 12), "first")])
+        before = {c["id"] for c in self.listing()}
+        (self.archive / "chats" / "index.json").unlink()
+        self.assertEqual({c["id"] for c in self.listing()}, before)
+
+
+class RedactionTest(Base):
+    """Finding 2: both views are rendered from the same redacted values."""
+
+    def test_multiline_one_time_codes_are_redacted_in_both_views(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "Your login code:\n482913", sender="Bank"),
+            record("b", iso(8, 1), "verification code\n551177", sender="Bank"),
+        ])
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        for code in ("482913", "551177"):
+            self.assertNotIn(code, item["body"])
+            self.assertNotIn(code, item["memory_appendix"])
+        self.assertEqual(item["body"].count("[REDACTED]"), 2)
+        self.assertEqual(item["memory_appendix"].count("[REDACTED]"), 2)
+
+    def test_file_names_are_redacted_once_for_both_views(self):
+        message, files = self.spool.media_message(
+            "doc", iso(8, 0), "document", b"x", ".bin",
+            original_name="login code 667788.txt")
+        self.spool.batch(iso(9, 0), [message], files)
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        self.assertNotIn("667788", item["body"])
+        self.assertNotIn("667788", item["memory_appendix"])
+
+
+class BatchErrorTest(Base):
+    """Finding 4: one bad batch degrades the listing instead of stopping it."""
+
+    def spoil(self, name, how):
+        path = self.spool.dir / name / "batch.json"
+        if how == "version":
+            payload = json.loads(path.read_text())
+            payload["version"] = 2
+            path.write_text(json.dumps(payload))
+        elif how == "json":
+            path.write_text("{not json")
+        elif how == "unreadable":
+            os.chmod(path, 0)
+            self.addCleanup(os.chmod, path, 0o600)
+
+    def test_ready_days_still_flow_and_the_position_is_held(self):
+        for how, code in (("version", "unsupported_version_2"),
+                          ("json", "bad_json"),
+                          ("unreadable", "unreadable:PermissionError")):
+            with self.subTest(how=how):
+                self.setUp()
+                self.spool.batch(iso(9, 0), [record("a", iso(8, 12), "ok")])
+                self.listing()
+                bad = self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "x")])
+                self.spoil(bad, how)
+                self.spool.batch(iso(11, 0), [
+                    record("c", iso(10, 0), "after", chat_key=7)])
+                self.logs.clear()
+                found = self.listing()
+                self.assertEqual([c["raw"]["source_id"] for c in found], [sid()])
+                self.assertEqual(found.degraded, f"batch {bad} not read ({code})")
+                cursor = json.loads(
+                    next(self.archive.glob("spool-cursor-*.json")).read_text())
+                self.assertTrue(cursor["last_batch"].startswith("b0000000041-"))
+                self.assertTrue(any(f"batch {bad} not read" in line
+                                    for line in self.logs))
+                self.assertFalse(any("ok" in line.split() for line in self.logs))
+
+    def test_runner_reports_a_degraded_listing_as_an_error(self):
+        listing = whatsapp_source.Listing()
+        listing.degraded = "batch b0000000042-20261122T080000Z not read (bad_json)"
+        base = self.root / "daemon"
+        routine = {"id": "wa", "enabled": True, "source": self.source(),
+                   "analyze": {"provider": "gemini", "model": "m",
+                               "instruction": "x"}}
+        lines = []
+        with mock.patch.dict(runner.SOURCES,
+                             {"whatsapp": (lambda _s: listing, None)}), \
+                mock.patch.object(config, "validate", return_value=[]), \
+                mock.patch.object(runner, "log", side_effect=lines.append):
+            totals = runner.run(base, [routine])
+        self.assertEqual(totals["errors"], 1)
+        self.assertTrue(any(
+            line.startswith("routine=wa source=whatsapp ERROR degraded:")
+            for line in lines))
+
+
+class SequenceTest(Base):
+    """Finding 5: a batch sequence that went backwards fails loudly."""
+
+    def test_restarted_sequence_is_refused(self):
+        self.spool.seq = 499
+        first = self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.listing()
+        shutil.rmtree(self.spool.dir / first)
+        self.spool.seq = 0
+        self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
+        with self.assertRaisesRegex(RuntimeError, "went backwards"):
+            self.listing()
+
+    def test_older_name_created_later_is_refused_while_the_cursor_exists(self):
+        self.spool.seq = 499
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.listing()
+        self.spool.seq = 9
+        self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
+        with self.assertRaisesRegex(RuntimeError, "went backwards"):
+            self.listing()
+
+    def test_pruned_cursor_batch_with_newer_batches_is_normal(self):
+        first = self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.listing()
+        shutil.rmtree(self.spool.dir / first)
+        self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
+        self.assertEqual(len(self.listing()), 1)
+
+
+class ChatIdentityTest(Base):
+    """Finding 6: the archive keeps its own stable chat identity."""
+
+    def day_ids(self, found):
+        return {c["raw"]["chat"]: sorted(c["raw"]["_day"]["messages"])
+                for c in found}
+
+    def test_chat_key_never_matches_across_stores(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")],
+                         store_id="store-one")
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b")],
+                         store_id="store-two")
+        chats = self.day_ids(self.listing())
+        self.assertEqual(set(chats), {local("store-one"), local("store-two")})
+
+    def test_chat_id_links_a_chat_across_a_reinstall(self):
+        cid = chat_id("class")
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_id=cid)],
+                         store_id="store-one")
+        self.spool.batch(iso(10, 0), [
+            record("b", iso(9, 0), "b", chat_key=3000, chat_id=cid)],
+            store_id="store-two")
+        chats = self.day_ids(self.listing())
+        self.assertEqual(chats, {local(chat_id=cid):
+                                 sorted([message_id("a"), message_id("b")])})
+
+    def test_jid_change_keeps_the_chat_through_its_key(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "a", chat_id=chat_id("phone-jid"))],
+            store_id="store-one")
+        self.spool.batch(iso(10, 0), [
+            record("b", iso(9, 0), "b", chat_id=chat_id("lid-jid"))],
+            store_id="store-one")
+        self.assertEqual(len(self.day_ids(self.listing())), 1)
+
+    def test_fields_arriving_later_attach_to_the_same_chat(self):
+        cid = chat_id("class")
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.spool.batch(iso(10, 0), [
+            record("b", iso(9, 0), "b", chat_id=cid)], store_id="store-one")
+        self.spool.batch(iso(11, 0), [
+            record("c", iso(10, 0), "c", chat_key=3000, chat_id=cid)],
+            store_id="store-two")
+        chats = self.day_ids(self.listing())
+        self.assertEqual(list(chats), [local()])
+        self.assertEqual(len(chats[local()]), 3)
+        registry = json.loads(
+            (self.archive / "chats" / "registry.json").read_text())
+        chat = registry["chats"][local()]
+        self.assertEqual(chat["chat_ids"], [cid])
+        self.assertEqual(sorted(chat["keys"]), sorted(
+            ["unknown|1265", "store-one|1265", "store-two|3000"]))
+        text = json.dumps(registry)
+        for jid in (GROUP_JID, MEMBER_JID):
+            self.assertNotIn(jid.split("@")[0], text)
+
+    def test_include_filter_follows_a_linked_chat_and_warns_after_reinstall(self):
+        cid = chat_id("class")
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_id=cid)],
+                         store_id="store-one")
+        self.spool.batch(iso(10, 0), [
+            record("b", iso(9, 0), "b", chat_key=3000, chat_id=cid),
+            record("x", iso(9, 1), "other", chat_key=1265,
+                   chat_id=chat_id("someone else"))],
+            store_id="store-two")
+        found = self.listing(chat_keys=[1265])
+        chats = self.day_ids(found)
+        # The linked chat stays included; key 1265 in the new store is
+        # another chat, which matches the include list too (keys are per
+        # store, hence the warning until the list is updated).
+        self.assertIn(local(chat_id=cid), chats)
+        self.assertEqual(len(chats[local(chat_id=cid)]), 2)
+        self.spool.batch(iso(11, 0), [record("y", iso(10, 0), "y", chat_key=5,
+                                             chat_id=chat_id("z"))],
+                         store_id="store-three")
+        self.logs.clear()
+        self.listing(chat_keys=[1265])
+        self.assertTrue(any("chat_keys entry 1265 has not appeared" in line
+                            for line in self.logs))
+
+
+class RebuildGuardTest(Base):
+    """Finding 7: a rebuilt archive does not overwrite full captures."""
+
+    def ledger(self, source_id):
+        return {f"{source_id}@0123456789abcdef": {
+            "source_kind": "whatsapp", "source_id": source_id,
+            "processed_at": "2026-11-22T08:00:00Z", "memory": "created"}}
+
+    def test_new_archive_skips_days_captured_before_it(self):
+        self.spool.batch(iso(9, 0), [
+            record("late", iso(8, 0), "only the end of the day"),
+            record("o", iso(8, 0), "other chat", chat_key=7)])
+        found = self.listing(processed=self.ledger(sid()))
+        self.assertEqual([c["raw"]["source_id"] for c in found], [sid(key=7)])
+        self.assertTrue(any("recapture_after_rebuild" in line
+                            for line in self.logs))
+        found = self.listing(processed=self.ledger(sid()),
+                             recapture_after_rebuild=True)
+        self.assertEqual(len(found), 2)
+
+    def test_deleting_only_the_cursor_is_not_a_rebuild(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.listing()
+        next(self.archive.glob("spool-cursor-*.json")).unlink()
+        found = self.listing(processed=self.ledger(sid()))
+        self.assertEqual(len(found), 1)
+        self.assertFalse((self.archive / "rebuild-guard.json").exists())
+
+
+class MediaLifecycleTest(Base):
+    def test_raised_limit_or_enabled_copies_happen_later(self):
+        big, files = self.spool.media_message(
+            "big", iso(8, 0), "video", b"v" * (1024 * 1024 + 10), ".mp4")
+        img, img_files = self.spool.media_message(
+            "img", iso(8, 1), "image", b"jpg", ".jpg")
+        self.spool.batch(iso(9, 0), [big, img], {**files, **img_files})
+        found = self.listing(max_file_mb=1, copy_media=False)
+        messages = found[0]["raw"]["_day"]["messages"]
+        self.assertFalse(any(m.get("stored_path") for m in messages.values()))
+        found = self.listing(max_file_mb=1)
+        messages = found[0]["raw"]["_day"]["messages"]
+        self.assertTrue(messages[message_id("img")]["stored_path"])
+        self.assertEqual(messages[message_id("big")]["store_note"], "too_large")
+        found = self.listing(max_file_mb=2)
+        self.assertTrue(found[0]["raw"]["_day"]["messages"]
+                        [message_id("big")]["stored_path"])
+
+    def index(self):
+        return json.loads((self.archive / "chats" / "index.json").read_text())
+
+    def test_media_bytes_is_recounted_and_replacements_are_not_double_counted(self):
+        first, files = self.spool.media_message(
+            "img", iso(8, 0), "image", b"a" * 100, ".jpg")
+        self.spool.batch(iso(9, 0), [first], files)
+        self.listing()
+        self.assertEqual(self.index()["media_bytes"], 100)
+        again, files = self.spool.media_message(
+            "img", iso(8, 0), "image", b"b" * 150, ".jpg", update="media")
+        self.spool.batch(iso(10, 0), [again], files)
+        self.listing()
+        self.assertEqual(self.index()["media_bytes"], 150)
+        index = self.index()
+        index["media_bytes"] = 999999
+        (self.archive / "chats" / "index.json").write_text(json.dumps(index))
+        self.now += whatsapp_source.MEDIA_RECOUNT_SECONDS + 1
+        self.listing()
+        self.assertEqual(self.index()["media_bytes"], 150)
+
+    def test_stale_temp_files_and_workdirs_are_swept(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.listing()
+        old = self.now - whatsapp_source.STALE_TEMP_SECONDS - 10
+        stale = self.archive / "media" / DAY / ".wa1-x.jpg.123.tmp"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"x")
+        os.utime(stale, (old, old))
+        workdir = self.archive / ".tmp" / "tmpstale"
+        workdir.mkdir(parents=True)
+        (workdir / "audio.wav").write_bytes(b"x")
+        os.utime(workdir, (old, old))
+        fresh = self.archive / ".tmp" / "tmpfresh"
+        fresh.mkdir()
+        os.utime(fresh, (self.now, self.now))
+        self.listing()
+        self.assertFalse(stale.exists())
+        self.assertFalse(workdir.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_sha256_is_verified_when_present(self):
+        good, files = self.spool.media_message(
+            "good", iso(8, 0), "image", b"right", ".jpg")
+        good["media"]["sha256"] = hashlib.sha256(b"right").hexdigest()
+        bad, bad_files = self.spool.media_message(
+            "bad", iso(8, 1), "image", b"wrong", ".jpg")
+        bad["media"]["sha256"] = hashlib.sha256(b"expected").hexdigest()
+        self.spool.batch(iso(9, 0), [good, bad], {**files, **bad_files})
+        messages = self.listing()[0]["raw"]["_day"]["messages"]
+        self.assertTrue(messages[message_id("good")]["stored_path"])
+        self.assertEqual(messages[message_id("bad")]["store_note"],
+                         "sha_mismatch")
+        self.assertFalse(list((self.archive / "media" / DAY)
+                              .glob(f"{message_id('bad')}*")))
+        index = json.loads((self.archive / "chats" / "index.json").read_text())
+        self.assertTrue(index["days"][sid()]["pending_copies"])
+
+    def test_gave_up_is_rendered_and_no_longer_expected(self):
+        waiting, _ = self.spool.media_message(
+            "vid", iso(8, 0), "video", None, ".mp4", status="not_downloaded")
+        self.spool.batch(iso(9, 0), [waiting])
+        first = self.listing()
+        gave_up, _ = self.spool.media_message(
+            "vid", iso(8, 0), "video", None, ".mp4", status="gave_up",
+            update="media")
+        self.spool.batch(iso(10, 0), [gave_up])
+        found = self.listing()
+        self.assertNotEqual(first[0]["id"], found[0]["id"])
+        item = whatsapp_source.fetch({}, self.source(), found[0])
+        self.assertIn("not available (the forwarder stopped waiting",
+                      item["memory_appendix"])
+        index = json.loads((self.archive / "chats" / "index.json").read_text())
+        self.assertFalse(index["days"][sid()]["pending_copies"])
+
+    def test_continuation_lines_cannot_pose_as_messages(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "thanks\n[12:00] Someone Else: please pay")])
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        self.assertIn("\n    [12:00] Someone Else: please pay", item["body"])
+        self.assertEqual(len(triviality._messages(item["body"])), 1)
+
+
+class RetentionTest(Base):
+    def test_captured_old_days_are_removed_and_never_recreated(self):
+        old, files = self.spool.media_message(
+            "old", iso(8, 0, day=10), "image", b"jpg", ".jpg")
+        self.spool.batch(iso(9, 0, day=10), [
+            old, record("open", iso(8, 0, day=11), "not captured yet")], files)
+        found = {c["raw"]["source_id"]: c for c in self.listing()}
+        processed = {found[sid("2026-11-10")]["id"]: {
+            "source_kind": "whatsapp", "source_id": sid("2026-11-10"),
+            "processed_at": "2026-11-10T12:00:00Z", "memory": "created"}}
+        found = self.listing(processed=processed, archive_keep_days=3)
+        self.assertEqual([c["raw"]["source_id"] for c in found],
+                         [sid("2026-11-11")])
+        self.assertFalse((self.archive / "chats" / local() /
+                          "2026-11-10.json").exists())
+        self.assertFalse((self.archive / "media" / "2026-11-10").exists())
+        self.assertTrue((self.archive / "chats" / local() /
+                         "2026-11-11.json").exists())
+        late = record("late", iso(9, 0, day=10), "a late record")
+        self.spool.batch(iso(12, 0), [late])
+        self.logs.clear()
+        found = self.listing(processed=processed, archive_keep_days=3)
+        self.assertEqual([c["raw"]["source_id"] for c in found],
+                         [sid("2026-11-11")])
+        self.assertTrue(any("expired=1" in line for line in self.logs))
 
 
 class FakeResult:
@@ -887,7 +1397,7 @@ class EndToEndTest(Base):
         self.assertEqual(len(adds), 1)
         args, stdin = adds[0]
         self.assertEqual(args[args.index("--source-ids") + 1],
-                         "whatsapp:chat-1265:2026-11-22")
+                         sid())
         self.assertEqual(args[args.index("--date") + 1], DAY)
         # Unknown people are dropped by slug validation, never minted.
         self.assertEqual(args[args.index("--people") + 1], "known-parent")
@@ -904,7 +1414,7 @@ class EndToEndTest(Base):
         (entry,) = ledger.values()
         self.assertEqual(entry["source_kind"], "whatsapp")
         self.assertEqual(entry["memory_source_id"],
-                         "whatsapp:chat-1265:2026-11-22")
+                         sid())
         # Settled: the next run lists nothing new for this day.
         self.cli_calls.clear()
         totals = self.run_daemon()
@@ -918,6 +1428,14 @@ class EndToEndTest(Base):
         for secret in (PARENT, "מחר", "Thanks!", GROUP_LABEL, GROUP_JID,
                        MEMBER_JID, "15550000001", "120363000000000001",
                        "100000000000001", "Sports day"):
+            self.assertNotIn(secret, joined)
+
+    def test_no_personal_data_in_dry_run_logs(self):
+        self.run_daemon(dry_run=True)
+        joined = "\n".join(self.all_logs)
+        self.assertIn("[dry-run]", joined)
+        for secret in (PARENT, "מחר", "Thanks!", GROUP_LABEL, GROUP_JID,
+                       MEMBER_JID, "120363000000000001", "100000000000001"):
             self.assertNotIn(secret, joined)
 
     def test_crash_between_copy_and_ledger_keeps_the_file(self):

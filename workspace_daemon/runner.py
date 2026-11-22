@@ -1968,6 +1968,19 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             )
             normal_ids = {_routing_id(candidate) for candidate in candidates}
             listed_routing_ids.update(normal_ids)
+            degraded = getattr(candidates, "degraded", None)
+            if degraded:
+                # The source listed what it could but part of its scope is
+                # unread (a WhatsApp spool batch it cannot parse): an error
+                # for status and alerts, and a barrier for lower-ranked
+                # routines, while the listed items are still processed.
+                totals["errors"] += 1
+                coverage_problems.append(f"{spec_label} degraded: {degraded}")
+                log(f"routine={rid} source={spec_label} ERROR degraded: {degraded}")
+                failures.append(_failure(
+                    routine, source, known_ids=normal_ids,
+                    ownership_class=ownership_class,
+                ))
             if getattr(candidates, "partial", False):
                 # Some of this source's queries failed. Its listed threads are
                 # fine, but a lower-ranked routine must not claim threads in
