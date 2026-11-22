@@ -1,5 +1,7 @@
 """Inbox 0.12.1: the `?` keyboard reference scrolls (keys and mouse wheel)
-when its content is taller than the screen.
+when its content is taller than the screen. 0.12.4: the wheel scrolls it
+wherever the pointer is (the box is 66 wide; the rest of the screen is the
+modal backdrop).
 
 Fictional data only. Needs Textual; the class skips without it."""
 import importlib.util
@@ -107,6 +109,42 @@ class HelpScrollTest(unittest.IsolatedAsyncioTestCase):
             body.post_message(events.MouseScrollDown(
                 body, 5, 5, 0, 0, 0, False, False, False))
             self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > 0))
+
+    async def test_the_wheel_scrolls_wherever_the_pointer_is(self):
+        # A real wheel event carries screen coordinates and goes through the
+        # App and Screen hit-testing, as the driver delivers it. It used to
+        # scroll only over the body text: the backdrop, border, padding and
+        # title took it and did nothing.
+        async def wheel(app, kind, x, y):
+            app.post_message(kind(None, x, y, 0, 0, 0, False, False, False,
+                                  screen_x=x, screen_y=y))
+        for size in (SMALL, (236, 60)):
+            app = make_app()
+            async with app.run_test(size=size) as pilot:
+                await settle(pilot, app)
+                pane = await open_help(pilot, app)
+                box = app.screen.query_one("#help")
+                title = app.screen.query_one("#help-title")
+                spots = {
+                    "backdrop left": (1, 10),
+                    "backdrop right": (size[0] - 2, 10),
+                    "backdrop above": (box.region.x + 10, 0),
+                    "border": (box.region.x, box.region.y + 8),
+                    "padding": (box.region.x + 1, box.region.y + 8),
+                    "title": (title.region.x + 3, title.region.y),
+                    "body": (pane.region.x + 5, pane.region.y + 5),
+                }
+                for name, (x, y) in spots.items():
+                    pane.scroll_to(0, 6, animate=False)
+                    await pilot.pause()
+                    await wheel(app, events.MouseScrollDown, x, y)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: pane.scroll_y > 6), (size, name, "down"))
+                    pane.scroll_to(0, 6, animate=False)
+                    await pilot.pause()
+                    await wheel(app, events.MouseScrollUp, x, y)
+                    self.assertTrue(await wait_for(
+                        pilot, lambda: pane.scroll_y < 6), (size, name, "up"))
 
     async def test_the_last_lines_are_visible_after_end(self):
         app = make_app()

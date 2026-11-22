@@ -7,6 +7,19 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-11-22
+
+### Fixed
+
+- **The mouse wheel did not scroll the `?` keyboard reference.** The box is
+  66 columns wide; the rest of the screen is the dimmed backdrop. The wheel
+  scrolled only with the pointer over the body text or its scrollbar. Over
+  the backdrop, the border, the padding or the title it did nothing, and on a
+  wide terminal that is most of the screen. The help screen now takes any
+  wheel event and scrolls the reference. The keys were not affected. The test
+  sends wheel events with screen coordinates through the App, not straight to
+  the body.
+
 ## [0.12.3] - 2026-11-19
 
 ### Added

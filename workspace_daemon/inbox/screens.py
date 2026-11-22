@@ -11,6 +11,7 @@ import time
 
 from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -608,6 +609,22 @@ class HelpScreen(ModalScreen):
     def action_scroll(self, step: int):
         pane = self.query_one("#help-scroll")
         pane.scroll_down(animate=False) if step > 0 else pane.scroll_up(animate=False)
+
+    # The box is 66 wide and the rest of the screen is the modal backdrop, so a
+    # wheel turned there, or over the border, padding or title, never reaches
+    # the scroll pane. It lands here (bubbled from the box, or posted to the
+    # screen); the pane takes it.
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown):
+        event.stop()
+        self._wheel(1)
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp):
+        event.stop()
+        self._wheel(-1)
+
+    def _wheel(self, sign: int):
+        self.query_one("#help-scroll").scroll_relative(
+            y=sign * self.app.scroll_sensitivity_y, animate=False)
 
     def action_close(self):
         self.dismiss(None)
