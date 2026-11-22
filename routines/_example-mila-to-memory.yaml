@@ -93,7 +93,8 @@ memory:
     # file (default): one todo per verified action. review: ONE todo per
     # meeting ("Review action items: ...", tag needs-review) listing every
     # candidate, verified or not, plus one row in a candidates queue for
-    # later review. Both modes key on the meeting source, not the entry type.
+    # later review (valid candidates are never dropped by max_per_item). Both
+    # modes key on the meeting source, not the entry type.
     mode: file
     # review mode only; default <state dir>/meeting-action-candidates.jsonl
     # review_queue: /absolute/path/meeting-action-candidates.jsonl

@@ -1730,7 +1730,8 @@ memory:
   The guarantee is weaker than live capture: the stored body is a model
   summary, so an action is kept only when an owner name shares its sentence or
   bullet. `--dry-run` calls the model and reports the count but writes nothing.
-  In `review` mode this command refuses; use `backfill-action-review` below.
+  The entry is accepted by its meeting source id (`mila:`, `whisper:`, ...), so
+  a meeting stored as `decision` or `note` can be backfilled too. In `review` mode this command refuses; use `backfill-action-review` below.
 
 ##### Review mode (`mode: review`)
 
@@ -1743,28 +1744,54 @@ grounded in the transcript), and:
 - files ONE `todo`, title `Review action items: <meeting title>`, people = the
   owner slug, tags = `tag` + the routine's tags + `needs-review`, dated the
   meeting date (body line `due <date>`), source id `<meeting source id>:review`
-  (so a re-run updates it in place; the capture guard moves it to
-  `<id>:review:auto` when a hand-logged entry carries the id). The body links
-  the meeting entry id and lists each candidate as a bullet with its quote
-  (transcript line, or body sentence in a backfill) and a marker:
-  `[unverified: ungrounded]` or `[invalid: <reason>]`; verified ones have none.
+  (so a re-run updates it in place). The capture guard keeps a hand-logged
+  entry that carries that exact id from being overwritten: the review todo
+  then goes under `<id>:auto`, i.e. `<meeting source id>:review:auto`. (A
+  meeting that was itself captured under a derived `...:auto` id gets
+  `...:auto:review`.) The body links the meeting entry id and lists each
+  candidate as a bullet with a marker, `[unverified: ungrounded]` or
+  `[invalid: <reason>]` (verified ones have none), and one line of evidence:
+  `quote` for a verified candidate, `line at timestamp` otherwise.
+- `quote` is the grounding evidence and exists only for a `valid` candidate: the
+  owner's own transcript line that matched the timestamp (live; if another
+  speaker shares that second, still the owner's line), or the body sentence
+  naming the owner (backfill). For `ungrounded` and `invalid` candidates it is
+  `null`; the optional `line_at_ts` then holds the first transcript line at the
+  action's timestamp (speaker label kept, whoever spoke it), when the action
+  gave a usable timestamp and the live transcript has such a line. It is
+  context for the reviewer, never evidence. A backfill has no timestamps, so no
+  `line_at_ts`.
+- Cap: `max_per_item` limits the candidates, but a `valid` one is never
+  dropped. Candidates are ordered valid, ungrounded, invalid; only the flagged
+  tail is trimmed, to the slots the valid ones leave (none when valid ones fill
+  the cap).
+- `needs-review` is in the Fibery export's default `exclude_tags`, so a review
+  todo never goes to Fibery (an explicit `exclude_tags` replaces the default:
+  keep `needs-review` in it).
 - appends one JSON line to the candidates queue (`review_queue`, relative paths
   resolve against the daemon directory). The file and its `.lock` are `0600`,
   every change holds an exclusive `flock`, and the queue keeps one row per
   `meeting_entry_id`: an identical re-run is skipped, a changed one replaces its
-  row. Row schema (`v` 1):
+  row. Rows are `\n`-separated, ASCII-escaped JSON (no U+2028, U+2029 or U+0085
+  can split one). A consumer that rewrites or removes rows must hold an
+  exclusive `flock` on `<queue>.lock` while it does, as the daemon does. A new
+  queue folder is created private (`0700`). Row schema (`v` 1):
 
   ```json
-  {"v":1,"meeting_entry_id":"...","review_todo_id":"...","source_id":"mila:REC-1",
+  {"v":1,"meeting_entry_id":"...","review_todo_id":"... or null","source_id":"mila:REC-1",
    "source_kind":"mila","recording_id":"REC-1","title":"...","date":"2026-10-01",
    "at":"2026-10-01T09:00:00Z",
-   "candidates":[{"text":"...","quote":"... or null","due":"2026-10-08",
+   "candidates":[{"text":"...","quote":"owner line, null unless valid",
+                  "line_at_ts":"optional, never for valid","due":"2026-10-08",
                   "owner":"me-example","status":"valid|ungrounded|invalid",
                   "reason":"null for valid"}]}
   ```
 
-  `recording_id` and a candidate's `due` appear only when known. A meeting with
-  no owner actions files nothing and writes no row.
+  `recording_id`, `line_at_ts` and a candidate's `due` appear only when known.
+  A meeting with no owner actions files nothing and writes no row. A meeting the
+  store refuses as a near-duplicate of an existing entry is not captured, so it
+  never reaches the queue; when only the review todo is refused as a
+  near-duplicate, the row is still written with `review_todo_id: null`.
 - logs carry counts and ids only, never candidate text.
 
 Review an already-stored meeting, whatever its entry type (told apart by its
@@ -1775,10 +1802,15 @@ source id), from its stored body:
     [--entry <meeting-entry-id> ...] [--since YYYY-MM-DD] [--redo] [--dry-run]
 ```
 
-Give `--entry` (repeatable) and/or `--since`. A meeting that already has its
-review todo is skipped without a model call unless `--redo` (which updates the
-same todo and queue row). `--dry-run` calls the model, prints counts and entry
-ids only, and writes nothing.
+Give `--entry` (repeatable) and/or `--since` (a real date). An `--entry` that is
+missing or not a meeting makes the command exit 1. Entries sharing a meeting
+source id (a hand-logged one and its `:auto` capture, or two captures) count as
+one meeting, and the daemon's own (`auto-captured`) entry is the one reviewed.
+A meeting that already has its review todo or a queue row is skipped without a
+model call unless `--redo` (which updates the same todo and queue row), so a
+near-duplicate-refused review todo does not cause repeated model calls.
+`--dry-run` calls the model, prints counts and entry ids only, and writes
+nothing.
 
 ### Zoom meeting summaries
 

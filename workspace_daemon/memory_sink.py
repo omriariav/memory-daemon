@@ -2268,13 +2268,17 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
     body = item.get("body", "")
     mapped = (item.get("frontmatter") or {}).get("mila_speaker_names") or ()
     for c in candidates:
-        if c["status"] != "valid":
-            continue
-        c["quote"] = owner_todos.transcript_quote(body, c.get("evidence_ts"))
-        if not owner_todos.grounded_in_transcript(
-                body, c.get("evidence_ts"), names, mapped):
+        ts = c.get("evidence_ts")
+        if c["status"] == "valid":
+            grounded, quote = owner_todos.ground_in_transcript(
+                body, ts, names, mapped)
+            if grounded:
+                c["quote"] = quote
+                continue
             c["status"] = "ungrounded"
             c["reason"] = "no owner-spoken transcript line at the timestamp"
+        if ts:
+            c["line_at_ts"] = owner_todos.transcript_quote(body, ts)
     meta = item.get("frontmatter") or {}
     return file_action_review(
         routine, meeting_source_id=source_id, meeting_entry_id=entry_id,
@@ -2337,10 +2341,10 @@ def file_action_review(routine, meeting_source_id, meeting_entry_id,
     rid = routine.get("id")
     store = cfg["store"]
     limit = owner_todos.max_per_item(routine)
-    if len(candidates) > limit:
-        log(f"routine={rid} owner-todos review: {len(candidates)} "
-            f"candidates, keeping the first {limit}")
-        candidates = candidates[:limit]
+    candidates, trimmed = owner_todos.cap_candidates(candidates, limit)
+    if trimmed:
+        log(f"routine={rid} owner-todos review: cap {limit}, dropped "
+            f"{trimmed} flagged candidate(s) (valid ones are never dropped)")
     redact = (lambda text: personal.redact(text)[0]) \
         if personal.redact_enabled(cfg) else None
     ptag = personal.personal_tag(cfg)
@@ -2481,9 +2485,8 @@ def _backfill_owner(routine, cfg):
     return owner_slug, names
 
 
-def _backfill_raw_actions(routine, cfg, entry, meeting_sid, names):
-    """Ask the model for the owner's actions in a stored entry body; returns
-    the raw `owner_actions` value. Raises ValueError on unparsable JSON."""
+def _backfill_answer(routine, cfg, entry, meeting_sid, names):
+    """The model's raw answer for a stored entry body (LLM errors propagate)."""
     from . import llm  # late import to avoid cycles
 
     prompt = owner_todos.BACKFILL_PROMPT.format(
@@ -2498,7 +2501,11 @@ def _backfill_raw_actions(routine, cfg, entry, meeting_sid, names):
     model = cfg.get("extract_model")
     if isinstance(model, str) and model.strip():
         kwargs["model"] = model.strip()
-    answer = llm.analyze(routine, prompt, **kwargs)
+    return llm.analyze(routine, prompt, **kwargs)
+
+
+def _parse_backfill_answer(answer):
+    """The raw `owner_actions` value of an answer; ValueError on bad JSON."""
     raw = re.sub(r"^```(json)?|```$", "", answer.strip(), flags=re.M)
     data = json.loads(raw.strip())
     return data.get("owner_actions") if isinstance(data, dict) else None
@@ -2506,6 +2513,7 @@ def _backfill_raw_actions(routine, cfg, entry, meeting_sid, names):
 
 def backfill_owner_todos(routine, entry_id, dry_run=False):
     """Re-run owner-action extraction over a stored meeting entry body.
+    The entry is told to be a meeting by its source id, not its type.
 
     Works from the entry body (which already lists the meeting's action
     items), so no recording transcript or source access is needed. The
@@ -2529,19 +2537,15 @@ def backfill_owner_todos(routine, entry_id, dry_run=False):
     entry = _load_memory_entries(cfg["store"]).get(entry_id)
     if entry is None:
         raise RuntimeError(f"memory entry {entry_id!r} not found")
-    if entry["type"] != "meeting":
-        raise RuntimeError(f"memory entry {entry_id!r} is not a meeting")
-    meeting_sids = [
-        value for value in entry["source_ids"]
-        if owner_todos.ACTION_ID_PREFIX not in value
-    ]
-    if not meeting_sids:
-        raise RuntimeError(f"memory entry {entry_id!r} has no source id")
+    meeting_sid = _meeting_source_id(entry)
+    if meeting_sid is None:
+        raise RuntimeError(
+            f"memory entry {entry_id!r} has no meeting source id")
     owner_slug, names = _backfill_owner(routine, cfg)
+    answer = _backfill_answer(routine, cfg, entry, meeting_sid, names)
     try:
         actions, dropped = owner_todos.validate_actions(
-            _backfill_raw_actions(routine, cfg, entry, meeting_sids[0], names)
-        )
+            _parse_backfill_answer(answer))
     except ValueError:
         actions = None
     if actions is None:
@@ -2555,11 +2559,17 @@ def backfill_owner_todos(routine, entry_id, dry_run=False):
         f"{dropped} invalid dropped")
     ptag = personal.personal_tag(cfg)
     return create_owner_todos(
-        routine, meeting_source_id=meeting_sids[0],
+        routine, meeting_source_id=meeting_sid,
         meeting_entry_id=entry_id, date=entry["date"], actions=grounded,
         owner_slug=owner_slug, dry_run=dry_run,
         is_personal=bool(ptag) and ptag in entry["tags"],
     )
+
+
+def _base_source_id(sid):
+    """A meeting source id without the derived `:auto` capture suffix."""
+    suffix = auto_source_id_for("")
+    return sid[:-len(suffix)] if sid.endswith(suffix) else sid
 
 
 def _meeting_source_id(entry):
@@ -2599,14 +2609,19 @@ def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
         raise RuntimeError("routine has no memory.owner_todos block")
     if not entry_ids and not since:
         raise RuntimeError("give --entry ID (repeatable) and/or --since DATE")
-    if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
-        raise RuntimeError("--since must be YYYY-MM-DD")
+    if since:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+                raise ValueError(since)
+            datetime.date.fromisoformat(since)
+        except ValueError:
+            raise RuntimeError("--since must be a real date, YYYY-MM-DD")
     rid = routine.get("id")
     entries = _load_memory_entries(cfg["store"])
     wanted = list(dict.fromkeys(entry_ids or ()))
     counts = {"selected": 0, "reviewed": 0, "queued": 0, "no_actions": 0,
-              "already_reviewed": 0, "skipped": 0, "errors": 0,
-              "candidates": 0}
+              "already_reviewed": 0, "skipped": 0, "duplicates": 0,
+              "errors": 0, "candidates": 0}
     reviewed_ids, picked = [], []
     for entry_id in wanted:
         if entry_id not in entries:
@@ -2624,24 +2639,41 @@ def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
             if e["date"] >= since and e["id"] not in picked
             and _meeting_source_id(e) is not None
         ]
+    # One meeting, one review: entries sharing a source id (a hand-logged one
+    # and its `:auto` capture, or two captures) collapse to one, preferring
+    # the daemon's own (AUTO_TAG) entry.
+    groups = {}
+    for entry_id in picked:
+        base = _base_source_id(_meeting_source_id(entries[entry_id]))
+        groups.setdefault(base, []).append(entry_id)
+    picked = []
+    for base, ids in groups.items():
+        ids.sort(key=lambda i: AUTO_TAG not in entries[i]["tags"])
+        picked.append(ids[0])
+        counts["duplicates"] += len(ids) - 1
     counts["selected"] = len(picked)
     if not picked:
         log(f"routine={rid} action-review: no meeting entries selected")
         return dict(counts, entry_ids=[])
     owner_slug, names = _backfill_owner(routine, cfg)
     carried = {sid for e in entries.values() for sid in e["source_ids"]}
+    queue = owner_todos.review_queue_path(routine, llm_base_dir())
     ptag = personal.personal_tag(cfg)
     for entry_id in picked:
         entry = entries[entry_id]
         sid = _meeting_source_id(entry)
-        review_sid = owner_todos.review_source_id(sid)
-        if not redo and (review_sid in carried
-                         or auto_source_id_for(review_sid) in carried):
+        base = _base_source_id(sid)
+        review_sids = [owner_todos.review_source_id(b)
+                       for b in (base, auto_source_id_for(base))]
+        done = any(r in carried or auto_source_id_for(r) in carried
+                   for r in review_sids) or bool(queue) and any(
+            action_review_queue.has_row(queue, key)
+            for key in (entry_id, base, auto_source_id_for(base)))
+        if not redo and done:
             counts["already_reviewed"] += 1
             continue
         try:
-            raw = _backfill_raw_actions(routine, cfg, entry, sid, names)
-            candidates = owner_todos.classify_actions(raw)
+            answer = _backfill_answer(routine, cfg, entry, sid, names)
         except claude_bridge.GUARD_STOPS:
             raise
         except Exception as exc:
@@ -2649,6 +2681,11 @@ def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
                 f"failed: {type(exc).__name__}")
             counts["errors"] += 1
             continue
+        try:
+            candidates = owner_todos.classify_actions(
+                _parse_backfill_answer(answer))
+        except ValueError:
+            candidates = None
         if candidates is None:
             log(f"routine={rid} action-review: entry {entry_id} model "
                 "returned invalid owner_actions")
@@ -2667,7 +2704,7 @@ def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
             if quote is None:
                 c["status"] = "ungrounded"
                 c["reason"] = "no owner name beside the action in the entry body"
-        prefix, _, rest = sid.partition(":")
+        prefix, _, rest = base.partition(":")
         out = file_action_review(
             routine, meeting_source_id=sid, meeting_entry_id=entry_id,
             source_kind=prefix, recording_id=rest if prefix == "mila" else None,
@@ -2675,6 +2712,7 @@ def backfill_action_review(routine, entry_ids=(), since=None, dry_run=False,
             owner_slug=owner_slug, dry_run=dry_run,
             is_personal=bool(ptag) and ptag in entry["tags"],
         )
+        carried.add(owner_todos.review_source_id(sid))
         reviewed_ids.append(entry_id)
         counts["candidates"] += out.get("memory_owner_review_candidates", 0)
         counts["reviewed"] += 1 if dry_run else out.get(

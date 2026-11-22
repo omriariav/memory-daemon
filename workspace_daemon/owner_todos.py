@@ -311,7 +311,11 @@ def classify_actions(raw, require_ts=False):
             text = ""
             if isinstance(row, dict) and isinstance(row.get("text"), str):
                 text = " ".join(row["text"].split())[:CANDIDATE_TEXT_LIMIT]
-            rows.append({"text": text, "status": "invalid", "reason": reason})
+            bad = {"text": text, "status": "invalid", "reason": reason}
+            ts = row.get("evidence_ts") if isinstance(row, dict) else None
+            if isinstance(ts, str) and _TS_RE.fullmatch(ts.strip()):
+                bad["evidence_ts"] = ts.strip()
+            rows.append(bad)
             continue
         key = action_key(out["text"])
         if key in seen:
@@ -348,9 +352,11 @@ def _name_match(label, names):
     )
 
 
-def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
-    """True when `evidence_ts` heads a transcript line (rendered as
-    `[ts] Speaker: text`) spoken by the owner.
+def ground_in_transcript(body, evidence_ts, names, mapped_names=()):
+    """(grounded, owner line). `grounded` is True when `evidence_ts` heads a
+    transcript line (rendered as `[ts] Speaker: text`) spoken by the owner.
+    The line is the MATCHED line (speaker kept, capped), never another line
+    that shares the second; None when not grounded or the line is empty.
 
     When the owner is mapped to a speaker in this recording (a line in the body
     carries an owner name, or `mapped_names` lists one) only the owner's own
@@ -359,7 +365,7 @@ def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
     non-owner fails and an unnamed or missing label passes."""
     want = _norm_ts(evidence_ts or "")
     if want is None:
-        return False
+        return False, None
     rows = []
     for line in str(body or "").splitlines():
         m = _LINE_RE.match(line.strip())
@@ -367,23 +373,29 @@ def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
             continue
         who = _SPEAKER_RE.match(m.group("rest"))
         rows.append((_norm_ts(m.group("ts")),
-                     who.group("who").strip() if who else None))
+                     who.group("who").strip() if who else None,
+                     " ".join(m.group("rest").split())[:QUOTE_LIMIT] or None))
     owner_mapped = any(_name_match(n, names) for n in mapped_names) or any(
-        label and _name_match(label, names) for _, label in rows
+        label and _name_match(label, names) for _, label, _ in rows
     )
-    for ts, label in rows:
+    for ts, label, rest in rows:
         if ts != want:
             continue
         if label and _name_match(label, names):
-            return True
+            return True, rest
         if not owner_mapped and (not label or _GENERIC_SPEAKER_RE.match(label)):
-            return True
-    return False
+            return True, rest
+    return False, None
+
+
+def grounded_in_transcript(body, evidence_ts, names, mapped_names=()):
+    return ground_in_transcript(body, evidence_ts, names, mapped_names)[0]
 
 
 def transcript_quote(body, evidence_ts):
-    """The transcript line (`Speaker: text`, speaker kept) at `evidence_ts`,
-    capped; None when no line carries that timestamp."""
+    """The first transcript line (`Speaker: text`, speaker kept) at
+    `evidence_ts`, capped, whoever spoke it; None when no line carries that
+    timestamp. Context for a candidate that did not ground, never a quote."""
     want = _norm_ts(evidence_ts or "")
     if want is None:
         return None
@@ -482,6 +494,8 @@ def review_body(meeting_entry_id, date, candidates, redact=None):
             line += f" (due {c['due']})"
         if c.get("quote"):
             line += f'\n  quote: "{redact(c["quote"])}"'
+        elif c.get("line_at_ts"):
+            line += f'\n  line at timestamp: "{redact(c["line_at_ts"])}"'
         lines.append(line)
     return "\n".join(lines)
 
@@ -492,8 +506,21 @@ def candidate_row(candidate, owner_slug, redact=None):
         "text": redact(candidate.get("text") or ""),
         "quote": redact(candidate["quote"]) if candidate.get("quote") else None,
     }
+    if candidate.get("line_at_ts"):
+        row["line_at_ts"] = redact(candidate["line_at_ts"])
     if candidate.get("due"):
         row["due"] = candidate["due"]
     row.update(owner=owner_slug, status=candidate["status"],
                reason=candidate.get("reason"))
     return row
+
+
+def cap_candidates(candidates, limit):
+    """Order valid, then ungrounded, then invalid, and cap at `limit` without
+    ever dropping a valid candidate: only the flagged tail is trimmed (to the
+    slots the valid ones leave). Returns (kept, dropped count)."""
+    rank = {"valid": 0, "ungrounded": 1, "invalid": 2}
+    ordered = sorted(candidates, key=lambda c: rank[c["status"]])
+    valid = sum(1 for c in ordered if c["status"] == "valid")
+    keep = max(limit, valid)
+    return ordered[:keep], len(ordered) - keep if len(ordered) > keep else 0

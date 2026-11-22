@@ -13,11 +13,18 @@ Row schema (v1):
                      "status": "valid"|"ungrounded"|"invalid", "reason"}]}
 
 Candidate text lives only here and in the review todo, never in logs.
+
+Lines are separated by "\\n" only and the JSON is ASCII-escaped, so no text can
+split a row for a reader that treats U+2028, U+2029 or U+0085 as a line break.
+A consumer that rewrites or removes rows must hold `<queue>.lock` (flock)
+while it does, as `upsert` does.
 """
 import fcntl
 import json
 import os
 import tempfile
+
+from . import state
 
 SCHEMA_VERSION = 1
 
@@ -53,16 +60,13 @@ def upsert(path, row):
     if not key:
         raise ValueError("queue row needs a meeting entry id or source id")
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    if not os.path.isdir(directory):
+        state.ensure_private_dir(directory)
     lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        lines, found = [], None
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        except FileNotFoundError:
-            pass
+        lines, found = _read_lines(path), None
         for index, line in enumerate(lines):
             try:
                 old = json.loads(line)
@@ -74,7 +78,7 @@ def upsert(path, row):
                     _private(path)
                     return "unchanged"
                 break
-        encoded = json.dumps(row, ensure_ascii=False, sort_keys=False)
+        encoded = json.dumps(row, ensure_ascii=True)
         if found is None:
             _append(path, encoded + "\n")
             return "added"
@@ -88,6 +92,32 @@ def upsert(path, row):
         return "replaced"
     finally:
         os.close(lock_fd)  # closing also drops the flock
+
+
+def _read_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return []
+    return [line for line in text.split("\n") if line]
+
+
+def has_row(path, key):
+    """Whether the queue holds a row for `key` (a meeting entry id or source
+    id). Best effort and lock-free: an unreadable queue counts as no."""
+    try:
+        for line in _read_lines(path):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and key and (
+                    row_key(row) == key or row.get("source_id") == key):
+                return True
+    except (OSError, UnicodeError):
+        pass
+    return False
 
 
 def _is_key(line, key):

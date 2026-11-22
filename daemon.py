@@ -207,7 +207,6 @@ def cmd_backfill_action_review(args):
         )
     except RuntimeError as exc:
         log(f"error: {exc}")
-        print(f"error: {exc}", file=sys.stderr)
         return 1
     verb = "would review" if args.dry_run else "reviewed"
     print(f"selected {result['selected']} meeting entr"
@@ -215,11 +214,14 @@ def cmd_backfill_action_review(args):
           f"{result['reviewed']} with {result['candidates']} candidate(s); "
           f"queued {result['queued']}, no actions {result['no_actions']}, "
           f"already reviewed {result['already_reviewed']}, "
+          f"duplicate source {result['duplicates']}, "
           f"skipped {result['skipped']}, errors {result['errors']}")
     for entry_id in result["entry_ids"]:
         print(f"  {entry_id}")
-    if result["errors"]:
-        print(f"{result['errors']} failure(s); see the log", file=sys.stderr)
+    if result["errors"] or result["skipped"]:
+        print(f"{result['errors']} failure(s), {result['skipped']} entr"
+              f"{'y' if result['skipped'] == 1 else 'ies'} not found or not "
+              "a meeting; see the log", file=sys.stderr)
         return 1
     return 0
 
