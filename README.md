@@ -1671,7 +1671,15 @@ memory:
     owner_slug: me-example # optional; default is the verified owner slug
     owner_name: Me Example # required unless the identity provider verifies a name
     owner_names: [M. Example]   # optional aliases, e.g. a native-script spelling
+    mode: file             # file (default) or review, see "Review mode"
+    review_queue: /path/meeting-action-candidates.jsonl  # review mode only;
+                           # default <state dir>/meeting-action-candidates.jsonl
 ```
+
+- A meeting is recognized by its source (a Mila, Whisper, transcripts,
+  meeting-notes or Zoom item, or one with a recording id), never by the entry
+  type the extraction model chose: a meeting stored as `decision` or `note`
+  files todos like any other.
 
 - Fails closed: without an owner slug and at least one owner name (configured
   or verified through the identity provider) nothing is asked or filed. Todos
@@ -1722,6 +1730,55 @@ memory:
   The guarantee is weaker than live capture: the stored body is a model
   summary, so an action is kept only when an owner name shares its sentence or
   bullet. `--dry-run` calls the model and reports the count but writes nothing.
+  In `review` mode this command refuses; use `backfill-action-review` below.
+
+##### Review mode (`mode: review`)
+
+`file` (default) is everything above. `review` never files one todo per
+action, so an unverified action cannot become a task by itself. For a meeting
+whose extraction returned owner actions, it keeps every candidate, the ones
+that would be filed and the ones the validator would drop (invalid, or not
+grounded in the transcript), and:
+
+- files ONE `todo`, title `Review action items: <meeting title>`, people = the
+  owner slug, tags = `tag` + the routine's tags + `needs-review`, dated the
+  meeting date (body line `due <date>`), source id `<meeting source id>:review`
+  (so a re-run updates it in place; the capture guard moves it to
+  `<id>:review:auto` when a hand-logged entry carries the id). The body links
+  the meeting entry id and lists each candidate as a bullet with its quote
+  (transcript line, or body sentence in a backfill) and a marker:
+  `[unverified: ungrounded]` or `[invalid: <reason>]`; verified ones have none.
+- appends one JSON line to the candidates queue (`review_queue`, relative paths
+  resolve against the daemon directory). The file and its `.lock` are `0600`,
+  every change holds an exclusive `flock`, and the queue keeps one row per
+  `meeting_entry_id`: an identical re-run is skipped, a changed one replaces its
+  row. Row schema (`v` 1):
+
+  ```json
+  {"v":1,"meeting_entry_id":"...","review_todo_id":"...","source_id":"mila:REC-1",
+   "source_kind":"mila","recording_id":"REC-1","title":"...","date":"2026-10-01",
+   "at":"2026-10-01T09:00:00Z",
+   "candidates":[{"text":"...","quote":"... or null","due":"2026-10-08",
+                  "owner":"me-example","status":"valid|ungrounded|invalid",
+                  "reason":"null for valid"}]}
+  ```
+
+  `recording_id` and a candidate's `due` appear only when known. A meeting with
+  no owner actions files nothing and writes no row.
+- logs carry counts and ids only, never candidate text.
+
+Review an already-stored meeting, whatever its entry type (told apart by its
+source id), from its stored body:
+
+```bash
+./daemon.py backfill-action-review --routine meeting-transcriptions \
+    [--entry <meeting-entry-id> ...] [--since YYYY-MM-DD] [--redo] [--dry-run]
+```
+
+Give `--entry` (repeatable) and/or `--since`. A meeting that already has its
+review todo is skipped without a model call unless `--redo` (which updates the
+same todo and queue row). `--dry-run` calls the model, prints counts and entry
+ids only, and writes nothing.
 
 ### Zoom meeting summaries
 

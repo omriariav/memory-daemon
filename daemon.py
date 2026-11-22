@@ -14,6 +14,9 @@ Every routine is a drop-in file in routines/*.yaml. Adding one is never a code c
   daemon.py inbox [--demo|--version]   unified keyboard-first inbox (needs the optional Textual extra)
   daemon.py backfill-owner-todos --routine ID --entry ENTRY [-n]
                                        file a stored meeting's owner actions as todos
+  daemon.py backfill-action-review --routine ID [--entry ENTRY ...]
+                                   [--since DATE] [--redo] [-n]
+                                       one review todo + queue row per stored meeting
 """
 import argparse
 import os
@@ -180,6 +183,43 @@ def cmd_joined(args):
         print(do(watch, args.channel))
     except (watch_joins.JoinedError, slack_watch.WatchError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_backfill_action_review(args):
+    set_log_file(LOG_FILE)
+    routines = {r["id"]: r for r in config.discover(BASE_DIR)}
+    routine = routines.get(args.routine)
+    if routine is None:
+        raise config.RoutineError(f"no routine with id '{args.routine}'")
+    problems = config.validate(routine)
+    if problems:
+        for p in problems:
+            log(f"invalid routine: {p}")
+        return 1
+    llm.configure(BASE_DIR)
+    identity.configure(BASE_DIR)
+    try:
+        result = memory_sink.backfill_action_review(
+            routine, entry_ids=args.entry or (), since=args.since,
+            dry_run=args.dry_run, redo=args.redo,
+        )
+    except RuntimeError as exc:
+        log(f"error: {exc}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "would review" if args.dry_run else "reviewed"
+    print(f"selected {result['selected']} meeting entr"
+          f"{'y' if result['selected'] == 1 else 'ies'}; {verb} "
+          f"{result['reviewed']} with {result['candidates']} candidate(s); "
+          f"queued {result['queued']}, no actions {result['no_actions']}, "
+          f"already reviewed {result['already_reviewed']}, "
+          f"skipped {result['skipped']}, errors {result['errors']}")
+    for entry_id in result["entry_ids"]:
+        print(f"  {entry_id}")
+    if result["errors"]:
+        print(f"{result['errors']} failure(s); see the log", file=sys.stderr)
         return 1
     return 0
 
@@ -833,6 +873,24 @@ def main(argv=None):
     p_bf.add_argument("-n", "--dry-run", action="store_true",
                       help="extract and count, but write nothing to the store")
     p_bf.set_defaults(func=cmd_backfill_owner_todos)
+    p_ar = sub.add_parser(
+        "backfill-action-review",
+        help="re-run owner-action extraction on stored meeting entries "
+             "(any type) and file one review todo + queue row each",
+    )
+    p_ar.add_argument("--routine", required=True,
+                      help="capture routine whose memory block to use")
+    p_ar.add_argument("--entry", action="append", metavar="ID",
+                      help="meeting memory entry id (repeatable)")
+    p_ar.add_argument("--since", metavar="DATE",
+                      help="every meeting entry dated on or after YYYY-MM-DD")
+    p_ar.add_argument("--redo", action="store_true",
+                      help="also re-extract meetings that already have a "
+                           "review todo (updates it and its queue row)")
+    p_ar.add_argument("-n", "--dry-run", action="store_true",
+                      help="call the model and print counts and ids only; "
+                           "write nothing")
+    p_ar.set_defaults(func=cmd_backfill_action_review)
     p_jn = sub.add_parser(
         "joined",
         help="list, watch or dismiss channels suggested after you joined them",

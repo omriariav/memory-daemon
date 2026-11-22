@@ -1,11 +1,16 @@
 """Meeting owner todos: prompt, validation, grounding, stable ids, backfill."""
+import fcntl
 import json
+import os
+import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from workspace_daemon import fibery_tasks_outbound, memory_sink, owner_todos
+from workspace_daemon import (action_review_queue, fibery_tasks_outbound,
+                              memory_sink, owner_todos)
 
 OWNER = "me-example"
 NAME = "Me Example"
@@ -62,6 +67,7 @@ class FakeStore:
 
     def __init__(self, todo_result=None):
         self.entries = {}
+        self.ids = {}
         self.calls = []
         self.todo_result = todo_result
 
@@ -74,14 +80,17 @@ class FakeStore:
             return mock.Mock(returncode=code, stdout=text, stderr="")
         verdict = "updated" if sid in self.entries else "created"
         self.entries[sid] = {"args": args, "flags": flags, "body": stdin_text}
-        eid = f"e{len(self.entries)}-{abs(hash(sid)) % 1000}"
+        eid = self.ids.setdefault(sid, f"e{len(self.ids) + 1}")
         return mock.Mock(returncode=0, stdout=f"✓ {verdict} {eid}\n", stderr="")
 
     def todos(self):
         return {k: v for k, v in self.entries.items() if "#action-" in k}
 
+    def reviews(self):
+        return {k: v for k, v in self.entries.items() if ":review" in k}
 
-class CaptureTest(unittest.TestCase):
+
+class CaptureHarness(unittest.TestCase):
     def setUp(self):
         memory_sink._slug_cache["/store"] = set()
         self.store = FakeStore()
@@ -100,6 +109,9 @@ class CaptureTest(unittest.TestCase):
             )
         self.logged = " ".join(str(c.args[0]) for c in log.call_args_list)
         return out
+
+
+class CaptureTest(CaptureHarness):
 
     def test_owner_actions_become_todos_with_stable_ids(self):
         out = self.capture(meeting_extraction([
@@ -190,8 +202,19 @@ class CaptureTest(unittest.TestCase):
         self.capture(meeting_extraction([act("Do it")]), routine=routine)
         self.assertEqual(self.store.todos(), {})
 
-    def test_non_meeting_entry_gets_no_todos(self):
-        self.capture(meeting_extraction([act("Do it")], type="note"))
+    def test_entry_type_does_not_gate_the_filer(self):
+        for etype in ("decision", "note", "meeting"):
+            with self.subTest(etype):
+                self.setUp()
+                out = self.capture(meeting_extraction(
+                    [act("Do it")], type=etype))
+                self.assertEqual(out["memory_owner_todos"], 1)
+                self.assertEqual(len(self.store.todos()), 1)
+
+    def test_non_meeting_source_gets_no_todos(self):
+        chat = dict(meeting_item(), source_kind="slack_mcp", frontmatter={})
+        self.capture(meeting_extraction([act("Do it")], type="meeting"),
+                     item=chat)
         self.assertEqual(self.store.todos(), {})
 
     def test_owner_attention_denied_files_nothing(self):
@@ -535,6 +558,497 @@ class BackfillTest(unittest.TestCase):
         del self.routine["memory"]["owner_todos"]
         with self.assertRaises(RuntimeError):
             self.run_backfill("planning-sync", "{}")
+
+
+def read_lines(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().splitlines()
+
+
+MIXED = [
+    act("Send the revised plan to the team", due="2026-10-08"),
+    act("Book the review room", ts="00:15:10"),
+    {"text": "Call the clinic back"},
+]
+
+
+class ReviewModeTest(CaptureHarness):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = os.path.join(self.tmp.name, "q", "candidates.jsonl")
+        self.routine = make_routine(mode="review", review_queue=self.queue)
+
+    def rows(self):
+        try:
+            with open(self.queue, encoding="utf-8") as fh:
+                return [json.loads(line) for line in fh.read().splitlines()]
+        except FileNotFoundError:
+            return []
+
+    def test_one_review_todo_with_every_candidate(self):
+        out = self.capture(meeting_extraction(MIXED, type="decision"))
+        self.assertEqual(self.store.todos(), {})
+        self.assertEqual(list(self.store.reviews()), ["mila:REC-1:review"])
+        row = self.store.reviews()["mila:REC-1:review"]
+        flags = row["flags"]
+        self.assertEqual(flags["--type"], "todo")
+        self.assertEqual(flags["--title"], "Review action items: Planning sync")
+        self.assertEqual(flags["--people"], OWNER)
+        self.assertEqual(flags["--date"], "2026-10-01")
+        tags = flags["--tags"].split(",")
+        for tag in ("from-meeting", "needs-review", "auto-captured"):
+            self.assertIn(tag, tags)
+        self.assertNotIn("--force-new", row["args"])
+        body = row["body"]
+        self.assertIn(f"From meeting {out['memory_entry_id']}", body)
+        self.assertIn("due 2026-10-01", body)
+        for text in ("Send the revised plan to the team",
+                     "Book the review room", "Call the clinic back"):
+            self.assertIn(text, body)
+        self.assertIn("[unverified: ungrounded]", body)
+        self.assertIn("[invalid: missing timestamp]", body)
+        self.assertIn('quote: "Me Example: I will send the revised plan to '
+                      'the team."', body)
+        self.assertEqual(out["memory_owner_review"], 1)
+        self.assertEqual(out["memory_owner_review_queue"], "added")
+
+    def test_queue_row_fields(self):
+        out = self.capture(meeting_extraction(MIXED, type="note"))
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(list(row), [
+            "v", "meeting_entry_id", "review_todo_id", "source_id",
+            "source_kind", "recording_id", "title", "date", "at",
+            "candidates"])
+        self.assertEqual(row["v"], 1)
+        self.assertEqual(row["meeting_entry_id"], out["memory_entry_id"])
+        self.assertEqual(row["review_todo_id"], out["memory_owner_review_id"])
+        self.assertEqual(row["source_id"], MEETING_SID)
+        self.assertEqual(row["source_kind"], "mila")
+        self.assertEqual(row["recording_id"], "REC-1")
+        self.assertEqual(row["title"], "Planning sync")
+        self.assertEqual(row["date"], "2026-10-01")
+        self.assertRegex(row["at"], r"^\d{4}-\d\d-\d\dT")
+        valid, ungrounded, invalid = row["candidates"]
+        self.assertEqual(valid, {
+            "text": "Send the revised plan to the team",
+            "quote": "Me Example: I will send the revised plan to the team.",
+            "due": "2026-10-08", "owner": OWNER, "status": "valid",
+            "reason": None})
+        self.assertEqual(ungrounded["status"], "ungrounded")
+        self.assertEqual(ungrounded["quote"],
+                         "Bob Stone: I will book the review room.")
+        self.assertTrue(ungrounded["reason"])
+        self.assertNotIn("due", ungrounded)
+        self.assertEqual(invalid, {
+            "text": "Call the clinic back", "quote": None, "owner": OWNER,
+            "status": "invalid", "reason": "missing timestamp"})
+
+    def test_rerun_is_idempotent(self):
+        self.capture(meeting_extraction(MIXED))
+        first = self.rows()
+        entries = dict(self.store.entries)
+        out = self.capture(meeting_extraction(MIXED))
+        self.assertEqual(self.rows()[0]["candidates"], first[0]["candidates"])
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(set(self.store.entries), set(entries))
+        self.assertEqual(len(self.store.reviews()), 1)
+        self.assertEqual(out["memory_owner_review_queue"], "unchanged")
+        # a changed extraction replaces the row, never adds one
+        out = self.capture(meeting_extraction([act("Send the revised plan")]))
+        self.assertEqual(out["memory_owner_review_queue"], "replaced")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]["candidates"]), 1)
+
+    def test_no_actions_files_nothing(self):
+        for actions in ([], None):
+            with self.subTest(actions):
+                self.setUp()
+                out = self.capture(meeting_extraction(actions))
+                self.assertEqual(self.store.reviews(), {})
+                self.assertEqual(self.store.todos(), {})
+                self.assertFalse(os.path.exists(self.queue))
+                self.assertNotIn("memory_owner_review", out)
+                self.assertIn("0 candidates", self.logged)
+
+    def test_non_list_files_nothing(self):
+        self.capture(meeting_extraction("garbage"))
+        self.assertEqual(self.store.reviews(), {})
+        self.assertEqual(self.rows(), [])
+
+    def test_only_invalid_candidates_still_reach_review(self):
+        self.capture(meeting_extraction([{"text": "No stamp"}]))
+        self.assertEqual(len(self.store.reviews()), 1)
+        self.assertEqual(self.rows()[0]["candidates"][0]["status"], "invalid")
+
+    def test_gate_is_source_and_owner_attention(self):
+        chat = dict(meeting_item(), source_kind="slack_mcp", frontmatter={})
+        self.capture(meeting_extraction(MIXED), item=chat)
+        self.capture(meeting_extraction(MIXED, owner_attention=False))
+        self.assertEqual(self.store.reviews(), {})
+        self.assertEqual(self.rows(), [])
+
+    def test_unknown_owner_fails_closed(self):
+        del self.routine["memory"]["owner_todos"]["owner_name"]
+        self.capture(meeting_extraction(MIXED))
+        self.assertEqual(self.store.reviews(), {})
+        self.assertFalse(os.path.exists(self.queue))
+
+    def test_logs_carry_no_candidate_text(self):
+        self.capture(meeting_extraction(MIXED))
+        for secret in ("revised plan", "review room", "clinic",
+                       "I will send", "Bob Stone"):
+            self.assertNotIn(secret, self.logged)
+        self.assertIn("valid=1", self.logged)
+        self.assertIn("ungrounded=1", self.logged)
+        self.assertIn("invalid=1", self.logged)
+
+    def test_max_per_item_caps_candidates(self):
+        self.routine["memory"]["owner_todos"]["max_per_item"] = 2
+        self.capture(meeting_extraction(MIXED))
+        self.assertEqual(len(self.rows()[0]["candidates"]), 2)
+
+    def test_default_queue_lives_in_the_state_dir(self):
+        del self.routine["memory"]["owner_todos"]["review_queue"]
+        with mock.patch.object(memory_sink, "llm_base_dir",
+                               return_value=self.tmp.name):
+            self.capture(meeting_extraction(MIXED))
+        default = os.path.join(
+            self.tmp.name, "state", "meeting-action-candidates.jsonl")
+        self.assertTrue(os.path.exists(default))
+
+    def test_missing_queue_path_still_files_the_todo(self):
+        del self.routine["memory"]["owner_todos"]["review_queue"]
+        with mock.patch.object(memory_sink, "llm_base_dir", return_value=None):
+            out = self.capture(meeting_extraction(MIXED))
+        self.assertEqual(len(self.store.reviews()), 1)
+        self.assertEqual(out["memory_owner_review_queue"], "no_path")
+
+    def test_todo_failure_writes_no_queue_row(self):
+        real = self.store.cli
+
+        def failing(store, args, stdin_text=None, timeout=120):
+            flags = dict(zip(args[1::2], args[2::2]))
+            if flags["--source-ids"].endswith(":review"):
+                return mock.Mock(returncode=1, stdout="", stderr="boom")
+            return real(store, args, stdin_text, timeout)
+
+        self.store.cli = failing
+        with mock.patch.object(memory_sink, "_verify_written_entry",
+                               return_value=None):
+            out = self.capture(meeting_extraction(MIXED))
+        self.assertEqual(out["memory_owner_review_error"], 1)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(out["memory"], "created")
+
+    def test_hand_logged_review_todo_is_not_overwritten(self):
+        def guard(store, source_id, etype, rid=None):
+            return (etype == "todo", ["hand-todo"] if etype == "todo" else [])
+
+        with mock.patch.object(memory_sink, "capture_guard",
+                               side_effect=guard):
+            self.capture(meeting_extraction(MIXED))
+        self.assertEqual(list(self.store.reviews()),
+                         ["mila:REC-1:review:auto"])
+
+
+class FileModeTest(CaptureHarness):
+    def test_default_mode_is_file_and_unchanged(self):
+        self.assertEqual(owner_todos.mode(self.routine), "file")
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = os.path.join(tmp, "q.jsonl")
+            routine = make_routine(review_queue=queue)
+            out = self.capture(meeting_extraction(
+                [act("Send the revised plan."), act("Book it", ts="00:15:10"),
+                 {"text": "no stamp"}], type="decision"), routine=routine)
+            self.assertFalse(os.path.exists(queue))
+        self.assertEqual(out["memory_owner_todos"], 1)
+        self.assertEqual(len(self.store.todos()), 1)
+        self.assertEqual(self.store.reviews(), {})
+        self.assertNotIn("memory_owner_review", out)
+
+    def test_explicit_file_mode(self):
+        routine = make_routine(mode="file")
+        out = self.capture(meeting_extraction([act("Do it")], type="note"),
+                           routine=routine)
+        self.assertEqual(out["memory_owner_todos"], 1)
+
+    def test_unknown_mode_falls_back_to_file(self):
+        self.assertEqual(owner_todos.mode(make_routine(mode="x")), "file")
+
+
+class QueueTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "state", "q.jsonl")
+
+    def row(self, meeting, **extra):
+        return action_review_queue.build_row(
+            meeting_entry_id=meeting, review_todo_id="t-" + meeting,
+            source_id="mila:" + meeting, source_kind="mila", recording_id=None,
+            title="T", date="2026-10-01", at="2026-10-01T00:00:00Z",
+            candidates=extra.get("candidates", []))
+
+    def test_permissions_and_lock_file(self):
+        action_review_queue.upsert(self.path, self.row("m1"))
+        for path in (self.path, self.path + ".lock"):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        # an existing loose file is tightened
+        os.chmod(self.path, 0o644)
+        self.assertEqual(
+            action_review_queue.upsert(self.path, self.row("m1")), "unchanged")
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        # a rewrite keeps 0600
+        action_review_queue.upsert(
+            self.path, self.row("m1", candidates=[{"text": "x"}]))
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+
+    def test_no_recording_id_key_when_unknown(self):
+        self.assertNotIn("recording_id", self.row("m1"))
+
+    def test_dedupe_replace_and_skip(self):
+        up = action_review_queue.upsert
+        self.assertEqual(up(self.path, self.row("m1")), "added")
+        self.assertEqual(up(self.path, self.row("m2")), "added")
+        self.assertEqual(up(self.path, self.row("m1")), "unchanged")
+        self.assertEqual(
+            up(self.path, self.row("m1", candidates=[{"text": "x"}])),
+            "replaced")
+        lines = read_lines(self.path)
+        ids = [json.loads(line)["meeting_entry_id"] for line in lines]
+        self.assertEqual(ids, ["m1", "m2"])
+
+    def test_writer_waits_for_the_lock(self):
+        os.makedirs(os.path.dirname(self.path))
+        lock = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = threading.Event()
+
+        def write():
+            action_review_queue.upsert(self.path, self.row("m1"))
+            done.set()
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        try:
+            self.assertFalse(done.wait(0.3))
+            self.assertFalse(os.path.exists(self.path))
+        finally:
+            os.close(lock)  # releases the flock
+        thread.join(5)
+        self.assertTrue(done.is_set())
+        self.assertEqual(len(read_lines(self.path)), 1)
+
+    def test_concurrent_writers_never_corrupt_or_duplicate(self):
+        def write(n):
+            for _ in range(2):
+                action_review_queue.upsert(self.path, self.row(f"m{n % 10}"))
+
+        threads = [threading.Thread(target=write, args=(n,))
+                   for n in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        ids = [json.loads(line)["meeting_entry_id"]
+               for line in read_lines(self.path)]
+        self.assertEqual(sorted(ids), sorted({f"m{n}" for n in range(10)}))
+
+    def test_malformed_lines_are_kept(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as fh:
+            fh.write("not json\n")
+        action_review_queue.upsert(self.path, self.row("m1"))
+        action_review_queue.upsert(
+            self.path, self.row("m1", candidates=[{"text": "x"}]))
+        lines = read_lines(self.path)
+        self.assertEqual(lines[0], "not json")
+        self.assertEqual(len(lines), 2)
+
+
+class ReviewHelpersTest(unittest.TestCase):
+    def test_validation_of_new_keys(self):
+        ok = {"owner_todos": {"mode": "review", "review_queue": "q.jsonl"}}
+        self.assertEqual(owner_todos.validate(ok, "r"), [])
+        self.assertEqual(owner_todos.validate(
+            {"owner_todos": {"mode": "file"}}, "r"), [])
+        for bad in ({"mode": "both"}, {"mode": True}, {"review_queue": ""},
+                    {"review_queue": 3}):
+            self.assertTrue(owner_todos.validate({"owner_todos": bad}, "r"),
+                            bad)
+
+    def test_classify_actions(self):
+        rows = owner_todos.classify_actions([
+            {"text": "Do A", "evidence_ts": "00:01:00"},
+            {"text": "do a!", "evidence_ts": "00:02:00"},
+            {"text": "Do B"},
+            {"text": "Do C", "bogus": 1},
+            "junk",
+            {"text": "x" * 300, "evidence_ts": "00:01:00"},
+            {"text": "Do D", "due": "soon", "evidence_ts": "00:01:00"},
+        ], require_ts=True)
+        self.assertEqual(
+            [(r["status"], r["reason"]) for r in rows],
+            [("valid", None), ("invalid", "missing timestamp"),
+             ("invalid", "unexpected field"), ("invalid", "not an object"),
+             ("invalid", "text too long"), ("invalid", "bad due date")])
+        self.assertEqual(len(rows[4]["text"]), owner_todos.CANDIDATE_TEXT_LIMIT)
+        self.assertEqual(rows[3]["text"], "")
+        self.assertEqual(owner_todos.classify_actions(None), [])
+        self.assertIsNone(owner_todos.classify_actions("nope"))
+
+    def test_quotes(self):
+        self.assertEqual(
+            owner_todos.transcript_quote(TRANSCRIPT, "00:15:10"),
+            "Bob Stone: I will book the review room.")
+        self.assertIsNone(owner_todos.transcript_quote(TRANSCRIPT, "09:00:00"))
+        self.assertIsNone(owner_todos.transcript_quote(TRANSCRIPT, "junk"))
+        body = "Notes.\n- Me Example sends the plan today.\n- Bob books."
+        self.assertEqual(
+            owner_todos.body_quote(body, "Send the plan", [NAME]),
+            "- Me Example sends the plan today")
+        self.assertIsNone(owner_todos.body_quote(body, "Book it", [NAME]))
+
+
+class ReviewBackfillTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.entries = self.root / "memory" / "entries"
+        self.entries.mkdir(parents=True)
+        self.write("m1", "decision", "2026-10-01", MEETING_SID,
+                   "Planning sync",
+                   f"- {NAME} sends the plan.\n- Bob books the room.")
+        self.write("m2", "note", "2026-10-05", "whisper:W-2", "Second sync",
+                   f"- {NAME} sends the notes.")
+        self.write("m3", "meeting", "2026-09-01", "mila:REC-0", "Old sync",
+                   f"- {NAME} sends the old plan.")
+        self.write("n1", "note", "2026-10-06", "gmail:1", "A note", "body")
+        self.write("t1", "todo", "2026-10-06", "mila:REC-1#action-0123456789",
+                   "A todo", "body")
+        self.queue = str(self.root / "state" / "q.jsonl")
+        self.routine = make_routine(
+            store=str(self.root), mode="review", review_queue=self.queue)
+        self.store = FakeStore()
+
+    def write(self, entry_id, etype, date, sid, title, body):
+        (self.entries / f"{entry_id}.md").write_text(
+            f"---\nid: {entry_id}\ntype: {etype}\ndate: '{date}'\n"
+            f"title: '{title}'\ntags: [work]\nsource_ids: ['{sid}']\n---\n"
+            f"{body}\n")
+
+    REPLY = json.dumps({"owner_actions": [
+        {"text": "Send the plan"}, {"text": "Book the room"},
+        {"text": "bad", "bogus": 1}]})
+
+    def run_backfill(self, reply=None, **kwargs):
+        with mock.patch("workspace_daemon.llm.analyze",
+                        return_value=reply or self.REPLY) as analyze, \
+                mock.patch.object(memory_sink, "_cli",
+                                  side_effect=self.store.cli), \
+                mock.patch.object(memory_sink, "_commit_store"), \
+                mock.patch.object(memory_sink, "log") as log:
+            result = memory_sink.backfill_action_review(
+                self.routine, **kwargs)
+        self.logged = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.analyze = analyze
+        return result
+
+    def rows(self):
+        try:
+            return [json.loads(line) for line in read_lines(self.queue)]
+        except FileNotFoundError:
+            return []
+
+    def test_real_run_on_a_decision_entry(self):
+        result = self.run_backfill(entry_ids=["m1"])
+        self.assertEqual(result["entry_ids"], ["m1"])
+        self.assertEqual((result["reviewed"], result["queued"],
+                          result["candidates"]), (1, 1, 3))
+        self.assertEqual(list(self.store.reviews()), ["mila:REC-1:review"])
+        self.assertEqual(self.store.todos(), {})
+        body = self.store.reviews()["mila:REC-1:review"]["body"]
+        self.assertIn("From meeting m1", body)
+        self.assertIn("[unverified: ungrounded]", body)
+        self.assertIn("[invalid: unexpected field]", body)
+        row, = self.rows()
+        self.assertEqual(row["meeting_entry_id"], "m1")
+        self.assertEqual(row["source_kind"], "mila")
+        self.assertEqual(row["recording_id"], "REC-1")
+        self.assertEqual(
+            [c["status"] for c in row["candidates"]],
+            ["valid", "ungrounded", "invalid"])
+        self.assertIn("Me Example sends the plan",
+                      row["candidates"][0]["quote"])
+
+    def test_dry_run_writes_nothing_and_logs_no_text(self):
+        result = self.run_backfill(since="2026-10-01", dry_run=True)
+        self.assertEqual(result["entry_ids"], ["m1", "m2"])
+        self.assertEqual(result["reviewed"], 2)
+        self.assertEqual(self.store.calls, [])
+        self.assertEqual(self.rows(), [])
+        self.assertFalse(os.path.exists(self.queue))
+        for secret in ("Send the plan", "Book the room", "sends the plan"):
+            self.assertNotIn(secret, self.logged)
+
+    def test_since_picks_meeting_sources_of_any_type(self):
+        result = self.run_backfill(since="2026-10-01")
+        self.assertEqual(result["selected"], 2)
+        self.assertEqual(self.analyze.call_count, 2)
+        self.assertEqual({r["meeting_entry_id"] for r in self.rows()},
+                         {"m1", "m2"})
+        self.assertEqual(
+            {r["source_kind"] for r in self.rows()}, {"mila", "whisper"})
+
+    def test_rerun_is_idempotent(self):
+        self.run_backfill(entry_ids=["m1"])
+        rows = self.rows()
+        # the store now holds the review todo
+        self.write("r1", "todo", "2026-10-01", "mila:REC-1:review",
+                   "Review action items: Planning sync", "x")
+        again = self.run_backfill(entry_ids=["m1"])
+        self.assertEqual(again["already_reviewed"], 1)
+        self.assertEqual(self.analyze.call_count, 0)
+        self.assertEqual(self.rows(), rows)
+        redo = self.run_backfill(entry_ids=["m1"], redo=True)
+        self.assertEqual(redo["reviewed"], 1)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.store.reviews()), 1)
+        self.assertEqual(self.rows()[0]["candidates"], rows[0]["candidates"])
+
+    def test_no_actions_and_bad_model_output(self):
+        none = self.run_backfill(
+            reply=json.dumps({"owner_actions": []}), entry_ids=["m1"])
+        self.assertEqual((none["no_actions"], none["reviewed"]), (1, 0))
+        self.assertEqual(self.store.calls, [])
+        self.assertFalse(os.path.exists(self.queue))
+        for reply in ("not json", json.dumps({"owner_actions": "x"})):
+            bad = self.run_backfill(reply=reply, entry_ids=["m1"])
+            self.assertEqual(bad["errors"], 1)
+        self.assertEqual(self.store.calls, [])
+
+    def test_unsuitable_entries_are_skipped(self):
+        result = self.run_backfill(entry_ids=["n1", "t1", "nope"])
+        self.assertEqual(result["skipped"], 3)
+        self.assertEqual(result["selected"], 0)
+        self.assertEqual(self.analyze.call_count, 0)
+
+    def test_needs_a_selector_and_a_date(self):
+        with self.assertRaises(RuntimeError):
+            self.run_backfill()
+        with self.assertRaises(RuntimeError):
+            self.run_backfill(since="yesterday")
+
+    def test_old_backfill_refuses_review_mode(self):
+        with self.assertRaises(RuntimeError):
+            with mock.patch("workspace_daemon.llm.analyze"):
+                memory_sink.backfill_owner_todos(self.routine, "m1")
 
 
 if __name__ == "__main__":
