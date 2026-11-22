@@ -1330,6 +1330,29 @@ class ReadinessTest(Base):
         with installed:
             self.assertEqual(self.listing(processed=ledger, **source), [])
 
+    def test_text_finished_in_the_ingest_run_adds_no_extra_wait(self):
+        model = self.root / "model.bin"
+        model.write_bytes(b"m")
+        message, files = self.spool.media_message(
+            "v", iso(8, 0), "audio", b"OggS", ".opus")
+        self.spool.batch(iso(9, 0), [message], files)  # quiet long since
+
+        def run(cmd, timeout=120, check=True):
+            if Path(cmd[0]).name == "whisper-cli":
+                Path(cmd[cmd.index("-of") + 1]).with_suffix(".txt") \
+                    .write_text("transcript", encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(
+                whatsapp_source, "optional_bin",
+                side_effect=lambda name, _env: f"/opt/tools/{name}"), \
+                mock.patch.object(whatsapp_source, "run", side_effect=run):
+            found = self.listing(transcribe_audio=True,
+                                 whisper_model=str(model), quiet_minutes=60)
+        record = found[0]["raw"]["_day"]["messages"][message_id("v")]
+        self.assertEqual(record["extract"]["state"], "done")
+        self.assertEqual(len(self.ready(found)), 1)
+
     def test_budget_zero_turns_extraction_off(self):
         model = self.root / "model.bin"
         model.write_bytes(b"m")

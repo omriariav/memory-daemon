@@ -1115,6 +1115,7 @@ class _Ingest:
         self.touched = set()  # chat-days whose index entry is recomputed
         self.dirty = set()    # chat-days to write back
         self.changed = set()  # chat-days whose content changed
+        self.fresh_ids = set()  # messages new or changed in this run
         self.index_dirty = False
         self.batch_error = None
         self.last_merged = None
@@ -1273,6 +1274,7 @@ class _Ingest:
                 note = record.get("store_note")
                 if self.copy(record, meta["date"]):
                     record["changed_epoch"] = int(now)
+                    self.fresh_ids.add(record["id"])
                     self.changed.add(key)
                 if record.get("store_note") != note or record.get("stored_path"):
                     self.dirty.add(key)
@@ -1314,6 +1316,7 @@ class _Ingest:
             record["first_epoch"] = record["changed_epoch"] = batch_epoch
             self.copy(record, date)
             day["messages"][record["id"]] = record
+            self.fresh_ids.add(record["id"])
             self.counts["new"] += 1
             self.changed.add(key)
             self.dirty.add(key)
@@ -1354,12 +1357,14 @@ class _Ingest:
             self.dirty.add(key)
             if self.copy(record, date):
                 record["changed_epoch"] = batch_epoch
+                self.fresh_ids.add(record["id"])
                 self.changed.add(key)
             self.counts["duplicates"] += 1
             return
         record["changed_epoch"] = batch_epoch
         self.copy(record, date)
         day["messages"][record["id"]] = record
+        self.fresh_ids.add(record["id"])
         self.counts["updated"] += 1
         self.changed.add(key)
         self.dirty.add(key)
@@ -1507,9 +1512,12 @@ class _Ingest:
                 if result != current:
                     record["extract"] = result
                     if result.get("state") in _EXTRACT_FINAL:
-                        # A finished transcript is a change like a new
-                        # message: it restarts the quiet period.
-                        record["changed_epoch"] = int(now)
+                        # A transcript finished in a later run is a change
+                        # like a new message: it restarts the quiet period.
+                        # One finished in the run that brought its message
+                        # keeps that message's time (no extra wait).
+                        if record["id"] not in self.fresh_ids:
+                            record["changed_epoch"] = int(now)
                         self.changed.add(key)
                     self.dirty.add(key)
 
