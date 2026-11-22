@@ -751,10 +751,10 @@ class ReviewModeTest(CaptureHarness):
 
     def test_same_second_collision_quotes_the_owner_line(self):
         for lines in (
-            [f"[00:20:00] Bob Stone: Not me, I am busy.",
+            ["[00:20:00] Bob Stone: Not me, I am busy.",
              f"[00:20:00] {NAME}: I will file the report."],
             [f"[00:20:00] {NAME}: I will file the report.",
-             f"[00:20:00] Bob Stone: Not me, I am busy."],
+             "[00:20:00] Bob Stone: Not me, I am busy."],
         ):
             with self.subTest(lines[0][:20]):
                 self.setUp()
