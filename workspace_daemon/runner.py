@@ -315,6 +315,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     slack_mcp.configure(base_dir)
     gmail_mcp.configure(base_dir)
     zoom_source.configure(base_dir)
+    whatsapp_source.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
     cursors = state.CursorStore(base_dir, dry_run=dry_run)

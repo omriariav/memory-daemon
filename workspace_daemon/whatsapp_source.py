@@ -16,13 +16,11 @@ whether or not anyone read them. This adapter is a spool *consumer*:
   records land in the archive before the position moves and long before the
   ledger settles a day, so the spool's pruning can never lose a file or
   shrink a conversation that was already seen. The spool is never written.
-* Chat identity. ``chat_key`` is a database row key (it changes when
-  WhatsApp is reinstalled or re-linked) and the forwarder's ``chat_id`` is a
-  hash of the chat JID (it changes when a chat moves from a phone-number JID
-  to an ``@lid`` one). Neither is stable alone, so the archive keeps its own
-  chat ids in ``chats/registry.json``: each archive chat collects the
-  ``(store_id, chat_key)`` pairs and ``chat_id`` values seen for it, and a
-  message joins an existing chat when either one is already known.
+* Chat identity. A chat's id is a keyed hash (HMAC-SHA256 with a secret in
+  the daemon's state directory) of its JID, so two chats can never become
+  one and a rebuilt archive gets the same ids. ``chat_key``, a database row
+  key reused after a reinstall, is only a link: within one ``store_id`` it
+  aliases a chat's new JID (a move to ``@lid``) to its existing id.
 * Capture unit. One candidate per archive chat per local day (the spool's
   timezone), memory source id ``whatsapp:<chat>:<date>``: opaque, never a
   phone number or JID. Later messages, a late file, a finished transcript or
@@ -38,9 +36,11 @@ message text, names, chat labels, JIDs or file names.
 """
 import datetime
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -54,14 +54,14 @@ from .shell import log, optional_bin, run
 
 FORMAT = "whatsapp-forwarder-spool"
 VERSION = 1
-ARCHIVE_VERSION = 2
+ARCHIVE_VERSION = 3
 
 BATCH_RE = re.compile(r"^b[0-9]{10}-[0-9]{8}T[0-9]{6}Z$")
 MESSAGE_ID_RE = re.compile(r"^wa1-[0-9a-f]{40}$")
 CHAT_ID_RE = re.compile(r"^wac1-[0-9a-f]{32}$")
-STORE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+STORE_ID_RE = re.compile(r"^was1-[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-LOCAL_CHAT_RE = re.compile(r"^c[0-9a-f]{10}(?:-[0-9]{1,4})?$")
+LOCAL_CHAT_RE = re.compile(r"^c[0-9a-f]{16}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # media.path is relative to the spool: "<batch>/media/wa-<row key>.<ext>".
 MEDIA_PATH_RE = re.compile(
@@ -76,7 +76,6 @@ SPOOL_STATUSES = (
     "blocked_type", "gave_up",
 )
 UNKNOWN_SENDER_RE = re.compile(r"^Unknown(?:-\d{1,6})?$")
-UNKNOWN_STORE = "unknown"
 
 DEFAULTS = {
     "quiet_minutes": 60,
@@ -427,7 +426,10 @@ def _content_digest(day):
                 media.get("size"),
             ],
             bool(message.get("stored_path")),
-            extract.get("state"),
+            # Pending and unavailable text change nothing a capture shows
+            # beyond a note; only a finished outcome is a new version.
+            extract.get("state") if extract.get("state") in _EXTRACT_FINAL
+            else None,
         ])
     return hashlib.sha256(
         json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode()
@@ -441,13 +443,17 @@ def _clean_record(message):
     if isinstance(media, dict):
         kept_media = {
             key: media.get(key)
-            for key in ("kind", "status", "path", "original_name", "mime",
-                        "size", "sha256")
+            for key in ("kind", "status", "reason", "path", "original_name",
+                        "mime", "size", "sha256")
         }
     return {
         "id": message["id"],
         "id_source": message.get("id_source"),
         "chat_key": message["chat_key"],
+        "store_id": message.get("store_id"),
+        "chat_id": message.get("chat_id") if isinstance(
+            message.get("chat_id"), str) and CHAT_ID_RE.match(
+            message["chat_id"]) else None,
         "chat_label": str(message.get("chat_label") or ""),
         "chat_type": str(message.get("chat_type") or "other"),
         "sender": str(message.get("sender") or ""),
@@ -489,8 +495,9 @@ def _valid_message(message):
 def _wanted(cfg, chat_keys, label):
     """Whether a chat passes the include and exclude filters.
 
-    ``chat_keys`` are every chat key the archive chat has had (one per
-    WhatsApp store); a chat linked across a reinstall keeps its inclusion.
+    ``chat_keys`` are the chat's keys in the current WhatsApp store only
+    (keys are database row keys: a key from an earlier store may name
+    another chat now). Without store ids, a record's own key in its batch.
     """
     include_keys, include_labels = cfg["chat_keys"], cfg["chat_labels"]
     if (include_keys or include_labels) and not (
@@ -503,131 +510,174 @@ def _wanted(cfg, chat_keys, label):
     )
 
 
-# --- chat identity -------------------------------------------------------------
+# --- daemon state (identity secret, aliases, capture ids) ------------------------
 
-class _Registry:
-    """The archive's own chat ids, linked to every identity seen for them."""
+_base_dir = None
 
-    def __init__(self, path):
-        self.path = path
-        data = _read_json(path, None)
-        if not isinstance(data, dict) or not isinstance(data.get("chats"), dict):
-            data = {"v": 1, "chats": {}, "stores": [], "unknown_store": None}
+
+def configure(base_dir):
+    """The daemon's base directory; its state/ holds the identity secret."""
+    global _base_dir
+    _base_dir = base_dir
+
+
+def state_dir():
+    if _base_dir is None:
+        raise RuntimeError(
+            "whatsapp source needs the daemon's state directory "
+            "(whatsapp_source.configure(base_dir))"
+        )
+    return Path(_base_dir) / "state" / "whatsapp"
+
+
+def _identity_key(directory, dry_run):
+    """The random secret behind archive chat ids, created once (0600).
+
+    It lives in the daemon's state directory next to the ledger, never in
+    the archive and never in a log. Losing it changes every chat id, which
+    is why it sits with the ledger: losing one without the other is the
+    case the capture-ids check (see candidates) guards against.
+    """
+    path = directory / "chat-id.key"
+    try:
+        value = path.read_text(encoding="ascii").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", value):
+            return bytes.fromhex(value)
+        raise RuntimeError(
+            "whatsapp identity key state/whatsapp/chat-id.key is malformed; "
+            "restore it from a backup (a new key renames every chat)"
+        )
+    except FileNotFoundError:
+        pass
+    key = secrets.token_bytes(32)
+    if dry_run:
+        return key  # a preview only; nothing is written
+    _private_tree(directory)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _identity_key(directory, dry_run)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(key.hex() + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return key
+
+
+class _Identity:
+    """Archive chat ids.
+
+    The primary id of a chat is a keyed hash (HMAC-SHA256 with the daemon's
+    own secret) of its JID: independent of the order messages are seen in,
+    so a rebuilt archive gets the same ids, and two chats with different
+    JIDs can never become one. ``chat_key`` is only ever a link: when a
+    record carries a ``store_id`` and its (store_id, chat_key) already
+    belongs to chat X while its JID-derived id has never been seen, that new
+    id becomes an alias of X (a chat moving from a phone-number JID to an
+    ``@lid`` one within one WhatsApp database). Without a store_id there is
+    no key-based linking at all.
+    """
+
+    def __init__(self, directory, dry_run):
+        self.path = directory / "identity.json"
+        self.dry_run = dry_run
+        self.key = _identity_key(directory, dry_run)
+        data = _read_json(self.path, None)
+        if not isinstance(data, dict) or data.get("v") != 1:
+            data = {"v": 1, "keys": {}, "aliases": {}, "chats": [],
+                    "stores": []}
         self.data = data
-        self.chats = data["chats"]
+        self.known = set(data["chats"])
         self.dirty = False
         self.conflicts = 0
-        self.by_key, self.by_chat_id = {}, {}
-        for local, chat in self.chats.items():
-            for key in chat.get("keys", []):
-                self.by_key[key] = local
-            for chat_id in chat.get("chat_ids", []):
-                self.by_chat_id[chat_id] = local
 
-    def _store_keys(self, store, chat_key):
-        """The store-qualified keys a message may match.
-
-        Batches written before the forwarder knew its store id use the
-        "unknown" namespace, which is the same database as the first store
-        id seen next to it; any other store never matches on chat_key.
-        """
-        alias = self.data.get("unknown_store")
-        if store == UNKNOWN_STORE:
-            stores = [UNKNOWN_STORE] + ([alias] if alias else [])
-        else:
-            stores = [store] + ([UNKNOWN_STORE] if store == alias else [])
-        return [f"{name}|{chat_key}" for name in stores]
+    def own_id(self, jid):
+        digest = hmac.new(
+            self.key, b"chat\n" + jid.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return "c" + digest[:16]
 
     def note_store(self, store):
-        stores = self.data.setdefault("stores", [])
-        if store != UNKNOWN_STORE and store not in stores:
-            stores.append(store)
+        if store and store not in self.data["stores"]:
+            self.data["stores"].append(store)
             self.dirty = True
-        if self.data.get("unknown_store") is None:
-            has_unknown = any(
-                key.startswith(f"{UNKNOWN_STORE}|") for key in self.by_key
-            )
-            if store != UNKNOWN_STORE and has_unknown:
-                self.data["unknown_store"] = store
-                self.dirty = True
-            elif store == UNKNOWN_STORE and stores:
-                self.data["unknown_store"] = stores[-1]
-                self.dirty = True
 
-    def peek(self, store, chat_key, chat_id):
-        """The archive chat a message belongs to, without recording anything."""
-        found = self.by_chat_id.get(chat_id) if chat_id else None
-        if found:
-            return found
-        for key in self._store_keys(store, chat_key):
-            if key in self.by_key:
-                return self.by_key[key]
-        return None
+    def current_store(self):
+        stores = self.data["stores"]
+        return stores[-1] if stores else None
 
-    def resolve(self, store, chat_key, chat_id, label):
-        self.note_store(store)
-        by_id = self.by_chat_id.get(chat_id) if chat_id else None
-        by_key = next(
-            (self.by_key[key] for key in self._store_keys(store, chat_key)
-             if key in self.by_key),
-            None,
-        )
-        own_key = f"{store}|{chat_key}"
-        if by_id and by_key and by_id != by_key:
-            # Two archive chats turned out to be one: the stronger identity
-            # (chat_id) wins this key from now on; earlier days stay where
-            # they are.
-            self.conflicts += 1
-            keys = self.chats[by_key]["keys"]
-            if own_key in keys:
-                keys.remove(own_key)
-        local = by_id or by_key
-        if local is None:
-            seed = f"id:{chat_id}" if chat_id else f"key:{own_key}"
-            local = "c" + hashlib.sha256(seed.encode()).hexdigest()[:10]
-            base, n = local, 1
-            while local in self.chats:
-                n += 1
-                local = f"{base}-{n}"
-            self.chats[local] = {"keys": [], "chat_ids": [], "chat_keys": []}
-            self.dirty = True
-        chat = self.chats[local]
-        if own_key not in chat["keys"]:
-            chat["keys"].append(own_key)
-            self.by_key[own_key] = local
-            self.dirty = True
-        if chat_key not in chat.setdefault("chat_keys", []):
-            chat["chat_keys"].append(chat_key)
-            self.dirty = True
-        if chat_id and chat_id not in chat["chat_ids"]:
-            chat["chat_ids"].append(chat_id)
-            self.by_chat_id[chat_id] = local
-            self.dirty = True
-        if chat.get("label") != label:
-            chat["label"] = label
+    def peek(self, jid):
+        own = self.own_id(jid)
+        return self.data["aliases"].get(own, own)
+
+    def resolve(self, store, chat_key, jid):
+        own = self.own_id(jid)
+        aliases, keys = self.data["aliases"], self.data["keys"]
+        local = aliases.get(own, own)
+        if store:
+            store_key = f"{store}|{chat_key}"
+            linked = keys.get(store_key)
+            if linked is None:
+                keys[store_key] = local
+                self.dirty = True
+            elif linked != local:
+                if own not in self.known and own not in aliases:
+                    aliases[own] = linked
+                    local = linked
+                else:
+                    # Two chats that both exist claim one key: never merge.
+                    # The key names the newest one from now on.
+                    self.conflicts += 1
+                    keys[store_key] = local
+                self.dirty = True
+        if local not in self.known:
+            self.known.add(local)
+            self.data["chats"].append(local)
             self.dirty = True
         return local
 
-    def chat_keys(self, local):
-        return list((self.chats.get(local) or {}).get("chat_keys") or [])
-
-    def label(self, local):
-        return str((self.chats.get(local) or {}).get("label") or "")
-
-    def keys_in_current_store(self):
-        stores = self.data.get("stores") or []
-        if len(stores) < 2:
-            return None  # no store change seen
-        current = stores[-1]
-        return {
-            int(key.split("|", 1)[1]) for key in self.by_key
-            if key.split("|", 1)[0] == current
-        }
+    def keys_in_store(self, store, local=None):
+        """Chat keys seen in one store (for one chat, or for all)."""
+        found = set()
+        for store_key, chat in self.data["keys"].items():
+            name, _sep, key = store_key.rpartition("|")
+            if name == store and (local is None or chat == local):
+                found.add(int(key))
+        return found
 
     def save(self):
-        if self.dirty:
+        if self.dirty and not self.dry_run:
             _write_json(self.path, self.data)
             self.dirty = False
+
+
+def _id_prefix(message_id):
+    return message_id[4:20]
+
+
+def _load_captures():
+    data = _read_json(state_dir() / "captures.json", None)
+    if not isinstance(data, dict) or not isinstance(data.get("days"), dict):
+        data = {"v": 1, "days": {}}
+    return data
+
+
+def _record_capture(source_id, digest, message_ids):
+    """Remember which messages a capture of this chat-day contains.
+
+    Written when the item is fetched for analysis, keyed by its digest; the
+    ledger says which digest was the last one settled. A later version of
+    the day must contain every one of them before it may replace that
+    capture (it might otherwise be a partial day rebuilt from what is left
+    in the spool).
+    """
+    data = _load_captures()
+    versions = data["days"].setdefault(source_id, {})
+    versions.pop(digest, None)
+    versions[digest] = sorted(_id_prefix(m) for m in message_ids)
+    while len(versions) > 3:
+        versions.pop(next(iter(versions)))
+    _write_json(state_dir() / "captures.json", data)
 
 
 # --- media copies ----------------------------------------------------------------
@@ -811,6 +861,8 @@ _EXTRACTORS = {"transcript": _transcribe, "pdf": _pdf_text}
 
 
 def _extraction_kind(cfg, message):
+    if not cfg["extract_budget_seconds"]:
+        return None  # a budget of 0 turns media text extraction off
     media = message.get("media") or {}
     if media.get("kind") == "audio" and cfg["transcribe_audio"]:
         return "transcript"
@@ -909,25 +961,44 @@ class _BatchError(Exception):
         self.code = code
 
 
-def _index_entry(chat, day):
+def _day_keys(day):
+    """The (store|chat key) pairs a chat-day's records were spooled under."""
+    return sorted({
+        f"{m.get('store_id') or ''}|{m.get('chat_key')}"
+        for m in day["messages"].values()
+    })
+
+
+def _index_entry(chat, day, mtime):
     messages = list(day["messages"].values())
     states = [(m.get("extract") or {}).get("state") for m in messages]
     return {
         "chat": chat,
         "date": day["date"],
         "label": day.get("chat_label", ""),
+        "keys": _day_keys(day),
         "digest": _content_digest(day),
         "changed": max((m.get("changed_epoch") or 0) for m in messages),
         "pending_copies": any(_retry_copy(m) for m in messages),
         "pending_extract": "pending" in states,
         "unavailable_extract": "unavailable" in states,
+        # The day file's mtime when this entry was computed: a day file
+        # written after it (a crash before the index) is re-indexed.
+        "mtime": mtime,
     }
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
 
 
 class _Ingest:
     """One listing's view of the archive plus the batches read into it."""
 
-    def __init__(self, cfg, dry_run):
+    def __init__(self, cfg, dry_run, ident=None):
         self.cfg = cfg
         self.dry_run = dry_run
         self.spool = Path(cfg["spool_dir"])
@@ -935,17 +1006,15 @@ class _Ingest:
         self.chats_dir = self.archive / "chats"
         self.index_path = self.chats_dir / "index.json"
         index = _read_json(self.index_path, {})
-        self.index = index if isinstance(index, dict) else {}
+        if not isinstance(index, dict) or index.get("v") != ARCHIVE_VERSION:
+            index = {}
+        self.index = index
         self.index.setdefault("v", ARCHIVE_VERSION)
         self.index.setdefault("days", {})
         self.index.setdefault("media_bytes", 0)
-        self.registry = _Registry(self.chats_dir / "registry.json")
+        self.identity = ident
         self.cursor_path = _cursor_path(self.archive, self.spool)
         cursor = _read_json(self.cursor_path, None)
-        # A new archive: no position and no chat-day files yet (deleting only
-        # the cursor to re-read the spool does not make an archive new).
-        self.fresh = not isinstance(cursor, dict) and not any(
-            self.chats_dir.glob("*/*.json"))
         self.cursor = cursor if isinstance(cursor, dict) else {}
         self.days = {}
         self.touched = set()  # chat-days whose index entry is recomputed
@@ -954,19 +1023,23 @@ class _Ingest:
         self.index_dirty = False
         self.batch_error = None
         self.last_merged = None
-        self.store = UNKNOWN_STORE
+        self.max_created = int(self.cursor.get("max_created_epoch") or 0)
+        self.store = None
         self.counts = dict.fromkeys((
             "batches", "messages", "new", "updated", "duplicates", "invalid",
-            "filtered", "expired", "copied", "reused", "too_large",
-            "archive_full", "copy_failed", "transcript", "pdf", "failed",
-            "unavailable", "deferred",
+            "no_chat_jid", "filtered", "expired", "copied", "reused",
+            "too_large", "archive_full", "copy_failed", "transcript", "pdf",
+            "failed", "unavailable", "deferred",
         ), 0)
 
     # -- days --
+    def day_path(self, chat, date):
+        return self.archive / _day_relpath(chat, date)
+
     def day(self, chat, date):
         key = identity(chat, date)
         if key not in self.days:
-            loaded = _read_json(self.archive / _day_relpath(chat, date), None)
+            loaded = _read_json(self.day_path(chat, date), None)
             if not isinstance(loaded, dict) or not isinstance(
                 loaded.get("messages"), dict
             ):
@@ -978,10 +1051,11 @@ class _Ingest:
         return self.days[key]
 
     def reconcile(self):
-        """Index every day file the index does not know (or has stale).
+        """Re-index every day file the index lacks or has stale.
 
-        The index is derived data: a crash between writing a day file and
-        the index must never hide that day.
+        The index is derived data: a day file written after its index entry
+        (a crash between the two, even if the batch is pruned before the
+        next run) is loaded and indexed again.
         """
         days = self.index["days"]
         seen = set()
@@ -991,7 +1065,10 @@ class _Ingest:
                 continue
             key = identity(chat, date)
             seen.add(key)
-            if key not in days:
+            meta = days.get(key)
+            if meta is not None and meta.get("expired"):
+                continue
+            if meta is None or meta.get("mtime") != _mtime(path):
                 self.day(chat, date)
                 self.touched.add(key)
         for key, meta in list(days.items()):
@@ -1033,8 +1110,7 @@ class _Ingest:
             for path in media.rglob("wa1-*"):
                 if STORED_MEDIA_RE.match(path.name) and path.is_file():
                     total += path.stat().st_size
-        if total != self.index.get("media_bytes"):
-            self.index["media_bytes"] = total
+        self.index["media_bytes"] = total
         self.index["media_counted"] = now
         self.index_dirty = True
 
@@ -1087,7 +1163,7 @@ class _Ingest:
             self.counts["reused"] += 1
         return True
 
-    def retry_copies(self):
+    def retry_copies(self, now):
         """Retry copies that may succeed now (transient, or a raised limit)."""
         if not self.cfg["copy_media"]:
             return
@@ -1101,26 +1177,26 @@ class _Ingest:
                     continue
                 note = record.get("store_note")
                 if self.copy(record, meta["date"]):
-                    record["changed_epoch"] = int(_now())
+                    record["changed_epoch"] = int(now)
                     self.changed.add(key)
                 if record.get("store_note") != note or record.get("stored_path"):
                     self.dirty.add(key)
 
     # -- merge --
     def merge(self, message, batch_epoch, timezone):
-        chat_id = message.get("chat_id")
-        chat_id = chat_id if isinstance(chat_id, str) and CHAT_ID_RE.match(
-            chat_id) else None
+        jid = message.get("chat_jid")
+        if not isinstance(jid, str) or not jid.strip() or len(jid) > 300:
+            # Without the chat's JID there is no identity that cannot merge
+            # two chats (chat_key is a reusable row key), so the record is
+            # not archived; the count shows how many.
+            self.counts["no_chat_jid"] += 1
+            return
         label = str(message.get("chat_label") or "")
-        known = self.registry.peek(self.store, message["chat_key"], chat_id)
-        chat_keys = set(self.registry.chat_keys(known)) if known else set()
-        if not _wanted(self.cfg, chat_keys | {message["chat_key"]}, label):
+        if not _wanted(self.cfg, {message["chat_key"]}, label):
             self.counts["filtered"] += 1
             return
-        chat = self.registry.resolve(
-            self.store, message["chat_key"], chat_id, label
-        )
-        record = _clean_record(message)
+        chat = self.identity.resolve(self.store, message["chat_key"], jid)
+        record = _clean_record(dict(message, store_id=self.store))
         date = record["timestamp"][:10]
         key = identity(chat, date)
         if (self.index["days"].get(key) or {}).get("expired"):
@@ -1161,7 +1237,7 @@ class _Ingest:
             newer_media.get("status") != "copied"
             or newer_media.get("size") == older_media.get("size")
         ):
-            # A re-sent or gave-up record never loses a copy we hold.
+            # A re-sent or closing record never loses a copy we hold.
             record["media"] = older_media
             record["stored_path"] = existing["stored_path"]
         if existing.get("extract") and record.get("stored_path") == existing.get(
@@ -1194,26 +1270,29 @@ class _Ingest:
         self.dirty.add(key)
 
     # -- batches --
-    def check_sequence(self, names):
-        """Refuse a spool whose batch sequence went backwards."""
+    def sequence_problem(self, names):
+        """Why the batch sequence looks reset, else None.
+
+        Compared with the newest creation time ever read (not the cursor
+        batch's), so a clock that stepped back does not alarm.
+        """
         last = self.cursor.get("last_batch")
         if not last or not names or not BATCH_RE.match(str(last)):
-            return
-        last_epoch = self.cursor.get("last_created_epoch") or _stamp_epoch(last)
+            return None
+        newest = self.max_created or _stamp_epoch(last)
         older_but_later = [
             name for name in names
-            if name < last and _stamp_epoch(name) > last_epoch
+            if name < last and _stamp_epoch(name) > newest
         ]
         gone_and_behind = last not in names and names[-1] < last
         if older_but_later or gone_and_behind:
-            raise RuntimeError(
-                "whatsapp spool batch sequence went backwards (the newest "
-                f"batch is numbered below the last one read, {last[:11]}); "
-                "the forwarder's state was probably reset. Check it, then "
-                f"delete {self.cursor_path.name} in archive_dir to read the "
-                "spool from its start (messages already archived are "
-                "matched by id)"
+            return (
+                f"batch sequence went backwards (below {last[:11]}; the "
+                "forwarder's state was probably reset): check it, then delete "
+                f"{self.cursor_path.name} in archive_dir to read the spool "
+                "from its start"
             )
+        return None
 
     def read_batches(self):
         """Merge every batch after the cursor; returns the last one merged."""
@@ -1222,7 +1301,14 @@ class _Ingest:
             entry.name for entry in os.scandir(self.spool)
             if BATCH_RE.match(entry.name) and entry.is_dir(follow_symlinks=False)
         )
-        self.check_sequence(names)
+        problem = self.sequence_problem(names)
+        if problem:
+            # Degraded like an unreadable batch: nothing new is read, the
+            # archived days keep flowing.
+            self.batch_error = problem
+            log(f"whatsapp spool ERROR: {problem.split(' (')[0]}; "
+                "position held")
+            return None
         pending = [name for name in names if last is None or name > last]
         if last and pending and not any(name <= last for name in names):
             if int(pending[0][1:11]) - int(last[1:11]) > 1:
@@ -1244,6 +1330,8 @@ class _Ingest:
                 break
             self.counts["batches"] += 1
             self.last_merged = (name, created)
+            self.max_created = max(self.max_created, created,
+                                   _stamp_epoch(name))
         return self.last_merged
 
     def _merge_batch(self, name):
@@ -1273,13 +1361,11 @@ class _Ingest:
         ):
             raise _BatchError("bad_header")
         store = payload.get("store_id")
-        self.store = (
-            store if isinstance(store, str) and STORE_ID_RE.match(store)
-            and store != UNKNOWN_STORE else UNKNOWN_STORE
-        )
+        self.store = store if isinstance(store, str) and STORE_ID_RE.match(
+            store) else None
         # Recorded per batch, so a store change is known even when every
         # message of the new store is filtered out.
-        self.registry.note_store(self.store)
+        self.identity.note_store(self.store)
         timezone = payload.get("timezone")
         timezone = timezone if isinstance(timezone, str) else None
         for message in messages:
@@ -1293,7 +1379,7 @@ class _Ingest:
     # -- media text --
     def extract_texts(self, now):
         """Local text extraction for stored media, within the time budget."""
-        if self.dry_run:
+        if self.dry_run or not self.cfg["extract_budget_seconds"]:
             return
         ready = _tools_ready(self.cfg)
         keys = set(self.touched) | {
@@ -1309,8 +1395,7 @@ class _Ingest:
             if not meta and key not in self.days:
                 continue
             day = self.day(chat, date)
-            # Recompute its index entry even when nothing changes now: an
-            # earlier run may have written the day and died before the index.
+            # Recompute its index entry even when nothing changes now.
             self.touched.add(key)
             for record in sorted(day["messages"].values(), key=_order):
                 kind = _extraction_kind(self.cfg, record)
@@ -1326,7 +1411,11 @@ class _Ingest:
                 )
                 if result != current:
                     record["extract"] = result
-                    self.touched.add(key)
+                    if result.get("state") in _EXTRACT_FINAL:
+                        # A finished transcript is a change like a new
+                        # message: it restarts the quiet period.
+                        record["changed_epoch"] = int(now)
+                        self.changed.add(key)
                     self.dirty.add(key)
 
     # -- retention --
@@ -1368,7 +1457,7 @@ class _Ingest:
                 except OSError:
                     pass
             try:
-                (self.archive / _day_relpath(meta["chat"], meta["date"])).unlink()
+                self.day_path(meta["chat"], meta["date"]).unlink()
             except FileNotFoundError:
                 pass
             self.index["days"][key] = {
@@ -1383,39 +1472,42 @@ class _Ingest:
 
     # -- persistence --
     def save(self):
-        """Persist registry, chat-days, the index, then the cursor.
+        """Persist identity, chat-days, the index, then the cursor.
 
         The index is recomputed for every day touched this run (duplicates
-        included), so a crash anywhere before the cursor moves is healed by
-        reading the same batches again.
+        included) and records each day file's mtime, so a crash anywhere
+        before the cursor moves is healed by reading the same batches again
+        or, if they are gone, by reconcile().
         """
+        if not self.dry_run:
+            self.identity.save()
+            for key in sorted(self.dirty):
+                day = self.days[key]
+                _write_json(self.day_path(key.split(":")[1], day["date"]), day)
         for key in sorted(self.touched):
             day = self.days.get(key)
             if day is None or not day["messages"]:
                 continue
             chat = key.split(":")[1]
-            entry = _index_entry(chat, day)
+            mtime = _mtime(self.day_path(chat, day["date"]))
+            entry = _index_entry(chat, day, mtime)
             if self.index["days"].get(key) != entry:
                 self.index["days"][key] = entry
                 self.index_dirty = True
         if self.dry_run:
             return
-        self.registry.save()
-        for key in sorted(self.dirty):
-            day = self.days[key]
-            _write_json(self.archive / _day_relpath(key.split(":")[1],
-                                                    day["date"]), day)
         if self.index_dirty or not self.index_path.exists():
             _write_json(self.index_path, self.index)
             self.index_dirty = False
         if self.last_merged is not None:
             name, created = self.last_merged
-            _write_json(self.cursor_path, {
+            self.cursor = {
                 "spool": os.path.normpath(str(self.spool)),
                 "last_batch": name,
                 "last_created_epoch": created,
-            })
-            self.cursor = {"last_batch": name, "last_created_epoch": created}
+                "max_created_epoch": self.max_created,
+            }
+            _write_json(self.cursor_path, self.cursor)
 
 
 def _content(record):
@@ -1423,7 +1515,7 @@ def _content(record):
     value = {
         k: v for k, v in record.items()
         if k not in ("first_epoch", "changed_epoch", "stored_path",
-                     "store_note", "backfill", "extract")
+                     "store_note", "backfill", "extract", "store_id")
     }
     if isinstance(value.get("media"), dict):
         value["media"] = {
@@ -1447,42 +1539,19 @@ def _check_runtime_paths(cfg, dry_run):
         state.ensure_private_dir(archive)
 
 
-def _rebuild_guard(work, processed):
-    """Source ids captured before this archive existed (item: rebuilt archive).
-
-    A new or relocated archive rebuilt from what is left in the spool can
-    hold only part of a day that was captured in full; re-capturing it would
-    overwrite the stored entry with the partial day.
-    """
-    path = work.archive / "rebuild-guard.json"
-    guard = _read_json(path, None)
-    if isinstance(guard, dict):
-        return set(guard.get("protected") or [])
-    if not work.fresh or processed is None:
-        return set()
-    protected = sorted({
-        entry.get("source_id") for _id, entry in processed.items()
-        if entry.get("source_kind") == "whatsapp" and _settled(entry)
-        and isinstance(entry.get("source_id"), str)
-    })
-    if protected and not work.dry_run:
-        _write_json(path, {"protected": protected, "at": int(_now())})
-    return set(protected)
-
-
 def ingest(source):
     """Read new spool batches into the archive; returns the ingest state."""
     cfg = settings(source)
     dry_run = bool(source.get("_dry_run") or source.get("_count_only"))
     _check_runtime_paths(cfg, dry_run)
     now = _now()
-    work = _Ingest(cfg, dry_run)
-    work.protected = _rebuild_guard(work, source.get("_processed"))
+    ident = _Identity(state_dir(), dry_run)
+    work = _Ingest(cfg, dry_run, ident)
     if not dry_run:
         work.sweep_temp(now)
         work.recount_media(now)
     work.reconcile()
-    work.retry_copies()
+    work.retry_copies(now)
     try:
         work.read_batches()
     except Exception:
@@ -1500,12 +1569,15 @@ def ingest(source):
             + " ".join(f"{key}={value}" for key, value in counts.items())
             + f" chat_days_changed={len(work.changed)}"
             + (f" last_batch={last}" if last else "")
-            + (f" identity_conflicts={work.registry.conflicts}"
-               if work.registry.conflicts else "")
+            + (f" identity_conflicts={ident.conflicts}"
+               if ident.conflicts else "")
             + (" [dry-run]" if dry_run else "")
         )
-    current = work.registry.keys_in_current_store()
-    if current is not None:
+    if counts["no_chat_jid"]:
+        log(f"whatsapp spool WARN: {counts['no_chat_jid']} record(s) without "
+            "a chat JID were not archived (no safe chat identity)")
+    if len(ident.data["stores"]) > 1:
+        current = ident.keys_in_store(ident.current_store())
         for key in cfg["chat_keys"]:
             if key not in current:
                 log(
@@ -1534,18 +1606,34 @@ def _epoch_of(value):
 
 
 def _last_captures(processed):
-    """Newest settled processing time per whatsapp source id."""
+    """Newest settled capture per whatsapp source id: (time, candidate id)."""
     found = {}
     if processed is None:
         return found
-    for _item_id, entry in processed.items():
+    for item_id, entry in processed.items():
         if entry.get("source_kind") != "whatsapp" or not _settled(entry):
             continue
         source_id = entry.get("source_id")
         at = _epoch_of(entry.get("processed_at"))
-        if isinstance(source_id, str) and at is not None:
-            found[source_id] = max(found.get(source_id, 0), at)
+        if isinstance(source_id, str) and at is not None and (
+            at >= found.get(source_id, (0, None))[0]
+        ):
+            found[source_id] = (at, item_id)
     return found
+
+
+def _current_keys(work, chat, meta):
+    """The chat's keys in the current store (or, without store ids, the
+    keys its records of this day were spooled under)."""
+    store = work.identity.current_store()
+    if store:
+        return work.identity.keys_in_store(store, chat)
+    keys = set()
+    for value in meta.get("keys") or []:
+        name, _sep, key = value.rpartition("|")
+        if not name:
+            keys.add(int(key))
+    return keys
 
 
 def candidates(source):
@@ -1562,35 +1650,43 @@ def candidates(source):
     quiet = cfg["quiet_minutes"] * 60
     max_wait = cfg["max_wait_hours"] * 3600
     last_capture = _last_captures(processed)
+    captured_ids = _load_captures()["days"] if last_capture else {}
     ready, waiting = [], []
-    settled = protected = 0
+    settled = shrinking = 0
     for key, meta in sorted(work.index["days"].items()):
         if meta.get("expired"):
             continue
         chat = meta["chat"]
-        if not _wanted(cfg, work.registry.chat_keys(chat),
-                       meta.get("label") or work.registry.label(chat)):
+        if not _wanted(cfg, _current_keys(work, chat, meta),
+                       meta.get("label") or ""):
             continue
         candidate_id = f"{key}@{meta['digest']}"
         existing = processed.get(candidate_id) if processed is not None else None
         if existing is not None and _settled(existing):
             settled += 1
             continue
-        if key in work.protected and not cfg["recapture_after_rebuild"]:
-            protected += 1
-            continue
         day = work.day(chat, meta["date"])
+        since, last_id = last_capture.get(key, (0, None))
+        if last_id and not cfg["recapture_after_rebuild"]:
+            before = (captured_ids.get(key) or {}).get(last_id.split("@")[-1])
+            present = {_id_prefix(m) for m in day["messages"]}
+            if before is not None and not set(before) <= present:
+                # This day holds fewer messages than its last capture (an
+                # archive rebuilt from what is left in the spool): wait
+                # until it holds all of them again.
+                shrinking += 1
+                continue
         changes = [m.get("changed_epoch") or 0 for m in day["messages"].values()]
         if not changes:
             continue
-        since = last_capture.get(key, 0)
-        uncaptured = [epoch for epoch in changes if epoch > since] or changes
+        uncaptured = [epoch for epoch in changes if epoch > since]
         quiet_for = now - max(changes)
-        waited = now - min(uncaptured)
+        waited = now - min(uncaptured) if uncaptured else 0
         due = (
             existing is not None  # a failed capture retries without waiting
-            or (quiet_for >= quiet and not meta.get("pending_extract"))
-            or waited >= max_wait
+            or (quiet_for >= quiet and not (
+                meta.get("pending_extract") and cfg["extract_budget_seconds"]))
+            or (bool(uncaptured) and waited >= max_wait)
         )
         candidate = {
             "id": candidate_id,
@@ -1615,11 +1711,11 @@ def candidates(source):
         ready = ready[:limit]
     for candidate in waiting:
         candidate["raw"]["_deferred"] = True
-    if protected:
+    if shrinking:
         log(
-            f"whatsapp WARN: {protected} chat-day(s) captured before this "
-            "archive existed are not captured again (it may hold only part "
-            "of them); set recapture_after_rebuild: true to allow"
+            f"whatsapp WARN: {shrinking} chat-day(s) hold fewer messages than "
+            "their last capture (a rebuilt archive?); they are captured again "
+            "once they hold all of them"
         )
     log(
         f"whatsapp: chat_days ready={len(ready)} waiting={len(waiting)} "
@@ -1636,8 +1732,13 @@ def _hhmm(message):
     return message["timestamp"][11:16]
 
 
+def _clean_name(value, limit):
+    """A display name or label on one line, redacted like message text."""
+    return redact_secrets(" ".join(str(value or "").split())[:limit])
+
+
 def _sender(message):
-    name = " ".join(str(message.get("sender") or "Unknown").split())[:80]
+    name = _clean_name(message.get("sender") or "Unknown", 80)
     return f"{name} [owner]" if message.get("from_me") else name
 
 
@@ -1669,7 +1770,11 @@ def _attachment_facts(message, name, archive, exact=False):
     elif status == "copied":
         where = f"not stored ({message.get('store_note') or 'pending copy'})"
     elif status == "gave_up":
-        where = "not available (the forwarder stopped waiting for the file)"
+        reason = media.get("reason")
+        reason = reason if reason in ("copy_failed", "expired", "watch_full") \
+            else None
+        where = ("not available (the forwarder stopped waiting for the file"
+                 + (f": {reason})" if reason else ")"))
     else:
         status = status if status in SPOOL_STATUSES else "unknown"
         where = f"not copied by the forwarder ({status})"
@@ -1699,6 +1804,8 @@ def _redacted_view(message, archive, cfg):
     media = message.get("media") or {}
     name = " ".join(str(media.get("original_name") or "").split())[:120]
     extract = message.get("extract") or {}
+    if _extraction_kind(cfg, message) is None:
+        extract = {}  # extraction is off for this kind (or the budget is 0)
     extracted = None
     if extract.get("state") == "done" and message.get("stored_path"):
         _stored, cache, _f, _a = _extract_paths(archive, message, extract["kind"])
@@ -1726,7 +1833,7 @@ def _render(messages, archive, cfg):
         # looks like "[12:00] Someone: ..." never reads as its own message.
         prompt.append(f"[{_hhmm(message)}] {_sender(message)}: {lines[0]}")
         prompt.extend(f"    {line}" for line in lines[1:])
-        sender = " ".join(str(message.get("sender") or "").split())
+        sender = _clean_name(message.get("sender"), 200)
         verbatim.append(
             f"- {message['timestamp']} · {sender} · {message['id']}"
             + (" · from_me" if message.get("from_me") else "")
@@ -1786,7 +1893,7 @@ def _bounded_prompt(lines, limit):
 def _participants(messages):
     names = []
     for message in messages:
-        name = " ".join(str(message.get("sender") or "").split())[:80]
+        name = _clean_name(message.get("sender"), 80)
         if (
             message.get("from_me") or not name or UNKNOWN_SENDER_RE.match(name)
             or name in names
@@ -1807,22 +1914,35 @@ def fetch(_routine, source, candidate):
         if not isinstance(day, dict):
             raise RuntimeError(
                 f"whatsapp archive has no record of {raw['source_id']}")
-    messages = sorted(day["messages"].values(), key=_order)
     if not dry_run and cfg["copy_media"] and any(
-        _retry_copy(m) for m in messages
+        _retry_copy(m) for m in day["messages"].values()
     ):
         # Last chance before the ledger settles this chat-day: a file the
         # listing could not copy is retried while the spool still has it.
-        # The index is left alone on purpose: this capture already shows the
-        # stored file, so it must not count as a new change.
+        # Work on the day file as it is now (never write back the listing's
+        # snapshot). The index digest is left alone on purpose: this capture
+        # already shows the stored file, so it must not count as a new
+        # change; its recorded mtime follows the file.
         work = _Ingest(cfg, dry_run=False)
-        stored = [work.copy(m, raw["date"]) for m in messages if _retry_copy(m)]
-        if any(stored):
-            _write_json(archive / _day_relpath(raw["chat"], raw["date"]), day)
-            _write_json(work.index_path, work.index)
+        path = work.day_path(raw["chat"], raw["date"])
+        current = _read_json(path, None)
+        if isinstance(current, dict) and isinstance(current.get("messages"), dict):
+            day = current
+            stored = [work.copy(m, raw["date"])
+                      for m in day["messages"].values() if _retry_copy(m)]
+            if any(stored):
+                _write_json(path, day)
+                entry = work.index["days"].get(raw["source_id"])
+                if isinstance(entry, dict):
+                    entry["mtime"] = _mtime(path)
+                _write_json(work.index_path, work.index)
+    messages = sorted(day["messages"].values(), key=_order)
+    if not dry_run:
+        _record_capture(raw["source_id"], raw.get("digest"),
+                        [m["id"] for m in messages])
     prompt_lines, verbatim_lines = _render(messages, archive, cfg)
     chat = raw["chat"]
-    label = " ".join(str(day.get("chat_label") or "").split())[:120]
+    label = _clean_name(day.get("chat_label"), 120)
     chat_type = str(day.get("chat_type") or "other")
     timezone = str(day.get("timezone") or "")
     header = (

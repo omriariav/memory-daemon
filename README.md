@@ -1913,13 +1913,16 @@ chat-day's merged messages, and every spooled file with status `copied` is
 copied to `media/<date>/<message id>.<ext>` (checked against the forwarder's
 `sha256` when the batch carries one; a mismatch is a failed copy, retried).
 A later record with a known id is a newer version: an `update: "media"`
-record contributes only its file (or the terminal `gave_up` status, shown as
-"not available"), and a re-sent duplicate changes nothing (it does not
+record contributes only its file (or its closing status: `gave_up` with its
+`reason`, shown as "not available", or a final `too_large`, `blocked_type`
+or `not_selected`), and a re-sent duplicate changes nothing (it does not
 restart the quiet period). Files are copied before the batch position is
 saved and long before the ledger settles the day, so a crash or the
 forwarder's pruning never loses a file or shrinks a conversation already
 seen; `chats/index.json` is derived data, recomputed for every day a run
-touches and rebuilt from the day files when they disagree. A copy that fails
+touches and records each day file's modification time, so a day file written
+after its index entry (a crash between the two) is indexed again even when
+its batch is gone. A copy that fails
 for a transient reason, or that a raised `max_file_mb` / `max_total_mb` or a
 re-enabled `copy_media` now allows, is retried while the spool still has the
 file. Nothing in the spool is ever written. Folders are 0700, files 0600;
@@ -1936,22 +1939,39 @@ listing still offers every archived chat-day that is ready; the runner logs
 (<reason>)`, counts it as an error for status and alerts, and keeps
 lower-ranked routines away. A batch sequence that went backwards (the
 forwarder's state was reset, so new batches are numbered below the last one
-read) fails the listing with instructions instead of being skipped
-silently. A new or relocated archive whose ledger already holds WhatsApp
-captures does not capture those chat-days again (the spool may hold only
-their end, which would overwrite the full entry); set
-`recapture_after_rebuild: true` to allow it.
+read, compared with the newest creation time ever read, so a clock stepped
+back does not count) degrades the listing the same way, with instructions,
+instead of being skipped silently.
 
-**Unit and identity.** `chat_key` is a row key of WhatsApp's database (it
-changes on a reinstall or re-link), and the forwarder's `chat_id` is a keyed
-hash of the chat's JID (it changes when a chat moves from a phone-number JID
-to an `@lid` one). The archive keeps its own chat ids in
-`chats/registry.json`: each one collects the `(store_id, chat_key)` pairs and
-`chat_id` values seen for it, and a message joins an existing chat when
-either is known. Chat keys never match across different `store_id`s;
-batches without `store_id` belong to the store seen next to them. The memory
-source id is `whatsapp:<archive chat id>:<YYYY-MM-DD>` (the message's local
-date in the spool's timezone), never a phone number or JID. The candidate id
+**Never a smaller day.** When a chat-day is fetched for analysis, the ids of
+its messages are recorded in the daemon's state
+(`state/whatsapp/captures.json`, last 3 versions per day). A later version of
+that day is offered again only once it holds every message of its last
+settled capture. In normal operation it always does; a new or relocated
+archive rebuilt from what is left in the spool may hold only the end of a
+day, and that day then waits (logged with a count) until it holds all of
+them, rather than overwriting the full entry. `recapture_after_rebuild: true`
+overrides this.
+
+**Unit and identity.** Merging two chats into one memory is the worst
+outcome for this source, so a chat's identity never comes from `chat_key` (a
+row key of WhatsApp's database, reused after a reinstall). The archive chat
+id is `c` plus 16 hex digits of HMAC-SHA256 of the record's `chat_jid`, keyed
+with a random secret the daemon creates once in
+`state/whatsapp/chat-id.key` (0600, next to the ledger, never in the archive
+or a log). It does not depend on the order messages are seen in, so a
+rebuilt archive gets the same ids. `chat_key` only links: when a batch
+carries a `store_id` and a record's (store_id, chat_key) already belongs to
+chat X while its JID-derived id is new, the new id becomes an alias of X (a
+chat moving from a phone-number JID to an `@lid` one within one database);
+two chats that both exist are never merged. Without a `store_id` there is no
+key-based linking at all. Aliases live in `state/whatsapp/identity.json`. A
+record without a `chat_jid` (the forwarder writes `null` when WhatsApp's
+chat row has no JID) has no safe identity: it is not archived, and the run
+logs how many. The forwarder's `chat_id` is kept on each record but never
+joined on. The memory source id is
+`whatsapp:<archive chat id>:<YYYY-MM-DD>` (the message's local date in the
+spool's timezone), never a phone number or JID. The candidate id
 adds a digest of the day's content, so new messages, a late file, a
 finished transcript or a newly stored copy update the same entry. Earlier
 days of the same chat are offered to the model as related memories, like
@@ -1960,12 +1980,14 @@ Google Chat.
 **Quiet period.** The forwarder writes every few minutes; a chat-day is
 analyzed once nothing in it changed for `quiet_minutes` (default 60) and no
 media text is still pending, or once its oldest change since the last
-capture has waited `max_wait_hours` (default 6, at most 72), whichever comes
+settled capture has waited `max_wait_hours` (default 6, at most 72), whichever comes
 first. Until then it is listed as deferred, so no other routine claims it. A
 longer quiet period means fewer model calls per busy day (each capture
 re-reads the whole day); the maximum wait keeps an all-day conversation from
-going uncaptured until midnight. A failed capture is retried on the next run
-without waiting.
+going uncaptured until midnight. A finished transcript or excerpt is a
+change with its own time (one more capture after the quiet period);
+pending or unavailable text changes nothing. A failed capture is retried on
+the next run without waiting.
 
 **Body and entry.** The model sees `[HH:MM] sender: text` lines (the owner's
 own marked `[owner]`, a message's further lines indented so none can pose as
@@ -1979,7 +2001,8 @@ the owner's own), the text on `  > ` lines exactly as sent (strip the prefix
 to get it back), the attachment's kind, name, type, size and stored path,
 and the transcript or excerpt. Each message's text, file name and extracted
 text is redacted once (`redact_secrets`) before either view is rendered, so
-the prompt and the stored block always agree; ID numbers are redacted too
+the prompt and the stored block always agree, and chat labels and sender
+names get the same redaction wherever they appear; ID numbers are redacted too
 when `memory.redact_ids` is on.
 
 **Text from media, locally.** With `transcribe_audio: true`, voice notes and
@@ -1993,7 +2016,7 @@ and no image description yet (a vision step would be one more entry in
 `whatsapp_source._EXTRACTORS`, budgeted, cached and rendered like a
 transcript). Extraction runs while the spool is read, within
 `extract_budget_seconds` per run (default 300); the rest waits for the next
-run. Results are cached next to the stored file. A non-zero exit or an empty
+run. `extract_budget_seconds: 0` turns media text extraction off. Results are cached next to the stored file. A non-zero exit or an empty
 result is final (`transcript: none (<reason>)`); a timeout, a kill by signal
 or an OS error is retried with backoff, at most 3 times. A missing tool or
 model is retried once it is installed. Tools are found like the other
@@ -2008,9 +2031,10 @@ the prompt (the newest lines are kept; the stored entry keeps every
 message). `chat_keys` / `chat_labels` include and `exclude_chat_keys` /
 `exclude_chat_labels` exclude chats; filters apply when a batch is read, so
 an excluded chat never reaches the archive. Chat keys belong to one WhatsApp
-installation: a chat the archive has linked across a reinstall keeps its
-inclusion, a new chat that happens to get a listed key is included too, and
-the daemon warns about listed keys it has not seen since the store changed.
+database: they match only a chat's key in the current `store_id` (without
+store ids, the record's own key in its batch), never a key it had before a
+reinstall, and the daemon warns about listed keys it has not seen since the
+store changed. Label filters are unaffected.
 `daemon.py validate` checks that `spool_dir` exists and is private and that
 `archive_dir` is safe, for enabled routines.
 
@@ -2021,7 +2045,8 @@ the configured `analyze` provider, like any other source's body, and the
 entry (summary plus the verbatim block) is written to the memory store.
 Media files, phone numbers and JIDs are never sent: JIDs are not even kept
 in the archive. The spool, the archive and the cached transcripts stay on
-this Mac; the archive holds message text and media for as long as
+this Mac, as do the identity secret, aliases and capture ids in
+`state/whatsapp/`; the archive holds message text and media for as long as
 `archive_keep_days` allows (unset: forever). With it set, captured
 chat-days older than that many days are deleted with their media and
 transcripts (a small tombstone keeps a late record from starting a partial

@@ -37,10 +37,19 @@ def iso(hour, minute=0, day=22):
     return datetime.datetime(2026, 11, day, hour, minute, tzinfo=ZONE)
 
 
-def local(store="unknown", key=1265, chat_id=None):
-    """The archive chat id the source derives for a chat seen first like this."""
-    seed = f"id:{chat_id}" if chat_id else f"key:{store}|{key}"
-    return "c" + hashlib.sha256(seed.encode()).hexdigest()[:10]
+def jid_for(key):
+    """The invented chat JID behind a fixture chat key."""
+    if key == 1265:
+        return GROUP_JID
+    if key == 2001:
+        return DIRECT_JID
+    return f"1203630000{key:08d}@g.us"
+
+
+def local(key=1265, jid=None):
+    """The archive chat id for a fixture chat (the daemon's keyed hash)."""
+    ident = whatsapp_source._Identity(whatsapp_source.state_dir(), False)
+    return ident.own_id(jid or jid_for(key))
 
 
 def sid(date=DAY, **kwargs):
@@ -55,7 +64,7 @@ def message_id(seed):
     return "wa1-" + hashlib.sha256(str(seed).encode()).hexdigest()[:40]
 
 
-def record(seed, when, text="", *, chat_key=1265, chat_jid=GROUP_JID,
+def record(seed, when, text="", *, chat_key=1265, chat_jid=None,
            label=GROUP_LABEL, chat_type="group", sender=PARENT,
            sender_jid=MEMBER_JID, from_me=False, kind="text", media=None,
            update=None, row_key=None, chat_id=None):
@@ -68,7 +77,7 @@ def record(seed, when, text="", *, chat_key=1265, chat_jid=GROUP_JID,
             hashlib.sha1(str(seed).encode()).hexdigest()[:3], 16),
         "stanza_id": "3EB0" + hashlib.sha1(str(seed).encode()).hexdigest()[:16].upper(),
         "chat_key": chat_key,
-        "chat_jid": chat_jid,
+        "chat_jid": chat_jid or jid_for(chat_key),
         "chat_label": label,
         "chat_type": chat_type,
         "entry": 1,
@@ -157,6 +166,8 @@ class Base(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         whatsapp_source._extract_spent = 0.0
+        whatsapp_source.configure(self.root / "daemon")
+        self.addCleanup(whatsapp_source.configure, None)
         self.logs = []
         log_patch = mock.patch.object(
             whatsapp_source, "log", side_effect=self.logs.append)
@@ -205,7 +216,7 @@ class GroupingAndIdentityTest(Base):
         for candidate in found:
             self.assertRegex(
                 candidate["id"],
-                r"^whatsapp:c[0-9a-f]{10}:\d{4}-\d{2}-\d{2}@[0-9a-f]{16}$")
+                r"^whatsapp:c[0-9a-f]{16}:\d{4}-\d{2}-\d{2}@[0-9a-f]{16}$")
             self.assertNotIn(GROUP_LABEL, candidate["title"])
         # No phone number or JID anywhere in the archive, names or content.
         for path in self.archive.rglob("*"):
@@ -253,8 +264,9 @@ class GroupingAndIdentityTest(Base):
         found = self.listing(exclude_chat_labels=[DIRECT_LABEL])
         self.assertEqual([c["raw"]["chat"] for c in found], [local()])
         self.assertFalse((self.archive / "chats" / local(key=2001)).exists())
-        registry = (self.archive / "chats" / "registry.json").read_text()
-        self.assertNotIn(DIRECT_LABEL, registry)  # excluded: never recorded
+        for path in [*self.archive.rglob("*.json"),
+                     *whatsapp_source.state_dir().glob("*.json")]:
+            self.assertNotIn(DIRECT_LABEL, path.read_text())  # never recorded
 
     def test_invalid_records_are_counted_not_ingested(self):
         bad_id = record("x", iso(8, 0), "bad id")
@@ -619,6 +631,10 @@ class MediaTextTest(Base):
         self.now += whatsapp_source.EXTRACT_BACKOFF_SECONDS + 1
         second = self.listing_with(source, self.fake_run({"whisper": "ok now"}))
         self.assertNotEqual(first[0]["id"], second[0]["id"])
+        # The finished transcript is a change: the quiet period runs again.
+        self.assertTrue(second[0]["raw"].get("_deferred"))
+        self.now += 31 * 60
+        second = self.listing_with(source, self.fake_run({}))
         self.assertFalse(second[0]["raw"].get("_deferred"))
         item = whatsapp_source.fetch({}, source, second[0])
         self.assertIn("ok now", item["body"])
@@ -626,7 +642,8 @@ class MediaTextTest(Base):
     def test_extraction_budget_leaves_the_rest_for_the_next_run(self):
         self.add_voice("v1", iso(8, 0))
         self.add_voice("v2", iso(8, 5))
-        source = self.voice_source(extract_budget_seconds=0)
+        source = self.voice_source()
+        whatsapp_source._extract_spent = 10 ** 6  # used up by other files
         found = self.listing_with(source, self.fake_run({"whisper": "t"}))
         self.assertEqual(self.calls, [])
         states = {r["extract"]["reason"] for r in
@@ -854,6 +871,12 @@ class ValidationTest(Base):
 
 
 class WiringTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        whatsapp_source.configure(Path(tmp.name))
+        self.addCleanup(whatsapp_source.configure, None)
+
     def test_registered_everywhere_it_needs_to_be(self):
         self.assertIn("whatsapp", config.VALID_SOURCE_KINDS)
         self.assertIn("whatsapp", runner.SOURCES)
@@ -874,6 +897,8 @@ class WiringTest(unittest.TestCase):
 class RelatedMemoriesTest(unittest.TestCase):
     def test_earlier_days_of_the_same_chat_are_offered_as_context(self):
         with tempfile.TemporaryDirectory() as tmp:
+            whatsapp_source.configure(Path(tmp) / "daemon")
+            self.addCleanup(whatsapp_source.configure, None)
             entries = Path(tmp) / "memory" / "entries"
             entries.mkdir(parents=True)
             today = datetime.date.today()
@@ -901,6 +926,7 @@ class IndexCrashTest(Base):
     def env(self, name):
         root = self.root / name
         root.mkdir()
+        whatsapp_source.configure(root / "daemon")
         spool = Spool(root)
         return spool, self.source(spool_dir=str(spool.dir),
                                   archive_dir=str(root / "archive"))
@@ -913,7 +939,9 @@ class IndexCrashTest(Base):
         ])
 
     def ids(self, source):
-        return {c["raw"]["source_id"]: c["id"]
+        whatsapp_source.configure(Path(source["archive_dir"]).parent / "daemon")
+        return {(c["raw"]["date"], tuple(sorted(c["raw"]["_day"]["messages"])),
+                 c["id"].split("@")[1])
                 for c in whatsapp_source.candidates(source)}
 
     def test_a_crash_at_any_write_of_save_never_hides_a_chat_day(self):
@@ -945,7 +973,7 @@ class IndexCrashTest(Base):
             with mock.patch.object(whatsapp_source, "_write_json",
                                    side_effect=crashing):
                 with self.assertRaises(OSError):
-                    whatsapp_source.candidates(source)
+                    self.ids(source)
             self.ids(source)
             self.assertEqual(self.ids(source), expected, f"crash at {step}")
 
@@ -1039,143 +1067,341 @@ class BatchErrorTest(Base):
 
 
 class SequenceTest(Base):
-    """Finding 5: a batch sequence that went backwards fails loudly."""
+    """A batch sequence that went backwards degrades the listing."""
 
-    def test_restarted_sequence_is_refused(self):
+    def test_restarted_sequence_degrades_and_archived_days_keep_flowing(self):
         self.spool.seq = 499
         first = self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
         self.listing()
         shutil.rmtree(self.spool.dir / first)
         self.spool.seq = 0
-        self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
-        with self.assertRaisesRegex(RuntimeError, "went backwards"):
-            self.listing()
+        self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b", chat_key=7)])
+        found = self.listing()
+        self.assertIn("went backwards", found.degraded)
+        self.assertEqual([c["raw"]["source_id"] for c in found], [sid()])
 
-    def test_older_name_created_later_is_refused_while_the_cursor_exists(self):
+    def test_older_name_created_later_degrades_while_the_cursor_exists(self):
         self.spool.seq = 499
         self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
         self.listing()
         self.spool.seq = 9
         self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
-        with self.assertRaisesRegex(RuntimeError, "went backwards"):
-            self.listing()
+        self.assertIn("went backwards", self.listing().degraded)
+
+    def test_a_clock_stepped_back_is_not_a_regression(self):
+        self.spool.batch(iso(10, 0), [record("a", iso(9, 0), "a")])
+        self.spool.batch(iso(9, 10), [record("b", iso(9, 5), "b")])  # clock back
+        self.assertIsNone(self.listing().degraded)
+        self.spool.batch(iso(9, 20), [record("c", iso(9, 15), "c")])
+        found = self.listing()
+        self.assertIsNone(found.degraded)
+        self.assertEqual(len(found[0]["raw"]["_day"]["messages"]), 3)
 
     def test_pruned_cursor_batch_with_newer_batches_is_normal(self):
         first = self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
         self.listing()
         shutil.rmtree(self.spool.dir / first)
         self.spool.batch(iso(12, 0), [record("b", iso(11, 0), "b")])
-        self.assertEqual(len(self.listing()), 1)
+        found = self.listing()
+        self.assertIsNone(found.degraded)
+        self.assertEqual(len(found), 1)
+
+
+STORE_A = "was1-" + "a" * 32
+STORE_B = "was1-" + "b" * 32
 
 
 class ChatIdentityTest(Base):
-    """Finding 6: the archive keeps its own stable chat identity."""
+    """Identity is a keyed hash of the chat JID; chat_key only links."""
 
-    def day_ids(self, found):
+    def chats(self, found):
         return {c["raw"]["chat"]: sorted(c["raw"]["_day"]["messages"])
                 for c in found}
 
-    def test_chat_key_never_matches_across_stores(self):
-        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")],
-                         store_id="store-one")
-        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b")],
-                         store_id="store-two")
-        chats = self.day_ids(self.listing())
-        self.assertEqual(set(chats), {local("store-one"), local("store-two")})
+    def test_reinstall_without_store_ids_never_merges_two_chats(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "family",
+                                            chat_key=5, chat_jid=GROUP_JID)])
+        self.listing()
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "doctor",
+                                             chat_key=5, chat_jid=DIRECT_JID)])
+        chats = self.chats(self.listing())
+        self.assertEqual(set(chats), {local(jid=GROUP_JID), local(jid=DIRECT_JID)})
 
-    def test_chat_id_links_a_chat_across_a_reinstall(self):
-        cid = chat_id("class")
-        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_id=cid)],
-                         store_id="store-one")
-        self.spool.batch(iso(10, 0), [
-            record("b", iso(9, 0), "b", chat_key=3000, chat_id=cid)],
-            store_id="store-two")
-        chats = self.day_ids(self.listing())
-        self.assertEqual(chats, {local(chat_id=cid):
-                                 sorted([message_id("a"), message_id("b")])})
+    def test_reinstall_with_a_new_store_never_merges_two_chats(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "family",
+                                            chat_key=5, chat_jid=GROUP_JID)])
+        self.listing()
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "doctor",
+                                             chat_key=5, chat_jid=DIRECT_JID)],
+                         store_id=STORE_B)
+        self.assertEqual(len(self.chats(self.listing())), 2)
 
-    def test_jid_change_keeps_the_chat_through_its_key(self):
-        self.spool.batch(iso(9, 0), [
-            record("a", iso(8, 0), "a", chat_id=chat_id("phone-jid"))],
-            store_id="store-one")
-        self.spool.batch(iso(10, 0), [
-            record("b", iso(9, 0), "b", chat_id=chat_id("lid-jid"))],
-            store_id="store-one")
-        self.assertEqual(len(self.day_ids(self.listing())), 1)
+    def test_same_jid_after_a_reinstall_is_the_same_chat(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_key=5,
+                                            chat_jid=GROUP_JID)],
+                         store_id=STORE_A)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b", chat_key=900,
+                                             chat_jid=GROUP_JID)],
+                         store_id=STORE_B)
+        self.assertEqual(self.chats(self.listing()),
+                         {local(): sorted([message_id("a"), message_id("b")])})
 
-    def test_fields_arriving_later_attach_to_the_same_chat(self):
-        cid = chat_id("class")
-        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
-        self.spool.batch(iso(10, 0), [
-            record("b", iso(9, 0), "b", chat_id=cid)], store_id="store-one")
-        self.spool.batch(iso(11, 0), [
-            record("c", iso(10, 0), "c", chat_key=3000, chat_id=cid)],
-            store_id="store-two")
-        chats = self.day_ids(self.listing())
-        self.assertEqual(list(chats), [local()])
-        self.assertEqual(len(chats[local()]), 3)
-        registry = json.loads(
-            (self.archive / "chats" / "registry.json").read_text())
-        chat = registry["chats"][local()]
-        self.assertEqual(chat["chat_ids"], [cid])
-        self.assertEqual(sorted(chat["keys"]), sorted(
-            ["unknown|1265", "store-one|1265", "store-two|3000"]))
-        text = json.dumps(registry)
-        for jid in (GROUP_JID, MEMBER_JID):
+    def test_jid_move_within_one_store_is_linked_by_its_key(self):
+        lid = "100000000000077@lid"
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_key=5,
+                                            chat_jid=DIRECT_JID)],
+                         store_id=STORE_A)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b", chat_key=5,
+                                             chat_jid=lid)], store_id=STORE_A)
+        chats = self.chats(self.listing())
+        self.assertEqual(list(chats), [local(jid=DIRECT_JID)])
+        self.assertEqual(len(chats[local(jid=DIRECT_JID)]), 2)
+        state = json.loads((whatsapp_source.state_dir() / "identity.json")
+                           .read_text())
+        self.assertEqual(state["aliases"],
+                         {local(jid=lid): local(jid=DIRECT_JID)})
+        text = json.dumps(state)
+        for jid in (DIRECT_JID, lid, GROUP_JID):
             self.assertNotIn(jid.split("@")[0], text)
 
-    def test_include_filter_follows_a_linked_chat_and_warns_after_reinstall(self):
-        cid = chat_id("class")
-        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_id=cid)],
-                         store_id="store-one")
+    def test_jid_move_without_a_store_id_is_not_linked(self):
+        lid = "100000000000077@lid"
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_key=5,
+                                            chat_jid=DIRECT_JID)])
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b", chat_key=5,
+                                             chat_jid=lid)])
+        self.assertEqual(len(self.chats(self.listing())), 2)
+
+    def test_two_known_chats_are_never_merged_by_a_key(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "a", chat_key=5, chat_jid=GROUP_JID),
+            record("b", iso(8, 1), "b", chat_key=6, chat_jid=DIRECT_JID)],
+            store_id=STORE_A)
         self.spool.batch(iso(10, 0), [
-            record("b", iso(9, 0), "b", chat_key=3000, chat_id=cid),
-            record("x", iso(9, 1), "other", chat_key=1265,
-                   chat_id=chat_id("someone else"))],
-            store_id="store-two")
-        found = self.listing(chat_keys=[1265])
-        chats = self.day_ids(found)
-        # The linked chat stays included; key 1265 in the new store is
-        # another chat, which matches the include list too (keys are per
-        # store, hence the warning until the list is updated).
-        self.assertIn(local(chat_id=cid), chats)
-        self.assertEqual(len(chats[local(chat_id=cid)]), 2)
-        self.spool.batch(iso(11, 0), [record("y", iso(10, 0), "y", chat_key=5,
-                                             chat_id=chat_id("z"))],
-                         store_id="store-three")
-        self.logs.clear()
-        self.listing(chat_keys=[1265])
-        self.assertTrue(any("chat_keys entry 1265 has not appeared" in line
+            record("c", iso(9, 0), "c", chat_key=5, chat_jid=DIRECT_JID)],
+            store_id=STORE_A)
+        found = self.listing()
+        self.assertEqual(len(self.chats(found)), 2)
+        self.assertTrue(any("identity_conflicts=1" in line for line in self.logs))
+
+    def test_ids_do_not_depend_on_what_was_seen_first(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        first = {c["raw"]["source_id"] for c in self.listing()}
+        rebuilt = {c["raw"]["source_id"] for c in self.listing(
+            archive_dir=str(self.root / "rebuilt"))}
+        self.assertEqual(first, rebuilt)
+        key = whatsapp_source.state_dir() / "chat-id.key"
+        self.assertEqual(stat.S_IMODE(os.stat(key).st_mode), 0o600)
+        self.assertFalse(list(self.archive.rglob("chat-id.key")))
+        self.assertFalse(any(key.read_text().strip() in line
+                             for line in self.logs))
+
+    def test_records_without_a_jid_are_skipped_and_counted(self):
+        orphan = record("x", iso(8, 0), "no jid", chat_key=5)
+        orphan["chat_jid"] = None
+        self.spool.batch(iso(9, 0), [orphan, record("a", iso(8, 1), "a")])
+        found = self.listing()
+        self.assertEqual(len(found), 1)
+        self.assertTrue(any("no_chat_jid=1" in line for line in self.logs))
+        self.assertTrue(any("without a chat JID were not archived" in line
                             for line in self.logs))
+
+    def test_key_filters_use_the_current_store_only(self):
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a", chat_key=5,
+                                            chat_jid=GROUP_JID)],
+                         store_id=STORE_A)
+        self.assertEqual(len(self.listing(chat_keys=[5, 900])), 1)
+        # Reinstalled: the same chat now has key 900 and key 5 is nobody.
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b", chat_key=900,
+                                             chat_jid=GROUP_JID)],
+                         store_id=STORE_B)
+        self.listing(chat_keys=[5, 900])
+        self.logs.clear()
+        self.assertEqual(self.listing(chat_keys=[5]), [])
+        self.assertTrue(any("chat_keys entry 5 has not appeared" in line
+                            for line in self.logs))
+        self.assertEqual(len(self.listing(chat_keys=[900])), 1)
+
+    def test_without_store_ids_a_key_filter_matches_the_record_key(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "a", chat_key=5),
+            record("b", iso(8, 1), "b", chat_key=6, chat_jid=DIRECT_JID)])
+        found = self.listing(chat_keys=[5])
+        self.assertEqual([c["raw"]["chat"] for c in found], [local(key=5)])
 
 
 class RebuildGuardTest(Base):
-    """Finding 7: a rebuilt archive does not overwrite full captures."""
+    """A day may replace its capture only once it holds every message of it."""
 
-    def ledger(self, source_id):
-        return {f"{source_id}@0123456789abcdef": {
-            "source_kind": "whatsapp", "source_id": source_id,
-            "processed_at": "2026-11-22T08:00:00Z", "memory": "created"}}
+    def capture(self, found, ledger):
+        for candidate in found:
+            whatsapp_source.fetch({}, self.source(), candidate)  # records ids
+            ledger[candidate["id"]] = {
+                "source_kind": "whatsapp",
+                "source_id": candidate["raw"]["source_id"],
+                "processed_at": "2026-11-22T20:00:00Z", "memory": "created"}
 
-    def test_new_archive_skips_days_captured_before_it(self):
-        self.spool.batch(iso(9, 0), [
-            record("late", iso(8, 0), "only the end of the day"),
-            record("o", iso(8, 0), "other chat", chat_key=7)])
-        found = self.listing(processed=self.ledger(sid()))
-        self.assertEqual([c["raw"]["source_id"] for c in found], [sid(key=7)])
-        self.assertTrue(any("recapture_after_rebuild" in line
-                            for line in self.logs))
-        found = self.listing(processed=self.ledger(sid()),
-                             recapture_after_rebuild=True)
-        self.assertEqual(len(found), 2)
-
-    def test_deleting_only_the_cursor_is_not_a_rebuild(self):
+    def test_superset_day_in_a_rebuilt_archive_is_captured_again(self):
+        ledger = {}
         self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
-        self.listing()
-        next(self.archive.glob("spool-cursor-*.json")).unlink()
-        found = self.listing(processed=self.ledger(sid()))
+        self.capture(self.listing(processed=ledger), ledger)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "new")])
+        found = self.listing(processed=ledger,
+                             archive_dir=str(self.root / "rebuilt"))
+        self.assertEqual([c["raw"]["source_id"] for c in found], [sid()])
+        self.assertFalse(found[0]["raw"].get("_deferred"))
+
+    def test_partial_day_is_held_and_gets_no_other_id(self):
+        ledger = {}
+        first = self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.capture(self.listing(processed=ledger), ledger)
+        shutil.rmtree(self.spool.dir / first)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b")],
+                         store_id=STORE_A)
+        found = self.listing(processed=ledger,
+                             archive_dir=str(self.root / "rebuilt"))
+        self.assertEqual(found, [])
+        self.assertTrue(any("fewer messages than their last capture" in line
+                            for line in self.logs))
+        days = list((self.root / "rebuilt" / "chats").glob("*/*.json"))
+        self.assertEqual([p.parent.name for p in days], [local()])
+        found = self.listing(processed=ledger,
+                             archive_dir=str(self.root / "rebuilt"),
+                             recapture_after_rebuild=True)
         self.assertEqual(len(found), 1)
-        self.assertFalse((self.archive / "rebuild-guard.json").exists())
+
+    def test_normal_growth_is_never_held(self):
+        ledger = {}
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        self.capture(self.listing(processed=ledger), ledger)
+        self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "b")])
+        self.assertEqual(len(self.ready(self.listing(processed=ledger))), 1)
+
+
+class ReadinessTest(Base):
+    """Extraction outcomes are changes with a time; nothing else re-arms a day."""
+
+    def settle(self, found, ledger, at="2026-11-22T20:00:00Z"):
+        for candidate in found:
+            ledger[candidate["id"]] = {
+                "source_kind": "whatsapp",
+                "source_id": candidate["raw"]["source_id"],
+                "processed_at": at, "memory": "created"}
+
+    def test_tools_installed_later_recapture_once_after_quiet(self):
+        model = self.root / "model.bin"
+        model.write_bytes(b"m")
+        message, files = self.spool.media_message(
+            "v", iso(8, 0, day=19), "audio", b"OggS", ".opus")
+        self.spool.batch(iso(9, 0, day=19), [message], files)
+        source = dict(transcribe_audio=True, whisper_model=str(model),
+                      quiet_minutes=60)
+        ledger = {}
+        missing = mock.patch.object(whatsapp_source, "optional_bin",
+                                    return_value=None)
+        with missing:
+            found = self.listing(processed=ledger, **source)
+        self.assertEqual(len(self.ready(found)), 1)
+        self.settle(found, ledger)
+        installed = mock.patch.object(
+            whatsapp_source, "optional_bin",
+            side_effect=lambda name, _env: f"/opt/tools/{name}")
+        whatsapp_source._extract_spent = 10 ** 6  # budget used up
+        with installed:
+            self.assertEqual(self.listing(processed=ledger, **source), [])
+
+        def run(cmd, timeout=120, check=True):
+            if Path(cmd[0]).name == "whisper-cli":
+                Path(cmd[cmd.index("-of") + 1]).with_suffix(".txt") \
+                    .write_text("transcript", encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        whatsapp_source._extract_spent = 0.0
+        with installed, mock.patch.object(whatsapp_source, "run",
+                                          side_effect=run):
+            found = self.listing(processed=ledger, **source)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["raw"].get("_deferred"))  # quiet period
+        self.now += 3601
+        with installed:
+            found = self.listing(processed=ledger, **source)
+        self.assertEqual(len(self.ready(found)), 1)
+        self.settle(found, ledger, at="2026-11-23T00:00:00Z")
+        with installed:
+            self.assertEqual(self.listing(processed=ledger, **source), [])
+
+    def test_budget_zero_turns_extraction_off(self):
+        model = self.root / "model.bin"
+        model.write_bytes(b"m")
+        message, files = self.spool.media_message(
+            "v", iso(8, 0), "audio", b"OggS", ".opus")
+        self.spool.batch(iso(9, 0), [message], files)
+        with mock.patch.object(whatsapp_source, "run") as run:
+            found = self.listing(transcribe_audio=True,
+                                 whisper_model=str(model),
+                                 extract_budget_seconds=0)
+        run.assert_not_called()
+        self.assertEqual(len(self.ready(found)), 1)
+        item = whatsapp_source.fetch({}, self.source(extract_budget_seconds=0),
+                                     found[0])
+        self.assertNotIn("transcript:", item["body"])
+
+
+class StaleIndexTest(Base):
+    def test_a_stale_index_entry_is_healed_even_when_the_batch_is_gone(self):
+        ledger = {}
+        self.spool.batch(iso(9, 0), [record("a", iso(8, 0), "a")])
+        found = self.listing(processed=ledger)
+        ledger[found[0]["id"]] = {"source_kind": "whatsapp",
+                                  "source_id": sid(), "memory": "created",
+                                  "processed_at": "2026-11-22T20:00:00Z"}
+        later = self.spool.batch(iso(10, 0), [record("b", iso(9, 0), "later")])
+        real = whatsapp_source._write_json
+
+        def crashing(path, payload):
+            if path.name == "index.json":
+                raise OSError(28, "No space left on device")
+            return real(path, payload)
+
+        with mock.patch.object(whatsapp_source, "_write_json",
+                               side_effect=crashing):
+            with self.assertRaises(OSError):
+                self.listing(processed=ledger)
+        shutil.rmtree(self.spool.dir / later)
+        found = self.listing(processed=ledger)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]["raw"]["_day"]["messages"]), 2)
+
+
+class FetchTest(Base):
+    def test_last_chance_copy_never_writes_back_the_listing_snapshot(self):
+        message, files = self.spool.media_message(
+            "img", iso(8, 0), "image", b"jpg", ".jpg")
+        self.spool.batch(iso(9, 0), [message], files)
+        real = whatsapp_source._copy_file
+        with mock.patch.object(whatsapp_source, "_copy_file",
+                               side_effect=PermissionError("denied")):
+            found = self.listing()
+        # Meanwhile the archive gains a message the snapshot does not hold.
+        self.spool.batch(iso(9, 30), [record("new", iso(9, 20), "newer")])
+        self.listing()
+        with mock.patch.object(whatsapp_source, "_copy_file",
+                               side_effect=real):
+            whatsapp_source.fetch({}, self.source(), found[0])
+        day = json.loads(next(self.archive.glob("chats/*/2026-11-22.json"))
+                         .read_text())
+        self.assertIn(message_id("new"), day["messages"])
+
+    def test_labels_and_sender_names_are_redacted_everywhere(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), "hi", label="password: Hunter2Label",
+                   sender="pin code: 9911")])
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        rendered = json.dumps(item, ensure_ascii=False)
+        self.assertNotIn("Hunter2Label", rendered)
+        self.assertNotIn("9911", rendered)
+        self.assertNotIn("Hunter2Label",
+                         "\n".join(llm.source_header_lines(item)))
 
 
 class MediaLifecycleTest(Base):

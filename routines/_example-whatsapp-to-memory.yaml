@@ -53,7 +53,7 @@ source:
   transcribe_timeout_seconds: 300
   # Seconds of transcription and PDF extraction per run; the rest waits for
   # the next run (a chat-day with pending media text waits up to
-  # max_wait_hours for it).
+  # max_wait_hours for it). 0 turns extraction off.
   extract_budget_seconds: 300
   transcript_max_chars: 8000
 
@@ -63,10 +63,14 @@ source:
   pdf_max_chars: 4000
 
   # Optional filters. Chat keys are the first column of the forwarder's
-  # --list-conversations and belong to one WhatsApp installation: after a
-  # reinstall or re-link they change (a chat the archive has linked keeps its
-  # inclusion; the daemon warns about listed keys it no longer sees).
+  # --list-conversations and belong to one WhatsApp database: they match a
+  # chat's key in the current store only, so after a reinstall or re-link
+  # update them (the daemon warns about listed keys it no longer sees).
   # Labels are the spool's chat_label.
+  #
+  # Chat identity needs no setting: the daemon keys a hash of each chat's
+  # JID with a secret it creates in state/whatsapp/chat-id.key (keep it with
+  # the ledger; a new secret renames every chat).
   exclude_chat_labels:
     - Example muted group
 
