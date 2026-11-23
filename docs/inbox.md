@@ -490,8 +490,9 @@ row, and answer `ok` with a message such as `already handled` when someone else
 settled the row first. The request, the response, the `op_id` idempotency, the
 retry and the conflict rules are those of every other act, so a retry of the
 same `op_id` must not record the outcome twice. Every other row keeps the plain
-`d`: FYI, feed, RSVP, alert, review, digest, saved and agent-card rows send
-`close` with `{}`, and a task or a decision keeps its [own keys](#tasks).
+`d`: FYI, feed, RSVP, alert, review and agent-card rows send `close` with `{}`
+(the rows the views make, digest and saved, send no acts at all), and a task
+or a decision keeps its [own keys](#tasks).
 
 ### The ops log (`L`)
 
