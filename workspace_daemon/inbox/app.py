@@ -163,9 +163,11 @@ class InboxCommands(SystemCommandsProvider):
     def _groups(self):
         app = self.app
         item = app.item_commands(self.screen)
-        skip = {c.callback for c in item} | {c.title for c in item}
+        # Each entry names the palette titles it stands for: those commands
+        # run the same method, so only the "This item" one is listed.
+        skip = app.item_covered_titles(self.screen) | {c.title for c in item}
         rest = [c for c in app.get_system_commands(self.screen)
-                if c.callback not in skip and c.title not in skip]
+                if c.title not in skip]
         return item, rest
 
     async def discover(self):
@@ -1092,6 +1094,14 @@ class InboxApp(App):
         return [SystemCommand(
             e.label, f"{e.shown}: {e.detail}" if e.detail else e.shown,
             e.run, True) for e in self.row_menu_entries(self.current)]
+
+    def item_covered_titles(self, screen=None):
+        """The palette titles the "This item" group replaces."""
+        if (self.view not in views.QUEUE_VIEWS or self.current is None
+                or (screen is not None and screen is not self.screen_stack[0])):
+            return set()
+        return {t for e in self.row_menu_entries(self.current)
+                for t in e.titles}
 
     def action_row_menu(self):
         """Enter: a menu of what the selected row can do, each entry with its

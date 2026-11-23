@@ -555,6 +555,7 @@ class RowMenu(ModalScreen):
         lst = self.query_one("#rowmenu-list", OptionList)
         lst.clear_options()
         options, first = [], None
+        index = {id(e): n for n, e in enumerate(self.entries)}
         for group in GROUPS:
             rows = [e for e in self.shown if e.group == group]
             if not rows:
@@ -570,7 +571,7 @@ class RowMenu(ModalScreen):
                 if e.detail:
                     prompt.append("  " + vis(e.detail, self.visual),
                                   Style(dim=True))
-                options.append(Option(prompt, id=str(self.entries.index(e))))
+                options.append(Option(prompt, id=str(index[id(e)])))
         if not options:
             options.append(Option(Text("nothing matches", Style(dim=True)),
                                   disabled=True))
@@ -634,7 +635,7 @@ HELP = [
         ("RSVP", "a accept · d done · s snooze"),
         ("Todo", "d close now · s due date"),
         ("Decision", "d asks for the decision, then closes · s due date"),
-        ("Agent card", "a ack · d done (and close at the source) · s snooze"),
+        ("Agent card", "a ack · d done / s snooze at the source (when the source supports it)"),
         ("FYI", "d dismiss · s snooze"),
         ("Alert", "a ack · d done · s snooze"),
         ("", "every old key still works; a row's others are in its enter menu")]),
@@ -657,6 +658,9 @@ HELP = [
         ("I", "ask for a new summary even if one is cached"),
         ("y / Y", "copy this item (sender, where, gist, link) / copy every item in this group"),
         ("", "writes confirm first, then wait out the 5 s undo window; u cancels before anything is sent"),
+        ("", "the send confirm: Draft in Slack d · Send y · Copy for Slack c (send: / copy: in inbox.yaml)"),
+        ("", "context and summary are read-only: nothing is confirmed or changed"),
+        ("mouse drag", "select text in the thread or draft pane"),
         ("", "L is the ops log: u on a row sends the inverse (reopen / unmute / the old due date) after a confirm")]),
     ("Views and moving", [
         ("1 2 3 4 5", "Inbox · Waiting · Tasks · Feed · Health"),

@@ -4,6 +4,7 @@ for the detail pane, the palette's "This item" group and the verbs-first help.
 Synthetic data only. The pure part (filtering, key matching) needs no
 Textual; the pilot classes skip without it."""
 import importlib.util
+import dataclasses
 import time
 import unittest
 from unittest import mock
@@ -13,7 +14,7 @@ from workspace_daemon.inbox import items as itm, rowmenu, sources
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 if HAVE_TEXTUAL:
     from workspace_daemon.inbox import __version__
-    from workspace_daemon.inbox.actions import FakeActions
+    from workspace_daemon.inbox.actions import FakeActions, safe_link
     from workspace_daemon.inbox.app import InboxApp, InboxCommands
     from workspace_daemon.inbox.screens import HelpScreen, RowMenu
     from workspace_daemon.inbox.store import InboxStore
@@ -53,6 +54,7 @@ def rows():
     return [
         row("cmd:ask", "needs_reply", "slack", ("reply", "open"),
             draft="Sure, tomorrow.", meta={"reply_to": REPLY_TO}),
+        row("cmd:nodraft", "needs_reply", "slack", ("reply", "open")),
         row("cmd:wait", "waiting", "slack", ("nudge", "open"),
             draft="Any update?"),
         row("invites:evt1", "needs_reply", "calendar", ("ack",),
@@ -69,7 +71,8 @@ def rows():
 
 
 KIND_ROWS = {                       # kind name -> (item key, view)
-    "ask": ("cmd:ask", "inbox"), "waiting": ("cmd:wait", "inbox"),
+    "ask": ("cmd:ask", "inbox"), "nodraft": ("cmd:nodraft", "inbox"),
+    "waiting": ("cmd:wait", "inbox"),
     "rsvp": ("invites:evt1", "inbox"), "fyi": ("cmd:fyi", "feed"),
     "ack": ("cmd:ack", "feed"), "alert": ("alert:disk", "feed"),
     "review": ("events:rev1", "inbox"), "todo": ("task:1", "tasks"),
@@ -78,19 +81,22 @@ KIND_ROWS = {                       # kind name -> (item key, view)
 
 # The menu of each kind with acts on, rsvp, react, polish, draft-for-me, save,
 # context, summary and one custom action (key p) all configured.
-COMMON = {"y", "Y", "m", "c", "C", "i", "I"}
+COMMON = {"y", "Y", "m", "c", "i", "I"}   # C only while the pane is open
 EXPECTED = {
-    "ask": COMMON | {"a", "e", "d", "s", "D", "P", "E", "w", "!", "x", "o", "p"},
-    "waiting": COMMON | {"a", "n", "e", "d", "s", "D", "P", "w", "!", "x", "o", "p"},
+    # a draft the source wrote: `D` would refuse to overwrite it
+    "ask": COMMON | {"a", "e", "d", "s", "P", "E", "w", "!", "x", "o", "p"},
+    # no draft: nothing to send, polish or react with; `D` can write one
+    "nodraft": COMMON | {"e", "d", "s", "D", "w", "!", "x", "o", "p"},
+    "waiting": COMMON | {"a", "n", "e", "d", "s", "P", "w", "!", "x", "o", "p"},
     "rsvp": COMMON | {"a", "X", "T", "d", "s", "o", "p"},
     "fyi": COMMON | {"d", "s", "x", "-", "M", "w", "!", "p"},
     "ack": COMMON | {"a", "d", "s", "x", "-", "M", "w", "!", "o", "p"},
     "alert": COMMON | {"a", "d", "s", "x", "-", "M", "R", "o", "p"},
     "review": {"d", "s", "D", "o", "y", "Y"},
-    "todo": {"d", "D", "s", "x", "m", "o", "y", "Y", "c", "C", "i", "I"},
-    "decision": {"d", "s", "x", "m", "y", "Y", "c", "C", "i", "I"},
+    "todo": {"d", "D", "s", "x", "m", "o", "y", "Y", "c", "i", "I"},
+    "decision": {"d", "s", "x", "m", "y", "Y", "c", "i", "I"},
 }
-FOOTER_A = {"ask": "send", "waiting": "nudge", "rsvp": "accept",
+FOOTER_A = {"ask": "send", "nodraft": None, "waiting": "nudge", "rsvp": "accept",
             "ack": "ack", "alert": "ack", "fyi": None, "review": None,
             "todo": None, "decision": None}
 
@@ -116,7 +122,7 @@ if HAVE_TEXTUAL:
             return item.meta.get("reply_to")
 
         def open_target(self, item):
-            return item.link
+            return safe_link(item.link)
 
 
     class Fixed:
@@ -127,12 +133,12 @@ if HAVE_TEXTUAL:
             return [sources.SourceResult("cmd", self.found, False, None, None)]
 
 
-    def make_app(view="inbox", actions=None, undo_s=30.0, found=None):
+    def make_app(view="inbox", actions=None, undo_s=30.0, found=None, **kw):
         store = InboxStore(None)
         actions = actions or MenuActions(store=store, draft_delay=0)
         return InboxApp(Fixed(rows() if found is None else found), store,
                         actions, settings=dict(DEFAULTS), undo_s=undo_s,
-                        leave_s=0, stream_delay=0, view=view,
+                        leave_s=0, stream_delay=0, view=view, **kw,
                         today=lambda: __import__("datetime").date(2030, 1, 10))
 
 
@@ -265,13 +271,13 @@ class MenuContentTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             labels = {}
-            for kind in ("ask", "todo", "review"):
+            for kind in ("nodraft", "todo", "review"):
                 await go(pilot, app, KIND_ROWS[kind][0])
                 menu = await open_menu(pilot, app)
                 labels[kind] = {e.key: e.label for e in menu.entries}
                 await pilot.press("escape")
                 await wait_for(pilot, lambda: not isinstance(app.screen, RowMenu))
-            self.assertEqual(labels["ask"]["D"], "Draft for me")
+            self.assertEqual(labels["nodraft"]["D"], "Draft for me")
             self.assertEqual(labels["todo"]["D"], "Done with outcome…")
             self.assertIn("save hint", labels["review"]["D"])
             self.assertEqual(len({labels[k]["D"] for k in labels}), 3)
@@ -478,6 +484,160 @@ class MenuRunsTheSameActionTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class OnlyWhatWorksTest(unittest.IsolatedAsyncioTestCase):
+    """An entry is listed only when its action would not refuse the row."""
+
+    def keys(self, app, it=None):
+        return {e.key for e in app.row_menu_entries(it)}
+
+    def row_of(self, app, key):
+        return next(i for i in app.items if i.key == key)
+
+    async def test_without_send_support_neither_a_nor_edit_is_listed(self):
+        store = InboxStore(None)
+        actions = MenuActions(store=store, draft_delay=0)
+        actions.supports_send = False
+        app = make_app(actions=actions)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "cmd:ask")
+            keys = self.keys(app)
+            self.assertFalse(keys & {"a", "e"})
+            self.assertNotIn("a", dict(app.hints()))
+            await go(pilot, app, "cmd:ack")             # an ack needs no send
+            self.assertIn("a", self.keys(app))
+
+    async def test_draft_for_me_never_overwrites_a_draft_it_did_not_write(self):
+        store = InboxStore(None)
+        actions = MenuActions(store=store, draft_delay=0)
+        actions.cached_draft_me = lambda it: None
+        app = make_app(actions=actions)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "cmd:ask")              # the source's own draft
+            self.assertNotIn("D", self.keys(app))
+            actions.cached_draft_me = lambda it: it.draft  # `D` wrote this one
+            self.assertIn("D", self.keys(app))
+            await go(pilot, app, "cmd:nodraft")          # no draft: `D` writes one
+            actions.cached_draft_me = lambda it: None
+            self.assertIn("D", self.keys(app))
+            app._draft_running.add("cmd:nodraft")        # one is being written
+            self.assertNotIn("D", self.keys(app))
+
+    async def test_a_nudge_needs_a_draft_or_the_template_fallback(self):
+        store = InboxStore(None)
+        actions = MenuActions(store=store, draft_delay=0)
+        found = [row("cmd:wait2", "waiting", "slack", ("nudge", "open"))]
+        app = make_app(actions=actions, found=found, view="waiting")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "cmd:wait2")
+            self.assertFalse(self.keys(app) & {"a", "n"})   # no draft, no template
+            self.assertNotIn("a", dict(app.hints()))
+            actions.act_nudge_text = lambda it: "Any news on this?"
+            keys = {k for e in app.row_menu_entries() for k in e.keys}
+            self.assertTrue({"a", "n"} <= keys)
+            self.assertEqual(dict(app.hints())["a"], "nudge")
+            actions.act_nudge_text = lambda it: "  "
+            self.assertFalse(self.keys(app) & {"a", "n"})
+
+    async def test_send_needs_a_non_blank_draft(self):
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "cmd:ask")
+            it = self.row_of(app, "cmd:ask")
+            self.assertEqual(rowmenu.approve_label(app, it), "send")
+            for blank in ("", "   \n"):
+                bare = dataclasses.replace(it, draft=blank)
+                self.assertIsNone(rowmenu.approve_label(app, bare))
+                self.assertNotIn("a", self.keys(app, bare))
+            # and `a` really does refuse it
+            await go(pilot, app, "cmd:nodraft")
+            await pilot.press("a")
+            await pilot.pause(0.2)
+            self.assertIn("No draft to send",
+                          " ".join(n.message for n in app._notifications))
+
+    async def test_o_follows_what_open_would_open(self):
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            ask = self.row_of(app, "cmd:ask")
+            self.assertTrue(rowmenu.can_open(app, ask))
+            for link in (None, "ftp://example.com/x", "javascript:alert(1)",
+                         "https://a b"):
+                self.assertFalse(rowmenu.can_open(
+                    app, dataclasses.replace(ask, link=link)), link)
+            task = self.row_of(app, "task:2")             # no link
+            self.assertFalse(rowmenu.can_open(app, task))
+            # even when a Slack open template would give a URL, a task
+            # without a link says "no link"
+            app.actions.open_target = lambda it: "https://example.com/t"
+            self.assertFalse(rowmenu.can_open(app, task))
+            self.assertTrue(rowmenu.can_open(app, ask))
+            await go(pilot, app, "task:2")
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            self.assertIn("no link", " ".join(
+                n.message for n in app._notifications))
+
+    async def test_the_demo_backend_opens_item_link_only_when_valid(self):
+        store = InboxStore(None)
+        app = make_app(actions=FakeActions(store=store, draft_delay=0))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            ask = self.row_of(app, "cmd:ask")
+            self.assertTrue(rowmenu.can_open(app, ask))
+            self.assertFalse(rowmenu.can_open(
+                app, dataclasses.replace(ask, link="ftp://example.com/x")))
+
+    async def test_refresh_context_only_while_the_pane_is_open(self):
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "cmd:ask")
+            self.assertNotIn("C", self.keys(app))
+            app.context_open = True
+            self.assertIn("C", self.keys(app))
+            app.context_open = False
+
+    async def test_feed_rules_are_listed_on_a_saved_row(self):
+        saved = [{"id": "s1", "source": "slack", "kind": "new",
+                  "ts": time.time() - 600, "title": "A saved thread",
+                  "link": None, "source_id": "slack:s1"}]
+        app = make_app(view="feed", saved=lambda: (saved, None), saved_days=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("S")
+            self.assertTrue(await wait_for(
+                pilot, lambda: (app.current_key or "").startswith("saved:")))
+            self.assertEqual(self.keys(app), {"d", "s", "y", "Y", "M"})
+            await open_menu(pilot, app)
+            await pilot.press("M")                      # it works there
+            self.assertTrue(await wait_for(
+                pilot, lambda: type(app.screen).__name__ == "RulesScreen"))
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
+class MenuIndexTest(unittest.IsolatedAsyncioTestCase):
+    async def test_equal_entries_keep_their_own_index(self):
+        # two entries that compare equal must not both map to the first
+        run = lambda: None  # noqa: E731
+        twin = [rowmenu.MenuEntry("d", "Done", rowmenu.G_ACT, run),
+                rowmenu.MenuEntry("d", "Done", rowmenu.G_ACT, run)]
+        self.assertEqual(twin[0], twin[1])
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            app.push_screen(RowMenu("x", twin))
+            self.assertTrue(await wait_for(pilot, lambda: isinstance(app.screen, RowMenu)))
+            lst = app.screen.query_one("#rowmenu-list")
+            ids = [o.id for o in lst.options if o.id is not None]
+            self.assertEqual(ids, ["0", "1"])
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class MenuKeysTest(unittest.IsolatedAsyncioTestCase):
     async def test_slash_filters_and_esc_clears_then_closes(self):
         app = make_app()
@@ -491,7 +651,7 @@ class MenuKeysTest(unittest.IsolatedAsyncioTestCase):
                 pilot, lambda: isinstance(app.focused, Input)))
             await press_text(pilot, "draft")
             self.assertTrue(await wait_for(pilot, lambda: len(menu.shown) < all_n))
-            self.assertEqual({e.key for e in menu.shown}, {"e", "D", "P"})
+            self.assertEqual({e.key for e in menu.shown}, {"e", "P"})
             self.assertEqual(app.pending, [])        # typing ran nothing
             await pilot.press("escape")              # clears the filter
             self.assertTrue(await wait_for(pilot, lambda: len(menu.shown) == all_n))
@@ -606,8 +766,8 @@ class OldKeysTest(unittest.IsolatedAsyncioTestCase):
                     letters.add(k)
         self.assertEqual(letters, set(settings.RESERVED_KEYS))
 
-    async def test_old_keys_work_with_the_menu_open_in_the_main_screen(self):
-        # a, d, s on a row, with no menu: the same as before
+    async def test_a_still_acknowledges_a_row_without_the_menu(self):
+        # `a` on a row, with no menu: the same as before
         app = make_app()
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
@@ -702,7 +862,7 @@ class PaletteTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             await go(pilot, app, "task:1")
             task = {h.text for h in await self.hits(app) if h.text.startswith("This item")}
-            await go(pilot, app, "cmd:ask")
+            await go(pilot, app, "cmd:nodraft")
             ask = {h.text for h in await self.hits(app) if h.text.startswith("This item")}
             self.assertIn("This item Done with outcome…", task)
             self.assertNotIn("This item Done with outcome…", ask)
@@ -722,6 +882,37 @@ class PaletteTest(unittest.IsolatedAsyncioTestCase):
             for key in ("b", "v", "L", "R", "ctrl+t"):
                 self.assertTrue(any(b.key == key or key in b.key.split(",")
                                     for b in InboxApp.BINDINGS), key)
+
+    async def test_no_command_is_listed_twice(self):
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            for key in ("cmd:ask", "cmd:nodraft", "cmd:wait", "invites:evt1",
+                        "task:1", "alert:disk"):
+                await go(pilot, app, key)
+                hits = await self.hits(app)
+                item = [h.text[len("This item "):] for h in hits
+                        if h.text.startswith("This item")]
+                rest = [h.text for h in hits if not h.text.startswith("This item")]
+                self.assertFalse(set(item) & set(rest), (key, set(item) & set(rest)))
+                covered = app.item_covered_titles()
+                self.assertFalse(covered & set(rest), (key, covered & set(rest)))
+                self.assertEqual(len(rest), len(set(rest)), key)
+            # the lambda commands too: "Summary" stands for "Summarize item"
+            await go(pilot, app, "cmd:ask")
+            hits = await self.hits(app)
+            rest = [h.text for h in hits if not h.text.startswith("This item")]
+            self.assertIn("This item Summary", [h.text for h in hits])
+            self.assertNotIn("Summarize item", rest)
+            self.assertNotIn("Summarize item (refresh)", rest)
+
+    async def test_commands_without_an_item_entry_stay_in_the_rest(self):
+        app = make_app(found=[])
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.pause(0.3)
+            texts = [h.text for h in await self.hits(app)]
+            for title in ("Summarize item", "Edit draft", "Mark done"):
+                self.assertIn(title, texts)
 
     async def test_no_item_no_group(self):
         app = make_app(found=[])
@@ -789,6 +980,18 @@ class HelpTest(unittest.IsolatedAsyncioTestCase):
             body = await self.body(app, pilot)
             ask = next(ln for ln in body.splitlines() if "Slack ask" in ln)
             self.assertNotIn("outcome", ask)
+
+    async def test_help_keeps_the_mouse_confirm_and_read_only_lines(self):
+        app = make_app()
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            body = await self.body(app, pilot)
+            self.assertIn("select text in the thread or draft pane", body)
+            self.assertIn("Draft in Slack d", body)
+            self.assertIn("Send y", body)
+            self.assertIn("Copy for Slack c", body)
+            self.assertIn("read-only", body)
+            self.assertIn("when the source supports it", body)
 
     async def test_help_still_scrolls_and_shows_the_version(self):
         app = make_app()

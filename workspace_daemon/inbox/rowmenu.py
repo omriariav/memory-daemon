@@ -10,6 +10,7 @@ configured, what the row's source lists) and returns the entries;
 """
 from dataclasses import dataclass, field
 
+from . import items as itm_items
 from . import tasks as tasksmod
 from . import views
 
@@ -29,6 +30,7 @@ class MenuEntry:
     run: object               # a no-argument callable: the app method
     also: tuple = ()          # more keys that run it (the `n` of a nudge)
     detail: str = ""
+    titles: tuple = ()        # the palette commands this entry stands for
     keys: tuple = field(init=False)
 
     def __post_init__(self):
@@ -37,6 +39,29 @@ class MenuEntry:
     @property
     def shown(self):
         return " / ".join(self.keys)
+
+
+# The command-palette titles (InboxApp.get_system_commands) that run the same
+# method as an entry's key: the palette's "This item" group replaces them, so
+# no command is listed twice.
+KEY_TITLES = {
+    "e": ("Edit draft",), "d": ("Mark done",), "s": ("Snooze…",),
+    "X": ("Decline invite",), "T": ("Tentative",), "E": ("React to message",),
+    "P": ("Polish draft",), "D": ("Draft for me",), "w": ("Waits on…",),
+    "!": ("Relay to work session…",), "o": ("Open link",),
+    "y": ("Copy item",), "Y": ("Copy section",),
+    "c": ("Toggle context pane",), "C": ("Refresh context",),
+    "i": ("Summarize item",), "I": ("Summarize item (refresh)",),
+    "u": ("Undo last action",), "M": ("Feed rules",),
+    "R": ("Show / hide resolved alerts",), "-": ("Less like this (Feed)",),
+    "x": ("Mute (Feed)",),
+}
+APPROVE_TITLES = {
+    "send": ("Approve draft / acknowledge",),
+    "ack": ("Approve draft / acknowledge",),
+    "accept": ("Approve draft / acknowledge", "Accept invite"),
+    "nudge": ("Approve draft / acknowledge", "Nudge"),
+}
 
 
 def filter_entries(entries, text):
@@ -77,7 +102,53 @@ def approve_label(app, it):
         return None
     if not getattr(app.actions, "supports_send", False):
         return None
-    return "nudge" if kind == "nudge" else "send"
+    if kind == "nudge":
+        return "nudge" if _nudge_text_ok(app, it) else None
+    # `_confirm_send` refuses an empty draft ("No draft to send")
+    return "send" if _has_draft(it) else None
+
+
+def _has_draft(it):
+    return bool(it.draft and it.draft.strip())
+
+
+def _nudge_text_ok(app, it):
+    """True when `action_nudge` gets to the confirm screen with text: the
+    stored draft, or (no draft at all) the `nudge_template` text of a row of
+    an acts source."""
+    if _has_draft(it):
+        return True
+    if it.draft:                      # blank text: the confirm refuses it
+        return False
+    fn = getattr(app.actions, "act_nudge_text", None)
+    if not (fn is not None and app._acts_any() and getattr(it, "origin", "")
+            and app._acts_on_source(it)):
+        return False
+    try:
+        return bool((fn(it) or "").strip())
+    except Exception:
+        return False
+
+
+def draft_me_ok(app, it):
+    """True when `D` would write a draft: `draft_me:` is usable, the row has a
+    reply or nudge, no draft for this row is being written, and the row has no
+    draft, or only the one `D` wrote (which it may redo). A draft written by
+    hand or by the source is never overwritten."""
+    if not getattr(app.actions, "draft_me_configured", False):
+        return False
+    if "reply" not in it.actions and "nudge" not in it.actions:
+        return False
+    if it.key in app._draft_running:
+        return False
+    if not _has_draft(it):
+        return True
+    fn = getattr(app.actions, "cached_draft_me", None)
+    try:
+        cached = fn(it) if fn else None
+    except Exception:
+        cached = None
+    return bool(cached) and it.draft == cached
 
 
 def can_open(app, it):
@@ -85,11 +156,13 @@ def can_open(app, it):
     open template's URL."""
     if it is None:
         return False
-    if it.link:
-        return True
+    if tasksmod.is_task(it) and not it.link:
+        return False                  # `_open_item` says "no link"
     fn = getattr(app.actions, "open_target", None)
+    if fn is None:                    # the demo backend opens `item.link`
+        return itm_items.valid_link(it.link)
     try:
-        return bool(fn and fn(it))
+        return bool(fn(it))           # the open template's URL or a safe link
     except Exception:
         return False
 
@@ -122,8 +195,12 @@ def build_entries(app, it):
     """The menu of `it`: only what is valid for this row now."""
     entries = []
 
-    def add(group, key, label, run, also=(), detail=""):
-        entries.append(MenuEntry(key, label, group, run, tuple(also), detail))
+    def add(group, key, label, run, also=(), detail="", titles=None):
+        if titles is None:
+            titles = ((label,) if group == G_CUSTOM
+                      else KEY_TITLES.get(key, ()))
+        entries.append(MenuEntry(key, label, group, run, tuple(also), detail,
+                                 tuple(titles)))
 
     if it is None:
         return entries
@@ -153,9 +230,8 @@ def build_entries(app, it):
         _row_entries(app, it, add, in_feed)
 
     if in_feed and not task and not review:
-        if not synthetic or views.is_digest(it):
-            add(G_FEED, "M", "Feed rules…", app.action_rules,
-                detail="the rules from inbox.yaml and the ones made here")
+        add(G_FEED, "M", "Feed rules…", app.action_rules,
+            detail="the rules from inbox.yaml and the ones made here")
 
     # open and copy
     if can_open(app, it):
@@ -168,11 +244,14 @@ def build_entries(app, it):
     if (not synthetic and not task and not review and app.actions_save_on
             and not it.memory_id):
         add(G_MEMORY, "m", "Save to memory", app.action_save_memory,
-            detail="by hand; the daemon saves on its own")
+            detail="by hand; the daemon saves on its own",
+            titles=("Save item to memory",))
     if not synthetic and not review:
         if app._ctx_on():
             add(G_MEMORY, "c", "Context pane", app.action_context)
-            add(G_MEMORY, "C", "Refresh context", app.action_context_refresh)
+            if app.context_open:      # `C` says "pane is closed" otherwise
+                add(G_MEMORY, "C", "Refresh context",
+                    app.action_context_refresh)
         if app._sum_on():
             add(G_MEMORY, "i", "Summary", lambda: app.action_summary(False))
             add(G_MEMORY, "I", "Summary (ask again)",
@@ -223,7 +302,8 @@ def _task_entries(app, it, add):
             detail="with an optional reason")
     add(G_ACT, "m", "Close remind me" if app.remind_key == it.key
         else "Remind me", app.action_remind,
-        detail="the source, the original words, related items")
+        detail="the source, the original words, related items",
+        titles=("Remind me",))
 
 
 def _row_entries(app, it, add, in_feed):
@@ -233,18 +313,19 @@ def _row_entries(app, it, add, in_feed):
                 "nudge": "Nudge…", "ack": "Acknowledge"}[label]
         also = ("n",) if label == "nudge" else ()
         add(G_ACT, "a", long, app.action_approve, also=also,
-            detail="confirm first" if label in ("send", "nudge") else "")
+            detail="confirm first" if label in ("send", "nudge") else "",
+            titles=APPROVE_TITLES[label])
     rsvp = app._rsvp_on(it)
     if rsvp:
         add(G_ACT, "X", "Decline invite", app.action_rsvp_decline)
         add(G_ACT, "T", "Tentative", app.action_rsvp_tentative)
-    if it.kind in ("reply", "nudge") and not rsvp:
+    if (it.kind in ("reply", "nudge") and not rsvp
+            and getattr(app.actions, "supports_send", False)):
         add(G_ACT, "e", "Edit draft", app.action_edit)
     add(G_ACT, "d", "Dismiss" if it.kind == "fyi" else "Done",
         app.action_done)
     add(G_ACT, "s", "Snooze…", app.action_snooze)
-    if getattr(app.actions, "draft_me_configured", False) and (
-            "reply" in it.actions or "nudge" in it.actions):
+    if draft_me_ok(app, it):
         add(G_ACT, "D", "Draft for me", app.action_draft_me,
             detail="writes a reply from the thread; never sends")
     if app._polish_on(it):

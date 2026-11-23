@@ -1875,7 +1875,7 @@ What the three verbs do by row:
 | RSVP (a pending invite) | accept | done | snooze |
 | Todo | none | close now | due date |
 | Decision | none | asks for the decision, then closes | due date |
-| Agent card (an ack row of a command source with `acts:`) | ack | done, and `close` at the source | snooze, and `snooze` at the source |
+| Agent card (an ack row of a command source with `acts:`) | ack | done; also `close` at the source (when the source supports it) | snooze; also `snooze` at the source (when the source supports it) |
 | FYI | none | dismiss | snooze |
 | Alert | ack | done | snooze |
 
