@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import (
-    config, llm, memory_sink, runner, state, triviality, whatsapp_source,
+    chat_text, config, llm, memory_sink, runner, state, triviality, whatsapp_source,
 )
 
 ZONE = datetime.timezone(datetime.timedelta(hours=2))
@@ -31,6 +31,10 @@ PARENT = "פלוני אלמוני"
 OTHER_PARENT = "Avi Example"
 HEBREW_TEXT = "מחר יום ספורט, מצורף לוח הזמנים\nשורה שנייה"
 DAY = "2026-11-22"
+# An invented to-do list in the shape that once leaked a card PIN: one
+# numbered line ends with "code <digits>" (the number is fake).
+CARD_CODE_TEXT = ("מה צריך לעשות מחר:\n1. לאסוף את החבילה\n"
+                  "2. לשלם עם הכרטיס שלי. קוד 4821\n3. להתקשר לגננת")
 
 
 def iso(hour, minute=0, day=22):
@@ -712,6 +716,29 @@ class MediaTextTest(Base):
         self.assertNotIn("909090", item["body"])
         self.assertNotIn("909090", item["memory_appendix"])
 
+    def test_transcript_short_codes_are_redacted_in_both_views(self):
+        self.add_voice()
+        source = self.voice_source()
+        found = self.listing_with(source, self.fake_run(
+            {"whisper": "תשלם עם הכרטיס, הקוד שלי הוא 48 21 תודה"}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        for view in (item["body"], item["memory_appendix"]):
+            self.assertNotIn("48 21", view)
+            self.assertIn("הקוד שלי הוא [REDACTED] תודה", view)
+
+    def test_pdf_excerpt_short_codes_are_redacted_in_both_views(self):
+        message, files = self.spool.media_message(
+            "pdf", iso(8, 0), "document", b"%PDF-1.7", ".pdf",
+            mime="application/pdf", original_name="welcome.pdf")
+        self.spool.batch(iso(9, 0), [message], files)
+        source = self.source()
+        found = self.listing_with(source, self.fake_run(
+            {"pdftotext": "Welcome! Gate code: 7305. Floor 3, room 214."}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        for view in (item["body"], item["memory_appendix"]):
+            self.assertNotIn("7305", view)
+            self.assertIn("Floor 3, room 214.", view)
+
     def test_default_timeout_suits_voice_notes(self):
         self.assertEqual(
             whatsapp_source.DEFAULTS["transcribe_timeout_seconds"], 300)
@@ -999,6 +1026,17 @@ class RedactionTest(Base):
         self.assertEqual(item["body"].count("[REDACTED]"), 2)
         self.assertEqual(item["memory_appendix"].count("[REDACTED]"), 2)
 
+    def test_card_code_in_a_numbered_hebrew_list_is_redacted(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), CARD_CODE_TEXT, from_me=True),
+        ])
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        self.assertNotIn("4821", item["body"])
+        self.assertNotIn("4821", item["memory_appendix"])
+        self.assertIn("    2. לשלם עם הכרטיס שלי. קוד [REDACTED]", item["body"])
+        self.assertIn("  > 2. לשלם עם הכרטיס שלי. קוד [REDACTED]\n"
+                      "  > 3. להתקשר לגננת", item["memory_appendix"])
+
     def test_file_names_are_redacted_once_for_both_views(self):
         message, files = self.spool.media_message(
             "doc", iso(8, 0), "document", b"x", ".bin",
@@ -1007,6 +1045,96 @@ class RedactionTest(Base):
         item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
         self.assertNotIn("667788", item["body"])
         self.assertNotIn("667788", item["memory_appendix"])
+
+
+class ShortCodeRedactionTest(unittest.TestCase):
+    """A keyword next to a short digit run is a secret (PIN, door code...).
+
+    Every number here is invented. Keeping a harmless number is the cost
+    the negative cases pin down; when unsure, the pattern redacts.
+    """
+
+    SECRET = [
+        # Hebrew keyword before the number, with prefixes and filler words
+        ("קוד 4821", "4821"),
+        ("הקוד: 4821", "4821"),
+        ("והקוד הוא 4821", "4821"),
+        ("שהקוד שלי הוא 4821", "4821"),
+        ("בקוד 4821 נכנסים", "4821"),
+        ("קוד סודי 4821", "4821"),
+        ("קוד כניסה לבניין 4821, דירה 26", "4821"),
+        ("קוד אשראי 482", "482"),
+        ("הסיסמה 482113", "482113"),
+        ("סיסמא 4821", "4821"),
+        ("ססמה 4821", "4821"),
+        ("הפין שלי 4821", "4821"),
+        ("3 ספרות בגב הכרטיס 482", "482"),
+        ("הקוד \"4821\"", "4821"),
+        ("הקוד:\n4821", "4821"),
+        # English keyword before the number
+        ("the code is 4821", "4821"),
+        ("Code: 4821", "4821"),
+        ("door code 4821", "4821"),
+        ("code for the gate is 4821", "4821"),
+        ("passcode 482113", "482113"),
+        ("password 4821", "4821"),
+        ("PIN 4821", "4821"),
+        ("pin number 4821", "4821"),
+        ("CVV 482", "482"),
+        ("cvc: 482", "482"),
+        ("OTP 482113", "482113"),
+        # digits split by spaces or dashes
+        ("code 48 21", "48 21"),
+        ("קוד 4-8-2-1", "4-8-2-1"),
+        ("PIN: 482 113", "482 113"),
+        # keyword after the number on the same short clause
+        ("4821 is the code", "4821"),
+        ("4821 is my PIN", "4821"),
+        ("4821 זה הקוד", "4821"),
+        ("4821 הוא הקוד לדלת", "4821"),
+        ("4821 הקוד.", "4821"),
+        # full card numbers (Luhn-valid test numbers)
+        ("כרטיס 4111 1111 1111 1111 בתוקף", "4111 1111 1111 1111"),
+        ("card 5555-5555-5555-4444", "5555-5555-5555-4444"),
+        ("378282246310005", "378282246310005"),
+    ]
+
+    KEPT = [
+        "code 17:30", "הקוד ב-17:30", "קוד 12.11.2026", "code 2026-11-22",
+        "קוד 120 ₪", "קוד 120 ש\"ח", "code 120 NIS", "code $120",
+        "code 050-0000000", "דירה 26, קומה 3", "area code 212",
+        "dress code: black, from 2026", "QR code 4821", "zip code 12345",
+        "מיקוד 1234567", "קוד מוצר 123456789", "product code 4821",
+        "קוד הנחה 4821", "קוד קופון 4821", "promo code 4821",
+        "discount code 4821", "4821 זה קוד ההנחה", "12345 is the zip code",
+        "קודם 4821", "פינה 4821", "barcode 4821", "250 code reviews",
+        "4821 קודים", "order 123456789012", "4111 1111 1111 1112",
+        "call 050-000-0000",
+    ]
+
+    def test_secret_codes_are_redacted(self):
+        for text, code in self.SECRET:
+            with self.subTest(text=text):
+                redacted = chat_text.redact_secrets(text)
+                self.assertNotIn(code, redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_the_keyword_and_the_rest_of_the_line_are_kept(self):
+        self.assertEqual(
+            chat_text.redact_secrets("קוד כניסה לבניין 4821, דירה 26"),
+            "קוד כניסה לבניין [REDACTED], דירה 26")
+        self.assertEqual(chat_text.redact_secrets("4821 זה הקוד"),
+                         "[REDACTED] זה הקוד")
+
+    def test_the_numbered_list_shape_is_redacted(self):
+        self.assertEqual(
+            chat_text.redact_secrets(CARD_CODE_TEXT),
+            CARD_CODE_TEXT.replace("4821", "[REDACTED]"))
+
+    def test_harmless_numbers_near_code_words_are_kept(self):
+        for text in self.KEPT:
+            with self.subTest(text=text):
+                self.assertEqual(chat_text.redact_secrets(text), text)
 
 
 class BatchErrorTest(Base):
@@ -1821,6 +1949,20 @@ class EndToEndTest(Base):
         totals = self.run_daemon()
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(self.cli_calls, [])
+
+    def test_a_card_code_reaches_neither_the_model_nor_the_entry(self):
+        self.spool.batch(iso(9, 1), [
+            record("todo", iso(8, 20), CARD_CODE_TEXT, from_me=True)])
+        totals = self.run_daemon()
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        (prompt,) = self.prompts
+        ((_args, stdin),) = [(a, s) for a, s in self.cli_calls
+                             if a[0] == "add"]
+        self.assertIn("## WhatsApp messages (verbatim)", stdin)
+        for text in (prompt, stdin):
+            self.assertNotIn("4821", text)
+            self.assertIn("לשלם עם הכרטיס שלי. קוד [REDACTED]", text)
 
     def test_no_personal_data_in_logs(self):
         self.run_daemon()

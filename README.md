@@ -2038,7 +2038,11 @@ and the transcript or excerpt. Each message's text, file name and extracted
 text is redacted once (`redact_secrets`) before either view is rendered, so
 the prompt and the stored block always agree, and chat labels and sender
 names get the same redaction wherever they appear; ID numbers are redacted too
-when `memory.redact_ids` is on.
+when `memory.redact_ids` is on. Besides one-time codes and credentials, this
+catches short secret codes, a 3-8 digit run next to a keyword before or after
+it (`קוד 4821`, `הסיסמה שלי היא 4821`, `PIN: 48 21`, `4821 זה הקוד`), and
+Luhn-valid card numbers; zip, area, QR, product, coupon and discount codes,
+times, dates and amounts are left alone. The archive keeps the text as sent.
 
 **Text from media, locally.** With `transcribe_audio: true`, voice notes and
 audio are converted by `ffmpeg` to 16 kHz mono WAV and transcribed by
