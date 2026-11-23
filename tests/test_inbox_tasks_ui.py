@@ -769,6 +769,7 @@ class ReadOnlyTest(Base):
             self.assertIn("task:1", keys_of(app))
             self.assertFalse(self.store.is_hidden("task:1"))
             keys = {k for k, _label in app.hints()}
+            keys |= {e.key for e in app.row_menu_entries()}
             self.assertFalse(keys & {"d", "D", "s", "x"})
             self.assertEqual(app.act_pending, 0)
 

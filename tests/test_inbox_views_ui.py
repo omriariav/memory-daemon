@@ -1011,7 +1011,7 @@ class HelpAndPaletteTest(unittest.IsolatedAsyncioTestCase):
         app, _ = make_app([item(1)])
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("1-5", "views"), app.hints())
+            self.assertIn(("⏎", "more"), app.hints())
             self.assertEqual(app.hints()[-1], ("?", "help"))
 
     async def test_palette_has_view_jumps(self):

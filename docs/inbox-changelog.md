@@ -7,6 +7,57 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-23
+
+Simple triage. The inbox had about 35 single-letter keys, a footer of 13
+hints on a reply row and a command palette of about 45 commands whatever row
+was selected. Four verbs now carry the day (`a`, `d`, `s`, `o`) and `enter`
+lists the rest for the row you are on. No key was removed and no key changed
+what it does: every old key works as before.
+
+### Added
+
+- **A row menu (`enter`).** A popup in the style of which-key that lists only
+  what the selected row can do now, each entry with its key and a clear label.
+  One press of an entry's key runs it (it calls the same method as the key
+  itself); the arrows and `enter` pick the highlighted entry; `/` filters by
+  text (the first `esc` clears the filter, the next closes the menu). Keys
+  that mean different things on different rows get their own labels: on a todo
+  `D` is "Done with outcome…", on a Slack ask it is "Draft for me", on a REVIEW
+  row it copies a save hint. The menu lists your `actions:` of `inbox.yaml`,
+  relay (`!`), react (`E`), polish (`P`), edit, nudge, RSVP decline and
+  tentative, waits on (`w`), mute (`x`), save to memory (`m`), copy, context
+  and summary, the Feed's less like this and rules, and undo while something
+  waits out its window; each one only when it is configured and valid for the
+  row. Nothing that is off or does not apply is listed. See
+  [Keys](inbox.md#keys).
+- **A "This item" group in the command palette (`ctrl+p`).** With nothing
+  typed, the commands of the selected row (the same entries as its menu) come
+  first, then the rest. A typed query matches both. Settings and rare toggles
+  (Hebrew order `b`, thread order `v`, audit log `L`, copy section as Markdown,
+  theme) are in the palette and keep their keys.
+- **The `?` help opens with the verbs.** `a`, `d`, `s`, `o`, `enter` and `u`,
+  then a short table of what `a`, `d` and `s` mean on each kind of row (Slack
+  ask, waiting, RSVP, todo, decision, agent card, FYI, alert), then "Power
+  keys (also in enter)". The scroll keys and the wheel work as in 0.12.4.
+
+### Changed
+
+- **`enter` on a Feed row opens the row menu; `tab` moves to its details.**
+  Until now `enter` on a Feed row moved the focus to the thread pane. `tab`
+  does that (it already cycled the panes; it is now the documented key). A
+  mouse click on a Feed row still moves the focus to the details.
+- **The footer shows at most seven hints for the selected row**, in this
+  order: `a <label>` (`send`, `accept`, `nudge` or `ack`; left out when the row
+  has no approve action), `d done`, `s later`, `o open` (when there is
+  something to open), `enter more` and `? help`. The context, summary, react,
+  polish, waits on, relay, draft for me, thread order, custom-action, copy,
+  save, view and group hints left the footer; their keys work as before and
+  each is in the row menu (the `1`-`5` and `[`/`]` keys are in the help). A
+  task row shows `d` and `s` only when its source lists the act. The footer of
+  a focused pane, of the filter and of an empty queue is unchanged apart from
+  being shorter where it was long.
+
 ## [0.12.4] - 2026-11-22
 
 ### Fixed

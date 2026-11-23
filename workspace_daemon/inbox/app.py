@@ -15,11 +15,14 @@ from textual import work
 from textual.app import App, ComposeResult, ScreenStackError, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.command import DiscoveryHit, Hit
+from textual.content import Content
 from textual.css.query import NoMatches
+from textual.system_commands import SystemCommandsProvider
 from textual.widgets import Input, Static, TextArea
 
 from . import acts as actsmod
-from . import bidi, customactions, feedrules, invites, themes, views
+from . import bidi, customactions, feedrules, invites, rowmenu, themes, views
 from . import context as ctxmod
 from . import health as healthmod
 from . import items as itm_items
@@ -34,7 +37,7 @@ from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, DateScreen, HelpScreen, NoteScreen,
                       OpsScreen,
-                      PolishScreen, RulesScreen, SnoozePicker)
+                      PolishScreen, RowMenu, RulesScreen, SnoozePicker)
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
@@ -148,9 +151,55 @@ class Pending:
     react: str = ""           # 0.10.0: done reaction emoji sent after the act
 
 
+THIS_ITEM = "This item"
+
+
+class InboxCommands(SystemCommandsProvider):
+    """The command palette's source (it replaces Textual's, and lists the same
+    commands): with nothing typed, a "This item" group comes first (what the
+    selected row can do, the same entries as its enter menu), then the rest
+    of the commands. A typed query matches both."""
+
+    def _groups(self):
+        app = self.app
+        item = app.item_commands(self.screen)
+        # Each entry names the palette titles it stands for: those commands
+        # run the same method, so only the "This item" one is listed.
+        skip = app.item_covered_titles(self.screen) | {c.title for c in item}
+        rest = [c for c in app.get_system_commands(self.screen)
+                if c.title not in skip]
+        return item, rest
+
+    async def discover(self):
+        item, rest = self._groups()
+        for c in item:
+            yield DiscoveryHit(
+                Text.assemble((f"{THIS_ITEM}  ", Style(dim=True)), c.title),
+                c.callback, text=f"{THIS_ITEM} {c.title}", help=c.help)
+        for c in sorted(rest, key=lambda c: c.title):
+            if c.discover:
+                yield DiscoveryHit(c.title, c.callback, text=c.title,
+                                   help=c.help)
+
+    async def search(self, query):
+        matcher = self.matcher(query)
+        item, rest = self._groups()
+        for group, cmds in ((THIS_ITEM, item), ("", rest)):
+            for c in cmds:
+                score = matcher.match(c.title)
+                if score > 0:
+                    shown = matcher.highlight(c.title)
+                    if group:
+                        shown = Content.assemble(
+                            (f"{group}  ", "dim"), shown)
+                    yield Hit(score, shown, c.callback, text=c.title,
+                              help=c.help)
+
+
 class InboxApp(App):
     TITLE = "inbox"
     ENABLE_COMMAND_PALETTE = True
+    COMMANDS = {InboxCommands}
 
     def get_driver_class(self):
         """The platform driver, wrapped so no write ever scrolls the screen
@@ -227,7 +276,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, DateScreen, OpsScreen { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, DateScreen, OpsScreen, RowMenu { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-warn { margin: 1 0 0 0; }
@@ -257,6 +306,12 @@ class InboxApp(App):
     #picker-hint { margin-top: 1; color: $text-muted; }
     #actbusy { width: 52; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #actbusy-hint { margin-top: 1; color: $text-muted; }
+    #rowmenu { width: 66; max-width: 94%; height: auto; max-height: 94%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #rowmenu-title { margin-bottom: 1; }
+    #rowmenu-filter { display: none; height: 1; border: none; padding: 0 1; background: $panel; margin-bottom: 1; }
+    #rowmenu-filter.on { display: block; }
+    #rowmenu-list { height: auto; max-height: 28; background: transparent; border: none; scrollbar-size-vertical: 1; }
+    #rowmenu-hint { margin-top: 1; color: $text-muted; }
     #help { width: 66; max-width: 94%; height: auto; max-height: 94%; border: heavy $primary; background: $surface; padding: 1 2; }
     #help-title { dock: top; margin-bottom: 1; }
     #help-scroll { height: auto; max-height: 100%; scrollbar-size-vertical: 1; }
@@ -944,36 +999,12 @@ class InboxApp(App):
             strip.update(strip.render_strip(self, self.pal, self.size.width))
 
     def hints(self):
-        """The footer: the base hints, with the context and summary keys
-        (when configured) in front of the trailing `?`."""
-        hints = self._base_hints()
-        if self.view in views.QUEUE_VIEWS and hints and not (
-                self.editing or isinstance(self.focused, Input)):
-            hints = hints[:1] + [("1-5", "views"), ("[ ]", "groups")] + hints[1:]
-        extra = []
-        if self._ctx_on():
-            extra.append(("c", "context"))
-        if self._sum_on():
-            extra.append(("i", "summary"))
-        if self.current is not None:
-            extra.append(("v", "order"))
-            if self._react_on(self.current):
-                extra.append(("E", "react"))
-            if self._polish_on(self.current):
-                extra.append(("P", "polish"))
-            if self._acts_on(self.current, "waits_on"):
-                extra.append(("w", "waits on"))
-            if self._acts_on(self.current, "relay"):
-                extra.append(("!", "relay"))
-            if (self._acts_any() and not views.is_synthetic(self.current)
-                    and getattr(self.actions, "draft_me_configured", False)
-                    and ("reply" in self.current.actions
-                         or "nudge" in self.current.actions)):
-                extra.append(("D", "draft for me"))
-            extra.extend((c["key"], c["label"][:16]) for c in self._custom)
-        if extra and hints and hints[-1] == ("?", "help"):
-            return hints[:-1] + extra + hints[-1:]
-        return hints
+        """The footer. For the selected row (the queue has the focus) at most
+        `rowmenu.FOOTER_MAX` hints, the same few on every kind of row:
+        `a <label>`, `d done`, `s later`, `o open`, `enter more`, `? help`
+        (one slot stays free). Everything else is in the row menu (enter),
+        the command palette and `?`; every key still works."""
+        return self._base_hints()
 
     def _base_hints(self):
         f = self.focused
@@ -985,57 +1016,27 @@ class InboxApp(App):
             return [("r", "refresh"), ("1-5", "views"), ("ctrl+p", "commands"),
                     ("?", "help"), ("q", "quit")]
         it = self.current
-        if (self.view == "feed" and it is not None and not self._rsvp_on(it)
-                and (self.focused is None or self.focused.id == "queue")):
-            opn = [("o", "open")] if it.link else []
-            save = [("m", "save by hand")] if self.actions_save_on else []
-            return [("f", "routine"), ("d", "dismiss"), ("x", "mute…"),
-                    ("-", "less like this"), ("M", "rules")] + opn + save + [
-                ("enter", "detail"), ("S", "saved"), ("u", "undo"), ("?", "help")]
         if it is None:
             return [("r", "poll"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("R", "resolved"), ("L", "audit"), ("ctrl+p", "commands"), ("?", "help"), ("q", "quit")]
         base = [("j/k", "move")]
-        opn = [("o", "open")] if it.link else []
-        save = [("m", "save by hand")] if self.actions_save_on else []
-        if tasksmod.is_task(it):
+        if tasksmod.is_task(it) and f is not None and f.id in ("thread", "draft-pane"):
+            # the card has the focus: its keys scroll it
             keys = []
             if self._acts_on(it, "close"):
                 keys.append(("d", "done"))
-                if tasksmod.task_type(it) == tasksmod.TODO:
-                    keys.append(("D", "outcome"))
             if self._acts_on(it, "due"):
                 keys.append(("s", "due date"))
-            if self._acts_on(it, "drop"):
-                keys.append(("x", "drop"))
             keys.append(("m", "close remind" if self.remind_key == it.key
                          else "remind me"))
-            if f is not None and f.id in ("thread", "draft-pane"):
-                # the card has the focus: its keys scroll it
-                return [("j/k", "scroll"), ("esc", "close" if self.remind_key
-                                            == it.key else "queue")] + keys + [
-                    ("?", "help")]
-            return base + keys + [("tab", "card")] + opn + [
-                ("u", "undo"), ("/", "filter"), ("?", "help")]
-        if views.is_review(it):
-            return base + [("d", "dismiss"), ("D", "copy save hint")] + opn + [
-                ("y", "copy"), ("u", "undo"), ("S", "saved"), ("?", "help")]
-        if self._rsvp_on(it):
-            tail = [("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [
-                ("u", "undo"), ("S", "saved"), ("?", "help")]
-            return base + [("a", "accept"), ("X", "decline"), ("T", "tentative")] + tail
+            return [("j/k", "scroll"), ("esc", "close" if self.remind_key
+                                        == it.key else "queue")] + keys + [
+                ("?", "help")]
         if f is not None and f.id == "context":
-            return base + [("C", "refresh"), ("i", "summary"), ("I", "redo summary"),
-                           ("c", "close"), ("tab", "next pane"), ("esc", "queue"), ("?", "help")]
+            return base + [("C", "refresh"), ("i", "summary"), ("c", "close"),
+                           ("tab", "next pane"), ("esc", "queue"), ("?", "help")]
         if f is not None and f.id in ("thread", "draft-pane"):
             return base + [("tab", "next pane"), ("y", "copy"), ("e", "edit"), ("a", "approve"), ("esc", "queue"), ("?", "help")]
-        if it.kind == "ack":
-            return base + [("a", "ack")] + opn + [("y", "copy")] + save + [("s", "snooze"), ("d", "done"), ("f", "source"), ("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
-        if it.kind == "fyi":
-            return base + [("d", "dismiss")] + opn + [("y", "copy")] + save + [("s", "snooze"), ("u", "undo"), ("/", "filter"), ("A", "all"), ("S", "saved"), ("?", "help")]
-        if it.kind == "nudge":
-            return base + [("n", "nudge"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [("y", "copy")] + save + [("u", "undo"), ("A", "all"), ("S", "saved"), ("?", "help")]
-        return base + [("a", "approve"), ("e", "edit"), ("d", "done"), ("s", "snooze")] + opn + [
-            ("y", "copy")] + save + [("u", "undo"), ("/", "filter"), ("f", "source"), ("A", "all"), ("S", "saved"), ("?", "help")]
+        return rowmenu.verb_hints(self, it)
 
     @property
     def actions_save_on(self):
@@ -1072,9 +1073,58 @@ class InboxApp(App):
 
     # ---------- queue events ----------
     def on_option_list_option_selected(self, e):
-        """enter on a Feed row: details (the thread pane takes the focus)."""
+        """A click on a Feed row: details (the thread pane takes the focus).
+        Enter does not select (it opens the row menu); tab is the key."""
         if e.option_list.id == "queue" and self.view == "feed":
             self.query_one("#thread").focus()
+
+    # ---------- the row menu (0.13.0) ----------
+    def row_menu_entries(self, it=None):
+        """The entries of the selected row's menu (what is valid now)."""
+        it = it if it is not None else self.current
+        return rowmenu.build_entries(self, it) if it is not None else []
+
+    def item_commands(self, screen=None):
+        """The selected row's valid commands for the palette's "This item"
+        group (`SystemCommand`s from the row menu's entries); empty when the
+        palette was opened over something other than the main screen."""
+        if (self.view not in views.QUEUE_VIEWS or self.current is None
+                or (screen is not None and screen is not self.screen_stack[0])):
+            return []
+        return [SystemCommand(
+            e.label, f"{e.shown}: {e.detail}" if e.detail else e.shown,
+            e.run, True) for e in self.row_menu_entries(self.current)]
+
+    def item_covered_titles(self, screen=None):
+        """The palette titles the "This item" group replaces."""
+        if (self.view not in views.QUEUE_VIEWS or self.current is None
+                or (screen is not None and screen is not self.screen_stack[0])):
+            return set()
+        return {t for e in self.row_menu_entries(self.current)
+                for t in e.titles}
+
+    def action_row_menu(self):
+        """Enter: a menu of what the selected row can do, each entry with its
+        key. It dispatches to the same methods the keys call."""
+        it = self.current
+        if (it is None or self.editing or not self.main_active
+                or self.view not in views.QUEUE_VIEWS):
+            return
+        entries = self.row_menu_entries(it)
+        if not entries:
+            self.notify("Nothing to do on this row", timeout=2, markup=False)
+            return
+        title = f"{it.who} · {it.where}" if it.where else it.who
+
+        def chosen(entry):
+            if entry is None:
+                return
+            if self.current_key != it.key:
+                self.notify("The selection changed; nothing was run",
+                            timeout=3, markup=False)
+                return
+            entry.run()
+        self.push_screen(RowMenu(title, entries, self.bidi), chosen)
 
     def on_option_list_option_highlighted(self, e):
         if e.option_list.id == "queue":
@@ -3947,6 +3997,7 @@ class InboxApp(App):
             ("Toggle Hebrew order", "logical / visual (python-bidi)", self.action_toggle_bidi),
             ("Toggle thread order", "v: newest or oldest message first in the thread pane", self.action_toggle_thread_order),
             ("Filter queue", "Fuzzy filter", self.action_filter),
+            ("Row menu", "enter: what the selected row can do, with a key for each", self.action_row_menu),
             ("Keyboard help", "?", self.action_help),
         ] + ([("Save item to memory", "m: save this item by hand (the daemon saves on its own, ◆ = already in memory)", self.action_save_memory)] if self.actions_save_on else []) + [
             (f"Go to {t}", f"key {n}", (lambda n=n: self.action_view(n)))

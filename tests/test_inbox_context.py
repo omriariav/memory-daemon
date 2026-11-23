@@ -1005,6 +1005,8 @@ class NotConfiguredTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.context_open)
             self.assertNotIn(("c", "context"), app.hints())
             self.assertNotIn(("i", "summary"), app.hints())
+            self.assertFalse({e.key for e in app.row_menu_entries()}
+                             & {"c", "C", "i", "I"})
 
     async def test_summary_alone_opens_the_pane_and_says_context_is_off(self):
         acts = LocalActions(InboxStore(None), base_dir=tempfile.mkdtemp(),
@@ -1023,7 +1025,9 @@ class NotConfiguredTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             text = pane_text(app)
             self.assertIn("Summary", text)
             self.assertIn("Context not configured", text)
-            self.assertIn(("i", "summary"), app.hints())
+            keys = {e.key for e in app.row_menu_entries()}
+            self.assertIn("i", keys)
+            self.assertNotIn("c", keys)
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -1721,8 +1725,8 @@ class KeyMapTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         app = make_app([make_item(1)], acts)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            hints = dict(app.hints())
-            self.assertEqual((hints["c"], hints["i"]), ("context", "summary"))
+            menu = {e.key: e.label for e in app.row_menu_entries()}
+            self.assertEqual((menu["c"], menu["i"]), ("Context pane", "Summary"))
             self.assertEqual(app.hints()[-1], ("?", "help"))
             titles = {c.title for c in app.get_system_commands(app.screen)}
             for name in ("Toggle context pane", "Refresh context",

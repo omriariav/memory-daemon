@@ -409,8 +409,8 @@ class HintsTest(ScrollBase):
         async with app.run_test(size=SIZE) as pilot:
             await self.settle(pilot, app)
             keys = lambda: [k for k, _v in app.hints()]  # noqa: E731
-            self.assertIn("tab", keys())            # "tab  card"
-            self.assertIn(("tab", "card"), app.hints())
+            self.assertEqual(keys()[-2:], ["⏎", "?"])   # the queue's footer
+            self.assertNotIn("tab", keys())            # not in the footer; the help has it
             await pilot.press("tab")
             self.assertTrue(await wait_for(
                 pilot, lambda: app.focused is app.query_one("#thread")))

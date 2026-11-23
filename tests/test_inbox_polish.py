@@ -591,14 +591,14 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, PolishScreen)
             self.assertTrue(any("Polish not configured" in t for t in toasts(app)))
-            self.assertNotIn(("P", "polish"), app.hints())
+            self.assertNotIn("P", {e.key for e in app.row_menu_entries()})
 
     async def test_no_draft_is_refused(self):
         acts = Scripted()
         app = make_app([item(1, draft="  ")], acts)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertNotIn(("P", "polish"), app.hints())
+            self.assertNotIn("P", {e.key for e in app.row_menu_entries()})
             await pilot.press("P")
             self.assertTrue(await wait_for(
                 pilot, lambda: any("No draft to polish" in t for t in toasts(app))))
@@ -616,7 +616,7 @@ class PolishFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertIn("Thanks! Could you send it?",
                           str(modal.query_one("#polish-new").render()))
             self.assertEqual(acts.polished, [("t:1", "hey can u send the report")])
-            self.assertIn(("P", "polish"), app.hints())
+            self.assertIn("P", {e.key for e in app.row_menu_entries()})
             await pilot.press("escape")                   # cancel
             # negative check: cancelling leaves the draft as it was
             await pilot.pause(0.2)

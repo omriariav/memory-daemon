@@ -363,6 +363,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(app.screen, ChoicePicker)
             self.assertTrue(any("React not configured" in t for t in toasts(app)))
             self.assertNotIn("react", " ".join(label for _k, label in app.hints()))
+            self.assertNotIn("E", {e.key for e in app.row_menu_entries()})
 
     async def test_an_item_without_a_message_says_so(self):
         store = InboxStore(None)
@@ -374,7 +375,7 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertNotIsInstance(app.screen, ChoicePicker)
             self.assertTrue(any("no message to react to" in t for t in toasts(app)))
-            self.assertNotIn(("E", "react"), app.hints())
+            self.assertNotIn("E", {e.key for e in app.row_menu_entries()})
 
     async def test_the_picker_lists_the_configured_emojis_with_quick_keys(self):
         store = InboxStore(None)
@@ -382,7 +383,8 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
                        store, undo_s=30)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("E", "react"), app.hints())
+            self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["E"],
+                             "React with an emoji…")
             await pilot.press("E")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, ChoicePicker)))

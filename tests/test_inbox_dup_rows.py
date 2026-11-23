@@ -285,8 +285,8 @@ class ReviewUITest(unittest.IsolatedAsyncioTestCase):
             for want in ("Example sync notes", "slack:C0EXAMPLE:100.5",
                          MATCH, "Send the notes"):
                 self.assertIn(want, body)
-            hints = " ".join(f"{k} {v}" for k, v in app.hints())
-            self.assertIn("D copy save hint", hints)
+            menu = {e.key: e.label for e in app.row_menu_entries()}
+            self.assertIn("save hint", menu["D"])
 
     async def test_d_dismisses_it_with_a_local_mark(self):
         actions = FakeActions(store=self.store, draft_delay=0)
@@ -337,6 +337,7 @@ class ReviewUITest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_key, self.row["id"])
             hints = " ".join(f"{k} {v}" for k, v in app.hints())
             self.assertNotIn("save by hand", hints)
+            self.assertNotIn("m", {e.key for e in app.row_menu_entries()})
 
     async def test_the_hint_is_the_same_without_a_save_command(self):
         app = self.app(NoSave(store=self.store, draft_delay=0))

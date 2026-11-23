@@ -507,7 +507,8 @@ class CopyTest(unittest.IsolatedAsyncioTestCase):
         app, _, _ = make_app(self.rows())
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("y", "copy"), app.hints())
+            self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["y"],
+                             "Copy item")
             await pilot.press("question_mark")
             await pilot.pause(0.1)
             body = str(app.screen.query_one("#help-body").render())

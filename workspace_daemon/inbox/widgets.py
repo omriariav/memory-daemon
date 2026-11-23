@@ -6,6 +6,7 @@ from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -106,12 +107,21 @@ class SelectableText(Static):
 
 class Queue(OptionList):
     """The grouped queue. Rows are Options keyed `i:<item id>`; the group
-    headers (a section, a person, a routine) are disabled Options."""
+    headers (a section, a person, a routine) are disabled Options.
+
+    Enter opens the row menu (0.13.0; it used to select, which moved the focus
+    to the detail pane of a Feed row: that is tab now). A mouse click still
+    selects."""
+
+    BINDINGS = [Binding("enter", "row_menu", show=False)]
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.rows = []
         self.first_idx = {}
+
+    def action_row_menu(self):
+        self.app.action_row_menu()
 
     def scroll_to_highlight(self, top=False):
         """As the list does, but the first row also shows its group header

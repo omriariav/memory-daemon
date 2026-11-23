@@ -778,7 +778,7 @@ anyway". `save: {mark_done: false}` keeps the row instead, with a `◆` and a
 local `saved` mark. A failure toasts the reason, adds no mark and leaves the
 row; a likely duplicate asks "Save anyway" first (see the protocol) and leaves
 the row too. Without `save:`, `m` says "Save not configured" and is left out
-of the footer, the help screen and the palette.
+of the row menu, the help screen and the palette.
 
 #### Already in memory
 
@@ -1739,7 +1739,8 @@ rule takes it out of the Feed ("Active keys are always listed"). Entering the
 Feed clears a source filter set in another view; `f` is the routine filter
 there. The left pane
 lists the routines with their counts, then the muted rows; `f` cycles the
-routine filter (`esc` clears it) and `enter` moves to the thread pane.
+routine filter (`esc` clears it), `tab` moves to the thread pane and
+`enter` opens the [row menu](#the-row-menu-enter).
 
 The routine `saved to memory` holds what the daemon saved (see
 [Saved view](#saved-view)); `S` jumps to it.
@@ -1851,6 +1852,62 @@ health:
 At most 10 heartbeats. The files are only `stat`ed.
 
 ## Keys
+
+Four verbs carry the day: `a` approve, `d` done, `s` later and `o` open. `enter`
+opens a menu of everything else the selected row can do. The footer shows at
+most these hints (seven at most; the seventh slot is kept free):
+
+| Hint | Shown when |
+| --- | --- |
+| `a <label>` | the row has an approve action: `send` (a reply), `accept` (an invite), `nudge` (a waiting row), `ack` (a calendar, recording or alert row) |
+| `d done` | always (on a task row only when its source lists `close`) |
+| `s later` | always (on a task row only when its source lists `due`) |
+| `o open` | the row has a link, or `slack_open:` gives it one |
+| `enter more` | always |
+| `? help` | always |
+
+What the three verbs do by row:
+
+| Row | `a` | `d` | `s` |
+| --- | --- | --- | --- |
+| Slack ask (I OWE) | send the reply (confirm first) | done | snooze |
+| Waiting | nudge (confirm first) | done | snooze |
+| RSVP (a pending invite) | accept | done | snooze |
+| Todo | none | close now | due date |
+| Decision | none | asks for the decision, then closes | due date |
+| Agent card (an ack row of a command source with `acts:`) | ack | done; also `close` at the source (when the source supports it) | snooze; also `snooze` at the source (when the source supports it) |
+| FYI | none | dismiss | snooze |
+| Alert | ack | done | snooze |
+
+### The row menu (`enter`)
+
+`enter` on a row of the queue (in any of the four list views) opens a popup
+that lists only the actions valid for that row, each with its key and a label.
+It calls the same methods as the keys, so nothing about an action changes.
+
+- A key runs its entry (`D` on a todo is "Done with outcome…", on a Slack ask
+  "Draft for me", on a REVIEW row "Copy a save hint"; a nudge shows `a / n`).
+- The arrows (or `j`/`k`) and `enter` pick the highlighted entry.
+- `/` filters the entries by text; the first `esc` clears the filter, the next
+  closes the menu. `esc` runs nothing.
+- It lists, when valid for the row: approve (`a`), RSVP decline and tentative
+  (`X`, `T`), edit (`e`), done (`d`), snooze or due date (`s`), draft for me
+  (`D`), polish (`P`), react (`E`), the source's acts (`w` waits on, `!`
+  relay, `x` mute the conversation), in the Feed `x` mute, `-` less like this
+  and `M` rules, on a task `x` drop and `m` remind me, open (`o`), copy (`y`,
+  `Y`), save to memory (`m`, only when `save:` is set and the row is not in
+  memory yet), context and summary (`c`, `C`, `i`, `I`, only when configured),
+  `R` on an alert, every `actions:` entry of `inbox.yaml` under its own key,
+  and `u` undo while something waits out its window. What is not configured
+  is not listed.
+- The `ctrl+p` palette starts with a "This item" group: the same entries,
+  then the rest of the commands. Settings and rare toggles (`b` Hebrew order,
+  `v` thread order, `L` audit log, copy section as Markdown, `ctrl+t` theme)
+  are only in the palette and the help, and keep their keys.
+- `tab` switches pane. On a Feed row `tab` moves to the details (`enter`
+  used to; it opens the menu now).
+
+Every key listed below still works as before.
 
 `1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
 group, `tab` switches pane, on a task row `d`, `D`, `s`, `x` and `o` (see [Tasks](#tasks)),

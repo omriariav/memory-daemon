@@ -20,6 +20,7 @@ from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi
+from .rowmenu import GROUPS, filter_entries, match_key
 from .widgets import vis
 
 
@@ -520,65 +521,179 @@ class PolishScreen(ModalScreen):
         pane.scroll_down(animate=False) if step > 0 else pane.scroll_up(animate=False)
 
 
+class RowMenu(ModalScreen):
+    """The row menu (Enter on a queue row): a which-key style list of what the
+    selected row can do, each with its key. One press of an entry's key runs
+    it; the arrows and Enter pick the highlighted one; `/` filters by text;
+    esc closes (first esc: clears the filter). Every string is plain `Text`.
+    Dismisses with the chosen `rowmenu.MenuEntry`, or None."""
+
+    BINDINGS = [Binding("escape", "close", "Close"),
+                Binding("slash", "filter", show=False),
+                Binding("j", "move(1)", show=False),
+                Binding("k", "move(-1)", show=False)]
+
+    def __init__(self, title, entries, visual=False):
+        super().__init__()
+        self.title_text, self.entries, self.visual = title, list(entries), visual
+        self.shown = list(entries)         # the entries the filter leaves
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rowmenu"):
+            yield Static(Text(vis(self.title_text, self.visual),
+                              Style(bold=True)), id="rowmenu-title")
+            yield Input(placeholder="/ filter…", id="rowmenu-filter")
+            yield OptionList(id="rowmenu-list")
+            yield Static(Text("a key runs it  ·  enter run  ·  / filter  ·  "
+                              "esc close", Style(dim=True)), id="rowmenu-hint")
+
+    def on_mount(self):
+        self._build()
+        self.query_one("#rowmenu-list", OptionList).focus()
+
+    def _build(self):
+        lst = self.query_one("#rowmenu-list", OptionList)
+        lst.clear_options()
+        options, first = [], None
+        index = {id(e): n for n, e in enumerate(self.entries)}
+        for group in GROUPS:
+            rows = [e for e in self.shown if e.group == group]
+            if not rows:
+                continue
+            options.append(Option(Text(group, Style(dim=True, bold=True)),
+                                  disabled=True))
+            for e in rows:
+                if first is None:
+                    first = len(options)
+                prompt = Text()
+                prompt.append(f" {e.shown:<7}", Style(bold=True))
+                prompt.append(" " + vis(e.label, self.visual))
+                if e.detail:
+                    prompt.append("  " + vis(e.detail, self.visual),
+                                  Style(dim=True))
+                options.append(Option(prompt, id=str(index[id(e)])))
+        if not options:
+            options.append(Option(Text("nothing matches", Style(dim=True)),
+                                  disabled=True))
+        lst.add_options(options)
+        lst.highlighted = first
+
+    def on_key(self, event: events.Key):
+        if isinstance(self.focused, Input):
+            return
+        entry = match_key(self.shown, event.character)
+        if entry is not None:
+            event.stop()
+            event.prevent_default()
+            self.dismiss(entry)
+
+    def action_filter(self):
+        box = self.query_one("#rowmenu-filter", Input)
+        box.add_class("on")
+        box.focus()
+
+    def action_move(self, step):
+        lst = self.query_one("#rowmenu-list", OptionList)
+        if isinstance(self.focused, Input):
+            return
+        lst.action_cursor_down() if step > 0 else lst.action_cursor_up()
+
+    def on_input_changed(self, e):
+        self.shown = filter_entries(self.entries, e.value)
+        self._build()
+
+    def on_input_submitted(self, e):
+        self.query_one("#rowmenu-list", OptionList).focus()
+
+    def on_option_list_option_selected(self, e):
+        if e.option.id is not None:
+            self.dismiss(self.entries[int(e.option.id)])
+
+    def action_close(self):
+        box = self.query_one("#rowmenu-filter", Input)
+        if box.has_class("on") or box.value:
+            box.value = ""
+            box.remove_class("on")
+            self.query_one("#rowmenu-list", OptionList).focus()
+            return
+        self.dismiss(None)
+
+
+POWER = "Power keys (also in enter)"
+
 HELP = [
-    ("Views", [("1 2 3 4 5", "Inbox · Waiting · Tasks · Feed · Health"),
-               ("[ / ]", "previous / next group in the view (section, person, routine)"),
-               ("", "the same items in every view: marks and the undo work alike")]),
-    ("Move / filter", [("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"),
-              ("tab / shift+tab", "switch pane"), ("/", "fuzzy filter"),
-              ("f", "filter by source (in the Feed: by routine)"),
-              ("R", "show / hide resolved alerts"),
-              ("A", "show all: sources that support it, and Feed rows older than the window"),
-              ("S", "Feed, filtered to saved to memory"),
-              ("esc", "clear filters / back")]),
-    ("Feed", [("x", "mute this row: this kind from this routine / this routine / titles like it, for 1 day, 1 week or always"),
-              ("-", "less like this: fold the routine's rows of a day into one"),
-              ("M", "rules: the ones in inbox.yaml and the ones made here (space switches a rule off, delete removes it)"),
-              ("d", "dismiss"), ("enter", "details")]),
-    ("Act", [("a", "approve draft (confirm first) / ack / accept an invite"), ("e", "edit draft  (esc / ctrl+s done)"),
-             ("d", "done / dismiss"), ("s", "snooze"), ("n", "nudge (confirm first)"),
-             ("o", "open the item's link (the Slack thread with slack_open:)"), ("u", "undo last action (5 s)"), ("r", "refresh / poll now")]),
-    ("RSVP / save", [("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
-                     ("m", "save to memory by hand (save: in inbox.yaml; the daemon saves on its own, ◆ = already in memory, ◇ = its thread is); marks it done"),
-                     ("", "both confirm first, then wait out the 5 s undo window")]),
+    ("The verbs", [
+        ("a", "approve: send the reply, accept the invite, nudge, ack"),
+        ("d", "done (dismiss on an FYI row)"),
+        ("s", "later: snooze, or a task's due date"),
+        ("o", "open the item's link (the Slack thread with slack_open:)"),
+        ("enter", "more: a menu of what this row can do (a key runs it, / filters)"),
+        ("u", "undo the last action (5 s)")]),
+    ("What a, d and s do, by row", [
+        ("Slack ask", "a send (confirm) · d done · s snooze"),
+        ("Waiting", "a nudge (confirm) · d done · s snooze"),
+        ("RSVP", "a accept · d done · s snooze"),
+        ("Todo", "d close now · s due date"),
+        ("Decision", "d asks for the decision, then closes · s due date"),
+        ("Agent card", "a ack · d done / s snooze at the source (when the source supports it)"),
+        ("FYI", "d dismiss · s snooze"),
+        ("Alert", "a ack · d done · s snooze"),
+        ("", "every old key still works; a row's others are in its enter menu")]),
+    (POWER, [
+        ("e", "edit the draft  (esc / ctrl+s done)"),
+        ("n", "nudge (confirm first); the same as a on a waiting row"),
+        ("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
+        ("D", "Slack ask: draft a reply for me (summary: or polish:; fills the Draft pane, never sends) · todo: done with an outcome · review: copy a save hint"),
+        ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
+        ("E", "react to the message with an emoji (react: in inbox.yaml)"),
+        ("w", "waits on: Me, a person in the thread, or Nobody (acts: waits_on)"),
+        ("!", "relay the item to your work session, with an optional note (acts: relay)"),
+        ("x", "mute this row: this kind from this routine / this routine / titles like it, for 1 day, 1 week or always; with acts: mute the conversation; a task: drop it"),
+        ("-", "less like this: fold the routine's rows of a day into one (Feed)"),
+        ("M", "rules: the ones in inbox.yaml and the ones made here (space switches a rule off, delete removes it)"),
+        ("m", "save to memory by hand (save: in inbox.yaml; the daemon saves on its own, ◆ = already in memory, ◇ = its thread is); marks it done · on a task: remind me"),
+        ("c", "show / hide the context pane (context: in inbox.yaml)"),
+        ("C  (r in pane)", "fetch the context again"),
+        ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),
+        ("I", "ask for a new summary even if one is cached"),
+        ("y / Y", "copy this item (sender, where, gist, link) / copy every item in this group"),
+        ("", "writes confirm first, then wait out the 5 s undo window; u cancels before anything is sent"),
+        ("", "the send confirm: Draft in Slack d · Send y · Copy for Slack c (send: / copy: in inbox.yaml)"),
+        ("", "context and summary are read-only: nothing is confirmed or changed"),
+        ("mouse drag", "select text in the thread or draft pane"),
+        ("", "L is the ops log: u on a row sends the inverse (reopen / unmute / the old due date) after a confirm")]),
+    ("Views and moving", [
+        ("1 2 3 4 5", "Inbox · Waiting · Tasks · Feed · Health"),
+        ("[ / ]", "previous / next group in the view (section, person, routine)"),
+        ("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"),
+        ("tab / shift+tab", "switch pane (tab on a Feed row: its details)"),
+        ("/", "fuzzy filter"),
+        ("f", "filter by source (in the Feed: by routine)"),
+        ("R", "show / hide resolved alerts"),
+        ("A", "show all: sources that support it, and Feed rows older than the window"),
+        ("S", "Feed, filtered to saved to memory"),
+        ("r", "refresh / poll now"),
+        ("esc", "clear filters / back"),
+        ("", "the same items in every view: marks and the undo work alike")]),
     ("Review (REVIEW in the Inbox)", [
         ("", "a capture the memory store refused as a near-duplicate: Not saved: near-duplicate of ..."),
         ("d", "dismiss: it is a duplicate, fine (a local mark)"),
         ("D", "copy a command-line hint for saving it anyway (a template: it needs the entry text; nothing is saved from here)")]),
-    ("Slack send / react / polish", [
-        ("a / n", "reply or nudge: Draft in Slack (d), Send (y) or Copy for Slack (c) (send: / copy: in inbox.yaml)"),
-        ("E", "react to the message with an emoji (react: in inbox.yaml)"),
-        ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
-        ("", "draft, send and react confirm first, then wait out the 5 s undo window; copy is local")]),
-    ("Acts (acts: on a command source)", [
-        ("d / s", "also tell the source: close / snooze"),
-        ("w", "waits on: Me, a person in the thread, or Nobody (FYI)"),
-        ("x", "mute this conversation: 1 day, 1 week or untrack (Feed rules stay in the Feed)"),
-        ("!", "relay the item to your work session, with an optional note"),
-        ("D", "draft a reply for me (summary: or polish:); fills the Draft pane, never sends"),
-        ("", "acts wait out the 5 s undo window; u cancels before anything is sent"),
-        ("L", "ops log; u on a row sends the inverse (reopen / unmute / the old due date) after a confirm")]),
     ("Tasks (a source's meta.kind: task rows)", [
         ("3", "the Tasks view: OVERDUE, DUE TODAY, THIS WEEK, LATER, DECIDE, NO DATE; overdue and due-today tasks are also in the Inbox"),
         ("d", "todo: close it now. decision: asks for the decision (required), then closes it"),
         ("D", "todo: asks for the outcome, then closes it"),
         ("s", "due date: tomorrow, next Sunday, +1 week, a date (YYYY-MM-DD) or none"),
         ("x", "drop it, with an optional reason (enter alone drops with none)"),
-        ("o", "open the task's link (none: says so)"),
         ("m", "remind me: fills the Detail pane with the source, date, people, original words, last activity and related items (read-only; m or esc closes)"),
-        ("", "needs acts: [close, drop, due] on the source; without it the keys only say so"),
-        ("", "all of them wait out the 5 s undo window; L can undo one afterwards")]),
-    ("Context / summary", [("c", "show / hide the context pane (context: in inbox.yaml)"),
-                           ("C  (r in pane)", "fetch the context again"),
-                           ("i", "AI summary of the item, shown in the pane (summary: in inbox.yaml)"),
-                           ("I", "ask for a new summary even if one is cached"),
-                           ("", "read-only: nothing is confirmed or changed")]),
-    ("Copy", [("y", "copy this item (sender, where, gist, link)"), ("Y", "copy every item in this group"),
-              ("ctrl+p", "palette: copy section as Markdown"),
-              ("mouse drag", "select text in the thread or draft pane")]),
-    ("App", [("ctrl+p", "command palette"), ("ctrl+t", "dark / light theme"), ("L", "audit log"),
+        ("tab", "the Detail card (j / k scroll it, esc back)"),
+        ("", "needs acts: [close, drop, due] on the source; without it the keys only say so")]),
+    ("App", [("ctrl+p", "command palette: this item's commands first, then the rest"),
+             ("ctrl+t", "dark / light theme"), ("L", "audit log"),
              ("b", "toggle Hebrew order (logical/visual)"),
-             ("v", "thread order: newest / oldest message first (saved)"), ("?", "this help"), ("q", "quit")]),
+             ("v", "thread order: newest / oldest message first (saved)"),
+             ("", "ctrl+p also has: copy section as Markdown"),
+             ("?", "this help"), ("q", "quit")]),
 ]
 
 
@@ -599,19 +714,18 @@ class HelpScreen(WheelAnywhere, ModalScreen):
         self.save_on = save_on
 
     def _section(self, title, rows):
-        """A help section; without `save:` the `m` line, the "save" in the
-        title and the "both" in the note are left out."""
-        if self.save_on or title != "RSVP / save":
+        """A help section; without `save:` the power keys' `m` line says only
+        what `m` does on a task."""
+        if self.save_on or title != POWER:
             return title, rows
-        return "RSVP", [
-            r if r[0] != "" else ("", "confirms first, then waits out the 5 s undo window")
-            for r in rows if r[0] != "m"]
+        return title, [("m", "on a task: remind me") if r[0] == "m" else r
+                       for r in rows]
 
     def compose(self) -> ComposeResult:
         t = Text()
         sections = [self._section(title, rows) for title, rows in HELP]
         if self.extra:
-            sections.insert(-2, ("Custom actions (actions: in inbox.yaml)", (
+            sections.insert(-1, ("Custom actions (actions: in inbox.yaml)", (
                 [(k, f"{label}: pick, confirm, then wait out the 5 s undo window")
                  for k, label in self.extra])))
         for title, rows in sections:

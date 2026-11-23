@@ -1080,9 +1080,11 @@ class RsvpFlowTest(unittest.IsolatedAsyncioTestCase):
                        save=validated({"save": SAVE_CFG})["save"]), store)
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            hints = dict((k, label) for k, label in app.hints())
-            self.assertEqual((hints["a"], hints["X"], hints["T"], hints["m"]),
-                             ("accept", "decline", "tentative", "save by hand"))
+            self.assertEqual(dict(app.hints())["a"], "accept")
+            menu = {e.key: e.label for e in app.row_menu_entries()}
+            self.assertEqual((menu["a"], menu["X"], menu["T"], menu["m"]),
+                             ("Accept invite", "Decline invite", "Tentative",
+                              "Save to memory"))
             titles = {c.title for c in app.get_system_commands(app.screen)}
             for name in ("Accept invite", "Decline invite", "Tentative",
                          "Save item to memory"):
