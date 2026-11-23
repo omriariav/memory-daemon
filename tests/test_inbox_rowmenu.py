@@ -973,13 +973,15 @@ class HelpTest(unittest.IsolatedAsyncioTestCase):
             self.assertLess(body.index("Power keys (also in enter)"),
                             body.index("Views and moving"))
 
-    async def test_help_does_not_promise_an_outcome_on_a_slack_done(self):
+    async def test_help_promises_an_outcome_on_a_slack_done_only_with_the_flag(self):
         app = make_app()
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             body = await self.body(app, pilot)
-            ask = next(ln for ln in body.splitlines() if "Slack ask" in ln)
-            self.assertNotIn("outcome", ask)
+            for word in ("Slack ask", "Waiting"):
+                line = next(ln for ln in body.splitlines()
+                            if ln.strip().startswith(word))
+                self.assertIn("when the source has close_outcome", line)
 
     async def test_help_keeps_the_mouse_confirm_and_read_only_lines(self):
         app = make_app()
@@ -1003,7 +1005,7 @@ class HelpTest(unittest.IsolatedAsyncioTestCase):
             before = pane.scroll_y
             await pilot.press("j")
             self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > before))
-            self.assertEqual(__version__, "0.13.0")
+            self.assertEqual(__version__, "0.13.1")
 
 
 if __name__ == "__main__":

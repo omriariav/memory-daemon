@@ -322,8 +322,12 @@ def _row_entries(app, it, add, in_feed):
     if (it.kind in ("reply", "nudge") and not rsvp
             and getattr(app.actions, "supports_send", False)):
         add(G_ACT, "e", "Edit draft", app.action_edit)
-    add(G_ACT, "d", "Dismiss" if it.kind == "fyi" else "Done",
-        app.action_done)
+    if app._outcome_on(it):
+        add(G_ACT, "d", "Done with outcome…", app.action_done,
+            detail="asks what happened; saved to memory before it closes")
+    else:
+        add(G_ACT, "d", "Dismiss" if it.kind == "fyi" else "Done",
+            app.action_done)
     add(G_ACT, "s", "Snooze…", app.action_snooze)
     if draft_me_ok(app, it):
         add(G_ACT, "D", "Draft for me", app.action_draft_me,

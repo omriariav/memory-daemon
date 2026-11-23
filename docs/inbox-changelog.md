@@ -7,6 +7,30 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-23
+
+`d` on a Slack ask or a waiting row can ask what happened before it closes, so
+a source can keep the outcome. It is opt-in per source; nothing changes for a
+source that does not ask for it.
+
+### Added
+
+- **`close_outcome: true` on a command source** (needs `close` in its `acts`).
+  With it, `d` on a Slack ask (I OWE) or a waiting row opens an `Outcome:`
+  prompt. An empty answer is refused, `esc` cancels and closes nothing. After
+  the usual 5 s undo window the source gets `close` with
+  `{"outcome": "<one line, up to 300 characters>"}`. Every other row (FYI,
+  feed, RSVP, alert, review, digest, saved, agent card, task, decision) keeps
+  its `d`. A source without the flag keeps the instant `d`. See
+  [Close with an outcome](inbox.md#close-with-an-outcome-d).
+- **A model draft of the outcome.** When `summary:` or `polish:` is set, one
+  background no-tools bridge call (the data markers of Draft for me, an 8 s
+  timeout, logged as `inbox-outcome`) fills the open prompt with a one-line
+  suggestion. It never overwrites text you typed, and a failure or a timeout
+  leaves the line empty. Nothing is stored or sent by it.
+- The row menu names the key "Done with outcome…" on such a row, and the `?`
+  help table says so.
+
 ## [0.13.0] - 2026-11-23
 
 Simple triage. The inbox had about 35 single-letter keys, a footer of 13

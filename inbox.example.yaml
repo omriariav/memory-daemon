@@ -256,6 +256,10 @@ sources:
   #   # state/inbox-ops-pending.jsonl and retried on refresh; a conflict undoes
   #   # the local mark. See "Acts" in docs/inbox.md.
   #   acts: [close, snooze, mute, waits_on, relay]
+  #   # Close with an outcome (0.13.1): needs `close` in acts. d on a Slack ask
+  #   # or a waiting row asks "Outcome:" first (an empty answer is refused) and
+  #   # sends close with args {"outcome": "<text>"}. See "Close with an outcome".
+  #   close_outcome: true
   #
   # A task source (0.12.0): a command source whose items carry
   # meta.kind: "task" (plus task_type todo|decision, due, date, people,

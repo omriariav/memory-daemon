@@ -77,7 +77,9 @@ def run(base_dir, demo=False, empty=False, settings_path=None):
                                open_with=settings["open_with"],
                                acts={s["name"]: {"argv": s["argv"],
                                                  "timeout_s": s["timeout_s"],
-                                                 "acts": s["acts"]}
+                                                 "acts": s["acts"],
+                                                 "close_outcome": s.get(
+                                                     "close_outcome", False)}
                                      for s in settings["sources"]
                                      if s.get("acts")},
                                done_reaction=settings["done_reaction"],
