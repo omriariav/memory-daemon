@@ -1492,6 +1492,17 @@ class FileShareTest(InboxTestCase):
         plain = comms_inbox.message_row(dict(hit, files=[]), ME)
         self.assertNotIn("files", plain)
 
+    def test_message_row_keeps_long_numeric_ids_in_permalinks(self):
+        link = ("https://example.slack.com/archives/C0EXAMPLE1/"
+                "p4111111111111111")
+        hit = {"channel": DM, "root": ts_at(1), "ts": ts_at(1), "user": BOB,
+               "is_bot": False, "text": f"see {link} (door code 7305)",
+               "label": "DM",
+               "files": [{"name": "plan.pdf", "permalink": link}]}
+        row = comms_inbox.message_row(hit, ME)
+        self.assertEqual(row["text"], f"see {link} (door code [REDACTED])")
+        self.assertEqual(row["files"][0]["permalink"], link)
+
     def parse(self, body_lines, text=""):
         page = history(DM, [(ts_at(1), BOB, text, body_lines)])
         return slack_mcp.parse_channel(page, ts_at(0), ts_at(9), DM)[0][0]

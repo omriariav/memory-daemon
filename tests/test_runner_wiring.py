@@ -458,6 +458,37 @@ class RunnerWiringTest(unittest.TestCase):
         self.assertEqual(item["body"].count("[REDACTED]"), 6)
         self.assertIn("Keep the onboarding fact.", item["body"])
 
+    def test_gmail_keeps_reference_numbers_but_not_short_secret_codes(self):
+        gmail.read_message = lambda mid: {
+            "headers": {
+                "subject": "Your booking code: 482133",
+                "from": "Bookings <bookings@example.com>",
+                "to": "owner@example.com",
+                "date": "Mon, 27 Jul 2026 15:46:29 +0000",
+            },
+            "body": (
+                "Your reference code is 48213377.\n"
+                "Order code 551920, invoice code 663301.\n"
+                "Your order 114-4821337-4821330 has shipped.\n"
+                "Door code for the venue: 7305\n"
+                "Gift card code 99012284\n"
+            ),
+        }
+        r = routine(self.vault, label="EMEA")
+
+        item = runner._gmail_fetch(
+            r,
+            r["source"],
+            {"id": "m3", "raw": {"thread_id": "thread-2"}},
+        )
+
+        self.assertIn("482133", item["title"] + item["body"])
+        for kept in ("48213377", "551920", "663301", "114-4821337-4821330"):
+            self.assertIn(kept, item["body"])
+        self.assertNotIn("7305", item["body"])
+        self.assertNotIn("99012284", item["body"])
+        self.assertEqual(item["body"].count("[REDACTED]"), 2)
+
     def test_thread_routing_analyzes_and_actions_the_newest_message(self):
         prompts = []
         action_ids = []
