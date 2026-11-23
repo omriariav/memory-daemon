@@ -343,6 +343,15 @@ lists it. `reopen` and `unmute` are never listed: they are the inverses of
 is `due` with the date it had. Rows the views make (the
 digest and the saved-to-memory rows) never send acts.
 
+A source that wants the outcome of a Slack ask or a waiting row when you close
+it adds `close_outcome: true` (it needs `close` in `acts`; see
+[Close with an outcome](#close-with-an-outcome-d)):
+
+```yaml
+    acts: [close, snooze, mute, waits_on, relay]
+    close_outcome: true        # d on a Slack ask or a waiting row asks "Outcome:"
+```
+
 ### The request
 
 `<argv...> act` reads one JSON object on stdin (never argv):
@@ -361,7 +370,7 @@ says, it answers `conflict` instead of applying the act. `meta` larger than
 
 | `action` | `args` | Sent by |
 | --- | --- | --- |
-| `close` | `{}` | `d` |
+| `close` | `{}`, or `{"outcome": "<one line, up to 300 characters>"}` (a [task](#tasks) sends `{"note": ...}`) | `d` |
 | `snooze` | `{"until": <epoch>}` | `s` (the chosen time) |
 | `mute` | `{"until": <epoch>}` or `{"until": null}` (never: stop tracking it) | `x`: Mute this conversation |
 | `waits_on` | `{"who": "me"}`, `{"who": "nobody"}` or `{"who": "<display name>"}` | `w` |
@@ -442,6 +451,47 @@ be remembered).
 - `!` opens a one-line note box (it may be empty) and sends `relay`, which
   hands the row over to the work session of the source's owner. There is no
   local mark.
+
+### Close with an outcome (`d`)
+
+A command source may ask for the outcome of a conversation before it closes.
+It declares that with `close_outcome: true` on its entry in `inbox.yaml` (a
+boolean, off by default; it is refused unless `close` is in the source's
+`acts`). Without it, `d` is the plain close described above.
+
+With the flag, `d` on a **Slack ask** (an I OWE row: a `reply` action in
+`needs_reply` or `urgent`) or a **waiting** row (`nudge`) opens an `Outcome:`
+prompt instead of closing at once:
+
+- It opens immediately. When `summary:` or `polish:` is set, one background
+  no-tools bridge call (the bridge and the data markers of
+  [Draft for me](#draft-for-me-d), logged as `inbox-outcome`, with the timeout cut to
+  8 s) drafts a one-line outcome from the thread and fills the prompt when it
+  returns. It fills only a prompt you have not typed in (a key typed, even
+  deleted again, keeps the line yours), and on a failure or a timeout the line
+  stays empty. The draft is a suggestion: it is never stored and never sent.
+- `enter` accepts what is in the line. An **empty answer is refused**: the
+  prompt stays open and says an outcome is required. `esc` cancels and nothing
+  closes.
+- The row is marked done at once, and after the 5 s undo window (`u` cancels it)
+  the inbox sends `close` with the text as one line of at most 300 characters:
+
+```json
+{"v": 1, "op_id": "<uuid4>", "action": "close", "id": "<item id>",
+ "meta": {"...": "the item's meta"}, "args": {"outcome": "Moved to Friday; Ada owns the notes."},
+ "seen": {"ts": 1893492000.0, "last_seen_ts": 1893492001.5}}
+```
+
+The outcome is text typed by a person or written by a model from other people's
+messages: a source must treat it as untrusted data (never in a command line,
+only through stdin, a file or a parameter). A source is free to do more than
+close: for example record the outcome in a notes system before it settles the
+row, and answer `ok` with a message such as `already handled` when someone else
+settled the row first. The request, the response, the `op_id` idempotency, the
+retry and the conflict rules are those of every other act, so a retry of the
+same `op_id` must not record the outcome twice. Every other row keeps the plain
+`d`: FYI, feed, RSVP, alert, review, digest, saved and agent-card rows send
+`close` with `{}`, and a task or a decision keeps its [own keys](#tasks).
 
 ### The ops log (`L`)
 
@@ -1471,7 +1521,10 @@ A `command` source takes `argv` (list), `timeout_s` (1 to 120),
 `supports_all` (`true` or `false`, default `false`): declare it only if
 `<argv> list --all` works, and `acts` (a list of `close`, `snooze`, `mute`,
 `waits_on`, `relay`, `drop`, `due`, default none; see [Acts](#acts); `timeout_s` is also the
-timeout of an `act` call).
+timeout of an `act` call), and `close_outcome` (`true` or `false`, default
+`false`; needs `close` in `acts`: `d` on a Slack ask or a waiting row then asks
+for an outcome and sends it with the `close`, see [Close with an
+outcome](#close-with-an-outcome-d)).
 
 `rsvp:` (no default; omit it and RSVP is off):
 
@@ -1870,8 +1923,8 @@ What the three verbs do by row:
 
 | Row | `a` | `d` | `s` |
 | --- | --- | --- | --- |
-| Slack ask (I OWE) | send the reply (confirm first) | done | snooze |
-| Waiting | nudge (confirm first) | done | snooze |
+| Slack ask (I OWE) | send the reply (confirm first) | done; with `close_outcome: true` on the source, asks `Outcome:` first and sends it with the `close` | snooze |
+| Waiting | nudge (confirm first) | done; with `close_outcome: true`, asks `Outcome:` first | snooze |
 | RSVP (a pending invite) | accept | done | snooze |
 | Todo | none | close now | due date |
 | Decision | none | asks for the decision, then closes | due date |
@@ -2010,6 +2063,10 @@ header and the help overlay show the inbox version.
   as JSON on stdin; a retry reuses the op id and never runs on the UI thread.
   `D` makes a no-tools bridge call over the thread and never sends;
   `done_reaction` uses the pinned react call.
+- The outcome prompt (0.13.1) sends only the text you accepted, after the undo
+  window, as the `outcome` arg of a `close`. Its model pre-fill has no tools,
+  treats the thread as data, runs with an 8 s timeout, and never fills over
+  what you typed or sends anything by itself.
 - Task keys (0.12.0) use the same acts path: a task source with no `acts:` is
   read-only, a write goes out only after the undo window and `L` can undo it
   (`reopen`, or `due` with the old date). The inbox has no shadow mode for

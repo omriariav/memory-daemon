@@ -48,6 +48,7 @@ from urllib.parse import urlsplit
 
 from . import acts as acts_mod
 from . import context, customactions, draftme, invites, items, mrkdwn, views
+from . import outcome as outcome_mod
 from . import polish as polish_mod
 from . import sources, writes
 from . import summary as summary_mod
@@ -558,6 +559,24 @@ class LocalActions:
 
     def act_enabled(self, item, action):
         return action in self.act_names(item)
+
+    def close_outcome_enabled(self, item):
+        """The item's source lists `close` and declared `close_outcome:
+        true`: `d` on its reply and waiting rows asks for an outcome and
+        sends it with the close (docs/inbox.md, "Close with an outcome")."""
+        if not self.act_enabled(item, "close"):
+            return False
+        cfg = self.acts_cfg.get(getattr(item, "origin", ""))
+        return bool(cfg and cfg.get("close_outcome"))
+
+    def draft_outcome(self, item):
+        """A one-line outcome for `item` from its thread: one no-tools bridge
+        call with a short timeout (blocks: call from a worker). Never stored,
+        never sent. An `outcome.Outcome`."""
+        if not self.draft_me_configured:
+            return outcome_mod.Outcome(False, "", "no model configured")
+        return outcome_mod.run_outcome(self._draft_me_cfg(), self.base_dir,
+                                       to_v1(item), complete=self._complete)
 
     def send_act(self, item, action, args=None, meta=None):
         """Tell the item's source (blocks: call from a worker): one `act`

@@ -49,6 +49,7 @@ MODULES = {
     "tests.test_inbox_owe": 12.0,
     "tests.test_inbox_remind": 8.0,
     "tests.test_inbox_rowmenu": 90.0,
+    "tests.test_inbox_outcome": 22.0,
 }
 
 # Inbox test modules the plain `test` job already runs (they need no Textual).

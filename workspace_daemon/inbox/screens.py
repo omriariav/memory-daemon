@@ -630,8 +630,8 @@ HELP = [
         ("enter", "more: a menu of what this row can do (a key runs it, / filters)"),
         ("u", "undo the last action (5 s)")]),
     ("What a, d and s do, by row", [
-        ("Slack ask", "a send (confirm) · d done · s snooze"),
-        ("Waiting", "a nudge (confirm) · d done · s snooze"),
+        ("Slack ask", "a send (confirm) · d done (with an outcome, when the source has close_outcome) · s snooze"),
+        ("Waiting", "a nudge (confirm) · d done (with an outcome, when the source has close_outcome) · s snooze"),
         ("RSVP", "a accept · d done · s snooze"),
         ("Todo", "d close now · s due date"),
         ("Decision", "d asks for the decision, then closes · s due date"),
@@ -815,6 +815,75 @@ class NoteScreen(ModalScreen):
 
     def on_input_submitted(self, e):
         self.dismiss(" ".join(e.value.split()))
+
+
+class OutcomeScreen(NoteScreen):
+    """The outcome of a Slack ask or a waiting row, asked on `d` (0.13.1).
+    Required: enter on an empty line stays open and says so; esc cancels
+    (nothing closes). It opens at once; `fill(text)` puts a suggested outcome
+    in when the model call returns, but only while the owner has typed
+    nothing (a typed key, even one deleted again, keeps the line theirs).
+    Dismisses with the text, or None."""
+
+    EMPTY = "an outcome is required  ·  esc cancel"
+
+    def __init__(self, who, max_len=300, drafting=False):
+        super().__init__(
+            "Outcome:", who, max_len,
+            placeholder=("drafting…  (type to write your own)" if drafting
+                         else self.READY),
+            hint="enter close  ·  esc cancel  ·  required")
+        self.typed = False
+        self.filled = False
+        self._filling = False
+        self._pending = ""         # a suggestion that came before the mount
+
+    def on_input_changed(self, e):
+        if not self._filling:
+            self.typed = True
+
+    def fill(self, text):
+        """Put the suggestion in an untouched prompt. Returns True when it
+        was used."""
+        if self.typed or self.filled or not text:
+            return False
+        found = self.query("#note-input")
+        if not found:               # not composed yet: on_mount puts it in
+            self._pending = text
+            return True
+        field = found.first()
+        self._filling = True
+        try:
+            field.value = text
+            field.cursor_position = len(field.value)
+        finally:
+            self._filling = False
+        self.filled = True
+        return True
+
+    def on_mount(self):
+        self.query_one("#note-input").placeholder = self.placeholder
+        pending, self._pending = self._pending, ""
+        if pending:
+            self.fill(pending)
+
+    READY = "what happened, one line  (enter to close)"
+
+    def stop_drafting(self):
+        """The model call failed or ran out of time: keep the line empty and
+        editable, and stop saying it is drafting."""
+        self.placeholder = self.READY    # used if the prompt is not composed yet
+        for field in self.query("#note-input"):
+            field.placeholder = self.READY
+
+    def on_input_submitted(self, e):
+        e.prevent_default()           # NoteScreen's handler would dismiss
+        text = " ".join(e.value.split())
+        if not text:
+            self.query_one("#note-hint", Static).update(
+                Text(self.EMPTY, Style(bold=True)))
+            return
+        self.dismiss(text)
 
 
 class DateScreen(ModalScreen):

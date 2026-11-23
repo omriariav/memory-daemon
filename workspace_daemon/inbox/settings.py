@@ -94,7 +94,7 @@ SOURCE_KEYS = {
     "events": ("name", "type", "window_h", "urgent", "invites_days",
                "saved_days", "email_require_label"),
     "command": ("name", "type", "argv", "timeout_s", "supports_all",
-                "watch", "acts"),
+                "watch", "acts", "close_outcome"),
 }
 DEFAULT_TIMEOUT_S = 20
 MAX_WATCH = 50
@@ -351,6 +351,14 @@ def validate(raw):
             listed = _check_acts(src.get("acts"), f"{label}.acts", problems)
             if listed:        # no `acts:` leaves the source exactly as before
                 source["acts"] = listed
+            close_outcome = src.get("close_outcome", False)
+            if not isinstance(close_outcome, bool):
+                problems.append(f"{label}.close_outcome must be true or false")
+            elif close_outcome and "close" not in listed:
+                problems.append(f"{label}.close_outcome needs close in "
+                                f"{label}.acts")
+            elif close_outcome:
+                source["close_outcome"] = True
             built.append(source)
     out["sources"] = built
     if problems:

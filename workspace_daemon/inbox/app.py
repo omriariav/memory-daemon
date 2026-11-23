@@ -27,6 +27,7 @@ from . import context as ctxmod
 from . import health as healthmod
 from . import items as itm_items
 from . import draftme as draftme_mod
+from . import outcome as outcome_mod
 from . import polish as polishmod
 from . import tasks as tasksmod
 from . import writes as writes_mod
@@ -35,7 +36,7 @@ from .actions import Result, act_meta
 from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
                      copy_section_text, from_v1)
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
-                      ConfirmWrite, DateScreen, HelpScreen, NoteScreen,
+                      ConfirmWrite, DateScreen, HelpScreen, NoteScreen, OutcomeScreen,
                       OpsScreen,
                       PolishScreen, RowMenu, RulesScreen, SnoozePicker)
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
@@ -2661,12 +2662,83 @@ class InboxApp(App):
             "The item is passed to your action command as JSON on stdin.",
             self.bidi), after)
 
+    def _outcome_on(self, it):
+        """0.13.1: `d` asks for an outcome on a Slack ask (I OWE) or a waiting
+        row of a source that lists `close` and declared `close_outcome: true`.
+        Every other row (FYI, feed, RSVP, alert, review, digest, saved, agent
+        card, task) keeps its `d`."""
+        if (it is None or tasksmod.is_task(it) or views.is_review(it)
+                or views.is_synthetic(it)
+                or it.kind not in ("reply", "nudge")
+                or it.section not in ("needs_reply", "urgent", "waiting")
+                or (isinstance(it.meta, dict)
+                    and it.meta.get("kind") == "invite")):
+            return False
+        fn = getattr(self.actions, "close_outcome_enabled", None)
+        try:
+            return bool(fn and fn(it))
+        except Exception:
+            return False
+
+    def _ask_outcome(self, it):
+        """d on an outcome row: the `Outcome:` prompt opens at once; one
+        background no-tools call may fill it in (never over typed text). An
+        empty answer is refused, esc closes nothing. The text goes to the
+        source as `close` `{"outcome": <text>}` after the undo window."""
+        drafting = bool(getattr(self.actions, "draft_me_configured", False))
+        screen = OutcomeScreen(it.who, actsmod.NOTE_MAX, drafting=drafting)
+
+        def answered(text):
+            if text is None:
+                self.notify("Cancelled. Nothing closed.", timeout=2,
+                            markup=False)
+                return
+            self._enqueue("done", it, f"Done: {it.who}",
+                          detail=text[:60], act="close",
+                          act_args={"outcome": actsmod.clean_note(text)},
+                          react=self._done_emoji(it))
+        self.push_screen(screen, answered)
+        if drafting:
+            threading.Thread(target=self._outcome_thread, args=(it, screen),
+                             name="inbox-outcome", daemon=True).start()
+
+    def _done_emoji(self, it):
+        fn = getattr(self.actions, "done_reaction_for", None)
+        try:
+            return (fn(it) if fn else None) or ""
+        except Exception:
+            return ""
+
+    def _outcome_thread(self, it, screen):
+        try:
+            out = self.actions.draft_outcome(it)
+        except Exception as exc:  # a backend bug must not end the session
+            out = outcome_mod.Outcome(False, "", f"cannot run: "
+                                                 f"{type(exc).__name__}")
+        if self._quitting:
+            return
+        self._post(self._outcome_drafted, it, screen, out)
+
+    def _outcome_drafted(self, it, screen, out):
+        """UI thread: fill the prompt if it is still open and untouched."""
+        if screen not in self.screen_stack:
+            return
+        if out.ok and screen.fill(out.text):
+            self.record("outcome-draft", it, f"{len(out.text)} chars",
+                        "filled")
+        else:
+            screen.stop_drafting()
+            if not out.ok:
+                self.record("outcome-draft", it, out.detail, "failed")
+
     def action_done(self):
         it = self.current
         if it is None:
             return
         if tasksmod.is_task(it):
             return self._task_done(it, outcome=False)
+        if self._outcome_on(it):
+            return self._ask_outcome(it)
         # 0.10.0: a row whose source lists `close` also closes there, and with
         # `done_reaction:` the message gets its emoji. Neither runs before the
         # undo window ends; with neither configured this is the old `d`.
