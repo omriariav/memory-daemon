@@ -1115,10 +1115,21 @@ class ShortCodeRedactionTest(unittest.TestCase):
         ("the combination is 4821", "4821"),
         ("keypad 4821", "4821"),
         ("intercom 4821", "4821"),
+        ("Gate: 4821", "4821"),
+        ("the combination to the safe 4821", "4821"),
+        ("combination: 4821", "4821"),
+        ("כספת combo 4821", "4821"),
+        ("code for the gate 4821", "4821"),
+        ("הקוד לשער 4821", "4821"),
+        ("code 1 2 3 4 5 6 7 8 9", "1 2 3 4 5 6 7 8 9"),
+        ("4111111111111111 cvv 482", ("4111111111111111", "482")),
+        ("4111111111111111 12/27 482", ("4111111111111111", "12/27", "482")),
+        ("Use 482113 to confirm", "482113"),
         ("lock box 4821", "4821"),
         ("wifi password 48214821", "48214821"),
         ("wi-fi pass 48214821", "48214821"),
-        ("pw 4821", "4821"),
+        ("pw: 4821", "4821"),
+        ("my pwd is 4821", "4821"),
         ("pwd: 4821", "4821"),
         ("Door: 4821", "4821"),
         ("the 3 digits on the back are 482", "482"),
@@ -1227,6 +1238,14 @@ class ShortCodeRedactionTest(unittest.TestCase):
         "code review 482 comments", "the code changed in 2026",
         "password expires in 90 days", "password length 128",
         "code at 1530", "the code costs 1500",
+        "deployed the code to 1200 hosts", "the code on 300 servers",
+        "code for 2500 users", "code this today 1500 lines",
+        "The code for 2025 is in the repo", "הקוד ל-300 משתמשים",
+        # ordinary words that are only sometimes keywords
+        "combination 4821", "a combination of 300 steps", "combo 482 deal",
+        "pwd 1234 (current directory)", "pw 4821", "intercom 26",
+        "intercom 482", "אינטרקום 26", "Gate: 482", "Door: 12 m",
+        "דלת: 1200 מטר", "Use 2026 to confirm", "G-482113 shipped",
         # the keyword after the number, without "is" or a secret keyword
         "250 code reviews", "4821 קודים", "4821 code", "4821 code.",
         "4821 קוד", "apartment 214 code", "In 2026 the code", "1500 the code",
@@ -1260,6 +1279,29 @@ class ShortCodeRedactionTest(unittest.TestCase):
         for text in self.KEPT:
             with self.subTest(text=text):
                 self.assertEqual(chat_text.redact_secrets(text), text)
+
+    # (input, exact output): what is kept next to a redacted code
+    EXACT = [
+        ("PIN 4821 300 people", "PIN [REDACTED] 300 people"),
+        ("code 4821 12 November", "code [REDACTED] 12 November"),
+        ("code 1 2 3 4 5 6 7 8 9", "code [REDACTED]"),
+        ("code 4821 1500 NIS", "code [REDACTED] 1500 NIS"),
+        ("PIN 4821 12/27", "PIN [REDACTED] 12/27"),
+        ("paid with 4111111111111111, 1500 NIS total",
+         "paid with [REDACTED], 1500 NIS total"),
+        ("card 4111111111111111 2026 was a great year",
+         "card [REDACTED] 2026 was a great year"),
+        ("card 4111111111111111 / 1234 Main st",
+         "card [REDACTED] / 1234 Main st"),
+        ("4111 1111 1111 1111 1227 482", "[REDACTED]"),
+        ("4111111111111111 12/27 482.", "[REDACTED]."),
+        ("4111111111111111 482", "[REDACTED] 482"),
+    ]
+
+    def test_exact_outputs(self):
+        for text, expected in self.EXACT:
+            with self.subTest(text=text):
+                self.assertEqual(chat_text.redact_secrets(text), expected)
 
     def test_redaction_is_idempotent(self):
         for text in [t for t, _c in self.SECRET] + self.KEPT:

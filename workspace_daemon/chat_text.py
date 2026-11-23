@@ -54,9 +54,14 @@ _HE_KEYWORD = (
     r"|אינטרקום"
     r"|(?:דלת|שער)(?=\s*:))"  # a bare label only before a colon
 )
+_COMBO_TARGET = r"(?:safe|lock|locker|padlock|lockbox|כספת|מנעול)"
 _EN_KEYWORD = (
-    r"(?:pass(?:word|code)|pwd?|pin(?:\s*(?:code|number|no\.?))?"
-    r"|cvv2?|cvc2?|otp|code|combo|combination|keypad|intercom|lock\s?box"
+    r"(?:pass(?:word|code)|pwd?(?=\s*(?:[:=]|is\b))"
+    r"|pin(?:\s*(?:code|number|no\.?))?|cvv2?|cvc2?|otp|code"
+    rf"|{_COMBO_TARGET}\s+(?:combo|combination)"
+    r"|(?:combo|combination)(?=\s*(?:[:=]|is\b)"
+    rf"|\s+(?:for|to|of)\s+(?:the\s+|my\s+)?{_COMBO_TARGET})"
+    r"|keypad|intercom|lock\s?box"
     r"|wi-?fi\s+pass|digits\s+on\s+the\s+back(?:\s+of\s+the\s+card)?"
     r"|(?:door|gate)(?=\s*:))"
 )
@@ -82,7 +87,31 @@ _GAP_CHAR = (r"[\s:=\-–—\"'״׳“”‘’„#(),*_~`«»\[\]<>→⇒➡➜
              "☀-➿⬀-⯿\U0001f300-\U0001faff]")
 _GAP = (rf"(?:{_GAP_CHAR}{{0,8}}{_LETTER_BEFORE}{_FILLER_WORD}{_LETTER_AFTER})"
         rf"{{0,5}}{_GAP_CHAR}{{0,8}}")
-_KEYWORD_RE = re.compile(rf"(?i)(?P<kw>{_KEYWORD}){_GAP}(?=\d)")
+_KEYWORD_RE = re.compile(rf"(?i)(?P<kw>{_KEYWORD})(?P<gap>{_GAP})(?=\d)")
+# A bare "code" / "קוד" is a common word in engineering chatter ("deployed
+# the code to 1200 hosts"), so only a narrow set of words may sit between it
+# and the number: is / the / my..., and places ("code for the gate is").
+_PLACE = (
+    r"(?:door|gate|building|entrance|lobby|alarm|safe|bank|card|wi-?fi|venue"
+    r"|office|house|home|apartment|flat|garage|front|main|intercom|keypad"
+    r"|[ובלשה]{0,2}(?:דלת|כניסה|בניין|בנין|שער|כספת|אזעקה|מחסן|חניה|חנייה"
+    r"|בית|דירה|משרד|מוסך|כרטיס|אשראי|ויפי|וויפי|אינטרקום|כספומט|wi-?fi))"
+)
+_BARE_FILLER = (
+    r"(?:is|was|the|my|your|our|הוא|היא|זה|זו|זאת|של|שלי|שלך|שלו|שלה|שלנו"
+    rf"|שלכם|שלהם|ה?חדשה?|ה?סודי|{_PLACE}"
+    rf"|(?:for|to|of)\s+(?:(?:the|my|our|your)\s+)?{_PLACE})"
+)
+_BARE_GAP = re.compile(
+    rf"(?i)(?:{_GAP_CHAR}*{_LETTER_BEFORE}{_BARE_FILLER}{_LETTER_AFTER})*"
+    rf"{_GAP_CHAR}*")
+# Labels that are also ordinary words need 4+ digits and no unit after them
+# ("intercom 26" is a flat, "Gate: 482" a boarding gate, "דלת: 1200 מטר").
+_LABEL_KEYWORD = re.compile(
+    r"(?i)(?:[ובלשה]{0,2}-?)?(?:intercom|keypad|door|gate|אינטרקום|דלת|שער)")
+_UNIT_AFTER = re.compile(
+    r"(?i)\s*(?:מטר|מ'|ק\"מ|ס\"מ|ס״מ|ק״מ|m|km|cm|ft|feet|meters?|metres?"
+    rf"|minutes?|min|דקות|דק'){_LETTER_AFTER}")
 _CURRENCY_AFTER = re.compile(
     r"(?i)\s*(?:₪|ש[\"״׳']?ח|שקל|\$|€|£|%|אחוז"
     rf"|(?:nis|ils|usd|eur|dollars?){_LETTER_AFTER})")
@@ -112,6 +141,7 @@ _PUBLIC_CODE_AFTER = re.compile(
     rf"|סטטוס)|qr){_LETTER_AFTER}"
 )
 _BARE_CODE = re.compile(r"(?i)code|[ובלשמכ]{0,2}קוד")
+_BARE_KEYWORD = re.compile(r"(?i)(?:[ובלשה]{0,2}-?)?code|[ובלשהמכ]{0,3}קוד")
 _PUBLIC_WINDOW = 40  # characters before a keyword checked for a qualifier
 _STATUS_AFTER = re.compile(r"(?i)\s+from\s+(?:the\s+)?(?:server|api|backend)")
 
@@ -144,16 +174,19 @@ def _public_code(text, start, end):
 def _code_end(text, start):
     """End of the 3-8 digit secret code starting at text[start], or None.
 
-    Digits may be split by single (or double) spaces or dashes. A time, a
-    date, a decimal or an amount is not a code; a number after the code
-    (an expiry date, a card number) ends it instead of cancelling it.
+    A split code is joined only when its groups look like one code: single
+    digits ("4 8 2 1", redacted whole even past 8), groups as long as the
+    first ("48 21", "482 113"), or dash-joined groups of 2-4 digits
+    ("48-213"). A group of another shape ("PIN 4821 300 people", "code 4821
+    12 November") ends the code. A time, date, decimal or amount in the code
+    itself cancels it; one after the code only ends it.
     """
     run = _DIGIT_RUN.match(text, start)
     parts = _RUN_SEP.split(run.group(0))
     groups, seps = parts[0::2], parts[1::2]
     if (len(groups) >= 3 and set(seps) == {"."}
             and all(len(group) == 1 for group in groups)):
-        length = len(run.group(0)) if len(groups) <= 8 else None  # 4.8.2.1
+        length = len(run.group(0))  # 4.8.2.1
     else:
         compound = [False] * len(groups)  # part of 17:30, 12/27, 3.12, 1,500
         for index, sep in enumerate(seps):
@@ -161,33 +194,56 @@ def _code_end(text, start):
                 compound[index] = compound[index + 1] = True
         if compound[0] or len(groups[0]) > 8:
             return None
-        digits, length = len(groups[0]), len(groups[0])
+        first = len(groups[0])
+        digits, length = first, first
+        steps = [(digits, length)]
         for index in range(1, len(groups)):
             sep, group = seps[index - 1], groups[index]
-            if compound[index] or sep not in (" ", "  ", "-"):
+            if compound[index] or sep not in (" ", "  ", "-") or (
+                    index > 1 and sep != seps[0]):
                 break
-            if digits + len(group) > 8:
-                if sep == "-":
+            if first == 1:
+                fits = len(group) == 1  # single digits: no 8-digit cap
+            elif sep == "-":
+                fits = 2 <= len(group) <= 4 and digits + len(group) <= 8
+                if not fits:
                     return None  # a phone number or a long dashed id
+            else:
+                fits = len(group) == first and digits + len(group) <= 8
+            if not fits:
                 break
             digits += len(group)
             length += len(sep) + len(group)
+            steps.append((digits, length))
+        # "code 4821 1500 NIS": the amount ends the code, it does not join it
+        while len(steps) > 1 and _CURRENCY_AFTER.match(text, start + length):
+            steps.pop()
+            digits, length = steps[-1]
         if digits < 3:
             return None
         if _DASH_DATE.fullmatch(text, start, start + length):
             return None
-    if length is None or _CURRENCY_AFTER.match(text, start + length):
+    if _CURRENCY_AFTER.match(text, start + length):
         return None
     return start + length
 
 
 def _keyword_spans(text):
     for match in _KEYWORD_RE.finditer(text):
+        keyword = match.group("kw")
         if _public_code(text, match.start("kw"), match.end("kw")):
             continue
+        if _BARE_KEYWORD.fullmatch(keyword) and not _BARE_GAP.fullmatch(
+                match.group("gap")):
+            continue
         end = _code_end(text, match.end())
-        if end is not None and not _STATUS_AFTER.match(text, end):
-            yield match.end(), end
+        if end is None or _STATUS_AFTER.match(text, end):
+            continue
+        if _LABEL_KEYWORD.fullmatch(keyword) and (
+                sum(char.isdigit() for char in text[match.end():end]) < 4
+                or _UNIT_AFTER.match(text, end)):
+            continue
+        yield match.end(), end
 
 
 # The keyword after the number: "4821 is the code", "4821 זה הקוד",
@@ -207,9 +263,11 @@ _CLAUSE_END = re.compile(
     r"(?i)\s*(?:$|[.,;:!?)\n☀-➿\U0001f300-\U0001faff]"
     rf"|{_FILLER_WORD}{_LETTER_AFTER})")
 _USE_TO_RE = re.compile(
-    rf"(?i){_LETTER_BEFORE}use\s+(?P<code>\d{{4,8}})\s+(?:to|for)\s+"
-    r"(?:log\s*in|login|sign\s*in|verify|confirm|reset)")
-_G_CODE_RE = re.compile(r"(?<![\w-])G-(?P<code>\d{6})(?!\d)")
+    rf"(?i){_LETTER_BEFORE}use\s+(?!(?:19|20)\d\d\s)(?P<code>\d{{4,8}})\s+"
+    r"(?:to|for)\s+(?:log\s*in|login|sign\s*in|verify|confirm|reset)")
+_G_CODE_RE = re.compile(
+    r"(?i)(?<![\w-])G-(?P<code>\d{6})(?!\d)"
+    r"(?=[^.!?\n]{0,60}?(?:code|verification|קוד))")
 
 
 def _trailing_spans(text):
@@ -245,12 +303,48 @@ _CARD_RE = re.compile(
     r"|[2-6]\d{12,18})"
     r"(?!\w|/(?!\d{2,4}(?![\w/])))"
 )
-_CARD_TAIL_RE = re.compile(
-    r"(?i)[\s,;|/\-]{0,3}"
-    r"(?:(?:exp(?:iry|ires|\.)?|valid(?:\s+thru)?|תוקף|ת\.ת|cvv2?|cvc2?|cvn"
-    r"|קוד|ספרות\s+בגב)[\s:.\-]{0,3})?"
-    r"(?:(?:0[1-9]|1[0-2])\s*/\s*(?:\d{4}|\d{2})|\d{3,4})(?![\w/])"
-)
+_TAIL_SEP = r"[\s,;|/\-]{0,3}"
+_EXPIRY_RE = re.compile(
+    rf"(?i){_TAIL_SEP}(?P<label>(?:exp(?:iry|ires|\.)?|valid(?:\s+thru)?"
+    r"|תוקף|ת\.ת)[\s:.\-]{0,3})?"
+    r"(?:(?P<slash>(?:0[1-9]|1[0-2])\s*/\s*(?:\d{4}|\d{2}))"
+    r"|(?:0[1-9]|1[0-2])\d{2})(?![\w/])")
+_CVV_LABELED_RE = re.compile(
+    rf"(?i){_TAIL_SEP}(?:cvv2?|cvc2?|cvn|קוד|ספרות\s+בגב)[\s:.\-]{{0,3}}"
+    r"\d{3,4}(?![\w/])")
+_CVV_BARE_RE = re.compile(r"[\s,;|\-]{0,3}\d{3,4}(?![\w/])")
+_CVV_SLASH_RE = re.compile(r"/\d{3,4}(?![\w/])")
+_WORD_OR_AMOUNT_AFTER = re.compile(
+    r"(?i)\s*(?:[^\W\d_]|₪|\$|€|£|%)")
+
+
+def _card_tail_end(text, end):
+    """End of an expiry date and CVV right after a card number.
+
+    A bare 3-4 digit number counts only right after an expiry date or
+    glued on with "/" (and never before a word or an amount: "1500 NIS
+    total", "1234 Main st"); otherwise it needs a label (cvv, קוד, exp).
+    """
+    def plain(match):
+        return match and not _WORD_OR_AMOUNT_AFTER.match(text, match.end())
+
+    expiry = _EXPIRY_RE.match(text, end)
+    if expiry and (expiry.group("label") or expiry.group("slash")
+                   or plain(expiry)):
+        end = expiry.end()
+    else:
+        expiry = None
+    cvv = _CVV_LABELED_RE.match(text, end)
+    if not cvv:
+        bare = (_CVV_BARE_RE if expiry else _CVV_SLASH_RE).match(text, end)
+        cvv = bare if plain(bare) else None
+    if cvv:
+        end = cvv.end()
+        if not expiry:
+            expiry = _EXPIRY_RE.match(text, end)
+            if expiry and (expiry.group("label") or expiry.group("slash")):
+                end = expiry.end()
+    return end
 
 
 def _card_brand_fits(digits):
@@ -282,13 +376,7 @@ def _card_spans(text):
         digits = re.sub(r"\D", "", match.group(0))
         if not (_card_brand_fits(digits) and _luhn_ok(digits)):
             continue
-        end = match.end()
-        for _ in range(2):  # an expiry date and a CVV
-            tail = _CARD_TAIL_RE.match(text, end)
-            if not tail:
-                break
-            end = tail.end()
-        yield match.start(), end
+        yield match.start(), _card_tail_end(text, match.end())
 
 
 def _redact_codes(value):
