@@ -28,6 +28,26 @@ class GmailCatchUpTest(unittest.TestCase):
         self.assertIn("in:inbox (is:unread OR is:starred)", query)
         self.assertIn("after:1785578400", query)
 
+    def test_list_timeout_setting_reaches_the_listing_call(self):
+        for extra, expected in (({"list_timeout_seconds": 900}, {"timeout": 900}), ({}, {})):
+            source = {"kind": "gmail", "query": "in:inbox", "max_results": 0,
+                      **extra}
+            with mock.patch.object(
+                runner.gmail, "search", return_value=[]
+            ) as search:
+                runner._gmail_candidates(source)
+            self.assertEqual(search.call_args.kwargs, expected)
+
+    def test_listing_timeout_propagates_so_the_cursor_is_held(self):
+        import subprocess
+        source = {"kind": "gmail", "query": "in:inbox", "max_results": 0}
+        with mock.patch.object(
+            runner.gmail, "search",
+            side_effect=subprocess.TimeoutExpired(["gws"], 600),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runner._gmail_candidates(source)
+
     def test_gmail_catch_up_rejects_rolling_query_and_caps(self):
         routine = {
             "id": "gmail",

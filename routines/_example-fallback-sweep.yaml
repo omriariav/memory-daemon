@@ -18,6 +18,7 @@ sources:
     catch_up: true
     catch_up_overlap: 1h
     catch_up_after: "2026-08-01T00:00:00Z"
+    # list_timeout_seconds: 900   # optional; listing default is 600s for max_results: 0
     actions: []
 
   - kind: slack

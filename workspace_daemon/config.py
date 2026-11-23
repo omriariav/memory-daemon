@@ -108,7 +108,7 @@ ANALYZE_KEYS = {
 OUTPUT_KEYS = {"vault_dir", "slug_prefix", "filename_template", "kind", "tags"}
 SOURCE_KEYS = {
     "kind", "query", "queue_query", "exclude_query", "max_results", "actions",
-    "read_thread", "handler",
+    "read_thread", "handler", "list_timeout_seconds",
     "self_forwarded_chat_followups", "catch_up", "catch_up_overlap",
     "catch_up_after", "channels", "ada_channels", "direct_channels",
     "private_channels", "include_mentions", "ada_days", "active_conversations",
@@ -2446,6 +2446,16 @@ def _validate_source(routine, source, prefix):
             f"{prefix}.self_forwarded_chat_followups requires actions: [] "
             "so only the user can complete the Inbox queue"
         )
+
+    if "list_timeout_seconds" in source:
+        if source.get("kind") != "gmail":
+            problems.append(
+                f"{prefix}.list_timeout_seconds is only supported by gmail"
+            )
+        elif not _bounded_int(source["list_timeout_seconds"], 1, 3600):
+            problems.append(
+                f"{prefix}.list_timeout_seconds must be an integer from 1 to 3600"
+            )
 
     catch_up = source.get("catch_up", False)
     if not isinstance(catch_up, bool):

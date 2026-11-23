@@ -17,17 +17,26 @@ def user_label_ids():
     }
 
 
-def search(query, max_results=20):
+LIST_TIMEOUT_SECONDS = 120
+# `gws gmail list --all` pages through the whole result inside one process, so
+# an unbounded listing (a large first catch-up) can legitimately run for minutes.
+LIST_ALL_TIMEOUT_SECONDS = 600
+
+
+def search(query, max_results=20, timeout=None):
+    """List threads. `timeout` (seconds) bounds the one gws call; the default is
+    120 for a capped listing and 600 for `max_results: 0` (all pages). A listing
+    that does not finish in time raises, exactly as before."""
     limit = int(max_results)
+    if timeout is None:
+        timeout = LIST_ALL_TIMEOUT_SECONDS if limit == 0 else LIST_TIMEOUT_SECONDS
     args = [gws_bin(), "gmail", "list", "--query", query]
     if limit == 0:
         args.append("--all")
     else:
         args.extend(["--max", str(limit)])
     args.extend(["--format", "json"])
-    result = run_json(
-        args
-    )
+    result = run_json(args, timeout=timeout)
     return result.get("threads", [])
 
 
