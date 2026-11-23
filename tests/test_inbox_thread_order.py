@@ -319,7 +319,7 @@ class ThreadPaneTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         app = make_app([thread_item()], InboxStore(None))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("v", "order"), app.hints())
+            self.assertNotIn(("v", "order"), app.hints())     # in the palette, not the footer
             self.assertEqual(app.hints()[-1], ("?", "help"))
             titles = {c.title for c in app.get_system_commands(app.screen)}
             self.assertIn("Toggle thread order", titles)

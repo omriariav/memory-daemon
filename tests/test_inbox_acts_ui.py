@@ -916,7 +916,7 @@ class ReviewFixesUITest(Base):
         app = self.app([item(1)])                  # acts on, no summary/polish
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            keys = {k for k, _label in app.hints()}
+            keys = {e.key for e in app.row_menu_entries()}
             self.assertNotIn("D", keys)
 
 
@@ -1129,6 +1129,7 @@ class ActsOffTest(Base):
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
             keys = {k for k, _label in app.hints()}
+            keys |= {e.key for e in app.row_menu_entries()}
             self.assertFalse(keys & {"w", "!", "D"})
 
     async def test_hints_name_the_new_keys_when_acts_are_on(self):
@@ -1136,7 +1137,7 @@ class ActsOffTest(Base):
             summary=settings.validate({"summary": {}})["summary"]))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            keys = {k for k, _label in app.hints()}
+            keys = {e.key for e in app.row_menu_entries()}    # in the menu, not the footer
             self.assertTrue({"w", "!", "D"} <= keys)
 
 

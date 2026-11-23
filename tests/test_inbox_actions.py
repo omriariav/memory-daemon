@@ -1082,7 +1082,8 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
         app = make_app([make_item(1)], acts, InboxStore(None))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("p", "Add to agenda"), app.hints())
+            self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["p"],
+                             "Add to agenda")
             self.assertEqual(app.hints()[-1], ("?", "help"))
             titles = {c.title for c in app.get_system_commands(app.screen)}
             self.assertIn("Add to agenda", titles)
@@ -1103,6 +1104,7 @@ class ActionFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             self.assertEqual(acts.calls, [])
             self.assertNotIn("p", [h[0] for h in app.hints()])
+            self.assertNotIn("p", {e.key for e in app.row_menu_entries()})
             await pilot.press("question_mark")
             self.assertTrue(await wait_for(pilot, lambda: isinstance(app.screen, HelpScreen)))
             self.assertNotIn("Custom actions",

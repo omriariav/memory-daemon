@@ -403,7 +403,11 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
                                                           draft_delay=0))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn(("m", "save by hand"), app.hints())
+            app.current_key = "t:2"          # t:1 is in memory already: no m
+            self.assertNotIn("m", {e.key for e in app.row_menu_entries(
+                next(i for i in app.items if i.key == "t:1"))})
+            self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["m"],
+                             "Save to memory")
 
     async def test_m_is_hidden_everywhere_without_save(self):
         app = make_app(self.rows(), lambda s: LocalActions(s))
@@ -414,6 +418,7 @@ class MemoryMarkUiTest(unittest.IsolatedAsyncioTestCase):
                 # negative check: it must not happen
                 await pilot.pause(0.1)
                 self.assertNotIn("m", [k for k, _ in app.hints()])
+                self.assertNotIn("m", {e.key for e in app.row_menu_entries()})
             titles = [c.title for c in app.get_system_commands(app.screen)]
             self.assertNotIn("Save item to memory", titles)
             await pilot.press("question_mark")

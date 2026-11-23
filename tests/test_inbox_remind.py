@@ -238,11 +238,13 @@ class RemindPaneTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("m")
                 self.assertTrue(await wait_for(
                     pilot, lambda: "REMIND ME" in detail(app)))
-                self.assertIn(("m", "close remind"), app.hints())
+                self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["m"],
+                                 "Close remind me")
                 await pilot.press(closer)
                 self.assertTrue(await wait_for(
                     pilot, lambda: "REMIND ME" not in detail(app)))
-                self.assertIn(("m", "remind me"), app.hints())
+                self.assertEqual({e.key: e.label for e in app.row_menu_entries()}["m"],
+                                 "Remind me")
                 self.assertIn("Evidence", detail(app))     # the usual card
             await pilot.press("m")
             self.assertTrue(await wait_for(
