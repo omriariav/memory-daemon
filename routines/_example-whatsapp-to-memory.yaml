@@ -1,0 +1,96 @@
+# WhatsApp messages and their media, read from the local spool of a separate
+# WhatsApp forwarder (the daemon never reads WhatsApp itself). One memory per
+# chat per local day; later messages, a late file or a re-sent message update
+# the same entry. Each stored entry ends with the day's messages verbatim
+# (time, sender, message id, text, attachment path, local transcript).
+#
+# What leaves the machine: the day's message text, sender display names, the
+# chat label, attachment facts (kind, name, type, size, local path) and the
+# locally made voice-note transcripts and PDF excerpts go to the analyze
+# provider below, like any other source's body. Media files themselves never
+# do. See "WhatsApp forwarder spool" in the README.
+id: whatsapp-to-memory
+enabled: false
+description: Capture durable facts from selected WhatsApp chats, one memory per chat-day.
+role: specialized
+
+schedule:
+  every: 30m
+
+source:
+  kind: whatsapp
+  # The forwarder's spool folder (mode 700, owned by the user the daemon
+  # runs as). Read only: nothing in it is ever written, renamed or deleted.
+  spool_dir: /absolute/path/to/whatsapp-forwarder/spool
+  # Required, private (700) and outside every git work tree, the memory
+  # store included. Holds media/<date>/<message id>.<ext> copies, cached
+  # transcripts, and chats/ (every message seen, merged by id, plus the
+  # archive's own chat ids), so nothing is lost when the forwarder prunes its
+  # batches. One archive per WhatsApp source.
+  archive_dir: /absolute/path/to/private/whatsapp-archive
+  # Delete captured chat-days (and their media) older than this many days.
+  # Leave it out to keep the archive. Days not yet captured are never removed.
+  archive_keep_days: 365
+  max_results: 0
+
+  # Analyze a chat-day once it has been quiet this long, or once its oldest
+  # uncaptured message has waited max_wait_hours, whichever comes first.
+  quiet_minutes: 60
+  max_wait_hours: 6
+
+  # Media copies. A file over max_file_mb, or one that would take the
+  # archive's media past max_total_mb, is recorded but not copied.
+  copy_media: true
+  max_file_mb: 100
+  max_total_mb: 10240
+
+  # Voice notes and audio: ffmpeg -> 16 kHz mono WAV -> whisper.cpp
+  # (whisper-cli), all local. A timeout or OS error is retried (3 attempts,
+  # with backoff); any other failure leaves "no transcript".
+  transcribe_audio: true
+  whisper_model: /absolute/path/to/ggml-model.bin
+  whisper_language: auto
+  transcribe_timeout_seconds: 300
+  # Seconds of transcription and PDF extraction per run; the rest waits for
+  # the next run (a chat-day with pending media text waits up to
+  # max_wait_hours for it). 0 turns extraction off.
+  extract_budget_seconds: 300
+  transcript_max_chars: 8000
+
+  # PDFs: a bounded local pdftotext excerpt (no OCR).
+  pdf_text: true
+  pdf_max_pages: 20
+  pdf_max_chars: 4000
+
+  # Optional filters. Chat keys are the first column of the forwarder's
+  # --list-conversations and belong to one WhatsApp database: they match a
+  # chat's key in the current store only, so after a reinstall or re-link
+  # update them (the daemon warns about listed keys it no longer sees).
+  # Labels are the spool's chat_label.
+  #
+  # Chat ids are a keyed hash of each chat's JID. The secret (chat-id.key),
+  # aliases and capture ids live in this private folder, outside every git
+  # work tree; without it, in the daemon's state/whatsapp. Back it up with
+  # the archive: a lost key is never re-created while the archive or the
+  # ledger holds chats (the source reports it until it is restored).
+  identity_dir: /absolute/path/to/private/whatsapp-identity
+  exclude_chat_labels:
+    - Example muted group
+
+analyze:
+  provider: gemini
+  model: gemini/gemini-3.1-pro-preview
+  max_output_tokens: 4096
+  skip_trivial: true
+  instruction: >-
+    The source is one day of one WhatsApp chat and may not be in English.
+    Write the memory in English. Keep durable facts only: plans, dates,
+    decisions, commitments, requests to the owner, logistics and changes to
+    them, and facts about people. Attachment transcripts and PDF excerpts are
+    machine-extracted and may contain errors. Ignore greetings and small talk.
+    Return exactly NOT MEMORY-WORTHY when nothing durable was said.
+
+memory:
+  store: /absolute/path/to/private-memory
+  type: note
+  tags: [whatsapp]

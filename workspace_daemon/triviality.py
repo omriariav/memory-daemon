@@ -6,7 +6,7 @@ known acknowledgement/greeting. Anything else is kept for the model.
 import re
 import unicodedata
 
-CHAT_KINDS = ("slack", "slack_mcp", "gchat")
+CHAT_KINDS = ("slack", "slack_mcp", "gchat", "whatsapp")
 DEFAULT_MAX_CHARS = 120
 
 _WORDS = """
