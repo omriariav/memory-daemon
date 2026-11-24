@@ -4,7 +4,10 @@ import json
 import unittest
 from unittest import mock
 
-import test_owner_todos as base
+try:    # run by discovery (tests/ on sys.path) or by dotted module name
+    import test_owner_todos as base
+except ImportError:
+    from tests import test_owner_todos as base
 from workspace_daemon import due_phrases, llm, memory_sink
 from workspace_daemon.due_phrases import WorkWeek, parse_week, resolve
 
@@ -40,17 +43,43 @@ class ResolveTest(unittest.TestCase):
         self.check("end of next week", WED, SUN_THU, "2026-12-03")
         self.check("by the end of the next week", WED, MON_FRI, "2026-12-04")
 
-    def test_by_and_on_a_weekday_is_the_next_such_day(self):
-        self.check("by Thursday", WED, MON_FRI, THU)
-        self.check("on Monday", WED, MON_FRI, "2026-11-30")
+    def test_a_deadline_weekday_is_the_next_such_day(self):
+        for cue in ("by", "until", "due", "due by", "due on"):
+            self.check(f"{cue} Thursday", WED, MON_FRI, THU)
+        self.check("by Monday", WED, MON_FRI, "2026-11-30")
         self.check("by Thursday", WED, SUN_THU, THU)
+        self.check("by this coming Thursday", WED, MON_FRI, THU)
 
     def test_asking_on_the_named_weekday_goes_a_week_out(self):
         self.check("by Thursday", THU, MON_FRI, "2026-12-03")
-        self.check("on Thursday", THU, SUN_THU, "2026-12-03")
+        self.check("due Thursday", THU, SUN_THU, "2026-12-03")
+
+    def test_a_bare_weekday_is_not_a_deadline(self):
+        for text in ("on Thursday", "Thursday", "see you on Monday",
+                     "on Monday we agreed"):
+            self.check(text, WED, MON_FRI, None)
 
     def test_weekday_phrase_keeps_an_off_day(self):
         self.check("by Friday", WED, SUN_THU, FRI)
+
+    def test_weekday_next_week_is_that_day_of_next_week(self):
+        for text in ("by Thursday next week", "on Thursday next week",
+                     "Thursday next week", "next week Thursday",
+                     "next week, on Thursday", "next week by Thursday"):
+            self.check(text, WED, MON_FRI, "2026-12-03")
+            self.check(text, WED, SUN_THU, "2026-12-03")
+        self.check("next week Tuesday", WED, MON_FRI, "2026-12-01")
+        self.check("on Sunday next week", WED, SUN_THU, "2026-11-29")
+        self.check("on Monday next week", WED, MON_FRI, "2026-11-30")
+
+    def test_end_of_day_with_a_weekday_is_that_weekday(self):
+        for text in ("end of day Thursday", "EOD Thursday",
+                     "end of the day on Thursday", "Thursday EOD"):
+            self.check(text, WED, MON_FRI, THU)
+        self.check("by Thursday EOD", WED, MON_FRI, THU)
+        # No cue, so today counts; with "by" it never does.
+        self.check("EOD Thursday", THU, MON_FRI, THU)
+        self.check("by Thursday EOD", THU, MON_FRI, "2026-12-03")
 
     def test_tomorrow_skips_off_days(self):
         self.check("tomorrow", WED, MON_FRI, THU)
@@ -59,10 +88,16 @@ class ResolveTest(unittest.TestCase):
         self.check("tomorrow", THU, SUN_THU, "2026-11-29")
         self.check("tomorrow", WED, SUN_THU, THU)
 
-    def test_today_and_end_of_day_are_the_anchor_even_on_an_off_day(self):
-        for phrase in ("today", "EOD", "end of day", "end of the day"):
+    def test_eod_and_a_cued_today_are_the_anchor_even_on_an_off_day(self):
+        for phrase in ("EOD", "end of day", "end of the day", "by today",
+                       "due today", "until today", "by EOD"):
             self.check(phrase, WED, MON_FRI, WED)
             self.check(phrase, SAT, MON_FRI, SAT)
+
+    def test_a_bare_or_possessive_today_never_matches(self):
+        for text in ("today", "we spoke today", "today's plan", "by today's",
+                     "tomorrow's meeting", "next week's agenda"):
+            self.check(text, WED, MON_FRI, None)
 
     def test_asking_on_an_off_day(self):
         # Mon-Fri team, Saturday: the coming Monday starts "next week".
@@ -82,16 +117,43 @@ class ResolveTest(unittest.TestCase):
         self.check("Early  Next WEEK", WED, MON_FRI, "2026-12-01")
         self.check("BY thursday", WED, MON_FRI, THU)
 
-    def test_phrase_inside_a_sentence_and_earliest_wins(self):
+    def test_phrase_inside_a_sentence(self):
         self.check("I will send it early next week, thanks", WED, MON_FRI,
                    "2026-12-01")
-        self.check("by Thursday, or at the latest next week", WED, MON_FRI,
-                   THU)
-        self.check("early next week, ideally today", WED, MON_FRI,
-                   "2026-12-01")
+        self.check("early next week, ideally by today", WED, MON_FRI, None)
 
-    def test_next_week_with_an_explicit_day_defers_to_the_day(self):
-        self.check("next week, on Tuesday", WED, MON_FRI, "2026-12-01")
+    def test_phrases_that_disagree_give_none(self):
+        for text in ("tomorrow or early next week",
+                     "by Thursday, or at the latest next week",
+                     "tomorrow and EOD", "early next week or end of next week"):
+            self.check(text, WED, MON_FRI, None)
+
+    def test_phrases_that_agree_still_resolve(self):
+        self.check("by Thursday, due Thursday", WED, MON_FRI, THU)
+        self.check("EOD, or by today", WED, MON_FRI, WED)
+
+    def test_a_longer_phrase_swallows_the_shorter_one_inside_it(self):
+        self.check("end of next week", WED, MON_FRI, "2026-12-04")
+        self.check("early next week", WED, MON_FRI, "2026-12-01")
+        self.check("end of day Thursday", WED, MON_FRI, THU)
+
+    def test_a_negated_phrase_is_skipped(self):
+        for text in ("not by Thursday", "don't send it by Thursday",
+                     "not tomorrow", "no rush next week", "never by Friday",
+                     "rather than tomorrow", "instead of next week",
+                     "can't do it early next week", "we won\u2019t make EOD"):
+            self.check(text, WED, MON_FRI, None)
+        self.check("not tomorrow, early next week", WED, MON_FRI, "2026-12-01")
+        self.check("I know it is not urgent. Send it by Thursday", WED,
+                   MON_FRI, THU)
+
+    def test_an_explicit_date_blocks_the_override(self):
+        for text in ("by Thursday 2026-11-27", "by Thursday, Nov 26",
+                     "by Thursday the 26th", "early next week (Dec 1)",
+                     "by Thursday 11/26", "tomorrow, 26 November",
+                     "tomorrow, 26th"):
+            self.check(text, WED, MON_FRI, None)
+        self.check("by Thursday, see the March notes", WED, MON_FRI, THU)
 
     def test_default_week_is_monday_to_friday(self):
         self.assertEqual(resolve("early next week", WED), "2026-12-01")
@@ -107,17 +169,17 @@ class ResolveTest(unittest.TestCase):
     def test_unknown_gives_none(self):
         for text in ("", None, "sometime soon", "next month", "later",
                      "late next week", "later next week", "mid next week",
-                     "next week Tuesday",
-                     "by next Thursday", "the weekend", "Thursday"):
+                     "by next Thursday", "the weekend"):
             self.check(text, WED, MON_FRI, None)
         self.assertIsNone(resolve("tomorrow", "not a date"))
         self.assertIsNone(resolve("tomorrow", None))
 
     def test_no_match_inside_unrelated_words(self):
-        for text in ("geod survey", "the video-eod format", "today-ish",
-                     "pretoday", "todays", "nextweek",
-                     "by Thursdays", "bye Thursday", "bay on Mondays",
-                     "tomorrowland", "weekend", "prefix early next weeks"):
+        for text in ("geod survey", "the video-eod format", "by today-ish",
+                     "pretoday", "by todays", "nextweek",
+                     "by Thursdays", "bye Thursday", "due Mondays",
+                     "tomorrowland", "weekend", "prefix early next weeks",
+                     "end of daytime"):
             self.check(text, WED, MON_FRI, None)
 
     def test_one_day_week_clamps_the_second_day(self):
@@ -125,13 +187,14 @@ class ResolveTest(unittest.TestCase):
         self.check("early next week", WED, week, "2026-11-30")
         self.check("end of next week", WED, week, "2026-11-30")
 
-    def test_resolve_first_prefers_the_earlier_text(self):
+    def test_analyse_counts_the_phrases(self):
+        self.assertEqual(due_phrases.analyse("nothing", WED), (0, None))
+        self.assertEqual(due_phrases.analyse("by Thursday", WED), (1, THU))
         self.assertEqual(
-            due_phrases.resolve_first(
-                [None, "", "no phrase", "by Thursday", "tomorrow"],
-                WED, MON_FRI),
-            THU)
-        self.assertIsNone(due_phrases.resolve_first(["nope"], WED, MON_FRI))
+            due_phrases.analyse("tomorrow or by Monday", WED), (2, None))
+        self.assertEqual(
+            due_phrases.analyse("by Thursday 2026-11-27", WED), (1, None))
+        self.assertEqual(due_phrases.analyse("tomorrow", "bad"), (1, None))
 
 
 class WorkWeekConfigTest(unittest.TestCase):
@@ -191,6 +254,27 @@ class WorkWeekConfigTest(unittest.TestCase):
             {"memory": {"work_week": {"start": "sunday"}}}), SUN_THU)
 
 
+def main_date_anchor(routine, item, today=None):
+    """origin/main's llm.date_anchor, verbatim: the reference an unconfigured
+    routine's prompt must still match byte for byte."""
+    try:
+        day = datetime.date.fromisoformat(str((item or {}).get("date") or "")[:10])
+    except ValueError:
+        day = today or datetime.datetime.now(llm.routine_zone(routine)).date()
+    rows = "\n".join(
+        f"{llm._WEEKDAYS[d.weekday()][:3]} {d.isoformat()}"
+        for d in (day + datetime.timedelta(days=n) for n in range(1, 8))
+    )
+    return (
+        f"Date reference: the source is dated {llm._WEEKDAYS[day.weekday()]} "
+        f"{day.isoformat()}.\nThe next 7 days are:\n{rows}\n"
+        "Resolve every relative day or date in the text (\"Thursday\", "
+        "\"tomorrow\", \"next week\", \"by Friday\") ONLY from this table, "
+        "and write dates as YYYY-MM-DD. Never count weekdays yourself; when "
+        "the day is not in the table, keep the original wording.\n"
+    )
+
+
 class DateAnchorWeekTest(unittest.TestCase):
     ITEM = {"date": WED, "title": "t", "body": "b", "frontmatter": {}}
 
@@ -198,12 +282,75 @@ class DateAnchorWeekTest(unittest.TestCase):
         return llm.date_anchor({"memory": dict(store="/s", **memory)},
                                self.ITEM)
 
-    def test_states_the_default_convention_and_resolved_phrases(self):
-        text = self.anchor()
-        self.assertIn("Work week: Monday-Friday (off: Saturday, Sunday)", text)
-        self.assertIn('"early next week" = 2026-12-01', text)
-        self.assertIn('"next week" = 2026-11-30', text)
-        self.assertIn('"end of this week" = 2026-11-27', text)
+    def test_unconfigured_anchor_is_main_s_text_byte_for_byte(self):
+        zoned = {"id": "r", "sources": [
+            {"kind": "mila", "calendar_timezone": "Europe/London"}]}
+        for routine in ({}, {"memory": {"store": "/s"}},
+                        {"memory": {"store": "/s", "due_dates": False}},
+                        {"memory": {"store": "/s", "owner_todos": {}}}, zoned):
+            for item in (self.ITEM, dict(self.ITEM, date=""),
+                         dict(self.ITEM, date="2026-11-24T23:30:00Z")):
+                with self.subTest(routine=routine, date=item["date"]):
+                    self.assertEqual(
+                        llm.date_anchor(routine, item,
+                                        today=datetime.date(2026, 11, 4)),
+                        main_date_anchor(routine, item,
+                                         today=datetime.date(2026, 11, 4)))
+        self.assertNotIn("Work week", self.anchor())
+
+    def test_unconfigured_analysis_prompt_is_unchanged(self):
+        routine = {"id": "r", "analyze": {
+            "provider": "claude", "model": "m", "instruction": "Summarize."},
+            "memory": {"store": "/s", "type": "note", "extract": True}}
+        item = dict(self.ITEM, id="x")
+        with mock.patch.object(llm.secrets, "token_hex", return_value="tok"):
+            now = llm.build_prompt(routine, item, [])
+            with mock.patch.object(llm, "date_anchor",
+                                   side_effect=main_date_anchor):
+                before = llm.build_prompt(routine, item, [])
+        self.assertEqual(now, before)
+
+    def test_unconfigured_extraction_prompt_is_unchanged(self):
+        routine = {"id": "r", "analyze": {
+            "provider": "claude", "model": "m", "instruction": "Summarize."},
+            "memory": {"store": "/s", "type": "note", "extract": True}}
+        prompts = []
+
+        def run(anchor=None):
+            def fake(routine, prompt, **kwargs):
+                prompts.append(prompt)
+                return json.dumps(entry())
+            patches = [mock.patch.object(llm, "analyze", side_effect=fake),
+                       mock.patch.object(llm.secrets, "token_hex",
+                                         return_value="tok"),
+                       mock.patch.object(memory_sink, "known_person_slugs",
+                                         return_value=set())]
+            if anchor:
+                patches.append(mock.patch.object(
+                    llm, "date_anchor", side_effect=anchor))
+            for patch in patches:
+                patch.start()
+            try:
+                memory_sink._extract(routine, slack_item(), "s", "/store")
+            finally:
+                mock.patch.stopall()
+
+        run()
+        run(main_date_anchor)
+        self.assertEqual(prompts[0], prompts[1])
+        self.assertNotIn('"due"', prompts[0])
+        self.assertNotIn("Work week", prompts[0])
+
+    def test_work_week_or_due_dates_adds_the_convention(self):
+        for memory in ({"work_week": {"start": "monday", "days": 5}},
+                       {"due_dates": True}):
+            with self.subTest(memory=memory):
+                text = self.anchor(**memory)
+                self.assertIn(
+                    "Work week: Monday-Friday (off: Saturday, Sunday)", text)
+                self.assertIn('"early next week" = 2026-12-01', text)
+                self.assertIn('"next week" = 2026-11-30', text)
+                self.assertIn('"end of this week" = 2026-11-27', text)
 
     def test_follows_the_configured_week(self):
         text = self.anchor(work_week={"start": "sunday", "days": 5})
@@ -214,10 +361,40 @@ class DateAnchorWeekTest(unittest.TestCase):
         self.assertIn('"end of next week" = 2026-12-03', text)
 
     def test_table_rows_are_unchanged(self):
-        rows = [line for line in self.anchor().splitlines()
-                if line[:3] in {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
-                                "Sun"} and line[3] == " "]
-        self.assertEqual(len(rows), 7)
+        for memory in ({}, {"work_week": {"start": "sunday"}}):
+            rows = [line for line in self.anchor(**memory).splitlines()
+                    if line[:3] in {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+                                    "Sun"} and line[3] == " "]
+            self.assertEqual(len(rows), 7)
+
+
+class AnchorDayTest(unittest.TestCase):
+    ZONED = {"timezone": "Asia/Jerusalem"}
+
+    def test_a_plain_date_is_used_as_written(self):
+        self.assertEqual(llm.anchor_day(self.ZONED, {"date": "2026-11-24"},
+                                        localize=True),
+                         datetime.date(2026, 11, 24))
+
+    def test_a_timestamp_converts_to_the_configured_zone(self):
+        item = {"date": "2026-11-24T23:30:00Z"}
+        self.assertEqual(llm.anchor_day(self.ZONED, item, localize=True),
+                         datetime.date(2026, 11, 25))
+        self.assertEqual(llm.anchor_day(self.ZONED, item),
+                         datetime.date(2026, 11, 24))
+
+    def test_no_zone_or_a_naive_timestamp_keeps_the_date_part(self):
+        self.assertEqual(
+            llm.anchor_day({}, {"date": "2026-11-24T23:30:00Z"},
+                           localize=True), datetime.date(2026, 11, 24))
+        self.assertEqual(
+            llm.anchor_day(self.ZONED, {"date": "2026-11-24T23:30:00"},
+                           localize=True), datetime.date(2026, 11, 24))
+
+    def test_a_missing_date_falls_back_to_today(self):
+        today = datetime.date(2026, 11, 4)
+        self.assertEqual(llm.anchor_day({}, {}, today=today, localize=True),
+                         today)
 
 
 # --- the override wiring ------------------------------------------------------
@@ -225,6 +402,9 @@ class DateAnchorWeekTest(unittest.TestCase):
 MEETING_DATE = "2026-10-01"  # a Thursday
 LINE = f"[00:12:03] {base.NAME}: I will send the revised plan early next week."
 PLAIN_LINE = f"[00:12:03] {base.NAME}: I will send the revised plan."
+TWO_LINE = (f"[00:12:03] {base.NAME}: I will send it tomorrow, or early "
+            "next week at the latest.")
+OPT_IN = {"start": "monday", "days": 5}
 
 
 def routine_with(week=None, due_dates=False):
@@ -245,48 +425,92 @@ class OwnerActionOverrideTest(base.CaptureHarness):
         (row,) = self.store.todos().values()
         return row
 
+    def body(self, due):
+        return (f"From meeting e1 at {base.TS} "
+                f"(evidence: meeting-owner-action){due}.")
+
+    def test_without_work_week_nothing_changes_byte_for_byte(self):
+        for due_dates in (False, True):
+            self.store = base.FakeStore()
+            row = self.filed(LINE, "Send the revised plan by Monday",
+                             "2026-10-02", due_dates=due_dates)
+            self.assertEqual(row["body"], self.body("; due 2026-10-02"))
+            self.assertEqual(row["flags"].get("--due"),
+                             "2026-10-02" if due_dates else None)
+
+    def test_without_work_week_review_rows_are_unchanged(self):
+        routine = routine_with()
+        routine["memory"]["owner_todos"]["mode"] = "review"
+        rows = []
+        with mock.patch.object(memory_sink, "file_action_review",
+                               side_effect=lambda *a, **k: rows.extend(
+                                   k["candidates"]) or {}):
+            self.capture(
+                base.meeting_extraction(
+                    [base.act("Send the plan tomorrow", due="2026-10-02")]),
+                item=base.meeting_item(LINE), routine=routine)
+        self.assertEqual(rows, [{
+            "text": "Send the plan tomorrow", "evidence_ts": base.TS,
+            "due": "2026-10-02", "status": "valid", "reason": None,
+            "quote": LINE[len("[00:12:03] "):]}])
+
     def test_phrase_on_the_owner_line_overrides_the_model_due(self):
-        row = self.filed(LINE, "Send the revised plan", "2026-10-02")
-        self.assertIn("due 2026-10-06", row["body"])  # Tuesday
-        self.assertNotIn("2026-10-02", row["body"])
+        row = self.filed(LINE, "Send the revised plan", "2026-10-02",
+                         week=OPT_IN)
+        self.assertEqual(row["body"], self.body("; due 2026-10-06"))  # Tuesday
 
     def test_the_configured_week_changes_the_date(self):
         row = self.filed(LINE, "Send the revised plan", "2026-10-02",
                          week={"start": "sunday", "days": 5})
-        self.assertIn("due 2026-10-05", row["body"])  # Monday
+        self.assertEqual(row["body"], self.body("; due 2026-10-05"))  # Monday
 
-    def test_phrase_in_the_action_text_when_the_line_has_none(self):
-        row = self.filed(PLAIN_LINE, "Send the plan by Monday", None)
+    def test_the_action_text_is_checked_before_the_line(self):
+        row = self.filed(LINE, "Send the plan by Monday", "2026-10-02",
+                         week=OPT_IN)
+        self.assertEqual(row["body"], self.body("; due 2026-10-05"))
+        row = self.filed(PLAIN_LINE, "Send the plan by Monday", None,
+                         week=OPT_IN)
         self.assertIn("due 2026-10-05", row["body"])
 
-    def test_the_owner_line_wins_over_the_action_text(self):
-        row = self.filed(LINE, "Send the plan by Monday", "2026-10-02")
-        self.assertIn("due 2026-10-06", row["body"])
+    def test_an_ambiguous_action_text_keeps_the_model_due(self):
+        row = self.filed(LINE, "Send it tomorrow or by Monday", "2026-10-08",
+                         week=OPT_IN)
+        self.assertEqual(row["body"], self.body("; due 2026-10-08"))
+
+    def test_the_line_counts_only_with_exactly_one_phrase(self):
+        row = self.filed(TWO_LINE, "Send the revised plan", "2026-10-08",
+                         week=OPT_IN)
+        self.assertEqual(row["body"], self.body("; due 2026-10-08"))
 
     def test_no_phrase_keeps_the_model_due(self):
-        row = self.filed(PLAIN_LINE, "Send the revised plan", "2026-10-08")
+        row = self.filed(PLAIN_LINE, "Send the revised plan", "2026-10-08",
+                         week=OPT_IN)
         self.assertIn("due 2026-10-08", row["body"])
 
     def test_no_phrase_and_no_model_due_means_no_due(self):
-        row = self.filed(PLAIN_LINE, "Send the revised plan", None)
-        self.assertNotIn("due ", row["body"])
+        row = self.filed(PLAIN_LINE, "Send the revised plan", None,
+                         week=OPT_IN)
+        self.assertEqual(row["body"], self.body(""))
 
-    def test_due_flag_reaches_the_store_only_when_enabled(self):
-        off = self.filed(LINE, "Send the revised plan", None)
+    def test_the_due_flag_matches_the_body_and_needs_due_dates(self):
+        off = self.filed(LINE, "Send the revised plan", None, week=OPT_IN)
         self.assertNotIn("--due", off["flags"])
+        self.assertIn("due 2026-10-06", off["body"])
         self.store = base.FakeStore()
-        on = self.filed(LINE, "Send the revised plan", None, due_dates=True)
+        on = self.filed(LINE, "Send the revised plan", None, week=OPT_IN,
+                        due_dates=True)
         self.assertEqual(on["flags"]["--due"], "2026-10-06")
+        self.assertIn("due 2026-10-06", on["body"])
 
     def test_no_phrase_but_model_due_is_sent_when_enabled(self):
         row = self.filed(PLAIN_LINE, "Send the revised plan", "2026-10-08",
-                         due_dates=True)
+                         week=OPT_IN, due_dates=True)
         self.assertEqual(row["flags"]["--due"], "2026-10-08")
+        self.assertIn("due 2026-10-08", row["body"])
 
     def test_review_mode_candidate_gets_the_coded_due(self):
-        routine = routine_with()
+        routine = routine_with(week=OPT_IN)
         routine["memory"]["owner_todos"]["mode"] = "review"
-        item = base.meeting_item(LINE)
         rows = []
         with mock.patch.object(memory_sink, "file_action_review",
                                side_effect=lambda *a, **k: rows.extend(
@@ -294,7 +518,7 @@ class OwnerActionOverrideTest(base.CaptureHarness):
             self.capture(
                 base.meeting_extraction(
                     [base.act("Send the revised plan", due="2026-10-02")]),
-                item=item, routine=routine)
+                item=base.meeting_item(LINE), routine=routine)
         self.assertEqual([c["due"] for c in rows], ["2026-10-06"])
 
 
@@ -333,6 +557,21 @@ class EntryDueOverrideTest(base.CaptureHarness):
             entry(title="Send the deck by Tuesday", body="Deck.", due=None),
             due_dates=True)
         self.assertEqual(flags["--due"], "2026-10-06")
+
+    def test_phrases_that_disagree_keep_the_model_due(self):
+        flags = self.added(
+            entry(title="Send the deck tomorrow", due="2026-10-09"),
+            due_dates=True)
+        self.assertEqual(flags["--due"], "2026-10-09")
+
+    def test_a_timestamp_anchor_uses_the_configured_zone(self):
+        routine = routine_with(due_dates=True)
+        routine["timezone"] = "Asia/Jerusalem"
+        item = slack_item("2026-11-24T23:30:00Z")  # already the 25th there
+        self.capture(entry(body="Send it tomorrow.", due=None), item=item,
+                     routine=routine)
+        (row,) = self.store.entries.values()
+        self.assertEqual(row["flags"]["--due"], "2026-11-26")
 
     def test_no_phrase_keeps_the_model_due(self):
         flags = self.added(entry(body="Send the deck.", due="2026-10-09"),

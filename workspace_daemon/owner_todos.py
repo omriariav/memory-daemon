@@ -435,11 +435,17 @@ def grounded_in_body(body, text, names):
 
 def apply_due_phrase(action, anchor, week, line=None):
     """`action` with its `due` replaced by the code-resolved date of a
-    relative phrase ("early next week", "by Thursday", ...) found in the
-    owner's own transcript `line` first, else the action text. The model's
-    `due` stays when no phrase matches. Never mutates `action`."""
-    due = due_phrases.resolve_first(
-        (line, action.get("line"), action.get("text")), anchor, week)
+    relative phrase ("early next week", "by Thursday", ...). The action text
+    is checked first and decides whenever it holds a phrase (an ambiguous one
+    leaves the model's `due`); only when it has none is the owner's spoken
+    `line`, used when it holds exactly one phrase. The model's `due` stays
+    when nothing resolves. Never mutates `action`."""
+    count, due = due_phrases.analyse(action.get("text"), anchor, week)
+    if not count:
+        count, due = due_phrases.analyse(
+            line or action.get("line"), anchor, week)
+        if count != 1:
+            due = None
     return dict(action, due=due) if due else action
 
 

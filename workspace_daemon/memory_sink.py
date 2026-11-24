@@ -1316,8 +1316,9 @@ def _entry_due(routine, item, entry, etype):
             or etype not in ("todo", "pending-decision"):
         return None
     from . import llm  # late import to avoid cycles
-    coded = due_phrases.resolve_first(
-        (entry.get("title"), entry.get("body")), llm.anchor_day(routine, item),
+    coded = due_phrases.resolve(
+        f"{entry.get('title') or ''}\n{entry.get('body') or ''}",
+        llm.anchor_day(routine, item, localize=True),
         due_phrases.week_from_routine(routine))
     if coded:
         return coded
@@ -1327,6 +1328,18 @@ def _entry_due(routine, item, entry, etype):
             if isinstance(model, str) and len(model) == 10 else None
     except ValueError:
         return None
+
+
+def _with_phrase_due(routine, action, date, line=None):
+    """An owner action with the code-resolved due date of a relative phrase
+    (see owner_todos.apply_due_phrase). Only a routine that sets
+    `memory.work_week` opts in; any other gets `action` back untouched."""
+    if not due_phrases.configured(routine):
+        return action
+    from . import llm  # late import to avoid cycles
+    anchor = llm.anchor_day(routine, {"date": date}, localize=True)
+    return owner_todos.apply_due_phrase(
+        action, anchor, due_phrases.week_from_routine(routine), line)
 
 
 def _parse_extraction(raw):
@@ -2498,9 +2511,8 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
                 body, ts, names, mapped)
             if grounded:
                 c["quote"] = quote
-                c.update(owner_todos.apply_due_phrase(
-                    c, item.get("date", ""),
-                    due_phrases.week_from_routine(routine), quote))
+                c.update(_with_phrase_due(
+                    routine, c, item.get("date", ""), quote))
                 continue
             c["status"] = "ungrounded"
             c["reason"] = "no owner-spoken transcript line at the timestamp"
@@ -2668,9 +2680,8 @@ def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
         routine, cfg.get("tags") or [], ptag, is_personal
     ) + [AUTO_TAG]))
     counts = {}
-    week = due_phrases.week_from_routine(routine)
     for action in actions:
-        action = owner_todos.apply_due_phrase(action, date, week)
+        action = _with_phrase_due(routine, action, date)
         text = action["text"]
         if personal.redact_enabled(cfg):
             text, _ = personal.redact(text)
