@@ -356,15 +356,19 @@ SAVED_NOTE = (
     "content. Say what it is about and why it matters. Lines marked as "
     "preceding context are earlier messages shown only as background: use "
     "them to name the topic the saved message refers to, but the saved "
-    "message is the item."
+    "message is the item. Take people, requests, decisions, to-dos and the "
+    "owner's commitments from the saved message only; if you mention a fact "
+    "from the background context, label it as earlier context (for example "
+    "\"Earlier in the channel: ...\") and never present it as an action for "
+    "anyone."
 )
 
 
 def is_saved(item):
-    """Whether the owner explicitly asked to save this item (a Slack save
-    reaction or a source that lists only saved items)."""
-    meta = (item or {}).get("frontmatter") or {}
-    return meta.get("slack_saved") is True or meta.get("saved_request") is True
+    """Whether the owner explicitly asked to save this item (one rule, shared
+    with the memory sink)."""
+    from . import memory_sink  # late import to avoid cycles
+    return memory_sink.is_saved_request((item or {}).get("frontmatter"))
 
 
 def build_prompt(routine, item, label_catalog):

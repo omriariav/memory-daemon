@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import contacts, drive, labels, llm, memory_sink
+from workspace_daemon.chat_text import CONTEXT_END, CONTEXT_START
 
 # Verbatim `slugs list --kind person` output from personal-memory (2026-07).
 # The count column broke the original parser: it returned an empty set, and the
@@ -974,16 +975,63 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertIn("Cost of the example rollout", calls["stdin"])
         self.assertNotIn("no durable content", calls["stdin"])
 
-    def test_saved_title_fallback_uses_the_message_when_summary_is_bad(self):
+    def test_saved_title_fallback_never_uses_the_message_text(self):
         self.saved()
         self.item["title"] = "Use the second option for the example rollout"
         bad = self.verdict("no-durable-content")
         _, calls = self._run_capture(
             [bad, bad], summary="Nothing to capture here.",
         )
-        self.assertEqual(
-            self.title(calls), "Use the second option for the example rollout"
+        self.assertEqual(self.title(calls), "Saved item 2026-07-27")
+        self.item["frontmatter"]["slack_channel"] = "C0EXAMPLE01"
+        _, calls = self._run_capture(
+            [bad, bad], summary="Nothing to capture here.",
         )
+        self.assertEqual(self.title(calls), "Saved Slack message 2026-07-27")
+        self.item["date"] = ""
+        _, calls = self._run_capture(
+            [bad, bad], summary="Nothing to capture here.",
+        )
+        self.assertEqual(self.title(calls), "Saved Slack message")
+
+    def test_a_veto_with_an_ordinary_title_only_flips_worthy(self):
+        self.saved()
+        outcome, calls = self._run_capture([
+            self.verdict("Rollout cost question", worthy=False),
+        ])
+        self.assertEqual(outcome["memory"], "created")
+        self.assertEqual(self.extract.call_count, 1)
+        self.assertEqual(self.title(calls), "Rollout cost question")
+
+    def test_a_real_title_that_contains_a_phrase_is_kept(self):
+        self.saved()
+        _, calls = self._run_capture([
+            self.verdict("Decision: no durable queue for events",
+                         body="The cache has no durable backing store, so "
+                              "a restart loses queued jobs; add one before "
+                              "launch and track it in the backlog."),
+        ])
+        self.assertEqual(self.extract.call_count, 1)
+        self.assertEqual(
+            self.title(calls), "Decision: no durable queue for events")
+        self.assertIn("backing store", calls["stdin"])
+
+    def test_forced_fallback_summary_keeps_the_saved_message(self):
+        context = "x" * 5000
+        body = (
+            f"{CONTEXT_START}\n[t] A: {context}\n{CONTEXT_END}\n"
+            "[t] B: the saved message text"
+        )
+        out = memory_sink._saved_fallback_summary({"body": body})
+        self.assertIn("the saved message text", out)
+        self.assertLess(out.index("the saved message text"),
+                        out.index("Background only") if "Background only"
+                        in out else len(out))
+        self.assertLessEqual(len(out), 2400)
+        self.assertNotIn(CONTEXT_START, out)
+        plain = memory_sink._saved_fallback_summary({"body": "only text"})
+        self.assertIn("only text", plain)
+        self.assertNotIn("Background only", plain)
 
     def test_saved_item_with_a_good_title_is_not_regenerated(self):
         self.saved()
@@ -1012,7 +1060,8 @@ class CaptureValidationTest(unittest.TestCase):
             "No durable content", "no-durable-content", "NO_DURABLE_CONTENT",
             "Not memory-worthy", "not memory worthy", "Nothing to capture",
             "nothing-to-capture here", "Not worth keeping",
-            "nothing worth saving", "No durable content in the thread",
+            "nothing worth saving", "No durable content in thread",
+            "This item has no durable content",
         ):
             with self.subTest(text=text):
                 self.assertTrue(memory_sink.says_not_worth_keeping(text))
@@ -1020,9 +1069,33 @@ class CaptureValidationTest(unittest.TestCase):
             "Rollout cost question", "Durable storage decision",
             "Capture the rollout plan", "", None,
             "Not worth the price: vendor renewal",
+            "Decision: no durable queue for events",
+            "Logs are not worth keeping beyond 30 days",
+            "Nothing to record in the audit for Q3",
+            "Cache has no durable backing store; restart loses jobs",
         ):
             with self.subTest(text=text):
                 self.assertFalse(memory_sink.says_not_worth_keeping(text))
+
+    def test_not_worth_keeping_bodies(self):
+        for text in (
+            "There is no durable content here.",
+            "Nothing to capture.",
+            "No durable content. The message is a short remark about "
+            "something that is not described anywhere in this note at all.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(memory_sink.body_says_not_worth_keeping(text))
+        for text in (
+            "The cache has no durable backing store, so a restart loses "
+            "queued jobs. The team agreed to add one before the launch and "
+            "to track the work in the platform backlog.",
+            "Pricing for the example plan was agreed. Logs are not worth "
+            "keeping beyond 30 days, so retention drops to 30.",
+            "", None,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(memory_sink.body_says_not_worth_keeping(text))
 
     def test_unsaved_not_worthy_thread_is_still_skipped(self):
         self.item["frontmatter"]["slack_owner_evidence"] = []

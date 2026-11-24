@@ -606,6 +606,30 @@ def discovery_warnings(routines):
     return out
 
 
+def saved_context_warnings(routines):
+    """Saved-message context is on (the default) but cannot be read.
+
+    Warnings, not errors: capture still works, without the preceding messages.
+    """
+    out = []
+    for routine in routines:
+        for source in sources(routine):
+            if source.get("kind") != "slack_mcp" or source.get("read_channel_tool"):
+                continue
+            count = source.get("saved_context_messages", 5)
+            if (
+                _bounded_int(count, 0, 20) and count > 0
+                and (source.get("save_reactions")
+                     or "saved_context_messages" in source)
+            ):
+                out.append(
+                    f"{routine.get('id', '?')}: saved_context_messages is on "
+                    "but read_channel_tool is not set, so saved channel "
+                    "messages are captured without preceding context"
+                )
+    return out
+
+
 def budget_cap(routine):
     """The routine's budget.daily_usd, or None when unset or malformed."""
     budget = routine.get("budget")

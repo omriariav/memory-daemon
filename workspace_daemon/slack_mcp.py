@@ -57,7 +57,9 @@ context, not the saved message: the saved message stays the anchor and source
 id (no id or ledger-key change). The read is one bridge session per up to
 THREADS_PER_SESSION such messages, under the same planned-call match as other
 reads; it happens only when the thread read confirms the message has no
-replies, and a failed read only logs a warning and captures without context.
+replies, and a failed read only logs a warning and captures without context
+(an outage or sleep, or a budget or pause stop, holds the capture instead).
+Context is background only and bounded to half of `max_thread_chars`.
 A saved thread reply still reads from its thread root. DMs keep `dm_sessions`
 (or the plain thread read), and excluded channels and self-DMs are never read.
 
@@ -148,7 +150,8 @@ from . import (
     sleepclock, state, watch_joins,
 )
 from .chat_text import (
-    redact_secrets, slack_timestamp_iso, timestamped_line,
+    CONTEXT_END, CONTEXT_START, redact_secrets, slack_timestamp_iso,
+    strip_context_markers, timestamped_line,
 )
 from .shell import log, utc_now_iso
 
@@ -1670,6 +1673,7 @@ def _group(cfg, found):
                 hit["root"] == hit["ts"] and not hit["replies"]
                 and not hit.get("dm_session")
                 and comms_inbox.channel_type(hit) == "channel"
+                and hit["label"] not in DM_LABELS
             ):
                 # A top-level channel message nobody replied to: its meaning
                 # may sit in the messages just before it.
@@ -3160,6 +3164,15 @@ def _read_dm_sessions(batch, wanted):
         }
 
 
+def _lone(batch, key):
+    """Whether the thread read of `key` succeeded and found no replies."""
+    outcome = batch["threads"].get(key)
+    if not outcome or outcome["status"] != "ok":
+        return False
+    _parent, replies, more = outcome["parsed"]
+    return not replies and not more
+
+
 def _read_context(batch, wanted):
     """One bridge session reading the channel messages before saved messages.
 
@@ -3175,11 +3188,13 @@ def _read_context(batch, wanted):
     """
     cfg = batch["cfg"]
     done = batch.setdefault("context", {})
+    if batch.get("context_outage"):
+        raise claude_bridge.BridgeOutage(batch["context_outage"])
     wanted_keys = batch.get("context_keys", ())
     order = batch["order"]
     todo = [wanted] + [
         key for key in order[order.index(wanted) + 1:]
-        if key in wanted_keys and key not in done
+        if key in wanted_keys and key not in done and _lone(batch, key)
     ]
     todo = todo[:THREADS_PER_SESSION]
     hours = cfg["saved_context_hours"]
@@ -3198,7 +3213,11 @@ def _read_context(batch, wanted):
             cfg, cfg["read_channel_tool"], {}, calls,
             "channel context read", [],
         )
-    except claude_bridge.GUARD_STOPS:
+    except (claude_bridge.BridgeOutage,) + claude_bridge.GUARD_STOPS as exc:
+        # An outage (or sleep) says nothing about the message: hold the
+        # capture for the next run rather than store it without context.
+        if isinstance(exc, claude_bridge.BridgeOutage):
+            batch["context_outage"] = str(exc)
         raise
     except claude_bridge.BridgeError as exc:
         log(f"slack_mcp: WARN saved-message context read failed ({exc}); "
@@ -3224,39 +3243,49 @@ def _read_context(batch, wanted):
         done[key] = before[-limit:]
 
 
-def _context_block(context, cfg):
-    """(frontmatter count, text) marking earlier messages as background."""
+def _context_block(context, cfg, saved_chars=0):
+    """(frontmatter count, text) marking earlier messages as background.
+
+    Bounded so that with the saved message (`saved_chars`) the body stays
+    within `max_thread_chars`, and to at most half of it. Message text is
+    data: marker look-alikes are removed and continuation lines indented, so a
+    message cannot close the block or pose as a line of its own.
+    """
     messages = [
-        m for m in context
+        dict(m, text="\n".join(
+            line.strip() for line in strip_context_markers(
+                m["text"]).split("\n") if line.strip()
+        ))
+        for m in context
         if m["text"].strip() and (cfg["include_bots"] or not m["is_bot"])
     ]
-    if not messages:
+    messages = [m for m in messages if m["text"]]
+    budget = min(
+        cfg["max_thread_chars"] // 2,
+        max(0, cfg["max_thread_chars"] - saved_chars),
+    )
+    if not messages or budget < 50:
         return 0, ""
-    bounded = _bound_session(messages, False, cfg["max_thread_chars"])
+    bounded = _bound_session(messages, False, budget, floor=50)
     lines = [
         timestamped_line(
             slack_timestamp_iso(m["ts"]), m["name"] or m["user"], m["text"]
-        )
+        ).replace("\n", "\n    ")
         for m in bounded
     ]
     return len(bounded), (
-        "[Preceding channel context: earlier top-level messages from the "
-        "same channel, shown only so the saved message can be understood. "
-        "They are NOT the saved message; the memory owner saved only the "
-        "message after this block.]\n"
-        + "\n".join(lines)
-        + "\n[End of preceding context. The saved message follows.]\n"
+        CONTEXT_START + "\n" + "\n".join(lines) + "\n" + CONTEXT_END + "\n"
     )
 
 
-def _bound_session(messages, incomplete, max_chars):
+def _bound_session(messages, incomplete, max_chars, floor=500):
     """Newest messages within max_chars, oldest dropped first.
 
     The newest is always kept (truncated only if it alone exceeds the
     budget). No message is promoted to a "parent": when anything older is
     missing the oldest kept message carries an omission note.
     """
-    budget = max(500, int(max_chars))
+    budget = max(floor, int(max_chars))
     used = 0
     kept = []
     for message in reversed(messages):
@@ -3375,18 +3404,19 @@ def fetch(routine, candidate, source=None):
             if r["user"] == cfg["self_user_id"] and r["ts"] not in seen else r
             for r in replies
         ]
+    messages = bound_thread(
+        parent, replies, more, cfg["max_thread_chars"],
+        raw.get("reply_hint") or 0,
+    )
     context_count, context_text = 0, ""
     if raw.get("context_wanted") and lone:
         # Still a lone message (the thread read agrees with the search).
         if key not in batch.get("context", {}):
             _read_context(batch, key)
         context_count, context_text = _context_block(
-            batch["context"].get(key) or [], cfg
+            batch["context"].get(key) or [], cfg,
+            sum(len(m["text"]) for m in messages),
         )
-    messages = bound_thread(
-        parent, replies, more, cfg["max_thread_chars"],
-        raw.get("reply_hint") or 0,
-    )
     names = {}
     for message in messages:
         names.setdefault(message["user"], message["name"] or message["user"])

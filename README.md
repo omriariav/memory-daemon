@@ -2579,20 +2579,33 @@ default 24). Both settings go in the watch file or the source (an inline source
 value wins). The messages reach the summary and the extractor marked as
 preceding context, not the saved message, so the entry names the topic; the
 saved message stays the anchor and source id, so ids and ledger keys do not
-change. The read shares the bridge sessions (up to eight saved messages per
-session), follows the same planned-call match as the other reads and is bounded
-by `max_thread_chars` (newest kept). It runs only when the thread read confirms
-there are no replies, never for excluded channels or self-DMs, and a failed read
-logs a warning and captures the message without context (a budget or pause stop
-still holds the capture). A saved thread reply still reads the whole thread
-from its root.
+change. Context is background only: people, requests, decisions, to-dos and the
+owner's commitments come from the saved message, the summary labels any fact
+taken from the context as earlier context, and context never adds owner
+evidence. Message text cannot forge the context markers (look-alikes are
+removed, continuation lines indented). The read shares the bridge sessions (up
+to eight saved messages whose thread read showed no replies per session),
+follows the same planned-call match as the other reads and is bounded so the
+context is at most half of `max_thread_chars` and, with the saved message, stays
+within it (newest kept). It runs only when the thread read confirms there are no
+replies, never for DMs (any message labeled DM or Group DM), excluded channels
+or self-DMs. A failed or unparseable read logs a warning and captures the
+message without context; a bridge outage (or a machine sleep) or a budget or
+pause stop holds the capture for the next run instead. `daemon.py validate`
+warns when the setting is on but `read_channel_tool` is not set. A saved thread
+reply still reads the whole thread from its root.
 
 A saved item never gets a "not worth keeping" title. The summary and extraction
-prompts say the owner explicitly saved it. If the extractor still returns a
-title such as "no durable content", "not memory-worthy" or "nothing to capture"
-(any case, hyphen, space or underscore), or vetoes the item, it is asked once
-more; if the title is still such a verdict, it is built from the summary or the
-message text instead, and a body that says the same is replaced by the summary.
+prompts say the owner explicitly saved it. Only a verdict-shaped title counts:
+one that opens with a phrase such as "no durable content", "not memory-worthy"
+or "nothing to capture" (any case, hyphen, space or underscore) followed by at
+most three other words. "Decision: no durable queue for events" is a real title.
+On such a title the extractor is asked once more; if it is still a verdict, the
+title is the summary's first sentence, else a neutral "Saved Slack message
+<date>" (never the message text). A veto with an ordinary title only flips the
+item to kept. A body that is itself such a verdict (short, or leading with one)
+is replaced by the summary. If the forced summary cannot run, the raw fallback
+puts the saved message first and the context after it.
 
 Its ledger key is `saved:slack:<channel>:<root>`, recorded only after the memory
 write succeeds. So a thread reacted twice, or with two emoji, is saved once; a
