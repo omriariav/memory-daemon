@@ -75,6 +75,8 @@ if HAVE_TEXTUAL:
             self.draft_reply = launcher.Draft(True, {}, [], "")
             self.launch_reply = Result(True, "started", name="")
             self.draft_cancelled = False
+            self.ignore_cancel = False     # answer even after a cancel
+            self.draft_done = False
 
         def task_draft(self, item, fields, taken=(), cancel=None):
             self.drafts.append((item.key, dict(fields), set(taken)))
@@ -82,8 +84,10 @@ if HAVE_TEXTUAL:
             while time.time() < end:
                 if cancel is not None and cancel.is_set():
                     self.draft_cancelled = True
-                    return launcher.Draft(False, {}, [], "cancelled")
+                    if not self.ignore_cancel:
+                        return launcher.Draft(False, {}, [], "cancelled")
                 time.sleep(0.01)
+            self.draft_done = True
             return self.draft_reply
 
         def task_launch(self, item, fields):
@@ -298,6 +302,21 @@ class ModalTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(screen.query_one("#task-persona").display)
             self.assertTrue(screen.query_one("#task-template").display)
 
+    async def test_extra_draft_fields_are_sent_back_in_the_launch(self):
+        app, acts, _f = make_app([plain()])
+        acts.draft_reply = launcher.Draft(
+            True, {"goal": "Drafted goal"}, [], "",
+            {"look_at": ["doc-a", "doc-b"]})
+        async with app.run_test(size=SIZE) as pilot:
+            screen = await self.open_modal(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: "draft ready" in screen.status))
+            await pilot.press("enter")
+            self.assertTrue(await until(pilot, lambda: acts.launches))
+            fields = acts.launches[0][1]
+            self.assertEqual(fields["look_at"], ["doc-a", "doc-b"])
+            self.assertEqual(fields["goal"], "Drafted goal")
+
     async def test_a_failed_draft_keeps_the_defaults_and_still_launches(self):
         app, acts, _f = make_app([plain()])
         acts.draft_reply = launcher.Draft(False, {}, [], "model timed out")
@@ -327,7 +346,8 @@ class ModalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_enter_before_the_draft_returns_launches_the_defaults(self):
         app, acts, _f = make_app([plain()])
-        acts.draft_wait = 5
+        acts.draft_wait = 1.0
+        acts.ignore_cancel = True          # the draft still answers, ok, late
         acts.draft_reply = launcher.Draft(True, {"goal": "too late"}, [], "")
         async with app.run_test(size=SIZE) as pilot:
             screen = await self.open_modal(pilot, app)
@@ -341,9 +361,71 @@ class ModalTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fields["role"], "researcher")
             self.assertEqual(fields["goal"],
                              "Look into: Check the rollout plan 1")
-            # the draft that was still running is stopped, and never applied
+            # the draft was asked to stop, and it answered ok anyway
             self.assertTrue(await until(pilot, lambda: acts.draft_cancelled))
-            self.assertNotIn("too late", fields["goal"])
+            self.assertTrue(await until(pilot, lambda: acts.draft_done,
+                                        tries=100))
+            await pilot.pause(0.3)
+            # ... and is ignored: the closed modal is untouched
+            self.assertEqual(screen.form.goal,
+                             "Look into: Check the rollout plan 1")
+            self.assertNotIn("draft ready", screen.status)
+            # a late `_task_drafted` for a closed modal does nothing either
+            app._task_drafted(app.current, screen, acts.draft_reply)
+            self.assertEqual(screen.form.goal,
+                             "Look into: Check the rollout plan 1")
+            self.assertEqual(len(acts.launches), 1)
+
+    async def test_a_key_typed_just_before_the_draft_is_not_overwritten(self):
+        app, acts, _f = make_app([plain()])
+        acts.draft_wait = 5
+        async with app.run_test(size=SIZE) as pilot:
+            screen = await self.open_modal(pilot, app)
+            # the value changed but its Changed message has not been handled
+            screen.query_one("#task-goal").value = "typed just now"
+            self.assertNotIn("goal", screen.form.touched)
+            done = screen.fill(launcher.Draft(
+                True, {"goal": "drafted goal", "name": "drafted-name"}, [],
+                ""))
+            self.assertEqual(done, ["name"])
+            self.assertEqual(screen.form.goal, "typed just now")
+            self.assertIn("goal", screen.form.touched)
+            self.assertEqual(screen.query_one("#task-goal").value,
+                             "typed just now")
+            self.assertEqual(screen.form.name, "drafted-name")
+
+    async def test_modal_keys_do_not_leak_to_the_queue(self):
+        app, acts, _f = make_app([plain(1), plain(2)])
+        async with app.run_test(size=SIZE) as pilot:
+            screen = await self.open_modal(pilot, app)
+            before = (app.view, app.current_key)
+            for key in ("3", "4", "5", "6", "d", "s", "x", "y", "j", "k",
+                        "o", "u", "w", "space"):
+                await pilot.press(key)
+            await pilot.pause(0.3)
+            self.assertIs(modal(app), screen)
+            self.assertEqual((app.view, app.current_key), before)
+            self.assertEqual(list(app.pending), [])
+            self.assertEqual([c for c in acts.calls
+                              if c[0] in ("mark_done", "snooze", "open")], [])
+            self.assertEqual(screen.form.role, "reader")        # 4: its chip
+
+    async def test_chip_letters_typed_in_a_line_stay_text(self):
+        app, acts, _f = make_app([plain()])
+        async with app.run_test(size=SIZE) as pilot:
+            screen = await self.open_modal(pilot, app)
+            await pilot.press("g")                     # into the goal line
+            for key in ("m", "e", "t", "a", "n", "p", "g", "1", "2"):
+                await pilot.press(key)
+            form = screen.form
+            self.assertTrue(form.goal.endswith("metanpg12"), form.goal)
+            self.assertEqual((form.model, form.effort, form.template),
+                             ("", "", ""))
+            self.assertEqual(form.role, "researcher")
+            self.assertFalse(screen.expanded)
+            self.assertEqual(screen.query_one("#task-goal").value, form.goal)
+            self.assertEqual(app.focused.id, "task-goal")
+
 
     async def test_esc_cancels_and_launches_nothing(self):
         app, acts, _f = make_app([plain()])
@@ -471,6 +553,78 @@ class LaunchTest(unittest.IsolatedAsyncioTestCase):
                                    for n in app._notifications)))
             self.assertTrue(app.is_running)
 
+    async def test_an_unclear_launch_is_a_warning_and_counts_as_launched(self):
+        app, acts, _f = make_app([plain()])
+        acts.launch_reply = Result(
+            False, "launch result unclear; it may have started (check the "
+            "Agents view) (timed out after 30s)", unclear=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await self.start(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: any(n.title == "Task may have started"
+                                   for n in app._notifications)))
+            note = next(n for n in app._notifications
+                        if n.title == "Task may have started")
+            self.assertEqual(note.severity, "warning")
+            self.assertIn("launch result unclear", note.message)
+            self.assertFalse(any(n.title == "Task not started"
+                                 for n in app._notifications))
+            self.assertIn("t:1", app._task_launched)
+            await pilot.press("t")
+            await pilot.pause(0.2)
+            self.assertIsNone(modal(app))
+
+    async def test_a_failed_launch_does_not_block_a_retry(self):
+        app, acts, _f = make_app([plain()])
+        acts.launch_reply = Result(False, "refused")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.start(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: any(n.title == "Task not started"
+                                   for n in app._notifications)))
+            self.assertNotIn("t:1", app._task_launched)
+            await pilot.press("t")
+            self.assertTrue(await until(pilot, lambda: modal(app)))
+            await pilot.press("escape")
+
+    async def test_the_double_launch_window_is_closed_until_the_card_shows(
+            self):
+        app, acts, fetch = make_app([plain()])
+        acts.launch_reply = Result(True, "started", name="plan-check")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.start(pilot, app)
+            self.assertTrue(await until(pilot, lambda: acts.launches))
+            self.assertTrue(await until(
+                pilot, lambda: "t:1" in app._task_launched))
+            self.assertNotIn("t", dict(app.hints()))
+            await pilot.press("t")
+            await pilot.pause(0.2)
+            self.assertIsNone(modal(app))
+            self.assertTrue(any("just started from this row" in t
+                                for t in toasts(app)))
+            self.assertEqual(len(acts.launches), 1)
+            # the card shows: the guard gives way to the badge's own rule
+            fetch.rows = [plain(), agent(1, "t:1", name="plan-check")]
+            app.poll()
+            self.assertTrue(await until(
+                pilot, lambda: "t:1" not in app._task_launched))
+            self.assertIn("▶ plan-check", row_text(app, "t:1"))
+
+    async def test_the_guard_expires_after_a_few_polls(self):
+        from workspace_daemon.inbox import app as appmod
+        app, acts, fetch = make_app([plain()])
+        acts.launch_reply = Result(True, "started", name="plan-check")
+        async with app.run_test(size=SIZE) as pilot:
+            await self.start(pilot, app)
+            self.assertTrue(await until(
+                pilot, lambda: "t:1" in app._task_launched))
+            app._task_launched["t:1"][1] = appmod.TASK_WAIT_POLLS
+            for _ in range(appmod.TASK_WAIT_POLLS):
+                self.assertIn("t:1", app._task_launched)
+                app._task_age_launched()
+            self.assertNotIn("t:1", app._task_launched)
+            self.assertEqual(rowmenu.task_refusal(app, app._rows["t:1"]), "")
+
     async def test_a_second_t_on_the_row_is_refused_while_it_starts(self):
         app, acts, _f = make_app([plain()], undo_s=0.8)
         async with app.run_test(size=SIZE) as pilot:
@@ -593,13 +747,52 @@ class OpenReportTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             entries = {e.key: e.label for e in app.row_menu_entries()}
             self.assertEqual(entries["o"], "Open task report")
-            self.assertEqual(entries["O"], "Open the source link")
+            self.assertEqual(entries["<"], "Open the source link")
             await pilot.press("enter")
             self.assertTrue(await until(
                 pilot, lambda: isinstance(app.screen, RowMenu)))
-            await pilot.press("O")
+            await pilot.press("less_than_sign")
             self.assertTrue(await until(pilot, lambda: self.opens(acts)))
             self.assertEqual(self.opens(acts), ["t:1"])
+
+    async def test_a_custom_action_may_own_O_without_a_clash(self):
+        store = InboxStore(None)
+        acts = LauncherActions(store=store, draft_delay=0)
+        acts.custom_actions = [{"key": "O", "label": "Own letter",
+                                "argv": ["x"], "timeout_s": 60.0,
+                                "mark_done": True}]
+        app, acts, _f = make_app([plain(1), agent(
+            1, "t:1", state="completed", bucket="done", link=REPORT)], acts)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            entries = app.row_menu_entries()
+            keys = [e.key for e in entries]
+            self.assertEqual(len(keys), len(set(keys)), keys)
+            self.assertEqual(rowmenu.match_key(entries, "O").label,
+                             "Own letter")
+            self.assertEqual(rowmenu.match_key(entries, "<").label,
+                             "Open the source link")
+            for e in entries:
+                if e.label == "Open the source link":
+                    self.assertFalse(e.key.isalpha())
+
+    async def test_greater_than_on_the_queue_goes_to_the_task(self):
+        app, _a, _f = make_app([plain(1), agent(1, "t:1")])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("greater_than_sign",
+                          {b.key for b in InboxApp.BINDINGS})
+            await pilot.press("greater_than_sign")
+            self.assertTrue(await until(pilot, lambda: app.view == "agents"))
+            self.assertEqual(app.current_key, "ag:1")
+
+    async def test_badges_work_without_a_task_launcher(self):
+        app, _a, _f = make_app([plain(1), agent(1, "t:1")], FakeActions(
+            store=InboxStore(None), draft_delay=0))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("▶ scout-1", row_text(app, "t:1"))
+            self.assertIn(">", [e.key for e in app.row_menu_entries()])
 
     async def test_o_opens_the_row_while_the_task_runs(self):
         app, acts, _f = make_app([plain(1), agent(
@@ -608,7 +801,7 @@ class OpenReportTest(unittest.IsolatedAsyncioTestCase):
             await settle(pilot, app)
             entries = {e.key: e.label for e in app.row_menu_entries()}
             self.assertEqual(entries["o"], "Open link")
-            self.assertNotIn("O", entries)
+            self.assertNotIn("<", entries)
             await pilot.press("o")
             self.assertTrue(await until(pilot, lambda: self.opens(acts)))
             self.assertEqual(self.opens(acts), ["t:1"])

@@ -50,8 +50,20 @@ TERM_GRACE_S = 5
 FIELD_NAMES = ("name", "role", "model", "effort", "goal", "acceptance",
                "persona", "template")
 
-Draft = namedtuple("Draft", "ok fields templates message")
-Launched = namedtuple("Launched", "ok name message")
+# `extra`: draft fields the modal does not show (`{key: scalar | [str]}`),
+# kept and sent back unchanged in the launch call's `fields`.
+Draft = namedtuple("Draft", "ok fields templates message extra",
+                   defaults=({},))
+EXTRA_KEY = re.compile(r"\A[a-z][a-z0-9_]{0,31}\Z")
+MAX_EXTRA = 8
+EXTRA_STR_MAX = 2000
+EXTRA_LIST_MAX = 20
+EXTRA_ITEM_MAX = 500
+# `unclear`: the launch may have started (a timeout, a crash, a reply the
+# inbox cannot read); only an explicit `ok: false` is a failure.
+Launched = namedtuple("Launched", "ok name message unclear",
+                      defaults=(False,))
+UNCLEAR = "launch result unclear; it may have started (check the Agents view)"
 
 # Which role a row starts with, by what the row is. A name is used only when
 # the configured `roles:` list has it, else the first configured role.
@@ -66,16 +78,47 @@ _PR_LINK = re.compile(
 # --- the protocol ----------------------------------------------------------
 
 def request(action, item, fields):
-    """The stdin of one call."""
+    """The stdin of one call. `fields` may carry extra keys (see
+    `clean_extra`); they go along unchanged, after the known ones."""
+    out = dict(clean_extra(fields))
+    out.update({
+        "name": fields.get("name", ""), "role": fields.get("role", ""),
+        "model": fields.get("model", ""),
+        "effort": fields.get("effort", ""),
+        "goal": fields.get("goal", ""),
+        "acceptance": list(fields.get("acceptance") or []),
+        "persona": fields.get("persona", ""),
+        "template": fields.get("template", "")})
     return {"v": PROTOCOL_VERSION, "action": action, "item": item,
-            "fields": {
-                "name": fields.get("name", ""), "role": fields.get("role", ""),
-                "model": fields.get("model", ""),
-                "effort": fields.get("effort", ""),
-                "goal": fields.get("goal", ""),
-                "acceptance": list(fields.get("acceptance") or []),
-                "persona": fields.get("persona", ""),
-                "template": fields.get("template", "")}}
+            "fields": out}
+
+
+def clean_extra(raw):
+    """The keys of `raw` that are not modal fields, when their values are
+    safe to pass through: a key of `[a-z][a-z0-9_]{0,31}`, a value that is a
+    JSON scalar (a string of up to EXTRA_STR_MAX characters, a finite number,
+    a boolean, null) or a list of up to EXTRA_LIST_MAX strings of up to
+    EXTRA_ITEM_MAX. At most MAX_EXTRA keys; anything else is dropped. Values
+    are kept exactly as given."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        if (len(out) >= MAX_EXTRA or not isinstance(key, str)
+                or key in FIELD_NAMES or not EXTRA_KEY.match(key)):
+            continue
+        if isinstance(value, str):
+            ok = len(value) <= EXTRA_STR_MAX
+        elif isinstance(value, list):
+            ok = (len(value) <= EXTRA_LIST_MAX and all(
+                isinstance(v, str) and len(v) <= EXTRA_ITEM_MAX
+                for v in value))
+        else:
+            ok = value is None or isinstance(value, bool) or (
+                isinstance(value, (int, float)) and itm._is_number(value))
+        if ok:
+            out[key] = list(value) if isinstance(value, list) else value
+    return out
 
 
 def _load(text):
@@ -161,7 +204,7 @@ def parse_draft(text, cfg, taken=()):
     ok = _ok(doc)
     message = _message(doc)
     if not ok:
-        return Draft(False, {}, [], message)
+        return Draft(False, {}, [], message, {})
     templates = []
     raw = doc.get("templates")
     if isinstance(raw, list):
@@ -170,18 +213,29 @@ def parse_draft(text, cfg, taken=()):
                     and t not in templates):
                 templates.append(t)
     return Draft(True, _clean_fields(doc.get("fields"), cfg, taken),
-                 templates[:MAX_TEMPLATES], message)
+                 templates[:MAX_TEMPLATES], message,
+                 clean_extra(doc.get("fields")))
 
 
 def parse_launch(text):
-    """`{"ok": bool, "name"?: str, "message"?: str}` -> `Launched`. A `name`
-    that is not a valid card name is dropped. Raises `ItemError`."""
-    doc = _load(text)
+    """`{"ok": bool, "name"?: str, "message"?: str}` -> `Launched`. Once `ok`
+    is a bool the rest is read leniently: a bad `v`, a `message` that is not a
+    string and a `name` that is not a valid card name are dropped, never
+    raised (the task may already be running). Raises `ItemError` only for a
+    reply that is not a JSON object or has no bool `ok`."""
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise itm.ItemError(f"response is not JSON ({exc})") from None
+    if not isinstance(doc, dict):
+        raise itm.ItemError("response is not a JSON object")
     ok = _ok(doc)
     name = doc.get("name")
     if not (isinstance(name, str) and NAME_RE.match(name)):
         name = ""
-    return Launched(ok, name, _message(doc))
+    message = doc.get("message")
+    return Launched(ok, name, first_line(message)
+                    if isinstance(message, str) else "")
 
 
 def _call(cfg, doc, timeout_s, cancel=None):
@@ -225,18 +279,20 @@ def run_draft(cfg, item, fields, taken=(), cancel=None):
 
 def run_launch(cfg, item, fields):
     """Start the task. Never raises, never retried, never cancelled: a
-    timeout asks the command to stop (SIGTERM, SIGKILL after TERM_GRACE_S)
-    and says the task may still have started."""
+    timeout asks the command to stop (SIGTERM, SIGKILL after TERM_GRACE_S).
+    Only a command that could not start, or an explicit `ok: false`, is a
+    failure; a timeout, a non-zero exit, output that is not JSON or a reply
+    with no bool `ok` is `unclear` (the task may have started)."""
     reason, text = _call(cfg, request("launch", item, fields),
                          cfg["timeout_s"])
     if reason:
-        if reason.startswith("timed out"):
-            reason += "; it may still have started"
-        return Launched(False, "", reason)
+        if reason.startswith("cannot run"):      # nothing was started
+            return Launched(False, "", reason)
+        return Launched(False, "", f"{UNCLEAR} ({reason})", True)
     try:
         res = parse_launch(text)
     except itm.ItemError as exc:
-        return Launched(False, "", f"bad response: {exc}")
+        return Launched(False, "", f"{UNCLEAR} ({exc})", True)
     if res.ok:
         return res._replace(message=res.message or "Task started")
     return res._replace(message=res.message
@@ -303,6 +359,7 @@ class TaskForm:
     templates: list = field(default_factory=list)
     taken: frozenset = frozenset()
     touched: set = field(default_factory=set)
+    extra: dict = field(default_factory=dict)   # draft fields not shown here
 
     @classmethod
     def local(cls, item, cfg, taken=()):
@@ -349,6 +406,7 @@ class TaskForm:
         for t in draft.templates:
             if t not in self.templates:
                 self.templates.append(t)
+        self.extra.update(draft.extra or {})
         done = []
         for key, value in draft.fields.items():
             if key in self.touched or getattr(self, key) == value:
@@ -373,7 +431,7 @@ class TaskForm:
         return ""
 
     def fields(self):
-        return {"name": self.name, "role": self.role, "model": self.model,
+        return {**self.extra, "name": self.name, "role": self.role, "model": self.model,
                 "effort": self.effort, "goal": self.goal.strip(),
                 "acceptance": list(self.acceptance),
                 "persona": self.persona, "template": self.template}

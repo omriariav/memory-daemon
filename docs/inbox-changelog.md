@@ -37,13 +37,23 @@ its own. Nothing changes without `task_launcher:` in `inbox.yaml`, except that
 - **A badge on the row** a task came from, `▶ <name> · <role> · <state>`, from
   the agent row whose `meta.source_key` is the row's `id`; green when the task
   has finished (`meta.state` `completed`, or `meta.bucket` `done`).
-- **Row menu**: `Start a task…` (`t`), `Go to task` (`>`, the row in the Agents
+- **Row menu**: `Start a task…` (`t`), `Go to task` (`>`, also bound on the queue; the row in the Agents
   view), and, for a finished task with a report link on its agent row, `o`
-  "Open task report" and `O` "Open the source link". `o` on such a row opens the
+  "Open task report" and `<` "Open the source link". `o` on such a row opens the
   report.
 - The footer shows `t task` (the seventh and last slot), the help has a
   "Start a task" section, the palette has "Start a task…" and "Go to task", and
   `inbox.example.yaml` has a commented `task_launcher:` block.
+- **Unclear launches.** Only an explicit `ok: false` is a failed launch. A
+  timeout, a non-zero exit or an unreadable reply is a warning, "launch result
+  unclear; it may have started (check the Agents view)". A launched row refuses
+  a second `t` until its card shows or 5 refreshes pass.
+- Extra draft fields are passed through to launch: keys of a `draft` answer's
+  `fields` that the modal does not show are kept (validated, capped) and sent
+  back unchanged in the `launch` call.
+- Badges work without `task_launcher:`: any `meta.kind: agent` row with a
+  `meta.source_key` badges that row (and, when finished, redirects `o` to its
+  http(s) link).
 
 ### Changed
 

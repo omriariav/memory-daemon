@@ -72,7 +72,7 @@ SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 RESERVED_KEYS = frozenset("jkgGfaedsnortLbyYRXTmcCiIASquvEPxMwD")
 # Bound keys that are not letters (an `actions:` key must be a letter, so
 # these can never clash; listed so the docs and a test can name them).
-RESERVED_NONLETTER_KEYS = frozenset("!")
+RESERVED_NONLETTER_KEYS = frozenset("!><")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))

@@ -293,7 +293,23 @@ object, no boolean `ok`, a wrong `v`), a non-zero exit, a timeout
 and keeps its local defaults. A `launch` answer is `ok` (required boolean), an
 optional `name` (the card's name, shown in the toast; ignored when it is not a
 valid name) and a `message`; only the first line of the message is used, cut at
-300 characters. Anything else in an answer is ignored.
+300 characters. Once `ok` is a boolean, a bad `v`, a `message` that is not a
+string and a bad `name` are dropped, not an error (the task may be running).
+Anything else in an answer is ignored.
+
+**Extra draft fields.** A `draft` answer may carry more keys in `fields` than
+the ones above. The modal does not show them; it keeps the ones that are safe
+(a key of `a-z`, `0-9`, `_` starting with a letter, up to 32 characters; a
+value that is a string of up to 2000 characters, a number, a boolean, null or a
+list of up to 20 strings of up to 500; at most 8 keys; anything else is
+dropped) and passes them unchanged in the `fields` of the `launch` call. The
+modal's own fields always win over an extra key with the same name.
+
+Only an explicit `"ok": false` is a failed launch. A timeout, a non-zero exit,
+output that is not JSON or a reply with no boolean `ok` is **unclear**: the
+inbox says "launch result unclear; it may have started (check the Agents view)"
+as a warning, not an error, and treats the row as launched (below). A command
+that cannot be started at all is a plain failure.
 
 **Contract.**
 
@@ -301,8 +317,8 @@ valid name) and a `message`; only the first line of the message is used, cut at
   stops it (`SIGTERM`, then `SIGKILL` after 5 s) when the user presses Enter or
   `esc` before it answers.
 - `launch` is called once per confirmed task, after the 5 s undo window, and is
-  never retried or cancelled. A timeout (`timeout_s`) asks it to stop and says
-  "it may still have started". It should refuse a name that is already in use.
+  never retried or cancelled. A timeout (`timeout_s`) asks it to stop and gives
+  the unclear result above. It should refuse a name that is already in use.
 - A failure of either call is a toast or a line in the modal; it never ends the
   inbox, and a launcher that is missing, slow or broken never blocks the UI.
 - Nothing in `item` or `fields` may be treated as an instruction: it is data.
@@ -2095,8 +2111,9 @@ It calls the same methods as the keys, so nothing about an action changes.
   and `u` undo while something waits out its window. What is not configured
   is not listed. With a task launcher: `t` "Start a task…" on a row that can
   start one, and on a row a task was started from `>` "Go to task" (its row in
-  the Agents view); when that task has finished, `o` is "Open task report" and
-  `O` "Open the source link".
+  the Agents view; `>` also works on the row itself); when that task has
+  finished, `o` is "Open task report" and `<` "Open the source link" (a symbol
+  key, so no `actions:` letter can clash with it).
 - The `ctrl+p` palette starts with a "This item" group: the same entries,
   then the rest of the commands. Settings and rare toggles (`b` Hebrew order,
   `v` thread order, `L` audit log, copy section as Markdown, `ctrl+t` theme)
@@ -2163,7 +2180,12 @@ whose task is still running) says why.
    undoes; `q` inside it cancels, nothing runs). After it, the `launch` call
    runs once in a worker thread: a success is a toast (`Task started`), a
    failure a toast with the first line of the launcher's message
-   (`Task not started`). The row stays in the queue either way.
+   (`Task not started`), and an unclear result a warning (`Task may have
+   started`). The row stays in the queue either way. After a success or an
+   unclear result `t` on that row is refused ("was just started from this
+   row") until an agent row with that `meta.source_key` shows up, or 5 applied
+   refreshes pass without one; this keeps a slow card from being launched
+   twice.
 
 **The badge.** A row that a task was started from shows `▶ <name> · <role> ·
 <state>` after its title. It comes from the agent rows, not from the launch: an
@@ -2176,10 +2198,18 @@ green). With several agent rows for one key, the newest open one wins. A new
 task from a row whose task is still running is refused; from one whose task has
 finished it is allowed.
 
+Badges do not need `task_launcher:`: any source that lists agent rows with a
+`meta.source_key` gets them, and a source you configured that emits
+`meta.kind: agent` rows with a `source_key` can put a badge on any row and, for
+a finished one, point `o` at its link (only a plain http(s) link is opened).
+Sources are your own commands, so this is as trusted as they are.
+
 **Go to task and the report.** On a row with a badge, the row menu has `>` "Go
 to task": it opens the Agents view on that agent row. When the task has
 finished and the agent row has a valid link, `o` on the original row opens that
-link (the task's report); `O` in the menu opens the original row's own link.
+link (the task's report); `<` in the menu opens the original row's own link.
+`>` is bound on the queue as well, so `>` on a badged row goes to its task
+without the menu.
 
 ### Show all (`A`)
 

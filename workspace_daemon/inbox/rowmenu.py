@@ -179,6 +179,10 @@ def task_refusal(app, it):
         return f"{card[1].name} is already running (enter, Go to task)"
     if app.task_starting(it):
         return "A task is already being started from this row"
+    recent = app.task_recent(it)
+    if recent:
+        return (f"{recent} was just started from this row; wait for its "
+                "card to show")
     return ""
 
 
@@ -293,7 +297,8 @@ def build_entries(app, it):
     if report_item(it) is not None:
         add(G_OPEN, "o", "Open task report", app.action_open)
         if can_open_source(app, it):
-            add(G_OPEN, "O", "Open the source link", app.action_open_source)
+            # a non-letter key: an `actions:` entry can own any free letter
+            add(G_OPEN, "<", "Open the source link", app.action_open_source)
     elif can_open(app, it):
         add(G_OPEN, "o", "Open link", app.action_open)
     add(G_OPEN, "y", "Copy item", app.action_copy_item)

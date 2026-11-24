@@ -136,7 +136,7 @@ class ProtocolParseTest(unittest.TestCase):
     def test_the_request_has_the_contract_shape(self):
         fields = {"name": "n", "role": "alpha", "goal": "g",
                   "acceptance": ["a"], "persona": "p", "template": "t",
-                  "model": "", "effort": "", "junk": "dropped"}
+                  "model": "", "effort": "", "JUNK": "dropped"}
         doc = launcher.request("draft", {"id": "x"}, fields)
         self.assertEqual(set(doc), {"v", "action", "item", "fields"})
         self.assertEqual((doc["v"], doc["action"], doc["item"]),
@@ -221,6 +221,23 @@ class ProtocolParseTest(unittest.TestCase):
         self.assertEqual((out.fields, out.templates), ({}, []))
         self.assertTrue(self.draft({"ok": True, "fields": "nope"}).ok)
 
+    def test_extra_draft_fields_are_kept_when_they_are_safe(self):
+        out = self.draft({"ok": True, "fields": {
+            "goal": "g", "look_at": ["a.md", "b.md"], "priority": 2,
+            "note": "text", "flag": True, "none": None,
+            "Bad-Key": "x", "name": "n-1", "cwd": ["/etc"],
+            "big": "x" * 3000, "mixed": ["a", 3], "deep": {"a": 1},
+            "long": ["x"] * 30, "nan": float("nan")}})
+        self.assertEqual(out.extra, {
+            "look_at": ["a.md", "b.md"], "priority": 2, "note": "text",
+            "flag": True, "none": None, "cwd": ["/etc"]})
+        self.assertNotIn("look_at", out.fields)     # not a modal field
+        many = {f"k{n}": n for n in range(20)}
+        self.assertEqual(len(self.draft(
+            {"ok": True, "fields": many}).extra), launcher.MAX_EXTRA)
+        self.assertEqual(self.draft({"ok": False, "fields": many}).extra, {})
+        self.assertEqual(self.draft({"ok": True, "fields": "x"}).extra, {})
+
     def test_a_launch_reply(self):
         out = launcher.parse_launch(json.dumps(
             {"v": 1, "ok": True, "name": "plan-check", "message": "started"}))
@@ -237,11 +254,19 @@ class ProtocolParseTest(unittest.TestCase):
             {"ok": True, "name": "Bad Name!", "extra": [1]}))
         self.assertEqual((out.ok, out.name), (True, ""))
 
-    def test_bad_launch_replies_raise(self):
-        for bad in ("nope", "[]", "{}", '{"ok": "yes"}', '{"ok": null}',
-                    '{"ok": true, "message": 5}'):
+    def test_unreadable_launch_replies_raise(self):
+        for bad in ("nope", "[]", '"s"', "{}", '{"ok": "yes"}',
+                    '{"ok": null}', '{"v": 2}'):
             with self.assertRaises(itm.ItemError, msg=bad):
                 launcher.parse_launch(bad)
+
+    def test_once_ok_is_a_bool_the_rest_is_read_leniently(self):
+        out = launcher.parse_launch('{"ok": true, "message": 5}')
+        self.assertEqual((out.ok, out.message), (True, ""))
+        out = launcher.parse_launch('{"v": 9, "ok": true, "name": "n-1"}')
+        self.assertEqual((out.ok, out.name), (True, "n-1"))
+        out = launcher.parse_launch('{"v": true, "ok": false, "message": "x"}')
+        self.assertEqual((out.ok, out.message), (False, "x"))
 
     def test_first_line(self):
         self.assertEqual(launcher.first_line("\n\n a  b \nc"), "a b")
@@ -305,6 +330,7 @@ class RunTest(unittest.TestCase):
         self.assertIn("cannot run", out.message)
         done = launcher.run_launch(cfg, {"id": "x"}, self.FIELDS)
         self.assertFalse(done.ok)
+        self.assertFalse(done.unclear)       # nothing could have started
         self.assertIn("cannot run", done.message)
 
     def test_a_slow_draft_times_out_and_can_be_cancelled(self):
@@ -326,26 +352,59 @@ class RunTest(unittest.TestCase):
                             "message": "started in a new tab"})
         out = launcher.run_launch(self.cfg, {"id": "t:1"}, self.FIELDS)
         self.assertEqual(out, launcher.Launched(
-            True, "plan-check", "started in a new tab"))
+            True, "plan-check", "started in a new tab", False))
         (req,) = self.requests()
         self.assertEqual(req["action"], "launch")
 
-    def test_launch_ok_false_exit_and_bad_json_are_failures(self):
+    def test_only_an_explicit_ok_false_is_a_failed_launch(self):
         for reply, text in [({"ok": False, "message": "refused"}, "refused"),
                             ({"ok": False}, "reported a failure"),
-                            ("badjson", "bad response"), ("exit", "exit 3")]:
+                            ({"v": 9, "ok": False, "message": "no"}, "no")]:
             self.config(launch=reply)
             out = launcher.run_launch(self.cfg, {"id": "x"}, self.FIELDS)
             self.assertFalse(out.ok, reply)
+            self.assertFalse(out.unclear, reply)
             self.assertIn(text, out.message)
 
-    def test_a_launch_timeout_says_it_may_have_started(self):
+    def test_a_launch_with_a_bad_message_or_v_still_succeeded(self):
+        for reply in ({"ok": True, "message": 5}, {"v": 9, "ok": True},
+                      {"ok": True, "message": ["x"], "name": "plan-check"}):
+            self.config(launch=reply)
+            out = launcher.run_launch(self.cfg, {"id": "x"}, self.FIELDS)
+            self.assertTrue(out.ok, reply)
+            self.assertFalse(out.unclear)
+            self.assertEqual(out.message, "Task started")
+
+    def test_anything_unreadable_is_unclear_not_failed(self):
+        for reply in ("badjson", "notobject", "exit", {}, {"ok": "yes"}):
+            self.config(launch=reply)
+            out = launcher.run_launch(self.cfg, {"id": "x"}, self.FIELDS)
+            self.assertFalse(out.ok, reply)
+            self.assertTrue(out.unclear, reply)
+            self.assertIn("launch result unclear; it may have started "
+                          "(check the Agents view)", out.message)
+
+    def test_a_launch_timeout_is_unclear(self):
         self.config(launch={"ok": True}, sleep_launch=5)
         out = launcher.run_launch(dict(self.cfg, timeout_s=0.5),
                                   {"id": "x"}, self.FIELDS)
         self.assertFalse(out.ok)
+        self.assertTrue(out.unclear)
         self.assertIn("timed out", out.message)
-        self.assertIn("may still have started", out.message)
+
+    def test_extra_draft_fields_reach_the_launch_call(self):
+        self.config(draft={"ok": True, "fields": {
+            "goal": "G", "look_at": ["x.md", "y.md"]}},
+            launch={"ok": True, "name": "plan-check"})
+        draft = launcher.run_draft(self.cfg, {"id": "t:1"}, self.FIELDS)
+        self.assertEqual(draft.extra, {"look_at": ["x.md", "y.md"]})
+        form = launcher.TaskForm.local(ui_item(), CFG)
+        form.apply_draft(draft)
+        launcher.run_launch(self.cfg, {"id": "t:1"}, form.fields())
+        sent = self.requests()[-1]
+        self.assertEqual(sent["action"], "launch")
+        self.assertEqual(sent["fields"]["look_at"], ["x.md", "y.md"])
+        self.assertEqual(sent["fields"]["goal"], "G")
 
     def test_local_actions_backend(self):
         self.config(draft={"ok": True, "fields": {"goal": "G"}},
@@ -451,6 +510,22 @@ class FormTest(unittest.TestCase):
         self.assertEqual(form.persona, "Careful reader")
         self.assertEqual(form.templates, ["research", "review"])
         self.assertEqual(form.template, "review")
+
+    def test_extra_fields_ride_along_to_the_launch_unchanged(self):
+        form = launcher.TaskForm.local(ui_item(), CFG)
+        form.apply_draft(launcher.Draft(
+            True, {}, [], "", {"look_at": ["a", "b"], "priority": 1}))
+        out = form.fields()
+        self.assertEqual(out["look_at"], ["a", "b"])
+        self.assertEqual(set(out) - {"look_at", "priority"},
+                         set(launcher.FIELD_NAMES))
+        # a later draft adds or replaces extras, never a modal field
+        form.apply_draft(launcher.Draft(True, {}, [], "", {"priority": 3}))
+        self.assertEqual(form.fields()["priority"], 3)
+        self.assertEqual(form.fields()["look_at"], ["a", "b"])
+        doc = launcher.request("launch", {"id": "x"}, form.fields())
+        self.assertEqual(doc["fields"]["look_at"], ["a", "b"])
+        self.assertEqual(doc["fields"]["name"], form.name)
 
     def test_a_failed_draft_changes_nothing(self):
         form = launcher.TaskForm.local(ui_item(), CFG)

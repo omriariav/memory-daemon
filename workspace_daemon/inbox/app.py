@@ -58,6 +58,9 @@ CONTEXT_OFF = "Context not configured (set context: in inbox.yaml)"
 SUMMARY_OFF = "Summary not configured (set summary: in inbox.yaml)"
 REACT_OFF = "React not configured (set react: in inbox.yaml)"
 TASK_OFF = "no task launcher configured"
+# After a launch the row refuses a second `t` until a card with its source_key
+# shows up, or this many polls have been applied without one.
+TASK_WAIT_POLLS = 5
 POLISH_OFF = "Polish not configured (set polish: in inbox.yaml)"
 SEND_KINDS = ("send", "nudge")
 # Every write that goes to Slack through the bridge's one-call path: only one
@@ -228,6 +231,7 @@ class InboxApp(App):
         Binding("f", "source_filter", show=False),
         Binding("a", "approve", show=False), Binding("e", "edit", show=False),
         Binding("t", "task", show=False),
+        Binding("greater_than_sign", "go_to_task", show=False),
         Binding("d", "done", show=False), Binding("s", "snooze", show=False),
         Binding("n", "nudge", show=False), Binding("o", "open", show=False),
         Binding("r", "refresh", show=False), Binding("u", "undo", show=False),
@@ -464,6 +468,7 @@ class InboxApp(App):
         self._custom = list(getattr(actions, "custom_actions", None) or [])
         self.task_cards = {}               # row id -> (agent row, launcher.Card)
         self._task_names = set()           # card names launched in this session
+        self._task_launched = {}           # row key -> [card name, polls left]: launched, no card seen yet
         self._task_op = None               # the open `t` modal: its draft's cancel event
         self._act_op = None                # the running choices/prepare lookup
         self._act_gen = 0                  # bumped on every lookup
@@ -3543,20 +3548,46 @@ class InboxApp(App):
     def _task_settled(self, p, res):
         """UI thread: the launch call returned."""
         name = res.name or p.fields.get("name", "")
-        if res.ok:
+        if res.ok or res.unclear:
+            # It may be running: no second launch from this row until its
+            # card shows (or TASK_WAIT_POLLS polls pass).
             if name:
                 self._task_names.add(name)
+            self._task_launched[p.item.key] = [name, TASK_WAIT_POLLS]
+        if res.ok:
             self.notify(f"{name}: {launchermod.first_line(res.detail)}"
                         if name else launchermod.first_line(res.detail),
                         title="Task started", timeout=6, markup=False)
-            self.redraw()
-            if not self.demo:
-                self.poll(quiet=True)       # the card shows as a badge
+        elif res.unclear:
+            self.notify(launchermod.first_line(res.detail), title=
+                        "Task may have started", severity="warning",
+                        timeout=12, markup=False)
+        else:
+            self.notify(launchermod.first_line(res.detail)
+                        or "the launcher reported a failure",
+                        title="Task not started", severity="error",
+                        timeout=10, markup=False)
             return
-        self.notify(launchermod.first_line(res.detail)
-                    or "the launcher reported a failure",
-                    title="Task not started", severity="error", timeout=10,
-                    markup=False)
+        self.refilter()
+        if not self.demo:
+            self.poll(quiet=True)           # the card shows as a badge
+
+    def task_recent(self, it):
+        """The name of a task launched from this row whose card has not shown
+        up yet, else ""."""
+        entry = self._task_launched.get(it.key)
+        return entry[0] or "a task" if entry else ""
+
+    def _task_age_launched(self):
+        """One poll was applied: forget a launch whose card shows, and count
+        down the others."""
+        for key in list(self._task_launched):
+            if key in self.task_cards:
+                del self._task_launched[key]
+                continue
+            self._task_launched[key][1] -= 1
+            if self._task_launched[key][1] <= 0:
+                del self._task_launched[key]
 
     def action_go_to_task(self):
         """The row menu's "Go to task": the Agents row of the task started
@@ -4221,6 +4252,8 @@ class InboxApp(App):
                     self._kept_draft(it)
                 rows.append(it)
         self.all_rows = rows
+        self.task_cards = launchermod.index_cards(rows)
+        self._task_age_launched()
         fresh = [i for i in rows if i.key not in self.known_ids
                  and i.section == "urgent" and not tasksmod.is_task(i)
                  and not self.store.is_hidden(i.key, meta=i.meta)]

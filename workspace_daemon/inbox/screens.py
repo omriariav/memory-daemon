@@ -751,12 +751,24 @@ class TaskScreen(ModalScreen):
     def fill(self, draft):
         """Put a `launcher.Draft` into the untouched fields; the names of the
         fields it filled."""
+        self._sync_inputs()
         done = self.form.apply_draft(draft)
         self.status = ("draft ready" + (": " + ", ".join(done) if done else
                                         ": nothing to change"))
         if self.is_mounted:
             self._redraw()
         return done
+
+    def _sync_inputs(self):
+        """Take what the lines show into the form before a draft is applied:
+        a key typed just now may not have reached `on_input_changed` yet, and
+        the draft must never overwrite it."""
+        if not self.is_mounted:
+            return
+        for box_id, key in self.INPUTS.items():
+            found = self.query(f"#{box_id}")
+            if found and found.first().value != getattr(self.form, key):
+                self.form.edit(key, found.first().value)
 
     def draft_failed(self, message):
         """The model call failed or ran out of time: the local defaults
@@ -913,7 +925,7 @@ HELP = [
         ("", "needs acts: [close, drop, due] on the source; without it the keys only say so")]),
     ("Start a task (t; task_launcher: in inbox.yaml)", [
         ("t", "modal: name, role 1-9, model m, effort e, goal g, acceptance a; a draft fills only what you have not touched; enter queues it (5 s undo), esc cancels"),
-        ("", "the row shows ▶ name · role · state; in its menu: > Go to task, and o opens the report when done"),
+        ("", "the row shows ▶ name · role · state; > goes to its task, and o opens the report when it is done (< the row's own link)"),
         ("", "without task_launcher: t says: no task launcher configured")]),
     ("Agents and the sessions strip (a source's meta.kind: agent rows and status lines)", [
         ("6", "the Agents view: every agent row, grouped NEEDS YOU / WORKING / DONE, with where, age, live or no session, old rules"),

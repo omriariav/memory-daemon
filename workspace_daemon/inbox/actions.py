@@ -72,6 +72,7 @@ class Result:
     note: str = ""
     shadow: bool = False
     name: str = ""            # 0.13.3 task launch: the name of the card it made
+    unclear: bool = False     # 0.13.3 task launch: it may have started
 
 
 # What `send_act` and the retry report: `status` is one of acts.OK, SHADOW,
@@ -256,7 +257,7 @@ class LocalActions:
         if self.task_launcher is None:
             return Result(False, "no task launcher configured")
         out = launcher_mod.run_launch(self.task_launcher, to_v1(item), fields)
-        return Result(out.ok, out.message, name=out.name)
+        return Result(out.ok, out.message, name=out.name, unclear=out.unclear)
 
     @property
     def summary_configured(self):
