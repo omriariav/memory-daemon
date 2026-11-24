@@ -70,5 +70,48 @@ class DateAnchorTest(unittest.TestCase):
         self.assertIn("dated Wednesday 2026-11-04", seen["prompt"])
 
 
+class SavedNoteTest(unittest.TestCase):
+    def saved_item(self, **meta):
+        return dict(ITEM, frontmatter=meta)
+
+    def test_analysis_prompt_tells_the_model_the_owner_saved_it(self):
+        for meta in ({"slack_saved": True}, {"saved_request": True}):
+            with self.subTest(meta=meta):
+                prompt = llm.build_prompt(ROUTINE, self.saved_item(**meta), [])
+                self.assertIn("explicitly saved this item", prompt)
+                self.assertIn("preceding context", prompt)
+        for meta in ({}, {"slack_save_tag": "saved"}):
+            with self.subTest(meta=meta):
+                prompt = llm.build_prompt(ROUTINE, self.saved_item(**meta), [])
+                self.assertNotIn("explicitly saved", prompt)
+
+    def extraction_prompt(self, **kwargs):
+        seen = {}
+
+        def fake_analyze(routine, prompt, **kw):
+            seen["prompt"] = prompt
+            return json.dumps({
+                "worthy": True, "owner_attention": False, "type": "note",
+                "title": "T", "people": [], "tags": ["x"], "follows": [],
+                "body": "b"})
+
+        with mock.patch.object(llm, "analyze", side_effect=fake_analyze), \
+                mock.patch.object(memory_sink, "known_person_slugs",
+                                  return_value=set()):
+            memory_sink._extract(ROUTINE, ITEM, "s", "/store", **kwargs)
+        return seen["prompt"]
+
+    def test_extraction_prompt_says_a_saved_item_is_worthy(self):
+        prompt = self.extraction_prompt(saved=True)
+        self.assertIn("explicitly saved this item", prompt)
+        self.assertIn("Never write a title or body saying there is no durable",
+                      prompt)
+        self.assertNotIn("explicitly saved", self.extraction_prompt())
+
+    def test_retry_note_is_added(self):
+        prompt = self.extraction_prompt(saved=True, retry_note="Try again.")
+        self.assertIn("Try again.", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

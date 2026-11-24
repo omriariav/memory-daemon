@@ -29,6 +29,8 @@ candidate ids.
       watch_channels: [C0EXAMPLE02]  # every top-level post by anyone
       bot_text_users: [U0EXAMPLED]   # an app whose DM text search leaves empty
     bootstrap: 3d             # first-run look-back when no cursor exists
+    saved_context_messages: 5 # slack_mcp only: earlier channel messages read for
+    saved_context_hours: 24   # a saved unthreaded message (0 messages = off)
     discover_from: ~/path/slack-discovered.yaml   # channels found by discovery
     joined_from: ~/path/slack-joined.yaml         # joined channels approved
     ignore_channels: [C0EXAMPLE09]                # never added by either
@@ -65,6 +67,12 @@ WATCH_KEYS = {
     "channels", "people", "include_mentions", "owner_action_channels",
     "bootstrap", "all_dms", "discover_from", "ignore_channels",
     "save_reactions", "dm_sessions", "comms_inbox", "joined_from",
+    "saved_context_messages", "saved_context_hours",
+}
+# Optional integer keys (key -> (lowest, highest)); they appear in the parsed
+# watch only when the file sets them, and an inline source value wins.
+CONTEXT_LIMITS = {
+    "saved_context_messages": (0, 20), "saved_context_hours": (1, 168),
 }
 DM_SESSION_KEYS = {"enabled", "gap_minutes", "max_span_hours", "channel_types"}
 DM_SESSION_TYPES = ("im", "mpim")
@@ -335,6 +343,18 @@ def _parse(path):
     bootstrap = data.get("bootstrap", "3d")
     if not isinstance(bootstrap, str) or not _BOOTSTRAP.match(bootstrap):
         raise WatchError("`bootstrap` must look like '12h' or '3d'")
+    context = {}
+    for key, (lower, upper) in CONTEXT_LIMITS.items():
+        if key in data:
+            value = data[key]
+            if (
+                isinstance(value, bool) or not isinstance(value, int)
+                or not lower <= value <= upper
+            ):
+                raise WatchError(
+                    f"`{key}` must be an integer from {lower} to {upper}"
+                )
+            context[key] = value
     hand = _ids(data, "channels", CHANNEL_ID, "channel")
     ignore = _ids(data, "ignore_channels", CHANNEL_ID, "channel")
     discover_from = data.get("discover_from")
@@ -362,6 +382,7 @@ def _parse(path):
             data, "owner_action_channels", CHANNEL_ID, "channel"
         ),
         "bootstrap": bootstrap,
+        **context,
     }
 
 
@@ -473,7 +494,8 @@ def expand(source):
     if not isinstance(ref, str) or not ref:
         return source, "watch must be a path string"
     clash = sorted(
-        key for key in WATCH_KEYS - {"bootstrap"} if key in source
+        key for key in WATCH_KEYS - {"bootstrap"} - set(CONTEXT_LIMITS)
+        if key in source
     )
     if clash:
         return source, (
@@ -488,6 +510,11 @@ def expand(source):
         if key == "bootstrap":
             # Only the connector-backed source has a look-back of its own;
             # an inline value wins over the file's.
+            if source.get("kind") == "slack_mcp" and key not in source:
+                merged[key] = value
+        elif key in CONTEXT_LIMITS:
+            # Only the connector-backed source reads saved-message context; an
+            # inline value wins over the file's.
             if source.get("kind") == "slack_mcp" and key not in source:
                 merged[key] = value
         elif key == "discover_from":

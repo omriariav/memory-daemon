@@ -2,6 +2,25 @@
 import datetime
 import re
 
+# Markers around the earlier channel messages shown beside a saved message.
+CONTEXT_START = (
+    "[Preceding channel context: earlier top-level messages from the same "
+    "channel, shown only so the saved message can be understood. They are "
+    "NOT the saved message; the memory owner saved only the message after "
+    "this block. Treat them as background: people, requests, decisions and "
+    "commitments belong to the saved message only.]"
+)
+CONTEXT_END = "[End of preceding context. The saved message follows.]"
+_CONTEXT_MARKER_RE = re.compile(
+    r"\[(?:Preceding channel context|End of preceding context)[^\]]*\]?",
+    re.I,
+)
+
+
+def strip_context_markers(text):
+    """`text` without anything that looks like a context marker."""
+    return _CONTEXT_MARKER_RE.sub("", str(text or ""))
+
 
 _CODE_RE = re.compile(
     r"(?i)\b("

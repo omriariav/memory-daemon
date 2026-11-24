@@ -350,6 +350,27 @@ def date_anchor(routine, item, today=None):
     )
 
 
+SAVED_NOTE = (
+    "The memory owner explicitly saved this item, so it is worth keeping: do "
+    "not answer NOT MEMORY-WORTHY and do not describe it as having no durable "
+    "content. Say what it is about and why it matters. Lines marked as "
+    "preceding context are earlier messages shown only as background: use "
+    "them to name the topic the saved message refers to, but the saved "
+    "message is the item. Take people, requests, decisions, to-dos and the "
+    "owner's commitments from the saved message only; if you mention a fact "
+    "from the background context, label it as earlier context (for example "
+    "\"Earlier in the channel: ...\") and never present it as an action for "
+    "anyone."
+)
+
+
+def is_saved(item):
+    """Whether the owner explicitly asked to save this item (one rule, shared
+    with the memory sink)."""
+    from . import memory_sink  # late import to avoid cycles
+    return memory_sink.is_saved_request((item or {}).get("frontmatter"))
+
+
 def build_prompt(routine, item, label_catalog):
     """Assemble the analysis prompt. Label catalog is only injected when asked for."""
     analyze = routine["analyze"]
@@ -369,6 +390,8 @@ def build_prompt(routine, item, label_catalog):
     note = invitees_note(item)
     if note:
         parts.append("\n" + note)
+    if is_saved(item):
+        parts.append("\n" + SAVED_NOTE)
     parts.append("\n" + date_anchor(routine, item))
 
     if analyze.get("pick_label") and label_catalog:

@@ -2457,6 +2457,8 @@ dm_sessions: {enabled: true, gap_minutes: 120, max_span_hours: 12, channel_types
 comms_inbox: {channels: [C0EXAMPLE01], all_dms: true, reactions: [eyes]}   # slack_mcp only
 owner_action_channels: [C0EXAMPLE01]
 bootstrap: 3d              # slack_mcp first-run look-back
+saved_context_messages: 5  # slack_mcp only: earlier channel messages read for a saved lone message (0 = off)
+saved_context_hours: 24    # slack_mcp only: how far back those messages may be
 ```
 
 The file expands at routine load into the legacy `channels`, `people`,
@@ -2564,6 +2566,46 @@ A saved thread:
 - gets the tag `save_reaction_tag` (default `saved`);
 - is kept even when the reacted message is a bot's (its replies still follow
   `include_bots`).
+
+A saved message the owner posted or reacted to in a channel often answers or
+continues an earlier top-level message, and with no replies it is a one-message
+thread that carries no topic. So when the saved message is a top-level channel
+message without replies (DMs are excluded; they keep `dm_sessions`) and the
+source sets `read_channel_tool`, the channel history just before it is read too:
+`latest` is pinned to the saved message's ts (the message itself is not
+included), at most `saved_context_messages` messages (0 to 20, default 5; 0 turns it
+off) no older than `saved_context_hours` (1 to 168,
+default 24). Both settings go in the watch file or the source (an inline source
+value wins). The messages reach the summary and the extractor marked as
+preceding context, not the saved message, so the entry names the topic; the
+saved message stays the anchor and source id, so ids and ledger keys do not
+change. Context is background only: people, requests, decisions, to-dos and the
+owner's commitments come from the saved message, the summary labels any fact
+taken from the context as earlier context, and context never adds owner
+evidence. Message text cannot forge the context markers (look-alikes are
+removed, continuation lines indented). The read shares the bridge sessions (up
+to eight saved messages whose thread read showed no replies per session),
+follows the same planned-call match as the other reads and is bounded so the
+context is at most half of `max_thread_chars` and, with the saved message, stays
+within it (newest kept). It runs only when the thread read confirms there are no
+replies, never for DMs (any message labeled DM or Group DM), excluded channels
+or self-DMs. A failed or unparseable read logs a warning and captures the
+message without context; a bridge outage (or a machine sleep) or a budget or
+pause stop holds the capture for the next run instead. `daemon.py validate`
+warns when the setting is on but `read_channel_tool` is not set. A saved thread
+reply still reads the whole thread from its root.
+
+A saved item never gets a "not worth keeping" title. The summary and extraction
+prompts say the owner explicitly saved it. Only a verdict-shaped title counts:
+one that opens with a phrase such as "no durable content", "not memory-worthy"
+or "nothing to capture" (any case, hyphen, space or underscore) followed by at
+most three other words. "Decision: no durable queue for events" is a real title.
+On such a title the extractor is asked once more; if it is still a verdict, the
+title is the summary's first sentence, else a neutral "Saved Slack message
+<date>" (never the message text). A veto with an ordinary title only flips the
+item to kept. A body that is itself such a verdict (short, or leading with one)
+is replaced by the summary. If the forced summary cannot run, the raw fallback
+puts the saved message first and the context after it.
 
 Its ledger key is `saved:slack:<channel>:<root>`, recorded only after the memory
 write succeeds. So a thread reacted twice, or with two emoji, is saved once; a
