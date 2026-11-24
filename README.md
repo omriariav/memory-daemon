@@ -2371,6 +2371,53 @@ model. Three config-driven guards, all safe by default:
   structured extraction pass, same provider as `analyze`. Unset keeps
   `analyze.model`. The summary pass is unchanged, so a cheap model can triage
   while a stronger one fills the JSON.
+- **`memory.work_week`** (optional; the opt-in for code-resolved due dates).
+  The team's work week, either `{start: sunday, days: 5}` (first working day
+  plus how many days, 1-7) or a list of consecutive weekday names
+  (`[sunday, monday, tuesday, wednesday, thursday]`). A week runs from its
+  start for seven days, so an off day belongs to the week it follows. Unset,
+  the week is Monday-Friday for the date reference, and owner-todo due dates,
+  review rows, prompts and todo bodies stay exactly as before. Set it and the
+  date reference also states the week convention and the dates it gives the
+  common phrases, and owner todos get the code date below.
+- **Due phrases.** Models mis-count "early next week", so code resolves these
+  English phrases (case-insensitive, whole words) from the item's date and
+  `work_week`:
+
+  | Phrase | Resolves to |
+  | --- | --- |
+  | `early next week` | 2nd working day of next week (Mon-Fri: Tuesday; Sun-Thu: Monday) |
+  | `next week` | 1st working day of next week (not `late`/`mid next week`) |
+  | `end of (the/this) week` | last working day of this week (None once it has passed) |
+  | `end of next week` | last working day of next week |
+  | `by` / `until` / `due <weekday>` | the next such day, today excluded; a bare `on <weekday>` never matches |
+  | `<weekday> next week`, `next week, <weekday>` | that day of next week |
+  | `end of day <weekday>`, `EOD <weekday>`, `<weekday> EOD` | that weekday, today included; `by <weekday> EOD` excludes today |
+  | `tomorrow` | calendar tomorrow, else the next working day |
+  | `EOD`, `end of (the) day`, `by`/`until`/`due today` | the item's date (a bare or possessive `today` never matches) |
+
+  A weekday phrase keeps an off day as named: `by Friday` in a Sun-Thu week is
+  Friday, an off day. The code returns nothing, and the model's date stays,
+  when the text's phrases resolve to different dates, when the text has an
+  explicit date (`2026-10-07`, `Oct 7`, `7/10`, `the 7th`), or when a phrase
+  follows a negation (`not`, `don't`, `no`, `never`, `rather than`, `instead of`
+  within three words in the same clause). The anchor is the item's date as
+  written; a full timestamp with an offset is converted to the routine's
+  configured timezone (`calendar_timezone` or `timezone`) first, and without
+  one the date part is used.
+
+  Owner todos from a meeting (`owner_todos`, only with `work_week` set) take
+  the code date over the model's `due`: the action text first (a phrase there
+  decides, an ambiguous one keeps the model's date), the owner's spoken line
+  only when it has exactly one phrase. The date goes in the todo body
+  (`due <date>`) and the review queue row.
+- **`memory.due_dates`** (default `false`). Sends due dates to the store as
+  `add --due YYYY-MM-DD` and offers the extraction an optional `due` for a
+  `todo` / `pending-decision`. A phrase in the model's own title and body
+  (never the verbatim source text) overrides it; with no phrase the model's
+  valid date stays. It also puts the week convention in the date reference.
+  Owner todos get `--due` too, with the code date only when `work_week` is
+  set. Turn it on only when the store's `add` supports `--due`.
 - **Extraction retry and fallback.** A schema or JSON failure is retried once
   with `Your previous JSON failed: <error>. Return corrected JSON only.`
   appended. If both answers are invalid and the item is a borderline chat item

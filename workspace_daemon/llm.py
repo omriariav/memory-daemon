@@ -5,7 +5,7 @@ import secrets
 import zoneinfo
 
 from .connector_prompts import resolve_instruction
-from . import claude_bridge, personal
+from . import claude_bridge, due_phrases, personal
 from .shell import log, run_json, yoetz_bin
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
@@ -325,28 +325,70 @@ def routine_zone(routine):
     return None
 
 
+def anchor_day(routine, item, today=None, localize=False):
+    """The date a source's relative phrases are counted from: the item's own
+    date, else today in the routine's timezone. With `localize`, a full
+    timestamp that carries an offset is converted to the routine's configured
+    timezone first (`calendar_timezone` / `timezone`); without a configured
+    zone, or for a plain `YYYY-MM-DD`, the date part is used as written."""
+    raw = str((item or {}).get("date") or "")
+    if localize and len(raw) > 10 and routine_zone(routine) is not None:
+        try:
+            moment = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+        if moment is not None and moment.tzinfo is not None:
+            return moment.astimezone(routine_zone(routine)).date()
+    try:
+        return datetime.date.fromisoformat(raw[:10])
+    except ValueError:
+        return today or datetime.datetime.now(routine_zone(routine)).date()
+
+
 def date_anchor(routine, item, today=None):
     """Prompt block naming the meeting date's weekday and the next 7 days.
 
     Models mis-count weekdays ("Thursday" written as the 6th when it is the
     5th), so every relative day must be resolved from this table. A missing or
-    malformed item date falls back to today in the routine's timezone.
+    malformed item date falls back to today in the routine's timezone. When
+    `memory.work_week` or `memory.due_dates` is set, the week convention and
+    the dates it gives the common week phrases come from the same code that
+    overrides a due date later; otherwise the block is the plain table.
     """
-    try:
-        day = datetime.date.fromisoformat(str((item or {}).get("date") or "")[:10])
-    except ValueError:
-        day = today or datetime.datetime.now(routine_zone(routine)).date()
+    use_week = due_phrases.prompt_block(routine)
+    day = anchor_day(routine, item, today, localize=use_week)
     rows = "\n".join(
         f"{_WEEKDAYS[d.weekday()][:3]} {d.isoformat()}"
         for d in (day + datetime.timedelta(days=n) for n in range(1, 8))
     )
-    return (
+    head = (
         f"Date reference: the source is dated {_WEEKDAYS[day.weekday()]} "
         f"{day.isoformat()}.\nThe next 7 days are:\n{rows}\n"
+    )
+    if not use_week:
+        return head + (
+            "Resolve every relative day or date in the text (\"Thursday\", "
+            "\"tomorrow\", \"next week\", \"by Friday\") ONLY from this table, "
+            "and write dates as YYYY-MM-DD. Never count weekdays yourself; "
+            "when the day is not in the table, keep the original wording.\n"
+        )
+    week = due_phrases.week_from_routine(routine)
+    phrases = "; ".join(
+        f"\"{phrase}\" = {due_phrases.resolve(phrase, day, week)}"
+        for phrase in ("tomorrow", "early next week", "next week",
+                       "end of next week", "end of this week")
+        if due_phrases.resolve(phrase, day, week)
+    )
+    return head + (
+        f"{due_phrases.convention(week)} \"Early next week\" is the second "
+        "working day of next week, \"next week\" its first working day, "
+        "\"end of the week\" the last working day. "
+        f"For this source: {phrases}.\n"
         "Resolve every relative day or date in the text (\"Thursday\", "
-        "\"tomorrow\", \"next week\", \"by Friday\") ONLY from this table, "
-        "and write dates as YYYY-MM-DD. Never count weekdays yourself; when "
-        "the day is not in the table, keep the original wording.\n"
+        "\"tomorrow\", \"next week\", \"by Friday\") ONLY from this table "
+        "and these week rules, and write dates as YYYY-MM-DD. Never count "
+        "weekdays yourself; when the day is not in the table, keep the "
+        "original wording.\n"
     )
 
 

@@ -36,6 +36,7 @@ import yaml
 
 from . import action_review_queue
 from . import claude_bridge
+from . import due_phrases
 from . import identity as identity_providers
 from . import owner_todos
 from . import person_resolver
@@ -98,7 +99,7 @@ other text, with exactly these keys:
             listed below, only invitees who took part, never someone who
             was only mentioned)
   "tags": array of 1-4 short kebab-case topic tags
-{personal_schema}{owner_todos_schema}{same_meeting_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
+{due_schema}{personal_schema}{owner_todos_schema}{same_meeting_schema}  "follows": array of entry ids copied EXACTLY from the related memory entries
           below that this note directly resolves, confirms, or updates —
           usually empty; never invent an id. When the note records the
           resolution or completion of a related entry, list it here and
@@ -194,6 +195,11 @@ SAME_MEETING_SCHEMA = """  "differs": array of at most 5 one-line strings — fa
             earlier capture of the same meeting given below. Only real
             conflicts, never extra detail or wording differences; an empty
             array when there are none.
+"""
+
+DUE_SCHEMA = """  "due": optional, only for a todo or pending-decision with a stated deadline:
+            "YYYY-MM-DD", resolved from the date reference below. Leave it
+            out when the text gives no deadline.
 """
 
 PERSONAL_SCHEMA = """  "personal": boolean — true when the content is primarily about the memory
@@ -347,7 +353,7 @@ def validate(routine):
         "identity", "personal_tag", "redact_ids", "personal_keywords",
         "extract_model", "owner_todos", "person_briefs",
         "person_resolver", "person_resolver_timeout", "internal_domains",
-        "person_alias_lookup",
+        "person_alias_lookup", "work_week", "due_dates",
     }
     if unknown:
         problems.append(
@@ -374,6 +380,9 @@ def validate(routine):
         cfg["person_alias_lookup"], bool
     ):
         problems.append(f"{rid}: memory.person_alias_lookup must be true or false")
+    if "due_dates" in cfg and not isinstance(cfg["due_dates"], bool):
+        problems.append(f"{rid}: memory.due_dates must be true or false")
+    problems.extend(due_phrases.validate(cfg, rid))
     problems.extend(identity_providers.validate(cfg, rid))
     problems.extend(personal.validate(cfg, rid))
     problems.extend(owner_todos.validate(cfg, rid))
@@ -1239,6 +1248,7 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
         slugs=", ".join(slugs) or "(none known yet)",
         verified_people=verified_catalog or "(none)",
         no_owner_action_marker=NO_OWNER_ACTION_MARKER,
+        due_schema=DUE_SCHEMA if due_dates_enabled(routine) else "",
         personal_schema=(
             PERSONAL_SCHEMA
             if personal.personal_tag(personal.memory_cfg(routine)) else ""
@@ -1288,6 +1298,50 @@ class ExtractionInvalid(ValueError):
     """Both extraction attempts answered, but with invalid output."""
 
 
+def due_dates_enabled(routine):
+    """`memory.due_dates: true` sends a todo / pending-decision's due date to
+    the store with `add --due` (the store must support the flag)."""
+    return memory_cfg(routine).get("due_dates") is True
+
+
+def _entry_due(routine, item, entry, etype):
+    """The due date to store for a todo / pending-decision, or None.
+
+    A relative phrase ("early next week", "by Thursday", ...) in the model's
+    entry title or body (never the verbatim source block) is resolved by code against the item's date and the
+    configured work week and overrides the model's `due`; with no phrase the
+    model's valid `due` stays. Off unless `memory.due_dates` is true.
+    """
+    if not due_dates_enabled(routine) \
+            or etype not in ("todo", "pending-decision"):
+        return None
+    from . import llm  # late import to avoid cycles
+    coded = due_phrases.resolve(
+        f"{entry.get('title') or ''}\n{entry.get('body') or ''}",
+        llm.anchor_day(routine, item, localize=True),
+        due_phrases.week_from_routine(routine))
+    if coded:
+        return coded
+    model = entry.get("due")
+    try:
+        return datetime.date.fromisoformat(model).isoformat() \
+            if isinstance(model, str) and len(model) == 10 else None
+    except ValueError:
+        return None
+
+
+def _with_phrase_due(routine, action, date, line=None):
+    """An owner action with the code-resolved due date of a relative phrase
+    (see owner_todos.apply_due_phrase). Only a routine that sets
+    `memory.work_week` opts in; any other gets `action` back untouched."""
+    if not due_phrases.configured(routine):
+        return action
+    from . import llm  # late import to avoid cycles
+    anchor = llm.anchor_day(routine, {"date": date}, localize=True)
+    return owner_todos.apply_due_phrase(
+        action, anchor, due_phrases.week_from_routine(routine), line)
+
+
 def _parse_extraction(raw):
     """Parse and validate one extraction answer; raises ValueError."""
     raw = raw.strip()
@@ -1303,7 +1357,8 @@ def _parse_extraction(raw):
     # a missing or malformed value must never discard the whole extraction.
     # `owner_actions` is validated by owner_todos.validate_actions(); a bad
     # value voids only the todos, never the meeting entry.
-    optional = {"personal", "personal_reason", "owner_actions", "differs"}
+    optional = {"personal", "personal_reason", "owner_actions", "differs",
+                "due"}
     if set(data) - optional != expected:
         missing = sorted(expected - set(data))
         unknown = sorted(set(data) - expected - optional)
@@ -1956,6 +2011,9 @@ def capture(routine, item, summary, dry_run=False):
     if people:
         args += ["--people", ",".join(people)]
     args += ["--tags", ",".join(dict.fromkeys(tags))]
+    due = _entry_due(routine, item, entry, etype)
+    if due:
+        args += ["--due", due]
     if source_id:
         args += ["--source-ids", source_id]
     else:
@@ -2404,11 +2462,13 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
             "memory.owner_todos.owner_slug and owner_name), "
             f"{len(actions)} action(s) not filed")
         return {}
-    grounded = [
-        a for a in actions if owner_todos.grounded_in_transcript(
+    grounded = []
+    for a in actions:
+        ok, line = owner_todos.ground_in_transcript(
             item.get("body", ""), a.get("evidence_ts"), names,
             (item.get("frontmatter") or {}).get("mila_speaker_names") or ())
-    ]
+        if ok:
+            grounded.append(dict(a, line=line))
     ungrounded = len(actions) - len(grounded)
     if dropped or ungrounded:
         log(f"routine={rid} owner-todos: dropped {dropped} invalid and "
@@ -2451,6 +2511,8 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
                 body, ts, names, mapped)
             if grounded:
                 c["quote"] = quote
+                c.update(_with_phrase_due(
+                    routine, c, item.get("date", ""), quote))
                 continue
             c["status"] = "ungrounded"
             c["reason"] = "no owner-spoken transcript line at the timestamp"
@@ -2466,7 +2528,8 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
     )
 
 
-def _add_owner_todo(routine, store, sid, title, date, owner_slug, tags, body):
+def _add_owner_todo(routine, store, sid, title, date, owner_slug, tags, body,
+                    due=None):
     """One stable-id todo write. Returns (verdict, entry id or None); the
     verdict is created/updated/unchanged/verified/duplicate_skipped/error.
     Never raises for store trouble (guard stops propagate)."""
@@ -2476,6 +2539,8 @@ def _add_owner_todo(routine, store, sid, title, date, owner_slug, tags, body):
         "--people", owner_slug, "--tags", ",".join(tags),
         "--source-ids", sid,
     ]
+    if due:
+        args += ["--due", due]
     try:
         r = _cli(store, args, stdin_text=body, timeout=300)
         out = (r.stdout or "") + (r.stderr or "")
@@ -2616,6 +2681,7 @@ def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
     ) + [AUTO_TAG]))
     counts = {}
     for action in actions:
+        action = _with_phrase_due(routine, action, date)
         text = action["text"]
         if personal.redact_enabled(cfg):
             text, _ = personal.redact(text)
@@ -2628,7 +2694,8 @@ def create_owner_todos(routine, meeting_source_id, meeting_entry_id, date,
                 f"source_id={sid}")
             continue
         verdict, _todo_id = _add_owner_todo(
-            routine, store, sid, title, date, owner_slug, tags, body)
+            routine, store, sid, title, date, owner_slug, tags, body,
+            due=action.get("due") if due_dates_enabled(routine) else None)
         counts[verdict] = counts.get(verdict, 0) + 1
     log(f"routine={rid} owner-todos: "
         + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
