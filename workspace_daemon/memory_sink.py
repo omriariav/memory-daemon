@@ -130,8 +130,9 @@ into an action for anyone.
 # collapsed to one space, so "No-Durable_Content" and "no durable content"
 # both match. Only verdict-shaped text counts: the phrase must open the text
 # (after a little filler such as "this item has") and at most
-# VERDICT_EXTRA_WORDS other words may follow, so "Decision: no durable queue
-# for events" or "Logs are not worth keeping beyond 30 days" are real titles.
+# VERDICT_EXTRA_WORDS other words may follow (or the phrase may close the text,
+# with a few words before it), so "Decision: no durable queue for events" or
+# "Logs are not worth keeping beyond 30 days" are real titles.
 NOT_WORTH_PHRASES = (
     "no durable", "nothing durable", "not memory worthy", "not memoryworthy",
     "nothing to capture", "nothing to keep", "nothing to save",
@@ -154,11 +155,27 @@ def _norm_words(text):
     return " ".join(re.sub(r"[\W_]+", " ", str(text or "").lower()).split())
 
 
+_TRAILING_RE = re.compile(
+    r"\b(?:" + "|".join(NOT_WORTH_PHRASES) + r")"
+    r"(?: (?:content|here|found|detected|info|information|value))?$"
+)
+
+
 def says_not_worth_keeping(text, extra_words=VERDICT_EXTRA_WORDS):
-    """Whether `text` is a verdict that the item has nothing worth keeping."""
-    norm = _norm_words(text)
+    """Whether `text` is a verdict that the item has nothing worth keeping.
+
+    The verdict phrase opens the text (at most `extra_words` other words
+    after it) or closes it, as in "Vendor logistics thread no durable
+    content" or the slug form "...-thread-no-durable-content" (at most two
+    more words before it than `extra_words`; a slug is read like a title).
+    """
+    # An entry id is its title's slug behind a date: ignore the date.
+    norm = re.sub(r"^\d{4} \d{2} \d{2} ", "", _norm_words(text))
     match = _VERDICT_RE.match(norm)
-    return bool(match) and len(norm[match.end():].split()) <= extra_words
+    if match and len(norm[match.end():].split()) <= extra_words:
+        return True
+    tail = _TRAILING_RE.search(norm)
+    return bool(tail) and len(norm[:tail.start()].split()) <= extra_words + 2
 
 
 def body_says_not_worth_keeping(body):

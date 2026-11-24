@@ -1062,6 +1062,11 @@ class CaptureValidationTest(unittest.TestCase):
             "nothing-to-capture here", "Not worth keeping",
             "nothing worth saving", "No durable content in thread",
             "This item has no durable content",
+            "Vendor logistics thread no durable content",
+            "Vendor logistics thread - no durable content.",
+            "vendor-logistics-thread-no-durable-content",
+            "2026-07-27-vendor-logistics-thread-no-durable-content",
+            "Weekly sync notes: not memory-worthy",
         ):
             with self.subTest(text=text):
                 self.assertTrue(memory_sink.says_not_worth_keeping(text))
@@ -1076,6 +1081,19 @@ class CaptureValidationTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(memory_sink.says_not_worth_keeping(text))
+
+    def test_trailing_verdict_title_is_regenerated_then_rebuilt(self):
+        self.saved()
+        bad = self.verdict("Vendor logistics thread no durable content")
+        _, calls = self._run_capture(
+            [bad, self.verdict("Vendor logistics: delivery dates agreed")])
+        self.assertEqual(self.extract.call_count, 2)
+        self.assertEqual(
+            self.title(calls), "Vendor logistics: delivery dates agreed")
+        _, calls = self._run_capture(
+            [bad, bad], summary="Delivery dates were agreed with the vendor.")
+        self.assertEqual(
+            self.title(calls), "Delivery dates were agreed with the vendor.")
 
     def test_not_worth_keeping_bodies(self):
         for text in (
