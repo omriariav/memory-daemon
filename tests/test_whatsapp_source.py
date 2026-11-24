@@ -13,12 +13,13 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from workspace_daemon import (
-    config, llm, memory_sink, runner, state, triviality, whatsapp_source,
+    chat_text, config, llm, memory_sink, runner, state, triviality, whatsapp_source,
 )
 
 ZONE = datetime.timezone(datetime.timedelta(hours=2))
@@ -31,6 +32,10 @@ PARENT = "פלוני אלמוני"
 OTHER_PARENT = "Avi Example"
 HEBREW_TEXT = "מחר יום ספורט, מצורף לוח הזמנים\nשורה שנייה"
 DAY = "2026-11-22"
+# An invented to-do list in the shape that once leaked a card PIN: one
+# numbered line ends with "code <digits>" (the number is fake).
+CARD_CODE_TEXT = ("מה צריך לעשות מחר:\n1. לאסוף את החבילה\n"
+                  "2. לשלם עם הכרטיס שלי. קוד 4821\n3. להתקשר לגננת")
 
 
 def iso(hour, minute=0, day=22):
@@ -712,6 +717,29 @@ class MediaTextTest(Base):
         self.assertNotIn("909090", item["body"])
         self.assertNotIn("909090", item["memory_appendix"])
 
+    def test_transcript_short_codes_are_redacted_in_both_views(self):
+        self.add_voice()
+        source = self.voice_source()
+        found = self.listing_with(source, self.fake_run(
+            {"whisper": "תשלם עם הכרטיס, הקוד שלי הוא 48 21 תודה"}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        for view in (item["body"], item["memory_appendix"]):
+            self.assertNotIn("48 21", view)
+            self.assertIn("הקוד שלי הוא [REDACTED] תודה", view)
+
+    def test_pdf_excerpt_short_codes_are_redacted_in_both_views(self):
+        message, files = self.spool.media_message(
+            "pdf", iso(8, 0), "document", b"%PDF-1.7", ".pdf",
+            mime="application/pdf", original_name="welcome.pdf")
+        self.spool.batch(iso(9, 0), [message], files)
+        source = self.source()
+        found = self.listing_with(source, self.fake_run(
+            {"pdftotext": "Welcome! Gate code: 7305. Floor 3, room 214."}))
+        item = whatsapp_source.fetch({}, source, found[0])
+        for view in (item["body"], item["memory_appendix"]):
+            self.assertNotIn("7305", view)
+            self.assertIn("Floor 3, room 214.", view)
+
     def test_default_timeout_suits_voice_notes(self):
         self.assertEqual(
             whatsapp_source.DEFAULTS["transcribe_timeout_seconds"], 300)
@@ -999,6 +1027,17 @@ class RedactionTest(Base):
         self.assertEqual(item["body"].count("[REDACTED]"), 2)
         self.assertEqual(item["memory_appendix"].count("[REDACTED]"), 2)
 
+    def test_card_code_in_a_numbered_hebrew_list_is_redacted(self):
+        self.spool.batch(iso(9, 0), [
+            record("a", iso(8, 0), CARD_CODE_TEXT, from_me=True),
+        ])
+        item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
+        self.assertNotIn("4821", item["body"])
+        self.assertNotIn("4821", item["memory_appendix"])
+        self.assertIn("    2. לשלם עם הכרטיס שלי. קוד [REDACTED]", item["body"])
+        self.assertIn("  > 2. לשלם עם הכרטיס שלי. קוד [REDACTED]\n"
+                      "  > 3. להתקשר לגננת", item["memory_appendix"])
+
     def test_file_names_are_redacted_once_for_both_views(self):
         message, files = self.spool.media_message(
             "doc", iso(8, 0), "document", b"x", ".bin",
@@ -1007,6 +1046,296 @@ class RedactionTest(Base):
         item = whatsapp_source.fetch({}, self.source(), self.listing()[0])
         self.assertNotIn("667788", item["body"])
         self.assertNotIn("667788", item["memory_appendix"])
+
+
+class ShortCodeRedactionTest(unittest.TestCase):
+    """A keyword next to a short digit run is a secret (PIN, door code...).
+
+    Every number here is invented; card numbers are public test numbers.
+    Keeping a harmless number is the cost the KEPT cases pin down; when
+    unsure, the patterns redact. Each SECRET case lists the digits that must
+    disappear.
+    """
+
+    SECRET = [
+        # Hebrew keyword before the number, with prefixes and filler words
+        ("קוד 4821", "4821"),
+        ("הקוד: 4821", "4821"),
+        ("והקוד הוא 4821", "4821"),
+        ("שהקוד שלי הוא 4821", "4821"),
+        ("בקוד 4821 נכנסים", "4821"),
+        ("קוד סודי 4821", "4821"),
+        ("קוד כניסה לבניין 4821, דירה 26", "4821"),
+        ("קוד אשראי 482", "482"),
+        ("קוד הדלת 4821", "4821"),
+        ("הקוד לשער הוא 4821", "4821"),
+        ("הקוד של האזעקה 4821", "4821"),
+        ("הקוד לאינטרקום 4821", "4821"),
+        ("קוד אינטרקום 4821", "4821"),
+        ("קוד כספומט 4821", "4821"),
+        ("הקוד של כרטיס האשראי שלי 4821", "4821"),
+        ("קוד האימות שלך לאתר הוא 482113", "482113"),
+        ("קוד חד פעמי 482113", "482113"),
+        ("הקוד החד פעמי שלך הוא 482113", "482113"),
+        ("קוד שובר 48213377", "48213377"),
+        ("קוד 2026", "2026"),
+        ("הסיסמה 482113", "482113"),
+        ("סיסמא 4821", "4821"),
+        ("ססמה 4821", "4821"),
+        ("הסיסמה החדשה שלי היא 4821", "4821"),
+        ("סיסמה לוויפי 48214821", "48214821"),
+        ("סיסמת הוויפי 48214821", "48214821"),
+        ("הסיסמא לאתר 4821", "4821"),
+        ("סיסמא: Abc4821", "Abc4821"),
+        ("הפין שלי 4821", "4821"),
+        ("ה-PIN שלי 4821", "4821"),
+        ("הPIN 4821", "4821"),
+        ("מספר סודי 4821", "4821"),
+        ("המספר הסודי של הכרטיס 4821", "4821"),
+        ("3 ספרות בגב הכרטיס 482", "482"),
+        ("3 הספרות בגב 482", "482"),
+        ("הקוד \"4821\"", "4821"),
+        ("הקוד:\n4821", "4821"),
+        ("דלת: 4821", "4821"),
+        ("אינטרקום 4821", "4821"),
+        # English keyword before the number
+        ("the code is 4821", "4821"),
+        ("Code: 4821", "4821"),
+        ("door code 4821", "4821"),
+        ("code for the gate is 4821", "4821"),
+        ("passcode 482113", "482113"),
+        ("password 4821", "4821"),
+        ("PIN 4821", "4821"),
+        ("pin number 4821", "4821"),
+        ("PIN#: 4821", "4821"),
+        ("CVV 482", "482"),
+        ("cvc: 482", "482"),
+        ("OTP 482113", "482113"),
+        ("safe combo 4821", "4821"),
+        ("the combination is 4821", "4821"),
+        ("keypad 4821", "4821"),
+        ("intercom 4821", "4821"),
+        ("Gate: 4821", "4821"),
+        ("the combination to the safe 4821", "4821"),
+        ("combination: 4821", "4821"),
+        ("כספת combo 4821", "4821"),
+        ("code for the gate 4821", "4821"),
+        ("הקוד לשער 4821", "4821"),
+        ("code 1 2 3 4 5 6 7 8 9", "1 2 3 4 5 6 7 8 9"),
+        ("4111111111111111 cvv 482", ("4111111111111111", "482")),
+        ("4111111111111111 12/27 482", ("4111111111111111", "12/27", "482")),
+        ("Use 482113 to confirm", "482113"),
+        ("lock box 4821", "4821"),
+        ("wifi password 48214821", "48214821"),
+        ("wi-fi pass 48214821", "48214821"),
+        ("pw: 4821", "4821"),
+        ("my pwd is 4821", "4821"),
+        ("pwd: 4821", "4821"),
+        ("Door: 4821", "4821"),
+        ("the 3 digits on the back are 482", "482"),
+        ("Your confirmation code is 482113", "482113"),
+        ("access code 4821", "4821"),
+        ("entry code 4821", "4821"),
+        ("gift card code 48213377", "48213377"),
+        ("voucher code 48213377", "48213377"),
+        ("redemption code 48213377", "48213377"),
+        # chat markup, wrappers, arrows and emoji around the number
+        ("קוד: *4821*", "4821"),
+        ("code is **4821**", "4821"),
+        ("קוד `4821`", "4821"),
+        ("קוד _4821_", "4821"),
+        ("קוד ~4821~", "4821"),
+        ("קוד «4821»", "4821"),
+        ("קוד [4821]", "4821"),
+        ("code -> 4821", "4821"),
+        ("code → 4821", "4821"),
+        ("קוד 🔑 4821", "4821"),
+        ("code ****4821", "4821"),
+        # digits split by spaces, dashes or dots
+        ("code 48 21", "48 21"),
+        ("קוד 48  21", "48  21"),
+        ("קוד 4-8-2-1", "4-8-2-1"),
+        ("קוד 4.8.2.1", "4.8.2.1"),
+        ("PIN: 482 113", "482 113"),
+        # a following number ends the code instead of cancelling it
+        ("PIN 4821 12/27", "4821"),
+        ("CVV 482 12/27", "482"),
+        ("קוד 4821 12:30", "4821"),
+        ("code 4821 4111111111111111", ("4821", "4111111111111111")),
+        ("הקוד הוא 4821, והסיסמה 9988", ("4821", "9988")),
+        # invisible format characters and niqqud
+        ("קוד‎ 4821", "4821"),
+        ("קוד ‏4821", "4821"),
+        ("קוד ⁦4821⁩", "4821"),
+        ("ק‍וד 4821", "4821"),
+        ("code​ 4821", "4821"),
+        ("2.⁠ לשלם עם הכרטיס. קוד 4821", "4821"),
+        ("﻿קוד 4821", "4821"),
+        ("הַקּוֹד 4821", "4821"),
+        ("סִיסְמָה 4821", "4821"),
+        ("קוד ٤٨٢١", "٤٨٢١"),
+        ("קוד ４８２１", "４８２１"),
+        # keyword after the number on the same short clause
+        ("4821 is the code", "4821"),
+        ("4821 is my PIN", "4821"),
+        ("4821 זה הקוד", "4821"),
+        ("4821 הוא הקוד לדלת", "4821"),
+        ("4821 הקוד.", "4821"),
+        ("4821 - הקוד", "4821"),
+        ("4821 = קוד", "4821"),
+        ("4821 קוד הכניסה", "4821"),
+        ("482113 is your verification code", "482113"),
+        ("482113 is your Example code", "482113"),
+        ("G-482113 is your Example verification code", "482113"),
+        ("Use 482113 to log in", "482113"),
+        # full card numbers, with an expiry date or CVV next to them
+        ("כרטיס 4111 1111 1111 1111 בתוקף", "4111 1111 1111 1111"),
+        ("card 5555-5555-5555-4444", "5555-5555-5555-4444"),
+        ("378282246310005", "378282246310005"),
+        ("3782 822463 10005", "3782 822463 10005"),
+        ("4111.1111.1111.1111", "4111.1111.1111.1111"),
+        ("4111  1111  1111  1111", "4111  1111  1111  1111"),
+        ("4111‏ 1111 1111 1111", "1111 1111 1111"),
+        ("*4111 1111 1111 1111*", "4111 1111 1111 1111"),
+        ("1. 4111111111111111", "4111111111111111"),
+        ("1 4111111111111111", "4111111111111111"),
+        ("4111111111111111 12/27", ("4111111111111111", "12/27")),
+        ("4111 1111 1111 1111 1227 482", ("1111 1111", "1227", "482")),
+        ("4111111111111111/482", ("4111111111111111", "482")),
+        ("כרטיס 4111111111111111 תוקף 12/27 cvv 482",
+         ("4111111111111111", "12/27", "482")),
+        ("4111-1111-1111-1111 exp 12/27", ("4111-1111", "12/27")),
+    ]
+
+    KEPT = [
+        # times, dates, amounts, phones, longer numbers
+        "code 17:30", "הקוד ב-17:30", "קוד 12.11.2026", "code 2026-11-22",
+        "code 3/4/2026", "Python code 3.12", "קוד 120 ₪", "קוד 120 ש\"ח",
+        "קוד 1,500 ₪", "code 120 NIS", "code $120", "code 050-0000000",
+        "code 0500000000", "קוד 054-0000000", "דירה 26, קומה 3",
+        "code 0x4821",
+        # codes that are not secrets
+        "area code 212", "dress code: black, from 2026", "QR code 4821",
+        "zip code 12345", "postal code 4821337", "מיקוד 1234567",
+        "קוד מוצר 123456789", "product code 4821", "קוד הנחה 4821",
+        "קוד קופון 4821", "promo code 4821", "discount code 4821",
+        "Your reference code is 48213377", "Booking code: 482133",
+        "Order code 482133", "invoice code 482133", "Ticket code 482133",
+        "customer code: 482133", "client code 482133", "member code 48213",
+        "employee code 4821", "course code 4821", "class code 4821",
+        "room code 214", "flight code 4821", "tracking code 48213377",
+        "claim code 482133", "case code 482133", "transaction code 482133",
+        "error code 404", "HTTP status code 500", "exit code 127",
+        "the error code was 404", "returned code 500", "response code 200",
+        "code 500 from the server", "ISO code 376", "country code 972",
+        "dialing code 972", "lines of code 4821", "Unicode code point 1488",
+        "קוד פתוח 4821", "קוד שגיאה 404", "קוד המדינה 972", "קוד מוסד 482133",
+        "קוד לקוח 482133", "קוד עובד 4821", "קוד קורס 4821",
+        "קוד הזמנה 482133", "קוד אסמכתא 482133", "קוד טיסה 4821",
+        "קוד חשבונית 482133", "קוד כרטיסיה 4821", "קוד סניף 482",
+        # code words that are not next to a code
+        "קודם 4821", "פינה 4821", "pinned 4821", "barcode 4821",
+        "code review 482 comments", "the code changed in 2026",
+        "password expires in 90 days", "password length 128",
+        "code at 1530", "the code costs 1500",
+        "deployed the code to 1200 hosts", "the code on 300 servers",
+        "code for 2500 users", "code this today 1500 lines",
+        "The code for 2025 is in the repo", "הקוד ל-300 משתמשים",
+        # ordinary words that are only sometimes keywords
+        "combination 4821", "a combination of 300 steps", "combo 482 deal",
+        "pwd 1234 (current directory)", "pw 4821", "intercom 26",
+        "intercom 482", "אינטרקום 26", "Gate: 482", "Door: 12 m",
+        "דלת: 1200 מטר", "Use 2026 to confirm", "G-482113 shipped",
+        # the keyword after the number, without "is" or a secret keyword
+        "250 code reviews", "4821 קודים", "4821 code", "4821 code.",
+        "4821 קוד", "apartment 214 code", "In 2026 the code", "1500 the code",
+        "Room 214 - code", "Item 4821, code", "2026 is the code year",
+        "4821 lines of code", "כתבתי 400 שורות קוד", "got a 500 code",
+        "4821 זה קוד ההנחה", "12345 is the zip code",
+        # card-shaped numbers that are not cards
+        "4111 1111 1111 1112", "order 123456789012", "call 050-000-0000",
+        "IMEI 490154203237518", "Tracking 9400111899223817",
+        "timestamp 1700000000012", "scores 10 20 30 40 50 60 71",
+        "Your order 114-4821337-4821330",
+        "https://example.slack.com/archives/C0EXAMPLE1/p4111111111111111",
+        "https://x.example.com/someone/status/4111111111111111",
+        "urn:li:activity:4111111111111111", "#inbox/4111111111111111",
+        "id=4111111111111111", "ref-4111111111111111",
+        "IBAN IL62 0108 0000 0009 9999 999",
+    ]
+
+    def assert_redacted(self, text, codes):
+        redacted = chat_text.redact_secrets(text)
+        for code in (codes,) if isinstance(codes, str) else codes:
+            self.assertNotIn(code, redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_secret_codes_are_redacted(self):
+        for text, codes in self.SECRET:
+            with self.subTest(text=text):
+                self.assert_redacted(text, codes)
+
+    def test_harmless_numbers_near_code_words_are_kept(self):
+        for text in self.KEPT:
+            with self.subTest(text=text):
+                self.assertEqual(chat_text.redact_secrets(text), text)
+
+    # (input, exact output): what is kept next to a redacted code
+    EXACT = [
+        ("PIN 4821 300 people", "PIN [REDACTED] 300 people"),
+        ("code 4821 12 November", "code [REDACTED] 12 November"),
+        ("code 1 2 3 4 5 6 7 8 9", "code [REDACTED]"),
+        ("code 4821 1500 NIS", "code [REDACTED] 1500 NIS"),
+        ("PIN 4821 12/27", "PIN [REDACTED] 12/27"),
+        ("paid with 4111111111111111, 1500 NIS total",
+         "paid with [REDACTED], 1500 NIS total"),
+        ("card 4111111111111111 2026 was a great year",
+         "card [REDACTED] 2026 was a great year"),
+        ("card 4111111111111111 / 1234 Main st",
+         "card [REDACTED] / 1234 Main st"),
+        ("4111 1111 1111 1111 1227 482", "[REDACTED]"),
+        ("4111111111111111 12/27 482.", "[REDACTED]."),
+        ("4111111111111111 482", "[REDACTED] 482"),
+    ]
+
+    def test_exact_outputs(self):
+        for text, expected in self.EXACT:
+            with self.subTest(text=text):
+                self.assertEqual(chat_text.redact_secrets(text), expected)
+
+    def test_redaction_is_idempotent(self):
+        for text in [t for t, _c in self.SECRET] + self.KEPT:
+            with self.subTest(text=text):
+                once = chat_text.redact_secrets(text)
+                self.assertEqual(chat_text.redact_secrets(once), once)
+
+    def test_the_keyword_and_the_rest_of_the_line_are_kept(self):
+        self.assertEqual(
+            chat_text.redact_secrets("קוד כניסה לבניין 4821, דירה 26"),
+            "קוד כניסה לבניין [REDACTED], דירה 26")
+        self.assertEqual(chat_text.redact_secrets("4821 זה הקוד"),
+                         "[REDACTED] זה הקוד")
+        self.assertEqual(chat_text.redact_secrets("PIN 4821 12/27"),
+                         "PIN [REDACTED] 12/27")
+
+    def test_invisible_characters_stay_where_they_were(self):
+        # Matching ignores them; the output keeps everything outside the code.
+        self.assertEqual(chat_text.redact_secrets("קוד‏ 4821 ‎תודה"),
+                         "קוד‏ [REDACTED] ‎תודה")
+
+    def test_the_numbered_list_shape_is_redacted(self):
+        self.assertEqual(
+            chat_text.redact_secrets(CARD_CODE_TEXT),
+            CARD_CODE_TEXT.replace("4821", "[REDACTED]"))
+
+    def test_long_text_with_many_near_matches_is_fast(self):
+        text = ("Please see the code 4821 in this diff, zip code 12345, "
+                "4821 is the code year, 4111 1111 1111 111x. ") * 3200
+        self.assertGreater(len(text), 300_000)
+        started = time.monotonic()
+        redacted = chat_text.redact_secrets(text)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(redacted.count("[REDACTED]"), 3200)
 
 
 class BatchErrorTest(Base):
@@ -1821,6 +2150,20 @@ class EndToEndTest(Base):
         totals = self.run_daemon()
         self.assertEqual(totals["processed"], 0)
         self.assertEqual(self.cli_calls, [])
+
+    def test_a_card_code_reaches_neither_the_model_nor_the_entry(self):
+        self.spool.batch(iso(9, 1), [
+            record("todo", iso(8, 20), CARD_CODE_TEXT, from_me=True)])
+        totals = self.run_daemon()
+        self.assertEqual(totals["errors"], 0)
+        self.assertEqual(totals["processed"], 1)
+        (prompt,) = self.prompts
+        ((_args, stdin),) = [(a, s) for a, s in self.cli_calls
+                             if a[0] == "add"]
+        self.assertIn("## WhatsApp messages (verbatim)", stdin)
+        for text in (prompt, stdin):
+            self.assertNotIn("4821", text)
+            self.assertIn("לשלם עם הכרטיס שלי. קוד [REDACTED]", text)
 
     def test_no_personal_data_in_logs(self):
         self.run_daemon()
