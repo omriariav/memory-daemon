@@ -2371,6 +2371,36 @@ model. Three config-driven guards, all safe by default:
   structured extraction pass, same provider as `analyze`. Unset keeps
   `analyze.model`. The summary pass is unchanged, so a cheap model can triage
   while a stronger one fills the JSON.
+- **`memory.work_week`** (optional; default Monday-Friday). The team's work
+  week, used to resolve relative due phrases and stated to the model in the
+  date reference. Either `{start: sunday, days: 5}` (first working day plus
+  how many days, 1-7) or a list of consecutive weekday names
+  (`[sunday, monday, tuesday, wednesday, thursday]`). A week runs from its
+  start for seven days, so an off day belongs to the week it follows.
+- **Due phrases (`memory.due_dates`, default `false`).** Models mis-count
+  "early next week", so code resolves these English phrases (case-insensitive,
+  whole words) from the item's date and `work_week`; the earliest phrase in the
+  text wins:
+
+  | Phrase | Resolves to |
+  | --- | --- |
+  | `early next week` | 2nd working day of next week (Mon-Fri: Tuesday; Sun-Thu: Monday) |
+  | `next week` | 1st working day of next week (not `late`/`mid next week`, or when a weekday follows) |
+  | `end of (the/this) week` | last working day of this week (None once it has passed) |
+  | `end of next week` | last working day of next week |
+  | `by` / `on <weekday>` | the next such day, today excluded |
+  | `tomorrow` | calendar tomorrow, else the next working day |
+  | `today`, `EOD`, `end of (the) day` | the item's date |
+
+  Owner todos from a meeting (`owner_todos`) always take the code date over
+  the model's `due` (the line the owner spoke first, then the action text) and
+  write it in the todo body (`due <date>`); the review queue row carries it
+  too. With `due_dates: true` the extraction prompt also offers an optional
+  `due` for a `todo` / `pending-decision`, a phrase in the model's own title or
+  body overrides it, and the date goes to the store as `add --due YYYY-MM-DD`
+  for those entries and for owner todos. Turn it on only when the store's
+  `add` supports `--due`. The model's date stays when no phrase matches. The
+  verbatim source text never supplies a phrase.
 - **Extraction retry and fallback.** A schema or JSON failure is retried once
   with `Your previous JSON failed: <error>. Return corrected JSON only.`
   appended. If both answers are invalid and the item is a borderline chat item

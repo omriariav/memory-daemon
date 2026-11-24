@@ -29,6 +29,8 @@ import hashlib
 import os
 import re
 
+from . import due_phrases
+
 MEETING_KINDS = {"mila", "whisper", "transcripts", "meeting-notes", "zoom"}
 DEFAULT_MAX_PER_ITEM = 5
 MAX_ALLOWED = 20
@@ -429,6 +431,16 @@ def grounded_in_body(body, text, names):
     """Backfill check: an owner name shares a sentence or bullet with the
     action (most of its significant words appear there)."""
     return body_quote(body, text, names) is not None
+
+
+def apply_due_phrase(action, anchor, week, line=None):
+    """`action` with its `due` replaced by the code-resolved date of a
+    relative phrase ("early next week", "by Thursday", ...) found in the
+    owner's own transcript `line` first, else the action text. The model's
+    `due` stays when no phrase matches. Never mutates `action`."""
+    due = due_phrases.resolve_first(
+        (line, action.get("line"), action.get("text")), anchor, week)
+    return dict(action, due=due) if due else action
 
 
 def todo_title(text):
