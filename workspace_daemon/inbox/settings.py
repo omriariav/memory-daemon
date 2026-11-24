@@ -24,7 +24,7 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
             "slack_open", "show_rsvp_replies", "feed", "health",
-            "done_reaction", "nudge_template", "open_with")
+            "done_reaction", "nudge_template", "open_with", "strip_lines")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -122,6 +122,7 @@ DEFAULTS = {
     "slack_open": None,   # no default: `o` opens the item's link
     "open_with": [],   # no default: `o` uses the default browser
     "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
+    "strip_lines": 4,   # sessions strip: status lines shown before "+N more"
     "health": {"heartbeats": []},
 }
 
@@ -195,6 +196,13 @@ def validate(raw):
             f"thread_order must be one of {', '.join(THREAD_ORDERS)}")
     else:
         out["thread_order"] = order
+
+    lines = raw.get("strip_lines", DEFAULTS["strip_lines"])
+    if not isinstance(lines, int) or isinstance(lines, bool) \
+            or not 1 <= lines <= 12:
+        problems.append("strip_lines must be an integer from 1 to 12")
+    else:
+        out["strip_lines"] = lines
 
     account = raw.get("gmail_account", DEFAULTS["gmail_account"])
     if not isinstance(account, int) or isinstance(account, bool) or account < 0:

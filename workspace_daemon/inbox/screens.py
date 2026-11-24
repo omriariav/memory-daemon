@@ -663,7 +663,7 @@ HELP = [
         ("mouse drag", "select text in the thread or draft pane"),
         ("", "L is the ops log: u on a row sends the inverse (reopen / unmute / the old due date) after a confirm")]),
     ("Views and moving", [
-        ("1 2 3 4 5", "Inbox · Waiting · Tasks · Feed · Health"),
+        ("1 2 3 4 5 6", "Inbox · Waiting · Tasks · Feed · Health · Agents"),
         ("[ / ]", "previous / next group in the view (section, person, routine)"),
         ("j / k  ↓ / ↑", "next / previous"), ("g / G", "top / bottom"),
         ("tab / shift+tab", "switch pane (tab on a Feed row: its details)"),
@@ -688,6 +688,11 @@ HELP = [
         ("m", "remind me: fills the Detail pane with the source, date, people, original words, last activity and related items (read-only; m or esc closes)"),
         ("tab", "the Detail card (j / k scroll it, esc back)"),
         ("", "needs acts: [close, drop, due] on the source; without it the keys only say so")]),
+    ("Agents and the sessions strip (a source's meta.kind: agent rows and status lines)", [
+        ("6", "the Agents view: every agent row, grouped NEEDS YOU / WORKING / DONE, with where, age, live or no session, old rules"),
+        ("", "an agent row that waits for you is also in the Inbox; one that is working or queued is only here and in the strip"),
+        ("", "the strip above the queue shows the status lines your sources send (4 lines, then +N more · 6); it is hidden when none do"),
+        ("ctrl+p", "Show / hide sessions strip (no key of its own; strip_lines: in inbox.yaml sets how many lines)")]),
     ("App", [("ctrl+p", "command palette: this item's commands first, then the rest"),
              ("ctrl+t", "dark / light theme"), ("L", "audit log"),
              ("b", "toggle Hebrew order (logical/visual)"),

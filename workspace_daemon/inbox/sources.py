@@ -19,8 +19,12 @@ from . import items as itm
 from .alertstate import MTIME_SLACK_S, Recovery
 from .store import rsvp_state
 
+# `status` (0.13.2): the validated status lines a command source sent with its
+# items (items.parse_status), for the sessions strip. Empty for every other
+# source and for a source that sends none.
 SourceResult = namedtuple(
-    "SourceResult", "name items stale age_min error", defaults=(None,)
+    "SourceResult", "name items stale age_min error status",
+    defaults=(None, ())
 )
 
 EVENTS_FILE = "events.jsonl"
@@ -1034,11 +1038,11 @@ def run_command_source(name, argv, timeout_s=20.0, show_all=False):
             name, [], False, None,
             f"exit {code}" + (f": {detail}" if detail else ""))
     try:
-        rows, stale, age, error = itm.parse_list_output(
-            out.decode("utf-8", "replace"))
+        rows, stale, age, error, status = itm.parse_list_output(
+            out.decode("utf-8", "replace"), with_status=True)
     except itm.ItemError as exc:
         return SourceResult(name, [], False, None, f"bad output: {exc}")
-    return SourceResult(name, rows, stale, age, error)
+    return SourceResult(name, rows, stale, age, error, status)
 
 
 def _act_failure(message):
