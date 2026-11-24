@@ -46,7 +46,7 @@ DEFAULT_DISALLOWED_TOOLS = (
     "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,CronCreate,"
     "CronDelete,CronList,RemoteTrigger,DesignSync,PushNotification,Monitor,"
     "EnterWorktree,ExitWorktree,SendMessage,ListAgents,Workflow,PublishPlugin,"
-    "ShareOnboardingGuide,ScheduleWakeup,ReportFindings,TaskStop,"
+    "ShareOnboardingGuide,ScheduleWakeup,ReportFindings,TaskStop,McpTaskCheck,"
     # Generic MCP resource readers appear once connectors attach; they could
     # read any connector's resources, so they are removed too.
     "ListMcpResourcesTool,ReadMcpResourceDirTool,ReadMcpResourceTool"
