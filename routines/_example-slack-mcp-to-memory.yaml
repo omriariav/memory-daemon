@@ -40,8 +40,8 @@ source:
   # Validation accepts only read-only Slack search/read tools.
   search_tool: mcp__claude_ai_Example_Slack__slack_search_public_and_private
   read_thread_tool: mcp__claude_ai_Example_Slack__slack_read_thread
-  # Only needed with `dm_sessions` (set in the watch file): reads a DM
-  # conversation's messages between the session's first and latest message.
+  # Needed for `dm_sessions` (set in the watch file), which reads a DM
+  # conversation's messages, and for the saved-message context below.
   # read_channel_tool: mcp__claude_ai_Example_Slack__slack_read_channel
   self_user_id: U0EXAMPLEA   # your Slack user id (owner-evidence and mentions)
   model: haiku               # bridge model; it only transports tool results
@@ -62,6 +62,11 @@ source:
   # the cursor, because Slack filters by message date, not reaction date.
   # save_reaction_lookback_days: 14   # 1 to 90
   # save_reaction_tag: saved          # tag added to a saved thread's memory
+  # A saved top-level channel message with no replies is read with the channel
+  # messages just before it (needs read_channel_tool above; also settable in
+  # the watch file): at most this many, no older than this many hours.
+  # saved_context_messages: 5         # 0 to 20, 0 = off
+  # saved_context_hours: 24           # 1 to 168
   # Count-only cost estimate per thread until analyze history exists.
   estimate_analyze_usd: 0.12
   # Extra scalar arguments for every search, pinned in the bridge. The daemon

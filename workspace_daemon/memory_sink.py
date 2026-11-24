@@ -109,10 +109,42 @@ Known memory person slugs: {slugs}
 Verified source identities: {verified_people}
 Related memory entries already captured from this conversation: {related_entries}
 {invitees}
-{date_anchor}{same_meeting_context}
+{date_anchor}{same_meeting_context}{saved_note}
 The note below was distilled from untrusted source text.
 {note}
 """
+
+SAVED_EXTRACT_NOTE = """The memory owner explicitly saved this item, so answer "worthy": true and
+write a title and body that say what it is about (the topic, the people, the
+request or fact). Never write a title or body saying there is no durable
+content, that it is not memory-worthy, or that there is nothing to capture.
+"""
+
+# A title or body that says the item is not worth keeping. Compared on text
+# lowercased with every run of non-letters/digits collapsed to one space, so
+# "No-Durable_Content" and "no durable content" both match.
+NOT_WORTH_PHRASES = (
+    "no durable", "nothing durable", "not memory worthy", "not memoryworthy",
+    "nothing to capture", "nothing to keep", "nothing to save",
+    "nothing to remember", "nothing to record",
+    "not worth keeping", "not worth saving", "not worth remembering",
+    "not worth capturing", "not worth recording",
+    "nothing worth keeping", "nothing worth saving",
+    "nothing worth remembering", "nothing worth capturing",
+    "nothing worth recording",
+)
+
+
+_NOT_WORTH_RE = re.compile(
+    r"\b(?:" + "|".join(NOT_WORTH_PHRASES) + r")\b"
+)
+
+
+def says_not_worth_keeping(text):
+    """Whether `text` says the item has nothing worth keeping."""
+    norm = " ".join(re.sub(r"[\W_]+", " ", str(text or "").lower()).split())
+    return bool(_NOT_WORTH_RE.search(norm))
+
 
 SAME_MEETING_SCHEMA = """  "differs": array of at most 5 one-line strings — facts, decisions,
             attendance, or action items where this note is in CONFLICT with the
@@ -1128,8 +1160,13 @@ def _attendance(meta, verified_source, identity, model_people, owner_names):
 
 
 def _extract(routine, item, summary, store, verified_people=(), identity=None,
-             owner_names=(), existing_titles=(), invitees_only=False):
-    """Structured second pass over the already-distilled summary."""
+             owner_names=(), existing_titles=(), invitees_only=False,
+             saved=False, retry_note=""):
+    """Structured second pass over the already-distilled summary.
+
+    `saved`: the owner explicitly saved the item, so the prompt says it is
+    worth keeping; `retry_note` is extra guidance for a regeneration.
+    """
     from . import llm  # late import to avoid cycles
 
     identity = identity or {"safe": False}
@@ -1172,6 +1209,10 @@ def _extract(routine, item, summary, store, verified_people=(), identity=None,
         same_meeting_schema=(
             SAME_MEETING_SCHEMA if same_meeting_context else ""),
         same_meeting_context=same_meeting_context,
+        saved_note=(
+            ("\n" + SAVED_EXTRACT_NOTE if saved else "")
+            + (f"{retry_note}\n" if retry_note else "")
+        ),
         date_anchor=llm.date_anchor(routine, item) + "\n",
         related_entries=related_catalog or "(none)",
         invitees=llm.invitees_note(item, complete=invitees_only),
@@ -1313,6 +1354,62 @@ def _operator_confirmed_summary(routine, item):
             "operator-confirmed source did not produce a usable summary"
         )
     return summary
+
+
+def _saved_title_fallback(item, summary):
+    """A title for a saved item built from its own text, never a verdict."""
+    for candidate in (
+        _summary_title(summary),
+        " ".join(str(item.get("title") or "").split())[:120],
+    ):
+        if candidate and candidate != "untitled" and not (
+            says_not_worth_keeping(candidate)
+        ):
+            return candidate
+    return "Saved item"
+
+
+def _guard_saved_entry(routine, item, summary, store, entry, extract_args,
+                       vetoed):
+    """Never let a saved item carry a "not worth keeping" title or body.
+
+    The owner's save forces capture, but the extractor may have judged the
+    item empty first and worded its title (and so the entry id) that way. One
+    regeneration says so explicitly; if the title is still such a verdict, or
+    there was no extraction, it is rebuilt from the text. Changes `entry`.
+    """
+    rid = routine.get("id")
+    if not (vetoed or says_not_worth_keeping(entry.get("title"))):
+        return
+    regenerated = False
+    if extract_args is not None:
+        note = (
+            "Your previous answer called this item not worth keeping, but "
+            "the owner saved it: describe what it is about instead."
+        )
+        try:
+            again = _extract(
+                routine, item, summary, store,
+                **dict(extract_args, retry_note=note),
+            )
+        except claude_bridge.GUARD_STOPS:
+            raise
+        except Exception as exc:
+            log(f"routine={rid} memory WARN: saved-item regeneration "
+                f"failed: {exc}")
+        else:
+            entry.update(again)
+            entry["worthy"] = True
+            regenerated = True
+    if says_not_worth_keeping(entry.get("title")):
+        entry["title"] = _saved_title_fallback(item, summary)
+        log(f"routine={rid} memory: replaced a not-worth-keeping title "
+            "of a saved item")
+    if (
+        says_not_worth_keeping(entry.get("body"))
+        or (vetoed and not regenerated)
+    ) and not says_not_worth_keeping(summary):
+        entry["body"] = summary
 
 
 def _saved_fallback_summary(item):
@@ -1463,6 +1560,7 @@ def capture(routine, item, summary, dry_run=False):
              "title": item.get("title", ""), "people": [], "tags": [], "body": summary}
     degraded = None
     extraction_succeeded = False
+    extract_args = None
     extract = cfg.get("extract", True)
     owner_emails = item.get("frontmatter", {}).get("drive_owner_emails") or []
     provider = identity_providers.provider_for(routine)
@@ -1497,12 +1595,14 @@ def capture(routine, item, summary, dry_run=False):
                 )
                 if todo_names and source_id:
                     todo_titles = existing_action_titles(store, source_id)
-            entry.update(_extract(
-                routine, item, summary, store,
+            extract_args = dict(
                 verified_people=verified_source,
                 identity=identity,
                 owner_names=todo_names, existing_titles=todo_titles,
-                invitees_only=invitees_only,
+                invitees_only=invitees_only, saved=saved_request,
+            )
+            entry.update(_extract(
+                routine, item, summary, store, **extract_args
             ))
             extraction_succeeded = True
         except claude_bridge.GUARD_STOPS:
@@ -1539,6 +1639,7 @@ def capture(routine, item, summary, dry_run=False):
             "operator confirmation overrode extraction veto"
         )
         entry["worthy"] = True
+    vetoed = False
     if (
         not entry.get("worthy", True)
         and saved_request
@@ -1549,12 +1650,18 @@ def capture(routine, item, summary, dry_run=False):
             "saved request overrode extraction veto"
         )
         entry["worthy"] = True
+        vetoed = True
     if not entry.get("worthy", True) and not active_chat_followup:
         log(
             f"routine={rid} memory source_id={source_id}: "
             "judged not memory-worthy, skipping"
         )
         return {"memory": "skipped_not_worthy"}
+    if saved_request and not active_chat_followup:
+        _guard_saved_entry(
+            routine, item, summary, store, entry,
+            extract_args if extraction_succeeded else None, vetoed,
+        )
 
     # --- validate everything the model returned -----------------------------
     etype = entry.get("type") if entry.get("type") in MEMORY_TYPES else cfg.get("type", "note")

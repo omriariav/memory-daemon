@@ -1937,6 +1937,7 @@ def _validate_slack_mcp(prefix, source):
         ("save_reaction_budget_s", 0, 3600),
         ("max_file_reads_per_run", 0, 50), ("file_scan_lookback_days", 1, 30),
         ("file_scan_minutes", 1, 1440),
+        ("saved_context_messages", 0, 20), ("saved_context_hours", 1, 168),
     ):
         if key in source and not _bounded_int(source[key], lower, upper):
             problems.append(

@@ -422,8 +422,12 @@ class CaptureValidationTest(unittest.TestCase):
                                      return_value=FakeResult())]
         if extraction is not None:
             self.routine["memory"]["extract"] = True
-            patches.append(mock.patch.object(memory_sink, "_extract",
-                                             return_value=extraction))
+            if isinstance(extraction, list):
+                self.extract = mock.Mock(side_effect=extraction)
+            else:
+                self.extract = mock.Mock(return_value=extraction)
+            patches.append(mock.patch.object(
+                memory_sink, "_extract", self.extract))
         with mock.patch.object(memory_sink, "log"):
             for p in patches:
                 p.start()
@@ -928,6 +932,97 @@ class CaptureValidationTest(unittest.TestCase):
         self.assertIn("saved", self.tags(calls))
         idx = calls["args"].index("--type")
         self.assertEqual(calls["args"][idx + 1], "note")
+
+    @staticmethod
+    def verdict(title, body="b", worthy=True):
+        return {"worthy": worthy, "owner_attention": False, "type": "note",
+                "title": title, "people": [], "tags": [], "body": body}
+
+    @staticmethod
+    def title(calls):
+        return calls["args"][calls["args"].index("--title") + 1]
+
+    def test_saved_item_with_a_not_worth_keeping_title_is_regenerated(self):
+        self.saved()
+        outcome, calls = self._run_capture([
+            self.verdict("No durable content", worthy=False),
+            self.verdict("Rollout cost question for the example project"),
+        ])
+        self.assertEqual(outcome["memory"], "created")
+        self.assertEqual(
+            self.title(calls), "Rollout cost question for the example project"
+        )
+        self.assertEqual(self.extract.call_count, 2)
+        self.assertTrue(self.extract.call_args_list[0].kwargs["saved"])
+        self.assertIn(
+            "saved it", self.extract.call_args_list[1].kwargs["retry_note"]
+        )
+
+    def test_saved_item_title_falls_back_to_the_text_after_a_second_miss(self):
+        self.saved()
+        bad = self.verdict("Not memory-worthy: nothing to capture",
+                           body="There is no durable content here.",
+                           worthy=False)
+        outcome, calls = self._run_capture(
+            [bad, bad], summary="Cost of the example rollout was discussed. "
+                                "No decision yet.",
+        )
+        self.assertEqual(outcome["memory"], "created")
+        self.assertEqual(
+            self.title(calls), "Cost of the example rollout was discussed."
+        )
+        self.assertIn("Cost of the example rollout", calls["stdin"])
+        self.assertNotIn("no durable content", calls["stdin"])
+
+    def test_saved_title_fallback_uses_the_message_when_summary_is_bad(self):
+        self.saved()
+        self.item["title"] = "Use the second option for the example rollout"
+        bad = self.verdict("no-durable-content")
+        _, calls = self._run_capture(
+            [bad, bad], summary="Nothing to capture here.",
+        )
+        self.assertEqual(
+            self.title(calls), "Use the second option for the example rollout"
+        )
+
+    def test_saved_item_with_a_good_title_is_not_regenerated(self):
+        self.saved()
+        _, calls = self._run_capture([self.verdict("Rollout decision")])
+        self.assertEqual(self.extract.call_count, 1)
+        self.assertEqual(self.title(calls), "Rollout decision")
+
+    def test_saved_regeneration_failure_still_titles_from_the_text(self):
+        self.saved()
+        _, calls = self._run_capture(
+            [self.verdict("No durable content"), RuntimeError("model down")],
+            summary="Pricing was agreed for the example plan.",
+        )
+        self.assertEqual(
+            self.title(calls), "Pricing was agreed for the example plan."
+        )
+
+    def test_unsaved_item_titles_are_left_alone(self):
+        self.item["frontmatter"]["slack_owner_evidence"] = ["mentioned"]
+        _, calls = self._run_capture([self.verdict("No durable content")])
+        self.assertEqual(self.extract.call_count, 1)
+        self.assertEqual(self.title(calls), "No durable content")
+
+    def test_not_worth_keeping_phrases(self):
+        for text in (
+            "No durable content", "no-durable-content", "NO_DURABLE_CONTENT",
+            "Not memory-worthy", "not memory worthy", "Nothing to capture",
+            "nothing-to-capture here", "Not worth keeping",
+            "nothing worth saving", "No durable content in the thread",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(memory_sink.says_not_worth_keeping(text))
+        for text in (
+            "Rollout cost question", "Durable storage decision",
+            "Capture the rollout plan", "", None,
+            "Not worth the price: vendor renewal",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(memory_sink.says_not_worth_keeping(text))
 
     def test_unsaved_not_worthy_thread_is_still_skipped(self):
         self.item["frontmatter"]["slack_owner_evidence"] = []

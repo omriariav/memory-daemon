@@ -350,6 +350,23 @@ def date_anchor(routine, item, today=None):
     )
 
 
+SAVED_NOTE = (
+    "The memory owner explicitly saved this item, so it is worth keeping: do "
+    "not answer NOT MEMORY-WORTHY and do not describe it as having no durable "
+    "content. Say what it is about and why it matters. Lines marked as "
+    "preceding context are earlier messages shown only as background: use "
+    "them to name the topic the saved message refers to, but the saved "
+    "message is the item."
+)
+
+
+def is_saved(item):
+    """Whether the owner explicitly asked to save this item (a Slack save
+    reaction or a source that lists only saved items)."""
+    meta = (item or {}).get("frontmatter") or {}
+    return meta.get("slack_saved") is True or meta.get("saved_request") is True
+
+
 def build_prompt(routine, item, label_catalog):
     """Assemble the analysis prompt. Label catalog is only injected when asked for."""
     analyze = routine["analyze"]
@@ -369,6 +386,8 @@ def build_prompt(routine, item, label_catalog):
     note = invitees_note(item)
     if note:
         parts.append("\n" + note)
+    if is_saved(item):
+        parts.append("\n" + SAVED_NOTE)
     parts.append("\n" + date_anchor(routine, item))
 
     if analyze.get("pick_label") and label_catalog:
