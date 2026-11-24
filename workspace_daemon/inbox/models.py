@@ -71,6 +71,7 @@ class Item:
     feed: str = "show"             # UI-only: the Feed rule outcome (show/digest/hide/inbox)
     feed_label: str = ""           # UI-only: what the matching rule says (muted list)
     local_due: Optional[tuple] = None   # UI-only (tasks): `(date or None,)`, a due date set here that the list has not caught up with yet
+    task: Optional[tuple] = field(default=None, repr=False, compare=False)   # UI-only: `(agent row, launcher.Card)` of the task started from this row
     members: List["Item"] = field(default_factory=list, repr=False,
                                   compare=False)   # UI-only: a digest row's items
     raw: Optional[dict] = field(default=None, repr=False, compare=False)

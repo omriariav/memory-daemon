@@ -48,6 +48,7 @@ from urllib.parse import urlsplit
 
 from . import acts as acts_mod
 from . import context, customactions, draftme, invites, items, mrkdwn, views
+from . import launcher as launcher_mod
 from . import outcome as outcome_mod
 from . import polish as polish_mod
 from . import sources, writes
@@ -70,6 +71,7 @@ class Result:
     op_id: str = ""
     note: str = ""
     shadow: bool = False
+    name: str = ""            # 0.13.3 task launch: the name of the card it made
 
 
 # What `send_act` and the retry report: `status` is one of acts.OK, SHADOW,
@@ -137,7 +139,7 @@ class LocalActions:
                  complete=None, actions=None, send=None, react=None,
                  polish=None, copy=False, team=None, slack_open=None,
                  acts=None, done_reaction=None, nudge_template=None,
-                 open_with=None, runner=None):
+                 open_with=None, runner=None, task_launcher=None):
         """`rsvp`, `save`, `context`, `summary`, `send`, `react` and `polish`
         are the validated settings blocks (None: not configured); `actions`
         the validated list. `call_tools` and `complete` replace the Claude
@@ -148,6 +150,9 @@ class LocalActions:
         `open_with` is the validated `[{host, app}]` list: an https link whose
         host matches a rule opens in that macOS app (`open -a`, run by
         `runner`, default `subprocess.run`), else in the default browser.
+
+        `task_launcher` is the validated `task_launcher:` block (None: `t`
+        says there is none; see launcher.py).
 
         `acts` maps a command source's name to `{"argv", "timeout_s", "acts"}`
         for each source that listed `acts:` (None or empty: acts are off and
@@ -162,6 +167,7 @@ class LocalActions:
                               and base_dir is not None)
         self._send_lock = threading.Lock()   # one send runs at a time
         self.custom_actions = list(actions or [])
+        self.task_launcher = task_launcher
         self._open = opener or webbrowser.open
         self.open_with = list(open_with or [])
         self._run = runner or subprocess.run
@@ -230,6 +236,27 @@ class LocalActions:
             return Result(False, "Unknown action")
         out = customactions.run_run(cfg, to_v1(item), choice, state)
         return Result(out.ok, out.message)
+
+    @property
+    def task_launcher_configured(self):
+        return self.task_launcher is not None
+
+    def task_draft(self, item, fields, taken=(), cancel=None):
+        """Ask the task launcher to improve the modal's fields (read-only).
+        Blocks: call from a worker. A `launcher.Draft`; never raises."""
+        if self.task_launcher is None:
+            return launcher_mod.Draft(False, {}, [],
+                                      "no task launcher configured")
+        return launcher_mod.run_draft(self.task_launcher, to_v1(item), fields,
+                                      taken, cancel=cancel)
+
+    def task_launch(self, item, fields):
+        """Start the task once (never retried). A `Result` whose `detail` is
+        the launcher's one-line message and `name` the card name."""
+        if self.task_launcher is None:
+            return Result(False, "no task launcher configured")
+        out = launcher_mod.run_launch(self.task_launcher, to_v1(item), fields)
+        return Result(out.ok, out.message, name=out.name)
 
     @property
     def summary_configured(self):
@@ -1003,6 +1030,8 @@ class FakeActions:
     summary_delay: float = 0.6
     action_delay: float = 0.3
     save_mark_done = True
+    task_launcher = None            # the demo has no launcher
+    task_launcher_configured = False
     custom_actions: list = field(default_factory=lambda: [
         {"key": "p", "label": "Add to agenda", "argv": ["demo"],
          "timeout_s": 60.0, "mark_done": True}])

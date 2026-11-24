@@ -619,6 +619,228 @@ class RowMenu(ModalScreen):
         self.dismiss(None)
 
 
+class TaskScreen(ModalScreen):
+    """Start a task from a row (`t`, 0.13.3): the name, the role chips, the
+    model and effort chips, one goal line, a collapsed acceptance line, and the
+    persona and template when the launcher's draft returned them. It opens at
+    once with local defaults; `fill(draft)` puts the launcher's draft in, but
+    only into fields the user has not touched (see `launcher.TaskForm`).
+
+    Nothing has the focus at first, so the keys are chip keys: 1-9 role,
+    `m` model, `e` effort, `t` template, `a` acceptance, and `n`, `g`, `p`
+    jump into the name, goal and persona lines (`tab` moves on, and comes
+    back to the chips; `enter` starts the task from anywhere, `esc` cancels).
+    Dismisses with the `TaskForm`, or None."""
+
+    AUTO_FOCUS = ""
+    BINDINGS = [Binding("escape", "cancel", "Cancel"),
+                Binding("enter", "start", "Start"),
+                Binding("tab", "next_field(1)", show=False),
+                Binding("shift+tab", "next_field(-1)", show=False)]
+    INPUTS = {"task-name": "name", "task-goal": "goal",
+              "task-persona": "persona"}
+
+    def __init__(self, title, form, visual=False, drafting=True):
+        super().__init__()
+        self.title_text, self.form, self.visual = title, form, visual
+        self.drafting = drafting
+        self.status = ("drafting…  (enter starts with what is here)"
+                       if drafting else "")
+        self.expanded = False
+        self._filling = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="task"):
+            yield Static(Text(vis(self.title_text, self.visual),
+                              Style(bold=True)), id="task-title")
+            yield Static(Text("Name"), classes="task-label")
+            yield Input(value=self.form.name, id="task-name",
+                        max_length=41, select_on_focus=False)
+            yield Static("", id="task-role", classes="task-chips")
+            yield Static("", id="task-model", classes="task-chips")
+            yield Static("", id="task-effort", classes="task-chips")
+            yield Static("", id="task-template", classes="task-chips")
+            yield Static(Text("Goal"), classes="task-label")
+            yield Input(value=self.form.goal, id="task-goal", max_length=300,
+                        select_on_focus=False)
+            yield Static("", id="task-accept")
+            yield Static(Text("Persona"), id="task-persona-label",
+                         classes="task-label")
+            yield Input(value=self.form.persona, id="task-persona",
+                        max_length=400, select_on_focus=False)
+            yield Static("", id="task-status")
+            yield Static("", id="task-hint")
+
+    def on_mount(self):
+        self._redraw()
+
+    # --- drawing
+    def _chips(self, label, key, pool, blank=None):
+        """One chip row: the choices, the chosen one reversed. `blank` is the
+        chip for "no choice" (the launcher's default)."""
+        text = Text()
+        text.append(f"{label:<8}", Style(bold=True))
+        cur = getattr(self.form, key)
+        stops = ([("", blank)] if blank else []) + [(c, c) for c in pool]
+        for n, (value, shown) in enumerate(stops, 1):
+            num = f"{n} " if key == "role" and n < 10 else ""
+            chip = f" {num}{shown} "
+            text.append(chip, Style(reverse=True, bold=True)
+                        if value == cur else Style(dim=True))
+            text.append(" ")
+        return text
+
+    def _redraw(self):
+        f = self.form
+        q = self.query_one
+        q("#task-role", Static).update(self._chips("Role", "role", f.roles))
+        models = q("#task-model", Static)
+        efforts = q("#task-effort", Static)
+        models.display = bool(f.models)
+        efforts.display = bool(f.efforts)
+        if f.models:
+            models.update(self._chips("Model", "model", f.models, "default"))
+        if f.efforts:
+            efforts.update(self._chips("Effort", "effort", f.efforts,
+                                       "default"))
+        tmpl = q("#task-template", Static)
+        tmpl.display = bool(f.templates)
+        if f.templates:
+            tmpl.update(self._chips("Brief", "template", f.templates,
+                                    "default"))
+        for key in ("name", "goal", "persona"):
+            box = q(f"#task-{key}", Input)
+            if box.value != getattr(f, key):
+                self._filling = True
+                try:
+                    box.value = getattr(f, key)
+                finally:
+                    self._filling = False
+        show_persona = bool(f.persona) or "persona" in f.touched
+        q("#task-persona-label").display = show_persona
+        q("#task-persona", Input).display = show_persona
+        acc = Text()
+        acc.append("Acceptance  ", Style(bold=True))
+        if not f.acceptance:
+            acc.append("the launcher's default", Style(dim=True))
+        elif self.expanded:
+            for line in f.acceptance:
+                acc.append("\n  - " + vis(line, self.visual))
+        else:
+            acc.append(vis(f.acceptance[0], self.visual))
+            more = len(f.acceptance) - 1
+            acc.append(f"  (+{more} more · a)" if more else "  (a)",
+                       Style(dim=True))
+        q("#task-accept", Static).update(acc)
+        q("#task-status", Static).update(Text(self.status, Style(dim=True)))
+        keys = ["1-9 role"]
+        if f.models:
+            keys.append("m model")
+        if f.efforts:
+            keys.append("e effort")
+        if f.templates:
+            keys.append("t brief")
+        keys += ["n name", "g goal"]
+        if show_persona:
+            keys.append("p persona")
+        keys += ["a acceptance", "tab next", "enter start", "esc cancel"]
+        q("#task-hint", Static).update(Text("  ·  ".join(keys),
+                                            Style(dim=True)))
+
+    # --- the launcher's draft
+    def fill(self, draft):
+        """Put a `launcher.Draft` into the untouched fields; the names of the
+        fields it filled."""
+        done = self.form.apply_draft(draft)
+        self.status = ("draft ready" + (": " + ", ".join(done) if done else
+                                        ": nothing to change"))
+        if self.is_mounted:
+            self._redraw()
+        return done
+
+    def draft_failed(self, message):
+        """The model call failed or ran out of time: the local defaults
+        stay."""
+        self.status = ("no draft: " + (message or "failed")
+                       + "  (the defaults stay)")
+        if self.is_mounted:
+            self._redraw()
+
+    # --- keys
+    def on_input_changed(self, e):
+        field = self.INPUTS.get(e.input.id)
+        if (field is None or self._filling
+                or e.value == getattr(self.form, field)):
+            return                  # not a change by the user (the mount)
+        self.form.edit(field, e.value)
+
+    def on_input_submitted(self, e):
+        e.stop()
+        self.action_start()
+
+    def on_key(self, event: events.Key):
+        if isinstance(self.focused, Input):
+            return
+        ch = event.character or ""
+        f = self.form
+        handled = True
+        if len(ch) == 1 and ch in "123456789":
+            handled = f.pick_role(int(ch))
+        elif ch == "m" and f.models:
+            f.cycle("model")
+        elif ch == "e" and f.efforts:
+            f.cycle("effort")
+        elif ch == "t" and f.templates:
+            f.cycle("template")
+        elif ch == "a":
+            self.expanded = not self.expanded
+        elif ch in ("n", "g", "p"):
+            target = {"n": "task-name", "g": "task-goal",
+                      "p": "task-persona"}[ch]
+            box = self.query_one(f"#{target}", Input)
+            if not box.display:
+                return
+            event.stop()
+            event.prevent_default()
+            box.focus()
+            box.cursor_position = len(box.value)
+            return
+        else:
+            return
+        event.stop()
+        event.prevent_default()
+        if handled:
+            self._redraw()
+
+    def _fields_order(self):
+        order = [None, "task-name", "task-goal"]
+        if self.query_one("#task-persona", Input).display:
+            order.append("task-persona")
+        return order
+
+    def action_next_field(self, step):
+        order = self._fields_order()
+        cur = getattr(self.focused, "id", None)
+        at = order.index(cur) if cur in order else 0
+        nxt = order[(at + int(step)) % len(order)]
+        if nxt is None:
+            self.set_focus(None)
+        else:
+            self.query_one(f"#{nxt}", Input).focus()
+
+    def action_start(self):
+        why = self.form.problem()
+        if why:
+            self.status = why
+            self.query_one("#task-status", Static).update(
+                Text(why, Style(bold=True, color="red")))
+            return
+        self.dismiss(self.form)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
 POWER = "Power keys (also in enter)"
 
 HELP = [
@@ -626,6 +848,7 @@ HELP = [
         ("a", "approve: send the reply, accept the invite, nudge, ack"),
         ("d", "done (dismiss on an FYI row)"),
         ("s", "later: snooze, or a task's due date"),
+        ("t", "task: start a task session from this row (task_launcher: in inbox.yaml)"),
         ("o", "open the item's link (the Slack thread with slack_open:)"),
         ("enter", "more: a menu of what this row can do (a key runs it, / filters)"),
         ("u", "undo the last action (5 s)")]),
@@ -688,6 +911,10 @@ HELP = [
         ("m", "remind me: fills the Detail pane with the source, date, people, original words, last activity and related items (read-only; m or esc closes)"),
         ("tab", "the Detail card (j / k scroll it, esc back)"),
         ("", "needs acts: [close, drop, due] on the source; without it the keys only say so")]),
+    ("Start a task (t; task_launcher: in inbox.yaml)", [
+        ("t", "modal: name, role 1-9, model m, effort e, goal g, acceptance a; a draft fills only what you have not touched; enter queues it (5 s undo), esc cancels"),
+        ("", "the row shows ▶ name · role · state; in its menu: > Go to task, and o opens the report when done"),
+        ("", "without task_launcher: t says: no task launcher configured")]),
     ("Agents and the sessions strip (a source's meta.kind: agent rows and status lines)", [
         ("6", "the Agents view: every agent row, grouped NEEDS YOU / WORKING / DONE, with where, age, live or no session, old rules"),
         ("", "an agent row that waits for you is also in the Inbox; one that is working or queued is only here and in the strip"),
