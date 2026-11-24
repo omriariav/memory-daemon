@@ -30,7 +30,9 @@ sends. Nothing changes for a source that sends neither `status` nor
 - **View `6` Agents**: every `meta.kind: agent` row, grouped `NEEDS YOU`,
   `WORKING` and `DONE` (`meta.bucket`, else the row's section), with `where`,
   the age, and the marks `live` / `no session` (`meta.live`) and `old rules`
-  (`meta.rules_stale`). The full row menu and the keys work as on any row.
+  (`meta.rules_stale`). The full row menu and the keys work as on any row. A
+  row that a Feed rule mutes stays hidden here too. In this view the strip
+  shows all its lines instead of `+N more · 6`.
   `6` is a view key like `1`-`5`; the help, the Health footer and the palette
   ("Go to Agents") follow.
 

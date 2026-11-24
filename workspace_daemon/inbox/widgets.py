@@ -14,6 +14,7 @@ from textual.widgets.option_list import Option
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
 from . import tasks as tasksmod
+from .items import STATUS_MAX
 from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
                      owe_action, owe_message, owes, thread_fixed, thread_note)
 from .views import VIEWS, is_agent
@@ -880,7 +881,8 @@ class HealthStrip(Static):
 class SessionsStrip(Static):
     """The sessions strip (0.13.2): the `status` lines the sources sent, pinned
     above the queue in every view. At most `app.strip_lines` lines, then
-    `+N more · 6` (the Agents view). The level only picks the colour. Hidden
+    `+N more · 6` (the Agents view). In the Agents view itself it shows every
+    line (up to `items.STATUS_MAX`). The level only picks the colour. Hidden
     when no source sent a line or when it is switched off (command palette)."""
 
     LEVEL_COLORS = {"ok": "ok", "warn": "warn", "alert": "urgent"}
@@ -890,7 +892,8 @@ class SessionsStrip(Static):
         lines = app.status_lines()
         if not lines or not app.strip_on:
             return None
-        cap = max(1, int(app.strip_lines))
+        in_agents = app.view == "agents"
+        cap = STATUS_MAX if in_agents else max(1, int(app.strip_lines))
         out = Text(no_wrap=True, overflow="crop")
         room = max(10, width - 4)
         for n, line in enumerate(lines[:cap]):
@@ -904,7 +907,8 @@ class SessionsStrip(Static):
         more = len(lines) - cap
         if more > 0:
             out.append("\n")
-            out.append(f"   +{more} more · 6", Style(color=pal["muted"]))
+            out.append(f"   +{more} more" + ("" if in_agents else " · 6"),
+                       Style(color=pal["muted"]))
         return out
 
 

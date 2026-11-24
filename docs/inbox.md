@@ -1701,7 +1701,8 @@ the Inbox, a person in Waiting, a routine in the Feed, a bucket in Agents).
 The strip shows the [status lines](#status-lines) the sources send, pinned
 above the queue in every view: a dot in the level's colour (`ok`, `warn` in the
 warning colour, `alert` in the urgent one) and the text. It shows `strip_lines`
-lines (default 4), then `+N more · 6`; `6` opens the Agents view. It is hidden
+lines (default 4), then `+N more · 6`; `6` opens the Agents view, where the
+strip shows every line (up to 12) instead. It is hidden
 when no source sends a line. **Show / hide sessions strip** in the `ctrl+p`
 palette turns it off and on (kept in the state file, `prefs.sessions_strip`);
 it has no key of its own, and a line cannot be selected.
@@ -1716,7 +1717,8 @@ Each row shows the usual `where` and the age since `ts`, plus marks from the
 row's `meta`: `live` (`meta.live` true) or `no session` (false; nothing when
 absent), and `old rules` (`meta.rules_stale` true). The rows are the same
 objects as in the other views, so the row menu, the keys and the undo work as
-on any row.
+on any row. Agents honours the Feed's mute: an agent row that a Feed rule hides
+(a `hide` rule, see [Feed](#feed)) is hidden here too.
 
 An agent row that waits for you (section `urgent` or `needs_reply`) is in the
 Inbox as well, as any such row is. An agent row that does not (a `fyi` row:

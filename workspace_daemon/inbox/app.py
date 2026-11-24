@@ -388,6 +388,7 @@ class InboxApp(App):
         shown_pref = store.get_pref("sessions_strip") \
             if hasattr(store, "get_pref") else None
         self.strip_on = shown_pref != "off"
+        self._strip_last = None            # the strip text last drawn
         self.today_fn = today or datetime.date.today
         self._due_marks = {}               # task key -> a due date set here, until the next refresh
         self._applying_since = None        # start of the fetch being applied
@@ -658,6 +659,7 @@ class InboxApp(App):
         agents = views.agent_groups(self.items)
         data = feed()
         shown = (views.view_rows(inbox) + views.view_rows(waiting)
+                 + views.view_rows(agents)
                  + [m for r in views.view_rows(data.groups)
                     for m in (r.members or [r])])
         saved = self._saved_items(shown)
@@ -1025,8 +1027,10 @@ class InboxApp(App):
             return
         text = sessions.render_strip(self, self.pal, self.size.width)
         sessions.display = text is not None
-        if text is not None:
-            sessions.update(text)
+        if text != self._strip_last:    # the timer runs 4 times a second
+            self._strip_last = text
+            if text is not None:
+                sessions.update(text)
 
     def hints(self):
         """The footer. For the selected row (the queue has the focus) at most

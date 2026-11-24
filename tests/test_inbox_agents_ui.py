@@ -1,8 +1,11 @@
 """Inbox 0.13.2 pilot tests: the sessions strip, view 6 (Agents) and the Inbox
 without working agent rows. Synthetic data only; needs Textual."""
 import importlib.util
+import os
+import tempfile
 import time
 import unittest
+from unittest import mock
 
 HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 
@@ -216,13 +219,62 @@ class SessionsStripTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("6", keys)
 
     async def test_status_text_is_displayed_not_run(self):
-        evil = [{"text": "$(touch /tmp/never) `x` ; rm -rf ~ [bold]x[/bold]",
-                 "level": "warn"}]
-        app, _ = make_app([plain(1)], evil)
+        with tempfile.TemporaryDirectory() as scratch:
+            marker = os.path.join(scratch, "never")
+            evil = [{"text": f"[bold]x[/bold] $(touch {marker}) "
+                             f"`touch {marker}` ; touch {marker}",
+                     "level": "warn"}]
+            app, _ = make_app([plain(1)], evil)
+            async with app.run_test(size=SIZE) as pilot:
+                await settle(pilot, app)
+                await pilot.pause(0.3)
+                self.assertIn(f"$(touch {marker})", strip_text(app))
+                self.assertIn("[bold]x[/bold]", strip_text(app))
+            self.assertFalse(os.path.exists(marker),
+                             "status text must never be run")
+
+    async def test_the_agents_view_shows_every_line_elsewhere_the_cap_applies(self):
+        app, _ = make_app([plain(1), agent(2)], lines(9))
         async with app.run_test(size=SIZE) as pilot:
             await settle(pilot, app)
-            self.assertIn("$(touch /tmp/never)", strip_text(app))
-            self.assertIn("[bold]x[/bold]", strip_text(app))
+            self.assertIn("+5 more · 6", strip_text(app))
+            await pilot.press("6")
+            await until(pilot, lambda: app.view == "agents")
+            self.assertTrue(await until(
+                pilot, lambda: len(strip_text(app).splitlines()) == 9))
+            self.assertNotIn("more", strip_text(app))
+            await pilot.press("1")
+            await until(pilot, lambda: "+5 more · 6" in strip_text(app))
+
+    async def test_more_than_twelve_lines_are_cut_in_the_agents_view(self):
+        def fetch():
+            return [sources.SourceResult("a", [agent(2)], False, None, None,
+                                         lines(10)),
+                    sources.SourceResult("b", [], False, None, None, lines(10))]
+        store = InboxStore(None)
+        app = InboxApp(fetch, store, FakeActions(store=store, draft_delay=0),
+                       undo_s=0.15, leave_s=0, stream_delay=0,
+                       settings=dict(DEFAULTS), view="agents")
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            shown = strip_text(app).splitlines()
+            self.assertEqual(len(shown), 13)
+            self.assertIn("+8 more", shown[-1])
+            self.assertNotIn("· 6", shown[-1])
+
+    async def test_an_unchanged_strip_is_not_redrawn(self):
+        app, _ = make_app([plain(1)], lines(2))
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            strip = app.query_one("#sessions")
+            with mock.patch.object(type(strip), "update") as upd:
+                for _ in range(5):
+                    app.tick_header()
+                self.assertEqual(upd.call_count, 0)
+            app.action_toggle_strip()
+            app.action_toggle_strip()
+            await pilot.pause(0.1)
+            self.assertIn("status line 0", strip_text(app))   # shown again, redrawn
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -317,6 +369,24 @@ class AgentsViewUiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             self.assertTrue(await until(
                 pilot, lambda: type(app.screen).__name__ == "RowMenu"))
+
+    async def test_a_saved_row_is_not_listed_again_for_a_row_only_agents_shows(self):
+        row = agent(3, "fyi", "working", source_id="job:3")
+        saved = [{"id": "s1", "source_id": "job:3", "title": "job three",
+                  "ts": time.time() - 60, "source": "other", "link": None,
+                  "kind": "task"},
+                 {"id": "s2", "source_id": "job:other", "title": "other job",
+                  "ts": time.time() - 90, "source": "other", "link": None,
+                  "kind": "task"}]
+        app, _ = make_app([plain(1), row], saved=lambda: (saved, None),
+                          saved_days=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            titles = [i.key for i in app.visible()]
+            await pilot.press("4")
+            await until(pilot, lambda: app.view == "feed")
+            self.assertEqual([i.key for i in app.visible()], ["saved:s2"],
+                             titles)
 
     async def test_an_empty_view_says_what_lists_agents(self):
         app, _ = make_app([plain(1)])

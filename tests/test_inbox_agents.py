@@ -199,6 +199,15 @@ class AgentViewTest(unittest.TestCase):
         self.assertEqual(keys(groups[0].items), ["ag:1", "ag:2", "ag:3"])
         self.assertEqual(views.agent_groups([plain(1)]), [])
 
+    def test_a_row_a_feed_rule_mutes_stays_hidden_in_view_6(self):
+        rows = [agent(1, bucket="working"), agent(2, bucket="working"),
+                agent(3, "needs_reply", bucket="needs_you")]
+        rows[1].feed = "hide"
+        listed = views.view_rows(views.agent_groups(rows))
+        self.assertEqual(keys(listed), ["ag:3", "ag:1"])   # NEEDS YOU first
+        rows[0].feed = rows[2].feed = "digest"     # only a mute hides a row
+        self.assertEqual(len(views.view_rows(views.agent_groups(rows))), 2)
+
     def test_the_groups_hold_the_same_objects(self):
         rows = [agent(1, "needs_reply", bucket="needs_you"),
                 agent(2, bucket="working")]

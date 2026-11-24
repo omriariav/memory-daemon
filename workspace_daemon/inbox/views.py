@@ -181,10 +181,11 @@ def inbox_groups(items, today=None):
 def agent_groups(items):
     """The Agents view: NEEDS YOU, WORKING and DONE (empty groups left out),
     each newest row first. The rows are the same `Item` objects the other
-    views list."""
+    views list. A row a Feed rule mutes (`feed == "hide"`) stays hidden here
+    too."""
     buckets = OrderedDict((key, []) for key, _title in AGENT_BUCKETS)
     for it in items:
-        if is_agent(it):
+        if is_agent(it) and it.feed != "hide":
             buckets[agent_bucket(it)].append(it)
     titles = dict(AGENT_BUCKETS)
     return [Group(key, titles[key], sorted(rows, key=lambda i: (-i.ts, i.key)),
