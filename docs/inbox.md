@@ -246,7 +246,9 @@ argument is expanded):
 - `<argv...> list` prints to stdout
   `{"v": 1, "items": [...], "stale": bool, "age_min": number|null, "error": str|null}`.
   `stale` says the source's own data is old; `age_min` is how old; `error` is
-  a message the UI shows without hiding the items.
+  a message the UI shows without hiding the items. A reply may also carry an
+  optional `status` list (since 0.13.2, see [Status lines](#status-lines)); a
+  source that sends none changes nothing.
 - `<argv...> list --all` is the same call with one optional flag: "list
   everything, not just what is open" (handled and older items too). The inbox
   sends `--all` only while the `A` toggle is on **and** the source declares
@@ -284,6 +286,33 @@ oversized response, stdin carrying the request.
 Refreshes never overlap: one that is still running when the next is due (or
 when you press `r`) is skipped, and `r` says "Poll already running". Each
 refresh first re-reads the state file, so marks made in another pane show up.
+
+### Status lines
+
+A `list` reply may carry, next to `items`, an optional `status` list: short
+lines about what the source is running right now, shown in the
+[sessions strip](#the-sessions-strip) above the queue.
+
+```json
+{"v": 1, "items": [],
+ "status": [{"text": "build-bot  running · 12m · live", "level": "ok"},
+            {"text": "sync-job  blocked on you · 2h · no session", "level": "warn",
+             "item_id": "agents:sync-job"}]}
+```
+
+| Field | Rule |
+| --- | --- |
+| `text` | string, cleaned to one line (no control characters or bidi overrides) and cut at 160 characters; an entry with no text is skipped |
+| `level` | `ok`, `warn` or `alert`; anything else, or no level, reads as `ok`. It only picks the colour |
+| `item_id` | optional string: the id of the item the line is about (kept for later use; the strip does not select anything) |
+
+The list holds at most 12 entries (the first 12 valid ones are read). Unknown
+keys are ignored. A `status` that is not a list, or an entry that is not an
+object, is dropped without a word: the items of the same reply are never
+affected, and an old source with no `status` behaves as before. The lines of
+every source that sends some are shown in source order. The text is data, like
+every other source text: it is displayed, never run and never put into a
+command line.
 
 ### Change-driven refresh
 
@@ -1445,7 +1474,8 @@ daemon's next tick that drops the key, so it can lag by a tick.
 `<base>/state/inbox-state.json`:
 `{"v": 1, "items": {"<id>": {"done": ts, "ack": ts, "snooze_until": ts, "updated": ts}}}`.
 A `prefs` object may sit beside `items` (`{"thread_order": "newest"}`): display
-choices made with a key, never item data, and not pruned. The Feed rules made
+choices made with a key or the palette (`thread_order`, `sessions_strip`),
+never item data, and not pruned. The Feed rules made
 with `x` and `-` are kept there too, as `prefs.feed_rules` (see [Feed](#feed)).
 
 - Done and ack hide an item; a snooze hides it until its time, then it
@@ -1488,6 +1518,7 @@ defaults; a broken one prints every problem and exits 2.
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
+| `strip_lines` | `4` | 1 to 12: how many status lines the [sessions strip](#the-sessions-strip) shows before `+N more · 6` |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default they are left out before the newest row per event is chosen, so the event shows its latest non-RSVP change (`new`, `update` or `cancel`). New, updated and cancelled invites are not affected |
 | `alert_urgent_max_age_h` | `6` | 1 to 168: an alert older than this is `fyi`, not urgent (see "Stale and recovered alerts") |
@@ -1632,11 +1663,13 @@ to `logical`. All of this lives in `workspace_daemon/inbox/bidi.py`; the
 ## Views
 
 The inbox is organised by whose move it is. A tab bar and a one-line health
-strip sit on top; `1` to `5` switch the view.
+strip sit on top; `1` to `6` switch the view.
 
 ```
- inbox 0.12.0  [1 Inbox 7]  2 Waiting 6   3 Tasks 4   4 Feed 14   5 Health ⚠2   updated 12s ago  14:52
+ inbox 0.13.2  [1 Inbox 7]  2 Waiting 6   3 Tasks 4   4 Feed 14   5 Health ⚠2   6 Agents 3   updated 12s ago  14:52
  slack ✓3m  calendar ✓4m  recordings ⚠ 1 unmatched  zoom ✗ failing  $6/$20
+  ● nightly-sync  idle · 5m
+  ● build-bot  reviewer (opus high)  working · 12m · live
 ```
 
 | View | What it lists |
@@ -1646,6 +1679,7 @@ strip sit on top; `1` to `5` switch the view.
 | `3` Tasks | the task rows of the command sources, by due date (see [Tasks](#tasks)). The tab counts the overdue and due-today ones: `3 Tasks 4`. |
 | `4` Feed | every `fyi` row, by routine (see [Feed](#feed)). |
 | `5` Health | the daemon's state (see [Health](#health)). |
+| `6` Agents | every `meta.kind: agent` row, grouped `NEEDS YOU`, `WORKING` and `DONE` (see [Agents](#agents)). |
 
 The views are filters and groupings of the same rows, not copies. A row that
 is in two views (a waiting row whose nudge is due is in Inbox and Waiting) is
@@ -1660,7 +1694,36 @@ fires after a streak of failed runs, so a group can be failing before one
 exists, and the badge should not stay quiet over a red cell.
 
 `[` and `]` jump to the first row of the previous and next group (a section in
-the Inbox, a person in Waiting, a routine in the Feed).
+the Inbox, a person in Waiting, a routine in the Feed, a bucket in Agents).
+
+### The sessions strip
+
+The strip shows the [status lines](#status-lines) the sources send, pinned
+above the queue in every view: a dot in the level's colour (`ok`, `warn` in the
+warning colour, `alert` in the urgent one) and the text. It shows `strip_lines`
+lines (default 4), then `+N more · 6`; `6` opens the Agents view, where the
+strip shows every line (up to 12) instead. It is hidden
+when no source sends a line. **Show / hide sessions strip** in the `ctrl+p`
+palette turns it off and on (kept in the state file, `prefs.sessions_strip`);
+it has no key of its own, and a line cannot be selected.
+
+### Agents
+
+View `6` lists the rows whose `meta.kind` is `agent`: sessions or tasks that a
+tool runs for you. They are grouped by `meta.bucket` (`needs_you`, `working`,
+`done`), and a row with no valid bucket goes to `NEEDS YOU` when its section is
+`urgent` or `needs_reply`, else to `WORKING`. Newest first inside a group.
+Each row shows the usual `where` and the age since `ts`, plus marks from the
+row's `meta`: `live` (`meta.live` true) or `no session` (false; nothing when
+absent), and `old rules` (`meta.rules_stale` true). The rows are the same
+objects as in the other views, so the row menu, the keys and the undo work as
+on any row. Agents honours the Feed's mute: an agent row that a Feed rule hides
+(a `hide` rule, see [Feed](#feed)) is hidden here too.
+
+An agent row that waits for you (section `urgent` or `needs_reply`) is in the
+Inbox as well, as any such row is. An agent row that does not (a `fyi` row:
+working, queued, closed) is **only** in Agents, never in the Inbox and never in
+the Feed.
 
 ### Review rows
 
@@ -1929,13 +1992,13 @@ What the three verbs do by row:
 | RSVP (a pending invite) | accept | done | snooze |
 | Todo | none | close now | due date |
 | Decision | none | asks for the decision, then closes | due date |
-| Agent card (an ack row of a command source with `acts:`) | ack | done; also `close` at the source (when the source supports it) | snooze; also `snooze` at the source (when the source supports it) |
+| Agent card (a `meta.kind: agent` row of a command source with `acts:`) | ack | done; also `close` at the source (when the source supports it) | snooze; also `snooze` at the source (when the source supports it) |
 | FYI | none | dismiss | snooze |
 | Alert | ack | done | snooze |
 
 ### The row menu (`enter`)
 
-`enter` on a row of the queue (in any of the four list views) opens a popup
+`enter` on a row of the queue (in any of the five list views) opens a popup
 that lists only the actions valid for that row, each with its key and a label.
 It calls the same methods as the keys, so nothing about an action changes.
 
@@ -1963,7 +2026,7 @@ It calls the same methods as the keys, so nothing about an action changes.
 
 Every key listed below still works as before.
 
-`1`-`5` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
+`1`-`6` switch the view, `j`/`k` move, `g`/`G` ends, `[`/`]` previous and next
 group, `tab` switches pane, on a task row `d`, `D`, `s`, `x` and `o` (see [Tasks](#tasks)),
 `/` fuzzy filter, `f` source filter (routine filter in the Feed), `a` approve or ack, `e` edit draft,
 `d` done, `s` snooze (both also tell a source that lists `close` / `snooze`), `n` nudge (without a stored draft, a template on an acts source), `o` open link (the Slack thread with `slack_open:`, in a desktop app with `open_with:`), `u` undo, on a pending invite

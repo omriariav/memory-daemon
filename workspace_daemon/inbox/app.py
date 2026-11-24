@@ -45,8 +45,8 @@ from .mrkdwn import to_slack_mrkdwn
 from .term import no_scroll_driver
 from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HealthStrip,
-                      HealthView, HintBar, Queue, RoutinePane, StatusHeader,
-                      ThreadView, fmt_age, fuzzy, palette, render_health,
+                      HealthView, HintBar, Queue, RoutinePane, SessionsStrip,
+                      StatusHeader, ThreadView, fmt_age, fuzzy, palette, render_health,
                       render_routines, scheduler_title, vis)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
@@ -215,7 +215,7 @@ class InboxApp(App):
         Binding("G", "edge(1)", "Bottom", show=False),
         Binding("1", "view(1)", show=False), Binding("2", "view(2)", show=False),
         Binding("3", "view(3)", show=False), Binding("4", "view(4)", show=False),
-        Binding("5", "view(5)", show=False),
+        Binding("5", "view(5)", show=False), Binding("6", "view(6)", show=False),
         Binding("left_square_bracket", "group(-1)", show=False),
         Binding("right_square_bracket", "group(1)", show=False),
         Binding("x", "mute", show=False), Binding("minus", "less", show=False),
@@ -248,6 +248,7 @@ class InboxApp(App):
     Screen { background: $background; color: $foreground; }
     #hdr { height: 1; background: $panel; }
     #strip { height: 1; }
+    #sessions { height: auto; display: none; }
     #main { height: 1fr; }
     #routines { width: 26; border: round $panel; border-title-color: $text-muted; padding: 0 1; display: none; }
     #health { height: 1fr; border: round $panel; border-title-color: $text-muted; padding: 0 1; display: none; scrollbar-size-vertical: 1; }
@@ -380,7 +381,14 @@ class InboxApp(App):
         self._event_origins = tuple(
             s["name"] for s in settings.get("sources") or []
             if s.get("type") == "events") or views.EVENT_ORIGINS
-        self._views = {"inbox": [], "waiting": [], "tasks": [], "feed": []}
+        self._views = {"inbox": [], "waiting": [], "tasks": [], "feed": [],
+                       "agents": []}
+        # The sessions strip (0.13.2): the `status` lines of the sources.
+        self.strip_lines = int(settings.get("strip_lines", 4))
+        shown_pref = store.get_pref("sessions_strip") \
+            if hasattr(store, "get_pref") else None
+        self.strip_on = shown_pref != "off"
+        self._strip_last = None            # the strip text last drawn
         self.today_fn = today or datetime.date.today
         self._due_marks = {}               # task key -> a due date set here, until the next refresh
         self._applying_since = None        # start of the fetch being applied
@@ -468,6 +476,7 @@ class InboxApp(App):
     def compose(self) -> ComposeResult:
         yield StatusHeader(id="hdr")
         yield HealthStrip(id="strip")
+        yield SessionsStrip(id="sessions")
         with Horizontal(id="main"):
             yield RoutinePane("", id="routines")
             with Vertical(id="left"):
@@ -586,7 +595,13 @@ class InboxApp(App):
                 "waiting": len(views.view_rows(self._views["waiting"])),
                 "tasks": tasksmod.due_count(self.items, self._today()),
                 "feed": self.feed_data.total,
-                "health": self.health_badge()}
+                "health": self.health_badge(),
+                "agents": len(views.view_rows(self._views["agents"]))}
+
+    def status_lines(self):
+        """The `status` lines of every source that sent some, in source order
+        (the sessions strip shows them)."""
+        return [line for r in self.results for line in (r.status or ())]
 
     def _today(self):
         """The local date task due dates are counted from."""
@@ -641,8 +656,10 @@ class InboxApp(App):
         inbox = views.inbox_groups(self.items, today)
         waiting = views.waiting_groups(self.items, now)
         tasks = views.task_groups(self.items, today)
+        agents = views.agent_groups(self.items)
         data = feed()
         shown = (views.view_rows(inbox) + views.view_rows(waiting)
+                 + views.view_rows(agents)
                  + [m for r in views.view_rows(data.groups)
                     for m in (r.members or [r])])
         saved = self._saved_items(shown)
@@ -650,7 +667,7 @@ class InboxApp(App):
             data = feed(saved)
         self.feed_data = data
         self._views = {"inbox": inbox, "waiting": waiting, "tasks": tasks,
-                       "feed": data.groups}
+                       "feed": data.groups, "agents": agents}
         self._rows = {i.key: i for i in self.items}
         for g in self.feed_data.groups:
             for i in g.items:
@@ -920,6 +937,12 @@ class InboxApp(App):
             t.append("Polling…\n\n", Style(bold=True, color=p["fg"]))
             t.append("r  poll now      ctrl+p  commands      ?  help", Style(color=p["muted"]))
             return t
+        if self.view == "agents":
+            t.append("No agents\n\n", Style(bold=True, color=p["fg"]))
+            t.append("A command source lists agent sessions with meta.kind: agent.\n",
+                     Style(color=p["muted"]))
+            t.append("r  poll now", Style(color=p["muted"]))
+            return t
         if self.view == "tasks":
             t.append("No open tasks\n\n", Style(bold=True, color=p["fg"]))
             t.append("A command source lists tasks with meta.kind: task.\n",
@@ -998,6 +1021,16 @@ class InboxApp(App):
                          or bool(self.act_pending or self.act_shadow))
         if strip.display:
             strip.update(strip.render_strip(self, self.pal, self.size.width))
+        try:
+            sessions = self.query_one("#sessions", SessionsStrip)
+        except NoMatches:
+            return
+        text = sessions.render_strip(self, self.pal, self.size.width)
+        sessions.display = text is not None
+        if text != self._strip_last:    # the timer runs 4 times a second
+            self._strip_last = text
+            if text is not None:
+                sessions.update(text)
 
     def hints(self):
         """The footer. For the selected row (the queue has the focus) at most
@@ -1014,7 +1047,7 @@ class InboxApp(App):
         if isinstance(f, Input):
             return [("enter", "keep filter"), ("esc", "clear"), ("", "type to fuzzy-match")]
         if self.view == "health":
-            return [("r", "refresh"), ("1-5", "views"), ("ctrl+p", "commands"),
+            return [("r", "refresh"), ("1-6", "views"), ("ctrl+p", "commands"),
                     ("?", "help"), ("q", "quit")]
         it = self.current
         if it is None:
@@ -1217,7 +1250,8 @@ class InboxApp(App):
             f.scroll_end(animate=False) if end else f.scroll_home(animate=False)
 
     def action_view(self, n):
-        """1-5: switch the view (Inbox, Waiting, Tasks, Feed, Health)."""
+        """1-6: switch the view (Inbox, Waiting, Tasks, Feed, Health,
+        Agents)."""
         self.set_view(views.VIEW_KEYS[int(n) - 1])
 
     def set_view(self, key, routine=None):
@@ -3715,6 +3749,23 @@ class InboxApp(App):
         self.notify(f"Thread order: {self.thread_order} first", timeout=2,
                     markup=False)
 
+    def action_toggle_strip(self):
+        """Command palette: hide or show the sessions strip (the `status`
+        lines of the sources). Saved in the inbox state, so a restart keeps
+        it. It never has a key of its own."""
+        self.strip_on = not self.strip_on
+        try:
+            self.store.set_pref("sessions_strip",
+                                "on" if self.strip_on else "off")
+        except (OSError, ValueError) as exc:
+            self.notify(f"Strip setting not saved: "
+                        f"{getattr(exc, 'strerror', None) or exc}",
+                        severity="warning", timeout=4, markup=False)
+        self.tick_header()
+        note = "" if self.status_lines() else " (no source sends status lines)"
+        self.notify("Sessions strip: " + ("shown" if self.strip_on else "hidden")
+                    + note, timeout=2, markup=False)
+
     def items_redraw_all(self):
         """Re-render every widget that shows text (queue, thread, draft, header)."""
         self.redraw()
@@ -4068,6 +4119,7 @@ class InboxApp(App):
             ("Show audit log", "Every action with its time", self.action_audit),
             ("Toggle Hebrew order", "logical / visual (python-bidi)", self.action_toggle_bidi),
             ("Toggle thread order", "v: newest or oldest message first in the thread pane", self.action_toggle_thread_order),
+            ("Show / hide sessions strip", "the status lines your sources send, pinned above the queue (6 lists the agents)", self.action_toggle_strip),
             ("Filter queue", "Fuzzy filter", self.action_filter),
             ("Row menu", "enter: what the selected row can do, with a key for each", self.action_row_menu),
             ("Keyboard help", "?", self.action_help),

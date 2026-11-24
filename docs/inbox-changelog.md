@@ -7,6 +7,43 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-11-24
+
+A sessions strip and an Agents view: what your agent sessions are doing, on
+screen next to the queue. Both are generic: they show what any command source
+sends. Nothing changes for a source that sends neither `status` nor
+`meta.kind: agent` rows.
+
+### Added
+
+- **`status` in a source's `list` reply** (optional): up to 12 lines
+  `{"text", "level": "ok"|"warn"|"alert", "item_id"?}`, each cleaned to one
+  line and cut at 160 characters. A bad `status` is dropped and never touches
+  the items; unknown keys are ignored. See
+  [Status lines](inbox.md#status-lines).
+- **The sessions strip**, pinned above the queue in every view: the status
+  lines of every source that sent some, the level choosing the colour. It
+  shows 4 lines (`strip_lines:` in `inbox.yaml`, 1 to 12), then
+  `+N more · 6`, and is hidden when no source sends a line. **Show / hide
+  sessions strip** in the `ctrl+p` palette turns it off and on (kept in
+  `prefs.sessions_strip`); it has no key of its own.
+- **View `6` Agents**: every `meta.kind: agent` row, grouped `NEEDS YOU`,
+  `WORKING` and `DONE` (`meta.bucket`, else the row's section), with `where`,
+  the age, and the marks `live` / `no session` (`meta.live`) and `old rules`
+  (`meta.rules_stale`). The full row menu and the keys work as on any row. A
+  row that a Feed rule mutes stays hidden here too. In this view the strip
+  shows all its lines instead of `+N more · 6`.
+  `6` is a view key like `1`-`5`; the help, the Health footer and the palette
+  ("Go to Agents") follow.
+
+### Changed
+
+- **Working and queued agent rows leave the Inbox.** An agent row that is not
+  waiting for you (a `fyi` row) is now listed in Agents only: no longer in the
+  Inbox (even when a Feed rule promotes it) and no longer in the Feed. An agent
+  row that waits for you (`urgent` or `needs_reply`) stays in the Inbox, and is
+  in Agents too.
+
 ## [0.13.1] - 2026-11-23
 
 `d` on a Slack ask or a waiting row can ask what happened before it closes, so

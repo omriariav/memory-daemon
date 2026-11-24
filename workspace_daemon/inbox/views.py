@@ -14,10 +14,13 @@ rows of one routine and day folded into one) and a saved-to-memory row.
            WEEK, LATER, DECIDE, NO DATE
 4 Feed     every fyi row by routine; saved-to-memory is one more routine
 5 Health   not a list of items (see health.py)
+6 Agents   every `meta.kind == "agent"` row, grouped NEEDS YOU / WORKING /
+           DONE (`meta.bucket`, else the row's section)
 
 A task row (`meta.kind == "task"`) never shows in Waiting, the Feed or the
 Inbox's URGENT, I OWE and NUDGE DUE. A review row (a refused near-duplicate
-capture) shows only in REVIEW.
+capture) shows only in REVIEW. An agent row that is not waiting for you (a
+FYI row) shows only in Agents: not in the Inbox and not in the Feed.
 """
 import datetime
 import time
@@ -29,11 +32,11 @@ from . import tasks
 from .models import Item, Msg, fmt_age
 
 VIEWS = (("inbox", "Inbox"), ("waiting", "Waiting"), ("tasks", "Tasks"),
-         ("feed", "Feed"), ("health", "Health"))
+         ("feed", "Feed"), ("health", "Health"), ("agents", "Agents"))
 VIEW_KEYS = tuple(k for k, _ in VIEWS)
 VIEW_TITLES = dict(VIEWS)
 # The views that list items in the queue.
-QUEUE_VIEWS = ("inbox", "waiting", "tasks", "feed")
+QUEUE_VIEWS = ("inbox", "waiting", "tasks", "feed", "agents")
 SAVED_ROUTINE = "saved to memory"
 DEFAULT_WINDOW_H = 24.0
 DIGEST_PREFIX = "digest:"
@@ -99,6 +102,34 @@ def is_synthetic(item):
     return is_digest(item) or is_saved_row(item)
 
 
+AGENT_KIND = "agent"
+AGENT_BUCKETS = (("needs_you", "NEEDS YOU"), ("working", "WORKING"),
+                 ("done", "DONE"))
+
+
+def is_agent(item):
+    """A row of an agent source (`meta.kind == "agent"`): a session or task
+    some tool is running for you."""
+    meta = item.meta if isinstance(item.meta, dict) else {}
+    return meta.get("kind") == AGENT_KIND
+
+
+def is_working_agent(item):
+    """An agent row that does not wait for you: a FYI row. It lives in the
+    Agents view only."""
+    return is_agent(item) and item.section == "fyi"
+
+
+def agent_bucket(item):
+    """`needs_you`, `working` or `done`: `meta.bucket` when it names one, else
+    from the section (urgent and needs_reply wait for you, the rest work)."""
+    bucket = item.meta.get("bucket") if isinstance(item.meta, dict) else None
+    if bucket in dict(AGENT_BUCKETS):
+        return bucket
+    return "needs_you" if item.section in ("urgent", "needs_reply") \
+        else "working"
+
+
 def is_active_alert(item):
     """A daemon alert whose condition has not ended. It is always listed
     (docs/inbox.md, "Active keys are always listed"): no Feed window and no
@@ -122,7 +153,8 @@ def inbox_groups(items, today=None):
     (`feed == "inbox"`) joins URGENT. Task rows are in none of the first
     three. `today` is a `datetime.date` (default: the local date)."""
     today = today or datetime.date.today()
-    rows = [i for i in items if not tasks.is_task(i) and not is_review(i)]
+    rows = [i for i in items if not tasks.is_task(i) and not is_review(i)
+            and not is_working_agent(i)]
     urgent = [i for i in rows
               if i.section == "urgent"
               or (i.section == "fyi" and i.feed == "inbox")]
@@ -142,6 +174,23 @@ def inbox_groups(items, today=None):
     if review:
         groups.append(Group("review", "REVIEW", review))
     return groups
+
+
+# --- 6 Agents ---------------------------------------------------------------
+
+def agent_groups(items):
+    """The Agents view: NEEDS YOU, WORKING and DONE (empty groups left out),
+    each newest row first. The rows are the same `Item` objects the other
+    views list. A row a Feed rule mutes (`feed == "hide"`) stays hidden here
+    too."""
+    buckets = OrderedDict((key, []) for key, _title in AGENT_BUCKETS)
+    for it in items:
+        if is_agent(it) and it.feed != "hide":
+            buckets[agent_bucket(it)].append(it)
+    titles = dict(AGENT_BUCKETS)
+    return [Group(key, titles[key], sorted(rows, key=lambda i: (-i.ts, i.key)),
+                  hot=key == "needs_you")
+            for key, rows in buckets.items() if rows]
 
 
 # --- 3 Tasks ----------------------------------------------------------------
@@ -265,7 +314,8 @@ def feed_view(items, now, window_h=DEFAULT_WINDOW_H, show_all=False,
     by_routine = OrderedDict()
     muted = OrderedDict()
     for it in sorted((i for i in items if i.section == "fyi"
-                      and not tasks.is_task(i) and not is_review(i)),
+                      and not tasks.is_task(i) and not is_review(i)
+                      and not is_agent(i)),
                      key=lambda i: -i.ts):
         if it.feed == "inbox":
             continue

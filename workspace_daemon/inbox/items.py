@@ -30,6 +30,11 @@ TEXT_MAX = 8000
 THREAD_MAX = 100
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 ITEMS_MAX = 2000
+# The optional `status` list of a `list` reply (0.13.2): lines for the
+# sessions strip.
+STATUS_MAX = 12
+STATUS_TEXT_MAX = 160
+STATUS_LEVELS = ("ok", "warn", "alert")
 # A memory entry id as the inbox shows and links it (`meta.memory_id`).
 MEMORY_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,200}\Z")
 
@@ -238,13 +243,45 @@ def make_item(*, id, source, section, urgency, sender, where, gist, ts,
     })
 
 
-def parse_list_output(text):
+def parse_status(raw):
+    """The `status` lines of a `list` reply, validated: a list of at most
+    `STATUS_MAX` `{"text", "level"[, "item_id"]}` dicts. `text` is cleaned to
+    one line and cut to `STATUS_TEXT_MAX` characters; `level` is `ok`, `warn`
+    or `alert` (anything else reads as `ok`); `item_id` is kept only when it
+    is a non-empty string. An entry with no text is skipped, unknown keys are
+    ignored, and anything that is not a list gives an empty list: a bad
+    `status` is dropped and never touches the items."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if len(out) >= STATUS_MAX:
+            break
+        if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
+            continue
+        text = truncate(clean_line(entry["text"]), STATUS_TEXT_MAX)
+        if not text:
+            continue
+        level = entry.get("level")
+        line = {"text": text,
+                "level": level if level in STATUS_LEVELS else "ok"}
+        item_id = entry.get("item_id")
+        if isinstance(item_id, str):
+            item_id = clean_line(item_id)
+            if item_id and len(item_id) <= ID_MAX:
+                line["item_id"] = item_id
+        out.append(line)
+    return out
+
+
+def parse_list_output(text, with_status=False):
     """Parse a command source's `list` stdout.
 
-    Returns `(items, stale, age_min, error)`. Raises ItemError when the
-    output as a whole is unusable. Items that fail validation are dropped
-    and described in the returned error string, so one bad row does not hide
-    the rest.
+    Returns `(items, stale, age_min, error)`; with `with_status` a fifth
+    value, the validated `status` lines (see `parse_status`). Raises
+    ItemError when the output as a whole is unusable. Items that fail
+    validation are dropped and described in the returned error string, so one
+    bad row does not hide the rest.
     """
     if len(text.encode("utf-8", "replace")) > OUTPUT_MAX_BYTES:
         raise ItemError(f"output is larger than {OUTPUT_MAX_BYTES} bytes")
@@ -290,7 +327,10 @@ def parse_list_output(text):
         notes.append(clean_line(err))
     if bad:
         notes.append(f"{len(bad)} item(s) dropped: {truncate(bad[0], 160)}")
-    return items, stale, age, "; ".join(notes) or None
+    result = items, stale, age, "; ".join(notes) or None
+    if with_status:
+        return result + (parse_status(doc.get("status")),)
+    return result
 
 
 def parse_act_request(text):

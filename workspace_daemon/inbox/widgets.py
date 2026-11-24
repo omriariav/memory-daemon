@@ -14,9 +14,10 @@ from textual.widgets.option_list import Option
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
 from . import tasks as tasksmod
+from .items import STATUS_MAX
 from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
                      owe_action, owe_message, owes, thread_fixed, thread_note)
-from .views import VIEWS
+from .views import VIEWS, is_agent
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
@@ -307,12 +308,17 @@ class Queue(OptionList):
         elif it.thread_memory_id:  # its thread is in memory, not this message
             t.append(" " + THREAD_GLYPH, Style(color=pal["muted"]))
         marked = it.saved or bool(it.thread_memory_id)
+        tags = agent_marks(it)
+        tags_w = sum(cell_len(text) + 2 for text, _col in tags)
         where = fit(it.where, max(0, width - cell_len(who) - cell_len(age) - 9
                                   - (2 if arrow else 0)
                                   - (9 if it.meta.get("kind") == "invite" else 0)
-                                  - (2 if marked else 0) - (2 if it.hint else 0)))
+                                  - (2 if marked else 0) - (2 if it.hint else 0)
+                                  - tags_w))
         if where:
             t.append("  " + where, Style(color=pal["muted"]))
+        for text, col in tags:
+            t.append("  " + text, Style(color=pal[col], bold=col == "warn"))
         pad = max(1, width - t.cell_len - cell_len(age))
         t.append(" " * pad + age, Style(color=pal["urgent"] if urgent else pal["muted"]))
         t.append("\n")
@@ -729,6 +735,23 @@ class DraftPane(Vertical):
         yield TextArea("", id="draft-edit", soft_wrap=True, show_line_numbers=False, read_only=True)
 
 
+def agent_marks(it):
+    """The marks of an agent row (`meta.kind == "agent"`) as `(text, palette
+    key)`: `live` or `no session` from `meta.live` (nothing when it is absent)
+    and `old rules` from `meta.rules_stale`."""
+    if not is_agent(it):
+        return []
+    out = []
+    live = it.meta.get("live")
+    if live is True:
+        out.append(("live", "ok"))
+    elif live is False:
+        out.append(("no session", "warn"))
+    if it.meta.get("rules_stale") is True:
+        out.append(("old rules", "warn"))
+    return out
+
+
 class HintBar(Static):
     def set_hints(self, hints, pal):
         t = Text(no_wrap=True, overflow="ellipsis")
@@ -744,7 +767,7 @@ STATE_COLORS = {healthmod.OK: "ok", healthmod.WARN: "warn",
 
 
 class StatusHeader(Static):
-    """The tab bar: the version, the five views with their counts, then the
+    """The tab bar: the version, the six views with their counts, then the
     freshness and the clock."""
 
     def render_header(self, app, pal, width):
@@ -852,6 +875,40 @@ class HealthStrip(Static):
             out.append(text, Style(color=pal[STATE_COLORS[state]],
                                    bold=state in (healthmod.WARN, healthmod.FAIL)))
             used += cell_len(piece)
+        return out
+
+
+class SessionsStrip(Static):
+    """The sessions strip (0.13.2): the `status` lines the sources sent, pinned
+    above the queue in every view. At most `app.strip_lines` lines, then
+    `+N more · 6` (the Agents view). In the Agents view itself it shows every
+    line (up to `items.STATUS_MAX`). The level only picks the colour. Hidden
+    when no source sent a line or when it is switched off (command palette)."""
+
+    LEVEL_COLORS = {"ok": "ok", "warn": "warn", "alert": "urgent"}
+
+    def render_strip(self, app, pal, width):
+        """The text to show, or None when the strip has nothing to say."""
+        lines = app.status_lines()
+        if not lines or not app.strip_on:
+            return None
+        in_agents = app.view == "agents"
+        cap = STATUS_MAX if in_agents else max(1, int(app.strip_lines))
+        out = Text(no_wrap=True, overflow="crop")
+        room = max(10, width - 4)
+        for n, line in enumerate(lines[:cap]):
+            col = self.LEVEL_COLORS[line["level"]]
+            if n:
+                out.append("\n")
+            out.append(" ● ", Style(color=pal[col]))
+            out.append(fit(vis(line["text"], app.bidi), room),
+                       Style(color=pal["fg"] if col == "ok" else pal[col],
+                             bold=col == "urgent"))
+        more = len(lines) - cap
+        if more > 0:
+            out.append("\n")
+            out.append(f"   +{more} more" + ("" if in_agents else " · 6"),
+                       Style(color=pal["muted"]))
         return out
 
 

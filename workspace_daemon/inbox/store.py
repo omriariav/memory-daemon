@@ -26,7 +26,8 @@ SCHEMA_VERSION = 1
 RSVP_ANSWERS = ("accepted", "declined", "tentative")
 # Display preferences kept beside the marks (`prefs` in the file): name ->
 # the values it may hold. A value outside this table reads as unset.
-PREF_VALUES = {"thread_order": ("newest", "oldest")}
+PREF_VALUES = {"thread_order": ("newest", "oldest"),
+               "sessions_strip": ("on", "off")}
 # The Feed rules made with `x` and `-` (a list of rules, see feedrules.py).
 FEED_RULES_PREF = "feed_rules"
 # An RSVP mark hides the invite until the calendar cache shows the answer. A
