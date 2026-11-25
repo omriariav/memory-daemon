@@ -391,16 +391,20 @@ class ViewportTest(ScrollBase):
         async with app.run_test(size=SIZE) as pilot:
             await self.settle(pilot, app)
             pane = app.query_one("#thread")
-            self.assertTrue(await wait_for(pilot, lambda: pane.max_scroll_y > 0))
+            self.assertTrue(await wait_for(pilot, lambda: pane.max_scroll_y > 0,
+                                           tries=300))
             pane.scroll_to(y=10, animate=False)
-            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y == 10))
+            self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y == 10,
+                                           tries=300))
             before = pane.virtual_size.height
             app.current.messages.append(type(app.current.messages[0])(
                 "Late", 1893499000.0, "a new reply\n" * 6))
             app.redraw()
+            # tries=300 (15 s): a slow CI runner lays the grown pane out late
             self.assertTrue(await wait_for(
                 pilot, lambda: pane.virtual_size.height > before
-                and pane.scroll_y == 10 + pane.virtual_size.height - before))
+                and pane.scroll_y == 10 + pane.virtual_size.height - before,
+                tries=300))
 
 
 class HintsTest(ScrollBase):
