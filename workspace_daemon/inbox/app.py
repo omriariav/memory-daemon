@@ -1484,6 +1484,18 @@ class InboxApp(App):
             self.query_one("#queue").focus()
 
     # ---------- actions with optimistic update + undo ----------
+    def _keep_at(self, it, pos):
+        """The key the cursor takes after `it` left, or moved within, the
+        visible list: the row now at `pos` (its index before the change),
+        clamped to the last row. A late mark that moved the cursor to
+        another still-visible row wins."""
+        after = self.visible()
+        keep = after[min(pos, len(after) - 1)].key if after else None
+        if (self.current_key not in (None, it.key)
+                and any(i.key == self.current_key for i in after)):
+            keep = self.current_key
+        return keep
+
     def _remove_optimistic(self, it):
         vis_before = self.visible()
         pos = vis_before.index(it) if it in vis_before else 0
@@ -1491,12 +1503,7 @@ class InboxApp(App):
         ghost_group = home.key if home is not None else None
         ghost_at = home.items.index(it) if home is not None else None
         self.refilter(redraw=False)       # the pending item is already listed
-        after = self.visible()
-        keep = after[min(pos, len(after) - 1)].key if after else None
-        if (self.current_key not in (None, it.key)
-                and any(i.key == self.current_key for i in after)):
-            keep = self.current_key   # a late mark must not move the cursor
-        self.current_key = keep
+        keep = self.current_key = self._keep_at(it, pos)
         if self.leave_s > 0:
             self.redraw(keep=keep, ghost=it, ghost_at=ghost_at,
                         ghost_group=ghost_group)
@@ -3705,12 +3712,16 @@ class InboxApp(App):
                 return
             date_str = day.isoformat() if day else None
             label = date_str or "no date"
+            before = self.visible()
+            pos = before.index(it) if it in before else 0
             p = self._enqueue(
                 "due", it, f"Due {label}: {it.gist}", hide=False,
                 detail=label, act="due", act_args={"date": date_str},
                 meta=act_meta(it))     # the date shown before this move
             self._set_due_mark(it, date_str, p)
-            self.redraw(keep=it.key)
+            # The row moves; the cursor stays at its place in the list.
+            self.current_key = self._keep_at(it, pos)
+            self.redraw(keep=self.current_key)
 
         def typed(text):
             if text is None:

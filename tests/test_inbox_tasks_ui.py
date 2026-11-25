@@ -475,7 +475,7 @@ class DueTest(Base):
                 r["status"] == "synced" for r in app.audit)))
             self.assertEqual(section_of(app, "task:1"), "week")
             self.assertIn("3 Tasks 1", self.header(app))     # no longer overdue
-            self.assertEqual(app.current_key, "task:1")
+            self.assertEqual(app.current_key, "task:2")      # the old index
             # the source list has the new date; a refresh keeps it there
             self.assertEqual(self.src.items()[0]["meta"]["due"], day(1))
             app.poll(manual=True)
@@ -556,6 +556,56 @@ class DueTest(Base):
             self.assertEqual(self.src.requests(), [])
             self.assertEqual(app._due_marks, {})
 
+    async def test_the_cursor_stays_at_its_place_when_the_row_moves(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "task:2")                   # index 1, today
+            self.assertEqual(keys_of(app)[1], "task:2")
+            await self.pick(pilot, app, "3")                 # +1 week
+            self.assertTrue(await wait_for(pilot, lambda: keys_of(app)[:3]
+                                           == ["task:1", "task:3", "task:2"]))
+            self.assertEqual(app.current_key, "task:3")      # the old index
+            q = app.query_one("#queue", Queue)
+            self.assertEqual(q.get_option_at_index(q.highlighted).id,
+                             ITEM_PREFIX + "task:3")
+
+    async def test_the_cursor_stays_on_a_row_that_keeps_its_place(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "task:3")                   # the only one this week
+            before = keys_of(app)
+            await self.pick(pilot, app, "1")                 # tomorrow
+            self.assertTrue(await wait_for(
+                pilot, lambda: app._due_marks.get("task:3") is not None))
+            self.assertEqual(keys_of(app), before)
+            self.assertEqual(app.current_key, "task:3")
+
+    async def test_the_cursor_clamps_to_the_last_row(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "task:5")                   # the last row
+            await self.pick(pilot, app, "1")                 # to this week
+            self.assertTrue(await wait_for(
+                pilot, lambda: section_of(app, "task:5") == "week"))
+            self.assertEqual(app.current_key, keys_of(app)[-1])
+            self.assertNotEqual(app.current_key, "task:5")
+
+    async def test_undo_puts_the_cursor_back_on_the_task(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "task:2")
+            await self.pick(pilot, app, "3")
+            self.assertTrue(await wait_for(
+                pilot, lambda: app.current_key == "task:3"))
+            await pilot.press("u")
+            self.assertTrue(await wait_for(
+                pilot, lambda: section_of(app, "task:2") == "today"))
+            self.assertEqual(app.current_key, "task:2")
+
     async def test_a_conflict_takes_the_shown_date_back(self):
         self.src.configure("conflict")
         app = self.app()
@@ -601,6 +651,7 @@ class DueTest(Base):
             await self.pick(pilot, app, "1")                 # to Jan 11
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
+            await go(pilot, app, "task:1")       # the cursor stayed in place
             await self.pick(pilot, app, "3")                 # to Jan 17
             self.assertTrue(await wait_for(
                 pilot, lambda: len(self.src.requests()) == 2))
@@ -707,6 +758,7 @@ class PendingMoveTest(Base):
             await pilot.press("1")                           # A: Jan 11
             self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 1))
             self.src.configure("ok")
+            await go(pilot, app, "task:1")   # the cursor stayed in place
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
             await pilot.press("3")                           # B: Jan 17
@@ -822,6 +874,7 @@ class KeysTest(Base):
             await pilot.press("1")
             self.assertTrue(await wait_for(pilot, lambda: app.pending
                                            or app.running))
+            await go(pilot, app, "task:1")   # the cursor stayed in place
             await pilot.press("s")
             self.assertTrue(await wait_for(pilot, lambda: any(
                 "already in progress" in t for t in toasts(app))))

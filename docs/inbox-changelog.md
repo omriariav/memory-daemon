@@ -22,7 +22,9 @@ longer moves the cursor. Nothing changes without the new optional
   task due next Sunday no longer shows as this week, and the `s` picker's
   `Next Sunday` becomes `Next week` on that day. Unset keeps the rolling 7
   days.
-
+- **The cursor stays in place when you set a due date** (`s` in the Tasks
+  view). The row moves to its new section; the cursor stays at the same place
+  in the list, on the row that is there now. Undo puts it back on the task.
 - **Word keys in every text field** (the `/` filter, the row menu filter, the
   snooze, note, due-date and task fields, and the draft editor):
   `alt+left` / `alt+right` jump a word, `alt+shift+left` / `alt+shift+right`
