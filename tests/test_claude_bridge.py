@@ -829,6 +829,118 @@ class McpConfigTest(BridgeBase):
             self.assertIn("--mcp-config", self.argv(argv_n))
 
 
+class McpServerSourceTest(BridgeBase):
+    """`read_mcp_server` and `call_tools(..., mcp_config_bytes=...)`: one
+    server out of a large Claude config, bytes straight to the run dir."""
+
+    ENV_MARK = "env-mark-value-0001"
+
+    def call(self, tools=None, **kw):
+        kw.setdefault("base_dir", self.base)
+        kw.setdefault("connect_delay", 0)
+        return claude_bridge.call_tools(
+            SECRET_PROMPT, tools if tools is not None else {TOOL_A: {}}, **kw)
+
+    def make(self, mode=0o600, doc=None):
+        path = self.root / "claude.json"
+        doc = doc if doc is not None else {
+            "numStartups": 3, "projects": {"/p": {"mcpServers": {
+                "example-mi": {"command": "wrong"}}}},
+            "mcpServers": {
+                "example-mi": {"type": "stdio", "command": "/bin/example",
+                               "env": {"TOKEN": self.ENV_MARK}},
+                "other": {"command": "/bin/other", "env": {"K": "other-key"}},
+                "bad": "text"}}
+        path.write_text(json.dumps(doc))
+        os.chmod(path, mode)
+        return path
+
+    def test_only_the_named_server_is_extracted(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        self.assertEqual(json.loads(raw), {"mcpServers": {"example-mi": {
+            "type": "stdio", "command": "/bin/example",
+            "env": {"TOKEN": self.ENV_MARK}}}})
+        self.assertNotIn(b"other-key", raw)
+        self.assertNotIn(b"wrong", raw)
+
+    def test_a_large_config_is_read_but_the_cap_holds(self):
+        doc = {"mcpServers": {"example-mi": {"command": "x"}},
+               "blob": "y" * (claude_bridge.MCP_CONFIG_MAX_BYTES + 10)}
+        raw = claude_bridge.read_mcp_server(self.make(doc=doc), "example-mi")
+        self.assertEqual(json.loads(raw)["mcpServers"]["example-mi"],
+                         {"command": "x"})
+        big = self.root / "big.json"
+        big.write_bytes(b" " * (claude_bridge.MCP_SERVER_SOURCE_MAX_BYTES + 1))
+        os.chmod(big, 0o600)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(big), "example-mi")
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_errors_name_the_file_and_server_never_the_definition(self):
+        path = self.make()
+        for server in ("absent", "bad"):
+            with self.assertRaises(claude_bridge.BridgeError) as ctx:
+                claude_bridge.read_mcp_server(str(path), server)
+            self.assertIn(server, str(ctx.exception))
+            self.assertIn(str(path), str(ctx.exception))
+            self.assertNotIn(self.ENV_MARK, str(ctx.exception))
+        path.write_text("{not json " + self.ENV_MARK)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(path), "example-mi")
+        self.assertNotIn(self.ENV_MARK, str(ctx.exception))
+
+    def test_unsafe_files_are_refused(self):
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(self.make(mode=0o644)),
+                                          "example-mi")
+        self.assertIn("chmod 600", str(ctx.exception))
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.read_mcp_server("claude.json", "example-mi")
+
+    def test_bytes_reach_the_run_dir_copy_only_and_it_is_removed(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            copy = Path(cmd[cmd.index("--mcp-config") + 1])
+            seen.update(copy=copy, bytes=copy.read_bytes(),
+                        mode=stat.S_IMODE(copy.stat().st_mode),
+                        strict="--strict-mcp-config" in cmd)
+            return 0, good_stream()
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            self.call(mcp_config_bytes=raw)
+        self.assertEqual(seen["bytes"], raw)
+        self.assertEqual(seen["mode"], 0o600)
+        self.assertTrue(seen["strict"])
+        self.assertTrue(str(seen["copy"]).startswith(
+            str(self.base / "state")))
+        self.assertFalse(seen["copy"].exists())
+        self.assertFalse(seen["copy"].parent.exists())     # the run dir is gone
+        for found in self.base.rglob("*"):
+            if found.is_file():
+                self.assertNotIn(self.ENV_MARK.encode(), found.read_bytes(),
+                                 str(found))
+
+    def test_the_copy_is_removed_when_the_run_fails(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            seen["copy"] = Path(cmd[cmd.index("--mcp-config") + 1])
+            raise claude_bridge.BridgeError("boom")
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            with self.assertRaises(claude_bridge.BridgeError):
+                self.call(mcp_config_bytes=raw, attempts=1)
+        self.assertFalse(seen["copy"].parent.exists())
+
+    def test_bytes_and_a_path_are_mutually_exclusive(self):
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(mcp_config_bytes=b"{}", mcp_config=str(self.make()))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(mcp_config_bytes="{}")
+        self.assertEqual(self.invocations(), 0)
+
+
 class MaxCallsTest(BridgeBase):
     """`call_tools(..., max_calls=N)`: the hook allows N calls of a pinned
     tool and denies the next; the stream re-check fails a run in which a call

@@ -101,7 +101,8 @@ TOOL_NAMES = {
 }
 # Keys only an mi source may carry (validated, not global source keys).
 SOURCE_KEYS = set(DEFAULTS) | set(TOOL_NAMES) | {
-    "calendar_file", "primary_recordings_file", "mcp_config"}
+    "calendar_file", "primary_recordings_file", "mcp_config",
+    "mcp_server_from"}
 # Model names that stay with Anthropic: an alias or a claude-* id.
 ANTHROPIC_MODEL = re.compile(
     r"^(?:haiku|sonnet|opus|claude-[A-Za-z0-9][A-Za-z0-9._-]*)$")
@@ -182,6 +183,11 @@ def settings(source):
     path = source.get("mcp_config")
     cfg["mcp_config"] = (
         os.path.expanduser(path.strip()) if isinstance(path, str) else None)
+    own = source.get("mcp_server_from")
+    cfg["mcp_server_from"] = (
+        {"file": os.path.expanduser(str(own.get("file", "")).strip()),
+         "server": own.get("server")}
+        if isinstance(own, dict) else None)
     cfg["stale_calendar_hours"] = STALE_CALENDAR_HOURS
     return cfg
 
@@ -345,11 +351,18 @@ def _bridge(cfg, calls, max_turns, budget):
     arguments denied) and capped at one call. With `mcp_config` the run is
     strict: only the servers of that file load (a headless run never loads
     user-scope servers), and `connect_delay_seconds` holds the prompt back
-    until they have listed their tools. A failure across a machine sleep is
+    until they have listed their tools. `mcp_server_from` does the same from
+    one server's definition in your Claude config, re-read each call. A failure across a machine sleep is
     an outage, not a failure of the session."""
     tools = {tool: args for tool, args in calls}
     span = sleepclock.Span()
     try:
+        # `mcp_server_from`: the one server's definition is read from the
+        # user's own Claude config on every call, kept in memory, and handed
+        # to the bridge as bytes (its private copy lives in the run dir only).
+        own = cfg.get("mcp_server_from")
+        server_bytes = (claude_bridge.read_mcp_server(
+            own["file"], own["server"]) if own else None)
         return claude_bridge.call_tools(
             _call_prompt(calls),
             tools,
@@ -362,6 +375,7 @@ def _bridge(cfg, calls, max_turns, budget):
             exact_args=True,
             max_calls=1,
             mcp_config=cfg.get("mcp_config"),
+            mcp_config_bytes=server_bytes,
             connect_delay=cfg["connect_delay_seconds"],
         )
     except claude_bridge.BridgeError as exc:

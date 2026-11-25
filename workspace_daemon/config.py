@@ -2230,6 +2230,36 @@ def _validate_mi_mcp_config(prefix, path):
     return []
 
 
+def _validate_mi_server_from(prefix, value):
+    """`mcp_server_from: {file, server}`: your Claude config file (checked as
+    the bridge checks it at run time) holding that server. Reports the file
+    and server, never the definition."""
+    from . import claude_bridge
+    key = f"{prefix}.mcp_server_from"
+    if not isinstance(value, dict):
+        return [f"{key} must be a mapping with file and server"]
+    problems = []
+    unknown = set(value) - {"file", "server"}
+    if unknown:
+        problems.append(f"{key} has unknown key(s) "
+                        f"{', '.join(sorted(map(str, unknown)))}")
+    path = value.get("file")
+    if (not isinstance(path, str) or not path.strip() or "\0" in path
+            or not os.path.isabs(os.path.expanduser(path.strip()))):
+        problems.append(f"{key}.file must be an absolute path to your Claude "
+                        "config JSON (a leading ~ is fine)")
+        return problems
+    if not isinstance(value.get("server"), str):
+        problems.append(f"{key}.server is required (the MCP server name)")
+        return problems
+    try:
+        claude_bridge.read_mcp_server(
+            os.path.expanduser(path.strip()), value["server"])
+    except claude_bridge.BridgeError as exc:
+        problems.append(f"{key}: {exc}")
+    return problems
+
+
 def _validate_mi(prefix, source, routine):
     """MI cross-check: three exact read-only tools, a calendar file, bounds,
     and the privacy rules (content may reach Anthropic models only)."""
@@ -2312,8 +2342,14 @@ def _validate_mi(prefix, source, routine):
     for key in ("shadow", "skip_declined"):
         if key in source and not isinstance(source[key], bool):
             problems.append(f"{prefix}.{key} must be true or false")
-    if "mcp_config" in source:
+    if "mcp_config" in source and "mcp_server_from" in source:
+        problems.append(
+            f"{prefix}: mcp_config and mcp_server_from are mutually exclusive")
+    elif "mcp_config" in source:
         problems.extend(_validate_mi_mcp_config(prefix, source["mcp_config"]))
+    elif "mcp_server_from" in source:
+        problems.extend(
+            _validate_mi_server_from(prefix, source["mcp_server_from"]))
     delay = source.get("connect_delay_seconds")
     if "connect_delay_seconds" in source and (
         not isinstance(delay, (int, float)) or isinstance(delay, bool)

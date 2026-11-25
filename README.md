@@ -2036,7 +2036,8 @@ Keys: `list_tool`, `summary_tool`, `transcript_tool`, `calendar_file`
 `max_summary_chars` (20000), `max_transcript_chars` (60000), `diff_model`
 (`sonnet`), `model` (`haiku`, the bridge model for the tool calls),
 `primary_sources` (`[mila]`), `primary_recordings_file` (unset),
-`mcp_config` (unset), `connect_delay_seconds` (6, from 0 to 60).
+`mcp_server_from` (unset), `mcp_config` (unset), `connect_delay_seconds` (6,
+from 0 to 60).
 `calendar_timezone` is required, `grace_minutes` must be less than
 `retry_hours * 60`, and `lookback_hours` must be at least `retry_hours` (a
 pending session the service no longer lists would otherwise hold its sibling
@@ -2049,26 +2050,44 @@ routine's worst-case delay (`language_check.hold_minutes`, plus its app-summary
 wait and schedule), or an MI-only entry may be written for a meeting Mila
 captures later. The routine also needs `memory.store`.
 
-`mcp_config` and `connect_delay_seconds`: the tool calls run through the
+`mcp_server_from`, `mcp_config` and `connect_delay_seconds`: the tool calls run through the
 headless Claude bridge (`claude -p --setting-sources ""`), and a headless run
 does **not** load user-scope MCP servers from your Claude config; only claude.ai
 connectors are loaded. So when the MI server is not a claude.ai connector (for
-example a local stdio server you added with `claude mcp add`), `mcp_config` is
-required: an absolute path (a leading `~` is fine) to a JSON file in Claude
-Code's MCP config format, for example
+example a local stdio server you added with `claude mcp add`), one of
+`mcp_server_from` or `mcp_config` is required. Two ways, mutually exclusive
+(validation rejects both together):
+
+- `mcp_server_from: {file: ~/.claude.json, server: example-mi}` (recommended
+  for a local server already in your Claude config): on every bridge call the
+  daemon reads that file, takes only `mcpServers["example-mi"]` and hands the
+  run a config of exactly `{"mcpServers": {"example-mi": <definition>}}`. No
+  second copy of the server's credentials is kept: the definition lives in
+  memory and in the run's private 0600 copy, which is removed with the run
+  directory. The file is re-read each run, so a changed key reaches the daemon
+  by itself. It gets the same checks as `mcp_config` (absolute path, a regular
+  file you own, no group or other access, opened without following symlinks)
+  with a 5 MB size cap, and must be JSON with a top-level `mcpServers` map
+  that holds the server as an object. `daemon.py validate` checks the file and
+  the server; errors name the file and the server, never the definition (it
+  can hold secrets in `env`).
+- `mcp_config`: an absolute path (a leading `~` is fine) to a JSON file in
+  Claude Code's MCP config format, for example
 
 ```json
 {"mcpServers": {"example-mi": {"type": "stdio",
   "command": "/path/to/example-mi-server", "args": []}}}
 ```
 
-The server name in the file must match the `<server>` part of the three tool
-names (`mcp__example-mi__list_meetings`, and so on). The file is passed as
-`--mcp-config <copy> --strict-mcp-config`, so the run loads only the servers in
-that file, and the tool allowlist still limits it to the three pinned read
-tools. It must be a regular file you own with mode 0600 (up to 1 MB), opened
-without following symlinks; `daemon.py validate` reports a missing, relative or
-unsafe file. It applies to the list, summary and transcript calls; the diff
+The server name (in `mcp_config`'s file, or `mcp_server_from.server`) must
+match the `<server>` part of the three tool names
+(`mcp__example-mi__list_meetings`, and so on). Either way the config is passed
+as `--mcp-config <copy> --strict-mcp-config`, so the run loads only that
+server, and the tool allowlist still limits it to the three pinned read tools.
+An `mcp_config` file must be a regular file you own with mode 0600 (up to
+1 MB), opened without following symlinks; `daemon.py validate` reports a
+missing, relative or unsafe file. Both apply to the list, summary and
+transcript calls; the diff
 call stays strict with no MCP. A slow stdio server may not have listed its
 tools when the CLI starts, so `connect_delay_seconds` holds the prompt back that
 long (default 6, the bridge's wait for connectors; raise it for a slower
