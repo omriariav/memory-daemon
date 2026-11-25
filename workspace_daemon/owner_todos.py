@@ -23,7 +23,9 @@ line per meeting goes to a candidates queue (see `action_review_queue.py`).
 
 The model's `evidence_ts` is a hint, not a requirement: an unusable one (0,
 "0", "00:00", free text, ...) is dropped and the row is kept, grounded by its
-text against the owner's own transcript lines (`ground_without_ts`).
+text against the owner's own transcript lines (`ground_without_ts`). A usable
+timestamp that matches no owner line gets the same text check before the row
+is given up.
 
 Pure helpers live here (config, prompt text, strict validation, deterministic
 grounding, stable keys); writing goes through memory_sink so the store CLI
@@ -50,6 +52,9 @@ MODES = ("file", "review")
 DEFAULT_MODE = "file"
 DEFAULT_QUEUE_NAME = "meeting-action-candidates.jsonl"
 NO_TS_REASON = "no timestamp and no owner-spoken line matches it"
+TEXT_MATCH_REASON = "matched by text"
+MAX_TS_SECONDS = 86400
+TEXT_MATCH_MIN = 0.75
 QUOTE_LIMIT = 240
 CANDIDATE_TEXT_LIMIT = 200
 MEETING_SOURCE_PREFIXES = tuple(f"{k}:" for k in sorted(MEETING_KINDS))
@@ -274,8 +279,9 @@ def usable_ts(value):
     """A comparable timestamp string, or None when `value` is not one.
 
     Usable: a string that fits `_TS_RE` and names a real, non-zero time of day
-    (`00:12:03`, `12:03`, `[00:12:03]`), or a positive number of seconds
-    (int/float, converted to `HH:MM:SS`, fraction dropped). Everything else
+    (`00:12:03`, `12:03`, `[00:12:03]`; surrounding brackets are stripped), or
+    a positive number of seconds below 24 h (int/float, converted to
+    `HH:MM:SS`, fraction dropped). Everything else
     (a missing value, 0, 0.0, "0", "00:00", "0:00:00", a bool, NaN, a bare
     digit string, free text) is None: a recorder's own action items carry
     `timestamp_seconds: 0` and the model copies it. Never invents a time.
@@ -285,6 +291,8 @@ def usable_ts(value):
     if isinstance(value, (int, float)):
         if value != value or value in (float("inf"), float("-inf")):
             return None
+        if value >= MAX_TS_SECONDS:
+            return None
         secs = int(value)
         if secs <= 0:
             return None
@@ -292,6 +300,8 @@ def usable_ts(value):
     if not isinstance(value, str):
         return None
     text = value.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
     if not _TS_RE.fullmatch(text):
         return None
     norm = _norm_ts(text)
@@ -422,27 +432,47 @@ def ground_in_transcript(body, evidence_ts, names, mapped_names=()):
     return False, None
 
 
+def _label_match(label, names):
+    """True when the speaker `label` IS an owner name: its whole words contain
+    all the words of a name, in order (case-insensitive, any script). "Dan"
+    and "Dan Cohen" match the name "Dan"; "Daniel" does not."""
+    got = re.findall(r"\w+", label.casefold())
+    for name in names:
+        want = re.findall(r"\w+", name.casefold())
+        if want and any(got[i:i + len(want)] == want
+                        for i in range(len(got) - len(want) + 1)):
+            return True
+    return False
+
+
 def ground_without_ts(body, text, names):
-    """(grounded, owner line) for an action that has no usable timestamp.
+    """(grounded, owner line) for an action that has no usable timestamp, or
+    whose timestamp matched no owner line.
 
     Weaker than `ground_in_transcript`, but still owner-only: grounded when a
-    transcript line whose speaker label matches an owner name shares most of
-    the action's significant words (the same 4-letter-stem rule as
-    `body_quote`). An unnamed or non-owner line never grounds it. The line
-    returned is the matched one (speaker kept, capped)."""
+    transcript line whose speaker label is an owner name (whole words, see
+    `_label_match`) shares at least `TEXT_MATCH_MIN` of the action's
+    significant words (4-letter stems, as `body_quote`). An unnamed or
+    non-owner line never grounds it. The line returned is the best-scoring
+    owner line (the first on a tie), speaker kept, capped. An action with
+    fewer than two significant words is never grounded this way."""
     words = {w[:4] for w in normalize(text).split() if len(w) >= 4}
-    if not words:
+    if len(words) < 2:   # one shared word is no evidence
         return False, None
+    best, best_score = None, 0.0
     for line in str(body or "").splitlines():
         m = _LINE_RE.match(line.strip())
         if not m:
             continue
         who = _SPEAKER_RE.match(m.group("rest"))
-        if not who or not _name_match(who.group("who").strip(), names):
+        if not who or not _label_match(who.group("who"), names):
             continue
         spoken = normalize(m.group("rest")[who.end():])
-        if len(words & {w[:4] for w in spoken.split()}) >= 0.6 * len(words):
-            return True, " ".join(m.group("rest").split())[:QUOTE_LIMIT] or None
+        score = len(words & {w[:4] for w in spoken.split()}) / len(words)
+        if score > best_score:
+            best, best_score = m.group("rest"), score
+    if best is not None and best_score >= TEXT_MATCH_MIN:
+        return True, " ".join(best.split())[:QUOTE_LIMIT] or None
     return False, None
 
 
@@ -546,6 +576,8 @@ def review_tags(routine, routine_tags, personal_tag=None, personal=False):
 
 def _flag(candidate):
     status = candidate["status"]
+    if status == "valid" and candidate.get("reason") == TEXT_MATCH_REASON:
+        return " [matched by text]"
     if status == "ungrounded":
         if candidate.get("reason") == NO_TS_REASON:
             return " [unverified: no timestamp]"

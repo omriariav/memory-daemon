@@ -2464,12 +2464,13 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
         return {}
     grounded = []
     for a in actions:
+        ok, line = False, None
         if a.get("evidence_ts"):
             ok, line = owner_todos.ground_in_transcript(
                 item.get("body", ""), a["evidence_ts"], names,
                 (item.get("frontmatter") or {}).get("mila_speaker_names")
                 or ())
-        else:   # the model gave no usable timestamp: match the owner's text
+        if not ok:   # no usable timestamp, or it missed: match the owner's text
             ok, line = owner_todos.ground_without_ts(
                 item.get("body", ""), a["text"], names)
         if ok:
@@ -2511,14 +2512,17 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
     for c in candidates:
         ts = c.get("evidence_ts")
         if c["status"] == "valid":
+            grounded, quote = False, None
+            miss = owner_todos.NO_TS_REASON
             if ts:
                 grounded, quote = owner_todos.ground_in_transcript(
                     body, ts, names, mapped)
                 miss = "no owner-spoken transcript line at the timestamp"
-            else:   # no usable timestamp: kept, matched by the owner's text
+            if not grounded:   # no usable timestamp, or it missed: by text
                 grounded, quote = owner_todos.ground_without_ts(
                     body, c["text"], names)
-                miss = owner_todos.NO_TS_REASON
+                if grounded:
+                    c["reason"] = owner_todos.TEXT_MATCH_REASON
             if grounded:
                 c["quote"] = quote
                 c.update(_with_phrase_due(

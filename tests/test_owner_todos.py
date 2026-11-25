@@ -865,7 +865,8 @@ class FileModeTest(CaptureHarness):
 
 
 BAD_TS = (0, 0.0, "0", "00:00", "0:00:00", "[00:00:00]", "00:00:00,000",
-          "garbage", "", None, True, float("nan"), [], {}, "125", -5, 0.4)
+          "garbage", "", None, True, float("nan"), [], {}, "125", -5, 0.4,
+          86400, 1e12, float("inf"))
 
 
 class UnusableTimestampTest(CaptureHarness):
@@ -877,6 +878,8 @@ class UnusableTimestampTest(CaptureHarness):
             with self.subTest(ts=ts):
                 self.assertIsNone(owner_todos.usable_ts(ts))
         for given, want in (("00:12:03", "00:12:03"), (" 12:03 ", "12:03"),
+                            ("[00:12:03]", "00:12:03"), (" [12:03] ", "12:03"),
+                            ("75:30", "75:30"), (86399, "23:59:59"),
                             ("00:12:03,000", "00:12:03,000"),
                             (723, "00:12:03"), (723.9, "00:12:03"),
                             (3725, "01:02:05")):
@@ -931,7 +934,46 @@ class UnusableTimestampTest(CaptureHarness):
         self.assertEqual(ok(TRANSCRIPT, "Call the clinic back", [NAME]),
                          (False, None))
         self.assertEqual(ok(TRANSCRIPT, "Do", [NAME]), (False, None))
+        self.assertEqual(ok(TRANSCRIPT, "Book it", [NAME]), (False, None))
         self.assertEqual(ok("", "Send the plan", [NAME]), (False, None))
+
+    def test_ground_without_ts_matches_whole_name_words_only(self):
+        ok = owner_todos.ground_without_ts
+        line = "[00:01:00] {}: I will send the revised plan to the team."
+        for label, want in (("Dan", True), ("Dan Cohen", True), ("dan", True),
+                            ("Cohen, Dan", True), ("Daniel", False),
+                            ("Dana Lee", False), ("Abdan", False)):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    ok(line.format(label), "Send the revised plan to the team",
+                       ["Dan"])[0], want)
+        self.assertTrue(ok("[00:01:00] \u05d3\u05e0: send the plan today",
+                           "Send the plan today", ["\u05d3\u05e0"])[0])
+        self.assertFalse(ok("[00:01:00] \u05d3\u05e0\u05d9: send the plan "
+                            "today", "Send the plan today", ["\u05d3\u05e0"])[0])
+
+    def test_ground_without_ts_returns_the_best_owner_line(self):
+        body = "\n".join([
+            f"[00:01:00] {NAME}: I will send the plan.",
+            f"[00:02:00] {NAME}: I will send the revised plan to the team.",
+        ])
+        self.assertEqual(
+            owner_todos.ground_without_ts(
+                body, "Send the revised plan to the team", [NAME]),
+            (True, f"{NAME}: I will send the revised plan to the team."))
+
+    def test_a_missed_timestamp_falls_back_to_the_text(self):
+        for ts in ("00:12:04", "75:30", 723.9 + 60, "01:59:59"):
+            with self.subTest(ts=ts):
+                self.setUp()
+                out = self.capture(meeting_extraction([
+                    act("Send the revised plan to the team", ts=ts),
+                    act("Call the clinic back", ts="00:16:00")]))
+                self.assertEqual(out["memory_owner_todos"], 1)
+                (row,) = self.store.todos().values()
+                self.assertEqual(row["flags"]["--title"],
+                                 "Send the revised plan to the team")
+                self.assertIn("1 ungrounded", self.logged)
 
     def test_file_mode_files_a_zero_timestamp_row_grounded_by_text(self):
         for ts in (0, "0", "00:00", "garbage", None):
@@ -993,6 +1035,26 @@ class ZeroTimestampReviewTest(CaptureHarness):
         self.assertNotIn("evidence_ts", cands[2])
         self.assertNotIn("line_at_ts", cands[2])
         self.assertNotIn("bad timestamp", self.logged)
+
+    def test_review_marks_a_text_match_and_keeps_a_timestamp_match_plain(self):
+        out = self.capture(meeting_extraction([
+            act("Send the revised plan to the team", ts="00:12:04"),   # missed
+            act("Booking the room is on me too", ts="00:17:00"),       # exact
+            act("Call the clinic back", ts="00:17:30"),                # no line
+        ]))
+        self.assertEqual(out["memory_owner_review"], 1)
+        body = self.store.reviews()["mila:REC-1:review"]["body"]
+        lines = [l for l in body.splitlines() if l.startswith("- ")]
+        self.assertIn("[matched by text]", lines[0])
+        self.assertNotIn("[matched by text]", lines[1])
+        self.assertIn("[unverified: ungrounded]", lines[2])
+        cands = self.rows()[0]["candidates"]
+        self.assertEqual([c["status"] for c in cands],
+                         ["valid", "valid", "ungrounded"])
+        self.assertEqual(cands[0]["reason"], owner_todos.TEXT_MATCH_REASON)
+        self.assertIsNone(cands[1]["reason"])
+        self.assertEqual(cands[0]["quote"], "Me Example: I will send the "
+                         "revised plan to the team.")
 
     def test_file_mode_nothing_grounded_files_no_todo_without_error(self):
         out = self.capture(meeting_extraction(
