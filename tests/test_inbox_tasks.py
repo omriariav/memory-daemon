@@ -520,7 +520,8 @@ class ParseDueInputTest(unittest.TestCase):
         self.ok("29/2", D(2028, 2, 29), D(2027, 3, 1))     # next leap year
         self.ok("29/2", D(2028, 2, 29), D(2028, 1, 5))
         self.ok("29/2", D(2028, 2, 29), D(2028, 2, 29))
-        self.bad("29/2", "calendar", today=D(2025, 3, 1))  # none in range
+        self.bad("29/2", "this year or next", today=D(2025, 3, 1))  # none in range
+        self.bad("31/4", "not a day of the calendar")
 
     def test_day_and_month_that_do_not_exist(self):
         for text in ("31/2", "30/2", "31/4", "0/5", "5/0", "32/1", "1/13",
@@ -562,7 +563,9 @@ class ParseDueInputTest(unittest.TestCase):
     def test_anything_else_lists_the_forms(self):
         for text in ("", "   ", "soon", "next week", "yesterday", "tomorow",
                      "nov 25", "25 nov", "-1", "0", "2026", "2026-11",
-                     "20261125", "now", None, 5, ["today"]):
+                     "20261125", "now", None, 5, ["today"],
+                     "\uff12\uff15/\uff11\uff11", "\u0662\u0665/\u0661\u0661",
+                     "+\uff13d", "+\u0663w"):     # non-ASCII digits
             self.bad(text, "Not a date", "YYYY-MM-DD", "tomorrow", "thu",
                      "25/11", "+3d", "+2w")
 

@@ -280,8 +280,8 @@ def due_choices(today, week_start=None, work_days=5):
 
 # --- a typed due date --------------------------------------------------------
 DUE_FORMS = "YYYY-MM-DD, today, tomorrow, a weekday (thu), d/m (25/11), +3d or +2w"
-_DAY_MONTH = re.compile(r"(\d{1,2})[/.](\d{1,2})\Z")
-_PLUS = re.compile(r"\+(\d{1,4})([dw]?)\Z")
+_DAY_MONTH = re.compile(r"([0-9]{1,2})[/.]([0-9]{1,2})\Z")   # ASCII digits only
+_PLUS = re.compile(r"\+([0-9]{1,4})([dw]?)\Z")
 MAX_DAYS = 365
 MAX_WEEKS = 52
 
@@ -322,7 +322,11 @@ def parse_due_input(text, today):
                 continue
             if found >= today:
                 return found, None
-        return None, f"{word} is not a day of the calendar. {nope}"
+        try:        # a real day (29/2) that falls in neither year
+            dt.date(2000, mon, d)
+        except ValueError:
+            return None, f"{word} is not a day of the calendar. {nope}"
+        return None, f"There is no {word} this year or next. {nope}"
     m = _PLUS.match(word)
     if m:
         n, unit = int(m.group(1)), m.group(2)

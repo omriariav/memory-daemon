@@ -1889,7 +1889,7 @@ and a source with no `acts:` is read-only: the keys say so):
 | --- | --- | --- |
 | `d` | a todo: closes it at once; a decision: asks `Decision:` (required, an empty or cancelled prompt sends nothing), then closes it | `close` `{"note": ""}` / `{"note": <decision>}` |
 | `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
-| `s` | due date picker, one key each: `1` Tomorrow, `2` Next Sunday (Next week with `work_week`), `3` +1 week, `4` Today, `5` Next work day (only with `work_week`, then always listed), then Pick date (`5`, or `6` with `work_week`; a typed date, see below) and No date | `due` `{"date": "YYYY-MM-DD" or null}` |
+| `s` | due date picker, one key each: `1` Tomorrow, `2` Next Sunday (Next week with `work_week`), `3` +1 week, `4` Today, `5` Next work day (only with `work_week`, then always listed), then Pick date (`5`, or `6` with `work_week`; a typed date, see below) and No date (`6`, or `7` with `work_week`) | `due` `{"date": "YYYY-MM-DD" or null}` |
 | `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
 
 **Pick date** takes `YYYY-MM-DD` or a shorthand (case-insensitive). The screen
