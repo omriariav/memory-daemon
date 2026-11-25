@@ -1609,6 +1609,7 @@ defaults; a broken one prints every problem and exits 2.
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
+| `week_start` | unset | a weekday name, `monday` to `sunday` (any case): where `THIS WEEK` in the Tasks view ends. Unset, `THIS WEEK` is the next 7 days. Set, it is the days after today and before the next `week_start` day (on a Wednesday with `sunday`: Thursday to Saturday), anything later is `LATER`, and the `s` picker's `Next Sunday` becomes `Next week` on that day. An invalid name is a settings error |
 | `strip_lines` | `4` | 1 to 12: how many status lines the [sessions strip](#the-sessions-strip) shows before `+N more · 6` |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default they are left out before the newest row per event is chosen, so the event shows its latest non-RSVP change (`new`, `update` or `cancel`). New, updated and cancelled invites are not affected |
@@ -1865,7 +1866,7 @@ or in the Inbox's URGENT, I OWE and NUDGE DUE. Their text is untrusted display
 text and is cleaned like any other.
 
 The Tasks view has six sections, empty ones hidden: `OVERDUE` (a todo due
-before today), `DUE TODAY`, `THIS WEEK` (due in the next 7 days), `LATER`,
+before today), `DUE TODAY`, `THIS WEEK` (due in the next 7 days, or before the next `week_start` day when `week_start:` is set), `LATER`,
 `DECIDE` (every decision, with or without a due date) and `NO DATE` (a todo
 with no due date). Inside a section rows go by due date, then creation date.
 "Today" is the local date and is recomputed on every refresh (and every 30 s),
@@ -1888,7 +1889,7 @@ and a source with no `acts:` is read-only: the keys say so):
 | --- | --- | --- |
 | `d` | a todo: closes it at once; a decision: asks `Decision:` (required, an empty or cancelled prompt sends nothing), then closes it | `close` `{"note": ""}` / `{"note": <decision>}` |
 | `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
-| `s` | due date: Tomorrow, Next Sunday, +1 week, Pick date (`YYYY-MM-DD`, checked), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
+| `s` | due date: Tomorrow, Next Sunday (Next week with `week_start`), +1 week, Pick date (`YYYY-MM-DD`, checked), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
 | `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
 
 ### Remind me

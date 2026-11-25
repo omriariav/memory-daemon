@@ -9,11 +9,19 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [0.13.4] - 2026-11-25
 
-Option+Left and Option+Right jump a word in every text field. Terminals send
-them as `alt+left` and `alt+right`, which Textual did not bind. Nothing else
-changes.
+Three small fixes. Option+Left and Option+Right jump a word in every text
+field (terminals send them as `alt+left` and `alt+right`, which Textual did not
+bind). `THIS WEEK` can end at the start of your week. Setting a due date no
+longer moves the cursor. Nothing changes without the new optional
+`week_start:`.
 
 ### Fixed
+
+- **`week_start:`** (optional, a weekday name) in `inbox.yaml`: with it set,
+  `THIS WEEK` in the Tasks view ends before the next `week_start` day, so a
+  task due next Sunday no longer shows as this week, and the `s` picker's
+  `Next Sunday` becomes `Next week` on that day. Unset keeps the rolling 7
+  days.
 
 - **Word keys in every text field** (the `/` filter, the row menu filter, the
   snooze, note, due-date and task fields, and the draft editor):

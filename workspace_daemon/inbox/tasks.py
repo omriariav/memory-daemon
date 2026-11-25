@@ -29,6 +29,8 @@ KIND = "task"
 TODO, DECISION = "todo", "decision"
 GLYPHS = {TODO: "☐", DECISION: "◇"}
 WEEK_DAYS = 7           # THIS WEEK: due within the next 7 days
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday")
 PEOPLE_MAX = 20
 NAME_MAX = 60
 SOURCE_IDS_MAX = 20
@@ -130,10 +132,18 @@ def due_count(items, today):
     return sum(1 for i in items if is_task(i) and is_due_by(i, today))
 
 
-def bucket(item, today):
+def next_week_start(today, week_start):
+    """The first `week_start` day (a name from WEEKDAYS) after `today`: a
+    week out when today is that day."""
+    ahead = (WEEKDAYS.index(week_start) - today.weekday()) % 7
+    return today + dt.timedelta(days=ahead or 7)
+
+
+def bucket(item, today, week_start=None):
     """The Tasks view section of a task. A decision is always DECIDE; a todo
     is OVERDUE, DUE TODAY, THIS WEEK or LATER by its due date, NO DATE
-    without one."""
+    without one. THIS WEEK is the next 7 days, or, with `week_start` set, the
+    days before the next `week_start` day."""
     if task_type(item) == DECISION:
         return DECIDE
     due = due_of(item)
@@ -143,6 +153,8 @@ def bucket(item, today):
         return OVERDUE
     if due == today:
         return TODAY
+    if week_start:
+        return WEEK if due < next_week_start(today, week_start) else LATER
     if (due - today).days <= WEEK_DAYS:
         return WEEK
     return LATER
@@ -208,16 +220,22 @@ def next_sunday(today):
     return today + dt.timedelta(days=7 - ((today.weekday() + 1) % 7))
 
 
-def due_choices(today):
-    """The `s` picker: `[(id, label, date or None)]`; `pick` has no date yet."""
+def due_choices(today, week_start=None):
+    """The `s` picker: `[(id, label, date or None)]`; `pick` has no date yet.
+    The second choice is Next Sunday, or, with `week_start` set, the start of
+    the next week."""
     tomorrow = today + dt.timedelta(days=1)
-    sunday = next_sunday(today)
+    if week_start:
+        sunday = next_week_start(today, week_start)
+        second = "Next week"
+    else:
+        sunday, second = next_sunday(today), "Next Sunday"
     week = today + dt.timedelta(days=7)
 
     def fmt(day):
         return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
     return [("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow),
-            ("sunday", f"Next Sunday  {fmt(sunday)}", sunday),
+            ("sunday", f"{second}  {fmt(sunday)}", sunday),
             ("week", f"+1 week  {fmt(week)}", week),
             ("pick", "Pick date…  YYYY-MM-DD", None),
             ("none", "No date", None)]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from . import acts, feedrules, health, invites, sources, themes
+from . import acts, feedrules, health, invites, sources, tasks, themes
 from .views import DEFAULT_WINDOW_H
 
 FILE_NAME = "inbox.yaml"
@@ -25,7 +25,7 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "summary", "actions", "send", "react", "polish", "copy", "team",
             "slack_open", "show_rsvp_replies", "feed", "health",
             "done_reaction", "nudge_template", "open_with", "strip_lines",
-            "task_launcher")
+            "task_launcher", "week_start")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -134,6 +134,7 @@ DEFAULTS = {
     "open_with": [],   # no default: `o` uses the default browser
     "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
     "strip_lines": 4,   # sessions strip: status lines shown before "+N more"
+    "week_start": None,   # no default: THIS WEEK is the next 7 days
     "task_launcher": None,   # no default: `t` says "no task launcher configured"
     "health": {"heartbeats": []},
 }
@@ -215,6 +216,16 @@ def validate(raw):
         problems.append("strip_lines must be an integer from 1 to 12")
     else:
         out["strip_lines"] = lines
+
+    week_start = raw.get("week_start")
+    if week_start is not None:
+        day = week_start.strip().lower() if isinstance(week_start, str) else None
+        if day not in tasks.WEEKDAYS:
+            problems.append(
+                f"week_start must be one of {', '.join(tasks.WEEKDAYS)} "
+                "or omitted")
+        else:
+            out["week_start"] = day
 
     account = raw.get("gmail_account", DEFAULTS["gmail_account"])
     if not isinstance(account, int) or isinstance(account, bool) or account < 0:

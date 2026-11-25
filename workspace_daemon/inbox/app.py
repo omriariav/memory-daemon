@@ -402,6 +402,7 @@ class InboxApp(App):
                        "agents": []}
         # The sessions strip (0.13.2): the `status` lines of the sources.
         self.strip_lines = int(settings.get("strip_lines", 4))
+        self.week_start = settings.get("week_start")   # weekday name or None
         shown_pref = store.get_pref("sessions_strip") \
             if hasattr(store, "get_pref") else None
         self.strip_on = shown_pref != "off"
@@ -676,7 +677,7 @@ class InboxApp(App):
         today = self._today()
         inbox = views.inbox_groups(self.items, today)
         waiting = views.waiting_groups(self.items, now)
-        tasks = views.task_groups(self.items, today)
+        tasks = views.task_groups(self.items, today, self.week_start)
         agents = views.agent_groups(self.items)
         data = feed()
         shown = (views.view_rows(inbox) + views.view_rows(waiting)
@@ -3694,7 +3695,7 @@ class InboxApp(App):
         if not self._task_gate(it, "due"):
             return
         today = self._today()
-        options = tasksmod.due_choices(today)
+        options = tasksmod.due_choices(today, self.week_start)
         by_id = {o[0]: o for o in options}
         choices = [{"id": key, "label": label, "detail": ""}
                    for key, label, _day in options]

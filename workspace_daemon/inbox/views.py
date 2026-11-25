@@ -195,15 +195,16 @@ def agent_groups(items):
 
 # --- 3 Tasks ----------------------------------------------------------------
 
-def task_groups(items, today):
+def task_groups(items, today, week_start=None):
     """The Tasks view: OVERDUE, DUE TODAY, THIS WEEK, LATER, DECIDE and NO
     DATE, in that order, empty sections left out. Inside a section the rows
     go by due date, then creation date (tasks.sort_key). `today` is a
-    `datetime.date`."""
+    `datetime.date`; `week_start` is the optional weekday name that ends THIS
+    WEEK (tasks.bucket)."""
     buckets = OrderedDict((key, []) for key, _title in tasks.BUCKETS)
     for it in items:
         if tasks.is_task(it):
-            buckets[tasks.bucket(it, today)].append(it)
+            buckets[tasks.bucket(it, today, week_start)].append(it)
     titles = dict(tasks.BUCKETS)
     return [Group(key, titles[key], sorted(rows, key=tasks.sort_key),
                   hot=key == tasks.OVERDUE)
