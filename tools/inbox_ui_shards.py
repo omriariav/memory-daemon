@@ -52,12 +52,14 @@ MODULES = {
     "tests.test_inbox_outcome": 22.0,
     "tests.test_inbox_agents": 0.2,
     "tests.test_inbox_agents_ui": 25.0,
+    "tests.test_inbox_start_task_ui": 30.0,
 }
 
 # Inbox test modules the plain `test` job already runs (they need no Textual).
 PLAIN_ONLY = {
     "tests.test_inbox_alert_active",
     "tests.test_inbox_gaps",
+    "tests.test_inbox_launcher",
     "tests.test_inbox_readside",
     "tests.test_inbox_review",
     "tests.test_inbox_version",

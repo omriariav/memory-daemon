@@ -298,8 +298,8 @@ sources:
 # default. The command is called with JSON on stdin (never argv): choices
 # (read-only, pick one), prepare (read-only, shows what will happen; may say
 # duplicate), then, after the confirm and the 5 s undo window, run (once, never
-# retried). The key must be one the inbox does not use: h l p t z or one
-# of B F H J K N O Q U V W Z. A successful run marks the item done
+# retried). The key must be one the inbox does not use: h l p z or one
+# of B F H J K N O Q U V W Z (`t` starts a task, see task_launcher below). A successful run marks the item done
 # (mark_done: false keeps it). See "Actions protocol" in docs/inbox.md.
 # actions:
 #   - key: "p"
@@ -307,3 +307,20 @@ sources:
 #     argv: ["python3", "~/bin/my-inbox-action.py"]
 #     timeout_s: 120         # 5 to 300 per call
 #     mark_done: true
+
+# Start a task from a row (inbox 0.13.3): `t` opens a small modal (name, role,
+# model and effort chips, a goal line) and, after Enter and the 5 s undo window,
+# asks your launcher command to start a task session. One program, two calls,
+# JSON on stdin and one JSON line on stdout (never argv): `draft` (read-only,
+# may use a model, fills only the fields you have not touched) and `launch`
+# (the only call that starts anything, once, never retried). Off until set;
+# without it `t` says "no task launcher configured". See "Start a task" in
+# docs/inbox.md. The names below are made up: roles and the models and efforts
+# are whatever your launcher understands.
+# task_launcher:
+#   argv: ["python3", "~/bin/my-task-launcher.py"]
+#   timeout_s: 30            # the launch call, 5 to 300
+#   draft_timeout_s: 90      # the draft call, 5 to 300
+#   roles: [researcher, analyst, reviewer, reader]   # chips 1-9, in order
+#   models: [haiku, sonnet, opus]                    # chips; none picked = launcher default
+#   efforts: [low, medium, high]

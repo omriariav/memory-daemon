@@ -24,7 +24,7 @@ if HAVE_TEXTUAL:
 
 DEFAULTS = {"poll_interval_s": 300.0, "theme": "dark", "bidi_mode": "logical"}
 SMALL = (100, 24)     # the reference is far taller than 24 lines
-BIG = (150, 170)      # ... and fits in 170
+BIG = (150, 200)      # ... and fits in 200
 
 
 class Fixed:

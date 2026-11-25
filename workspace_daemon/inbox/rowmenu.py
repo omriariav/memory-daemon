@@ -14,7 +14,7 @@ from . import items as itm_items
 from . import tasks as tasksmod
 from . import views
 
-FOOTER_MAX = 7          # one slot is kept free for the task key of step 3
+FOOTER_MAX = 7          # a send, d, s, t, o, enter and ? on a row that has all of them
 
 # The menu's groups, in the order they are listed.
 G_ACT, G_SOURCE, G_FEED, G_OPEN, G_MEMORY, G_CUSTOM = (
@@ -50,6 +50,7 @@ KEY_TITLES = {
     "P": ("Polish draft",), "D": ("Draft for me",), "w": ("Waits on…",),
     "!": ("Relay to work session…",), "o": ("Open link",),
     "y": ("Copy item",), "Y": ("Copy section",),
+    "t": ("Start a task…",), ">": ("Go to task",),
     "c": ("Toggle context pane",), "C": ("Refresh context",),
     "i": ("Summarize item",), "I": ("Summarize item (refresh)",),
     "u": ("Undo last action",), "M": ("Feed rules",),
@@ -151,9 +152,57 @@ def draft_me_ok(app, it):
     return bool(cached) and it.draft == cached
 
 
+def report_item(it):
+    """The agent row of a finished task started from this row when it has a
+    report link (`o` opens it), else None."""
+    task = getattr(it, "task", None)
+    if task and task[1].completed and task[1].link:
+        return task[0]
+    return None
+
+
+def task_refusal(app, it):
+    """Why `t` cannot start a task from this row, or "" when it can: not a
+    digest, saved, review or agent row, not an invite or an alert, and not a
+    row whose task is still running (or being started)."""
+    if it is None:
+        return "Nothing selected"
+    if views.is_synthetic(it) or views.is_review(it):
+        return "A task starts from a single row, not from this one"
+    if views.is_agent(it):
+        return "This row is a task already"
+    meta = it.meta if isinstance(it.meta, dict) else {}
+    if it.source == "alert" or meta.get("kind") == "invite":
+        return "A task cannot start from an alert or an invite"
+    card = getattr(it, "task", None)
+    if card and not card[1].completed:
+        return f"{card[1].name} is already running (enter, Go to task)"
+    if app.task_starting(it):
+        return "A task is already being started from this row"
+    recent = app.task_recent(it)
+    if recent:
+        return (f"{recent} was just started from this row; wait for its "
+                "card to show")
+    return ""
+
+
+def task_ok(app, it):
+    """True when the footer and the menu offer `t` on this row: a task
+    launcher is configured and the row can start one."""
+    return (it is not None
+            and bool(getattr(app.actions, "task_launcher_configured", False))
+            and not task_refusal(app, it))
+
+
 def can_open(app, it):
-    """True when `o` has something to open: the item's link, or the Slack
-    open template's URL."""
+    """True when `o` has something to open: the finished task's report, the
+    item's link, or the Slack open template's URL."""
+    return report_item(it) is not None or can_open_source(app, it)
+
+
+def can_open_source(app, it):
+    """True when the row's own link (or the Slack open template's URL) can be
+    opened."""
     if it is None:
         return False
     if tasksmod.is_task(it) and not it.link:
@@ -173,9 +222,10 @@ def _closable(app, it):
 
 def verb_hints(app, it):
     """The footer of a selected row: at most FOOTER_MAX hints, in this order:
-    a <label>, d done, s later, o open, enter more, ? help. A task shows `d`
-    and `s` only when its source lists the act (the keys only say so
-    otherwise)."""
+    a <label>, d done, s later, t task, o open, enter more, ? help. A task
+    shows `d` and `s` only when its source lists the act (the keys only say so
+    otherwise); `t` shows with a configured task launcher on a row that can
+    start one."""
     hints = []
     label = approve_label(app, it)
     if label:
@@ -184,6 +234,8 @@ def verb_hints(app, it):
         hints.append(("d", "done"))
     if not tasksmod.is_task(it) or app._acts_on(it, "due"):
         hints.append(("s", "later"))
+    if task_ok(app, it):
+        hints.append(("t", "task"))
     if can_open(app, it):
         hints.append(("o", "open"))
     hints.append(("⏎", "more"))
@@ -233,8 +285,21 @@ def build_entries(app, it):
         add(G_FEED, "M", "Feed rules…", app.action_rules,
             detail="the rules from inbox.yaml and the ones made here")
 
+    # start a task, and the task started from this row
+    if task_ok(app, it):
+        add(G_ACT, "t", "Start a task…", app.action_task,
+            detail="a task session works on it; the row stays")
+    if getattr(it, "task", None):
+        add(G_ACT, ">", "Go to task", app.action_go_to_task,
+            detail="its row in the Agents view")
+
     # open and copy
-    if can_open(app, it):
+    if report_item(it) is not None:
+        add(G_OPEN, "o", "Open task report", app.action_open)
+        if can_open_source(app, it):
+            # a non-letter key: an `actions:` entry can own any free letter
+            add(G_OPEN, "<", "Open the source link", app.action_open_source)
+    elif can_open(app, it):
         add(G_OPEN, "o", "Open link", app.action_open)
     add(G_OPEN, "y", "Copy item", app.action_copy_item)
     add(G_OPEN, "Y", "Copy section", app.action_copy_section,

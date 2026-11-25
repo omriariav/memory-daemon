@@ -13,6 +13,7 @@ from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
 from . import health as healthmod
+from . import launcher
 from . import tasks as tasksmod
 from .items import STATUS_MAX
 from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
@@ -275,8 +276,12 @@ class Queue(OptionList):
         t.append(f" {age:>4}", Style(color=pal["muted"]))
         t.append("\n")
         people = tasksmod.people_compact(tasksmod.people_of(it))
-        t.append("   " + (vis(fit(people, width - 4), visual) or "-"),
+        badge = task_badge(it)
+        room = width - 4 - (cell_len(badge[0]) + 2 if badge else 0)
+        t.append("   " + (vis(fit(people, max(0, room)), visual) or "-"),
                  Style(color=pal["muted"]))
+        if badge:
+            t.append("  " + badge[0], Style(color=pal[badge[1]]))
         return t
 
     def _row(self, it, width, pal, now, visual):
@@ -322,8 +327,12 @@ class Queue(OptionList):
         pad = max(1, width - t.cell_len - cell_len(age))
         t.append(" " * pad + age, Style(color=pal["urgent"] if urgent else pal["muted"]))
         t.append("\n")
-        gist = fit(it.gist, width - 4)
+        badge = task_badge(it)
+        gist = fit(it.gist, width - 4 - (cell_len(badge[0]) + 2
+                                         if badge else 0))
         t.append("   " + vis(gist, visual), Style(color=pal["muted"]))
+        if badge:
+            t.append("  " + badge[0], Style(color=pal[badge[1]]))
         return t
 
     def _ghost_opt(self, it, width, pal, visual):
@@ -750,6 +759,16 @@ def agent_marks(it):
     if it.meta.get("rules_stale") is True:
         out.append(("old rules", "warn"))
     return out
+
+
+def task_badge(it):
+    """`(text, palette key)` of the task started from this row
+    (`▶ <name> · <role> · <state>`), or None. Green once it is finished."""
+    card = getattr(it, "task", None)
+    if not card:
+        return None
+    info = card[1]
+    return (launcher.badge_text(info), "ok" if info.completed else "primary")
 
 
 class HintBar(Static):

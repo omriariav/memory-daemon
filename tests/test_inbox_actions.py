@@ -86,7 +86,7 @@ class ActionsSettingsTest(unittest.TestCase):
         self.assertEqual((out["timeout_s"], out["mark_done"]), (300.0, False))
 
     def test_every_free_key_is_accepted(self):
-        for key in "hlptz" + "BFHJKNOQUVWZ":
+        for key in "hlpz" + "BFHJKNOQUVWZ":
             self.assertEqual(
                 validated({"actions": [dict(ACTION, key=key)]})
                 ["actions"][0]["key"], key)
@@ -147,7 +147,7 @@ class ActionsSettingsTest(unittest.TestCase):
                          letters - settings.RESERVED_KEYS)
         self.assertEqual(
             "".join(settings.ACTION_KEY_CHOICES),
-            "BFHJKNOQUVWZhlptz")
+            "BFHJKNOQUVWZhlpz")
 
 
 # ----------------------------------------------------------------- protocol
@@ -1349,7 +1349,7 @@ class KeyMapInvariantTest(unittest.TestCase):
         bound = set(self.bound())
         for key in settings.ACTION_KEY_CHOICES:
             self.assertNotIn(key, bound, key)
-        for key in "hlptzBFHJKNOQUVWZ":
+        for key in "hlpzBFHJKNOQUVWZ":
             self.assertIn(key, settings.ACTION_KEY_CHOICES)
         InboxApp(lambda: [], InboxStore(None), Scripted(None),
                  settings=dict(DEFAULTS))
@@ -1367,7 +1367,7 @@ class KeyMapInvariantTest(unittest.TestCase):
 
     def test_the_example_and_docs_use_free_keys_and_name_them(self):
         text = (ROOT / "docs" / "inbox.md").read_text()
-        self.assertIn("`h l p t z`", text)
+        self.assertIn("`h l p z`", text)
         self.assertIn("`B F H J K N O Q U V W Z`", text)
         example = (ROOT / "inbox.example.yaml").read_text()
         self.assertIn('#   - key: "p"', example)

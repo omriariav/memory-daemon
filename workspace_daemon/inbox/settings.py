@@ -24,7 +24,8 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "alert_urgent_max_age_h", "sources", "rsvp", "save", "context",
             "summary", "actions", "send", "react", "polish", "copy", "team",
             "slack_open", "show_rsvp_replies", "feed", "health",
-            "done_reaction", "nudge_template", "open_with", "strip_lines")
+            "done_reaction", "nudge_template", "open_with", "strip_lines",
+            "task_launcher")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -54,14 +55,24 @@ REACT_ARG_KEYS = ("channel", "timestamp", "name")
 POLISH_KEYS = ("mcp_config", "tone_tool", "tone_args", "model", "timeout_s",
                "max_budget_usd", "cache_h")
 ACTION_KEYS = ("key", "label", "argv", "timeout_s", "mark_done")
+TASK_LAUNCHER_KEYS = ("argv", "timeout_s", "draft_timeout_s", "roles",
+                      "models", "efforts")
+# A role, model or effort chip: a short lowercase word, never a flag.
+CHIP_NAME = re.compile(r"\A[a-z0-9][a-z0-9_.-]{0,39}\Z")
+MAX_ROLE_CHIPS = 9          # the modal's role keys are 1-9
+MAX_PICK_CHIPS = 6
+DEFAULT_TASK_MODELS = ("haiku", "sonnet", "opus")
+DEFAULT_TASK_EFFORTS = ("low", "medium", "high")
+DEFAULT_TASK_TIMEOUT_S = 30
+DEFAULT_TASK_DRAFT_TIMEOUT_S = 90
 CONTEXT_KEYS = ("argv", "timeout_s")
 SUMMARY_KEYS = ("model", "timeout_s", "max_budget_usd")
 # Every letter the inbox binds to a key of its own (app.InboxApp.BINDINGS; a
 # test keeps this list equal to it). An `actions:` key must be another letter.
-RESERVED_KEYS = frozenset("jkgGfaedsnorLbyYRXTmcCiIASquvEPxMwD")
+RESERVED_KEYS = frozenset("jkgGfaedsnortLbyYRXTmcCiIASquvEPxMwD")
 # Bound keys that are not letters (an `actions:` key must be a letter, so
 # these can never clash; listed so the docs and a test can name them).
-RESERVED_NONLETTER_KEYS = frozenset("!")
+RESERVED_NONLETTER_KEYS = frozenset("!><")
 ACTION_KEY_CHOICES = tuple(sorted(
     c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     if c not in RESERVED_KEYS))
@@ -123,6 +134,7 @@ DEFAULTS = {
     "open_with": [],   # no default: `o` uses the default browser
     "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
     "strip_lines": 4,   # sessions strip: status lines shown before "+N more"
+    "task_launcher": None,   # no default: `t` says "no task launcher configured"
     "health": {"heartbeats": []},
 }
 
@@ -225,6 +237,8 @@ def validate(raw):
     out["send"] = _check_send(raw.get("send"), problems)
     out["react"] = _check_react(raw.get("react"), problems)
     out["polish"] = _check_polish(raw.get("polish"), problems)
+    out["task_launcher"] = _check_task_launcher(raw.get("task_launcher"),
+                                                problems)
     done = raw.get("done_reaction")
     if done is not None:
         if not isinstance(done, str) or not EMOJI_NAME.match(done):
@@ -878,6 +892,64 @@ def _check_polish(raw, problems):
             "max_budget_usd": float(budget), "cache_h": float(cache_h)}
 
 
+def _check_chips(raw, label, default, limit, problems, required=False):
+    """A `task_launcher` chip list (roles, models, efforts) as a tuple of
+    unique lowercase words. Absent means `default`; `[]` is allowed unless
+    `required`."""
+    if raw is None:
+        if required:
+            problems.append(f"{label} is required: a non-empty list of "
+                            "role names")
+        return tuple(default or ())
+    if (not isinstance(raw, list) or len(raw) > limit
+            or not all(isinstance(c, str) and CHIP_NAME.match(c)
+                       for c in raw)
+            or len(set(raw)) != len(raw)
+            or (required and not raw)):
+        problems.append(
+            f"{label} must be a{' non-empty' if required else ''} list of "
+            f"up to {limit} different lowercase words (a-z, 0-9, _ . -)")
+        return tuple(default or ())
+    return tuple(raw)
+
+
+def _check_task_launcher(raw, problems):
+    """The `task_launcher:` block as a clean dict, or None (absent or
+    invalid): one command that drafts and launches a task session from a row
+    (docs/inbox.md, "Start a task")."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("task_launcher must be a mapping")
+        return None
+    start = len(problems)
+    for key in raw:
+        if key not in TASK_LAUNCHER_KEYS:
+            problems.append(f"task_launcher: unknown key '{key}'")
+    argv = raw.get("argv")
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(a, str) and a for a in argv)):
+        problems.append("task_launcher.argv must be a non-empty list of "
+                        "strings (no shell)")
+    timeout = raw.get("timeout_s", DEFAULT_TASK_TIMEOUT_S)
+    if not _num(timeout) or not 5 <= timeout <= 300:
+        problems.append("task_launcher.timeout_s must be 5 to 300")
+    draft_timeout = raw.get("draft_timeout_s", DEFAULT_TASK_DRAFT_TIMEOUT_S)
+    if not _num(draft_timeout) or not 5 <= draft_timeout <= 300:
+        problems.append("task_launcher.draft_timeout_s must be 5 to 300")
+    roles = _check_chips(raw.get("roles"), "task_launcher.roles", (),
+                         MAX_ROLE_CHIPS, problems, required=True)
+    models = _check_chips(raw.get("models"), "task_launcher.models",
+                          DEFAULT_TASK_MODELS, MAX_PICK_CHIPS, problems)
+    efforts = _check_chips(raw.get("efforts"), "task_launcher.efforts",
+                           DEFAULT_TASK_EFFORTS, MAX_PICK_CHIPS, problems)
+    if len(problems) > start:
+        return None
+    return {"argv": list(argv), "timeout_s": float(timeout),
+            "draft_timeout_s": float(draft_timeout), "roles": list(roles),
+            "models": list(models), "efforts": list(efforts)}
+
+
 def _check_actions(raw, problems):
     """The `actions:` list as clean dicts (empty when absent or invalid)."""
     if raw is None:
@@ -902,6 +974,13 @@ def _check_actions(raw, problems):
         if not isinstance(key, str) or len(key) != 1 \
                 or not key.isascii() or not key.isalpha():
             problems.append(f"{where}.key must be one letter (a-z, A-Z)")
+        elif key == "t":
+            problems.append(
+                f"{where}.key 't' is already used by the inbox: it is "
+                "reserved since 0.13.3 to start a task from a row "
+                "(task_launcher:). Give this action another key (free keys "
+                f"are {''.join(ACTION_KEY_CHOICES)}); it stays in the row "
+                "menu (enter)")
         elif key in RESERVED_KEYS:
             problems.append(
                 f"{where}.key '{key}' is already used by the inbox; free "

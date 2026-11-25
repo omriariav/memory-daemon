@@ -7,6 +7,61 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-11-24
+
+Start a task from any row. `t` opens a small modal, and your own command (the
+task launcher) drafts and starts a task session. The inbox only talks to that
+command; the roles come from your config, and it knows no tools or sessions of
+its own. Nothing changes without `task_launcher:` in `inbox.yaml`, except that
+`t` is now a reserved key.
+
+### Added
+
+- **`task_launcher:`** in `inbox.yaml`: `argv`, `timeout_s` (launch, default
+  30), `draft_timeout_s` (default 90), `roles` (required, chips `1`-`9`),
+  `models` and `efforts` (chips). One command, JSON on stdin, one JSON line on
+  stdout, no shell, item text never in argv. See the [Task launcher
+  protocol](inbox.md#task-launcher-protocol): a read-only `draft` call and a
+  `launch` call that runs once and is never retried.
+- **`t` on a row** opens the modal at once, with local defaults: a slug name
+  (`-2` when taken), a role by the row (a pull or merge request link, a decision
+  task, anything else), model and effort chips (`m`, `e`; the first stop is the
+  launcher's default), a goal line from a template, a collapsed acceptance line
+  (`a`) and, when the draft returned them, a persona line and brief chips (`t`).
+  A background `draft` call fills only the fields you have not touched; `enter`
+  works before it returns (and stops it); `esc` cancels. `enter` queues the
+  launch with the 5 s undo window; a failure is a toast with the first line of
+  the launcher's message. Without `task_launcher:` `t` says `no task launcher
+  configured`. A row that cannot start a task (a digest, saved, review or agent
+  row, an invite, an alert, a row whose task still runs) says why.
+- **A badge on the row** a task came from, `▶ <name> · <role> · <state>`, from
+  the agent row whose `meta.source_key` is the row's `id`; green when the task
+  has finished (`meta.state` `completed`, or `meta.bucket` `done`).
+- **Row menu**: `Start a task…` (`t`), `Go to task` (`>`, also bound on the queue; the row in the Agents
+  view), and, for a finished task with a report link on its agent row, `o`
+  "Open task report" and `<` "Open the source link". `o` on such a row opens the
+  report.
+- The footer shows `t task` (the seventh and last slot), the help has a
+  "Start a task" section, the palette has "Start a task…" and "Go to task", and
+  `inbox.example.yaml` has a commented `task_launcher:` block.
+- **Unclear launches.** Only an explicit `ok: false` is a failed launch. A
+  timeout, a non-zero exit or an unreadable reply is a warning, "launch result
+  unclear; it may have started (check the Agents view)". A launched row refuses
+  a second `t` until its card shows or 5 refreshes pass.
+- Extra draft fields are passed through to launch: keys of a `draft` answer's
+  `fields` that the modal does not show are kept (validated, capped) and sent
+  back unchanged in the `launch` call.
+- Badges work without `task_launcher:`: any `meta.kind: agent` row with a
+  `meta.source_key` badges that row (and, when finished, redirects `o` to its
+  http(s) link).
+
+### Changed
+
+- **`t` is a reserved key.** An `actions:` entry on `t` is now refused at
+  startup with a message that names the clash; give it another key (it stays in
+  the row menu). The free action keys are `h l p z` and `B F H J K N O Q U V W
+  Z`.
+
 ## [0.13.2] - 2026-11-24
 
 A sessions strip and an Agents view: what your agent sessions are doing, on

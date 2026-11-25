@@ -23,6 +23,7 @@ from textual.widgets import Input, Static, TextArea
 
 from . import acts as actsmod
 from . import bidi, customactions, feedrules, invites, rowmenu, themes, views
+from . import launcher as launchermod
 from . import context as ctxmod
 from . import health as healthmod
 from . import items as itm_items
@@ -38,7 +39,8 @@ from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, DateScreen, HelpScreen, NoteScreen, OutcomeScreen,
                       OpsScreen,
-                      PolishScreen, RowMenu, RulesScreen, SnoozePicker)
+                      PolishScreen, RowMenu, RulesScreen, SnoozePicker,
+                      TaskScreen)
 from .sources import (SourceResult, annotate_memory, merge, units_answers,
                       units_memory_index)
 from .mrkdwn import to_slack_mrkdwn
@@ -55,6 +57,10 @@ SAVE_OFF = "Save not configured (set save: in inbox.yaml)"
 CONTEXT_OFF = "Context not configured (set context: in inbox.yaml)"
 SUMMARY_OFF = "Summary not configured (set summary: in inbox.yaml)"
 REACT_OFF = "React not configured (set react: in inbox.yaml)"
+TASK_OFF = "no task launcher configured"
+# After a launch the row refuses a second `t` until a card with its source_key
+# shows up, or this many polls have been applied without one.
+TASK_WAIT_POLLS = 5
 POLISH_OFF = "Polish not configured (set polish: in inbox.yaml)"
 SEND_KINDS = ("send", "nudge")
 # Every write that goes to Slack through the bridge's one-call path: only one
@@ -78,7 +84,7 @@ RSVP_KEYS = {
 # Kinds that act outside the inbox: quitting inside the undo window cancels
 # them (nothing is sent), unlike the local marks, which quitting commits.
 EXTERNAL_KINDS = ("send", "nudge", "draft", "rsvp", "save", "action", "react",
-                  "waits_on", "relay", "due")
+                  "waits_on", "relay", "due", "task")
 # 0.10.0 acts. `done`, `snooze` and `mute` write a local mark and then tell the
 # source (quitting commits the mark and keeps the op for a retry: it never
 # calls the source); `waits_on` and `relay` have no local mark (they are in
@@ -131,7 +137,7 @@ def review_cli_hint(source_id, title):
 
 @dataclass
 class Pending:
-    kind: str                 # send | nudge | draft | done | ack | snooze | mute | drop | due | waits_on | relay | rsvp | save | action | react
+    kind: str                 # send | nudge | draft | done | ack | snooze | mute | drop | due | waits_on | relay | rsvp | save | action | react | task
     item: Item
     text: str = ""
     until: float = 0.0
@@ -150,6 +156,7 @@ class Pending:
     act_args: dict = field(default_factory=dict)   # its args
     act_meta: object = None   # 0.12.0: the request meta fixed at enqueue (a due move: the date shown before it)
     react: str = ""           # 0.10.0: done reaction emoji sent after the act
+    fields: dict = field(default_factory=dict)   # 0.13.3 task: the launch fields fixed at enqueue
 
 
 THIS_ITEM = "This item"
@@ -223,6 +230,8 @@ class InboxApp(App):
         Binding("slash", "filter", "Filter", show=False),
         Binding("f", "source_filter", show=False),
         Binding("a", "approve", show=False), Binding("e", "edit", show=False),
+        Binding("t", "task", show=False),
+        Binding("greater_than_sign", "go_to_task", show=False),
         Binding("d", "done", show=False), Binding("s", "snooze", show=False),
         Binding("n", "nudge", show=False), Binding("o", "open", show=False),
         Binding("r", "refresh", show=False), Binding("u", "undo", show=False),
@@ -278,7 +287,7 @@ class InboxApp(App):
     #draft-edit { height: auto; min-height: 3; max-height: 14; display: none; border: none; background: $surface; }
     #draft-edit.on { display: block; }
     #hints { height: 1; background: $panel; }
-    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, DateScreen, OpsScreen, RowMenu { align: center middle; background: $background 55%; }
+    ConfirmSend, ConfirmWrite, SnoozePicker, HelpScreen, AuditScreen, ActionBusy, ChoicePicker, PolishScreen, RulesScreen, NoteScreen, DateScreen, OpsScreen, RowMenu, TaskScreen { align: center middle; background: $background 55%; }
     #confirm { width: 74; max-width: 94%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
     #confirm-title { text-style: bold; color: $error; margin-bottom: 1; }
     #confirm-warn { margin: 1 0 0 0; }
@@ -324,6 +333,14 @@ class InboxApp(App):
     #ops-table { height: 1fr; }
     #note { width: 70; max-width: 94%; height: auto; border: heavy $primary; background: $surface; padding: 1 2; }
     #note-hint { margin-top: 1; color: $text-muted; }
+    #task { width: 84; max-width: 96%; height: auto; max-height: 96%; border: heavy $primary; background: $surface; padding: 1 2; }
+    #task-title { margin-bottom: 1; }
+    .task-label { color: $text-muted; }
+    #task Input { height: 1; border: none; padding: 0 1; background: $panel; margin-bottom: 1; }
+    .task-chips { margin-bottom: 0; }
+    #task-accept { margin-top: 1; }
+    #task-status { margin-top: 1; }
+    #task-hint { color: $text-muted; }
     #rules { width: 96%; height: 70%; border: heavy $primary; background: $surface; padding: 1 2; }
     #rules-title { margin-bottom: 1; }
     #rules-table { height: 1fr; }
@@ -449,6 +466,10 @@ class InboxApp(App):
         self._cancel = threading.Event()   # set on quit: stops context commands
         self.remind_key = None             # m on a task: its "Remind me" card is showing
         self._custom = list(getattr(actions, "custom_actions", None) or [])
+        self.task_cards = {}               # row id -> (agent row, launcher.Card)
+        self._task_names = set()           # card names launched in this session
+        self._task_launched = {}           # row key -> [card name, polls left]: launched, no card seen yet
+        self._task_op = None               # the open `t` modal: its draft's cancel event
         self._act_op = None                # the running choices/prepare lookup
         self._act_gen = 0                  # bumped on every lookup
         self._act_screen = None            # the "looking up" modal
@@ -674,7 +695,11 @@ class InboxApp(App):
                 self._rows.setdefault(i.key, i)
         # The date is part of the signature: the due cells and ages redraw
         # when midnight passes.
-        return (today, tuple(
+        # A task badge (a card started from a row) is part of it too.
+        badges = tuple(sorted(
+            (k, c.name, c.role, c.state, c.completed)
+            for k, (_row, c) in self.task_cards.items()))
+        return (today, badges, tuple(
             (v, tuple((g.key, tuple(i.key for i in g.items)) for g in gs))
             for v, gs in self._views.items()))
 
@@ -683,7 +708,9 @@ class InboxApp(App):
         items, wake snoozed ones that are due, apply the Feed rules."""
         busy_keys = self._busy_keys()
         now = time.time()
+        self.task_cards = launchermod.index_cards(self.all_rows)
         for i in self.all_rows:
+            i.task = self.task_cards.get(i.key)
             i.local_due = self._due_marks.get(i.key, {}).get("due")
             # One mark for "this is in memory": saved here with `m`, or
             # saved by the daemon (meta.memory_id).
@@ -1035,8 +1062,8 @@ class InboxApp(App):
     def hints(self):
         """The footer. For the selected row (the queue has the focus) at most
         `rowmenu.FOOTER_MAX` hints, the same few on every kind of row:
-        `a <label>`, `d done`, `s later`, `o open`, `enter more`, `? help`
-        (one slot stays free). Everything else is in the row menu (enter),
+        `a <label>`, `d done`, `s later`, `t task` (with a task launcher),
+        `o open`, `enter more`, `? help`. Everything else is in the row menu (enter),
         the command palette and `?`; every key still works."""
         return self._base_hints()
 
@@ -1479,11 +1506,12 @@ class InboxApp(App):
     def _enqueue(self, kind, it, toast, text="", until=0.0, detail="",
                  answer="", hide=True, force=False, name="", choice="",
                  state="", mark_done=False, act="", act_args=None, react="",
-                 meta=None):
+                 meta=None, fields=None):
         p = Pending(kind=kind, item=it, text=text, until=until, label=toast,
                     answer=answer, hide=hide, force=force, name=name,
                     choice=choice, state=state, mark_done=mark_done, act=act,
-                    act_args=dict(act_args or {}), react=react, act_meta=meta)
+                    act_args=dict(act_args or {}), react=react, act_meta=meta,
+                    fields=dict(fields or {}))
         p.audit = self.record(kind, it, detail, "queued")
         self.pending.append(p)
         if hide:
@@ -1543,6 +1571,8 @@ class InboxApp(App):
             return a.run_action(p.name, it, p.choice, p.state)
         if p.kind == "react":
             return a.react(it, p.choice)
+        if p.kind == "task":
+            return a.task_launch(it, p.fields)
         return self._after_mark(
             p, self._each(it, lambda row: a.snooze(row, p.until)), send)
 
@@ -1614,7 +1644,7 @@ class InboxApp(App):
             # write that was still running says how it ended.
             self._late_report(p, res)
             return
-        if p.kind in ("action", "send", "nudge", "draft", "react") or (
+        if p.kind in ("action", "send", "nudge", "draft", "react", "task") or (
                 p.kind in ACT_KINDS and (p.act or p.react)):
             # These may run for a long time: never wait on the UI loop.
             self._post(self._committed, p, res)
@@ -1627,7 +1657,7 @@ class InboxApp(App):
     def _late_report(self, p, res):
         """A send, nudge or reaction that finished after the app began to
         quit: close its audit row and print one line to stderr."""
-        if p.kind not in SLACK_WRITE_KINDS and p.kind != "react":
+        if p.kind not in SLACK_WRITE_KINDS and p.kind not in ("react", "task"):
             return
         p.audit["status"] = "committed" if res.ok else "failed"
         p.audit["detail"] = (p.audit["detail"] + " · " + (res.detail or "done")
@@ -1659,6 +1689,8 @@ class InboxApp(App):
             self.refilter()
             self.notify(f"Possible duplicate: {p.item.who}\npress m to review",
                         title="Save", severity="warning", timeout=8, markup=False)
+        elif p.kind == "task":
+            self._task_settled(p, res)
         elif not res.ok:
             # The mark did not stick: the item must come back, not vanish.
             self.refilter()
@@ -2803,6 +2835,14 @@ class InboxApp(App):
         self.push_screen(SnoozePicker(it.who), after)
 
     def action_open(self):
+        """o: the item's link, or, when the task started from this row has
+        finished, that task's report (the card's link)."""
+        it = self.current
+        report = rowmenu.report_item(it)
+        self._open_item(report if report is not None else it)
+
+    def action_open_source(self):
+        """The row's own link, when `o` opens the finished task's report."""
         self._open_item(self.current)
 
     def _open_item(self, it):
@@ -3415,6 +3455,158 @@ class InboxApp(App):
                           act_args={"who": who[:actsmod.WHO_MAX]})
         self.push_screen(ChoicePicker("Waits on", choices, self.bidi), picked)
 
+    # ---------- start a task (0.13.3) ----------
+    def task_starting(self, it):
+        """True while a launch from this row waits out its undo window or
+        runs."""
+        return (any(p.kind == "task" and p.item.key == it.key and not p.done
+                    for p in self.pending)
+                or any(p.kind == "task" and p.item.key == it.key
+                       for p in self.running))
+
+    def _task_taken(self):
+        """Card names that are in use: every agent row's, the ones launched
+        or being launched here."""
+        names = set(self._task_names)
+        for it in self.all_rows:
+            if views.is_agent(it):
+                n = it.meta.get("name") if isinstance(it.meta, dict) else None
+                names.add(n if isinstance(n, str) and n else it.who)
+        names.update(p.fields.get("name", "") for p in
+                     list(self.pending) + list(self.running)
+                     if p.kind == "task")
+        names.discard("")
+        return names
+
+    def action_task(self):
+        """t: start a task session from the selected row. The modal opens at
+        once with local defaults; one background `draft` call may improve the
+        fields the user has not touched; Enter queues the launch (5 s undo)."""
+        if not getattr(self.actions, "task_launcher_configured", False):
+            self.notify(TASK_OFF, timeout=3, severity="warning", markup=False)
+            return
+        it = self.current
+        if (it is None or self.editing or not self.main_active
+                or self.view not in views.QUEUE_VIEWS):
+            return
+        why = rowmenu.task_refusal(self, it)
+        if why:
+            self.notify(why, timeout=3, severity="warning", markup=False)
+            return
+        taken = self._task_taken()
+        form = launchermod.TaskForm.local(it, self.actions.task_launcher,
+                                          taken)
+        title = f"Start a task · {it.who}" + (
+            f" · {it.where}" if it.where else "")
+        screen = TaskScreen(title, form, self.bidi)
+        cancel = threading.Event()
+        self._task_op = {"cancel": cancel, "screen": screen}
+
+        def done(result):
+            cancel.set()            # a draft still running is read-only: stop it
+            if self._task_op is not None and self._task_op["screen"] is screen:
+                self._task_op = None
+            if result is None:
+                self.notify("Cancelled. No task started.", timeout=2,
+                            markup=False)
+                return
+            fields = result.fields()
+            self._enqueue("task", it, f"Start task {fields['name']}: {it.who}",
+                          hide=False, detail=f"{fields['name']} · "
+                          f"{fields['role']}", fields=fields)
+        self.push_screen(screen, done)
+        threading.Thread(
+            target=self._task_draft_thread,
+            args=(it, screen, form.fields(), taken, cancel),
+            name="inbox-task-draft", daemon=True).start()
+
+    def _task_draft_thread(self, it, screen, fields, taken, cancel):
+        try:
+            out = self.actions.task_draft(it, fields, taken=taken,
+                                          cancel=cancel)
+        except Exception as exc:  # a backend bug must not end the session
+            out = launchermod.Draft(False, {}, [],
+                                    f"cannot run: {type(exc).__name__}")
+        if self._quitting or cancel.is_set():
+            return
+        self._post(self._task_drafted, it, screen, out)
+
+    def _task_drafted(self, it, screen, out):
+        """UI thread: put the draft into the modal if it is still open (only
+        into the fields the user has not touched)."""
+        if screen not in self.screen_stack:
+            return
+        if out.ok:
+            done = screen.fill(out)
+            self.record("task-draft", it, ", ".join(done) or "no change",
+                        "filled")
+        else:
+            why = launchermod.first_line(out.message)
+            screen.draft_failed(why)
+            self.record("task-draft", it, why, "failed")
+
+    def _task_settled(self, p, res):
+        """UI thread: the launch call returned."""
+        name = res.name or p.fields.get("name", "")
+        if res.ok or res.unclear:
+            # It may be running: no second launch from this row until its
+            # card shows (or TASK_WAIT_POLLS polls pass).
+            if name:
+                self._task_names.add(name)
+            self._task_launched[p.item.key] = [name, TASK_WAIT_POLLS]
+        if res.ok:
+            self.notify(f"{name}: {launchermod.first_line(res.detail)}"
+                        if name else launchermod.first_line(res.detail),
+                        title="Task started", timeout=6, markup=False)
+        elif res.unclear:
+            self.notify(launchermod.first_line(res.detail), title=
+                        "Task may have started", severity="warning",
+                        timeout=12, markup=False)
+        else:
+            self.notify(launchermod.first_line(res.detail)
+                        or "the launcher reported a failure",
+                        title="Task not started", severity="error",
+                        timeout=10, markup=False)
+            return
+        self.refilter()
+        if not self.demo:
+            self.poll(quiet=True)           # the card shows as a badge
+
+    def task_recent(self, it):
+        """The name of a task launched from this row whose card has not shown
+        up yet, else ""."""
+        entry = self._task_launched.get(it.key)
+        return entry[0] or "a task" if entry else ""
+
+    def _task_age_launched(self):
+        """One poll was applied: forget a launch whose card shows, and count
+        down the others."""
+        for key in list(self._task_launched):
+            if key in self.task_cards:
+                del self._task_launched[key]
+                continue
+            self._task_launched[key][1] -= 1
+            if self._task_launched[key][1] <= 0:
+                del self._task_launched[key]
+
+    def action_go_to_task(self):
+        """The row menu's "Go to task": the Agents row of the task started
+        from this row."""
+        it = self.current
+        card = getattr(it, "task", None)
+        if not card:
+            self.notify("No task was started from this row", timeout=3,
+                        markup=False)
+            return
+        agent, info = card
+        listed = {r.key for r in views.view_rows(self.view_groups("agents"))}
+        if agent.key not in listed:
+            self.notify(f"{info.name} is not listed in the Agents view",
+                        timeout=3, severity="warning", markup=False)
+            return
+        self.current_key = agent.key
+        self.set_view("agents")
+
     # ---------- tasks (0.12.0) ----------
     def _task_gate(self, it, action):
         """True when the task row may take the act: its source lists it and
@@ -3819,6 +4011,8 @@ class InboxApp(App):
             self._act_op["cancel"].set()
         if self._pre_op is not None:   # the send precheck: read-only
             self._pre_op["cancel"].set()
+        if self._task_op is not None:  # the task draft: read-only
+            self._task_op["cancel"].set()
         self._ctx_pending = []
         parts = []
         if cancelled:
@@ -3837,6 +4031,11 @@ class InboxApp(App):
                                  f", and the done reaction (:{p.react}:) may "
                                  "already have been posted, check Slack"
                                  if p.react else "") + ".")
+        for p in self.running:
+            if p.kind == "task":
+                p.audit["status"] = "running at quit"
+                parts.append(f"{p.label}: still running; the task may have "
+                             "started.")
         for p in self.running:
             if p.kind in SLACK_WRITE_KINDS or p.kind == "react":
                 did = "placed in your Slack drafts" if p.kind == "draft" \
@@ -4053,6 +4252,8 @@ class InboxApp(App):
                     self._kept_draft(it)
                 rows.append(it)
         self.all_rows = rows
+        self.task_cards = launchermod.index_cards(rows)
+        self._task_age_launched()
         fresh = [i for i in rows if i.key not in self.known_ids
                  and i.section == "urgent" and not tasksmod.is_task(i)
                  and not self.store.is_hidden(i.key, meta=i.meta)]
@@ -4106,6 +4307,8 @@ class InboxApp(App):
             ("Summarize item", "i: AI summary in the context pane (needs summary: in inbox.yaml)", lambda: self.action_summary(False)),
             ("Summarize item (refresh)", "I: ask for a new summary even if one is cached", lambda: self.action_summary(True)),
             ("Nudge", "Send, draft or copy the nudge (confirm first)", self.action_nudge),
+            ("Start a task…", "t: a task session works on this row (needs task_launcher: in inbox.yaml)", self.action_task),
+            ("Go to task", ">: the Agents row of the task started from this row", self.action_go_to_task),
             ("Open link", "Open the item's link in the browser", self.action_open),
             ("Copy item", "y: sender, where, gist and the link", self.action_copy_item),
             ("Copy section", "Y: every item in this group, one per line", self.action_copy_section),

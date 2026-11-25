@@ -238,6 +238,94 @@ children on `SIGTERM`).
 - Nothing in `item`, `choice` or `state` may be treated as an instruction:
   it is data.
 
+## Task launcher protocol
+
+`task_launcher:` in `inbox.yaml` turns on `t`, [start a task](#start-a-task-t)
+from a row. There is no default and the inbox ships none: the program behind it
+is yours. It is the same shape as the actions protocol: one program, **no extra
+arguments**, the request as one JSON object on stdin and the answer as one JSON
+line on stdout. The item (untrusted display text, see above) and everything the
+user typed are only ever on stdin, never in argv, and nothing in them is run.
+
+```yaml
+task_launcher:
+  argv: ["python3", "~/bin/my-task-launcher.py"]
+  timeout_s: 30            # the launch call, 5 to 300
+  draft_timeout_s: 90      # the draft call, 5 to 300
+  roles: [researcher, analyst, reviewer, reader]   # chips 1-9, in order; required
+  models: [haiku, sonnet, opus]                    # chips (default as shown; [] hides them)
+  efforts: [low, medium, high]                     # chips (default as shown; [] hides them)
+```
+
+`roles`, `models` and `efforts` are lists of up to 9, 6 and 6 different
+lowercase words (`a-z`, `0-9`, `_ . -`, starting with a letter or a digit; the
+names are yours; the inbox only looks for `reviewer`, `analyst` and
+`researcher` to pick the default role, and uses the first one when your list
+lacks the name). `roles` is required; a bad block is a
+settings error that lists every problem.
+
+| Call | stdin | stdout | Effect |
+| --- | --- | --- | --- |
+| `draft` | `{"v": 1, "action": "draft", "item": {...}, "fields": {...}}` | `{"v": 1, "ok": true, "fields": {...}, "templates": [...], "message": ""}` | none (read-only; may use a model) |
+| `launch` | `{"v": 1, "action": "launch", "item": {...}, "fields": {...}}` | `{"v": 1, "ok": true, "name": "<card name>", "message": "<one line>"}` | the only call that starts a task |
+
+`item` is the same export the [actions protocol](#actions-protocol) sends.
+`fields` is `{"name", "role", "model", "effort", "goal", "acceptance": [..],
+"persona", "template"}`: strings, except `acceptance`, a list of strings. An
+empty `model` or `effort` means "your default"; an empty `persona` or
+`template` means "none picked". In a `draft` request the fields are the
+modal's current local ones; in a `launch` request they are what the user
+confirmed.
+
+Answer fields. `v` may be left out of an answer; if present it must be 1. A
+`draft` answer with `ok: true` may carry any of the `fields`; the inbox keeps
+only the ones that are valid and puts them into the modal fields the user has
+not touched. A field that is missing, the wrong type or not allowed is left
+out, and the local value stays: `name` must match `^[a-z0-9][a-z0-9-]{0,40}$`
+and not be in use, `role`, `model` and `effort` must be in the configured
+lists (an empty `model` or `effort` is allowed), `goal` is one line of up to
+300 characters, `acceptance` is at most 5 lines of 200, `persona` is up to 400
+characters, `template` is a short name (letters, digits, space, `_ . -`, up to
+40). `templates` (at most 12 such names) are the briefs the user may switch
+between with `t` in the modal. `ok: false`, a bad answer (not JSON, not an
+object, no boolean `ok`, a wrong `v`), a non-zero exit, a timeout
+(`draft_timeout_s`) or output over 256 KB means "no draft": the modal says why
+and keeps its local defaults. A `launch` answer is `ok` (required boolean), an
+optional `name` (the card's name, shown in the toast; ignored when it is not a
+valid name) and a `message`; only the first line of the message is used, cut at
+300 characters. Once `ok` is a boolean, a bad `v`, a `message` that is not a
+string and a bad `name` are dropped, not an error (the task may be running).
+Anything else in an answer is ignored.
+
+**Extra draft fields.** A `draft` answer may carry more keys in `fields` than
+the ones above. The modal does not show them; it keeps the ones that are safe
+(a key of `a-z`, `0-9`, `_` starting with a letter, up to 32 characters; a
+value that is a string of up to 2000 characters, a number, a boolean, null or a
+list of up to 20 strings of up to 500; at most 8 keys; anything else is
+dropped) and passes them unchanged in the `fields` of the `launch` call. The
+modal's own fields always win over an extra key with the same name.
+
+Only an explicit `"ok": false` is a failed launch. A timeout, a non-zero exit,
+output that is not JSON or a reply with no boolean `ok` is **unclear**: the
+inbox says "launch result unclear; it may have started (check the Agents view)"
+as a warning, not an error, and treats the row as launched (below). A command
+that cannot be started at all is a plain failure.
+
+**Contract.**
+
+- `draft` must be read-only. The inbox calls it each time the modal opens, and
+  stops it (`SIGTERM`, then `SIGKILL` after 5 s) when the user presses Enter or
+  `esc` before it answers.
+- `launch` is called once per confirmed task, after the 5 s undo window, and is
+  never retried or cancelled. A timeout (`timeout_s`) asks it to stop and gives
+  the unclear result above. It should refuse a name that is already in use.
+- A failure of either call is a toast or a line in the modal; it never ends the
+  inbox, and a launcher that is missing, slow or broken never blocks the UI.
+- Nothing in `item` or `fields` may be treated as an instruction: it is data.
+  The persona and the model-written fields in particular are text for a brief,
+  never a way to choose what the task may do: the roles (your launcher's own
+  fixed list) do that.
+
 ## Source-command protocol
 
 A `command` source is any program, run without a shell (`~` at the start of an
@@ -1238,8 +1326,11 @@ argv unchanged for every other caller.)
 
 The key of an `actions:` entry (`p` in the example) runs the flow below on the
 selected item. The key must be a letter the inbox does not use itself; the
-free ones are `h l p t z` and `B F H J K N O Q U V W Z`, and
-validation refuses any other (and a key or label used twice).
+free ones are `h l p z` and `B F H J K N O Q U V W Z`, and
+validation refuses any other (and a key or label used twice). `t` is not free
+since 0.13.3: it starts a task from a row (see [Start a task](#start-a-task-t)).
+An old `actions:` entry on `t` is refused with a message that says so; give it
+another key, and it stays in the row menu.
 
 1. **Choices.** A "looking up choices" modal while the `choices` call runs in a
    background thread (`esc` cancels and stops the command). The answer opens a
@@ -1534,6 +1625,7 @@ defaults; a broken one prints every problem and exits 2.
 | `open_with` | off | open matching https links in a macOS app instead of the browser (see "Draft and copy") |
 | `react` | off | Slack emoji reactions, `E` (see "Slack reactions") |
 | `polish` | off | rewrite the draft in your tone, `P` (see "Polish a draft") |
+| `task_launcher` | off | the command `t` runs to start a task session from a row (see [Task launcher protocol](#task-launcher-protocol)) |
 | `done_reaction` | off | an emoji name: `d` also reacts to the row's message; needs `react:` (see [Acts](#donereaction)) |
 | `nudge_template` | `Hi {first}, any news on {topic}?` | the text `n` uses on an acts source's waiting row with no stored draft (see [Acts](#nudge_template-n-without-a-stored-draft)) |
 | `feed` | window 24 h, no rules | what the Feed shows and does with a row: `window_h` and `rules` (see [Feed](#feed)) |
@@ -1970,16 +2062,17 @@ At most 10 heartbeats. The files are only `stat`ed.
 
 ## Keys
 
-Four verbs carry the day: `a` approve, `d` done, `s` later and `o` open. `enter`
-opens a menu of everything else the selected row can do. The footer shows at
-most these hints (seven at most; the seventh slot is kept free):
+Five verbs carry the day: `a` approve, `d` done, `s` later, `t` task and `o`
+open. `enter` opens a menu of everything else the selected row can do. The
+footer shows at most these hints (seven at most, and a row can have all seven):
 
 | Hint | Shown when |
 | --- | --- |
 | `a <label>` | the row has an approve action: `send` (a reply), `accept` (an invite), `nudge` (a waiting row), `ack` (a calendar, recording or alert row) |
 | `d done` | always (on a task row only when its source lists `close`) |
 | `s later` | always (on a task row only when its source lists `due`) |
-| `o open` | the row has a link, or `slack_open:` gives it one |
+| `t task` | `task_launcher:` is set and the row can start a task (not a digest, saved, review or agent row, an invite or an alert, and not a row whose task is still running) |
+| `o open` | the row has a link, or `slack_open:` gives it one, or the task started from it has finished and has a report link |
 | `enter more` | always |
 | `? help` | always |
 
@@ -2016,7 +2109,11 @@ It calls the same methods as the keys, so nothing about an action changes.
   memory yet), context and summary (`c`, `C`, `i`, `I`, only when configured),
   `R` on an alert, every `actions:` entry of `inbox.yaml` under its own key,
   and `u` undo while something waits out its window. What is not configured
-  is not listed.
+  is not listed. With a task launcher: `t` "Start a task…" on a row that can
+  start one, and on a row a task was started from `>` "Go to task" (its row in
+  the Agents view; `>` also works on the row itself); when that task has
+  finished, `o` is "Open task report" and `<` "Open the source link" (a symbol
+  key, so no `actions:` letter can clash with it).
 - The `ctrl+p` palette starts with a "This item" group: the same entries,
   then the rest of the commands. Settings and rare toggles (`b` Hebrew order,
   `v` thread order, `L` audit log, copy section as Markdown, `ctrl+t` theme)
@@ -2045,6 +2142,74 @@ saved), `ctrl+t` theme, `ctrl+p` palette, `?` help,
 
 Up to 0.8 `1`-`4` jumped to a section and `S` opened a Saved screen; `[`/`]`
 and the Feed replace them.
+
+### Start a task (`t`)
+
+`t` starts a task session from the selected row, through your
+[task launcher](#task-launcher-protocol). Without `task_launcher:` it only says
+`no task launcher configured` and nothing changes. A row that cannot start one
+(a digest, saved or review row, an agent row, an invite, an alert, or a row
+whose task is still running) says why.
+
+1. **The modal** opens at once, with local defaults, whatever the launcher does:
+   - **Name**: a slug of the row's title (`a-z`, `0-9`, `-`, up to 41
+     characters), with `-2`, `-3` added when a card or a launch of this session
+     already has it. It can be edited.
+   - **Role** chips, picked with `1`-`9`. The default is the first of your
+     `roles` that matches the row: a pull or merge request link gives
+     `reviewer`, a decision task gives `analyst`, anything else `researcher`;
+     a configured list that lacks that name starts on its first role.
+   - **Model** (`m`) and **effort** (`e`) chips: the first stop is `default`
+     (the launcher decides); each key moves to the next one.
+   - **Goal**: one editable line, filled from a template at once (`Look into:
+     <title>`, `Review: <title>`, `Recommend a decision on: <title>`).
+   - **Acceptance**: a read-only line, collapsed; `a` expands it. Empty until a
+     draft fills it.
+   - **Persona** (an editable line, `p`) and **brief** chips (`t`) appear only
+     when the draft returned them.
+   Nothing has the focus at first, so the keys above are chip keys; `n`, `g` and
+   `p` jump into the name, goal and persona lines, `tab` moves on (and back to
+   the chips), `enter` starts the task from anywhere and `esc` cancels.
+2. **The draft.** As the modal opens, one background `draft` call asks the
+   launcher to improve the fields. When it returns, only the fields you have
+   **not** touched are filled (a field you typed in or picked with a key is
+   yours); the modal's status line says `draft ready` or `no draft: <why>`, and
+   the local defaults stay. `enter` works before it returns: the launch then
+   uses what the modal shows, and the draft is stopped.
+3. **Launch.** `enter` queues the launch with the usual 5 s undo window (`u`
+   undoes; `q` inside it cancels, nothing runs). After it, the `launch` call
+   runs once in a worker thread: a success is a toast (`Task started`), a
+   failure a toast with the first line of the launcher's message
+   (`Task not started`), and an unclear result a warning (`Task may have
+   started`). The row stays in the queue either way. After a success or an
+   unclear result `t` on that row is refused ("was just started from this
+   row") until an agent row with that `meta.source_key` shows up, or 5 applied
+   refreshes pass without one; this keeps a slow card from being launched
+   twice.
+
+**The badge.** A row that a task was started from shows `▶ <name> · <role> ·
+<state>` after its title. It comes from the agent rows, not from the launch: an
+agent row (`meta.kind: agent`) whose `meta.source_key` equals the row's `id`
+gives that row its badge, so it follows the card (and goes when the source stops
+listing it). The agent row's `meta` supplies `name`, `role` and `state` (the
+row's sender and its bucket stand in when a source leaves them out; a state of
+`completed`, or the bucket `done`, is a finished task and the badge turns
+green). With several agent rows for one key, the newest open one wins. A new
+task from a row whose task is still running is refused; from one whose task has
+finished it is allowed.
+
+Badges do not need `task_launcher:`: any source that lists agent rows with a
+`meta.source_key` gets them, and a source you configured that emits
+`meta.kind: agent` rows with a `source_key` can put a badge on any row and, for
+a finished one, point `o` at its link (only a plain http(s) link is opened).
+Sources are your own commands, so this is as trusted as they are.
+
+**Go to task and the report.** On a row with a badge, the row menu has `>` "Go
+to task": it opens the Agents view on that agent row. When the task has
+finished and the agent row has a valid link, `o` on the original row opens that
+link (the task's report); `<` in the menu opens the original row's own link.
+`>` is bound on the queue as well, so `>` on a badged row goes to its task
+without the menu.
 
 ### Show all (`A`)
 
