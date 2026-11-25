@@ -590,6 +590,96 @@ def capture_guard(store, source_id, etype, rid=None):
     return False, []
 
 
+EXTRA_SOURCE_ID_RE = re.compile(r"[a-z][a-z0-9_-]*:[^\s,|]+")
+EXTRA_SOURCE_ID_MAX = 200
+
+
+def _well_formed_extra_id(value):
+    """`scheme:rest` as the CLI normalizes it (lowercase scheme), with no
+    whitespace, comma (the CLI's list separator) or pipe (rejected)."""
+    return (isinstance(value, str) and len(value) <= EXTRA_SOURCE_ID_MAX
+            and EXTRA_SOURCE_ID_RE.fullmatch(value) is not None)
+
+
+def _simulated_target(matches, open_ids, etype):
+    """Which entry the CLI's `add --type <etype> --source-ids ...` acts on.
+
+    `matches` is [(date, id, type, ids)] for entries carrying any requested
+    id; `open_ids` the open todos / pending decisions among them. Returns
+    ("new",) when no entry is touched (no match, or a split), ("error", id)
+    when the CLI refuses because an open item is the target, else
+    ("write", id): a same-type refresh, or a note retyped in place.
+    """
+    ordered = sorted(matches, key=lambda m: (m[0], m[1]))
+    if not ordered:
+        return ("new",)
+    for _, entry_id, kind, _ in ordered:
+        if kind == etype:
+            return ("write", entry_id)
+    for _, entry_id, _, _ in ordered:
+        if entry_id in open_ids:
+            return ("error", entry_id)
+    if all(kind == "note" for _, _, kind, _ in ordered):
+        return ("write", ordered[0][1])
+    return ("new",)
+
+
+def linkable_extra_source_ids(store, source_id, extra_ids, etype, rid=None):
+    """The subset of `extra_ids` that can ride along on `--source-ids` without
+    changing which entry the CLI writes.
+
+    The CLI resolves its target by ANY of the ids it is given, so an extra id
+    that some other entry already carries could make it overwrite that entry,
+    retype a note, or refuse on an open item. Each extra id is kept only when
+    the simulated target (see `_simulated_target`) equals the one for
+    `[source_id]` alone, re-simulated with the ids accepted so far. "Open"
+    is decided as in `capture_guard`: no entry follows the todo / pending
+    decision. Malformed ids are dropped. An unreadable store fails closed:
+    no extras.
+    """
+    wanted = []
+    for value in extra_ids or ():
+        if (_well_formed_extra_id(value) and value != source_id
+                and value not in wanted):
+            wanted.append(value)
+    if not wanted or not source_id:
+        return []
+    needles = [source_id, *wanted]
+    try:
+        carriers = []
+        for frontmatter, _ in _store_entries(store, needles=needles):
+            entry_id = frontmatter.get("id")
+            ids = frontmatter.get("source_ids") or []
+            if (not isinstance(entry_id, str) or not isinstance(ids, list)
+                    or not all(isinstance(value, str) for value in ids)
+                    or not set(ids).intersection(needles)):
+                continue
+            kind = frontmatter.get("type")
+            carriers.append(
+                (str(frontmatter.get("date") or ""), entry_id,
+                 kind if isinstance(kind, str) else "", set(ids)))
+        candidates = [entry_id for _, entry_id, kind, _ in carriers
+                      if kind in OPEN_ITEM_TYPES]
+        open_ids = (set(candidates) - _followed_ids(store, candidates)
+                    if candidates else set())
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError):
+        log(f"routine={rid} memory WARN: could not read the store to check "
+            f"extra source ids {wanted} for source_id={source_id}; "
+            "capturing without them")
+        return []
+
+    def target(ids):
+        return _simulated_target(
+            [c for c in carriers if c[3].intersection(ids)], open_ids, etype)
+
+    base = target([source_id])
+    accepted = []
+    for extra in wanted:
+        if target([source_id, *accepted, extra]) == base:
+            accepted.append(extra)
+    return accepted
+
+
 def auto_source_id_for(source_id):
     """Stable source id for a daemon capture of a thread that a hand-logged
     entry already carries, so the capture never rewrites that entry. Same
@@ -1608,8 +1698,11 @@ def capture(routine, item, summary, dry_run=False):
                 f"source_id={source_id}"
             )
         else:
+            extras = item.get("extra_source_ids")
             log(f"routine={rid} [dry-run] would extract + memory-add "
-                f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}")
+                f"(fallback type={cfg.get('type', 'note')}) source_id={source_id}"
+                + (f" extra_source_ids={extras} (linked only if the store "
+                   "allows it)" if extras and isinstance(extras, list) else ""))
         return {"memory": "dry_run"}
 
     if summary.strip() == "NOT MEMORY-WORTHY" and active_chat_followup:
@@ -2014,8 +2107,20 @@ def capture(routine, item, summary, dry_run=False):
     due = _entry_due(routine, item, entry, etype)
     if due:
         args += ["--due", due]
+    linked_extras = []
     if source_id:
-        args += ["--source-ids", source_id]
+        offered = item.get("extra_source_ids")
+        offered = (
+            [value for value in offered if isinstance(value, str)]
+            if isinstance(offered, list) else []
+        )
+        if offered and not active_chat_followup:
+            linked_extras = linkable_extra_source_ids(
+                store, source_id, offered, etype, rid)
+            log(f"routine={rid} memory: extra source ids linked "
+                f"{linked_extras}, dropped "
+                f"{[v for v in offered if v not in linked_extras]}")
+        args += ["--source-ids", ",".join([source_id, *linked_extras])]
     else:
         # No canonical id -> the store's near-dup guard may interject; force-new
         # would risk duplicates, so let the guard win and report it.
@@ -2057,7 +2162,8 @@ def capture(routine, item, summary, dry_run=False):
 
     if dry_run:
         log(f"routine={rid} [dry-run] would memory-add type={etype} title={title!r} "
-            f"people={people} source_id={source_id}")
+            f"people={people} source_id={source_id}"
+            + (f" extra_source_ids={linked_extras}" if linked_extras else ""))
         return {"memory": "dry_run"}
 
     r = _cli(store, args, stdin_text=body, timeout=300)
@@ -2068,6 +2174,7 @@ def capture(routine, item, summary, dry_run=False):
     if retry:
         thread_source_id = original_source_id or source_id
         args, source_id, todo_id = retry
+        linked_extras = []  # the retry replaces the whole --source-ids value
         log(
             f"routine={rid} memory: {todo_id} is an open todo anchored on "
             f"this thread; logging the reply as a new entry {source_id}"
@@ -2166,6 +2273,8 @@ def capture(routine, item, summary, dry_run=False):
     }
     if duplicate_of:
         outcome["memory_duplicate_of"] = duplicate_of
+    if linked_extras and verdict != "duplicate_skipped":
+        outcome["memory_extra_source_ids"] = linked_extras
     if unfiled_actions:
         outcome["memory_owner_todos_unfiled"] = len(unfiled_actions)
     if thread_source_id:
