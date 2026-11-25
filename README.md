@@ -2054,7 +2054,7 @@ captures later. The routine also needs `memory.store`.
 headless Claude bridge (`claude -p --setting-sources ""`), and a headless run
 does **not** load user-scope MCP servers from your Claude config; only claude.ai
 connectors are loaded. So when the MI server is not a claude.ai connector (for
-example a local stdio server you added with `claude mcp add`), one of
+example a local stdio server added with `claude mcp add -s user`), one of
 `mcp_server_from` or `mcp_config` is required. Two ways, mutually exclusive
 (validation rejects both together):
 
@@ -2068,7 +2068,9 @@ example a local stdio server you added with `claude mcp add`), one of
   by itself. It gets the same checks as `mcp_config` (absolute path, a regular
   file you own, no group or other access, opened without following symlinks)
   with a 5 MB size cap, and must be JSON with a top-level `mcpServers` map
-  that holds the server as an object. `daemon.py validate` checks the file and
+  that holds the server as an object (`claude mcp add -s user` puts it there;
+  the default local scope is stored under `projects[...]` and is not read).
+  `daemon.py validate` checks the file and
   the server; errors name the file and the server, never the definition (it
   can hold secrets in `env`).
 - `mcp_config`: an absolute path (a leading `~` is fine) to a JSON file in
@@ -2093,6 +2095,20 @@ tools when the CLI starts, so `connect_delay_seconds` holds the prompt back that
 long (default 6, the bridge's wait for connectors; raise it for a slower
 server). A run that still finds no tools is retried once (`attempts: 2`) and
 then fails with "required tool results missing".
+
+Leftovers of a killed run: each run's private directory
+(`state/claude-runs/run-*`, which holds the server's definition in
+`mcp-config.json`) is removed when the run ends. If the daemon is killed
+mid-run (SIGKILL, a crash, power loss) the next bridge attempt removes run
+directories older than an hour, never younger ones and never through a
+symlink. On SIGTERM or Ctrl-C the `claude` child and the MCP server it started
+are killed with it. Claude Code also writes per-run MCP logs to its own cache
+(`~/Library/Caches/claude-cli-nodejs/<run-dir-name>/mcp-logs-<server>/` on
+macOS, `~/.cache/claude-cli-nodejs/` elsewhere) and never removes them; each
+bridge attempt prunes those directories that belong to this daemon's run
+directories (name contains `state-claude-runs-run-`) and are over a day old, at
+most 500 per attempt, only under that cache root and never through a symlink.
+Those logs can contain the server's output, so treat that cache as private.
 
 Privacy: MI content reaches Anthropic models only, which validation enforces
 (`analyze.provider: claude`, `model` and `diff_model` an Anthropic alias or

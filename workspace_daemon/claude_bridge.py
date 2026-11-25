@@ -111,6 +111,80 @@ def _runs_dir(base_dir):
     return Path(base_dir) / "state" / "claude-runs"
 
 
+# A run dir older than this is the leftover of a killed or crashed run (a run
+# lives at most its `timeout`, 600 s at the very most) and is removed at the
+# start of the next attempt. Younger dirs belong to runs that may be live.
+STALE_RUN_SECONDS = 3600
+# Claude Code keeps per-run MCP logs in a cache dir named after the run's cwd
+# (every non-alphanumeric character becomes "-"), so ours all contain this.
+CLI_CACHE_SLUG = "state-claude-runs-run-"
+CLI_CACHE_MAX_AGE_SECONDS = 24 * 3600
+CLI_CACHE_MAX_DELETIONS = 500
+MAX_STALE_RUN_DELETIONS = 200
+
+
+def _cli_cache_dir():
+    """Where Claude Code writes its per-run logs, or None when unknown. A
+    stubbed claude binary (tests) never writes there, so nothing is pruned
+    unless WORKSPACE_DAEMON_CLAUDE_CACHE_DIR names a directory."""
+    explicit = os.environ.get("WORKSPACE_DAEMON_CLAUDE_CACHE_DIR")
+    if explicit:
+        return Path(explicit)
+    if os.environ.get("WORKSPACE_DAEMON_CLAUDE_BIN"):
+        return None
+    home = Path(os.path.expanduser("~"))
+    if sys.platform == "darwin":
+        return home / "Library" / "Caches" / "claude-cli-nodejs"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    root = Path(xdg) if xdg and os.path.isabs(xdg) else home / ".cache"
+    return root / "claude-cli-nodejs"
+
+
+def _remove_old_dirs(root, older_than, match, limit):
+    """Remove up to `limit` directories directly under `root` whose name
+    satisfies `match` and whose mtime is before `older_than`. A symlink (the
+    root itself or an entry) is never followed or removed, and nothing outside
+    `root` is touched. Returns the number removed; never raises."""
+    removed = 0
+    try:
+        if os.path.islink(root) or not os.path.isdir(root):
+            return 0
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if removed >= limit:
+                    break
+                try:
+                    if (not match(entry.name)
+                            or entry.is_symlink()
+                            or not entry.is_dir(follow_symlinks=False)
+                            or entry.stat(follow_symlinks=False).st_mtime
+                            >= older_than):
+                        continue
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                    removed += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return removed
+
+
+def _sweep_leftovers(base_dir):
+    """Remove what killed runs left behind: stale `run-*` dirs under
+    state/claude-runs (each can hold an `mcp-config.json` with a server's env
+    secrets) and Claude Code's old per-run MCP logs for our run dirs. Called
+    before a run dir is created, so a live run is never touched; never raises."""
+    now = time.time()
+    _remove_old_dirs(
+        _runs_dir(base_dir), now - STALE_RUN_SECONDS,
+        lambda name: name.startswith("run-"), MAX_STALE_RUN_DELETIONS)
+    cache = _cli_cache_dir()
+    if cache is not None:
+        _remove_old_dirs(
+            cache, now - CLI_CACHE_MAX_AGE_SECONDS,
+            lambda name: CLI_CACHE_SLUG in name, CLI_CACHE_MAX_DELETIONS)
+
+
 def _usage_log(base_dir):
     return Path(base_dir) / "state" / "claude-usage.jsonl"
 
@@ -533,7 +607,9 @@ def read_mcp_server(path, server):
             f"the mcp_server_from file has no mcpServers map ({where})")
     if server not in servers:
         raise BridgeError(
-            f"the mcp_server_from file has no such server ({where})")
+            f"the mcp_server_from file has no such server ({where}); only "
+            "servers in the top-level mcpServers map count, which is where "
+            "`claude mcp add -s user` puts them")
     definition = servers[server]
     if not isinstance(definition, dict) or not definition:
         raise BridgeError(
@@ -583,12 +659,12 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
     seconds so connector tools are discoverable when the model starts. The
     delay and the write share the one `timeout` budget.
     """
+    message = json.dumps(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, cwd=cwd, start_new_session=True,
-    )
-    message = json.dumps(
-        {"type": "user", "message": {"role": "user", "content": prompt}}
     )
     deadline = time.monotonic() + timeout
     try:
@@ -615,6 +691,22 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
             proc.kill()
         proc.communicate()
         raise BridgeError(f"claude run timed out after {timeout}s") from None
+    except BaseException:
+        # SIGTERM turned into an exception, Ctrl-C, or any other unwinding:
+        # the child (its own session) and the MCP server it started, whose
+        # environment may hold secrets, must not outlive us.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            with contextlib.suppress(OSError):
+                proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(Exception):
+                    pipe.close()
+        raise
     return proc.returncode, stdout
 
 
@@ -764,6 +856,7 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     # 0600 copy inside the run dir, which is removed with it.
     mcp_bytes = (read_mcp_config(mcp_config) if mcp_config is not None
                  else mcp_config_bytes)
+    _sweep_leftovers(base_dir)
     started = time.monotonic()
     span = sleepclock.Span()
     result_event = None

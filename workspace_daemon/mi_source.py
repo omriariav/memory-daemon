@@ -352,8 +352,9 @@ def _bridge(cfg, calls, max_turns, budget):
     strict: only the servers of that file load (a headless run never loads
     user-scope servers), and `connect_delay_seconds` holds the prompt back
     until they have listed their tools. `mcp_server_from` does the same from
-    one server's definition in your Claude config, re-read each call. A failure across a machine sleep is
-    an outage, not a failure of the session."""
+    one server's definition in your Claude config, re-read each call. A
+    failure across a machine sleep is an outage, not a failure of the
+    session."""
     tools = {tool: args for tool, args in calls}
     span = sleepclock.Span()
     try:
