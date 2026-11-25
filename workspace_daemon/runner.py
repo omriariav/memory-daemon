@@ -13,7 +13,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from email.utils import getaddresses
 
-from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whatsapp_source, whisper_source
+from . import actions, chat_text, claude_bridge, config, contacts, drive, gchat_source, gmail, identity, labels, llm, local_triage, maintenance, memory_sink, mi_source, mila_source, notes, person_briefs, slack_source, state, time_utils, triviality, whatsapp_source, whisper_source
 from .count_only import report as count_report
 from . import gmail_mcp, person_resolver, slack_mcp, sleepclock, zoom_source
 from .shell import log, utc_now_iso
@@ -315,6 +315,7 @@ def _run_locked(base_dir, routines, dry_run, lock=None, refresh_labels=False,
     slack_mcp.configure(base_dir)
     gmail_mcp.configure(base_dir)
     zoom_source.configure(base_dir)
+    mi_source.configure(base_dir)
     whatsapp_source.configure(base_dir)
     identity.configure(base_dir)
     processed = state.Store(base_dir, dry_run=dry_run)
@@ -1481,6 +1482,7 @@ SOURCES = {
     "mila": (mila_source.candidates, mila_source.fetch),
     "whisper": (whisper_source.candidates, whisper_source.fetch),
     "zoom": (zoom_source.candidates, zoom_source.fetch),
+    "mi": (mi_source.candidates, mi_source.fetch),
     "whatsapp": (whatsapp_source.candidates, whatsapp_source.fetch),
 }
 
@@ -1491,6 +1493,15 @@ SOURCES = {
 TRANSCRIPT_SOURCES = {
     "mila": mila_source,
     "whisper": whisper_source,
+}
+
+
+# A source kind that fully handles some of its items after fetch (no analysis,
+# no capture by the normal pipeline). The processor is called as
+# `process(routine, source, item, dry_run)` and returns the ledger record
+# fields when it handled the item, or None to fall through.
+SOURCE_PROCESSORS = {
+    "mi": mi_source.process,
 }
 
 
@@ -1509,6 +1520,8 @@ def _scope(source):
         return source.get("recordings_file") or "Mila recordings"
     if source.get("kind") == "zoom":
         return "Zoom meeting summaries"
+    if source.get("kind") == "mi":
+        return "MI meeting sessions"
     if source.get("kind") == "whisper":
         return source.get("transcriptions_dir") or "Whisper transcripts"
     if source.get("kind") == "whatsapp":
@@ -1554,6 +1567,7 @@ _SOURCE_DEFAULT_LIMITS = {
     "mila": 0,
     "whisper": 0,
     "zoom": 0,
+    "mi": 0,
     "whatsapp": 0,
 }
 
@@ -1708,7 +1722,7 @@ def _ownership_limit(source, sources):
 
 def _source_coverage_problem(source, candidates):
     """Why a successful listing still cannot prove the whole scope was read."""
-    if source.get("kind") in ("slack_mcp", "gmail_mcp", "zoom", "whatsapp"):
+    if source.get("kind") in ("slack_mcp", "gmail_mcp", "zoom", "mi", "whatsapp"):
         # These keep their own position (watermarks, or the WhatsApp spool
         # cursor), not a hold.
         return None
@@ -1814,6 +1828,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         if source_kinds is None or source.get("kind") in source_kinds
     ]
     all_sources = [source for _, _, source in entries]
+    # Mila only looks for an MI-only capture of a meeting when some enabled
+    # routine has an mi source; otherwise there can be none.
+    mi_enabled = any(
+        routine.get("enabled", True)
+        and any(isinstance(s, dict) and s.get("kind") == "mi"
+                for s in config.sources(routine))
+        for routine in routing_context
+    )
     context_sources = [
         source
         for routine in routing_context
@@ -1857,7 +1879,7 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
             # The ledger says when a chat-day was last captured, which
             # starts its quiet period and maximum wait afresh.
             listing_source = dict(listing_source, _processed=processed)
-        if kind == "zoom":
+        if kind in ("zoom", "mi"):
             # The ledger settles a meeting; the store links transcripts.
             listing_source = dict(
                 listing_source, _processed=processed,
@@ -1890,7 +1912,9 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         listing_specs = [{
             "label": kind,
             "listing_source": listing_source,
-            "claim_source": source,
+            "claim_source": (
+                dict(source, _mi_enabled=True)
+                if kind == "mila" and mi_enabled else source),
             "ownership_class": "ordinary",
             "expand_ownership": True,
         }]
@@ -2756,6 +2780,33 @@ def _process(routine, source, candidate, fetch, processed, label_catalog,
         item["frontmatter"] = meta
     meta = item.get("frontmatter") or {}
     item.setdefault("source_kind", source["kind"])
+    processor = SOURCE_PROCESSORS.get(source["kind"])
+    if processor is not None:
+        handled = processor(routine, source, item, dry_run)
+        if handled is not None:
+            if dry_run:
+                return None
+            record = {
+                "rule_id": rid,
+                "source_kind": source["kind"],
+                "source_id": item.get("source_id"),
+                "processed_at": utc_now_iso(),
+                **handled,
+            }
+            if record.get("memory_entry_id"):
+                # Only a write looks like a capture to ledger readers.
+                record["memory_source_id"] = item.get("source_id")
+            if handler_id:
+                record["handler_id"] = handler_id
+            if record.get("memory_error"):
+                # Recorded unresolved, so the next run retries it.
+                totals["errors"] += 1
+                log(f"routine={rid} memory ERROR: {record['memory_error']}")
+                processed.record(item["id"], record)
+            else:
+                processed.record_resolving(
+                    item["id"], record, item.get("source_id"))
+            return record
     static = _static_label(routine, item) if source["kind"] == "gmail" else None
 
     transcript_module = TRANSCRIPT_SOURCES.get(source["kind"])

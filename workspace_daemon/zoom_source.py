@@ -197,20 +197,22 @@ def save_state(meetings):
 
 # --- calendar ------------------------------------------------------------------
 
-def _read_calendar(cfg, now):
-    """(events, refreshed epoch) from the calendar cache file; ([], None) if absent."""
+def _read_calendar(cfg, now, label="zoom"):
+    """(events, refreshed epoch) from the calendar cache file; ([], None) if absent.
+
+    `label` prefixes the log lines (the mi source reads the same file)."""
     path = Path(str(cfg["calendar_file"])).expanduser()
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
-        log(f"zoom WARN calendar file unreadable: {type(exc).__name__}")
+        log(f"{label} WARN calendar file unreadable: {type(exc).__name__}")
         return [], None
     if not isinstance(data, dict) or not isinstance(data.get("events"), list):
-        log("zoom WARN calendar file has no events list")
+        log(f"{label} WARN calendar file has no events list")
         return [], None
     refreshed = _epoch(data.get("refreshed_at"))
     if refreshed is not None and now - refreshed > cfg["stale_calendar_hours"] * 3600:
-        log("zoom WARN calendar file is stale; new meetings may be missed")
+        log(f"{label} WARN calendar file is stale; new meetings may be missed")
     owner = str(data.get("owner_email") or "").strip().casefold()
     events = [e for e in data["events"] if isinstance(e, dict)]
     if owner:
