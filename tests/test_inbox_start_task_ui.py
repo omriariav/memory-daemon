@@ -271,7 +271,9 @@ class ModalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_draft_fills_only_untouched_fields(self):
         app, acts, _f = make_app([plain()])
-        acts.draft_wait = 0.5
+        # 2 s, not 0.5: on a slow CI runner the draft landed before the goal
+        # was typed in, so the goal still counted as untouched
+        acts.draft_wait = 2.0
         acts.draft_reply = launcher.Draft(True, {
             "name": "plan-check", "role": "analyst", "model": "sonnet",
             "effort": "high", "goal": "Drafted goal", "persona": "Careful",
