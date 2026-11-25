@@ -624,9 +624,10 @@ def _needs_listing(cfg, data, now):
 def _winners(matched, sessions):
     """{event id: session key} of the one session to handle per event.
 
-    A session already pending is in flight and keeps the event. Otherwise the
-    longest session wins (the rest of a drop-and-rejoin is the tail); ties go
-    to the earliest start."""
+    A session already pending is in flight and keeps the event. Otherwise a
+    time-window match beats a date match (only it may go full), then the
+    longest session wins (the rest of a drop-and-rejoin is the tail), then
+    the earliest start."""
     chosen, ranks = {}, {}
     for key, record, _m, _o, event_id, _e, started, _end in matched:
         if event_id not in chosen:
@@ -639,7 +640,8 @@ def _winners(matched, sessions):
                 ranks[event_id] = None
         if ranks.get(event_id, ()) is None:
             continue  # a pending session holds the event
-        rank = (-int(record.get("duration") or 0), started)
+        rank = (record.get("match") != "time",
+                -int(record.get("duration") or 0), started)
         if event_id not in chosen or rank < ranks[event_id]:
             chosen[event_id], ranks[event_id] = key, rank
     return chosen

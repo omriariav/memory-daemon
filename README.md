@@ -1980,8 +1980,9 @@ Three cases, by what the store holds for the calendar event:
 * **Mila only.** Untouched: this source never sees it.
 
 **One session per event.** A drop-and-rejoin gives two sessions of one
-meeting; only the longest is handled (ties go to the earliest start), unless
-one is already pending. The others are `superseded`: still open, so they are
+meeting; only one is handled: a session matched within the time window beats a
+date match, then the longest, then the earliest start, unless one is already
+pending. The others are `superseded`: still open, so they are
 reconsidered if the chosen one fails or expires, and dropped at `retry_hours`.
 An event is settled for good when a session of it is done or the store holds an
 entry carrying `mi-gcal:<event id>` or `mi-check:<event id>`; its other
@@ -2035,8 +2036,10 @@ Keys: `list_tool`, `summary_tool`, `transcript_tool`, `calendar_file`
 `max_summary_chars` (20000), `max_transcript_chars` (60000), `diff_model`
 (`sonnet`), `model` (`haiku`, the bridge model for the tool calls),
 `primary_sources` (`[mila]`), `primary_recordings_file` (unset).
-`calendar_timezone` is required, and `grace_minutes` must be less than
-`retry_hours * 60`. The list call is pinned to `from` and `limit: 50`
+`calendar_timezone` is required, `grace_minutes` must be less than
+`retry_hours * 60`, and `lookback_hours` must be at least `retry_hours` (a
+pending session the service no longer lists would otherwise hold its sibling
+sessions back until it expires). The list call is pinned to `from` and `limit: 50`
 and is not paged; a next page is logged as a warning. The list call is made on
 most runs while any recent event has no settled session (about one small haiku
 session per run); it is skipped when nothing is open and no recent event is

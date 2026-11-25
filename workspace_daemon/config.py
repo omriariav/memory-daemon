@@ -2285,6 +2285,14 @@ def _validate_mi(prefix, source, routine):
             f"{prefix}.grace_minutes must be less than retry_hours * 60: a "
             "session is dropped at retry_hours, so it could never go full"
         )
+    lookback = source.get("lookback_hours", 24)
+    if (_bounded_int(lookback, 1, 168) and _bounded_int(retry, 1, 168)
+            and lookback < retry):
+        problems.append(
+            f"{prefix}.lookback_hours must be at least retry_hours: a "
+            "session the service no longer lists could not be settled before "
+            "it expires, and would hold its sibling sessions back"
+        )
     for key in ("shadow", "skip_declined"):
         if key in source and not isinstance(source[key], bool):
             problems.append(f"{prefix}.{key} must be true or false")

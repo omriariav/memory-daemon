@@ -691,6 +691,25 @@ class OneSessionPerEventTest(MiBase):
         found = self.list_candidates()
         self.assertEqual([c["raw"]["session_id"] for c in found], [SESSION])
 
+    def test_a_time_match_beats_a_longer_date_match_and_can_go_full(self):
+        # one event, two sessions: a long one an hour late (date match only)
+        # and a short one on time. The short one must win and go full.
+        meetings = json.loads(listing(minutes=10))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(hours=1)),
+            "durationMinutes": 45, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        self.at(60 + 45 + 200)
+        self.write_calendar([event()])
+        found = self.list_candidates()
+        self.assertEqual([c["raw"]["session_id"] for c in found], [SESSION])
+        self.assertEqual((found[0]["raw"]["mode"], found[0]["raw"]["match"]),
+                         ("full", "time"))
+        long_one = mi_source.load_state()["sessions"][f"{MEETING}:{self.SECOND}"]
+        self.assertEqual(long_one["status"], "superseded")
+
     def test_the_sibling_is_reconsidered_when_the_chosen_session_fails(self):
         self.write_mila_entry()
         meetings = json.loads(listing(minutes=5))["meetings"]
@@ -1103,6 +1122,21 @@ class ConfigTest(unittest.TestCase):
             routine = example_routine()
             routine["source"][key] = value
             self.assertTrue(config.validate(routine), (key, value))
+
+    def test_lookback_must_cover_the_retry_window(self):
+        routine = example_routine()
+        routine["source"].update(lookback_hours=12)  # retry defaults to 24
+        self.assertTrue(any("lookback_hours must be at least retry_hours" in p
+                            for p in config.validate(routine)))
+        routine["source"].update(lookback_hours=24)
+        self.assertEqual(config.validate(routine), [])
+        routine["source"].update(lookback_hours=48, retry_hours=48)
+        self.assertEqual(config.validate(routine), [])
+        routine["source"].update(lookback_hours=24, retry_hours=36)
+        self.assertTrue(config.validate(routine))
+        del routine["source"]["lookback_hours"]  # default 24 < 36
+        self.assertTrue(any("lookback_hours" in p
+                            for p in config.validate(routine)))
 
     def test_live_mode_needs_the_primary_recordings_file(self):
         routine = example_routine()
