@@ -403,7 +403,9 @@ class InboxApp(App):
         # The sessions strip (0.13.2): the `status` lines of the sources.
         self.strip_lines = int(settings.get("strip_lines", 4))
         # the first day of the work week (`work_week:`), or None
-        self.week_start = (settings.get("work_week") or {}).get("start")
+        work_week = settings.get("work_week") or {}
+        self.week_start = work_week.get("start")
+        self.work_days = work_week.get("days", 5)    # work days from week_start
         shown_pref = store.get_pref("sessions_strip") \
             if hasattr(store, "get_pref") else None
         self.strip_on = shown_pref != "off"
@@ -3703,12 +3705,13 @@ class InboxApp(App):
             hint="enter drop  ·  esc cancel"), noted)
 
     def _task_due(self, it):
-        """s: the due date picker (tomorrow, next Sunday, +1 week, a typed
-        date, no date). Sends `due`; the row moves at once."""
+        """s: the due date picker (today, tomorrow, next work day, next week,
+        +1 week, a typed date, no date). Sends `due`; the row moves at once."""
         if not self._task_gate(it, "due"):
             return
         today = self._today()
-        options = tasksmod.due_choices(today, self.week_start)
+        options = tasksmod.due_choices(today, self.week_start,
+                                       self.work_days)
         by_id = {o[0]: o for o in options}
         choices = [{"id": key, "label": label, "detail": ""}
                    for key, label, _day in options]

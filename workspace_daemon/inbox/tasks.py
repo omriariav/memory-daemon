@@ -224,10 +224,37 @@ def next_sunday(today):
     return today + dt.timedelta(days=7 - ((today.weekday() + 1) % 7))
 
 
-def due_choices(today, week_start=None):
+def is_work_day(day, week_start, days):
+    """True when `day` is one of the `days` work days that start on the
+    `week_start` weekday (a name from WEEKDAYS)."""
+    return (day.weekday() - WEEKDAYS.index(week_start)) % 7 < days
+
+
+def next_work_day(today, week_start, days=5):
+    """The first work day after `today`. The work days are `week_start` and
+    the `days - 1` days after it. Always within a week: `days` is at least 1
+    (clamped to 1-7)."""
+    days = min(7, max(1, days))
+    for ahead in range(1, 8):
+        day = today + dt.timedelta(days=ahead)
+        if is_work_day(day, week_start, days):
+            return day
+    return today + dt.timedelta(days=7)         # not reached
+
+
+def fmt_day(day, today):
+    """`Thu 26 Nov`, with the year when it is not this year's."""
+    year = f" {day.year}" if day.year != today.year else ""
+    return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}{year}"
+
+
+def due_choices(today, week_start=None, work_days=5):
     """The `s` picker: `[(id, label, date or None)]`; `pick` has no date yet.
-    The second choice is Next Sunday, or, with `week_start` set, the start of
-    the next week."""
+    In the order of the keys: Tomorrow, Next Sunday (Next week, the next
+    `week_start` day, when set), +1 week (these three kept their keys from
+    0.13.4), then Today, Next work day (only with `week_start` set; always
+    listed then, even when it repeats Tomorrow or Next week), Pick date and
+    No date."""
     tomorrow = today + dt.timedelta(days=1)
     if week_start:
         sunday = next_week_start(today, week_start)
@@ -237,13 +264,79 @@ def due_choices(today, week_start=None):
     week = today + dt.timedelta(days=7)
 
     def fmt(day):
-        year = f" {day.year}" if day.year != today.year else ""
-        return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}{year}"
-    return [("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow),
-            ("sunday", f"{second}  {fmt(sunday)}", sunday),
-            ("week", f"+1 week  {fmt(week)}", week),
-            ("pick", "Pick date…  YYYY-MM-DD", None),
+        return fmt_day(day, today)
+
+    out = [("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow),
+           ("sunday", f"{second}  {fmt(sunday)}", sunday),
+           ("week", f"+1 week  {fmt(week)}", week),
+           ("today", f"Today  {fmt(today)}", today)]
+    if week_start:
+        work = next_work_day(today, week_start, work_days)
+        out.append(("workday", f"Next work day  {fmt(work)}", work))
+    out += [("pick", "Pick date…  25/11, thu, +3d, YYYY-MM-DD", None),
             ("none", "No date", None)]
+    return out
+
+
+# --- a typed due date --------------------------------------------------------
+DUE_FORMS = "YYYY-MM-DD, today, tomorrow, a weekday (thu), d/m (25/11), +3d or +2w"
+_DAY_MONTH = re.compile(r"([0-9]{1,2})[/.]([0-9]{1,2})\Z")   # ASCII digits only
+_PLUS = re.compile(r"\+([0-9]{1,4})([dw]?)\Z")
+MAX_DAYS = 365
+MAX_WEEKS = 52
+
+
+def parse_due_input(text, today):
+    """A typed due date: `(date, None)`, or `(None, reason)` when it is not
+    one, or not allowed. Forms (case-insensitive, spaces around ignored):
+    `YYYY-MM-DD` (not before `today`), `today`, `tomorrow`, a weekday name or
+    its 3-letter form (the next such day after today: a week out for today's
+    own), `d/m` or `d.m` (day first; this year, next year when it has passed),
+    `+N` / `+Nd` (N days, 1-365) and `+Nw` (N weeks, 1-52)."""
+    raw = text if isinstance(text, str) else ""
+    word = " ".join(raw.split()).lower()
+    nope = f"Not a date. Use {DUE_FORMS}"
+    if not word:
+        return None, nope
+    day = parse_day(word)
+    if day is not None:
+        if day < today:
+            return None, (f"{word} has passed. Use {today.isoformat()} "
+                          "or later")
+        return day, None
+    if word == "today":
+        return today, None
+    if word == "tomorrow":
+        return today + dt.timedelta(days=1), None
+    for index, name in enumerate(WEEKDAYS):
+        if word in (name, name[:3]):
+            ahead = (index - today.weekday()) % 7
+            return today + dt.timedelta(days=ahead or 7), None
+    m = _DAY_MONTH.match(word)
+    if m:
+        d, mon = int(m.group(1)), int(m.group(2))
+        for year in (today.year, today.year + 1):
+            try:
+                found = dt.date(year, mon, d)
+            except ValueError:
+                continue
+            if found >= today:
+                return found, None
+        try:        # a real day (29/2) that falls in neither year
+            dt.date(2000, mon, d)
+        except ValueError:
+            return None, f"{word} is not a day of the calendar. {nope}"
+        return None, f"There is no {word} this year or next. {nope}"
+    m = _PLUS.match(word)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        weeks = unit == "w"
+        top = MAX_WEEKS if weeks else MAX_DAYS
+        if not 1 <= n <= top:
+            return None, (f"{word}: use 1 to {top} "
+                          f"{'weeks' if weeks else 'days'}")
+        return today + dt.timedelta(days=n * (7 if weeks else 1)), None
+    return None, nope
 
 
 # --- "Remind me" (0.12.3) ----------------------------------------------------

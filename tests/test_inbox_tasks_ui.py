@@ -131,10 +131,11 @@ class Base(unittest.IsolatedAsyncioTestCase):
                if acts is None else acts)
         return LocalActions(self.store, base_dir=self.base, acts=cfg, **kw)
 
-    def app(self, view="tasks", actions=None, undo_s=0.15, **kw):
+    def app(self, view="tasks", actions=None, undo_s=0.15, settings=None,
+            **kw):
         return InboxApp(FromSource(self.src), self.store,
                         actions or self.actions(),
-                        settings=dict(DEFAULTS), undo_s=undo_s, leave_s=0,
+                        settings=dict(settings or DEFAULTS), undo_s=undo_s, leave_s=0,
                         stream_delay=0, view=view,
                         today=lambda: self.today, **kw)
 
@@ -454,6 +455,9 @@ class DueTest(Base):
                              ("due", "task:1", {"date": want}))
             self.assertEqual(req["meta"]["due"], day(-2))
 
+    async def test_today(self):
+        await self.sends("4", "2030-01-10")
+
     async def test_tomorrow(self):
         await self.sends("1", "2030-01-11")
 
@@ -463,8 +467,57 @@ class DueTest(Base):
     async def test_plus_one_week(self):
         await self.sends("3", "2030-01-17")
 
+    async def test_today_moves_the_row_to_due_today_and_says_so(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(section_of(app, "task:1"), "overdue")
+            await self.pick(pilot, app, "4")                 # Today
+            self.assertTrue(await wait_for(
+                pilot, lambda: section_of(app, "task:1") == "today"))
+            self.assertEqual(app._due_marks["task:1"]["due"], (day(0),))
+            self.assertTrue(any("Due 2030-01-10" in t for t in toasts(app)))
+
+    async def test_next_work_day_with_a_work_week(self):
+        cfg = dict(DEFAULTS, work_week={"start": "sunday", "days": 5})
+        app = self.app(settings=cfg)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await pilot.press("s")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
+            labels = [c["label"] for c in app.screen.choices]
+            self.assertEqual(labels[1], "Next week  Sun 13 Jan")
+            self.assertEqual(labels[4], "Next work day  Sun 13 Jan")
+            await pilot.press("5")
+            self.assertTrue(await wait_for(pilot, self.src.requests))
+            self.assertEqual(self.src.requests()[0]["args"],
+                             {"date": "2030-01-13"})
+
+    async def test_pick_date_takes_a_shorthand(self):
+        app = self.app()
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await self.pick(pilot, app, "5")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, DateScreen)))
+            await type_text(pilot, "nonsense")
+            await pilot.press("enter")
+            await pilot.pause(0.1)                           # must not happen
+            self.assertIsInstance(app.screen, DateScreen)
+            hint = str(app.screen.query_one("#note-hint").render())
+            self.assertIn("Not a date", hint)
+            self.assertIn("+3d", hint)
+            for _ in range(8):
+                await pilot.press("backspace")
+            await type_text(pilot, "+3d")
+            await pilot.press("enter")
+            self.assertTrue(await wait_for(pilot, self.src.requests))
+            self.assertEqual(self.src.requests()[0]["args"],
+                             {"date": "2030-01-13"})
+
     async def test_no_date_sends_null(self):
-        await self.sends("5", None)
+        await self.sends("6", None)
 
     async def test_the_row_moves_section_and_stays_until_a_refresh(self):
         app = self.app()
@@ -501,7 +554,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, DateScreen)))
             await type_text(pilot, "2030-02-30")             # not a real day
@@ -526,7 +579,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, DateScreen)))
             await type_text(pilot, "2029-01-09")             # a year typo
@@ -555,7 +608,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             await wait_for(pilot, lambda: isinstance(app.screen, DateScreen))
             await pilot.press("escape")
             self.assertTrue(await wait_for(
@@ -568,7 +621,7 @@ class DueTest(Base):
         async with self.session(app) as pilot:
             await settle(pilot, app)
             self.assertIn("task:1", keys_of(app))
-            await self.pick(pilot, app, "5")
+            await self.pick(pilot, app, "6")
             self.assertTrue(await wait_for(
                 pilot, lambda: "task:1" not in keys_of(app)))
             self.assertEqual(section_of(app, "task:1"), "nodate")

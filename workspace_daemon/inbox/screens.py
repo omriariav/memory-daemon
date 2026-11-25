@@ -1131,9 +1131,11 @@ class OutcomeScreen(NoteScreen):
 
 
 class DateScreen(ModalScreen):
-    """A `YYYY-MM-DD` date (the task due date picker's "Pick date"). Enter
-    accepts a real date from `today` on and stays open on anything else, with
-    the reason; esc cancels. Dismisses with the date string, or None."""
+    """A typed due date (the task due date picker's "Pick date"): `YYYY-MM-DD`
+    or a shorthand (`tasks.parse_due_input`: today, tomorrow, thu, 25/11,
+    +3d, +2w). Enter accepts a date from `today` on and stays open on anything
+    else, with the reason; esc cancels. Dismisses with the date as
+    `YYYY-MM-DD`, or None."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -1148,8 +1150,8 @@ class DateScreen(ModalScreen):
         head.append(self.who, Style(dim=True))
         with Vertical(id="note"):
             yield Static(head, id="note-title")
-            yield WordInput(placeholder="YYYY-MM-DD  (enter to set)",
-                            id="note-input", max_length=10)
+            yield WordInput(placeholder="25/11, thu, +3d, YYYY-MM-DD  (enter to set)",
+                            id="note-input", max_length=20)
             yield Static(Text("enter set  ·  esc cancel", Style(dim=True)),
                          id="note-hint")
 
@@ -1160,15 +1162,10 @@ class DateScreen(ModalScreen):
         self.dismiss(None)
 
     def on_input_submitted(self, e):
-        from .tasks import parse_day
-        text = e.value.strip()
-        day = parse_day(text)
-        if day is None:
-            why = "Not a date. Use YYYY-MM-DD, for example 2030-01-31"
-        elif day < self.today:
-            why = f"{text} has passed. Use {self.today.isoformat()} or later"
-        else:
-            self.dismiss(text)
+        from .tasks import parse_due_input
+        day, why = parse_due_input(e.value, self.today)
+        if day is not None:
+            self.dismiss(day.isoformat())
             return
         self.query_one("#note-hint", Static).update(
             Text(why, Style(bold=True, color="red")))
