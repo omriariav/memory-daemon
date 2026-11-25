@@ -793,6 +793,8 @@ maintenance:
   stale_after: 2h                      # mark the text file STALE after this
   conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]
   lookback_hours: 0                    # 0 = off; N (0-72) adds recent_events to the JSON
+  lookback_refresh_minutes: 60         # 15-1440: refetch the past at most this often
+  lookback_max_events: 100             # 1-500: cap of the past listing
 ```
 
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
@@ -800,19 +802,30 @@ are exact MCP names from your connector and are never defaulted.
 
 Past events (`lookback_hours`, default `0` = off): the text file and `events`
 only ever hold what is still ahead, so a finished meeting is never in them.
-With `lookback_hours: N` (0 to 72) each run makes one more pinned list call,
+With `lookback_hours: N` (0 to 72) the routine also makes one pinned list call,
 in its own bridge session, for `[now - N hours, now]` (`max_results` =
-`max_events`; no detail lookups) and writes the events that started before now
-under a separate JSON key, `recent_events` (same per-event shape as `events`),
-plus `lookback_hours`. Cancelled events are dropped. `events`, the text file,
-the event diff, free/busy and invite scans are unchanged, and the past listing
-has its own `max_events`, so it never crowds out upcoming events. A meeting
-that is running now is in both lists; readers dedupe by event id. If this
-extra call fails the refresh still succeeds: `recent_events` keeps the earlier
-file's past events plus any `events` that have started since, and a warning is
-logged. Only the `mi` and `zoom` sources read `recent_events`; a file without
-the key (an older refresh) works as before. If the lookback listing reaches
-`max_events`, the latest past events may be cut (a warning is logged).
+`lookback_max_events`, default 100; no detail lookups) and writes the events
+that started before now under a separate JSON key, `recent_events` (same
+per-event shape as `events`), plus `lookback_hours` and `recent_fetched_at`.
+Cancelled events are dropped. `events`, the text file, the event diff,
+free/busy and invite scans are unchanged, and the past listing has its own cap,
+so it never crowds out upcoming events. A meeting that is running now is in
+both lists; readers dedupe by event id.
+
+Cost: the past window barely changes between refreshes, so the extra call runs
+at most once per `lookback_refresh_minutes` (default 60, 15 to 1440), not on
+every refresh. At the default that is about 24 extra headless sessions a day
+(one list call each, turn and budget capped like the invite scan) next to the
+main refresh. Between fetches `recent_events` is carried forward from the
+previous file (its past events plus any `events` that have started since) and
+filtered to the window again on every run; a changed `lookback_hours` fetches at
+once. If the extra call fails for any reason, the refresh still succeeds with
+the carried-over events, a warning is logged and the next run tries again. If
+the past listing reaches `lookback_max_events`, the newest past events may be
+missing (the connector lists oldest first and cuts there); a warning is logged,
+and only the newest `lookback_max_events` are kept. Only the `mi` and `zoom`
+sources read `recent_events`; a file without the key (an older refresh) works as
+before.
 
 Busy/free: `get_event` does not return "Show as", so with `freebusy_tool` set
 the fetch makes one extra free/busy call for the whole window (primary

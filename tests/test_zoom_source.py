@@ -144,6 +144,19 @@ class ZoomSourceTest(unittest.TestCase):
         self.listing()
         self.assertEqual(set(self.meetings()), {"ev1", "ev2"})
 
+    def test_an_unhashable_event_id_is_skipped_in_either_list(self):
+        self.at(10)
+        cfg = dict(zoom_source.settings(self.source))
+        odd = [dict(event("x"), event_id=[1]), dict(event("y"), event_id={"a": 1}),
+               dict(event("z"), event_id=None), dict(event("w"), event_id=5)]
+        self.write_calendar_with_recent([event()] + odd, odd + [event("ev2")])
+        events, _ = zoom_source._read_calendar(cfg, self.now.timestamp())
+        str_ids = [e["event_id"] for e in events
+                   if isinstance(e["event_id"], str)]
+        self.assertEqual(str_ids, ["ev1", "ev2"])
+        self.listing()  # does not raise
+        self.assertEqual(set(self.meetings()), {"ev1", "ev2"})
+
     def test_a_file_without_recent_events_or_with_a_bad_one(self):
         self.at(10)
         cfg = dict(zoom_source.settings(self.source))

@@ -1523,12 +1523,16 @@ class LookbackTest(unittest.TestCase):
 
     def test_recent_args_are_exact(self):
         self.assertEqual(
-            calendar_cache.recent_args(cfg(lookback_hours=24, max_events=7), NOW),
+            calendar_cache.recent_args(
+                cfg(lookback_hours=24, max_events=7, lookback_max_events=7), NOW),
             {"calendar_id": "primary", "time_min": "2026-10-19T08:30:00Z",
              "time_max": "2026-10-20T08:30:00Z", "max_results": 7})
         self.assertEqual(
             calendar_cache.recent_args(cfg(lookback_hours=1.5), NOW)["time_min"],
             "2026-10-20T07:00:00Z")
+        # default cap is its own, not max_events
+        self.assertEqual(calendar_cache.recent_args(
+            cfg(lookback_hours=24, max_events=7), NOW)["max_results"], 100)
 
     def test_main_window_args_do_not_change_with_lookback(self):
         self.assertEqual(
@@ -1558,7 +1562,7 @@ class LookbackTest(unittest.TestCase):
         prompt, tools, kwargs = self.sessions[1]
         self.assertEqual(tools, {LIST_TOOL: {
             "calendar_id": "primary", "time_min": "2026-10-19T08:30:00Z",
-            "time_max": "2026-10-20T08:30:00Z", "max_results": 50}})
+            "time_max": "2026-10-20T08:30:00Z", "max_results": 100}})
         self.assertIn('time_min "2026-10-19T08:30:00Z"', prompt)
         self.assertEqual(kwargs["required"], [LIST_TOOL])
         # The main session is the unchanged one.
@@ -1646,9 +1650,134 @@ class LookbackTest(unittest.TestCase):
         self.assertEqual(self.data()["recent_events"], [])
 
     def test_a_full_past_listing_warns(self):
-        self.run_cache(max_events=4)
-        self.assertTrue(any("lookback listing reached max_events" in c.args[0]
+        self.run_cache(lookback_max_events=4)
+        self.assertTrue(any("reached lookback_max_events" in c.args[0]
                             for c in self.log.call_args_list))
+
+    def test_a_cut_past_listing_keeps_the_newest(self):
+        self.past = "Found 5 event(s):\n\n" + "\n".join(
+            _timed(f"p{n}", f"2026-10-20T0{n}:00:00Z", f"2026-10-20T0{n}:30:00Z",
+                   f"E{n}") for n in range(1, 6))
+        self.run_cache(lookback_max_events=3)
+        self.assertEqual(self.sessions[1][1][LIST_TOOL]["max_results"], 3)
+        self.assertEqual([e["event_id"] for e in self.data()["recent_events"]],
+                         ["p3", "p4", "p5"])
+        self.assertTrue(any("newest past events may be missing" in c.args[0]
+                            for c in self.log.call_args_list))
+
+    def test_lookback_is_fetched_at_most_once_per_refresh_interval(self):
+        self.run_cache()
+        first = self.data()
+        self.assertEqual(first["recent_fetched_at"], "2026-10-20T17:30:00+09:00")
+        self.assertEqual(len(self.sessions), 2)
+        for minutes in (15, 30, 59):
+            self.run_cache(now=NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(len(self.sessions), 5)  # only main sessions were added
+        data = self.data()
+        self.assertEqual(data["recent_fetched_at"], first["recent_fetched_at"])
+        self.assertEqual([e["event_id"] for e in data["recent_events"]][:2],
+                         ["past1", "running"])
+        self.run_cache(now=NOW + datetime.timedelta(minutes=61))
+        self.assertEqual(len(self.sessions), 7)  # fetched again
+        self.assertEqual(self.data()["recent_fetched_at"],
+                         "2026-10-20T18:31:00+09:00")
+
+    def test_refresh_interval_is_configurable(self):
+        self.run_cache(lookback_refresh_minutes=15)
+        self.run_cache(now=NOW + datetime.timedelta(minutes=16))
+        self.assertEqual(len(self.sessions), 4)
+
+    def test_a_changed_lookback_fetches_at_once(self):
+        self.run_cache()
+        self.run_cache(now=NOW + datetime.timedelta(minutes=5),
+                       lookback_hours=12)
+        self.assertEqual(len(self.sessions), 4)
+        self.assertEqual(self.data()["lookback_hours"], 12)
+
+    def test_carry_forward_drops_rows_that_left_the_window(self):
+        self.run_cache(lookback_refresh_minutes=1440)
+        self.assertIn("past1",
+                      [e["event_id"] for e in self.data()["recent_events"]])
+        # 23h on: past1 (ended 07:00Z) is older than now - 24h; carried, not fetched
+        self.run_cache(now=NOW + datetime.timedelta(hours=23))
+        self.assertEqual(len(self.sessions), 3)
+        self.assertNotIn("past1", [e["event_id"]
+                                   for e in self.data()["recent_events"]])
+
+    def test_a_failed_fetch_does_not_move_the_fetch_time(self):
+        self.run_cache()
+        stamp = self.data()["recent_fetched_at"]
+        self.fail_past = True
+        self.run_cache(now=NOW + datetime.timedelta(minutes=61))
+        self.assertEqual(self.data()["recent_fetched_at"], stamp)
+
+    def test_any_exception_from_the_fetch_keeps_the_refresh(self):
+        for error in (RuntimeError("x"), KeyError("k"), ValueError("v")):
+            with mock.patch.object(calendar_cache, "fetch_recent",
+                                   side_effect=error):
+                self.run_cache()
+            self.assertEqual(self.data()["recent_events"], [])
+            self.assertIn("Weekly sync", self.out.read_text())
+            self.assertTrue(any("lookback fetch failed" in c.args[0]
+                                for c in self.log.call_args_list))
+
+    def test_a_corrupt_previous_file_never_fails_the_refresh(self):
+        self.out.parent.mkdir(parents=True)
+        good = {"event_id": "g", "start": "2026-10-20T10:00:00+09:00",
+                "end": "2026-10-20T11:00:00+09:00", "all_day": False,
+                "title": "Good", "my_rsvp": "accepted", "organizer": None,
+                "location": "", "conference_url": None,
+                "conference_solution": "", "rooms": [], "attendees": [],
+                "links": [], "recurring": False, "show_as": None}
+        self.twin.write_text(json.dumps({
+            "lookback_hours": 24,
+            "recent_events": [
+                good, "x", None, 5, {}, {"event_id": ["l"]},
+                dict(good, event_id={"a": 1}),
+                {k: v for k, v in good.items() if k != "title"},
+                dict(good, event_id="ts", start="not a time"),
+            ],
+            "events": "nope",
+        }))
+        self.fail_past = True
+        self.run_cache()
+        self.assertEqual([e["event_id"] for e in self.data()["recent_events"]],
+                         ["g"])
+
+    def test_a_render_failure_of_past_events_does_not_fail_the_refresh(self):
+        real = calendar_cache.render_json
+
+        def render(events, cfg, now, recent=None, recent_fetched_at=None):
+            if recent:
+                raise KeyError("title")
+            return real(events, cfg, now, recent, recent_fetched_at)
+
+        with mock.patch.object(calendar_cache, "render_json", render):
+            self.run_cache()
+        self.assertEqual(self.data()["recent_events"], [])
+        self.assertEqual(len(self.data()["events"]), 2)
+        self.assertTrue(any("past events not written" in c.args[0]
+                            for c in self.log.call_args_list))
+
+    def test_with_lookback_off_the_files_are_byte_identical_to_before(self):
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        self.cfg.pop("lookback_hours")
+        results = [
+            list_call(LIST_TEXT),
+            tool_call(GET_TOOL, DETAIL_TEXT, calendar_id="primary",
+                      event_id="1abcdefrecurring_20261020T090000Z"),
+        ]
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools", return_value=results,
+        ):
+            calendar_cache.run(self.cfg, self.base, now=NOW)
+        # Both fixtures were rendered by the code before lookback_hours existed.
+        self.assertEqual(
+            self.twin.read_text(),
+            (fixtures / "calendar_cache_no_lookback.json").read_text())
+        self.assertEqual(
+            self.out.read_text(),
+            (fixtures / "calendar_cache_no_lookback.txt").read_text())
 
     def test_failed_main_fetch_still_fails(self):
         with mock.patch.object(
@@ -1787,6 +1916,19 @@ class ConfigTest(unittest.TestCase):
 
     def test_tools_must_differ(self):
         self.assertTrue(self.problems(get_tool=LIST_TOOL))
+
+    def test_lookback_cap_and_refresh_validated(self):
+        for key, goods, bads in (
+            ("lookback_max_events", (1, 100, 500), (0, 501, 1.5, "5", True)),
+            ("lookback_refresh_minutes", (15, 60, 1440, 20.5),
+             (14, 1441, "60", True, None)),
+        ):
+            for good in goods:
+                self.assertEqual(self.problems(**{key: good}), [], (key, good))
+            for bad in bads:
+                self.assertTrue(
+                    any(key in p for p in self.problems(**{key: bad})),
+                    (key, bad))
 
     def test_lookback_hours_validated(self):
         for good in (0, 1, 24, 72, 1.5):

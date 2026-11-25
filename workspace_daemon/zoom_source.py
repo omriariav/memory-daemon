@@ -221,10 +221,14 @@ def _read_calendar(cfg, now, label="zoom"):
     # upcoming list wins.
     recent = data.get("recent_events")
     if isinstance(recent, list):
-        known = {e.get("event_id") for e in events}
+        # Only string ids are compared (an id that is a list or a dict, in
+        # either list, is never hashed); such a row is skipped as before.
+        known = {e.get("event_id") for e in events
+                 if isinstance(e.get("event_id"), str)}
         for event in recent:
-            if isinstance(event, dict) and event.get("event_id") not in known:
-                known.add(event.get("event_id"))
+            event_id = event.get("event_id") if isinstance(event, dict) else None
+            if isinstance(event_id, str) and event_id not in known:
+                known.add(event_id)
                 events.append(event)
     if owner:
         # The file drops the per-row `self` flag; restore it from the owner.
