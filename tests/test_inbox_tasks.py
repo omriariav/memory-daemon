@@ -191,6 +191,122 @@ class InboxSectionTest(unittest.TestCase):
         self.assertEqual(views.feed_view(rows, 0.0).total, 0)
 
 
+class WeekStartTest(unittest.TestCase):
+    """`work_week.start` ends THIS WEEK at the next start of the week."""
+    WED = D(2026, 11, 25)
+    SUN = D(2026, 11, 29)
+
+    def bucket(self, due, today, week_start=None):
+        return tasks.bucket(task(1, due=due.isoformat()), today, week_start)
+
+    def test_on_a_wednesday_with_sunday(self):
+        wed = self.WED
+        for off, want in ((1, tasks.WEEK), (3, tasks.WEEK),   # Thu, Sat
+                          (4, tasks.LATER), (5, tasks.LATER),  # Sun, Mon
+                          (0, tasks.TODAY), (-1, tasks.OVERDUE)):
+            self.assertEqual(
+                self.bucket(wed + dt.timedelta(days=off), wed, "sunday"),
+                want, off)
+
+    def test_on_the_week_start_day_itself(self):
+        sun = self.SUN
+        for off, want in ((1, tasks.WEEK), (6, tasks.WEEK),
+                          (7, tasks.LATER)):
+            self.assertEqual(
+                self.bucket(sun + dt.timedelta(days=off), sun, "sunday"),
+                want, off)
+
+    def test_unset_keeps_the_rolling_seven_days(self):
+        wed = self.WED
+        for off, want in ((4, tasks.WEEK), (7, tasks.WEEK), (8, tasks.LATER)):
+            self.assertEqual(
+                self.bucket(wed + dt.timedelta(days=off), wed), want, off)
+
+    def test_next_week_start(self):
+        self.assertEqual(tasks.next_week_start(self.WED, "sunday"), self.SUN)
+        self.assertEqual(tasks.next_week_start(self.SUN, "sunday"),
+                         D(2026, 12, 6))
+        self.assertEqual(tasks.next_week_start(self.WED, "monday"),
+                         D(2026, 11, 30))
+        self.assertEqual(tasks.next_week_start(self.WED, "wednesday"),
+                         D(2026, 12, 2))
+
+    def test_task_groups_pass_it_on(self):
+        rows = [task(1, due=self.SUN.isoformat()),
+                task(2, due="2026-11-28")]
+        groups = {g.key: keys(g.items)
+                  for g in views.task_groups(rows, self.WED, "sunday")}
+        self.assertEqual(groups, {tasks.WEEK: ["task:2"],
+                                  tasks.LATER: ["task:1"]})
+        groups = {g.key: keys(g.items)
+                  for g in views.task_groups(rows, self.WED)}
+        self.assertEqual(list(groups), [tasks.WEEK])
+
+    def test_the_due_picker(self):
+        plain = {k: (l, d) for k, l, d in tasks.due_choices(self.WED)}
+        self.assertEqual(plain["sunday"], ("Next Sunday  Sun 29 Nov", self.SUN))
+        wk = {k: (l, d) for k, l, d in tasks.due_choices(self.WED, "monday")}
+        self.assertEqual(wk["sunday"],
+                         ("Next week  Mon 30 Nov", D(2026, 11, 30)))
+        sun = {k: (l, d) for k, l, d in tasks.due_choices(self.WED, "sunday")}
+        self.assertEqual(sun["sunday"], ("Next week  Sun 29 Nov", self.SUN))
+
+    def test_on_a_saturday_with_sunday(self):
+        sat = D(2026, 11, 28)
+        sun = sat + dt.timedelta(days=1)
+        self.assertEqual(self.bucket(sun, sat, "sunday"), tasks.LATER)
+        self.assertEqual(self.bucket(sat, sat, "sunday"), tasks.TODAY)
+        groups = views.task_groups([task(1, due=sun.isoformat())], sat,
+                                   "sunday")
+        self.assertEqual([g.key for g in groups], [tasks.LATER])   # no THIS WEEK
+        picks = {k: (l, d) for k, l, d in tasks.due_choices(sat, "sunday")}
+        self.assertEqual(picks["sunday"][1], sun)
+        self.assertEqual(picks["tomorrow"][1], sun)
+        self.assertEqual(picks["sunday"][0], "Next week  Sun 29 Nov")
+
+    def test_the_due_cell_names_a_weekday_only_inside_this_week(self):
+        wed = self.WED
+        cell = lambda off, ws=None: tasks.due_cell(   # noqa: E731
+            wed + dt.timedelta(days=off), wed, ws)
+        self.assertEqual(cell(3, "sunday"), "Sat")
+        self.assertEqual(cell(4, "sunday"), "29 Nov")     # Sunday: LATER
+        self.assertEqual(cell(5, "sunday"), "30 Nov")
+        self.assertEqual(cell(4), "Sun")                  # unset: unchanged
+        self.assertEqual(cell(7), "2 Dec")
+        self.assertEqual(cell(0, "sunday"), "today")
+        self.assertEqual(cell(-2, "sunday"), "2d late")
+
+    def test_the_picker_shows_the_year_when_it_differs(self):
+        late = D(2026, 12, 29)
+        labels = {k: l for k, l, _d in tasks.due_choices(late)}
+        self.assertEqual(labels["tomorrow"], "Tomorrow  Wed 30 Dec")
+        self.assertEqual(labels["sunday"], "Next Sunday  Sun 3 Jan 2027")
+        self.assertEqual(labels["week"], "+1 week  Tue 5 Jan 2027")
+
+    def test_work_week_settings(self):
+        self.assertIsNone(settings.validate({})["work_week"])
+        ok = lambda v: settings.validate({"work_week": v})["work_week"]  # noqa: E731
+        self.assertEqual(ok({"start": "sunday"}),
+                         {"start": "sunday", "days": 5})
+        self.assertEqual(ok({"start": "Monday", "days": 6}),
+                         {"start": "monday", "days": 6})
+        self.assertEqual(ok({"start": " SATURDAY ", "days": 1}),
+                         {"start": "saturday", "days": 1})
+        self.assertEqual(ok({"start": "sunday", "days": 7})["days"], 7)
+        for bad in ("sunday", ["sunday"], 5, {}, {"days": 5},
+                    {"start": "funday"}, {"start": 1}, {"start": ""},
+                    {"start": "sunday", "days": 0},
+                    {"start": "sunday", "days": 8},
+                    {"start": "sunday", "days": 2.5},
+                    {"start": "sunday", "days": "5"},
+                    {"start": "sunday", "days": True},
+                    {"start": "sunday", "week": 1}):
+            with self.assertRaises(settings.SettingsError, msg=repr(bad)):
+                settings.validate({"work_week": bad})
+        with self.assertRaises(settings.SettingsError):
+            settings.validate({"week_start": "sunday"})   # never released
+
+
 class CellTest(unittest.TestCase):
     def test_due_cell(self):
         cell = lambda offset: tasks.due_cell(

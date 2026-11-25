@@ -7,6 +7,37 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-11-25
+
+Word jumps in the text fields, a calendar-week view of THIS WEEK, and a calmer
+due-date picker. Nothing changes without the new optional `work_week:`.
+
+### Added
+
+- **`work_week:`** in `inbox.yaml`, `{start: <weekday>, days: <1-7>}` (the same
+  shape as the daemon's `memory.work_week`; `start` is required, `days`
+  defaults to 5 and is only stored for now). With it set, `THIS WEEK` in the
+  Tasks view ends before the next `start` day, so a task due next Sunday is
+  `LATER`, the due cell names a weekday only inside `THIS WEEK`, and the `s`
+  picker's `Next Sunday` becomes `Next week` (the next `start` day). Unset
+  keeps the rolling 7 days.
+
+### Fixed
+
+- **Word keys in every text field** (the `/` filter, the row menu filter, the
+  snooze, note, due-date and task fields, and the draft editor):
+  `alt+left` / `alt+right` jump a word, `alt+shift+left` / `alt+shift+right`
+  select by word, `alt+backspace` deletes the word to the left and
+  `alt+delete` the word to the right. `ctrl+left` / `ctrl+right` work as
+  before.
+- **The cursor stays in place when you set a due date** (`s` in the Tasks
+  view). The row moves to its new section; the cursor stays at the same place
+  in the list, on the row that is there now, even when a refresh lands while
+  the picker is open. Undo puts it back on the task.
+- **Pick date refuses a day before today.** The screen stays open and says so,
+  like it does for a bad format. A date in another year shows its year in the
+  picker.
+
 ## [0.13.3] - 2026-11-24
 
 Start a task from any row. `t` opens a small modal, and your own command (the

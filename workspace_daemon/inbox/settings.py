@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from . import acts, feedrules, health, invites, sources, themes
+from . import acts, feedrules, health, invites, sources, tasks, themes
 from .views import DEFAULT_WINDOW_H
 
 FILE_NAME = "inbox.yaml"
@@ -25,7 +25,7 @@ TOP_KEYS = ("poll_interval_s", "watch_interval_s", "theme", "bidi_mode", "thread
             "summary", "actions", "send", "react", "polish", "copy", "team",
             "slack_open", "show_rsvp_replies", "feed", "health",
             "done_reaction", "nudge_template", "open_with", "strip_lines",
-            "task_launcher")
+            "task_launcher", "work_week")
 FEED_KEYS = ("window_h", "rules")
 HEALTH_KEYS = ("heartbeats",)
 HEARTBEAT_KEYS = ("name", "path", "stale_min", "hours")
@@ -134,6 +134,7 @@ DEFAULTS = {
     "open_with": [],   # no default: `o` uses the default browser
     "feed": {"window_h": DEFAULT_WINDOW_H, "rules": []},
     "strip_lines": 4,   # sessions strip: status lines shown before "+N more"
+    "work_week": None,   # no default: THIS WEEK is the next 7 days
     "task_launcher": None,   # no default: `t` says "no task launcher configured"
     "health": {"heartbeats": []},
 }
@@ -166,6 +167,34 @@ def load(base_dir, path=None):
     except yaml.YAMLError as exc:
         raise SettingsError([f"{path.name}: invalid YAML: {exc}"])
     return validate(raw if raw is not None else {})
+
+
+def _check_work_week(raw, problems):
+    """`work_week: {start: <weekday>, days: 1-7}`: `start` is required, `days`
+    defaults to 5. Returns `{"start": name, "days": n}` or None."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append("work_week must be a mapping: "
+                        "{start: <weekday>, days: <1-7>}")
+        return None
+    bad = False
+    for key in raw:
+        if key not in ("start", "days"):
+            problems.append(f"work_week: unknown key '{key}'")
+            bad = True
+    start = raw.get("start")
+    name = start.strip().lower() if isinstance(start, str) else None
+    if name not in tasks.WEEKDAYS:
+        problems.append(f"work_week.start must be one of "
+                        f"{', '.join(tasks.WEEKDAYS)}")
+        bad = True
+    days = raw.get("days", 5)
+    if not isinstance(days, int) or isinstance(days, bool) \
+            or not 1 <= days <= 7:
+        problems.append("work_week.days must be an integer from 1 to 7")
+        bad = True
+    return None if bad else {"start": name, "days": days}
 
 
 def validate(raw):
@@ -215,6 +244,8 @@ def validate(raw):
         problems.append("strip_lines must be an integer from 1 to 12")
     else:
         out["strip_lines"] = lines
+
+    out["work_week"] = _check_work_week(raw.get("work_week"), problems)
 
     account = raw.get("gmail_account", DEFAULTS["gmail_account"])
     if not isinstance(account, int) or isinstance(account, bool) or account < 0:

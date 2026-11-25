@@ -49,7 +49,7 @@ from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HealthStrip,
                       HealthView, HintBar, Queue, RoutinePane, SessionsStrip,
                       StatusHeader, ThreadView, fmt_age, fuzzy, palette, render_health,
-                      render_routines, scheduler_title, vis)
+                      render_routines, scheduler_title, vis, WordInput)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
 RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
@@ -402,6 +402,8 @@ class InboxApp(App):
                        "agents": []}
         # The sessions strip (0.13.2): the `status` lines of the sources.
         self.strip_lines = int(settings.get("strip_lines", 4))
+        # the first day of the work week (`work_week:`), or None
+        self.week_start = (settings.get("work_week") or {}).get("start")
         shown_pref = store.get_pref("sessions_strip") \
             if hasattr(store, "get_pref") else None
         self.strip_on = shown_pref != "off"
@@ -501,7 +503,7 @@ class InboxApp(App):
         with Horizontal(id="main"):
             yield RoutinePane("", id="routines")
             with Vertical(id="left"):
-                yield Input(placeholder="/ filter…", id="filter")
+                yield WordInput(placeholder="/ filter…", id="filter")
                 yield Queue(id="queue")
                 yield Static("", id="zero")
             with Vertical(id="right"):
@@ -676,7 +678,7 @@ class InboxApp(App):
         today = self._today()
         inbox = views.inbox_groups(self.items, today)
         waiting = views.waiting_groups(self.items, now)
-        tasks = views.task_groups(self.items, today)
+        tasks = views.task_groups(self.items, today, self.week_start)
         agents = views.agent_groups(self.items)
         data = feed()
         shown = (views.view_rows(inbox) + views.view_rows(waiting)
@@ -920,7 +922,7 @@ class InboxApp(App):
             q.build(groups, self.pal, now, keep=keep, ghost=ghost,
                     ghost_group=ghost_group, ghost_at=ghost_at,
                     visual=self.bidi, today=self._today(),
-                    reset_scroll=reset)
+                    reset_scroll=reset, week_start=self.week_start)
             # While the queue was hidden (the first poll still running) it
             # lost focus; give it back, or the arrows do nothing until a
             # click. Not while the terminal is in the background: Textual
@@ -1483,19 +1485,31 @@ class InboxApp(App):
             self.query_one("#queue").focus()
 
     # ---------- actions with optimistic update + undo ----------
-    def _remove_optimistic(self, it):
-        vis_before = self.visible()
-        pos = vis_before.index(it) if it in vis_before else 0
-        home = views.group_of(self.view_groups(), it)
-        ghost_group = home.key if home is not None else None
-        ghost_at = home.items.index(it) if home is not None else None
-        self.refilter(redraw=False)       # the pending item is already listed
+    def _index_of(self, it):
+        """Where `it` is in the visible list, by key (a poll may have
+        replaced the row with an equal-key Item); 0 when it is not there."""
+        return next((n for n, i in enumerate(self.visible())
+                     if i.key == it.key), 0)
+
+    def _keep_at(self, it, pos):
+        """The key the cursor takes after `it` left, or moved within, the
+        visible list: the row now at `pos` (its index before the change),
+        clamped to the last row. A late mark that moved the cursor to
+        another still-visible row wins."""
         after = self.visible()
         keep = after[min(pos, len(after) - 1)].key if after else None
         if (self.current_key not in (None, it.key)
                 and any(i.key == self.current_key for i in after)):
-            keep = self.current_key   # a late mark must not move the cursor
-        self.current_key = keep
+            keep = self.current_key
+        return keep
+
+    def _remove_optimistic(self, it):
+        pos = self._index_of(it)
+        home = views.group_of(self.view_groups(), it)
+        ghost_group = home.key if home is not None else None
+        ghost_at = home.items.index(it) if home is not None else None
+        self.refilter(redraw=False)       # the pending item is already listed
+        keep = self.current_key = self._keep_at(it, pos)
         if self.leave_s > 0:
             self.redraw(keep=keep, ghost=it, ghost_at=ghost_at,
                         ghost_group=ghost_group)
@@ -3694,7 +3708,7 @@ class InboxApp(App):
         if not self._task_gate(it, "due"):
             return
         today = self._today()
-        options = tasksmod.due_choices(today)
+        options = tasksmod.due_choices(today, self.week_start)
         by_id = {o[0]: o for o in options}
         choices = [{"id": key, "label": label, "detail": ""}
                    for key, label, _day in options]
@@ -3704,12 +3718,15 @@ class InboxApp(App):
                 return
             date_str = day.isoformat() if day else None
             label = date_str or "no date"
+            pos = self._index_of(it)
             p = self._enqueue(
                 "due", it, f"Due {label}: {it.gist}", hide=False,
                 detail=label, act="due", act_args={"date": date_str},
                 meta=act_meta(it))     # the date shown before this move
             self._set_due_mark(it, date_str, p)
-            self.redraw(keep=it.key)
+            # The row moves; the cursor stays at its place in the list.
+            self.current_key = self._keep_at(it, pos)
+            self.redraw(keep=self.current_key)
 
         def typed(text):
             if text is None:
@@ -3723,7 +3740,7 @@ class InboxApp(App):
                 self.notify("Cancelled. Nothing sent.", timeout=2,
                             markup=False)
             elif choice["id"] == "pick":
-                self.push_screen(DateScreen("Due date", it.gist), typed)
+                self.push_screen(DateScreen("Due date", it.gist, today), typed)
             else:
                 send(by_id[choice["id"]][2])
         self.push_screen(ChoicePicker("Due date", choices, self.bidi), picked)
