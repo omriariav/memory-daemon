@@ -1469,6 +1469,17 @@ class CrossCheckTest(MiBase):
         self.assertEqual(args[args.index("--source-ids") + 1],
                          f"mi:{MEETING}:{SESSION}")
 
+    def test_mcp_config_and_delay_never_reach_the_diff_call(self):
+        path = Path(self.tmp.name) / "mcp.json"
+        path.write_text("{}")
+        os.chmod(path, 0o600)
+        self.run_process(source={"mcp_config": str(path),
+                                 "connect_delay_seconds": 15})
+        _, kwargs = self.complete_calls[0]
+        self.assertIs(kwargs["strict_mcp"], True)
+        self.assertNotIn("mcp_config", kwargs)
+        self.assertNotIn("connect_delay", kwargs)
+
     def test_the_diff_call_is_a_no_tools_sonnet_call_with_all_inputs(self):
         self.run_process()
         prompt, kwargs = self.complete_calls[0]
@@ -1858,6 +1869,84 @@ class RunnerHookTest(MiBase):
     def test_mi_is_a_meeting_source_for_owner_review(self):
         from workspace_daemon import owner_todos
         self.assertTrue(owner_todos.is_meeting_item({"source_kind": "mi"}))
+
+
+class McpConfigTest(MiBase):
+    """`mcp_config` and `connect_delay_seconds` reach the bridge for the tool
+    calls only; the diff call stays strict with no MCP."""
+
+    def write_config(self, mode=0o600, name="mcp.json"):
+        path = Path(self.tmp.name) / name
+        path.write_text(json.dumps({"mcpServers": {"example-mi": {
+            "type": "stdio", "command": "/path/to/example-mi-server",
+            "args": []}}}))
+        os.chmod(path, mode)
+        return str(path)
+
+    def problems(self, **extra):
+        routine = example_routine()
+        routine["source"].update(extra)
+        return config.validate(routine)
+
+    def test_a_good_file_validates(self):
+        self.assertEqual(self.problems(mcp_config=self.write_config()), [])
+
+    def test_a_leading_tilde_is_expanded(self):
+        path = self.write_config()
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
+            self.assertEqual(self.problems(mcp_config="~/mcp.json"), [])
+            self.assertEqual(
+                mi_source.settings({"mcp_config": "~/mcp.json"})["mcp_config"],
+                path)
+
+    def test_a_missing_file_is_reported(self):
+        missing = str(Path(self.tmp.name) / "nope.json")
+        found = self.problems(mcp_config=missing)
+        self.assertTrue(any("mcp_config" in p and "cannot open" in p
+                            for p in found), found)
+
+    def test_a_relative_path_is_reported(self):
+        for value in ("mcp.json", "", 5, None):
+            found = self.problems(mcp_config=value)
+            self.assertTrue(any("mcp_config must be an absolute path" in p
+                                for p in found), (value, found))
+
+    def test_a_loose_mode_is_reported(self):
+        found = self.problems(mcp_config=self.write_config(mode=0o644))
+        self.assertTrue(any("mcp_config" in p and "chmod 600" in p
+                            for p in found), found)
+
+    def test_a_directory_is_reported(self):
+        found = self.problems(mcp_config=self.tmp.name)
+        self.assertTrue(any("mcp_config" in p for p in found), found)
+
+    def test_connect_delay_is_bounded(self):
+        for value in (0, 6, 12.5, 60):
+            self.assertEqual(self.problems(connect_delay_seconds=value), [],
+                             value)
+        for value in (-1, 61, "6", True, None):
+            found = self.problems(connect_delay_seconds=value)
+            self.assertTrue(any("connect_delay_seconds" in p for p in found),
+                            (value, found))
+
+    def test_defaults_keep_the_bridge_behaviour(self):
+        self.write_mila_entry()
+        self.list_candidates()
+        kwargs = self.service.calls[0]["kwargs"]
+        self.assertIsNone(kwargs["mcp_config"])
+        self.assertEqual(kwargs["connect_delay"],
+                         claude_bridge.CONNECT_DELAY_SECONDS)
+
+    def test_tool_calls_get_the_config_and_the_delay(self):
+        path = self.write_config()
+        self.source.update(mcp_config=path, connect_delay_seconds=15)
+        self.write_mila_entry()
+        found = self.list_candidates()
+        self.fetch(found[0])
+        self.assertEqual(len(self.service.calls), 2)  # list, then summary+transcript
+        for call in self.service.calls:
+            self.assertEqual(call["kwargs"]["mcp_config"], path)
+            self.assertEqual(call["kwargs"]["connect_delay"], 15)
 
 
 if __name__ == "__main__":

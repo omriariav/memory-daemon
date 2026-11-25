@@ -2214,6 +2214,22 @@ def _validate_zoom(prefix, source):
     return problems
 
 
+def _validate_mi_mcp_config(prefix, path):
+    """The MI server's MCP config file: absolute (a leading ~ is fine), and
+    present, owned by you, mode 0600 (the bridge's own check, run now so a
+    bad file shows up in `validate`, not in the first run)."""
+    from . import claude_bridge
+    if (not isinstance(path, str) or not path.strip() or "\0" in path
+            or not os.path.isabs(os.path.expanduser(path.strip()))):
+        return [f"{prefix}.mcp_config must be an absolute path to a JSON "
+                "file of MCP servers (a leading ~ is fine)"]
+    try:
+        claude_bridge.read_mcp_config(os.path.expanduser(path.strip()))
+    except claude_bridge.BridgeError as exc:
+        return [f"{prefix}.mcp_config: {exc}"]
+    return []
+
+
 def _validate_mi(prefix, source, routine):
     """MI cross-check: three exact read-only tools, a calendar file, bounds,
     and the privacy rules (content may reach Anthropic models only)."""
@@ -2296,6 +2312,15 @@ def _validate_mi(prefix, source, routine):
     for key in ("shadow", "skip_declined"):
         if key in source and not isinstance(source[key], bool):
             problems.append(f"{prefix}.{key} must be true or false")
+    if "mcp_config" in source:
+        problems.extend(_validate_mi_mcp_config(prefix, source["mcp_config"]))
+    delay = source.get("connect_delay_seconds")
+    if "connect_delay_seconds" in source and (
+        not isinstance(delay, (int, float)) or isinstance(delay, bool)
+        or not 0 <= delay <= 60
+    ):
+        problems.append(
+            f"{prefix}.connect_delay_seconds must be a number from 0 to 60")
     for key in ("model", "diff_model"):
         if key in source and not (
             isinstance(source[key], str)

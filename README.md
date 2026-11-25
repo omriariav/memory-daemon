@@ -2035,7 +2035,8 @@ Keys: `list_tool`, `summary_tool`, `transcript_tool`, `calendar_file`
 `from` of the list call), `retry_hours` (24), `max_sessions_per_run` (5),
 `max_summary_chars` (20000), `max_transcript_chars` (60000), `diff_model`
 (`sonnet`), `model` (`haiku`, the bridge model for the tool calls),
-`primary_sources` (`[mila]`), `primary_recordings_file` (unset).
+`primary_sources` (`[mila]`), `primary_recordings_file` (unset),
+`mcp_config` (unset), `connect_delay_seconds` (6, from 0 to 60).
 `calendar_timezone` is required, `grace_minutes` must be less than
 `retry_hours * 60`, and `lookback_hours` must be at least `retry_hours` (a
 pending session the service no longer lists would otherwise hold its sibling
@@ -2047,6 +2048,32 @@ unsettled. Without `primary_recordings_file`, set `grace_minutes` above the Mila
 routine's worst-case delay (`language_check.hold_minutes`, plus its app-summary
 wait and schedule), or an MI-only entry may be written for a meeting Mila
 captures later. The routine also needs `memory.store`.
+
+`mcp_config` and `connect_delay_seconds`: the tool calls run through the
+headless Claude bridge (`claude -p --setting-sources ""`), and a headless run
+does **not** load user-scope MCP servers from your Claude config; only claude.ai
+connectors are loaded. So when the MI server is not a claude.ai connector (for
+example a local stdio server you added with `claude mcp add`), `mcp_config` is
+required: an absolute path (a leading `~` is fine) to a JSON file in Claude
+Code's MCP config format, for example
+
+```json
+{"mcpServers": {"example-mi": {"type": "stdio",
+  "command": "/path/to/example-mi-server", "args": []}}}
+```
+
+The server name in the file must match the `<server>` part of the three tool
+names (`mcp__example-mi__list_meetings`, and so on). The file is passed as
+`--mcp-config <copy> --strict-mcp-config`, so the run loads only the servers in
+that file, and the tool allowlist still limits it to the three pinned read
+tools. It must be a regular file you own with mode 0600 (up to 1 MB), opened
+without following symlinks; `daemon.py validate` reports a missing, relative or
+unsafe file. It applies to the list, summary and transcript calls; the diff
+call stays strict with no MCP. A slow stdio server may not have listed its
+tools when the CLI starts, so `connect_delay_seconds` holds the prompt back that
+long (default 6, the bridge's wait for connectors; raise it for a slower
+server). A run that still finds no tools is retried once (`attempts: 2`) and
+then fails with "required tool results missing".
 
 Privacy: MI content reaches Anthropic models only, which validation enforces
 (`analyze.provider: claude`, `model` and `diff_model` an Anthropic alias or
