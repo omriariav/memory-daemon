@@ -120,6 +120,41 @@ class ZoomSourceTest(unittest.TestCase):
     def meetings(self):
         return zoom_source.load_state()
 
+    def write_calendar_with_recent(self, events, recent):
+        self.calendar.write_text(json.dumps({
+            "events": events, "recent_events": recent,
+            "refreshed_at": iso(self.now), "owner_email": "ann@example.com",
+        }))
+
+    def test_a_running_meeting_in_recent_events_is_tracked(self):
+        self.at(10)  # started 10 minutes ago, ends in 20
+        self.write_calendar_with_recent([], [event()])
+        self.listing()
+        self.assertEqual(self.meetings()["ev1"]["number"], "91234567890")
+
+    def test_recent_events_are_read_and_deduped_by_event_id(self):
+        self.at(10)
+        newer = dict(event(), title="Renamed")
+        self.write_calendar_with_recent(
+            [newer], [event(), event("ev2", number="91234567891")])
+        events, _ = zoom_source._read_calendar(
+            dict(zoom_source.settings(self.source)), self.now.timestamp())
+        self.assertEqual([e["event_id"] for e in events], ["ev1", "ev2"])
+        self.assertEqual(events[0]["title"], "Renamed")  # events wins
+        self.listing()
+        self.assertEqual(set(self.meetings()), {"ev1", "ev2"})
+
+    def test_a_file_without_recent_events_or_with_a_bad_one(self):
+        self.at(10)
+        cfg = dict(zoom_source.settings(self.source))
+        self.write_calendar([event()])
+        events, _ = zoom_source._read_calendar(cfg, self.now.timestamp())
+        self.assertEqual([e["event_id"] for e in events], ["ev1"])
+        for bad in ("x", {"a": 1}, None, [1, "x"]):
+            self.write_calendar_with_recent([event()], bad)
+            events, _ = zoom_source._read_calendar(cfg, self.now.timestamp())
+            self.assertEqual([e["event_id"] for e in events], ["ev1"], bad)
+
     def test_meeting_number_from_join_links(self):
         hosts = ["zoom.us"]
         self.assertEqual(zoom_source.meeting_number(

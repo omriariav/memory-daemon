@@ -49,6 +49,7 @@ MAX_LINKS = 3
 DEFAULT_MAX_DETAILS = 20
 DEFAULT_STALE_AFTER = "2h"
 DEFAULT_EVENTS_WINDOW_DAYS = 7
+MAX_LOOKBACK_HOURS = 72
 # Far invites: past the diff window, up to invite_lookahead_days ahead, the
 # unanswered invites are checked once an hour in pinned 7-day listings.
 INVITE_CHUNK_DAYS = 7
@@ -842,45 +843,52 @@ def render_text(events, cfg, now, stale=False):
     return f"{header}\n# {UNTRUSTED_NOTE}\n{body}\n"
 
 
-def render_json(events, cfg, now):
-    tz = ZoneInfo(cfg.get("timezone", "UTC"))
-
+def _json_row(event, tz):
     def iso(value, all_day):
         return value.isoformat() if all_day else value.astimezone(tz).isoformat()
 
-    rows = []
-    for event in events:
-        row = {
-            "event_id": event["event_id"],
-            "start": iso(event["start"], event["all_day"]),
-            "end": iso(event["end"], event["all_day"]),
-            "all_day": event["all_day"],
-            "title": event["title"],
-            "my_rsvp": event["my_rsvp"],
-            "organizer": event["organizer"],
-            "location": event["location"],
-            "conference_url": event["conference_url"],
-            "conference_solution": event["conference_solution"],
-            "rooms": event["rooms"],
-            "attendees": [
-                {k: v for k, v in person.items() if k not in ("self", "optional")}
-                for person in event["attendees"]
-            ],
-            "links": event["links"],
-            "recurring": event["recurring"],
-            "show_as": event.get("show_as"),
-        }
-        if event["description"]:
-            row["description"] = event["description"]
-        rows.append(row)
-    return json.dumps({
+    row = {
+        "event_id": event["event_id"],
+        "start": iso(event["start"], event["all_day"]),
+        "end": iso(event["end"], event["all_day"]),
+        "all_day": event["all_day"],
+        "title": event["title"],
+        "my_rsvp": event["my_rsvp"],
+        "organizer": event["organizer"],
+        "location": event["location"],
+        "conference_url": event["conference_url"],
+        "conference_solution": event["conference_solution"],
+        "rooms": event["rooms"],
+        "attendees": [
+            {k: v for k, v in person.items() if k not in ("self", "optional")}
+            for person in event["attendees"]
+        ],
+        "links": event["links"],
+        "recurring": event["recurring"],
+        "show_as": event.get("show_as"),
+    }
+    if event["description"]:
+        row["description"] = event["description"]
+    return row
+
+
+def render_json(events, cfg, now, recent=None):
+    """The JSON twin. `recent` (events that started before now, only when
+    lookback_hours > 0) goes under its own `recent_events` key; `events` is
+    never touched by it."""
+    tz = ZoneInfo(cfg.get("timezone", "UTC"))
+    doc = {
         "refreshed_at": now.astimezone(tz).isoformat(),
         "window_hours": cfg.get("window_hours", 48),
         "timezone": cfg.get("timezone", "UTC"),
         "note": UNTRUSTED_NOTE,
         "owner_email": str(cfg.get("owner_email") or "").strip().lower(),
-        "events": rows,
-    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        "events": [_json_row(event, tz) for event in events],
+    }
+    if recent is not None:
+        doc["lookback_hours"] = lookback_hours(cfg)
+        doc["recent_events"] = [_json_row(event, tz) for event in recent]
+    return json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 # --- fetch + run -----------------------------------------------------------
@@ -893,6 +901,28 @@ def diff_hours(cfg):
 def fetch_hours(cfg):
     """One listing covers both the output window and the (wider) diff window."""
     return max(float(cfg.get("window_hours", 48)), diff_hours(cfg))
+
+
+def lookback_hours(cfg):
+    """How far back `recent_events` reaches; 0 (the default) keeps it off."""
+    return float(cfg.get("lookback_hours", 0) or 0)
+
+
+def recent_args(cfg, now):
+    """Pinned list arguments for the past part: [now - lookback, now].
+
+    A listing of its own (not a wider main one), so past events can never use
+    up the max_events of the upcoming listing or skew the event diff.
+    """
+    time_max = now.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    time_min = time_max - datetime.timedelta(hours=lookback_hours(cfg))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return {
+        "calendar_id": cfg.get("calendar_id", "primary"),
+        "time_min": time_min.strftime(fmt),
+        "time_max": time_max.strftime(fmt),
+        "max_results": int(cfg.get("max_events", 50)),
+    }
 
 
 def list_args(cfg, now):
@@ -1145,6 +1175,72 @@ def in_window(listed, now, window_hours, tz):
         if end < now or (end == now and start != end):
             continue
         kept.append(event)
+    return kept
+
+
+def in_lookback(listed, now, hours, tz):
+    """Events that started before `now` and ended after now - hours;
+    cancelled ones are dropped."""
+    floor = now - datetime.timedelta(hours=float(hours))
+    kept = []
+    for event in listed:
+        if (event.get("status") or "") == "cancelled":
+            continue
+        start, end = _bounds(event, tz)
+        if start < now and end > floor:
+            kept.append(event)
+    return kept
+
+
+def fetch_recent(cfg, base_dir, now, tz):
+    """Past events (started before now, within lookback_hours), normalized.
+
+    One extra bridge session, listing only; no detail lookups. Raises the
+    bridge or parse error; the caller decides what a failure costs.
+    """
+    args = recent_args(cfg, now)
+    list_tool = cfg["list_tool"]
+    results = claude_bridge.call_tools(
+        _invite_prompt(cfg, args), {list_tool: args},
+        model=cfg.get("model", "haiku"), base_dir=base_dir,
+        max_turns=4, max_budget_usd=0.1, timeout=BRIDGE_TIMEOUT,
+        attempts=1, required=[list_tool], accept_partial=True,
+    )
+    listing = next(
+        (r for r in results if r["name"] == list_tool
+         and not r.get("is_error") and r.get("input") == args),
+        None,
+    )
+    if listing is None:
+        raise claude_bridge.BridgeError(
+            "list_events produced no result with the pinned arguments"
+        )
+    parsed = parse_list(listing["text"], tz)
+    if len(parsed) >= args["max_results"]:
+        log("calendar_cache: the lookback listing reached max_events; "
+            "the latest past events may be cut (raise max_events or lower "
+            "lookback_hours)")
+    return normalize(
+        in_lookback(parsed, now, lookback_hours(cfg), tz), {}, cfg, tz
+    )
+
+
+def carry_recent(cfg, json_path, now, tz):
+    """Past events from the previous JSON, for a refresh whose lookback fetch
+    failed: its `recent_events` plus every `events` row that has started since.
+    Empty when there is no readable previous file."""
+    try:
+        data = json.loads(json_path.read_text())
+        rows = list(data.get("recent_events") or []) + list(data["events"])
+        events = [_event_from_row(row, tz) for row in rows]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+    seen, kept = set(), []
+    for event in in_lookback(events, now, lookback_hours(cfg), tz):
+        if event["event_id"] not in seen:
+            seen.add(event["event_id"])
+            kept.append(event)
+    kept.sort(key=lambda e: (_sort_start(e, tz), e["title"]))
     return kept
 
 
@@ -1655,7 +1751,18 @@ def run(cfg, base_dir, dry_run=False, now=None, routine_id="calendar-cache"):
         listed, details, wide = fetch(cfg, base_dir, now, tz)
         events = normalize(listed, details, cfg, tz)
         text = render_text(events, cfg, now)
-        twin = render_json(events, cfg, now)
+        recent = None
+        if lookback_hours(cfg) > 0:
+            try:
+                recent = fetch_recent(cfg, base_dir, now, tz)
+            except (claude_bridge.BridgeError, CalendarParseError) as exc:
+                # Past events only feed the meeting sources: never fail the
+                # refresh (the text file, the diff) for them.
+                recent = carry_recent(cfg, json_path, now, tz)
+                log(f"calendar_cache WARN lookback fetch failed "
+                    f"({type(exc).__name__}); kept {len(recent)} past "
+                    "event(s) from the previous file")
+        twin = render_json(events, cfg, now, recent)
     except Exception:
         try:
             if mark_stale(cfg, text_path, json_path, now):
@@ -1686,6 +1793,9 @@ def run(cfg, base_dir, dry_run=False, now=None, routine_id="calendar-cache"):
     except Exception as exc:  # noqa: BLE001 - announcements only
         log(f"calendar_cache WARN far invite scan failed: "
             f"{type(exc).__name__}: {exc}")
-    return {"ok": True, "dry_run": False, "events": len(events),
-            "details": len(details), "emitted": emitted, "output": str(text_path),
-            "json": str(json_path)}
+    report = {"ok": True, "dry_run": False, "events": len(events),
+              "details": len(details), "emitted": emitted,
+              "output": str(text_path), "json": str(json_path)}
+    if recent is not None:
+        report["recent_events"] = len(recent)
+    return report

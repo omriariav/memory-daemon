@@ -55,6 +55,8 @@ source:
   # mcp_config: ~/.config/memory-daemon/example-mi-mcp.json
   # connect_delay_seconds: 15    # 0 to 60 (default 6): wait for a slow stdio
   #                              # server to list its tools before the prompt
+  # The calendar_cache routine must set lookback_hours >= this source's
+  # lookback_hours (below): the file then lists past meetings in `recent_events`.
   calendar_file: ~/.cache/claude-calendar/next48h.json
   calendar_timezone: Europe/London
   skip_declined: true

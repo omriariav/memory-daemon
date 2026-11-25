@@ -792,10 +792,27 @@ maintenance:
   max_details: 20                      # get_event lookups per run, soonest first
   stale_after: 2h                      # mark the text file STALE after this
   conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]
+  lookback_hours: 0                    # 0 = off; N (0-72) adds recent_events to the JSON
 ```
 
 `owner_email`, `list_tool`, `get_tool` and `output` are required. Tool names
 are exact MCP names from your connector and are never defaulted.
+
+Past events (`lookback_hours`, default `0` = off): the text file and `events`
+only ever hold what is still ahead, so a finished meeting is never in them.
+With `lookback_hours: N` (0 to 72) each run makes one more pinned list call,
+in its own bridge session, for `[now - N hours, now]` (`max_results` =
+`max_events`; no detail lookups) and writes the events that started before now
+under a separate JSON key, `recent_events` (same per-event shape as `events`),
+plus `lookback_hours`. Cancelled events are dropped. `events`, the text file,
+the event diff, free/busy and invite scans are unchanged, and the past listing
+has its own `max_events`, so it never crowds out upcoming events. A meeting
+that is running now is in both lists; readers dedupe by event id. If this
+extra call fails the refresh still succeeds: `recent_events` keeps the earlier
+file's past events plus any `events` that have started since, and a warning is
+logged. Only the `mi` and `zoom` sources read `recent_events`; a file without
+the key (an older refresh) works as before. If the lookback listing reaches
+`max_events`, the latest past events may be cut (a warning is logged).
 
 Busy/free: `get_event` does not return "Show as", so with `freebusy_tool` set
 the fetch makes one extra free/busy call for the whole window (primary
@@ -1874,7 +1891,9 @@ shared with you. Zoom search misses meetings created from a calendar, so
 discovery reads the `calendar_cache` routine's JSON twin instead
 (`calendar_file`). Every event whose join link is on a `conference_hosts` host
 and carries a meeting number is remembered in `state/zoom-meetings.json`
-(declined events are skipped; personal `/my/` links carry no number).
+(declined events are skipped; personal `/my/` links carry no number). The file
+also lists past meetings under `recent_events` when the `calendar_cache` routine
+sets `lookback_hours`; they are read the same way (deduped by event id).
 
 After a meeting ends, one bridge session per run calls the read-only
 `assets_tool` (`mcp__<server>__get_meeting_assets`) for each due meeting. A
@@ -1942,7 +1961,11 @@ primary capture arrives), and every `mi-gcal:` link comes from a start within
 `retry_hours`, then dropped; a declined event is skipped (`skip_declined`).
 MI data arrives 13 to 50 minutes after a meeting ends. Events are remembered in
 `state/mi-sessions.json` (0600) because the calendar file holds only the next
-hours.
+hours. A meeting that ended before the source first saw it (a restart, a new
+routine, a refresh gap) has no event to match, so set the `calendar_cache`
+routine's `lookback_hours` to at least this source's `lookback_hours` (for
+example `24`): the file then also carries `recent_events`, which MI reads
+together with `events` (deduped by event id).
 
 Three cases, by what the store holds for the calendar event:
 

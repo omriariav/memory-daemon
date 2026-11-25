@@ -64,3 +64,9 @@ maintenance:
   # Conference links from outside events are kept only for these hosts (and
   # their subdomains).
   conference_hosts: [zoom.us, meet.google.com, teams.microsoft.com]
+  # Optional, 0-72, default 0 (off): also list events that started up to this
+  # many hours ago into a separate `recent_events` key of the JSON twin (the
+  # text file and `events` are unchanged). The mi and zoom sources need it to
+  # match a meeting that already ended; use at least the mi lookback_hours
+  # (for example 24).
+  # lookback_hours: 24

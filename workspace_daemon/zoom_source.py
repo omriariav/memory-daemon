@@ -199,6 +199,7 @@ def save_state(meetings):
 
 def _read_calendar(cfg, now, label="zoom"):
     """(events, refreshed epoch) from the calendar cache file; ([], None) if absent.
+    `events` plus `recent_events` when the file has them, deduped by event id.
 
     `label` prefixes the log lines (the mi source reads the same file)."""
     path = Path(str(cfg["calendar_file"])).expanduser()
@@ -215,6 +216,16 @@ def _read_calendar(cfg, now, label="zoom"):
         log(f"{label} WARN calendar file is stale; new meetings may be missed")
     owner = str(data.get("owner_email") or "").strip().casefold()
     events = [e for e in data["events"] if isinstance(e, dict)]
+    # `recent_events` (calendar_cache lookback_hours) holds meetings that
+    # started before the refresh; absent in an older file. By event id, the
+    # upcoming list wins.
+    recent = data.get("recent_events")
+    if isinstance(recent, list):
+        known = {e.get("event_id") for e in events}
+        for event in recent:
+            if isinstance(event, dict) and event.get("event_id") not in known:
+                known.add(event.get("event_id"))
+                events.append(event)
     if owner:
         # The file drops the per-row `self` flag; restore it from the owner.
         for event in events:

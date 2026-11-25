@@ -24,6 +24,7 @@ source:
   kind: zoom
   # Exact MCP tool name as your connector exposes it (`claude mcp list`).
   assets_tool: mcp__claude_ai_Example_Zoom__get_meeting_assets
+  # Also reads `recent_events` when the calendar_cache routine sets lookback_hours.
   calendar_file: ~/.cache/claude-calendar/next48h.json
   model: haiku                 # bridge model; it only transports tool results
   conference_hosts: [zoom.us]  # join links on these hosts carry the meeting number

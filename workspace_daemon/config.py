@@ -50,7 +50,7 @@ MAINTENANCE_ALLOWED_KEYS = {
         "internal_domains", "output", "skip_titles", "max_attendee_names",
         "model", "list_tool", "get_tool", "max_events", "max_details",
         "stale_after", "conference_hosts", "events_window_days",
-        "invite_lookahead_days", "freebusy_tool",
+        "invite_lookahead_days", "freebusy_tool", "lookback_hours",
     },
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
@@ -1701,6 +1701,15 @@ def _validate_calendar_cache(rid, cfg):
         problems.append(
             f"{rid}: maintenance.invite_lookahead_days must be a number "
             "from 0 (off) to 35"
+        )
+    lookback = cfg.get("lookback_hours", 0)
+    if (
+        not isinstance(lookback, (int, float)) or isinstance(lookback, bool)
+        or not 0 <= lookback <= 72
+    ):
+        problems.append(
+            f"{rid}: maintenance.lookback_hours must be a number "
+            "from 0 (off) to 72"
         )
     days = cfg.get("events_window_days", 7)
     if (

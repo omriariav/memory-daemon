@@ -1472,6 +1472,206 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.out.parent.stat().st_mode & 0o777, 0o755)
 
 
+PAST_TEXT = "Found 4 event(s):\n\n" + "\n".join([
+    _timed("past1", "2026-10-20T06:00:00Z", "2026-10-20T07:00:00Z", "Standup"),
+    _timed("running", "2026-10-20T08:00:00Z", "2026-10-20T09:00:00Z", "Sync"),
+    _timed("old", "2026-10-19T05:00:00Z", "2026-10-19T06:00:00Z", "Too old"),
+    _timed("gone", "2026-10-20T05:00:00Z", "2026-10-20T05:30:00Z", "Gone")
+    + "  Status: cancelled\n",
+])
+
+
+class LookbackTest(unittest.TestCase):
+    """lookback_hours: past events go only into the JSON's recent_events."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name) / "base"
+        self.base.mkdir()
+        self.out = Path(tmp.name) / "out" / "next48h.txt"
+        self.twin = self.out.with_suffix(".json")
+        self.cfg = cfg(output=str(self.out), lookback_hours=24)
+        self.past = PAST_TEXT
+        self.fail_past = False
+        self.sessions = []
+        self.now = NOW
+
+    def fake(self, prompt, tools, **kwargs):
+        args = tools[LIST_TOOL]
+        self.sessions.append((prompt, tools, kwargs))
+        if args == calendar_cache.recent_args(self.cfg, self.now):
+            if self.fail_past:
+                raise claude_bridge.BridgeError("boom")
+            text = self.past
+        else:
+            text = LIST_TEXT
+        return [tool_call(LIST_TOOL, text, **args)]
+
+    def run_cache(self, now=NOW, **over):
+        self.cfg.update(over)
+        self.now = now
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools", side_effect=self.fake,
+        ), mock.patch.object(calendar_cache, "log") as log:
+            report = calendar_cache.run(self.cfg, self.base, now=now)
+        self.log = log
+        return report
+
+    def data(self):
+        return json.loads(self.twin.read_text())
+
+    def test_recent_args_are_exact(self):
+        self.assertEqual(
+            calendar_cache.recent_args(cfg(lookback_hours=24, max_events=7), NOW),
+            {"calendar_id": "primary", "time_min": "2026-10-19T08:30:00Z",
+             "time_max": "2026-10-20T08:30:00Z", "max_results": 7})
+        self.assertEqual(
+            calendar_cache.recent_args(cfg(lookback_hours=1.5), NOW)["time_min"],
+            "2026-10-20T07:00:00Z")
+
+    def test_main_window_args_do_not_change_with_lookback(self):
+        self.assertEqual(
+            calendar_cache.list_args(cfg(lookback_hours=24), NOW),
+            calendar_cache.list_args(cfg(), NOW))
+        self.assertEqual(
+            calendar_cache.list_args(cfg(lookback_hours=24), NOW)["time_min"],
+            "2026-10-20T08:30:00Z")
+
+    def test_off_by_default_one_session_and_no_new_keys(self):
+        self.cfg.pop("lookback_hours")
+        report = self.run_cache()
+        self.assertEqual(len(self.sessions), 1)
+        data = self.data()
+        self.assertNotIn("recent_events", data)
+        self.assertNotIn("lookback_hours", data)
+        self.assertNotIn("recent_events", report)
+
+    def test_zero_is_off(self):
+        self.run_cache(lookback_hours=0)
+        self.assertEqual(len(self.sessions), 1)
+        self.assertNotIn("recent_events", self.data())
+
+    def test_second_session_is_pinned_to_the_past_window(self):
+        report = self.run_cache()
+        self.assertEqual(len(self.sessions), 2)
+        prompt, tools, kwargs = self.sessions[1]
+        self.assertEqual(tools, {LIST_TOOL: {
+            "calendar_id": "primary", "time_min": "2026-10-19T08:30:00Z",
+            "time_max": "2026-10-20T08:30:00Z", "max_results": 50}})
+        self.assertIn('time_min "2026-10-19T08:30:00Z"', prompt)
+        self.assertEqual(kwargs["required"], [LIST_TOOL])
+        # The main session is the unchanged one.
+        self.assertEqual(self.sessions[0][1][LIST_TOOL]["time_min"],
+                         "2026-10-20T08:30:00Z")
+        self.assertEqual(report["recent_events"], 2)
+
+    def test_recent_events_contents(self):
+        self.run_cache()
+        data = self.data()
+        self.assertEqual(data["lookback_hours"], 24)
+        recent = data["recent_events"]
+        # sorted; cancelled and out-of-range dropped; same shape as events
+        self.assertEqual([e["event_id"] for e in recent],
+                         ["past1", "running"])
+        base_keys = {"event_id", "start", "end", "all_day", "title",
+                     "my_rsvp", "organizer", "location", "conference_url",
+                     "conference_solution", "rooms", "attendees", "links",
+                     "recurring", "show_as"}
+        for row in recent + data["events"]:
+            self.assertEqual(set(row) - {"description"}, base_keys)
+        self.assertEqual(recent[0]["title"], "Standup")
+        self.assertEqual(recent[0]["start"], "2026-10-20T15:00:00+09:00")
+        self.assertIsNone(recent[0]["show_as"])
+
+    def test_events_text_and_diff_are_unchanged(self):
+        plain_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(plain_dir.cleanup)
+        plain_out = Path(plain_dir.name) / "next48h.txt"
+        plain_cfg = cfg(output=str(plain_out))
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools",
+            return_value=[list_call(LIST_TEXT)],
+        ):
+            calendar_cache.run(plain_cfg, self.base, now=NOW)
+        self.run_cache()
+        self.assertEqual(self.out.read_text(), plain_out.read_text())
+        expected = json.loads(plain_out.with_suffix(".json").read_text())
+        data = self.data()
+        self.assertEqual(data["events"], expected["events"])
+        for key in ("refreshed_at", "window_hours", "timezone", "owner_email"):
+            self.assertEqual(data[key], expected[key])
+        self.assertNotIn("past1", self.out.read_text())
+
+    def test_event_diff_is_not_skipped_by_past_events(self):
+        # The past listing is separate, so it cannot fill max_events of the
+        # main one: a wide diff window still runs.
+        self.run_cache(events_window_days=7, max_events=4)
+        self.assertEqual(len(self.sessions), 2)
+        self.assertTrue((self.base / "state" / "calendar-snapshot.json").exists())
+
+    def test_failed_past_fetch_keeps_the_refresh(self):
+        self.run_cache()
+        first = self.data()
+        self.fail_past = True
+        later = NOW + datetime.timedelta(hours=1)
+        report = self.run_cache(now=later)
+        data = self.data()
+        self.assertEqual(report["events"], 2)
+        self.assertIn("Weekly sync", self.out.read_text())
+        # past1/running carried over; the events that started since are added
+        ids = [e["event_id"] for e in data["recent_events"]]
+        self.assertEqual(ids[:2], ["past1", "running"])
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("1abcdefrecurring_20261020T090000Z", ids)
+        self.assertEqual(data["refreshed_at"][:13], "2026-10-20T18")
+        self.assertTrue(any("lookback fetch failed" in c.args[0]
+                            for c in self.log.call_args_list))
+        self.assertEqual(first["events"], data["events"])
+
+    def test_failed_past_fetch_without_a_previous_file(self):
+        self.fail_past = True
+        self.run_cache()
+        self.assertEqual(self.data()["recent_events"], [])
+        self.assertIn("Weekly sync", self.out.read_text())
+
+    def test_unparseable_past_listing_does_not_fail_the_run(self):
+        self.past = "Something odd"
+        self.run_cache()
+        self.assertEqual(self.data()["recent_events"], [])
+
+    def test_empty_past_listing(self):
+        self.past = "No events found"
+        self.run_cache()
+        self.assertEqual(self.data()["recent_events"], [])
+
+    def test_a_full_past_listing_warns(self):
+        self.run_cache(max_events=4)
+        self.assertTrue(any("lookback listing reached max_events" in c.args[0]
+                            for c in self.log.call_args_list))
+
+    def test_failed_main_fetch_still_fails(self):
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools",
+            side_effect=claude_bridge.BridgeError("boom"),
+        ):
+            with self.assertRaises(claude_bridge.BridgeError):
+                calendar_cache.run(self.cfg, self.base, now=NOW)
+        self.assertFalse(self.twin.exists())
+
+    def test_stale_marking_ignores_recent_events(self):
+        self.run_cache()
+        later = NOW + datetime.timedelta(hours=3)
+        with mock.patch.object(
+            calendar_cache.claude_bridge, "call_tools",
+            side_effect=claude_bridge.BridgeError("boom"),
+        ):
+            with self.assertRaises(claude_bridge.BridgeError):
+                calendar_cache.run(self.cfg, self.base, now=later)
+        self.assertIn("STALE", self.out.read_text())
+        self.assertNotIn("Standup", self.out.read_text())
+
+
 class StaleTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1587,6 +1787,14 @@ class ConfigTest(unittest.TestCase):
 
     def test_tools_must_differ(self):
         self.assertTrue(self.problems(get_tool=LIST_TOOL))
+
+    def test_lookback_hours_validated(self):
+        for good in (0, 1, 24, 72, 1.5):
+            self.assertEqual(self.problems(lookback_hours=good), [], good)
+        for bad in (-1, 73, "24", True, None, [24]):
+            self.assertTrue(
+                any("lookback_hours" in p
+                    for p in self.problems(lookback_hours=bad)), bad)
 
     def test_output_must_be_absolute_or_tilde(self):
         for bad in ("cache/next.txt", "./next.txt", "next.txt"):
