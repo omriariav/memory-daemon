@@ -21,6 +21,12 @@ type the model chose. In `review` mode the actions are not filed one by one:
 one `needs-review` todo lists every candidate (verified or not) and one JSON
 line per meeting goes to a candidates queue (see `action_review_queue.py`).
 
+The model's `evidence_ts` is a hint, not a requirement: an unusable one (0,
+"0", "00:00", free text, ...) is dropped and the row is kept, grounded by its
+text against the owner's own transcript lines (`ground_without_ts`). A usable
+timestamp that matches no owner line gets the same text check before the row
+is given up.
+
 Pure helpers live here (config, prompt text, strict validation, deterministic
 grounding, stable keys); writing goes through memory_sink so the store CLI
 stays the only writer.
@@ -45,6 +51,10 @@ REVIEW_EVIDENCE = "meeting-owner-action-review"
 MODES = ("file", "review")
 DEFAULT_MODE = "file"
 DEFAULT_QUEUE_NAME = "meeting-action-candidates.jsonl"
+NO_TS_REASON = "no timestamp and no owner-spoken line matches it"
+TEXT_MATCH_REASON = "matched by text"
+MAX_TS_SECONDS = 86400
+TEXT_MATCH_MIN = 0.75
 QUOTE_LIMIT = 240
 CANDIDATE_TEXT_LIMIT = 200
 MEETING_SOURCE_PREFIXES = tuple(f"{k}:" for k in sorted(MEETING_KINDS))
@@ -66,7 +76,8 @@ PROMPT_SECTION = """  "owner_actions": array (at most {max_per_item}) of {owner}
             (hints are candidates only). Use [] when none.{existing}
 """
 TS_SCHEMA = (', "evidence_ts": the timestamp in brackets of the transcript '
-             'line where it was committed to, copied exactly (required)')
+             'line where it was committed to, copied exactly; leave the key '
+             'out when no transcript line carries one (never 0)')
 
 BACKFILL_PROMPT = """You are reading a stored meeting memory entry. Answer with a SINGLE JSON
 object, no markdown fence, no other text, with exactly one key:
@@ -236,11 +247,13 @@ def action_source_id(meeting_source_id, text):
     return f"{meeting_source_id}{ACTION_ID_PREFIX}{action_key(text)}"
 
 
-def validate_actions(raw, require_ts=False):
+def validate_actions(raw):
     """Strictly validate the model's `owner_actions`.
 
     Returns (clean list, dropped count), or (None, 0) when the value itself is
     not a list. An invalid element is dropped on its own; the rest are kept.
+    A row without a usable `evidence_ts` is kept without one (see
+    `usable_ts`); the caller grounds it by its text instead.
     """
     if raw is None:
         return [], 0
@@ -248,7 +261,7 @@ def validate_actions(raw, require_ts=False):
         return None, 0
     clean, dropped = [], 0
     for row in raw:
-        out = _clean_row(row, require_ts)
+        out = _check_row(row)[0]
         if out is None:
             dropped += 1
         else:
@@ -262,8 +275,43 @@ def validate_actions(raw, require_ts=False):
     return unique, dropped
 
 
-def _check_row(row, require_ts):
-    """(clean row, None) or (None, reason); a reason never quotes the row."""
+def usable_ts(value):
+    """A comparable timestamp string, or None when `value` is not one.
+
+    Usable: a string that fits `_TS_RE` and names a real, non-zero time of day
+    (`00:12:03`, `12:03`, `[00:12:03]`; surrounding brackets are stripped), or
+    a positive number of seconds below 24 h (int/float, converted to
+    `HH:MM:SS`, fraction dropped). Everything else
+    (a missing value, 0, 0.0, "0", "00:00", "0:00:00", a bool, NaN, a bare
+    digit string, free text) is None: a recorder's own action items carry
+    `timestamp_seconds: 0` and the model copies it. Never invents a time.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        if value >= MAX_TS_SECONDS:
+            return None
+        secs = int(value)
+        if secs <= 0:
+            return None
+        return f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not _TS_RE.fullmatch(text):
+        return None
+    norm = _norm_ts(text)
+    return text if norm and norm != "00:00:00" else None
+
+
+def _check_row(row):
+    """(clean row, None) or (None, reason); a reason never quotes the row.
+
+    An unusable `evidence_ts` is dropped, never a reason to refuse the row."""
     if not isinstance(row, dict):
         return None, "not an object"
     if set(row) - _KEYS:
@@ -280,26 +328,19 @@ def _check_row(row, require_ts):
         if not isinstance(due, str) or not _DATE_RE.fullmatch(due):
             return None, "bad due date"
         out["due"] = due
-    ts = row.get("evidence_ts")
-    if ts is not None:
-        if not isinstance(ts, str) or not _TS_RE.fullmatch(ts.strip()):
-            return None, "bad timestamp"
-        out["evidence_ts"] = ts.strip()
-    if require_ts and "evidence_ts" not in out:
-        return None, "missing timestamp"
+    ts = usable_ts(row.get("evidence_ts"))
+    if ts:
+        out["evidence_ts"] = ts
     return out, None
 
 
-def _clean_row(row, require_ts):
-    return _check_row(row, require_ts)[0]
-
-
-def classify_actions(raw, require_ts=False):
+def classify_actions(raw):
     """Every candidate the model returned, valid or not.
 
     Returns None when `raw` is not a list, else a list of
     `{"text", "status": "valid"|"invalid", "reason", ...}`; valid rows keep
-    `due` / `evidence_ts` and are de-duplicated like `validate_actions`
+    `due` and a usable `evidence_ts` (a row without one is still valid) and
+    are de-duplicated like `validate_actions`
     (a repeat is not a candidate). An invalid row keeps a readable, capped
     `text` when it has one; its reason never quotes it."""
     if raw is None:
@@ -308,15 +349,16 @@ def classify_actions(raw, require_ts=False):
         return None
     rows, seen = [], set()
     for row in raw:
-        out, reason = _check_row(row, require_ts)
+        out, reason = _check_row(row)
         if out is None:
             text = ""
             if isinstance(row, dict) and isinstance(row.get("text"), str):
                 text = " ".join(row["text"].split())[:CANDIDATE_TEXT_LIMIT]
             bad = {"text": text, "status": "invalid", "reason": reason}
-            ts = row.get("evidence_ts") if isinstance(row, dict) else None
-            if isinstance(ts, str) and _TS_RE.fullmatch(ts.strip()):
-                bad["evidence_ts"] = ts.strip()
+            ts = usable_ts(row.get("evidence_ts")) \
+                if isinstance(row, dict) else None
+            if ts:
+                bad["evidence_ts"] = ts
             rows.append(bad)
             continue
         key = action_key(out["text"])
@@ -387,6 +429,50 @@ def ground_in_transcript(body, evidence_ts, names, mapped_names=()):
             return True, rest
         if not owner_mapped and (not label or _GENERIC_SPEAKER_RE.match(label)):
             return True, rest
+    return False, None
+
+
+def _label_match(label, names):
+    """True when the speaker `label` IS an owner name: its whole words contain
+    all the words of a name, in order (case-insensitive, any script). "Dan"
+    and "Dan Cohen" match the name "Dan"; "Daniel" does not."""
+    got = re.findall(r"\w+", label.casefold())
+    for name in names:
+        want = re.findall(r"\w+", name.casefold())
+        if want and any(got[i:i + len(want)] == want
+                        for i in range(len(got) - len(want) + 1)):
+            return True
+    return False
+
+
+def ground_without_ts(body, text, names):
+    """(grounded, owner line) for an action that has no usable timestamp, or
+    whose timestamp matched no owner line.
+
+    Weaker than `ground_in_transcript`, but still owner-only: grounded when a
+    transcript line whose speaker label is an owner name (whole words, see
+    `_label_match`) shares at least `TEXT_MATCH_MIN` of the action's
+    significant words (4-letter stems, as `body_quote`). An unnamed or
+    non-owner line never grounds it. The line returned is the best-scoring
+    owner line (the first on a tie), speaker kept, capped. An action with
+    fewer than two significant words is never grounded this way."""
+    words = {w[:4] for w in normalize(text).split() if len(w) >= 4}
+    if len(words) < 2:   # one shared word is no evidence
+        return False, None
+    best, best_score = None, 0.0
+    for line in str(body or "").splitlines():
+        m = _LINE_RE.match(line.strip())
+        if not m:
+            continue
+        who = _SPEAKER_RE.match(m.group("rest"))
+        if not who or not _label_match(who.group("who"), names):
+            continue
+        spoken = normalize(m.group("rest")[who.end():])
+        score = len(words & {w[:4] for w in spoken.split()}) / len(words)
+        if score > best_score:
+            best, best_score = m.group("rest"), score
+    if best is not None and best_score >= TEXT_MATCH_MIN:
+        return True, " ".join(best.split())[:QUOTE_LIMIT] or None
     return False, None
 
 
@@ -490,7 +576,11 @@ def review_tags(routine, routine_tags, personal_tag=None, personal=False):
 
 def _flag(candidate):
     status = candidate["status"]
+    if status == "valid" and candidate.get("reason") == TEXT_MATCH_REASON:
+        return " [matched by text]"
     if status == "ungrounded":
+        if candidate.get("reason") == NO_TS_REASON:
+            return " [unverified: no timestamp]"
         return " [unverified: ungrounded]"
     if status == "invalid":
         return f" [invalid: {candidate.get('reason') or 'unknown'}]"

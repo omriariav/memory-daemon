@@ -1709,14 +1709,33 @@ memory:
   explicitly asked to do and accepted. Other people's actions stay in the
   meeting body; app hints are candidates only. Titles of todos already filed
   for the meeting are offered so a repeat run reuses them verbatim.
-- Deterministic grounding (live capture): `evidence_ts` is required and must
-  head a `[hh:mm:ss] Speaker: text` line of the transcript; when that line has
+- Deterministic grounding (live capture): `evidence_ts` should head a
+  `[hh:mm:ss] Speaker: text` line of the transcript; when that line has
   a real speaker name it must match an owner name. When the owner is mapped to a
   speaker in the recording (Mila `speakerNames`, or an owner-named line), only
   the owner's own lines ground an action: any other key, named or a raw
   `SPEAKER_NN`, fails. If the owner is not mapped at all, a named non-owner
   fails and an unnamed label passes. Other actions are dropped; logs carry
   counts only.
+- An unusable `evidence_ts` is dropped, never a reason to refuse the action
+  (a recorder's own action items carry `timestamp_seconds: 0` and the model
+  copies it). Unusable means absent, `0`, `0.0`, `"0"`, `"00:00"`,
+  `"0:00:00"`, a bool, NaN, a bare digit string or anything that is not a
+  clock time; a positive number of seconds is converted to `HH:MM:SS`. A row
+  without a timestamp is kept and grounded by its text instead: it needs a
+  transcript line spoken by a speaker named as the owner that shares most of
+  the action's significant words (an unnamed or other speaker's line never
+  grounds it). The speaker label must be an owner name as whole words
+  (`Dan` and `Dan Cohen` match the name `Dan`, `Daniel` does not), the action
+  needs at least two significant words and 75% of them in the line, and the
+  best-scoring owner line is the quote. A usable timestamp that matches no
+  owner line gets the same text check before the row is given up. File mode
+  drops a row that can be grounded by neither timestamp nor text (no speaker
+  names in the transcript, or a transcript in another language than the
+  action text); `review` mode lists it as `[unverified: no timestamp]` (or
+  `[unverified: ungrounded]` when it had a timestamp), and a candidate
+  grounded by text only is marked `[matched by text]`. A time is never
+  invented.
 - Each action becomes its own `todo`: title = the action text, people = the
   owner slug, tags = `tag` + the routine's tags minus source-type noise,
   body = one line naming the meeting entry id, timestamp and
@@ -1768,9 +1787,12 @@ grounded in the transcript), and:
   then goes under `<id>:auto`, i.e. `<meeting source id>:review:auto`. (A
   meeting that was itself captured under a derived `...:auto` id gets
   `...:auto:review`.) The body links the meeting entry id and lists each
-  candidate as a bullet with a marker, `[unverified: ungrounded]` or
-  `[invalid: <reason>]` (verified ones have none), and one line of evidence:
-  `quote` for a verified candidate, `line at timestamp` otherwise.
+  candidate as a bullet with a marker, `[unverified: ungrounded]`,
+  `[unverified: no timestamp]` (no usable timestamp and no owner line matches
+  the text), `[matched by text]` (verified, but by the owner's words and
+  not by timestamp) or `[invalid: <reason>]` (a candidate verified by its
+  timestamp has none), and one line of evidence: `quote` for a verified
+  candidate, `line at timestamp` otherwise.
 - `quote` is the grounding evidence and exists only for a `valid` candidate: the
   owner's own transcript line that matched the timestamp (live; if another
   speaker shares that second, still the owner's line), or the body sentence
