@@ -17,10 +17,11 @@ theme: dark                # dark | light   (ctrl+t flips it at runtime)
 # $INBOX_BIDI overrides this; the `b` key toggles at runtime.
 bidi_mode: auto
 
-# Tasks view: THIS WEEK is the next 7 days. Set week_start to end it at the
+# Tasks view: THIS WEEK is the next 7 days. Set work_week to end it at the
 # next start of your week instead, and to make the `s` picker's "Next Sunday"
-# the next week_start day (monday .. sunday).
-# week_start: sunday
+# the next `start` day (monday .. sunday). `days` (1-7, default 5) is stored for
+# later; same shape as the daemon's memory.work_week.
+# work_week: {start: sunday, days: 5}
 
 # Gmail links open /mail/u/<N>/: set N to your account's position when it is
 # not the first one signed in to your browser.

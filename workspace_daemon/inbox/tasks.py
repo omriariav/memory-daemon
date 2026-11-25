@@ -166,10 +166,10 @@ def sort_key(item):
     return (due is None, due or dt.date.max, created or dt.date.max, item.key)
 
 
-def due_cell(due, today):
+def due_cell(due, today, week_start=None):
     """`today`, `2d late`, `Thu`, `21 Nov` or `-` for the row's due cell. A
     weekday name only for the next six days (a name seven days out would read
-    as today)."""
+    as today); with `week_start` set, only for the days of THIS WEEK."""
     if due is None:
         return "-"
     days = (due - today).days
@@ -177,7 +177,11 @@ def due_cell(due, today):
         return "today"
     if days < 0:
         return f"{-days}d late"
-    if days < WEEK_DAYS:
+    if week_start:
+        named = due < next_week_start(today, week_start)
+    else:
+        named = days < WEEK_DAYS
+    if named:
         return due.strftime("%a")
     return f"{due.day} {due.strftime('%b')}"
 
@@ -233,7 +237,8 @@ def due_choices(today, week_start=None):
     week = today + dt.timedelta(days=7)
 
     def fmt(day):
-        return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
+        year = f" {day.year}" if day.year != today.year else ""
+        return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}{year}"
     return [("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow),
             ("sunday", f"{second}  {fmt(sunday)}", sunday),
             ("week", f"+1 week  {fmt(week)}", week),

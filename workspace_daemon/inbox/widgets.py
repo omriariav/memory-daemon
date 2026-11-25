@@ -36,15 +36,13 @@ class WordInput(Input):
 
 
 class WordTextArea(TextArea):
-    """`TextArea` with the same Option word keys (alt+backspace and
-    alt+delete are already bound by Textual)."""
+    """`TextArea` with the same Option word jumps. Textual already binds
+    alt+backspace and alt+delete to the word deletes, so they are not here."""
     BINDINGS = [
         Binding("alt+left", "cursor_word_left", show=False),
         Binding("alt+right", "cursor_word_right", show=False),
         Binding("alt+shift+left", "cursor_word_left(True)", show=False),
         Binding("alt+shift+right", "cursor_word_right(True)", show=False),
-        Binding("alt+backspace", "delete_word_left", show=False),
-        Binding("alt+delete", "delete_word_right", show=False),
     ]
 
 
@@ -219,7 +217,8 @@ class Queue(OptionList):
         self._page(1)
 
     def build(self, groups, pal, now, keep=None, ghost=None, ghost_group=None,
-              ghost_at=None, visual=False, today=None, reset_scroll=False):
+              ghost_at=None, visual=False, today=None, reset_scroll=False,
+              week_start=None):
         """Draw `groups` (`views.Group`). A group with no rows is skipped,
         unless it is `keep_empty` (then a dash stands in). `ghost` is a row
         that just left `ghost_group` at position `ghost_at`. `today` (a
@@ -230,6 +229,7 @@ class Queue(OptionList):
         # starts at the top instead of at the old offset.
         keep_y = self.scroll_y if self.options and not reset_scroll else None
         self.today = today or dt.date.today()
+        self.week_start = week_start      # the work week's first day, or None
         opts = []
         self.rows = []
         first_idx = {}
@@ -287,7 +287,7 @@ class Queue(OptionList):
         due = tasksmod.due_of(it)
         overdue = due is not None and due < today
         col = pal["urgent"] if overdue else pal["primary"]
-        cell = tasksmod.due_cell(due, today)
+        cell = tasksmod.due_cell(due, today, getattr(self, "week_start", None))
         age = tasksmod.age_label(tasksmod.created_of(it), today)
         right = f"{cell:>7} {age:>4}"
         t = Text(no_wrap=True, overflow="ellipsis")

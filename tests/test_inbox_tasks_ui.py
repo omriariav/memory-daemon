@@ -9,6 +9,7 @@ pause is one short wait before a negative check (a modal that must stay
 open). A session waits for the commit workers to finish before it closes, so
 no test ends while one still writes the state files."""
 import contextlib
+import dataclasses
 import datetime as dt
 import importlib.util
 import sys
@@ -521,6 +522,35 @@ class DueTest(Base):
             self.assertTrue(await wait_for(
                 pilot, lambda: section_of(app, "task:1") == "later"))
 
+    async def test_pick_date_refuses_a_day_before_today(self):
+        app = self.app()
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await self.pick(pilot, app, "4")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, DateScreen)))
+            await type_text(pilot, "2029-01-09")             # a year typo
+            await pilot.press("enter")
+            await pilot.pause(0.1)                           # must not happen
+            self.assertIsInstance(app.screen, DateScreen)
+            self.assertEqual(self.src.requests(), [])
+            hint = str(app.screen.query_one("#note-hint").render())
+            self.assertIn("has passed", hint)
+            self.assertIn("2030-01-10", hint)
+            for _ in range(10):
+                await pilot.press("backspace")
+            await type_text(pilot, "2030-01-09")             # yesterday
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            self.assertIsInstance(app.screen, DateScreen)
+            for _ in range(10):
+                await pilot.press("backspace")
+            await type_text(pilot, "2030-01-10")             # today is fine
+            await pilot.press("enter")
+            self.assertTrue(await wait_for(pilot, self.src.requests))
+            self.assertEqual(self.src.requests()[0]["args"],
+                             {"date": "2030-01-10"})
+
     async def test_pick_date_can_be_cancelled(self):
         app = self.app()
         async with self.session(app) as pilot:
@@ -581,6 +611,23 @@ class DueTest(Base):
                 pilot, lambda: app._due_marks.get("task:3") is not None))
             self.assertEqual(keys_of(app), before)
             self.assertEqual(app.current_key, "task:3")
+
+    async def test_a_refresh_while_the_picker_is_open_keeps_the_place(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await go(pilot, app, "task:2")                   # index 1
+            await pilot.press("s")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
+            # a poll replaces the row with an equal-key Item that differs
+            app.all_rows = [dataclasses.replace(i, gist=i.gist + " (new)")
+                            if i.key == "task:2" else i for i in app.all_rows]
+            app.refilter()
+            await pilot.press("3")                           # +1 week
+            self.assertTrue(await wait_for(pilot, lambda: keys_of(app)[:3]
+                                           == ["task:1", "task:3", "task:2"]))
+            self.assertEqual(app.current_key, "task:3")      # not row 0
 
     async def test_the_cursor_clamps_to_the_last_row(self):
         app = self.app(undo_s=5)

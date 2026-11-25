@@ -1132,14 +1132,15 @@ class OutcomeScreen(NoteScreen):
 
 class DateScreen(ModalScreen):
     """A `YYYY-MM-DD` date (the task due date picker's "Pick date"). Enter
-    accepts a real date and stays open on anything else, with the reason;
-    esc cancels. Dismisses with the date string, or None."""
+    accepts a real date from `today` on and stays open on anything else, with
+    the reason; esc cancels. Dismisses with the date string, or None."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, title, who):
+    def __init__(self, title, who, today=None):
         super().__init__()
         self.title_text, self.who = title, who
+        self.today = today or dt.date.today()
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -1161,12 +1162,16 @@ class DateScreen(ModalScreen):
     def on_input_submitted(self, e):
         from .tasks import parse_day
         text = e.value.strip()
-        if parse_day(text) is None:
-            self.query_one("#note-hint", Static).update(Text(
-                "Not a date. Use YYYY-MM-DD, for example 2030-01-31",
-                Style(bold=True, color="red")))
+        day = parse_day(text)
+        if day is None:
+            why = "Not a date. Use YYYY-MM-DD, for example 2030-01-31"
+        elif day < self.today:
+            why = f"{text} has passed. Use {self.today.isoformat()} or later"
+        else:
+            self.dismiss(text)
             return
-        self.dismiss(text)
+        self.query_one("#note-hint", Static).update(
+            Text(why, Style(bold=True, color="red")))
 
 
 class OpsScreen(ModalScreen):

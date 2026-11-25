@@ -402,7 +402,8 @@ class InboxApp(App):
                        "agents": []}
         # The sessions strip (0.13.2): the `status` lines of the sources.
         self.strip_lines = int(settings.get("strip_lines", 4))
-        self.week_start = settings.get("week_start")   # weekday name or None
+        # the first day of the work week (`work_week:`), or None
+        self.week_start = (settings.get("work_week") or {}).get("start")
         shown_pref = store.get_pref("sessions_strip") \
             if hasattr(store, "get_pref") else None
         self.strip_on = shown_pref != "off"
@@ -921,7 +922,7 @@ class InboxApp(App):
             q.build(groups, self.pal, now, keep=keep, ghost=ghost,
                     ghost_group=ghost_group, ghost_at=ghost_at,
                     visual=self.bidi, today=self._today(),
-                    reset_scroll=reset)
+                    reset_scroll=reset, week_start=self.week_start)
             # While the queue was hidden (the first poll still running) it
             # lost focus; give it back, or the arrows do nothing until a
             # click. Not while the terminal is in the background: Textual
@@ -1484,6 +1485,12 @@ class InboxApp(App):
             self.query_one("#queue").focus()
 
     # ---------- actions with optimistic update + undo ----------
+    def _index_of(self, it):
+        """Where `it` is in the visible list, by key (a poll may have
+        replaced the row with an equal-key Item); 0 when it is not there."""
+        return next((n for n, i in enumerate(self.visible())
+                     if i.key == it.key), 0)
+
     def _keep_at(self, it, pos):
         """The key the cursor takes after `it` left, or moved within, the
         visible list: the row now at `pos` (its index before the change),
@@ -1497,8 +1504,7 @@ class InboxApp(App):
         return keep
 
     def _remove_optimistic(self, it):
-        vis_before = self.visible()
-        pos = vis_before.index(it) if it in vis_before else 0
+        pos = self._index_of(it)
         home = views.group_of(self.view_groups(), it)
         ghost_group = home.key if home is not None else None
         ghost_at = home.items.index(it) if home is not None else None
@@ -3712,8 +3718,7 @@ class InboxApp(App):
                 return
             date_str = day.isoformat() if day else None
             label = date_str or "no date"
-            before = self.visible()
-            pos = before.index(it) if it in before else 0
+            pos = self._index_of(it)
             p = self._enqueue(
                 "due", it, f"Due {label}: {it.gist}", hide=False,
                 detail=label, act="due", act_args={"date": date_str},
@@ -3735,7 +3740,7 @@ class InboxApp(App):
                 self.notify("Cancelled. Nothing sent.", timeout=2,
                             markup=False)
             elif choice["id"] == "pick":
-                self.push_screen(DateScreen("Due date", it.gist), typed)
+                self.push_screen(DateScreen("Due date", it.gist, today), typed)
             else:
                 send(by_id[choice["id"]][2])
         self.push_screen(ChoicePicker("Due date", choices, self.bidi), picked)
