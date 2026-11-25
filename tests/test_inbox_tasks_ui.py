@@ -131,10 +131,11 @@ class Base(unittest.IsolatedAsyncioTestCase):
                if acts is None else acts)
         return LocalActions(self.store, base_dir=self.base, acts=cfg, **kw)
 
-    def app(self, view="tasks", actions=None, undo_s=0.15, **kw):
+    def app(self, view="tasks", actions=None, undo_s=0.15, settings=None,
+            **kw):
         return InboxApp(FromSource(self.src), self.store,
                         actions or self.actions(),
-                        settings=dict(DEFAULTS), undo_s=undo_s, leave_s=0,
+                        settings=dict(settings or DEFAULTS), undo_s=undo_s, leave_s=0,
                         stream_delay=0, view=view,
                         today=lambda: self.today, **kw)
 
@@ -454,24 +455,76 @@ class DueTest(Base):
                              ("due", "task:1", {"date": want}))
             self.assertEqual(req["meta"]["due"], day(-2))
 
+    async def test_today(self):
+        await self.sends("1", "2030-01-10")
+
     async def test_tomorrow(self):
-        await self.sends("1", "2030-01-11")
+        await self.sends("2", "2030-01-11")
 
     async def test_next_sunday(self):
-        await self.sends("2", "2030-01-13")
+        await self.sends("3", "2030-01-13")
 
     async def test_plus_one_week(self):
-        await self.sends("3", "2030-01-17")
+        await self.sends("4", "2030-01-17")
+
+    async def test_today_moves_the_row_to_due_today_and_says_so(self):
+        app = self.app(undo_s=5)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            self.assertEqual(section_of(app, "task:1"), "overdue")
+            await self.pick(pilot, app, "1")                 # Today
+            self.assertTrue(await wait_for(
+                pilot, lambda: section_of(app, "task:1") == "today"))
+            self.assertEqual(app._due_marks["task:1"]["due"], (day(0),))
+            self.assertTrue(any("Due 2030-01-10" in t for t in toasts(app)))
+
+    async def test_next_work_day_with_a_work_week(self):
+        cfg = dict(DEFAULTS, work_week={"start": "sunday", "days": 5})
+        app = self.app(settings=cfg)
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await pilot.press("s")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, ChoicePicker)))
+            labels = [c["label"] for c in app.screen.choices]
+            self.assertEqual(labels[2], "Next work day  Sun 13 Jan")
+            self.assertEqual(labels[3], "Next week  Sun 13 Jan")
+            await pilot.press("3")
+            self.assertTrue(await wait_for(pilot, self.src.requests))
+            self.assertEqual(self.src.requests()[0]["args"],
+                             {"date": "2030-01-13"})
+
+    async def test_pick_date_takes_a_shorthand(self):
+        app = self.app()
+        async with self.session(app) as pilot:
+            await settle(pilot, app)
+            await self.pick(pilot, app, "5")
+            self.assertTrue(await wait_for(
+                pilot, lambda: isinstance(app.screen, DateScreen)))
+            await type_text(pilot, "nonsense")
+            await pilot.press("enter")
+            await pilot.pause(0.1)                           # must not happen
+            self.assertIsInstance(app.screen, DateScreen)
+            hint = str(app.screen.query_one("#note-hint").render())
+            self.assertIn("Not a date", hint)
+            self.assertIn("+3d", hint)
+            for _ in range(8):
+                await pilot.press("backspace")
+            await type_text(pilot, "+3d")
+            await pilot.press("enter")
+            self.assertTrue(await wait_for(pilot, self.src.requests))
+            self.assertEqual(self.src.requests()[0]["args"],
+                             {"date": "2030-01-13"})
 
     async def test_no_date_sends_null(self):
-        await self.sends("5", None)
+        await self.sends("6", None)
 
     async def test_the_row_moves_section_and_stays_until_a_refresh(self):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
             self.assertEqual(section_of(app, "task:1"), "overdue")
-            await self.pick(pilot, app, "1")                 # tomorrow
+            await self.pick(pilot, app, "2")                 # tomorrow
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
             self.assertEqual(section_of(app, "task:1"), "week")
@@ -489,7 +542,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "1")
+            await self.pick(pilot, app, "2")
             self.assertTrue(await wait_for(pilot, lambda: app.running))
             self.assertEqual(section_of(app, "task:1"), "week")
             app.poll(manual=True)                       # the old list arrives
@@ -501,7 +554,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, DateScreen)))
             await type_text(pilot, "2030-02-30")             # not a real day
@@ -526,7 +579,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             self.assertTrue(await wait_for(
                 pilot, lambda: isinstance(app.screen, DateScreen)))
             await type_text(pilot, "2029-01-09")             # a year typo
@@ -555,7 +608,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "4")
+            await self.pick(pilot, app, "5")
             await wait_for(pilot, lambda: isinstance(app.screen, DateScreen))
             await pilot.press("escape")
             self.assertTrue(await wait_for(
@@ -568,7 +621,7 @@ class DueTest(Base):
         async with self.session(app) as pilot:
             await settle(pilot, app)
             self.assertIn("task:1", keys_of(app))
-            await self.pick(pilot, app, "5")
+            await self.pick(pilot, app, "6")
             self.assertTrue(await wait_for(
                 pilot, lambda: "task:1" not in keys_of(app)))
             self.assertEqual(section_of(app, "task:1"), "nodate")
@@ -577,7 +630,7 @@ class DueTest(Base):
         app = self.app(undo_s=5)
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "1")
+            await self.pick(pilot, app, "2")
             self.assertTrue(await wait_for(
                 pilot, lambda: section_of(app, "task:1") == "week"))
             await pilot.press("u")
@@ -592,7 +645,7 @@ class DueTest(Base):
             await settle(pilot, app)
             await go(pilot, app, "task:2")                   # index 1, today
             self.assertEqual(keys_of(app)[1], "task:2")
-            await self.pick(pilot, app, "3")                 # +1 week
+            await self.pick(pilot, app, "4")                 # +1 week
             self.assertTrue(await wait_for(pilot, lambda: keys_of(app)[:3]
                                            == ["task:1", "task:3", "task:2"]))
             self.assertEqual(app.current_key, "task:3")      # the old index
@@ -606,7 +659,7 @@ class DueTest(Base):
             await settle(pilot, app)
             await go(pilot, app, "task:3")                   # the only one this week
             before = keys_of(app)
-            await self.pick(pilot, app, "1")                 # tomorrow
+            await self.pick(pilot, app, "2")                 # tomorrow
             self.assertTrue(await wait_for(
                 pilot, lambda: app._due_marks.get("task:3") is not None))
             self.assertEqual(keys_of(app), before)
@@ -624,7 +677,7 @@ class DueTest(Base):
             app.all_rows = [dataclasses.replace(i, gist=i.gist + " (new)")
                             if i.key == "task:2" else i for i in app.all_rows]
             app.refilter()
-            await pilot.press("3")                           # +1 week
+            await pilot.press("4")                           # +1 week
             self.assertTrue(await wait_for(pilot, lambda: keys_of(app)[:3]
                                            == ["task:1", "task:3", "task:2"]))
             self.assertEqual(app.current_key, "task:3")      # not row 0
@@ -634,7 +687,7 @@ class DueTest(Base):
         async with self.session(app) as pilot:
             await settle(pilot, app)
             await go(pilot, app, "task:5")                   # the last row
-            await self.pick(pilot, app, "1")                 # to this week
+            await self.pick(pilot, app, "2")                 # to this week
             self.assertTrue(await wait_for(
                 pilot, lambda: section_of(app, "task:5") == "week"))
             self.assertEqual(app.current_key, keys_of(app)[-1])
@@ -645,7 +698,7 @@ class DueTest(Base):
         async with self.session(app) as pilot:
             await settle(pilot, app)
             await go(pilot, app, "task:2")
-            await self.pick(pilot, app, "3")
+            await self.pick(pilot, app, "4")
             self.assertTrue(await wait_for(
                 pilot, lambda: app.current_key == "task:3"))
             await pilot.press("u")
@@ -658,7 +711,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "1")
+            await self.pick(pilot, app, "2")
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "conflict" for r in app.audit)))
             self.assertTrue(await wait_for(
@@ -669,7 +722,7 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "3")                 # +1 week
+            await self.pick(pilot, app, "4")                 # +1 week
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
             await pilot.press("L")
@@ -695,11 +748,11 @@ class DueTest(Base):
         app = self.app()
         async with self.session(app) as pilot:
             await settle(pilot, app)
-            await self.pick(pilot, app, "1")                 # to Jan 11
+            await self.pick(pilot, app, "2")                 # to Jan 11
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
             await go(pilot, app, "task:1")       # the cursor stayed in place
-            await self.pick(pilot, app, "3")                 # to Jan 17
+            await self.pick(pilot, app, "4")                 # to Jan 17
             self.assertTrue(await wait_for(
                 pilot, lambda: len(self.src.requests()) == 2))
             self.assertEqual(self.src.requests()[1]["meta"]["due"], day(1))
@@ -738,7 +791,7 @@ class UnitsModeTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertTrue(await wait_for(pilot, lambda: any(
                 r["status"] == "synced" for r in app.audit)))
             # the ok also asks the tasks source for its list again
@@ -777,7 +830,7 @@ class PendingMoveTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 1))
             self.assertEqual(section_of(app, "task:1"), "week")
             app.poll(manual=True)                  # the list still says Jan 8
@@ -802,13 +855,13 @@ class PendingMoveTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")                           # A: Jan 11
+            await pilot.press("2")                           # A: Jan 11
             self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 1))
             self.src.configure("ok")
             await go(pilot, app, "task:1")   # the cursor stayed in place
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("3")                           # B: Jan 17
+            await pilot.press("4")                           # B: Jan 17
             self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 0
                                            and len(self.src.requests()) == 2))
             with mock.patch.object(acts, "RETRY_EVERY_S", 0):
@@ -829,7 +882,7 @@ class PendingMoveTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertTrue(await wait_for(pilot, lambda: app.act_pending == 1))
             self.src.configure("conflict")
             with mock.patch.object(acts, "RETRY_EVERY_S", 0):
@@ -918,7 +971,7 @@ class KeysTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertTrue(await wait_for(pilot, lambda: app.pending
                                            or app.running))
             await go(pilot, app, "task:1")   # the cursor stayed in place
@@ -936,7 +989,7 @@ class KeysTest(Base):
             await settle(pilot, app)
             await pilot.press("s")
             await wait_for(pilot, lambda: isinstance(app.screen, ChoicePicker))
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertTrue(await wait_for(pilot, lambda: app.pending))
             with mock.patch.object(app, "exit"):
                 await app.action_quit()

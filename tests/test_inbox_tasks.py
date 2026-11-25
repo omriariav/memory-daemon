@@ -307,6 +307,256 @@ class WeekStartTest(unittest.TestCase):
             settings.validate({"week_start": "sunday"})   # never released
 
 
+class NextWorkDayTest(unittest.TestCase):
+    WEEK = D(2026, 11, 23)        # a Monday
+
+    def days(self, start, count):
+        return [tasks.next_work_day(self.WEEK + dt.timedelta(days=n), start,
+                                    count) for n in range(7)]
+
+    def test_sunday_five_every_weekday(self):
+        # Mon 23 .. Sun 29: work days are Sun-Thu
+        want = [D(2026, 11, d) for d in (24, 25, 26, 29, 29, 29, 30)]
+        self.assertEqual(self.days("sunday", 5), want)
+
+    def test_monday_five_every_weekday(self):
+        want = [D(2026, 11, d) for d in (24, 25, 26, 27, 30, 30, 30)]
+        self.assertEqual(self.days("monday", 5), want)
+
+    def test_seven_days_is_tomorrow(self):
+        for start in tasks.WEEKDAYS:
+            want = [self.WEEK + dt.timedelta(days=n + 1) for n in range(7)]
+            self.assertEqual(self.days(start, 7), want, start)
+
+    def test_one_day_is_the_next_week_start(self):
+        for start in ("monday", "thursday", "sunday"):
+            for n in range(7):
+                today = self.WEEK + dt.timedelta(days=n)
+                self.assertEqual(tasks.next_work_day(today, start, 1),
+                                 tasks.next_week_start(today, start), (start, n))
+
+    def test_the_issue_examples(self):
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 26), "sunday", 5),
+                         D(2026, 11, 29))             # Thu -> Sun
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 25), "sunday", 5),
+                         D(2026, 11, 26))             # Wed -> Thu
+
+    def test_a_week_that_wraps_the_weekend(self):
+        # saturday/3: Sat, Sun, Mon work; on a Monday the next is Saturday
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 23), "saturday", 3),
+                         D(2026, 11, 28))
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 28), "saturday", 3),
+                         D(2026, 11, 29))
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 29), "saturday", 3),
+                         D(2026, 11, 30))
+
+    def test_days_out_of_range_are_clamped(self):
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 23), "friday", 0),
+                         D(2026, 11, 27))
+        self.assertEqual(tasks.next_work_day(D(2026, 11, 23), "friday", 99),
+                         D(2026, 11, 24))
+
+
+class DueChoicesTest(unittest.TestCase):
+    def ids(self, today, *args):
+        return [k for k, _l, _d in tasks.due_choices(today, *args)]
+
+    def test_without_work_week(self):
+        got = tasks.due_choices(TODAY)
+        self.assertEqual([k for k, _l, _d in got],
+                         ["today", "tomorrow", "sunday", "week", "pick",
+                          "none"])
+        self.assertEqual([l for _k, l, _d in got][:4],
+                         ["Today  Thu 10 Jan", "Tomorrow  Fri 11 Jan",
+                          "Next Sunday  Sun 13 Jan", "+1 week  Thu 17 Jan"])
+        self.assertEqual([d for _k, _l, d in got],
+                         [TODAY, D(2030, 1, 11), D(2030, 1, 13),
+                          D(2030, 1, 17), None, None])
+        self.assertTrue(got[4][1].startswith("Pick date"))
+
+    def test_with_work_week(self):
+        thu = D(2026, 11, 26)
+        got = {k: (l, d) for k, l, d in tasks.due_choices(thu, "sunday", 5)}
+        self.assertEqual(got["workday"],
+                         ("Next work day  Sun 29 Nov", D(2026, 11, 29)))
+        self.assertEqual(got["today"][0], "Today  Thu 26 Nov")
+        self.assertEqual(got["tomorrow"][1], D(2026, 11, 27))
+        self.assertEqual(got["sunday"][0], "Next week  Sun 29 Nov")
+        self.assertEqual(self.ids(D(2026, 11, 27), "monday", 5),
+                         ["today", "tomorrow", "workday", "sunday", "week",
+                          "pick", "none"])
+
+    def test_next_work_day_is_left_out_when_it_is_tomorrow(self):
+        plain = ["today", "tomorrow", "sunday", "week", "pick", "none"]
+        self.assertEqual(self.ids(D(2026, 11, 25), "sunday", 5), plain)  # Wed
+        self.assertEqual(self.ids(D(2026, 11, 28), "sunday", 5), plain)  # Sat
+        self.assertEqual(self.ids(D(2026, 11, 25), "sunday", 7), plain)  # 7 days
+
+    def test_next_work_day_stays_when_it_is_also_next_week(self):
+        for today in (D(2026, 11, 26), D(2026, 11, 27)):     # Thu, Fri
+            got = {k: d for k, _l, d in tasks.due_choices(today, "sunday", 5)}
+            self.assertEqual(got["workday"], D(2026, 11, 29))
+            self.assertEqual(got["sunday"], D(2026, 11, 29))
+
+    def test_one_work_day_a_week(self):
+        got = {k: d for k, _l, d in tasks.due_choices(D(2026, 11, 25),
+                                                      "sunday", 1)}
+        self.assertEqual(got["workday"], D(2026, 11, 29))
+        self.assertEqual(got["sunday"], D(2026, 11, 29))
+
+    def test_the_work_days_default_to_five(self):
+        self.assertEqual(tasks.due_choices(D(2026, 11, 26), "sunday"),
+                         tasks.due_choices(D(2026, 11, 26), "sunday", 5))
+
+    def test_labels_carry_the_year_when_it_is_not_this_year(self):
+        late = D(2026, 12, 31)                    # a Thursday
+        got = {k: l for k, l, _d in tasks.due_choices(late, "sunday", 5)}
+        self.assertEqual(got["today"], "Today  Thu 31 Dec")
+        self.assertEqual(got["tomorrow"], "Tomorrow  Fri 1 Jan 2027")
+        self.assertEqual(got["workday"], "Next work day  Sun 3 Jan 2027")
+        self.assertEqual(got["sunday"], "Next week  Sun 3 Jan 2027")
+        self.assertEqual(got["week"], "+1 week  Thu 7 Jan 2027")
+
+
+class ParseDueInputTest(unittest.TestCase):
+    TODAY = D(2026, 11, 25)       # a Wednesday
+
+    def ok(self, text, want, today=None):
+        got, why = tasks.parse_due_input(text, today or self.TODAY)
+        self.assertEqual((got, why), (want, None), text)
+
+    def bad(self, text, *words, today=None):
+        got, why = tasks.parse_due_input(text, today or self.TODAY)
+        self.assertIsNone(got, text)
+        for word in words:
+            self.assertIn(word, why, text)
+
+    def test_strict_date(self):
+        self.ok("2026-11-25", self.TODAY)
+        self.ok("2030-01-31", D(2030, 1, 31))
+        self.ok("  2026-12-01 ", D(2026, 12, 1))
+        self.bad("2026-11-24", "has passed", "2026-11-25")
+        self.bad("2025-01-09", "has passed")
+        self.bad("2030-02-30", "Not a date")
+        self.bad("2030-1-31", "Not a date")
+
+    def test_today_and_tomorrow(self):
+        self.ok("today", self.TODAY)
+        self.ok("TODAY", self.TODAY)
+        self.ok("Tomorrow", D(2026, 11, 26))
+        self.ok(" tomorrow ", D(2026, 11, 26))
+        self.ok("tomorrow", D(2027, 1, 1), D(2026, 12, 31))
+
+    def test_weekday_names(self):
+        # Wednesday 25 Nov 2026
+        self.ok("thu", D(2026, 11, 26))
+        self.ok("Thursday", D(2026, 11, 26))
+        self.ok("sun", D(2026, 11, 29))
+        self.ok("SUNDAY", D(2026, 11, 29))
+        self.ok("mon", D(2026, 11, 30))
+        self.ok("tue", D(2026, 12, 1))
+        self.ok("wed", D(2026, 12, 2))            # today's name: a week out
+        self.ok("wednesday", D(2026, 12, 2))
+        self.ok("fri", D(2026, 11, 27))
+        self.ok("sat", D(2026, 11, 28))
+
+    def test_every_weekday_is_one_to_seven_days_ahead(self):
+        for n in range(7):
+            today = self.TODAY + dt.timedelta(days=n)
+            for name in tasks.WEEKDAYS:
+                for form in (name, name[:3]):
+                    got, _ = tasks.parse_due_input(form, today)
+                    self.assertEqual(got.strftime("%A").lower(), name)
+                    self.assertTrue(1 <= (got - today).days <= 7, (today, form))
+
+    def test_a_weekday_abbreviation_must_be_exact(self):
+        for word in ("th", "thur", "thurs", "tues", "sund", "su", "wedn",
+                     "sunday!", "sun day"):
+            self.bad(word, "Not a date")
+
+    def test_day_and_month(self):
+        self.ok("25/11", self.TODAY)               # today is not passed
+        self.ok("26/11", D(2026, 11, 26))
+        self.ok("3.1", D(2027, 1, 3))              # passed: next year
+        self.ok("03.01", D(2027, 1, 3))
+        self.ok("24/11", D(2027, 11, 24))
+        self.ok("1/12", D(2026, 12, 1))
+        self.ok("31/12", D(2026, 12, 31))
+        self.ok("1/1", D(2027, 1, 1))
+        self.ok("25.11", self.TODAY)
+        self.ok(" 3/1 ", D(2027, 1, 3))
+
+    def test_day_and_month_in_a_year_change(self):
+        dec = D(2026, 12, 31)
+        self.ok("31/12", dec, dec)
+        self.ok("1/1", D(2027, 1, 1), dec)
+        self.ok("30/12", D(2027, 12, 30), dec)
+        jan = D(2027, 1, 1)
+        self.ok("1/1", jan, jan)
+        self.ok("31/12", D(2027, 12, 31), jan)
+
+    def test_leap_day(self):
+        self.ok("29/2", D(2028, 2, 29), D(2027, 3, 1))     # next leap year
+        self.ok("29/2", D(2028, 2, 29), D(2028, 1, 5))
+        self.ok("29/2", D(2028, 2, 29), D(2028, 2, 29))
+        self.bad("29/2", "calendar", today=D(2025, 3, 1))  # none in range
+
+    def test_day_and_month_that_do_not_exist(self):
+        for text in ("31/2", "30/2", "31/4", "0/5", "5/0", "32/1", "1/13",
+                     "99/99"):
+            self.bad(text, "not a day of the calendar", "Not a date")
+
+    def test_day_and_month_wrong_shape(self):
+        for text in ("25/11/2026", "25-11", "2026/11", "1/2/3", "/11", "25/",
+                     "25//11", "123/4", "1/234"):
+            self.bad(text, "Not a date")
+
+    def test_plus_days(self):
+        self.ok("+1", D(2026, 11, 26))
+        self.ok("+1d", D(2026, 11, 26))
+        self.ok("+3d", D(2026, 11, 28))
+        self.ok("+7", D(2026, 12, 2))
+        self.ok("+10D", D(2026, 12, 5))
+        self.ok("+365", D(2027, 11, 25))
+        self.ok("+365d", D(2027, 11, 25))
+        self.ok("+007", D(2026, 12, 2))
+
+    def test_plus_weeks(self):
+        self.ok("+1w", D(2026, 12, 2))
+        self.ok("+2w", D(2026, 12, 9))
+        self.ok("+2W", D(2026, 12, 9))
+        self.ok("+52w", D(2027, 11, 24))
+
+    def test_plus_out_of_range(self):
+        for text in ("+0", "+0d", "+366", "+366d", "+1000", "+9999d"):
+            self.bad(text, "1 to 365 days")
+        for text in ("+0w", "+53w", "+500w"):
+            self.bad(text, "1 to 52 weeks")
+
+    def test_plus_wrong_shape(self):
+        for text in ("+", "+d", "+w", "+-3", "+3x", "+3 d", "+3dd", "3d",
+                     "+1.5", "++3", "+12345"):
+            self.bad(text, "Not a date")
+
+    def test_anything_else_lists_the_forms(self):
+        for text in ("", "   ", "soon", "next week", "yesterday", "tomorow",
+                     "nov 25", "25 nov", "-1", "0", "2026", "2026-11",
+                     "20261125", "now", None, 5, ["today"]):
+            self.bad(text, "Not a date", "YYYY-MM-DD", "tomorrow", "thu",
+                     "25/11", "+3d", "+2w")
+
+    def test_the_result_is_never_before_today(self):
+        for n in range(0, 800, 17):
+            today = self.TODAY + dt.timedelta(days=n)
+            for text in ("today", "tomorrow", "sun", "wed", "1/1", "29/2",
+                         "31/12", "+1", "+30d", "+4w", "15.6"):
+                got, why = tasks.parse_due_input(text, today)
+                if got is not None:
+                    self.assertGreaterEqual(got, today, (today, text))
+                else:
+                    self.assertTrue(why)
+
+
 class CellTest(unittest.TestCase):
     def test_due_cell(self):
         cell = lambda offset: tasks.due_cell(
@@ -332,6 +582,7 @@ class CellTest(unittest.TestCase):
 
     def test_the_due_pickers(self):
         choices = {k: d for k, _l, d in tasks.due_choices(TODAY)}
+        self.assertEqual(choices["today"], TODAY)
         self.assertEqual(choices["tomorrow"], D(2030, 1, 11))
         self.assertEqual(choices["sunday"], D(2030, 1, 13))
         self.assertEqual(choices["week"], D(2030, 1, 17))

@@ -1609,7 +1609,7 @@ defaults; a broken one prints every problem and exits 2.
 | `theme` | `dark` | `dark` or `light` |
 | `bidi_mode` | `auto` | `logical`, `visual` or `auto` (see below) |
 | `thread_order` | `newest` | `newest` or `oldest`: which message the thread pane lists first (see "Thread order") |
-| `work_week` | unset | `{start: <weekday>, days: <1-7>}`, the same shape as the daemon's `memory.work_week`: `start` (required, `monday` to `sunday`, any case) is the first day of your week, `days` (default `5`) how many days work. Unset, `THIS WEEK` in the Tasks view is the next 7 days. Set, it is the days after today and before the next `start` day (on a Wednesday with `sunday`: Thursday to Saturday), anything later is `LATER`, the due cell names a weekday only inside `THIS WEEK`, and the `s` picker's `Next Sunday` becomes `Next week` (the next `start` day). `days` is stored for a later release. A bad value is a settings error |
+| `work_week` | unset | `{start: <weekday>, days: <1-7>}`, the same shape as the daemon's `memory.work_week`: `start` (required, `monday` to `sunday`, any case) is the first day of your week, `days` (default `5`) how many days work. Unset, `THIS WEEK` in the Tasks view is the next 7 days. Set, it is the days after today and before the next `start` day (on a Wednesday with `sunday`: Thursday to Saturday), anything later is `LATER`, the due cell names a weekday only inside `THIS WEEK`, the `s` picker's `Next Sunday` becomes `Next week` (the next `start` day), and the picker adds `Next work day` (`days` is how many days from `start` work). `days` has no other use yet. A bad value is a settings error |
 | `strip_lines` | `4` | 1 to 12: how many status lines the [sessions strip](#the-sessions-strip) shows before `+N more · 6` |
 | `gmail_account` | `0` | integer >= 0: the `/mail/u/N/` index in Gmail links, for when the account is not your first signed-in one |
 | `show_rsvp_replies` | `false` | `true` lists the calendar events of kind `rsvp` (other people answering your invites, shown as `RSVP: <title>`); by default they are left out before the newest row per event is chosen, so the event shows its latest non-RSVP change (`new`, `update` or `cancel`). New, updated and cancelled invites are not affected |
@@ -1889,8 +1889,24 @@ and a source with no `acts:` is read-only: the keys say so):
 | --- | --- | --- |
 | `d` | a todo: closes it at once; a decision: asks `Decision:` (required, an empty or cancelled prompt sends nothing), then closes it | `close` `{"note": ""}` / `{"note": <decision>}` |
 | `D` | a todo: asks `Outcome:`, then closes it (a decision: same as `d`) | `close` `{"note": <outcome>}` |
-| `s` | due date: Tomorrow, Next Sunday (Next week with `work_week`), +1 week, Pick date (`YYYY-MM-DD`, checked: a day before today is refused and the screen stays open), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
+| `s` | due date picker, one key each (`1`-`9`): Today, Tomorrow, Next work day (only with `work_week`; left out when it is tomorrow), Next Sunday (Next week with `work_week`), +1 week, Pick date (a typed date, see below), No date | `due` `{"date": "YYYY-MM-DD" or null}` |
 | `x` | drops it, with an optional `Reason:` (enter alone drops with none; esc cancels) | `drop` `{"note": <reason or "">}` |
+
+**Pick date** takes `YYYY-MM-DD` or a shorthand (case-insensitive). The screen
+stays open, with the accepted forms, on anything else, and refuses a day
+before today.
+
+| Typed | Date |
+|---|---|
+| `today`, `tomorrow` | today, the next day |
+| `sun`, `Sunday`, `thu` (a weekday name or its 3-letter form) | the next such day after today; today's own weekday name means a week from today |
+| `25/11`, `3.1` (`d/m` or `d.m`, day first) | this year, or next year when that day has passed (`29/2` only when this year or next has one) |
+| `+3`, `+3d`, `+2w` | that many days (1-365) or weeks (1-52) from today |
+
+"Today" and the typed `today` set the due date only: no time, no hiding.
+`Next work day` is the first day after today that is one of the `work_week`
+work days (`start` and the `days - 1` days after it): with `sunday` and `5`, on
+a Thursday it is Sunday.
 
 ### Remind me
 

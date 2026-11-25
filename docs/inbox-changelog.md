@@ -7,6 +7,34 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-11-25
+
+An easier due-date picker for tasks (`s` in the Tasks view). Nothing changes
+for a source or a settings file.
+
+### Added
+
+- **Today** is the first choice of the `s` picker. It sets the due date to
+  today (the date only).
+- **Next work day** in the picker, when `work_week:` is set: the first day
+  after today that is a work day (`start` and the `days - 1` days after it).
+  With `sunday` and `5`, on a Thursday it is Sunday. It is left out when it is
+  tomorrow, so the same date never shows twice in a row. `work_week.days` is
+  read for the first time.
+- **Typed due dates** in Pick date: `today`, `tomorrow`, a weekday name or its
+  3-letter form (`thu`: the next such day; today's own weekday means a week
+  out), `d/m` or `d.m` (`25/11`: this year, or next year when it has passed),
+  `+3` / `+3d` (days, 1-365) and `+2w` (weeks, 1-52), next to `YYYY-MM-DD`.
+  The "Not a date" message lists the forms. A day before today is still
+  refused.
+
+### Changed
+
+- The picker's choices now start at Today: `1` Today, `2` Tomorrow, then Next
+  work day (with `work_week`), Next Sunday or Next week, +1 week, Pick date
+  and No date. The number keys follow that order, so `1` is no longer
+  Tomorrow.
+
 ## [0.13.4] - 2026-11-25
 
 Word jumps in the text fields, a calendar-week view of THIS WEEK, and a calmer
