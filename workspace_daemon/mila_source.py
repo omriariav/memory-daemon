@@ -1931,27 +1931,56 @@ def match_is_final(source, item, match, attempts):
     return age > hours * 3600
 
 
-def _captured_by_mi(routine, event_id):
-    """Entry id of an MI-only capture of this calendar event, or None.
+def _mi_captures(routine):
+    """{event id: entry id} of the MI-only captures in the routine's store.
 
-    Read daemon-side from the store (`memory.store`). A read error fails
-    open: Mila is the primary source and captures normally.
+    One prefix pass over the store per run, cached in the run state. A read
+    error fails open (Mila is the primary source and captures normally) and
+    is logged once per run, naming the cause and the file relative to the
+    store, never any content.
     """
     from . import calendar_links, memory_sink  # late: keep imports acyclic
     store = memory_sink.memory_cfg(routine).get("store")
     if not store:
-        return None
+        return {}
+    cache = _run_state().setdefault("mi_gcal", {})
+    if store in cache:
+        return cache[store]
+    prefix = f"{calendar_links.MI_GCAL_SCHEME}:"
+    found = {}
     try:
-        rows = memory_sink.entries_with_source_ids(
-            store, [calendar_links.mi_gcal_id(event_id)])
+        rows = memory_sink.entries_with_source_ids(store, [prefix], prefix=True)
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        where = getattr(exc, "store_path", None) or getattr(
+            exc, "filename", None)
+        try:
+            where = str(Path(where).relative_to(store)) if where else None
+        except ValueError:
+            where = None
         log(f"mila WARN could not read the store to look for an MI capture "
-            f"({type(exc).__name__}); capturing normally")
+            f"({type(exc).__name__}"
+            f"{' in ' + where if where else ''}); capturing normally")
+        rows = []
+    for frontmatter, _body in rows:
+        entry_id = frontmatter.get("id")
+        if not (isinstance(entry_id, str) and entry_id):
+            continue
+        for sid in frontmatter.get("source_ids") or []:
+            if isinstance(sid, str) and sid.startswith(prefix):
+                event_id = sid[len(prefix):]
+                if event_id and (event_id not in found
+                                 or entry_id < found[event_id]):
+                    found[event_id] = entry_id
+    cache[store] = found
+    return found
+
+
+def _captured_by_mi(routine, source, event_id):
+    """Entry id of an MI-only capture of this calendar event, or None. Only
+    looked up when an MI routine exists (the runner sets `_mi_enabled`)."""
+    if not source.get("_mi_enabled"):
         return None
-    ids = sorted(
-        str(fm["id"]) for fm, _body in rows
-        if isinstance(fm.get("id"), str) and fm["id"])
-    return ids[0] if ids else None
+    return _mi_captures(routine).get(event_id)
 
 
 def match_calendar(routine, source, item):
@@ -2002,7 +2031,7 @@ def match_calendar(routine, source, item):
             match, held=True, waiting_for=waiting,
             reason="waiting for primary capture",
         )
-    taken = _captured_by_mi(routine, event["id"])
+    taken = _captured_by_mi(routine, source, event["id"])
     if taken:
         # MI captured this meeting alone while the recording was held; one
         # meeting entry (and one review todo) is enough.

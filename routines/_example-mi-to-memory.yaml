@@ -44,6 +44,7 @@ source:
   calendar_timezone: Europe/London
   skip_declined: true
   shadow: true                 # write nothing to the store; log to the shadow file
+                               # (shadow: false requires primary_recordings_file)
   grace_minutes: 90            # wait this long after the end for the Mila entry
   match_window_minutes: 10     # MI start vs calendar start, same normalized title
   lookback_hours: 24           # `from` of the list call
@@ -57,7 +58,8 @@ source:
   # The Mila routine's recordings.json. While a Mila recording overlaps the
   # meeting slot, the session keeps waiting past grace_minutes (until
   # retry_hours), so a held recording is never captured twice. Set it in a
-  # live config; without it only the grace timer decides.
+  # live config (required when shadow is false); without it only the grace timer
+  # decides.
   primary_recordings_file: /absolute/path/to/mila-recordings/recordings.json
 
 # Used only by the MI-only (full) capture; the cross-check call uses diff_model.

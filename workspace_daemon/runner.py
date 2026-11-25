@@ -1828,6 +1828,14 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         if source_kinds is None or source.get("kind") in source_kinds
     ]
     all_sources = [source for _, _, source in entries]
+    # Mila only looks for an MI-only capture of a meeting when some enabled
+    # routine has an mi source; otherwise there can be none.
+    mi_enabled = any(
+        routine.get("enabled", True)
+        and any(isinstance(s, dict) and s.get("kind") == "mi"
+                for s in config.sources(routine))
+        for routine in routing_context
+    )
     context_sources = [
         source
         for routine in routing_context
@@ -1904,7 +1912,9 @@ def _collect_claims(routines, totals, source_kinds=None, routing_context=None,
         listing_specs = [{
             "label": kind,
             "listing_source": listing_source,
-            "claim_source": source,
+            "claim_source": (
+                dict(source, _mi_enabled=True)
+                if kind == "mila" and mi_enabled else source),
             "ownership_class": "ordinary",
             "expand_ownership": True,
         }]

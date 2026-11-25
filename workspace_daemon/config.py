@@ -2270,6 +2270,14 @@ def _validate_mi(prefix, source, routine):
             problems.append(
                 f"{prefix}.{key} must be an integer from {lower} to {upper}"
             )
+    if source.get("shadow", True) is False and not source.get(
+            "primary_recordings_file"):
+        problems.append(
+            f"{prefix}.primary_recordings_file is required when shadow is "
+            "false: without it only a timer decides that Mila will not "
+            "capture a meeting, and an MI-only entry for a meeting Mila "
+            "captures later would be written twice"
+        )
     grace, retry = source.get("grace_minutes", 90), source.get("retry_hours", 24)
     if (_bounded_int(grace, 0, 720) and _bounded_int(retry, 1, 168)
             and grace >= retry * 60):

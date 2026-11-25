@@ -497,17 +497,21 @@ def _store_entries(store, needles=()):
         if path.is_file()
     ]
     for path in paths:
-        raw = path.read_text(encoding="utf-8")
-        # Matches the raw text, so a source id that YAML writes escaped would
-        # be missed; accepted for slack, gmail and gdrive ids.
-        if needles and not any(needle in raw for needle in needles):
-            continue
-        if not raw.startswith("---"):
-            continue
-        parts = raw.split("---", 2)
-        if len(parts) != 3:
-            continue
-        frontmatter = yaml.safe_load(parts[1]) or {}
+        try:
+            raw = path.read_text(encoding="utf-8")
+            # Matches the raw text, so a source id that YAML writes escaped
+            # would be missed; accepted for slack, gmail and gdrive ids.
+            if needles and not any(needle in raw for needle in needles):
+                continue
+            if not raw.startswith("---"):
+                continue
+            parts = raw.split("---", 2)
+            if len(parts) != 3:
+                continue
+            frontmatter = yaml.safe_load(parts[1]) or {}
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            exc.store_path = str(path)  # for a diagnostic; same exception
+            raise
         if not isinstance(frontmatter, dict):
             continue
         yield frontmatter, parts[2]

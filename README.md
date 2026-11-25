@@ -1934,7 +1934,11 @@ matches when its title equals the event title (case-folded, whitespace
 collapsed) and it started within `match_window_minutes` of the event start;
 failing that, the same title on the same local date (`calendar_timezone`,
 required) when exactly one event has it and it starts within 4 hours of the
-session (logged when used). An ambiguous or missing match is re-checked until
+session (logged when used). A title-and-date match may be a different meeting,
+so it is used for a cross-check only: it never takes the MI-only path (the
+session stays open as `date_match_no_primary` until `retry_hours`, in case a
+primary capture arrives), and every `mi-gcal:` link comes from a start within
+`match_window_minutes`. An ambiguous or missing match is re-checked until
 `retry_hours`, then dropped; a declined event is skipped (`skip_declined`).
 MI data arrives 13 to 50 minutes after a meeting ends. Events are remembered in
 `state/mi-sessions.json` (0600) because the calendar file holds only the next
@@ -1976,10 +1980,12 @@ Three cases, by what the store holds for the calendar event:
 * **Mila only.** Untouched: this source never sees it.
 
 **One session per event.** A drop-and-rejoin gives two sessions of one
-meeting; only the first is handled. An event is settled when state holds a
-done or pending session for it, or the store holds an entry carrying
-`mi-gcal:<event id>` or `mi-check:<event id>`. Later sessions are skipped
-(`event_settled`, logged once).
+meeting; only the longest is handled (ties go to the earliest start), unless
+one is already pending. The others are `superseded`: still open, so they are
+reconsidered if the chosen one fails or expires, and dropped at `retry_hours`.
+An event is settled for good when a session of it is done or the store holds an
+entry carrying `mi-gcal:<event id>` or `mi-check:<event id>`; its other
+sessions are then skipped (`event_settled`, logged once).
 
 **Failures.** These count toward 3 attempts: an exception in the fetch or the
 cross-check (tool call, malformed diff), a cross-check store write that fails,
@@ -1999,12 +2005,18 @@ to the later of event end and session end, plus 10 minutes of tolerance), the
 session stays waiting even after `grace_minutes`, until `retry_hours` drops it.
 It never goes full while a Mila recording of the slot exists, and an unreadable
 file keeps it waiting too. Without the key only the `grace_minutes` timer
-decides, so set it in a live config. A back-to-back meeting recorded by Mila
+decides, so `shadow: false` requires it (validation rejects a live config
+without it). A back-to-back meeting recorded by Mila
 can keep a neighbouring MI-only session waiting; that is the safe side. On the
 Mila side, `mila_source.match_calendar` ledgers a recording as a duplicate
 (`captured by mi`, no analysis, no second entry or review todo) when the store
-already holds an entry carrying `mi-gcal:<event id>`; a store read error fails
-open and Mila captures normally.
+already holds an entry carrying `mi-gcal:<event id>`. It only looks when an
+enabled routine has an `mi` source (the runner flags the Mila source), and reads
+the store once per run (one prefix pass for `mi-gcal:`). A store read error
+fails open and Mila captures normally, with one WARN per run naming the cause
+and the file relative to the store (no content). A recording whose interval
+cannot be worked out is skipped with one WARN (a count); only an unreadable
+file blocks the full path.
 
 `shadow` defaults to **true** for this kind: nothing is written to the store
 and no capture model is called for an MI-only session. What would have been

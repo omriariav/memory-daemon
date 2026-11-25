@@ -414,6 +414,46 @@ class ModeTest(MiBase):
                 self.routine(), self.source, item, False))
             bridge.complete.assert_not_called()
 
+    def test_a_date_fallback_match_never_goes_full(self):
+        # started an hour after the event: outside the 10 minute window
+        self.service.list_text = listing(started=T0 + datetime.timedelta(hours=1))
+        self.at(60 + 30 + 200)
+        self.write_calendar([event()])
+        self.assertEqual(self.list_candidates(), [])
+        record = next(iter(mi_source.load_state()["sessions"].values()))
+        self.assertEqual((record["match"], record["last_result"]),
+                         ("date", "date_match_no_primary"))
+        self.assertEqual(record["status"], "waiting")
+        logged = " ".join(str(c.args[0]) for c in mi_source.log.call_args_list)
+        self.assertIn("matched by title and date only", logged)
+        self.assertEqual(logged.count("not captured alone"), 1)
+        # a primary that shows up later still gets the cross-check
+        self.write_mila_entry()
+        self.at(60 + 30 + 210)
+        found = self.list_candidates()
+        self.assertEqual(found[0]["raw"]["mode"], "cross_check")
+        self.assertEqual(found[0]["raw"]["match"], "date")
+
+    def test_a_time_match_is_recorded_on_the_item(self):
+        self.at(30 + 91)
+        item = self.fetch(self.list_candidates()[0])
+        self.assertEqual(item["frontmatter"]["mi_match"], "time")
+        record = next(iter(mi_source.load_state()["sessions"].values()))
+        self.assertEqual(record["match"], "time")
+
+    def test_fetch_refuses_a_full_item_without_a_time_match(self):
+        self.at(30 + 91)
+        candidate = self.list_candidates()[0]
+        for match in ("date", None):
+            candidate["raw"]["match"] = match
+            with self.assertRaises(RuntimeError):
+                self.fetch(candidate)
+        calls = len(self.service.calls)
+        candidate["raw"]["match"] = "date"
+        candidate["raw"]["mode"] = "cross_check"
+        self.fetch(candidate)  # a cross-check may rest on a date match
+        self.assertEqual(len(self.service.calls), calls + 1)
+
     def test_late_primary_turns_a_waiting_session_into_a_cross_check(self):
         self.list_candidates()
         self.write_mila_entry()
@@ -615,13 +655,99 @@ class OneSessionPerEventTest(MiBase):
         sessions = mi_source.load_state()["sessions"]
         second = sessions[f"{MEETING}:{self.SECOND}"]
         self.assertEqual((second["status"], second["last_result"]),
-                         ("skipped", "event_settled"))
+                         ("superseded", "superseded"))
         # later runs: still nothing for the second, logged once
         self.at(50)
         self.assertEqual(len(self.list_candidates()), 1)  # first, retried
         logged = [str(c.args[0]) for c in mi_source.log.call_args_list
-                  if "later session of an event" in str(c.args[0])]
+                  if "not the longest session" in str(c.args[0])]
         self.assertEqual(len(logged), 1)
+
+    def test_drop_and_rejoin_picks_the_longer_session(self):
+        self.write_mila_entry()
+        # a 5 minute first session, then a 30 minute rejoin
+        meetings = json.loads(listing(minutes=5))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(minutes=6)),
+            "durationMinutes": 30, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        self.at(60)
+        found = self.list_candidates()
+        self.assertEqual([c["raw"]["session_id"] for c in found], [self.SECOND])
+        short = mi_source.load_state()["sessions"][f"{MEETING}:{SESSION}"]
+        self.assertEqual(short["status"], "superseded")
+
+    def test_equal_lengths_go_to_the_earliest_start(self):
+        self.write_mila_entry()
+        meetings = json.loads(listing(minutes=10))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(minutes=12)),
+            "durationMinutes": 10, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        found = self.list_candidates()
+        self.assertEqual([c["raw"]["session_id"] for c in found], [SESSION])
+
+    def test_the_sibling_is_reconsidered_when_the_chosen_session_fails(self):
+        self.write_mila_entry()
+        meetings = json.loads(listing(minutes=5))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(minutes=6)),
+            "durationMinutes": 30, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        self.at(60)
+        self.assertEqual(self.list_candidates()[0]["raw"]["session_id"],
+                         self.SECOND)
+        # the chosen session fails three times
+        data = mi_source.load_state()
+        data["sessions"][f"{MEETING}:{self.SECOND}"]["attempts"] = \
+            mi_source.MAX_ATTEMPTS
+        mi_source.save_state(data)
+        self.at(70)
+        found = self.list_candidates()
+        sessions = mi_source.load_state()["sessions"]
+        self.assertEqual(sessions[f"{MEETING}:{self.SECOND}"]["status"], "failed")
+        self.assertEqual([c["raw"]["session_id"] for c in found], [SESSION])
+
+    def test_a_superseded_session_expires_and_is_settled_by_a_done_sibling(self):
+        self.write_mila_entry()
+        meetings = json.loads(listing(minutes=5))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(minutes=6)),
+            "durationMinutes": 30, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        self.at(60)
+        found = self.list_candidates()
+        self.processed[found[0]["id"]] = {"memory": "mi_shadow"}
+        self.at(75)
+        self.assertEqual(self.list_candidates(), [])
+        short = mi_source.load_state()["sessions"][f"{MEETING}:{SESSION}"]
+        self.assertEqual((short["status"], short["last_result"]),
+                         ("skipped", "event_settled"))
+
+    def test_superseded_sessions_expire_at_the_retry_window(self):
+        self.write_mila_entry()
+        meetings = json.loads(listing(minutes=5))["meetings"]
+        meetings[0]["occurrences"].append({
+            "sessionId": self.SECOND,
+            "startedAt": zulu(T0 + datetime.timedelta(minutes=6)),
+            "durationMinutes": 30, "transcriptReady": True,
+            "hasSummary": True})
+        self.service.list_text = json.dumps({"meetings": meetings})
+        self.at(60)
+        self.list_candidates()
+        self.at(30 + 24 * 60 + 10)
+        self.write_calendar([event()])
+        self.list_candidates()
+        short = mi_source.load_state()["sessions"][f"{MEETING}:{SESSION}"]
+        self.assertEqual(short["status"], "expired")
 
     def test_a_done_session_settles_its_events_later_sessions(self):
         self.write_mila_entry()
@@ -723,11 +849,24 @@ class PrimaryRecordingsTest(MiBase):
         self.assertEqual(self.list_candidates(), [])
         self.recordings.write_text(json.dumps({"not": "a list"}))
         self.assertEqual(self.list_candidates(), [])
-        self.recordings.write_text(json.dumps(
-            [{"id": "r1", "source": "voiceMemo", "createdAt": "garbage"}]))
+        self.recordings.write_text(json.dumps({"not": "a list"}))
         self.assertEqual(self.list_candidates(), [])
         self.assertEqual(self.session_state()["last_result"],
                          "mila_unreadable")
+
+    def test_a_malformed_record_is_skipped_and_the_rest_still_count(self):
+        garbage = {"id": "r0", "source": "voiceMemo", "createdAt": "garbage"}
+        self.write_recordings([garbage, "not an object", self.recording()])
+        self.assertEqual(self.list_candidates(), [])  # r1 still covers it
+        self.assertEqual(self.session_state()["last_result"],
+                         "mila_recording")
+        logged = [str(c.args[0]) for c in mi_source.log.call_args_list
+                  if "no usable interval" in str(c.args[0])]
+        self.assertEqual(len(logged), 1)
+        self.assertIn("2 recording(s)", logged[0])
+        elsewhere = T0 + datetime.timedelta(hours=5)
+        self.write_recordings([garbage, self.recording(start=elsewhere)])
+        self.assertEqual(self.list_candidates()[0]["raw"]["mode"], "full")
 
     def test_no_overlapping_recording_goes_full(self):
         elsewhere = T0 + datetime.timedelta(hours=5)
@@ -766,7 +905,8 @@ class MilaYieldsToMiTest(unittest.TestCase):
         self.store = Path(self.tmp.name)
         (self.store / "memory" / "entries" / "2026" / "07").mkdir(parents=True)
         self.routine = {"id": "mila-r", "memory": {"store": str(self.store)}}
-        self.source = {"kind": "mila", "match": dict(LOCAL_MATCH)}
+        self.source = {"kind": "mila", "match": dict(LOCAL_MATCH),
+                       "_mi_enabled": True}
 
     def entry(self, source_ids, name="mi-entry"):
         path = self.store / "memory" / "entries" / "2026" / "07" / f"{name}.md"
@@ -802,6 +942,70 @@ class MilaYieldsToMiTest(unittest.TestCase):
             (accepted, match), _ = self.match()
         self.assertTrue(accepted)
         self.assertIn("WARN", str(log.call_args.args[0]))
+
+    def test_without_an_mi_routine_the_store_is_never_read(self):
+        self.entry(["mi:m:s", calendar_links.mi_gcal_id("evt-intro")])
+        del self.source["_mi_enabled"]
+        with mock.patch.object(memory_sink, "entries_with_source_ids") as read:
+            (accepted, _), _ = self.match()
+        self.assertTrue(accepted)
+        read.assert_not_called()
+
+    def test_the_store_is_read_once_per_run(self):
+        self.entry(["mi:m:s", calendar_links.mi_gcal_id("evt-other")])
+        real = memory_sink.entries_with_source_ids
+        with mock.patch.object(memory_sink, "entries_with_source_ids",
+                               side_effect=real) as read:
+            first = self.match()
+            second = mila_source.match_calendar(
+                self.routine, self.source,
+                match_item(events=[mila_event("evt-two", "Alpha -- Beta - intro")]))
+        self.assertTrue(first[0][0])
+        self.assertTrue(second[0])
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[1], ["mi-gcal:"])
+        self.assertTrue(read.call_args.kwargs["prefix"])
+
+    def test_an_unreadable_store_warns_once_with_cause_and_relative_path(self):
+        self.entry(["mi:m:s", "mi-gcal:evt-other"], name="fine")
+        bad = self.store / "memory" / "entries" / "2026" / "07" / "broken.md"
+        bad.write_text("---\n: : [unclosed\n---\nSECRET-BODY mi-gcal:x\n")
+        with mock.patch.object(mila_source, "log") as log:
+            first = self.match()
+            second = mila_source.match_calendar(
+                self.routine, self.source,
+                match_item(events=[mila_event("evt-two", "Alpha -- Beta - intro")]))
+        self.assertTrue(first[0][0])
+        self.assertTrue(second[0])
+        warns = [str(c.args[0]) for c in log.call_args_list
+                 if "WARN" in str(c.args[0])]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("ParserError", warns[0])
+        self.assertIn("memory/entries/2026/07/broken.md", warns[0])
+        self.assertNotIn(str(self.store), warns[0])
+        self.assertNotIn("SECRET-BODY", warns[0])
+
+    def test_the_runner_flags_mila_only_when_an_mi_routine_exists(self):
+        listed = []
+
+        def candidates(source):
+            listed.append(source)
+            return [{"id": "mila:R@h", "title": "t",
+                     "raw": {"source_id": "mila:R"}}]
+
+        mila = {"id": "mila-r", "source": {"kind": "mila", "max_results": 0},
+                "analyze": {"provider": "claude", "model": "sonnet"}}
+        mi = {"id": "mi-r", "source": {"kind": "mi"},
+              "analyze": {"provider": "claude", "model": "sonnet"}}
+        for routines, expected in (([mila], False), ([mila, mi], True),
+                                   ([mila, dict(mi, enabled=False)], False)):
+            with mock.patch.dict(runner.SOURCES,
+                                 {"mila": (candidates, lambda *a: {})}):
+                claims, _failures = runner._collect_claims(
+                    routines, {"errors": 0}, source_kinds={"mila"},
+                    routing_context=routines)
+            claim = next(iter(claims.values()))[0]
+            self.assertIs(claim["source"].get("_mi_enabled", False), expected)
 
     def test_no_store_or_no_entry_changes_nothing(self):
         self.routine = {"id": "mila-r"}
@@ -899,6 +1103,19 @@ class ConfigTest(unittest.TestCase):
             routine = example_routine()
             routine["source"][key] = value
             self.assertTrue(config.validate(routine), (key, value))
+
+    def test_live_mode_needs_the_primary_recordings_file(self):
+        routine = example_routine()
+        routine["source"]["shadow"] = False
+        self.assertIn("primary_recordings_file", routine["source"])
+        self.assertEqual(config.validate(routine), [])
+        del routine["source"]["primary_recordings_file"]
+        self.assertTrue(any("primary_recordings_file is required when shadow "
+                            "is false" in p for p in config.validate(routine)))
+        routine["source"]["shadow"] = True
+        self.assertEqual(config.validate(routine), [])
+        del routine["source"]["shadow"]  # the default is shadow
+        self.assertEqual(config.validate(routine), [])
 
     def test_link_calendar_event_is_mila_only(self):
         routine = example_routine()

@@ -27,6 +27,11 @@ with each session it can tie to a calendar event:
   review. The plain ``gcal:`` id is never written: it belongs to hand-logged
   entries, and the store targets an entry by any source id it is given.
 
+Only a session whose start is within ``match_window_minutes`` of the event
+start may go full: a title-and-date fallback match could be another meeting,
+and an ``mi-gcal`` link written for it would make the real primary capture
+look like a duplicate. Such a session may still cross-check.
+
 A Mila-only meeting is untouched: this source never sees it.
 
 ``shadow`` (default true) writes nothing to the store: the would-be note or
@@ -121,7 +126,10 @@ MAX_ITEMS = 8
 MAX_FIELD_CHARS = 300
 TITLE_LIMIT = 120
 NOTE_TAG = "mi-check"
-OPEN_STATUSES = ("waiting", "no_match", "pending")
+# `superseded`: a shorter session of an event whose longer sibling is being
+# handled. It stays open, so it is reconsidered when the sibling fails or
+# expires, and expires itself at retry_hours.
+OPEN_STATUSES = ("waiting", "no_match", "pending", "superseded")
 TERMINAL_STATUSES = ("done", "skipped", "expired", "failed")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
@@ -532,25 +540,27 @@ def _store_index(cfg, store, event_ids):
 
 
 def _mila_slots(cfg):
-    """[(start, end)] epochs of every recording in the primary source's
-    recordings file, or None when the key is unset. Raises RuntimeError when
-    the file or any record cannot be read: nothing can then be ruled out."""
+    """[(start, end)] epochs of the recordings in the primary source's
+    recordings file, or None when the key is unset. A record whose interval
+    cannot be worked out is skipped (one WARN with the count, no content);
+    only a file-level failure raises RuntimeError, because nothing can then
+    be ruled out."""
     path = cfg.get("primary_recordings_file")
     if not path:
         return None
     zone = ZoneInfo(cfg["calendar_timezone"])
-    slots = []
-    try:
-        for record in mila_source._read_json(Path(path).expanduser()):
+    slots, skipped = [], 0
+    for record in mila_source._read_json(Path(path).expanduser()):
+        try:
             if not isinstance(record, dict):
                 raise ValueError("record is not an object")
             start, end = mila_source._recording_interval(record, zone)
             slots.append((start.timestamp(), end.timestamp()))
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(
-            f"cannot read a recording ({type(exc).__name__})") from None
+        except Exception:
+            skipped += 1
+    if skipped:
+        log(f"mi WARN {skipped} recording(s) in the primary recordings file "
+            "have no usable interval and are ignored")
     return slots
 
 
@@ -585,6 +595,12 @@ def _reconcile(sessions, processed, now, retry):
                     f"{retry // 3600}h ({record.get('last_result')}), dropping")
         if now > end + retry + TOMBSTONE_DAYS * 86400:
             sessions.pop(key)
+    done_events = {r.get("event_id") for r in sessions.values()
+                   if r.get("status") == "done" and r.get("event_id")}
+    for record in sessions.values():
+        if (record.get("status") == "superseded"
+                and record.get("event_id") in done_events):
+            record.update(status="skipped", last_result="event_settled")
 
 
 def _needs_listing(cfg, data, now):
@@ -603,6 +619,30 @@ def _needs_listing(cfg, data, now):
                 and not (cfg["skip_declined"] and event.get("declined"))):
             return True
     return False
+
+
+def _winners(matched, sessions):
+    """{event id: session key} of the one session to handle per event.
+
+    A session already pending is in flight and keeps the event. Otherwise the
+    longest session wins (the rest of a drop-and-rejoin is the tail); ties go
+    to the earliest start."""
+    chosen, ranks = {}, {}
+    for key, record, _m, _o, event_id, _e, started, _end in matched:
+        if event_id not in chosen:
+            pending = next(
+                (other for other, r in sessions.items()
+                 if r.get("event_id") == event_id
+                 and r.get("status") == "pending"), None)
+            if pending is not None:
+                chosen[event_id] = pending
+                ranks[event_id] = None
+        if ranks.get(event_id, ()) is None:
+            continue  # a pending session holds the event
+        rank = (-int(record.get("duration") or 0), started)
+        if event_id not in chosen or rank < ranks[event_id]:
+            chosen[event_id], ranks[event_id] = key, rank
+    return chosen
 
 
 def candidates(source):
@@ -695,6 +735,7 @@ def candidates(source):
             log(f"mi: session {key} matched by title and date only (no "
                 "start within match_window_minutes)")
         record["event_id"] = event_id
+        record["match"] = reason
         if cfg["skip_declined"] and event.get("declined"):
             record.update(status="skipped", last_result="declined")
             skipped += 1
@@ -714,17 +755,27 @@ def candidates(source):
             matched = []
     waiting = deferred = superseded = 0
     slots = False  # not read yet
+    winners = _winners(matched, sessions)
     for key, record, meeting, occ, event_id, event, started, end in matched:
         # One session per calendar event: a drop-and-rejoin makes a second.
+        # A handled event settles its other sessions for good; otherwise the
+        # longest session is handled and the others wait their turn.
         if event_id in in_store or any(
             other != key and r.get("event_id") == event_id
-            and r.get("status") in ("done", "pending")
+            and r.get("status") == "done"
             for other, r in sessions.items()
         ):
             if record.get("last_result") != "event_settled":
                 log(f"mi: session {key} is a later session of an event "
                     "already handled; skipped")
             record.update(status="skipped", last_result="event_settled")
+            superseded += 1
+            continue
+        if winners.get(event_id) != key:
+            if record.get("last_result") != "superseded":
+                log(f"mi: session {key} is not the longest session of its "
+                    "event; waiting for it")
+            record.update(status="superseded", last_result="superseded")
             superseded += 1
             continue
         primary = index.get(event_id)
@@ -758,6 +809,20 @@ def candidates(source):
                     record.update(status="waiting", last_result=reason)
                     waiting += 1
                     continue
+            if record.get("match") != "time":
+                # Only a start within match_window_minutes proves this is the
+                # event's own recording. A title-and-date match could be
+                # another meeting, and an `mi-gcal:` id written for it would
+                # make the real primary capture look like a duplicate. It may
+                # still cross-check when a primary exists; it stays open (and
+                # expires at retry_hours) in case one arrives.
+                if record.get("last_result") != "date_match_no_primary":
+                    log(f"mi: session {key} matched by date only and has no "
+                        "primary capture; not captured alone")
+                record.update(status="waiting",
+                              last_result="date_match_no_primary")
+                waiting += 1
+                continue
             mode = "full"
         if len(out) >= cfg["max_sessions_per_run"]:
             deferred += 1
@@ -773,6 +838,7 @@ def candidates(source):
                 "event_id": event_id,
                 "event": dict(event),
                 "mode": mode,
+                "match": record.get("match"),
                 "started_at": occ["startedAt"],
                 "primary": primary,
             },
@@ -840,6 +906,10 @@ def fetch(routine, source, candidate):
 def _fetch(_routine, source, candidate):
     cfg = settings(source)
     raw = candidate["raw"]
+    if raw["mode"] == "full" and raw.get("match") != "time":
+        # Defence in depth: every mi-gcal id comes from a start within the
+        # match window (see calendar_links).
+        raise RuntimeError("an MI-only item needs a time-window calendar match")
     pinned = {"meetingId": raw["meeting_id"], "sessionId": raw["session_id"]}
     results = _bridge(
         cfg,
@@ -868,6 +938,7 @@ def _fetch(_routine, source, candidate):
         "mi_session_id": raw["session_id"],
         "mi_mode": raw["mode"],
         "mi_started_at": raw["started_at"],
+        "mi_match": raw.get("match"),
         "calendar_event_id": raw["event_id"],
         "calendar_event_title": event.get("title") or "",
         "calendar_event_start": event.get("start"),

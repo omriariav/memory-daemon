@@ -9,6 +9,10 @@ import them without importing each other.
 """
 
 # An MI-only meeting entry: carries `mi:<meeting>:<session>` and this link.
+# The Mila source treats a recording whose event carries this link as already
+# captured, so the link must only ever name the event's own recording: the MI
+# source writes it only for a session whose start is within the match window
+# of the event start (never for a title-and-date fallback match).
 MI_GCAL_SCHEME = "mi-gcal"
 # The cross-check note beside a primary entry: a note-only link, so a second
 # session of the same event can be recognised as already handled.
