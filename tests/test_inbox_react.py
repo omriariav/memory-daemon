@@ -492,8 +492,10 @@ class ReactFlowTest(WorkerCleanup, unittest.IsolatedAsyncioTestCase):
     async def test_full_flow_confirm_undo_window_call_then_done(self):
         store = InboxStore(None)
         calls = []
+        # 1.5 s, not 0.4: on a slow CI runner a short window closed before the
+        # "still pending" check ran (the later waits poll, so this costs ~1 s)
         app = make_app([row(1), row(2)], real(store, good_call(calls)), store,
-                       undo_s=0.4)
+                       undo_s=1.5)
         async with app.run_test(size=SIZE) as pilot:
             await self.to_confirm(pilot, app, "1")
             modal = app.screen
