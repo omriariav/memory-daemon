@@ -364,14 +364,14 @@ class DueChoicesTest(unittest.TestCase):
     def test_without_work_week(self):
         got = tasks.due_choices(TODAY)
         self.assertEqual([k for k, _l, _d in got],
-                         ["today", "tomorrow", "sunday", "week", "pick",
+                         ["tomorrow", "sunday", "week", "today", "pick",
                           "none"])
         self.assertEqual([l for _k, l, _d in got][:4],
-                         ["Today  Thu 10 Jan", "Tomorrow  Fri 11 Jan",
-                          "Next Sunday  Sun 13 Jan", "+1 week  Thu 17 Jan"])
+                         ["Tomorrow  Fri 11 Jan", "Next Sunday  Sun 13 Jan",
+                          "+1 week  Thu 17 Jan", "Today  Thu 10 Jan"])
         self.assertEqual([d for _k, _l, d in got],
-                         [TODAY, D(2030, 1, 11), D(2030, 1, 13),
-                          D(2030, 1, 17), None, None])
+                         [D(2030, 1, 11), D(2030, 1, 13), D(2030, 1, 17),
+                          TODAY, None, None])
         self.assertTrue(got[4][1].startswith("Pick date"))
 
     def test_with_work_week(self):
@@ -383,20 +383,41 @@ class DueChoicesTest(unittest.TestCase):
         self.assertEqual(got["tomorrow"][1], D(2026, 11, 27))
         self.assertEqual(got["sunday"][0], "Next week  Sun 29 Nov")
         self.assertEqual(self.ids(D(2026, 11, 27), "monday", 5),
-                         ["today", "tomorrow", "workday", "sunday", "week",
+                         ["tomorrow", "sunday", "week", "today", "workday",
                           "pick", "none"])
 
-    def test_next_work_day_is_left_out_when_it_is_tomorrow(self):
-        plain = ["today", "tomorrow", "sunday", "week", "pick", "none"]
-        self.assertEqual(self.ids(D(2026, 11, 25), "sunday", 5), plain)  # Wed
-        self.assertEqual(self.ids(D(2026, 11, 28), "sunday", 5), plain)  # Sat
-        self.assertEqual(self.ids(D(2026, 11, 25), "sunday", 7), plain)  # 7 days
+    def test_the_old_keys_keep_their_places(self):
+        # 0.13.4: 1 Tomorrow, 2 Next Sunday / Next week, 3 +1 week
+        for args in ((), ("sunday", 5), ("monday", 7)):
+            self.assertEqual(self.ids(TODAY, *args)[:3],
+                             ["tomorrow", "sunday", "week"])
 
-    def test_next_work_day_stays_when_it_is_also_next_week(self):
+    def test_the_order_is_fixed_whatever_the_day(self):
+        want = ["tomorrow", "sunday", "week", "today", "workday", "pick",
+                "none"]
+        for start in tasks.WEEKDAYS:
+            for count in (1, 5, 7):
+                for n in range(7):
+                    today = D(2026, 11, 23) + dt.timedelta(days=n)
+                    self.assertEqual(self.ids(today, start, count), want,
+                                     (start, count, today))
+        plain = ["tomorrow", "sunday", "week", "today", "pick", "none"]
+        for n in range(7):
+            self.assertEqual(self.ids(D(2026, 11, 23) + dt.timedelta(days=n)),
+                             plain)
+
+    def test_next_work_day_stays_when_it_repeats_tomorrow_or_next_week(self):
+        got = {k: d for k, _l, d in tasks.due_choices(D(2026, 11, 25),
+                                                      "sunday", 5)}   # Wed
+        self.assertEqual(got["workday"], got["tomorrow"])
+        self.assertEqual(got["workday"], D(2026, 11, 26))
         for today in (D(2026, 11, 26), D(2026, 11, 27)):     # Thu, Fri
             got = {k: d for k, _l, d in tasks.due_choices(today, "sunday", 5)}
             self.assertEqual(got["workday"], D(2026, 11, 29))
             self.assertEqual(got["sunday"], D(2026, 11, 29))
+        got = {k: d for k, _l, d in tasks.due_choices(D(2026, 11, 25),
+                                                      "sunday", 7)}
+        self.assertEqual(got["workday"], got["tomorrow"])
 
     def test_one_work_day_a_week(self):
         got = {k: d for k, _l, d in tasks.due_choices(D(2026, 11, 25),

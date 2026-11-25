@@ -250,9 +250,11 @@ def fmt_day(day, today):
 
 def due_choices(today, week_start=None, work_days=5):
     """The `s` picker: `[(id, label, date or None)]`; `pick` has no date yet.
-    Today, Tomorrow, Next work day (only with `week_start` set; left out when
-    it is the same day as Tomorrow), Next Sunday (Next week, the
-    next `week_start` day, when set), +1 week, Pick date, No date."""
+    In the order of the keys: Tomorrow, Next Sunday (Next week, the next
+    `week_start` day, when set), +1 week (these three kept their keys from
+    0.13.4), then Today, Next work day (only with `week_start` set; always
+    listed then, even when it repeats Tomorrow or Next week), Pick date and
+    No date."""
     tomorrow = today + dt.timedelta(days=1)
     if week_start:
         sunday = next_week_start(today, week_start)
@@ -264,15 +266,14 @@ def due_choices(today, week_start=None, work_days=5):
     def fmt(day):
         return fmt_day(day, today)
 
-    out = [("today", f"Today  {fmt(today)}", today),
-           ("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow)]
+    out = [("tomorrow", f"Tomorrow  {fmt(tomorrow)}", tomorrow),
+           ("sunday", f"{second}  {fmt(sunday)}", sunday),
+           ("week", f"+1 week  {fmt(week)}", week),
+           ("today", f"Today  {fmt(today)}", today)]
     if week_start:
         work = next_work_day(today, week_start, work_days)
-        if work != tomorrow:
-            out.append(("workday", f"Next work day  {fmt(work)}", work))
-    out += [("sunday", f"{second}  {fmt(sunday)}", sunday),
-            ("week", f"+1 week  {fmt(week)}", week),
-            ("pick", "Pick date…  25/11, thu, +3d, YYYY-MM-DD", None),
+        out.append(("workday", f"Next work day  {fmt(work)}", work))
+    out += [("pick", "Pick date…  25/11, thu, +3d, YYYY-MM-DD", None),
             ("none", "No date", None)]
     return out
 

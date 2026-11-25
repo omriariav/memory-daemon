@@ -14,13 +14,13 @@ for a source or a settings file.
 
 ### Added
 
-- **Today** is the first choice of the `s` picker. It sets the due date to
+- **Today** is a choice of the `s` picker (`4`). It sets the due date to
   today (the date only).
 - **Next work day** in the picker, when `work_week:` is set: the first day
   after today that is a work day (`start` and the `days - 1` days after it).
-  With `sunday` and `5`, on a Thursday it is Sunday. It is left out when it is
-  tomorrow, so the same date never shows twice in a row. `work_week.days` is
-  read for the first time.
+  With `sunday` and `5`, on a Thursday it is Sunday. It is always listed, even
+  when its date is the same as Tomorrow or Next week, so a key never changes
+  from one day to the next. `work_week.days` is read for the first time.
 - **Typed due dates** in Pick date: `today`, `tomorrow`, a weekday name or its
   3-letter form (`thu`: the next such day; today's own weekday means a week
   out), `d/m` or `d.m` (`25/11`: this year, or next year when it has passed),
@@ -30,10 +30,11 @@ for a source or a settings file.
 
 ### Changed
 
-- The picker's choices now start at Today: `1` Today, `2` Tomorrow, then Next
-  work day (with `work_week`), Next Sunday or Next week, +1 week, Pick date
-  and No date. The number keys follow that order, so `1` is no longer
-  Tomorrow.
+- The picker's choices are `1` Tomorrow, `2` Next Sunday (Next week with
+  `work_week`) and `3` +1 week, as before, then the new `4` Today and, with
+  `work_week`, `5` Next work day. Pick date and No date moved down: they were
+  `4` and `5`, and are now `5` and `6` (`6` and `7` with `work_week`). The
+  order is the same every day.
 
 ## [0.13.4] - 2026-11-25
 
