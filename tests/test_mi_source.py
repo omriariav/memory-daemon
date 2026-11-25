@@ -301,6 +301,49 @@ class MatchingTest(MiBase):
         self.list_candidates()
         self.assertIn("ev1", mi_source.load_state()["events"])
 
+    def write_calendar_with_recent(self, events, recent):
+        self.calendar.write_text(json.dumps({
+            "events": events, "recent_events": recent,
+            "refreshed_at": iso(self.now), "owner_email": "ann@example.com"}))
+
+    def session(self):
+        return next(iter(mi_source.load_state()["sessions"].values()))
+
+    def test_a_past_meeting_matches_through_recent_events(self):
+        self.write_calendar_with_recent([], [event()])
+        self.list_candidates()
+        self.assertEqual(self.session()["event_id"], "ev1")
+        self.assertEqual(self.session()["match"], "time")
+        self.assertEqual(mi_source.load_state()["events"]["ev1"]["title"], TITLE)
+
+    def test_a_past_meeting_is_not_matched_without_recent_events(self):
+        # another event that ended makes the service get listed
+        self.write_calendar([event(
+            "ev2", title="Other meeting", start=T0 - datetime.timedelta(hours=1))])
+        self.list_candidates()
+        self.assertEqual(self.session()["status"], "no_match")
+        self.assertEqual(self.session()["last_result"], "no_event")
+
+    def test_events_and_recent_events_are_deduped_by_event_id(self):
+        moved = event(title="Renamed")
+        self.write_calendar_with_recent([moved], [event(), event("ev2", "Other")])
+        self.list_candidates()
+        tracked = mi_source.load_state()["events"]
+        self.assertEqual(tracked["ev1"]["title"], "Renamed")  # events wins
+        self.assertIn("ev2", tracked)
+
+    def test_an_old_file_without_recent_events_still_works(self):
+        self.write_calendar([event()])  # no recent_events key
+        self.list_candidates()
+        self.assertEqual(self.session()["event_id"], "ev1")
+
+    def test_a_malformed_recent_events_key_is_ignored(self):
+        for bad in ("x", {"a": 1}, None, [1, "x", None]):
+            mi_source.configure(str(self.base))  # keep state across runs
+            self.write_calendar_with_recent([event()], bad)
+            self.list_candidates()
+            self.assertEqual(self.session()["event_id"], "ev1", bad)
+
     def test_all_day_events_are_not_tracked(self):
         all_day = event("ev9")
         all_day["all_day"] = True

@@ -50,7 +50,8 @@ MAINTENANCE_ALLOWED_KEYS = {
         "internal_domains", "output", "skip_titles", "max_attendee_names",
         "model", "list_tool", "get_tool", "max_events", "max_details",
         "stale_after", "conference_hosts", "events_window_days",
-        "invite_lookahead_days", "freebusy_tool",
+        "invite_lookahead_days", "freebusy_tool", "lookback_hours",
+        "lookback_max_events", "lookback_refresh_minutes",
     },
     "fibery_tasks_inbound": {
         "kind", "document_secret", "read_tool", "model", "owner_slug",
@@ -1701,6 +1702,30 @@ def _validate_calendar_cache(rid, cfg):
         problems.append(
             f"{rid}: maintenance.invite_lookahead_days must be a number "
             "from 0 (off) to 35"
+        )
+    lookback = cfg.get("lookback_hours", 0)
+    if (
+        not isinstance(lookback, (int, float)) or isinstance(lookback, bool)
+        or not 0 <= lookback <= 72
+    ):
+        problems.append(
+            f"{rid}: maintenance.lookback_hours must be a number "
+            "from 0 (off) to 72"
+        )
+    cap = cfg.get("lookback_max_events", 100)
+    if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 500:
+        problems.append(
+            f"{rid}: maintenance.lookback_max_events must be an integer "
+            "from 1 to 500"
+        )
+    refresh = cfg.get("lookback_refresh_minutes", 60)
+    if (
+        not isinstance(refresh, (int, float)) or isinstance(refresh, bool)
+        or not 15 <= refresh <= 1440
+    ):
+        problems.append(
+            f"{rid}: maintenance.lookback_refresh_minutes must be a number "
+            "from 15 to 1440"
         )
     days = cfg.get("events_window_days", 7)
     if (
