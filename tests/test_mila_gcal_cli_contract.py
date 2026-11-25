@@ -8,7 +8,10 @@ CLI's target is the same with and without it.
 Optional: skipped unless a sibling checkout of the store repo (with
 node_modules), Node 20+ and npx are available. The store code is COPIED into a
 scratch directory (only node_modules is symlinked), so the real store is never
-written; the test asserts its entry count and git status are unchanged.
+written; the test asserts its entry count (store and graph stores) and the HEAD
+and status of the code repo and the nested store repos are unchanged. CI has no
+sibling store checkout, so CI always skips this test: a green CI run does not
+mean the contract passed.
 """
 import os
 import re
@@ -65,13 +68,30 @@ SKIP_REASON = (
 
 
 def _entry_count(repo):
-    return sum(1 for _ in (repo / "memory" / "entries").rglob("*.md"))
+    """Entry files in the store and in every graph store."""
+    count = 0
+    for folder in (repo / "memory", repo / "memory-graphs"):
+        if folder.is_dir():
+            count += sum(1 for _ in folder.rglob("*.md"))
+    return count
 
 
 def _git_status(repo):
-    return subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"],
-        capture_output=True, text=True, timeout=60).stdout
+    """HEAD and porcelain status of the code repo and of the nested store
+    repos (`memory/` and each graph store keep their own .git)."""
+    out = []
+    repos = [repo, repo / "memory"]
+    graphs = repo / "memory-graphs"
+    if graphs.is_dir():
+        repos += sorted(p for p in graphs.iterdir() if (p / ".git").exists())
+    for path in repos:
+        if not (path / ".git").exists():
+            continue
+        for args in (["rev-parse", "HEAD"], ["status", "--porcelain"]):
+            out.append(subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True, text=True, timeout=60).stdout)
+    return "".join(out)
 
 
 @unittest.skipIf(SKIP_REASON, SKIP_REASON or "")
