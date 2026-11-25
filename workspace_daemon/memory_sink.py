@@ -609,6 +609,12 @@ def _simulated_target(matches, open_ids, etype):
     ("new",) when no entry is touched (no match, or a split), ("error", id)
     when the CLI refuses because an open item is the target, else
     ("write", id): a same-type refresh, or a note retyped in place.
+
+    Mirrors the target resolution of `add` in the store's src/cli.ts: the
+    `else if (sourceIds.length)` branch (about lines 213-240: matches ordered
+    by (date, id); the `--type` rules: same type, else open item, else all
+    notes, else split) and the open-item guard after it (about lines 244-262).
+    tests/test_mila_gcal_cli_contract.py runs the real CLI to pin this.
     """
     ordered = sorted(matches, key=lambda m: (m[0], m[1]))
     if not ordered:
@@ -636,6 +642,11 @@ def linkable_extra_source_ids(store, source_id, extra_ids, etype, rid=None):
     is decided as in `capture_guard`: no entry follows the todo / pending
     decision. Malformed ids are dropped. An unreadable store fails closed:
     no extras.
+
+    The check is still needed for the Mila `mila-gcal:<event id>` link: no
+    hand-logged entry carries that scheme, but a second, non-overlapping Mila
+    recording of the same event does, and linking would then make the CLI
+    update that recording's entry instead of writing this one.
     """
     wanted = []
     for value in extra_ids or ():

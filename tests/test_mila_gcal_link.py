@@ -1,5 +1,5 @@
-"""A Mila meeting entry also carries the calendar event as `gcal:<id>`, but only
-when the extra id cannot change which entry the store CLI writes."""
+"""A Mila meeting entry also carries the calendar event as `mila-gcal:<id>`, but
+only when the extra id cannot change which entry the store CLI writes."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +14,7 @@ from test_mila_source import (
 )
 
 SID = "mila:X"
-GCAL = "gcal:evt1_20260801T100000Z"
+GCAL = f"{mila_source.CALENDAR_LINK_SCHEME}:evt1_20260801T100000Z"
 STORE = "/store"
 
 
@@ -38,8 +38,15 @@ class ItemExtraIdsTest(unittest.TestCase):
         item = match_item(events=[event("evt-intro", "Alpha -- Beta - intro")])
         accepted, _ = self.match(item)
         self.assertTrue(accepted)
-        self.assertEqual(item["extra_source_ids"], ["gcal:evt-intro"])
+        self.assertEqual(item["extra_source_ids"], [f"{mila_source.CALENDAR_LINK_SCHEME}:evt-intro"])
         self.assertEqual(item["source_id"], "mila:R")
+
+    def test_scheme_is_not_the_hand_logged_gcal(self):
+        item = match_item(events=[event("evt-intro", "Alpha -- Beta - intro")])
+        self.match(item)
+        self.assertEqual(mila_source.CALENDAR_LINK_SCHEME, "mila-gcal")
+        for value in item["extra_source_ids"]:
+            self.assertFalse(value.startswith(("gcal:", "mila:")), value)
 
     def test_option_off_disables_it(self):
         item = match_item(events=[event("evt-intro", "Alpha -- Beta - intro")])
@@ -128,6 +135,11 @@ class LinkableTest(StoreFixture):
         self.write("hand-event", "event", [GCAL])
         self.assertEqual(self.linked(), [GCAL])
 
+    def test_hand_logged_gcal_id_does_not_touch_the_link(self):
+        # Hand-logged entries carry `gcal:<id>`, a different id altogether.
+        self.write("hand-note", "note", ["gcal:evt1_20260801T100000Z"])
+        self.assertEqual(self.linked(), [GCAL])
+
     def test_dropped_when_another_meeting_carries_it(self):
         self.write("other-recording", "meeting", [GCAL, "mila:OTHER"])
         self.assertEqual(self.linked(), [])
@@ -166,16 +178,17 @@ class LinkableTest(StoreFixture):
         self.assertEqual(self.linked(), [])
 
     def test_extras_are_judged_one_by_one(self):
-        other = "gcal:other"
+        other = "mila-gcal:other"
         self.write("hand-note", "note", [other])
         self.assertEqual(self.linked([other, GCAL]), [GCAL])
 
     def test_malformed_ids_are_never_linked(self):
-        for bad in ("gcal:a,b", "gcal:a|b", "gcal:a b", "gcal:a\tb",
-                    "nocolon", "gcal:", ":rest", "GCAL:x", "gcal:\n", "",
-                    None, 7, "gcal:" + "x" * 300, SID):
+        for bad in ("mila-gcal:a,b", "mila-gcal:a|b", "mila-gcal:a b",
+                    "mila-gcal:a\tb", "nocolon", "mila-gcal:", ":rest",
+                    "MILA-GCAL:x", "mila-gcal:\n", "", None, 7,
+                    "mila-gcal:" + "x" * 300, SID):
             self.assertEqual(self.linked([bad]), [], msg=repr(bad))
-        self.assertEqual(self.linked(["gcal:a,b", GCAL, GCAL]), [GCAL])
+        self.assertEqual(self.linked(["mila-gcal:a,b", GCAL, GCAL]), [GCAL])
 
     def test_store_read_error_fails_closed(self):
         with mock.patch.object(memory_sink, "_store_entries",
@@ -287,7 +300,8 @@ class CaptureArgvTest(StoreFixture):
 
     def test_malformed_extras_are_never_passed(self):
         self.item["extra_source_ids"] = [
-            "gcal:a,b", "gcal:a|b", "gcal:a b", "nocolon", 7, None]
+            "mila-gcal:a,b", "mila-gcal:a|b", "mila-gcal:a b", "nocolon", 7,
+            None]
         out, calls, _ = self.capture()
         self.assertEqual(self.ids(calls), SID)
         self.assertNotIn("memory_extra_source_ids", out)
@@ -328,6 +342,17 @@ class ConfigTest(unittest.TestCase):
             self.assertTrue(
                 any("link_calendar_event" in p for p in problems),
                 msg=repr(bad))
+
+    def test_other_source_kinds_reject_the_key(self):
+        source = {"kind": "whisper", "transcriptions_dir": "/tmp/w",
+                  "link_calendar_event": True}
+        problems = config.validate(routine("/tmp/store", source))
+        self.assertTrue(
+            any("link_calendar_event" in p and "only supported for kind mila"
+                in p for p in problems), msg=str(problems))
+        source = {"kind": "mila", "recordings_file": "/tmp/mila/r.json",
+                  "match": dict(LOCAL_MATCH), "link_calendar_event": True}
+        self.assertEqual(config.validate(routine("/tmp/store", source)), [])
 
     def test_example_routines_validate(self):
         root = Path(__file__).resolve().parent.parent / "routines"

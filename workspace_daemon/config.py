@@ -2931,10 +2931,13 @@ def _validate_source(routine, source, prefix):
 
     if kind == "mila":
         problems.extend(_validate_mila_match(source, prefix))
-    elif any(key in source for key in ("calendar", "match", "max_transcript_chars", "app_summary", "language_check")):
+    elif any(key in source for key in (
+        "calendar", "match", "max_transcript_chars", "app_summary",
+        "language_check", "link_calendar_event",
+    )):
         problems.append(
             f"{prefix}: calendar, match, max_transcript_chars, "
-            f"app_summary and language_check are only "
+            f"app_summary, language_check and link_calendar_event are only "
             f"supported for kind mila"
         )
 
