@@ -2422,7 +2422,7 @@ def _unfiled_owner_actions(routine, cfg, item, entry, etype,
             and owner_todos.is_meeting_item(item)):
         return []
     actions, _dropped = owner_todos.validate_actions(
-        entry.get("owner_actions"), require_ts=True)
+        entry.get("owner_actions"))
     texts = [a["text"] for a in actions or []][:owner_todos.max_per_item(routine)]
     if personal.redact_enabled(cfg):
         texts = [personal.redact(text)[0] for text in texts]
@@ -2445,7 +2445,7 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
             title)
     rid = routine.get("id")
     actions, dropped = owner_todos.validate_actions(
-        entry.get("owner_actions"), require_ts=True
+        entry.get("owner_actions")
     )
     if actions is None:
         log(f"routine={rid} owner-todos: invalid owner_actions, "
@@ -2464,9 +2464,14 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
         return {}
     grounded = []
     for a in actions:
-        ok, line = owner_todos.ground_in_transcript(
-            item.get("body", ""), a.get("evidence_ts"), names,
-            (item.get("frontmatter") or {}).get("mila_speaker_names") or ())
+        if a.get("evidence_ts"):
+            ok, line = owner_todos.ground_in_transcript(
+                item.get("body", ""), a["evidence_ts"], names,
+                (item.get("frontmatter") or {}).get("mila_speaker_names")
+                or ())
+        else:   # the model gave no usable timestamp: match the owner's text
+            ok, line = owner_todos.ground_without_ts(
+                item.get("body", ""), a["text"], names)
         if ok:
             grounded.append(dict(a, line=line))
     ungrounded = len(actions) - len(grounded)
@@ -2485,8 +2490,7 @@ def _file_live_owner_todos(routine, item, entry, source_id, entry_id,
 def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
                                identity, is_personal, title):
     rid = routine.get("id")
-    candidates = owner_todos.classify_actions(
-        entry.get("owner_actions"), require_ts=True)
+    candidates = owner_todos.classify_actions(entry.get("owner_actions"))
     if candidates is None:
         log(f"routine={rid} owner-todos review: invalid owner_actions, "
             "nothing filed")
@@ -2507,15 +2511,21 @@ def _review_live_owner_actions(routine, item, entry, source_id, entry_id,
     for c in candidates:
         ts = c.get("evidence_ts")
         if c["status"] == "valid":
-            grounded, quote = owner_todos.ground_in_transcript(
-                body, ts, names, mapped)
+            if ts:
+                grounded, quote = owner_todos.ground_in_transcript(
+                    body, ts, names, mapped)
+                miss = "no owner-spoken transcript line at the timestamp"
+            else:   # no usable timestamp: kept, matched by the owner's text
+                grounded, quote = owner_todos.ground_without_ts(
+                    body, c["text"], names)
+                miss = owner_todos.NO_TS_REASON
             if grounded:
                 c["quote"] = quote
                 c.update(_with_phrase_due(
                     routine, c, item.get("date", ""), quote))
                 continue
             c["status"] = "ungrounded"
-            c["reason"] = "no owner-spoken transcript line at the timestamp"
+            c["reason"] = miss
         if ts:
             c["line_at_ts"] = owner_todos.transcript_quote(body, ts)
     meta = item.get("frontmatter") or {}

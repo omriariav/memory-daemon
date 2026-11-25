@@ -166,7 +166,7 @@ class CaptureTest(CaptureHarness):
         for bad in (
             "not a list", [{"text": ""}], [act("x", owner="bob")],
             [act("x", due="tomorrow")], ["plain string"],
-            [{"text": "no timestamp"}], [act(5)], [act("y" * 500)],
+            [act(5)], [act("y" * 500)],
         ):
             with self.subTest(bad=bad):
                 self.store = FakeStore()
@@ -408,7 +408,9 @@ class PromptTest(unittest.TestCase):
         self.assertIn("explicitly committed to", prompt)
         self.assertIn("Never other people's actions", prompt)
         self.assertIn("hints are candidates only", prompt)
-        self.assertIn("(required)", prompt)
+        self.assertIn("leave the key out when no transcript line carries one",
+                      prompt)
+        self.assertIn("never 0", prompt)
         chat = dict(meeting_item(), source_kind="slack_mcp", frontmatter={})
         self.assertNotIn("owner_actions", self.prompt(
             make_routine(), chat, owner_names=names))
@@ -568,7 +570,7 @@ def read_lines(path):
 MIXED = [
     act("Send the revised plan to the team", due="2026-10-08"),
     act("Book the review room", ts="00:15:10"),
-    {"text": "Call the clinic back"},
+    {"text": "Call the clinic back", "due": "soon"},
 ]
 
 
@@ -608,7 +610,7 @@ class ReviewModeTest(CaptureHarness):
                      "Book the review room", "Call the clinic back"):
             self.assertIn(text, body)
         self.assertIn("[unverified: ungrounded]", body)
-        self.assertIn("[invalid: missing timestamp]", body)
+        self.assertIn("[invalid: bad due date]", body)
         self.assertIn('line at timestamp: "Bob Stone: I will book the review '
                       'room."', body)
         self.assertNotIn('quote: "Bob', body)
@@ -649,7 +651,7 @@ class ReviewModeTest(CaptureHarness):
         self.assertNotIn("due", ungrounded)
         self.assertEqual(invalid, {
             "text": "Call the clinic back", "quote": None, "owner": OWNER,
-            "status": "invalid", "reason": "missing timestamp"})
+            "status": "invalid", "reason": "bad due date"})
 
     def test_rerun_is_idempotent(self):
         self.capture(meeting_extraction(MIXED))
@@ -685,7 +687,7 @@ class ReviewModeTest(CaptureHarness):
         self.assertEqual(self.rows(), [])
 
     def test_only_invalid_candidates_still_reach_review(self):
-        self.capture(meeting_extraction([{"text": "No stamp"}]))
+        self.capture(meeting_extraction([{"text": "No date", "due": "soon"}]))
         self.assertEqual(len(self.store.reviews()), 1)
         self.assertEqual(self.rows()[0]["candidates"][0]["status"], "invalid")
 
@@ -781,7 +783,7 @@ class ReviewModeTest(CaptureHarness):
         body = "\n".join(
             f"[00:0{n}:00] {NAME}: I will do thing {n}." for n in range(1, 4))
         self.routine["memory"]["owner_todos"]["max_per_item"] = 2
-        actions = [{"text": "Flagged first"}] + [
+        actions = [{"text": "Flagged first", "due": "soon"}] + [
             act(f"Do thing {n}", ts=f"00:0{n}:00") for n in range(1, 4)]
         self.capture(meeting_extraction(actions), item=meeting_item(body))
         cands = self.rows()[0]["candidates"]
@@ -860,6 +862,145 @@ class FileModeTest(CaptureHarness):
 
     def test_unknown_mode_falls_back_to_file(self):
         self.assertEqual(owner_todos.mode(make_routine(mode="x")), "file")
+
+
+BAD_TS = (0, 0.0, "0", "00:00", "0:00:00", "[00:00:00]", "00:00:00,000",
+          "garbage", "", None, True, float("nan"), [], {}, "125", -5, 0.4)
+
+
+class UnusableTimestampTest(CaptureHarness):
+    """An unusable evidence_ts (a recorder's own `timestamp_seconds: 0`
+    copied by the model) is dropped; the row is kept."""
+
+    def test_usable_ts(self):
+        for ts in BAD_TS:
+            with self.subTest(ts=ts):
+                self.assertIsNone(owner_todos.usable_ts(ts))
+        for given, want in (("00:12:03", "00:12:03"), (" 12:03 ", "12:03"),
+                            ("00:12:03,000", "00:12:03,000"),
+                            (723, "00:12:03"), (723.9, "00:12:03"),
+                            (3725, "01:02:05")):
+            with self.subTest(ts=given):
+                self.assertEqual(owner_todos.usable_ts(given), want)
+
+    def test_validate_keeps_the_row_without_the_timestamp(self):
+        for ts in BAD_TS:
+            with self.subTest(ts=ts):
+                rows, dropped = owner_todos.validate_actions(
+                    [{"text": "Send it", "evidence_ts": ts}])
+                self.assertEqual((rows, dropped), ([{"text": "Send it"}], 0))
+        rows, _ = owner_todos.validate_actions(
+            [{"text": "Send it"}, act("Do it", ts=723)])
+        self.assertEqual(rows, [{"text": "Send it"},
+                                {"text": "Do it", "evidence_ts": "00:12:03"}])
+
+    def test_classify_keeps_the_row_valid(self):
+        for ts in BAD_TS:
+            with self.subTest(ts=ts):
+                rows = owner_todos.classify_actions(
+                    [{"text": "Send it", "evidence_ts": ts, "due": "2026-10-08"}])
+                self.assertEqual(rows, [{
+                    "text": "Send it", "due": "2026-10-08",
+                    "status": "valid", "reason": None}])
+
+    def test_other_refusals_are_unchanged(self):
+        bad = [
+            ({"text": "", "evidence_ts": 0}, "missing text"),
+            ({"text": "x" * 500, "evidence_ts": 0}, "text too long"),
+            ({"text": "x", "evidence_ts": 0, "due": "soon"}, "bad due date"),
+            ({"text": "x", "evidence_ts": 0, "owner": "bob"}, "unexpected field"),
+            ("plain", "not an object"),
+        ]
+        for row, reason in bad:
+            with self.subTest(reason=reason):
+                self.assertEqual(owner_todos.validate_actions([row]), ([], 1))
+                got = owner_todos.classify_actions([row])[0]
+                self.assertEqual((got["status"], got["reason"]),
+                                 ("invalid", reason))
+                self.assertNotIn(reason, got["text"])
+
+    def test_ground_without_ts_is_owner_only(self):
+        ok = owner_todos.ground_without_ts
+        self.assertEqual(
+            ok(TRANSCRIPT, "Send the revised plan to the team", [NAME]),
+            (True, f"{NAME}: I will send the revised plan to the team."))
+        # Bob's line and the unnamed speaker never ground an owner action
+        self.assertEqual(ok("[00:15:10] Bob Stone: I will book the review "
+                            "room.", "Book the review room", [NAME]),
+                         (False, None))
+        self.assertEqual(ok(TRANSCRIPT, "Call the clinic back", [NAME]),
+                         (False, None))
+        self.assertEqual(ok(TRANSCRIPT, "Do", [NAME]), (False, None))
+        self.assertEqual(ok("", "Send the plan", [NAME]), (False, None))
+
+    def test_file_mode_files_a_zero_timestamp_row_grounded_by_text(self):
+        for ts in (0, "0", "00:00", "garbage", None):
+            with self.subTest(ts=ts):
+                self.setUp()
+                out = self.capture(meeting_extraction([
+                    act("Send the revised plan to the team", ts=ts),
+                    act("Call the clinic back", ts=0),     # unnamed speaker
+                ]))
+                self.assertEqual(out["memory_owner_todos"], 1)
+                (row,) = self.store.todos().values()
+                self.assertEqual(row["flags"]["--title"],
+                                 "Send the revised plan to the team")
+                self.assertNotIn(" at ", row["body"])
+                self.assertIn("1 ungrounded", self.logged)
+
+    def test_file_mode_positive_seconds_ground_like_a_timestamp(self):
+        out = self.capture(meeting_extraction([
+            act("Send the revised plan to the team", ts=723)]))
+        self.assertEqual(out["memory_owner_todos"], 1)
+        (row,) = self.store.todos().values()
+        self.assertIn("at 00:12:03", row["body"])
+
+
+class ZeroTimestampReviewTest(CaptureHarness):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = os.path.join(self.tmp.name, "q.jsonl")
+        self.routine = make_routine(mode="review", review_queue=self.queue)
+
+    def rows(self):
+        with open(self.queue, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh.read().splitlines()]
+
+    def test_meeting_of_only_zero_timestamp_items_is_filed_for_review(self):
+        out = self.capture(meeting_extraction([
+            act("Send the revised plan to the team", ts=0),
+            act("Booking the room is on me too", ts="0:00:00"),
+            act("Call the clinic back", ts=0.0),
+            act("Order the lunch", ts="garbage"),
+        ]))
+        self.assertEqual(out["memory_owner_review"], 1)
+        self.assertEqual(out["memory_owner_review_candidates"], 4)
+        body = self.store.reviews()["mila:REC-1:review"]["body"]
+        self.assertNotIn("[invalid", body)
+        self.assertNotIn("bad timestamp", body)
+        self.assertEqual(body.count("[unverified: no timestamp]"), 2)
+        self.assertNotIn("[unverified: ungrounded]", body)
+        self.assertIn('quote: "Me Example: I will send the revised plan to '
+                      'the team."', body)
+        cands = self.rows()[0]["candidates"]
+        self.assertEqual([c["status"] for c in cands],
+                         ["valid", "valid", "ungrounded", "ungrounded"])
+        self.assertEqual(cands[0]["quote"],
+                         "Me Example: I will send the revised plan to the team.")
+        self.assertEqual(cands[2]["reason"], owner_todos.NO_TS_REASON)
+        self.assertNotIn("evidence_ts", cands[2])
+        self.assertNotIn("line_at_ts", cands[2])
+        self.assertNotIn("bad timestamp", self.logged)
+
+    def test_file_mode_nothing_grounded_files_no_todo_without_error(self):
+        out = self.capture(meeting_extraction(
+            [act("Call the clinic back", ts=0)]),
+            routine=make_routine())
+        self.assertEqual(self.store.todos(), {})
+        self.assertNotIn("memory_owner_todos", out)
+        self.assertIn("1 ungrounded", self.logged)
 
 
 class QueueTest(unittest.TestCase):
@@ -995,15 +1136,15 @@ class ReviewHelpersTest(unittest.TestCase):
         rows = owner_todos.classify_actions([
             {"text": "Do A", "evidence_ts": "00:01:00"},
             {"text": "do a!", "evidence_ts": "00:02:00"},
-            {"text": "Do B"},
+            {"text": "Do B", "evidence_ts": 0},
             {"text": "Do C", "bogus": 1},
             "junk",
             {"text": "x" * 300, "evidence_ts": "00:01:00"},
             {"text": "Do D", "due": "soon", "evidence_ts": "00:01:00"},
-        ], require_ts=True)
+        ])
         self.assertEqual(
             [(r["status"], r["reason"]) for r in rows],
-            [("valid", None), ("invalid", "missing timestamp"),
+            [("valid", None), ("valid", None),
              ("invalid", "unexpected field"), ("invalid", "not an object"),
              ("invalid", "text too long"), ("invalid", "bad due date")])
         self.assertEqual(len(rows[4]["text"]), owner_todos.CANDIDATE_TEXT_LIMIT)

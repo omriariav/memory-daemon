@@ -21,6 +21,10 @@ type the model chose. In `review` mode the actions are not filed one by one:
 one `needs-review` todo lists every candidate (verified or not) and one JSON
 line per meeting goes to a candidates queue (see `action_review_queue.py`).
 
+The model's `evidence_ts` is a hint, not a requirement: an unusable one (0,
+"0", "00:00", free text, ...) is dropped and the row is kept, grounded by its
+text against the owner's own transcript lines (`ground_without_ts`).
+
 Pure helpers live here (config, prompt text, strict validation, deterministic
 grounding, stable keys); writing goes through memory_sink so the store CLI
 stays the only writer.
@@ -45,6 +49,7 @@ REVIEW_EVIDENCE = "meeting-owner-action-review"
 MODES = ("file", "review")
 DEFAULT_MODE = "file"
 DEFAULT_QUEUE_NAME = "meeting-action-candidates.jsonl"
+NO_TS_REASON = "no timestamp and no owner-spoken line matches it"
 QUOTE_LIMIT = 240
 CANDIDATE_TEXT_LIMIT = 200
 MEETING_SOURCE_PREFIXES = tuple(f"{k}:" for k in sorted(MEETING_KINDS))
@@ -66,7 +71,8 @@ PROMPT_SECTION = """  "owner_actions": array (at most {max_per_item}) of {owner}
             (hints are candidates only). Use [] when none.{existing}
 """
 TS_SCHEMA = (', "evidence_ts": the timestamp in brackets of the transcript '
-             'line where it was committed to, copied exactly (required)')
+             'line where it was committed to, copied exactly; leave the key '
+             'out when no transcript line carries one (never 0)')
 
 BACKFILL_PROMPT = """You are reading a stored meeting memory entry. Answer with a SINGLE JSON
 object, no markdown fence, no other text, with exactly one key:
@@ -236,11 +242,13 @@ def action_source_id(meeting_source_id, text):
     return f"{meeting_source_id}{ACTION_ID_PREFIX}{action_key(text)}"
 
 
-def validate_actions(raw, require_ts=False):
+def validate_actions(raw):
     """Strictly validate the model's `owner_actions`.
 
     Returns (clean list, dropped count), or (None, 0) when the value itself is
     not a list. An invalid element is dropped on its own; the rest are kept.
+    A row without a usable `evidence_ts` is kept without one (see
+    `usable_ts`); the caller grounds it by its text instead.
     """
     if raw is None:
         return [], 0
@@ -248,7 +256,7 @@ def validate_actions(raw, require_ts=False):
         return None, 0
     clean, dropped = [], 0
     for row in raw:
-        out = _clean_row(row, require_ts)
+        out = _check_row(row)[0]
         if out is None:
             dropped += 1
         else:
@@ -262,8 +270,38 @@ def validate_actions(raw, require_ts=False):
     return unique, dropped
 
 
-def _check_row(row, require_ts):
-    """(clean row, None) or (None, reason); a reason never quotes the row."""
+def usable_ts(value):
+    """A comparable timestamp string, or None when `value` is not one.
+
+    Usable: a string that fits `_TS_RE` and names a real, non-zero time of day
+    (`00:12:03`, `12:03`, `[00:12:03]`), or a positive number of seconds
+    (int/float, converted to `HH:MM:SS`, fraction dropped). Everything else
+    (a missing value, 0, 0.0, "0", "00:00", "0:00:00", a bool, NaN, a bare
+    digit string, free text) is None: a recorder's own action items carry
+    `timestamp_seconds: 0` and the model copies it. Never invents a time.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        secs = int(value)
+        if secs <= 0:
+            return None
+        return f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _TS_RE.fullmatch(text):
+        return None
+    norm = _norm_ts(text)
+    return text if norm and norm != "00:00:00" else None
+
+
+def _check_row(row):
+    """(clean row, None) or (None, reason); a reason never quotes the row.
+
+    An unusable `evidence_ts` is dropped, never a reason to refuse the row."""
     if not isinstance(row, dict):
         return None, "not an object"
     if set(row) - _KEYS:
@@ -280,26 +318,19 @@ def _check_row(row, require_ts):
         if not isinstance(due, str) or not _DATE_RE.fullmatch(due):
             return None, "bad due date"
         out["due"] = due
-    ts = row.get("evidence_ts")
-    if ts is not None:
-        if not isinstance(ts, str) or not _TS_RE.fullmatch(ts.strip()):
-            return None, "bad timestamp"
-        out["evidence_ts"] = ts.strip()
-    if require_ts and "evidence_ts" not in out:
-        return None, "missing timestamp"
+    ts = usable_ts(row.get("evidence_ts"))
+    if ts:
+        out["evidence_ts"] = ts
     return out, None
 
 
-def _clean_row(row, require_ts):
-    return _check_row(row, require_ts)[0]
-
-
-def classify_actions(raw, require_ts=False):
+def classify_actions(raw):
     """Every candidate the model returned, valid or not.
 
     Returns None when `raw` is not a list, else a list of
     `{"text", "status": "valid"|"invalid", "reason", ...}`; valid rows keep
-    `due` / `evidence_ts` and are de-duplicated like `validate_actions`
+    `due` and a usable `evidence_ts` (a row without one is still valid) and
+    are de-duplicated like `validate_actions`
     (a repeat is not a candidate). An invalid row keeps a readable, capped
     `text` when it has one; its reason never quotes it."""
     if raw is None:
@@ -308,15 +339,16 @@ def classify_actions(raw, require_ts=False):
         return None
     rows, seen = [], set()
     for row in raw:
-        out, reason = _check_row(row, require_ts)
+        out, reason = _check_row(row)
         if out is None:
             text = ""
             if isinstance(row, dict) and isinstance(row.get("text"), str):
                 text = " ".join(row["text"].split())[:CANDIDATE_TEXT_LIMIT]
             bad = {"text": text, "status": "invalid", "reason": reason}
-            ts = row.get("evidence_ts") if isinstance(row, dict) else None
-            if isinstance(ts, str) and _TS_RE.fullmatch(ts.strip()):
-                bad["evidence_ts"] = ts.strip()
+            ts = usable_ts(row.get("evidence_ts")) \
+                if isinstance(row, dict) else None
+            if ts:
+                bad["evidence_ts"] = ts
             rows.append(bad)
             continue
         key = action_key(out["text"])
@@ -387,6 +419,30 @@ def ground_in_transcript(body, evidence_ts, names, mapped_names=()):
             return True, rest
         if not owner_mapped and (not label or _GENERIC_SPEAKER_RE.match(label)):
             return True, rest
+    return False, None
+
+
+def ground_without_ts(body, text, names):
+    """(grounded, owner line) for an action that has no usable timestamp.
+
+    Weaker than `ground_in_transcript`, but still owner-only: grounded when a
+    transcript line whose speaker label matches an owner name shares most of
+    the action's significant words (the same 4-letter-stem rule as
+    `body_quote`). An unnamed or non-owner line never grounds it. The line
+    returned is the matched one (speaker kept, capped)."""
+    words = {w[:4] for w in normalize(text).split() if len(w) >= 4}
+    if not words:
+        return False, None
+    for line in str(body or "").splitlines():
+        m = _LINE_RE.match(line.strip())
+        if not m:
+            continue
+        who = _SPEAKER_RE.match(m.group("rest"))
+        if not who or not _name_match(who.group("who").strip(), names):
+            continue
+        spoken = normalize(m.group("rest")[who.end():])
+        if len(words & {w[:4] for w in spoken.split()}) >= 0.6 * len(words):
+            return True, " ".join(m.group("rest").split())[:QUOTE_LIMIT] or None
     return False, None
 
 
@@ -491,6 +547,8 @@ def review_tags(routine, routine_tags, personal_tag=None, personal=False):
 def _flag(candidate):
     status = candidate["status"]
     if status == "ungrounded":
+        if candidate.get("reason") == NO_TS_REASON:
+            return " [unverified: no timestamp]"
         return " [unverified: ungrounded]"
     if status == "invalid":
         return f" [invalid: {candidate.get('reason') or 'unknown'}]"
