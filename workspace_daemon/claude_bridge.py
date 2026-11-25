@@ -111,6 +111,80 @@ def _runs_dir(base_dir):
     return Path(base_dir) / "state" / "claude-runs"
 
 
+# A run dir older than this is the leftover of a killed or crashed run (a run
+# lives at most its `timeout`, 600 s at the very most) and is removed at the
+# start of the next attempt. Younger dirs belong to runs that may be live.
+STALE_RUN_SECONDS = 3600
+# Claude Code keeps per-run MCP logs in a cache dir named after the run's cwd
+# (every non-alphanumeric character becomes "-"), so ours all contain this.
+CLI_CACHE_SLUG = "state-claude-runs-run-"
+CLI_CACHE_MAX_AGE_SECONDS = 24 * 3600
+CLI_CACHE_MAX_DELETIONS = 500
+MAX_STALE_RUN_DELETIONS = 200
+
+
+def _cli_cache_dir():
+    """Where Claude Code writes its per-run logs, or None when unknown. A
+    stubbed claude binary (tests) never writes there, so nothing is pruned
+    unless WORKSPACE_DAEMON_CLAUDE_CACHE_DIR names a directory."""
+    explicit = os.environ.get("WORKSPACE_DAEMON_CLAUDE_CACHE_DIR")
+    if explicit:
+        return Path(explicit)
+    if os.environ.get("WORKSPACE_DAEMON_CLAUDE_BIN"):
+        return None
+    home = Path(os.path.expanduser("~"))
+    if sys.platform == "darwin":
+        return home / "Library" / "Caches" / "claude-cli-nodejs"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    root = Path(xdg) if xdg and os.path.isabs(xdg) else home / ".cache"
+    return root / "claude-cli-nodejs"
+
+
+def _remove_old_dirs(root, older_than, match, limit):
+    """Remove up to `limit` directories directly under `root` whose name
+    satisfies `match` and whose mtime is before `older_than`. A symlink (the
+    root itself or an entry) is never followed or removed, and nothing outside
+    `root` is touched. Returns the number removed; never raises."""
+    removed = 0
+    try:
+        if os.path.islink(root) or not os.path.isdir(root):
+            return 0
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if removed >= limit:
+                    break
+                try:
+                    if (not match(entry.name)
+                            or entry.is_symlink()
+                            or not entry.is_dir(follow_symlinks=False)
+                            or entry.stat(follow_symlinks=False).st_mtime
+                            >= older_than):
+                        continue
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                    removed += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return removed
+
+
+def _sweep_leftovers(base_dir):
+    """Remove what killed runs left behind: stale `run-*` dirs under
+    state/claude-runs (each can hold an `mcp-config.json` with a server's env
+    secrets) and Claude Code's old per-run MCP logs for our run dirs. Called
+    before a run dir is created, so a live run is never touched; never raises."""
+    now = time.time()
+    _remove_old_dirs(
+        _runs_dir(base_dir), now - STALE_RUN_SECONDS,
+        lambda name: name.startswith("run-"), MAX_STALE_RUN_DELETIONS)
+    cache = _cli_cache_dir()
+    if cache is not None:
+        _remove_old_dirs(
+            cache, now - CLI_CACHE_MAX_AGE_SECONDS,
+            lambda name: CLI_CACHE_SLUG in name, CLI_CACHE_MAX_DELETIONS)
+
+
 def _usage_log(base_dir):
     return Path(base_dir) / "state" / "claude-usage.jsonl"
 
@@ -435,20 +509,23 @@ NO_TOOLS_NOTE = (
 
 
 MCP_CONFIG_MAX_BYTES = 1024 * 1024
+# The user's own Claude config holds every server and can run to hundreds of KB.
+MCP_SERVER_SOURCE_MAX_BYTES = 5 * 1024 * 1024
+MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
-def read_mcp_config(path):
-    """The bytes of the MCP config file `path`, checked: an absolute path to
-    an existing regular file that you own and that nobody else can read or
-    write (no group or other bits). Opened with O_NOFOLLOW (never through a
+def _read_private_file(path, name, noun, cap):
+    """The bytes of `path`, checked: an absolute path to an existing regular
+    file that you own and that nobody else can read or write (no group or
+    other bits), at most `cap` bytes. Opened with O_NOFOLLOW (never through a
     symlink), judged on the open descriptor and read from that same
     descriptor, so what is checked is exactly what is read. Raises
     BridgeError (a message with no file content) otherwise."""
     if not isinstance(path, (str, os.PathLike)) or not str(path):
-        raise BridgeError("mcp_config must be a path")
+        raise BridgeError(f"{name} must be a path")
     path = os.fspath(path)
     if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
-        raise BridgeError("mcp_config must be an absolute path")
+        raise BridgeError(f"{name} must be an absolute path")
     try:
         # O_NONBLOCK: opening a FIFO must not wait for a writer; the type is
         # judged below, and a regular file is unaffected.
@@ -457,19 +534,18 @@ def read_mcp_config(path):
                      | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise BridgeError(
-            f"cannot open the mcp_config file: {exc.strerror or 'error'}"
+            f"cannot open {noun}: {exc.strerror or 'error'}"
         ) from None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            raise BridgeError("the mcp_config file is not a regular file")
+            raise BridgeError(f"{noun} is not a regular file")
         if info.st_uid != os.getuid():
-            raise BridgeError("the mcp_config file is not owned by you")
+            raise BridgeError(f"{noun} is not owned by you")
         if info.st_mode & 0o077:
-            raise BridgeError(
-                "the mcp_config file is accessible to others; chmod 600 it")
-        if info.st_size > MCP_CONFIG_MAX_BYTES:
-            raise BridgeError("the mcp_config file is too large")
+            raise BridgeError(f"{noun} is accessible to others; chmod 600 it")
+        if info.st_size > cap:
+            raise BridgeError(f"{noun} is too large")
         os.set_blocking(fd, True)
         chunks, total = [], 0
         while True:
@@ -477,22 +553,68 @@ def read_mcp_config(path):
             if not chunk:
                 break
             total += len(chunk)
-            if total > MCP_CONFIG_MAX_BYTES:
-                raise BridgeError("the mcp_config file is too large")
+            if total > cap:
+                raise BridgeError(f"{noun} is too large")
             chunks.append(chunk)
     except OSError as exc:
         raise BridgeError(
-            f"cannot read the mcp_config file: {exc.strerror or 'error'}"
+            f"cannot read {noun}: {exc.strerror or 'error'}"
         ) from None
     finally:
         os.close(fd)
     return b"".join(chunks)
 
 
+def read_mcp_config(path):
+    """The bytes of the MCP config file `path`, checked as
+    `_read_private_file` does (cap MCP_CONFIG_MAX_BYTES)."""
+    return _read_private_file(
+        path, "mcp_config", "the mcp_config file", MCP_CONFIG_MAX_BYTES)
+
+
 def check_mcp_config(path):
     """Check `path` as `read_mcp_config` does and return it as a string."""
     read_mcp_config(path)
     return os.fspath(path)
+
+
+def read_mcp_server(path, server):
+    """The config bytes `{"mcpServers": {server: <definition>}}` taken from
+    the top-level `mcpServers` map of the JSON file `path` (your own Claude
+    config). The file gets the same checks as `read_mcp_config` with the
+    larger MCP_SERVER_SOURCE_MAX_BYTES cap, and only that one definition is
+    kept: no other server and no other key leaves this function. Raises
+    BridgeError naming the file and the server, never the definition (it can
+    hold secrets in `env`)."""
+    if not isinstance(server, str) or not MCP_SERVER_NAME.match(server):
+        raise BridgeError("mcp_server_from.server must be a server name "
+                          "(letters, digits, _ . -)")
+    where = f"{path}, server {server}"
+    try:
+        raw = _read_private_file(
+            path, "mcp_server_from.file", "the mcp_server_from file",
+            MCP_SERVER_SOURCE_MAX_BYTES)
+    except BridgeError as exc:
+        raise BridgeError(f"{exc} ({where})") from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise BridgeError(f"the mcp_server_from file is not JSON ({where})"
+                          ) from None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        raise BridgeError(
+            f"the mcp_server_from file has no mcpServers map ({where})")
+    if server not in servers:
+        raise BridgeError(
+            f"the mcp_server_from file has no such server ({where}); only "
+            "servers in the top-level mcpServers map count, which is where "
+            "`claude mcp add -s user` puts them")
+    definition = servers[server]
+    if not isinstance(definition, dict) or not definition:
+        raise BridgeError(
+            f"the mcp_server_from server is not an object ({where})")
+    return json.dumps({"mcpServers": {server: definition}}).encode("utf-8")
 
 
 def _build_command(model, settings_path, allowed, max_turns, max_budget_usd,
@@ -537,12 +659,12 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
     seconds so connector tools are discoverable when the model starts. The
     delay and the write share the one `timeout` budget.
     """
+    message = json.dumps(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, cwd=cwd, start_new_session=True,
-    )
-    message = json.dumps(
-        {"type": "user", "message": {"role": "user", "content": prompt}}
     )
     deadline = time.monotonic() + timeout
     try:
@@ -569,6 +691,22 @@ def _spawn(cmd, prompt, cwd, timeout, connect_delay):
             proc.kill()
         proc.communicate()
         raise BridgeError(f"claude run timed out after {timeout}s") from None
+    except BaseException:
+        # SIGTERM turned into an exception, Ctrl-C, or any other unwinding:
+        # the child (its own session) and the MCP server it started, whose
+        # environment may hold secrets, must not outlive us.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            with contextlib.suppress(OSError):
+                proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(Exception):
+                    pipe.close()
+        raise
     return proc.returncode, stdout
 
 
@@ -705,7 +843,7 @@ def _log_usage(base_dir, model, names, attempt, outcome, started, result,
 def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
              timeout, attempt, disallowed, connect_delay, required=None,
              accept_partial=False, exact_args=False, mcp_config=None,
-             max_calls=None, strict_mcp=False):
+             max_calls=None, strict_mcp=False, mcp_config_bytes=None):
     """One claude run. Returns (results, final result event, partial).
 
     Raises BridgeError. partial is True only when accept_partial let a
@@ -714,7 +852,11 @@ def _attempt(prompt, tools, *, model, base_dir, max_turns, max_budget_usd,
     base_dir = _absolute(base_dir)
     # Refused before any run dir or process exists; nothing is logged.
     _check_guards(base_dir)
-    mcp_bytes = read_mcp_config(mcp_config) if mcp_config is not None else None
+    # Bytes given directly never touch a file: they are written once, to a
+    # 0600 copy inside the run dir, which is removed with it.
+    mcp_bytes = (read_mcp_config(mcp_config) if mcp_config is not None
+                 else mcp_config_bytes)
+    _sweep_leftovers(base_dir)
     started = time.monotonic()
     span = sleepclock.Span()
     result_event = None
@@ -918,7 +1060,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
                disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
                connect_delay=CONNECT_DELAY_SECONDS, required=None,
                accept_partial=False, exact_args=False, mcp_config=None,
-               max_calls=None):
+               max_calls=None, mcp_config_bytes=None):
     """Let headless Claude call the allowlisted MCP tools; return their real results.
 
     `tools` maps exact MCP tool name -> dict of pinned argument values (exact
@@ -949,6 +1091,12 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
     are loaded. The allowlist hook and the stream re-check still restrict the
     run to the pinned tools. A bad file raises BridgeError before any run.
 
+    mcp_config_bytes: None (default). Bytes of an MCP config JSON given
+    directly instead of a path (for example from `read_mcp_server`): the run
+    is strict exactly as with `mcp_config`, the bytes are written only to the
+    bridge's private 0600 copy in the run directory, and that directory is
+    removed when the run ends. Mutually exclusive with `mcp_config`.
+
     max_calls: None (default, unchanged: the model may call an allowlisted
     tool as often as it likes). A positive integer caps the ALLOWED calls of
     each pinned tool in one run: the hook claims one marker file per allowed
@@ -970,6 +1118,13 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
         raise BridgeDryRun("dry-run: claude bridge not invoked")
     if mcp_config is not None:
         mcp_config = check_mcp_config(mcp_config)
+    if mcp_config_bytes is not None:
+        if mcp_config is not None:
+            raise BridgeError(
+                "mcp_config and mcp_config_bytes are mutually exclusive")
+        if not isinstance(mcp_config_bytes, (bytes, bytearray)):
+            raise BridgeError("mcp_config_bytes must be bytes")
+        mcp_config_bytes = bytes(mcp_config_bytes)
     if max_calls is not None and (not isinstance(max_calls, int)
                                   or isinstance(max_calls, bool)
                                   or max_calls < 1):
@@ -990,6 +1145,7 @@ def call_tools(prompt, tools, *, model="haiku", base_dir, max_turns=6,
             connect_delay=connect_delay, required=needed,
             accept_partial=accept_partial, exact_args=exact_args,
             mcp_config=mcp_config, max_calls=max_calls,
+            mcp_config_bytes=mcp_config_bytes,
         )
         if all(any(r["name"] == name and not r["is_error"] for r in results)
                for name in needed):

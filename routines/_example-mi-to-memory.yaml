@@ -37,9 +37,24 @@ schedule:
 source:
   kind: mi
   # Exact MCP tool names as your connector exposes them (`claude mcp list`).
-  list_tool: mcp__example_mi__list_meetings
-  summary_tool: mcp__example_mi__get_summary
-  transcript_tool: mcp__example_mi__get_transcript
+  list_tool: mcp__example-mi__list_meetings
+  summary_tool: mcp__example-mi__get_summary
+  transcript_tool: mcp__example-mi__get_transcript
+  # Headless runs do not load user-scope MCP servers (only claude.ai
+  # connectors). When the MI server is not a claude.ai connector, use ONE of:
+  # (recommended, for a server already in your Claude config) take just that
+  # server from your own config on every run; no second copy of its secrets:
+  # mcp_server_from:
+  #   file: ~/.claude.json       # mode 0600, top-level mcpServers map
+  #   server: example-mi
+  # or point mcp_config at a JSON file (mode 0600) of just that server, e.g.:
+  #   {"mcpServers": {"example-mi": {"type": "stdio",
+  #     "command": "/path/to/example-mi-server", "args": []}}}
+  # The server name must match <server> in the tool names above. With either
+  # set, the run loads only that one server (the two are mutually exclusive).
+  # mcp_config: ~/.config/memory-daemon/example-mi-mcp.json
+  # connect_delay_seconds: 15    # 0 to 60 (default 6): wait for a slow stdio
+  #                              # server to list its tools before the prompt
   calendar_file: ~/.cache/claude-calendar/next48h.json
   calendar_timezone: Europe/London
   skip_declined: true

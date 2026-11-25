@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -827,6 +828,256 @@ class McpConfigTest(BridgeBase):
         self.assertEqual(self.invocations(), 2)
         for argv_n in (1, 2):
             self.assertIn("--mcp-config", self.argv(argv_n))
+
+
+class McpServerSourceTest(BridgeBase):
+    """`read_mcp_server` and `call_tools(..., mcp_config_bytes=...)`: one
+    server out of a large Claude config, bytes straight to the run dir."""
+
+    ENV_MARK = "env-mark-value-0001"
+
+    def call(self, tools=None, **kw):
+        kw.setdefault("base_dir", self.base)
+        kw.setdefault("connect_delay", 0)
+        return claude_bridge.call_tools(
+            SECRET_PROMPT, tools if tools is not None else {TOOL_A: {}}, **kw)
+
+    def make(self, mode=0o600, doc=None):
+        path = self.root / "claude.json"
+        doc = doc if doc is not None else {
+            "numStartups": 3, "projects": {"/p": {"mcpServers": {
+                "example-mi": {"command": "wrong"}}}},
+            "mcpServers": {
+                "example-mi": {"type": "stdio", "command": "/bin/example",
+                               "env": {"TOKEN": self.ENV_MARK}},
+                "other": {"command": "/bin/other", "env": {"K": "other-key"}},
+                "bad": "text"}}
+        path.write_text(json.dumps(doc))
+        os.chmod(path, mode)
+        return path
+
+    def test_only_the_named_server_is_extracted(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        self.assertEqual(json.loads(raw), {"mcpServers": {"example-mi": {
+            "type": "stdio", "command": "/bin/example",
+            "env": {"TOKEN": self.ENV_MARK}}}})
+        self.assertNotIn(b"other-key", raw)
+        self.assertNotIn(b"wrong", raw)
+
+    def test_a_large_config_is_read_but_the_cap_holds(self):
+        doc = {"mcpServers": {"example-mi": {"command": "x"}},
+               "blob": "y" * (claude_bridge.MCP_CONFIG_MAX_BYTES + 10)}
+        raw = claude_bridge.read_mcp_server(self.make(doc=doc), "example-mi")
+        self.assertEqual(json.loads(raw)["mcpServers"]["example-mi"],
+                         {"command": "x"})
+        big = self.root / "big.json"
+        big.write_bytes(b" " * (claude_bridge.MCP_SERVER_SOURCE_MAX_BYTES + 1))
+        os.chmod(big, 0o600)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(big), "example-mi")
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_errors_name_the_file_and_server_never_the_definition(self):
+        path = self.make()
+        for server in ("absent", "bad"):
+            with self.assertRaises(claude_bridge.BridgeError) as ctx:
+                claude_bridge.read_mcp_server(str(path), server)
+            self.assertIn(server, str(ctx.exception))
+            self.assertIn(str(path), str(ctx.exception))
+            self.assertNotIn(self.ENV_MARK, str(ctx.exception))
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(path), "absent")
+        self.assertIn("claude mcp add -s user", str(ctx.exception))
+        path.write_text("{not json " + self.ENV_MARK)
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(path), "example-mi")
+        self.assertNotIn(self.ENV_MARK, str(ctx.exception))
+
+    def test_unsafe_files_are_refused(self):
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            claude_bridge.read_mcp_server(str(self.make(mode=0o644)),
+                                          "example-mi")
+        self.assertIn("chmod 600", str(ctx.exception))
+        with self.assertRaises(claude_bridge.BridgeError):
+            claude_bridge.read_mcp_server("claude.json", "example-mi")
+
+    def test_bytes_reach_the_run_dir_copy_only_and_it_is_removed(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            copy = Path(cmd[cmd.index("--mcp-config") + 1])
+            seen.update(copy=copy, bytes=copy.read_bytes(),
+                        mode=stat.S_IMODE(copy.stat().st_mode),
+                        strict="--strict-mcp-config" in cmd)
+            return 0, good_stream()
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            self.call(mcp_config_bytes=raw)
+        self.assertEqual(seen["bytes"], raw)
+        self.assertEqual(seen["mode"], 0o600)
+        self.assertTrue(seen["strict"])
+        self.assertTrue(str(seen["copy"]).startswith(
+            str(self.base / "state")))
+        self.assertFalse(seen["copy"].exists())
+        self.assertFalse(seen["copy"].parent.exists())     # the run dir is gone
+        for found in self.base.rglob("*"):
+            if found.is_file():
+                self.assertNotIn(self.ENV_MARK.encode(), found.read_bytes(),
+                                 str(found))
+
+    def test_the_copy_is_removed_when_the_run_fails(self):
+        raw = claude_bridge.read_mcp_server(self.make(), "example-mi")
+        seen = {}
+
+        def spawn(cmd, prompt, cwd, timeout, connect_delay):
+            seen["copy"] = Path(cmd[cmd.index("--mcp-config") + 1])
+            raise claude_bridge.BridgeError("boom")
+        with mock.patch.object(claude_bridge, "_spawn", spawn):
+            with self.assertRaises(claude_bridge.BridgeError):
+                self.call(mcp_config_bytes=raw, attempts=1)
+        self.assertFalse(seen["copy"].parent.exists())
+
+    def test_bytes_and_a_path_are_mutually_exclusive(self):
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(mcp_config_bytes=b"{}", mcp_config=str(self.make()))
+        with self.assertRaises(claude_bridge.BridgeError):
+            self.call(mcp_config_bytes="{}")
+        self.assertEqual(self.invocations(), 0)
+
+
+class SweepTest(BridgeBase):
+    """Leftovers of killed runs: stale run dirs (they can hold an MCP config
+    with secrets), Claude Code's old per-run logs, and the child process."""
+
+    def setUp(self):
+        super().setUp()
+        self.runs = self.base / "state" / "claude-runs"
+        self.runs.mkdir(parents=True)
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+        env = mock.patch.dict(os.environ, {
+            "WORKSPACE_DAEMON_CLAUDE_CACHE_DIR": str(self.cache)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def old(self, path, age):
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+    def call(self):
+        self.stream(good_stream())
+        claude_bridge.call_tools(
+            SECRET_PROMPT, {TOOL_A: {}}, base_dir=self.base, connect_delay=0)
+
+    def leftover(self, parent, name, age, secret=False):
+        path = parent / name
+        path.mkdir()
+        (path / "mcp-config.json").write_text("env-mark-value-0002")
+        self.old(path, age)
+        return path
+
+    def test_stale_run_dirs_go_young_and_odd_ones_stay(self):
+        old = self.leftover(self.runs, "run-old", 2 * 3600)
+        young = self.leftover(self.runs, "run-young", 60)
+        other = self.leftover(self.runs, "keep-me", 2 * 3600)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "file").write_text("x")
+        self.old(outside, 5 * 3600)
+        link = self.runs / "run-link"
+        link.symlink_to(outside)
+        self.old(link, 5 * 3600)
+        self.call()
+        self.assertFalse(old.exists())
+        self.assertTrue(young.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((outside / "file").read_text(), "x")
+
+    def test_a_stale_run_dir_symlink_inside_is_not_followed(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "file").write_text("x")
+        old = self.leftover(self.runs, "run-old", 2 * 3600)
+        (old / "inner").symlink_to(outside)
+        self.old(old, 2 * 3600)
+        self.call()
+        self.assertFalse(old.exists())
+        self.assertEqual((outside / "file").read_text(), "x")
+
+    def test_old_cli_logs_of_our_run_dirs_are_pruned(self):
+        slug = "-Users-me-d-state-claude-runs-run-"
+        old = self.leftover(self.cache, slug + "aaa", 2 * 86400)
+        young = self.leftover(self.cache, slug + "bbb", 3600)
+        other = self.leftover(self.cache, "-Users-me-project", 5 * 86400)
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.old(outside, 5 * 86400)
+        link = self.cache / (slug + "ccc")
+        link.symlink_to(outside)
+        self.old(link, 5 * 86400)
+        self.call()
+        self.assertFalse(old.exists())
+        self.assertTrue(young.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(outside.exists())
+
+    def test_cache_pruning_is_bounded_per_run(self):
+        slug = "-d-state-claude-runs-run-"
+        for n in range(5):
+            self.leftover(self.cache, f"{slug}{n}", 3 * 86400)
+        with mock.patch.object(claude_bridge, "CLI_CACHE_MAX_DELETIONS", 2):
+            self.call()
+        self.assertEqual(len(list(self.cache.iterdir())), 3)
+
+    def test_a_symlinked_cache_root_is_left_alone(self):
+        real = self.root / "real-cache"
+        real.mkdir()
+        victim = self.leftover(real, "-d-state-claude-runs-run-x", 3 * 86400)
+        shutil.rmtree(self.cache)
+        self.cache.symlink_to(real)
+        self.call()
+        self.assertTrue(victim.exists())
+
+    def test_no_cache_pruning_with_a_stubbed_binary_and_no_override(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("WORKSPACE_DAEMON_CLAUDE_CACHE_DIR")
+            self.assertIsNone(claude_bridge._cli_cache_dir())
+
+    def test_the_child_group_is_killed_on_an_interrupt(self):
+        pids = self.root / "pids"
+        script = (
+            "import os,subprocess,time\n"
+            "g=subprocess.Popen(['sleep','60'])\n"
+            f"open({str(pids)!r},'w').write(str(os.getpid())+' '+str(g.pid))\n"
+            "time.sleep(60)\n")
+        real_sleep = time.sleep
+        fired = []
+
+        def interrupt(seconds):
+            if fired:                      # only the connect delay is cut short
+                return real_sleep(seconds)
+            fired.append(True)
+            for _ in range(200):
+                if pids.exists() and pids.read_text().count(" "):
+                    break
+                real_sleep(0.05)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(claude_bridge.time, "sleep", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                claude_bridge._spawn(
+                    [sys.executable, "-c", script], "hi", self.root, 30, 1)
+        for pid in map(int, pids.read_text().split()):
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                real_sleep(0.05)
+            else:
+                self.fail(f"process {pid} survived")
 
 
 class MaxCallsTest(BridgeBase):

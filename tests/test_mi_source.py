@@ -1469,6 +1469,29 @@ class CrossCheckTest(MiBase):
         self.assertEqual(args[args.index("--source-ids") + 1],
                          f"mi:{MEETING}:{SESSION}")
 
+    def test_mcp_config_and_delay_never_reach_the_diff_call(self):
+        path = Path(self.tmp.name) / "mcp.json"
+        path.write_text("{}")
+        os.chmod(path, 0o600)
+        self.run_process(source={"mcp_config": str(path),
+                                 "connect_delay_seconds": 15})
+        _, kwargs = self.complete_calls[0]
+        self.assertIs(kwargs["strict_mcp"], True)
+        self.assertNotIn("mcp_config", kwargs)
+        self.assertNotIn("connect_delay", kwargs)
+
+    def test_mcp_server_from_never_reaches_the_diff_call(self):
+        path = Path(self.tmp.name) / "claude.json"
+        path.write_text(json.dumps({"mcpServers": {"example-mi": {
+            "command": "/bin/example"}}}))
+        os.chmod(path, 0o600)
+        self.run_process(source={"mcp_server_from": {
+            "file": str(path), "server": "example-mi"}})
+        _, kwargs = self.complete_calls[0]
+        self.assertIs(kwargs["strict_mcp"], True)
+        self.assertNotIn("mcp_config_bytes", kwargs)
+        self.assertNotIn("mcp_server_from", kwargs)
+
     def test_the_diff_call_is_a_no_tools_sonnet_call_with_all_inputs(self):
         self.run_process()
         prompt, kwargs = self.complete_calls[0]
@@ -1858,6 +1881,181 @@ class RunnerHookTest(MiBase):
     def test_mi_is_a_meeting_source_for_owner_review(self):
         from workspace_daemon import owner_todos
         self.assertTrue(owner_todos.is_meeting_item({"source_kind": "mi"}))
+
+
+class McpConfigTest(MiBase):
+    """`mcp_config` and `connect_delay_seconds` reach the bridge for the tool
+    calls only; the diff call stays strict with no MCP."""
+
+    def write_config(self, mode=0o600, name="mcp.json"):
+        path = Path(self.tmp.name) / name
+        path.write_text(json.dumps({"mcpServers": {"example-mi": {
+            "type": "stdio", "command": "/path/to/example-mi-server",
+            "args": []}}}))
+        os.chmod(path, mode)
+        return str(path)
+
+    def problems(self, **extra):
+        routine = example_routine()
+        routine["source"].update(extra)
+        return config.validate(routine)
+
+    def test_a_good_file_validates(self):
+        self.assertEqual(self.problems(mcp_config=self.write_config()), [])
+
+    def test_a_leading_tilde_is_expanded(self):
+        path = self.write_config()
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
+            self.assertEqual(self.problems(mcp_config="~/mcp.json"), [])
+            self.assertEqual(
+                mi_source.settings({"mcp_config": "~/mcp.json"})["mcp_config"],
+                path)
+
+    def test_a_missing_file_is_reported(self):
+        missing = str(Path(self.tmp.name) / "nope.json")
+        found = self.problems(mcp_config=missing)
+        self.assertTrue(any("mcp_config" in p and "cannot open" in p
+                            for p in found), found)
+
+    def test_a_relative_path_is_reported(self):
+        for value in ("mcp.json", "", 5, None):
+            found = self.problems(mcp_config=value)
+            self.assertTrue(any("mcp_config must be an absolute path" in p
+                                for p in found), (value, found))
+
+    def test_a_loose_mode_is_reported(self):
+        found = self.problems(mcp_config=self.write_config(mode=0o644))
+        self.assertTrue(any("mcp_config" in p and "chmod 600" in p
+                            for p in found), found)
+
+    def test_a_directory_is_reported(self):
+        found = self.problems(mcp_config=self.tmp.name)
+        self.assertTrue(any("mcp_config" in p for p in found), found)
+
+    def test_connect_delay_is_bounded(self):
+        for value in (0, 6, 12.5, 60):
+            self.assertEqual(self.problems(connect_delay_seconds=value), [],
+                             value)
+        for value in (-1, 61, "6", True, None):
+            found = self.problems(connect_delay_seconds=value)
+            self.assertTrue(any("connect_delay_seconds" in p for p in found),
+                            (value, found))
+
+    def test_defaults_keep_the_bridge_behaviour(self):
+        self.write_mila_entry()
+        self.list_candidates()
+        kwargs = self.service.calls[0]["kwargs"]
+        self.assertIsNone(kwargs["mcp_config"])
+        self.assertEqual(kwargs["connect_delay"],
+                         claude_bridge.CONNECT_DELAY_SECONDS)
+
+    def test_tool_calls_get_the_config_and_the_delay(self):
+        path = self.write_config()
+        self.source.update(mcp_config=path, connect_delay_seconds=15)
+        self.write_mila_entry()
+        found = self.list_candidates()
+        self.fetch(found[0])
+        self.assertEqual(len(self.service.calls), 2)  # list, then summary+transcript
+        for call in self.service.calls:
+            self.assertEqual(call["kwargs"]["mcp_config"], path)
+            self.assertEqual(call["kwargs"]["connect_delay"], 15)
+
+
+class McpServerFromTest(MiBase):
+    """`mcp_server_from`: one server read from your Claude config on every
+    bridge call and passed as bytes; never together with `mcp_config`."""
+
+    ENV_MARK = "env-mark-value-0001"
+
+    def write_claude(self, mode=0o600, servers=None):
+        path = Path(self.tmp.name) / "claude.json"
+        path.write_text(json.dumps({"mcpServers": servers if servers is not None
+            else {"example-mi": {"type": "stdio", "command": "/bin/example",
+                                 "env": {"TOKEN": self.ENV_MARK}},
+                  "other": {"command": "/bin/other", "env": {"K": "other-key"}}},
+            "history": ["x"] * 50}))
+        os.chmod(path, mode)
+        return str(path)
+
+    def own(self, path, server="example-mi"):
+        return {"file": path, "server": server}
+
+    def problems(self, **extra):
+        routine = example_routine()
+        routine["source"].update(extra)
+        return config.validate(routine)
+
+    def test_a_good_file_and_server_validate(self):
+        self.assertEqual(self.problems(
+            mcp_server_from=self.own(self.write_claude())), [])
+
+    def test_a_missing_server_is_reported_without_the_definition(self):
+        path = self.write_claude()
+        found = self.problems(mcp_server_from=self.own(path, "absent"))
+        text = " ".join(found)
+        self.assertIn("absent", text)
+        self.assertIn(path, text)
+        self.assertNotIn(self.ENV_MARK, text)
+
+    def test_a_non_object_definition_and_bad_shapes_are_reported(self):
+        path = self.write_claude(servers={"example-mi": "text"})
+        self.assertTrue(self.problems(mcp_server_from=self.own(path)))
+        good = self.write_claude()
+        for value in ("x", {"file": good}, {"server": "example-mi"},
+                      {"file": "rel.json", "server": "example-mi"},
+                      {"file": good, "server": "example-mi", "extra": 1}):
+            self.assertTrue(self.problems(mcp_server_from=value), value)
+
+    def test_bad_permissions_are_reported(self):
+        found = self.problems(mcp_server_from=self.own(
+            self.write_claude(mode=0o644)))
+        self.assertTrue(any("chmod 600" in p for p in found), found)
+
+    def test_both_keys_are_refused(self):
+        found = self.problems(
+            mcp_server_from=self.own(self.write_claude()),
+            mcp_config=self.write_claude())
+        self.assertTrue(any("mutually exclusive" in p for p in found), found)
+
+    def test_every_tool_call_gets_only_that_server_as_bytes(self):
+        path = self.write_claude()
+        self.source["mcp_server_from"] = self.own(path)
+        self.write_mila_entry()
+        found = self.list_candidates()
+        self.fetch(found[0])
+        self.assertEqual(len(self.service.calls), 2)
+        for call in self.service.calls:
+            kwargs = call["kwargs"]
+            self.assertIsNone(kwargs["mcp_config"])
+            self.assertEqual(json.loads(kwargs["mcp_config_bytes"]),
+                             {"mcpServers": {"example-mi": {
+                                 "type": "stdio", "command": "/bin/example",
+                                 "env": {"TOKEN": self.ENV_MARK}}}})
+            self.assertNotIn(b"other-key", kwargs["mcp_config_bytes"])
+
+    def test_the_file_is_read_again_on_every_run(self):
+        path = self.write_claude()
+        self.source["mcp_server_from"] = self.own(path)
+        self.write_mila_entry()
+        self.list_candidates()
+        Path(path).write_text(json.dumps({"mcpServers": {"example-mi": {
+            "command": "/bin/rotated"}}}))
+        self.at(46)
+        self.list_candidates()
+        first, last = (json.loads(c["kwargs"]["mcp_config_bytes"])
+                       for c in (self.service.calls[0], self.service.calls[-1]))
+        self.assertEqual(first["mcpServers"]["example-mi"]["command"],
+                         "/bin/example")
+        self.assertEqual(last["mcpServers"]["example-mi"]["command"],
+                         "/bin/rotated")
+
+    def test_a_missing_server_at_run_time_fails_without_leaking(self):
+        self.source["mcp_server_from"] = self.own(self.write_claude(), "absent")
+        self.write_mila_entry()
+        with self.assertRaises(claude_bridge.BridgeError) as ctx:
+            self.list_candidates()
+        self.assertNotIn(self.ENV_MARK, str(ctx.exception))
+        self.assertEqual(self.service.calls, [])
 
 
 if __name__ == "__main__":
