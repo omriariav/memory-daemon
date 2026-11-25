@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import OptionList, Static, TextArea
+from textual.widgets import Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import __version__, bidi, slackfmt
@@ -19,6 +19,34 @@ from .items import STATUS_MAX
 from .models import (OWE_QUOTE_CHARS, OWE_QUOTE_LINES, SOURCES, fmt_age,
                      owe_action, owe_message, owes, thread_fixed, thread_note)
 from .views import VIEWS, is_agent
+
+
+class WordInput(Input):
+    """`Input` with the macOS word keys. iTerm2 sends Option+Left as
+    `alt+left`, and Textual binds a word jump to `ctrl+left` only."""
+    BINDINGS = [
+        Binding("alt+left", "cursor_left_word", show=False),
+        Binding("alt+right", "cursor_right_word", show=False),
+        Binding("alt+shift+left", "cursor_left_word(True)", show=False),
+        Binding("alt+shift+right", "cursor_right_word(True)", show=False),
+        # Textual binds alt+backspace to delete_right_word on an Input
+        Binding("alt+backspace", "delete_left_word", show=False),
+        Binding("alt+delete", "delete_right_word", show=False),
+    ]
+
+
+class WordTextArea(TextArea):
+    """`TextArea` with the same Option word keys (alt+backspace and
+    alt+delete are already bound by Textual)."""
+    BINDINGS = [
+        Binding("alt+left", "cursor_word_left", show=False),
+        Binding("alt+right", "cursor_word_right", show=False),
+        Binding("alt+shift+left", "cursor_word_left(True)", show=False),
+        Binding("alt+shift+right", "cursor_word_right(True)", show=False),
+        Binding("alt+backspace", "delete_word_left", show=False),
+        Binding("alt+delete", "delete_word_right", show=False),
+    ]
+
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SAVED_GLYPH = "◆"  # an item in memory (saved here with m, or by the daemon)
@@ -741,7 +769,7 @@ class DraftPane(Vertical):
             yield Static("", id="draft-status")
         with VerticalScroll(id="draft-scroll"):
             yield SelectableText("", id="draft-view")
-        yield TextArea("", id="draft-edit", soft_wrap=True, show_line_numbers=False, read_only=True)
+        yield WordTextArea("", id="draft-edit", soft_wrap=True, show_line_numbers=False, read_only=True)
 
 
 def agent_marks(it):

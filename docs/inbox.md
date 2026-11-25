@@ -2143,6 +2143,12 @@ saved), `ctrl+t` theme, `ctrl+p` palette, `?` help,
 Up to 0.8 `1`-`4` jumped to a section and `S` opened a Saved screen; `[`/`]`
 and the Feed replace them.
 
+In every text field (the `/` filter, the snooze, note, due-date and task
+fields, the draft editor) `alt+left` / `alt+right` (Option on macOS) jump a
+word, `alt+shift+left` / `alt+shift+right` select by word, `alt+backspace`
+deletes the word to the left and `alt+delete` the word to the right (since
+0.13.4). `ctrl+left` / `ctrl+right` do the same jumps.
+
 ### Start a task (`t`)
 
 `t` starts a task session from the selected row, through your

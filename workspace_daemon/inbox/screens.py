@@ -21,7 +21,7 @@ from textual.widgets.option_list import Option
 
 from . import __version__, bidi
 from .rowmenu import GROUPS, filter_entries, match_key
-from .widgets import vis
+from .widgets import WordInput, vis
 
 
 CHOICE_LABELS = {"draft": "Draft in Slack", "send": None,
@@ -330,7 +330,7 @@ class SnoozePicker(ModalScreen):
                 Option("[b]1[/b]  In 1 hour", id="1h"), Option("[b]2[/b]  In 3 hours", id="3h"),
                 Option("[b]3[/b]  Tomorrow 09:00", id="tom"), Option("[b]4[/b]  Custom…", id="custom"),
                 id="snooze-list")
-            yield Input(placeholder="e.g. 90m, 2h, 1d, 17:30  (enter to confirm)", id="snooze-input")
+            yield WordInput(placeholder="e.g. 90m, 2h, 1d, 17:30  (enter to confirm)", id="snooze-input")
             yield Static(Text("enter pick  ·  1-4 quick pick  ·  esc cancel", Style(dim=True)), id="snooze-hint")
 
     def on_mount(self):
@@ -542,7 +542,7 @@ class RowMenu(ModalScreen):
         with Vertical(id="rowmenu"):
             yield Static(Text(vis(self.title_text, self.visual),
                               Style(bold=True)), id="rowmenu-title")
-            yield Input(placeholder="/ filter…", id="rowmenu-filter")
+            yield WordInput(placeholder="/ filter…", id="rowmenu-filter")
             yield OptionList(id="rowmenu-list")
             yield Static(Text("a key runs it  ·  enter run  ·  / filter  ·  "
                               "esc close", Style(dim=True)), id="rowmenu-hint")
@@ -654,20 +654,20 @@ class TaskScreen(ModalScreen):
             yield Static(Text(vis(self.title_text, self.visual),
                               Style(bold=True)), id="task-title")
             yield Static(Text("Name"), classes="task-label")
-            yield Input(value=self.form.name, id="task-name",
-                        max_length=41, select_on_focus=False)
+            yield WordInput(value=self.form.name, id="task-name",
+                            max_length=41, select_on_focus=False)
             yield Static("", id="task-role", classes="task-chips")
             yield Static("", id="task-model", classes="task-chips")
             yield Static("", id="task-effort", classes="task-chips")
             yield Static("", id="task-template", classes="task-chips")
             yield Static(Text("Goal"), classes="task-label")
-            yield Input(value=self.form.goal, id="task-goal", max_length=300,
-                        select_on_focus=False)
+            yield WordInput(value=self.form.goal, id="task-goal", max_length=300,
+                            select_on_focus=False)
             yield Static("", id="task-accept")
             yield Static(Text("Persona"), id="task-persona-label",
                          classes="task-label")
-            yield Input(value=self.form.persona, id="task-persona",
-                        max_length=400, select_on_focus=False)
+            yield WordInput(value=self.form.persona, id="task-persona",
+                            max_length=400, select_on_focus=False)
             yield Static("", id="task-status")
             yield Static("", id="task-hint")
 
@@ -1047,8 +1047,8 @@ class NoteScreen(ModalScreen):
         head.append(self.who, Style(dim=True))
         with Vertical(id="note"):
             yield Static(head, id="note-title")
-            yield Input(placeholder=self.placeholder,
-                        id="note-input", max_length=self.max_len)
+            yield WordInput(placeholder=self.placeholder,
+                            id="note-input", max_length=self.max_len)
             yield Static(Text(self.hint, Style(dim=True)), id="note-hint")
 
     def on_mount(self):
@@ -1147,8 +1147,8 @@ class DateScreen(ModalScreen):
         head.append(self.who, Style(dim=True))
         with Vertical(id="note"):
             yield Static(head, id="note-title")
-            yield Input(placeholder="YYYY-MM-DD  (enter to set)",
-                        id="note-input", max_length=10)
+            yield WordInput(placeholder="YYYY-MM-DD  (enter to set)",
+                            id="note-input", max_length=10)
             yield Static(Text("enter set  ·  esc cancel", Style(dim=True)),
                          id="note-hint")
 

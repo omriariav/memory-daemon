@@ -49,7 +49,7 @@ from .watch import Watcher
 from .widgets import (ITEM_PREFIX, ContextPane, DraftPane, HealthStrip,
                       HealthView, HintBar, Queue, RoutinePane, SessionsStrip,
                       StatusHeader, ThreadView, fmt_age, fuzzy, palette, render_health,
-                      render_routines, scheduler_title, vis)
+                      render_routines, scheduler_title, vis, WordInput)
 
 NOT_YET = "Replying is not available yet (phase 2). Nothing is sent."
 RSVP_OFF = "RSVP not configured (set rsvp: in inbox.yaml)"
@@ -501,7 +501,7 @@ class InboxApp(App):
         with Horizontal(id="main"):
             yield RoutinePane("", id="routines")
             with Vertical(id="left"):
-                yield Input(placeholder="/ filter…", id="filter")
+                yield WordInput(placeholder="/ filter…", id="filter")
                 yield Queue(id="queue")
                 yield Static("", id="zero")
             with Vertical(id="right"):

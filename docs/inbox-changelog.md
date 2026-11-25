@@ -7,6 +7,21 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-11-25
+
+Option+Left and Option+Right jump a word in every text field. Terminals send
+them as `alt+left` and `alt+right`, which Textual did not bind. Nothing else
+changes.
+
+### Fixed
+
+- **Word keys in every text field** (the `/` filter, the row menu filter, the
+  snooze, note, due-date and task fields, and the draft editor):
+  `alt+left` / `alt+right` jump a word, `alt+shift+left` / `alt+shift+right`
+  select by word, `alt+backspace` deletes the word to the left and
+  `alt+delete` the word to the right. `ctrl+left` / `ctrl+right` work as
+  before.
+
 ## [0.13.3] - 2026-11-24
 
 Start a task from any row. `t` opens a small modal, and your own command (the
