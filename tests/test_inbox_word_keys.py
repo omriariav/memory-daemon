@@ -13,12 +13,13 @@ if HAVE_TEXTUAL:
     from workspace_daemon.inbox.screens import RowMenu
     from workspace_daemon.inbox.widgets import WordInput, WordTextArea
 
-try:    # run by discovery (tests/ on sys.path) or by dotted module name
-    from test_inbox_draft import wait_for
-    from test_inbox_rowmenu import go, make_app, press_text, settle
-except ImportError:
-    from tests.test_inbox_draft import wait_for
-    from tests.test_inbox_rowmenu import go, make_app, press_text, settle
+if HAVE_TEXTUAL:   # the helpers below exist only when Textual is installed
+    try:    # run by discovery (tests/ on sys.path) or by dotted module name
+        from test_inbox_draft import wait_for
+        from test_inbox_rowmenu import go, make_app, press_text, settle
+    except ImportError:
+        from tests.test_inbox_draft import wait_for
+        from tests.test_inbox_rowmenu import go, make_app, press_text, settle
 
 TEXT = "hello brave world"
 
