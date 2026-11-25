@@ -31,6 +31,10 @@ source:
   calendar_timezone: Europe/London
   calendar_window_days: 3
   calendar_match_hours: 6
+  # Also carry the matched calendar event as a second source id
+  # (mila-gcal:<id>) so another source can find the meeting entry; skipped
+  # when it could change which entry the store writes. Default true.
+  link_calendar_event: true
   max_calendar_candidates: 8
   calendar_max_results: 250
   # Upper bound on transcript characters sent to analysis (head and tail are

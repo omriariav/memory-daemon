@@ -1574,6 +1574,20 @@ analyze:
   later run is still recognised as a duplicate. If the preferred copy failed to
   match in an earlier run and the other copy was captured, the later preferred
   copy is ledgered as the duplicate instead.
+- Calendar link (`link_calendar_event`, default `true`, Mila sources only): an
+  accepted calendar match adds `mila-gcal:<event id>` as a second source id on
+  the meeting entry (not on the review todo; the primary `mila:` id and
+  everything keyed on it are unchanged), so another source can find the entry
+  by its event. The scheme is not `gcal:`, the id hand-logged entries carry:
+  the store targets an entry by any of its ids, so a later hand log under
+  `gcal:<event id>` would otherwise overwrite the meeting entry. The store
+  resolves its target by any id it is given, so the id is added only when it
+  cannot change which entry the store writes: another meeting entry (for
+  example a second recording of the event), an open todo or pending decision,
+  or a lone note carrying the id drops it (logged, ids only), and so does a
+  store read error. In the split case, any settled entry of another type
+  carrying the id is excluded from the store's near-duplicate check, so a
+  capture that resembles it is no longer refused. Set `false` to turn it off.
 
 Mila's directory is read-only. The daemon writes small, private receipts under
 `state/transcriptions/processed/` and `state/transcriptions/failed/`; it never

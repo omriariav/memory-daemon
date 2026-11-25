@@ -217,6 +217,9 @@ def _transcript(record, directory, manual=None):
 
 
 APP_SUMMARY_MODES = ("off", "hints")
+# Scheme of the second source id an accepted calendar match adds to the
+# meeting entry (`mila-gcal:<event id>`). Nothing else anchors on it.
+CALENDAR_LINK_SCHEME = "mila-gcal"
 APP_SUMMARY_KEYS = {
     "mode", "wait_minutes", "min_chars", "min_overlap", "item_min_overlap",
 }
@@ -1977,6 +1980,14 @@ def match_calendar(routine, source, item):
     transcripts.accept_event(
         item, event, match["confidence"], match["reason"]
     )
+    if source.get("link_calendar_event", True):
+        # A second source id so another source can find this entry by the
+        # calendar event; the sink adds it only when it cannot change which
+        # entry the store writes (see memory_sink.linkable_extra_source_ids).
+        # Not `gcal:`: that is the id hand-logged entries carry, and the store
+        # targets an entry by ANY of its ids, so a later hand log under the
+        # same `gcal:` id would overwrite this entry.
+        item["extra_source_ids"] = [f"{CALENDAR_LINK_SCHEME}:{event['id']}"]
     entries = state["pending"].setdefault(event["id"], [])
     entries[:] = [p for p in entries if p["source_id"] != item.get("source_id")]
     entries.append(dict(_item_trait(item), source_id=item.get("source_id")))
