@@ -288,6 +288,16 @@ def source_header_lines(item):
             lines.append(f"Calendar event start: {meta['calendar_event_start']}")
         if meta.get("zoom_start"):
             lines.append(f"Meeting started: {meta['zoom_start']}")
+    if item.get("source_kind") == "mi" or meta.get("mi_session_id"):
+        lines.append(
+            "Source: meeting-recording service (machine-written summary "
+            "followed by the transcript)")
+        if meta.get("calendar_event_title"):
+            lines.append(f"Calendar event: {meta['calendar_event_title']}")
+        if meta.get("calendar_event_start"):
+            lines.append(f"Calendar event start: {meta['calendar_event_start']}")
+        if meta.get("mi_started_at"):
+            lines.append(f"Recording started: {meta['mi_started_at']}")
     return lines
 
 

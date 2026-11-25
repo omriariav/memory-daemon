@@ -37,7 +37,9 @@ import re
 
 from . import due_phrases
 
-MEETING_KINDS = {"mila", "whisper", "transcripts", "meeting-notes", "zoom"}
+MEETING_KINDS = {
+    "mila", "whisper", "transcripts", "meeting-notes", "zoom", "mi",
+}
 DEFAULT_MAX_PER_ITEM = 5
 MAX_ALLOWED = 20
 DEFAULT_TAG = "from-meeting"

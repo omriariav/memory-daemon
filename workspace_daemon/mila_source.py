@@ -27,6 +27,8 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import yaml
+
 from . import calendar_cache, claude_bridge, llm, local_llm, transcripts
 from . import events as event_log
 from . import state as state_mod
@@ -1929,6 +1931,29 @@ def match_is_final(source, item, match, attempts):
     return age > hours * 3600
 
 
+def _captured_by_mi(routine, event_id):
+    """Entry id of an MI-only capture of this calendar event, or None.
+
+    Read daemon-side from the store (`memory.store`). A read error fails
+    open: Mila is the primary source and captures normally.
+    """
+    from . import calendar_links, memory_sink  # late: keep imports acyclic
+    store = memory_sink.memory_cfg(routine).get("store")
+    if not store:
+        return None
+    try:
+        rows = memory_sink.entries_with_source_ids(
+            store, [calendar_links.mi_gcal_id(event_id)])
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        log(f"mila WARN could not read the store to look for an MI capture "
+            f"({type(exc).__name__}); capturing normally")
+        return None
+    ids = sorted(
+        str(fm["id"]) for fm, _body in rows
+        if isinstance(fm.get("id"), str) and fm["id"])
+    return ids[0] if ids else None
+
+
 def match_calendar(routine, source, item):
     """Return ``(accepted, match)``; only a validated high match is accepted.
 
@@ -1977,6 +2002,11 @@ def match_calendar(routine, source, item):
             match, held=True, waiting_for=waiting,
             reason="waiting for primary capture",
         )
+    taken = _captured_by_mi(routine, event["id"])
+    if taken:
+        # MI captured this meeting alone while the recording was held; one
+        # meeting entry (and one review todo) is enough.
+        return False, dict(match, duplicate_of=taken, reason="captured by mi")
     transcripts.accept_event(
         item, event, match["confidence"], match["reason"]
     )

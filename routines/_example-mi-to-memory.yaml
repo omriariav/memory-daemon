@@ -1,0 +1,80 @@
+# Example: cross-check Mila meeting captures against a second recording
+# service ("MI"), and capture a meeting only MI recorded.
+#
+# Mila (kind: mila) stays the primary meeting source. For each MI session that
+# ties to a calendar event (same title, start within match_window_minutes):
+#   * the primary entry exists (it carries mila-gcal:<event id>, i.e.
+#     <primary_sources scheme>-gcal:<event id>, or the Mila receipts name it):
+#     one no-tools model call lists only what MI has and
+#     the Mila entry lacks or states differently, and a non-empty result is
+#     written as ONE note "MI check: <title>" that carries only its own id
+#     mi:<meetingId>:<sessionId> plus a note-only mi-check:<event id> link, and
+#     names the Mila entry in its body (never --follows, never a todo).
+#     Nothing differs: nothing is written.
+#   * no primary entry within grace_minutes after the meeting ended: MI is the
+#     only record, so it is captured like any meeting (source id
+#     mi:<meetingId>:<sessionId>, linked as mi-gcal:<event id>) with the usual
+#     owner action-item review.
+# A Mila-only meeting is untouched. Only one session per calendar event is
+# handled (a drop-and-rejoin makes two); a session that fails 3 times is
+# settled as failed.
+#
+# Discovery reads the calendar_cache routine's JSON twin, so that routine must
+# run too. The three tools are the ONLY tools ever allowed, each read-only and
+# pinned to its arguments. MI content reaches Anthropic models only.
+#
+# shadow: true (the default) writes nothing to the store: what would be written
+# is appended to state/mi-check-shadow.jsonl (0600). Shadowed sessions are
+# settled, so switching to shadow: false does not backfill them.
+id: example-mi-to-memory
+enabled: false
+description: Cross-check Mila meeting entries against the MI capture of the same meeting.
+role: specialized
+
+schedule:
+  every: 30m
+
+source:
+  kind: mi
+  # Exact MCP tool names as your connector exposes them (`claude mcp list`).
+  list_tool: mcp__example_mi__list_meetings
+  summary_tool: mcp__example_mi__get_summary
+  transcript_tool: mcp__example_mi__get_transcript
+  calendar_file: ~/.cache/claude-calendar/next48h.json
+  calendar_timezone: Europe/London
+  skip_declined: true
+  shadow: true                 # write nothing to the store; log to the shadow file
+  grace_minutes: 90            # wait this long after the end for the Mila entry
+  match_window_minutes: 10     # MI start vs calendar start, same normalized title
+  lookback_hours: 24           # `from` of the list call
+  retry_hours: 24              # an unmatched or unresolved session is dropped after this
+  max_sessions_per_run: 5
+  max_summary_chars: 20000
+  max_transcript_chars: 60000
+  model: haiku                 # bridge model for the tool calls (Anthropic only)
+  diff_model: sonnet           # the one comparison call (Anthropic only)
+  primary_sources: [mila]      # source-id schemes that count as the primary capture
+  # The Mila routine's recordings.json. While a Mila recording overlaps the
+  # meeting slot, the session keeps waiting past grace_minutes (until
+  # retry_hours), so a held recording is never captured twice. Set it in a
+  # live config; without it only the grace timer decides.
+  primary_recordings_file: /absolute/path/to/mila-recordings/recordings.json
+
+# Used only by the MI-only (full) capture; the cross-check call uses diff_model.
+analyze:
+  provider: claude             # required: MI content may reach Anthropic models only
+  model: sonnet
+  max_output_tokens: 4096
+  instruction: >-
+    The source is a machine-written meeting summary followed by the
+    transcript. Preserve only durable decisions, commitments, action items,
+    deadlines, blockers and people/project facts. Attribute an owner or
+    deadline only when stated. Ignore small talk and personal chatter.
+    Return exactly NOT MEMORY-WORTHY when nothing durable was discussed.
+
+memory:
+  store: /absolute/path/to/your/personal-memory
+  type: meeting
+  tags: [meeting]
+  owner_todos:
+    owner_name: Me Example     # names the owner in the cross-check prompt

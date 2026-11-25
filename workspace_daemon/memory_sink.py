@@ -240,6 +240,32 @@ def read_entry_body(store, entry_id):
     return None
 
 
+def read_entry(store, entry_id):
+    """(frontmatter, body) of an entry by id, or None. Daemon-side read; the
+    default store first, then the graph stores."""
+    if not store or not SOURCE_FOLLOWS_RE.fullmatch(str(entry_id)):
+        return None
+    base = Path(store)
+    roots = [base / "memory" / "entries"]
+    graphs = base / "memory-graphs"
+    try:
+        if graphs.is_dir():
+            roots.extend(sorted(
+                path / "entries" for path in graphs.iterdir()
+                if path.is_dir()))
+        for root in roots:
+            for path in root.rglob(f"{entry_id}.md"):
+                parts = path.read_text(encoding="utf-8").split("---", 2)
+                if len(parts) != 3:
+                    continue
+                frontmatter = yaml.safe_load(parts[1]) or {}
+                if isinstance(frontmatter, dict):
+                    return frontmatter, parts[2].strip()
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    return None
+
+
 def _same_meeting_context(store, meta):
     """Prompt block with the earlier same-meeting entry bodies, or ''."""
     blocks = []
@@ -288,7 +314,7 @@ CAPTURE_SOURCE_ID_PREFIXES = (
 # prefixes above, plus zoom, calendar, alerts and person briefs). An
 # `external_events` routine may not claim one of these.
 RESERVED_EVENT_SOURCES = frozenset(CAPTURE_SOURCE_ID_PREFIXES) | {
-    "zoom", "gcal", "daemon", "person", "slack-profile", "unknown",
+    "zoom", "mi", "gcal", "daemon", "person", "slack-profile", "unknown",
 }
 OPERATOR_CONFIRMED_SOURCE_ID_RE = re.compile(
     r"^(?:" + "|".join(CAPTURE_SOURCE_ID_PREFIXES) + r"):[^\s]+$"
@@ -494,6 +520,29 @@ def _carries_source_id(frontmatter, source_id):
         and all(isinstance(value, str) for value in source_ids)
         and source_id in source_ids
     )
+
+
+def entries_with_source_ids(store, source_ids, prefix=False):
+    """[(frontmatter, body)] of every entry, in the default store and the
+    graph stores, that carries one of `source_ids` (with `prefix`, a source id
+    that starts with one of them). One pass over the store whatever the number
+    of ids. Raises OSError, UnicodeError or yaml.YAMLError when a file cannot
+    be read, so a caller never mistakes an unreadable store for "no entry"."""
+    wanted = tuple(value for value in source_ids if isinstance(value, str) and value)
+    if not wanted:
+        return []
+    found = []
+    for frontmatter, body in _store_entries(store, needles=wanted):
+        carried = frontmatter.get("source_ids") or []
+        if not isinstance(carried, list):
+            continue
+        if any(
+            isinstance(value, str)
+            and (value.startswith(wanted) if prefix else value in wanted)
+            for value in carried
+        ):
+            found.append((frontmatter, body))
+    return found
 
 
 def _followed_ids(store, entry_ids):
@@ -2696,6 +2745,58 @@ def _add_owner_todo(routine, store, sid, title, date, owner_slug, tags, body,
             or "near duplicate" in out.lower():
         return "duplicate_skipped", None
     log(f"routine={rid} owner-todos WARN add failed (exit {r.returncode})")
+    return "error", None
+
+
+def add_linked_note(routine, source_id, extra_ids, etype, title, date, people,
+                    tags, body):
+    """One stable-id note that sits beside an existing entry, never in it.
+
+    `source_id` is the note's own id (through the capture guard, so a
+    hand-logged entry carrying it is never overwritten). `extra_ids` are
+    note-only link ids, and only those `linkable_extra_source_ids` reports
+    as safe are passed: the CLI updates the entry any listed id already
+    belongs to, so an id that links the note to the entry it sits beside
+    (a calendar id) must never be offered. No `--follows`, no `--force-new`:
+    the store's near-duplicate guard wins. Returns (verdict, entry id or
+    None) with the same verdicts as `_add_owner_todo` (created/updated/
+    unchanged/verified/duplicate_skipped/error). Never raises for store
+    trouble (guard stops propagate).
+    """
+    cfg = memory_cfg(routine)
+    store = cfg["store"]
+    rid = routine.get("id")
+    use_auto, _hand = capture_guard(store, source_id, etype, rid)
+    sid = auto_source_id_for(source_id) if use_auto else source_id
+    extra = []
+    if extra_ids:
+        extra = list(linkable_extra_source_ids(
+            store, sid, list(extra_ids), etype, rid))
+    args = ["add", "--type", etype, "--title", title, "--date", date]
+    if people:
+        args += ["--people", ",".join(people)]
+    args += ["--tags", ",".join(tags),
+             "--source-ids", ",".join([sid] + extra)]
+    try:
+        r = _cli(store, args, stdin_text=body, timeout=300)
+        out = (r.stdout or "") + (r.stderr or "")
+        _commit_store(store, f"memory: {rid} linked note")
+    except claude_bridge.GUARD_STOPS:
+        raise
+    except Exception as exc:
+        log(f"routine={rid} linked-note WARN add failed: "
+            f"{type(exc).__name__}")
+        return "error", None
+    m = re.search(r"[✓↻]\s+(created|updated|unchanged)\s+(\S+)", out)
+    if r.returncode == 0 and m:
+        return m.group(1), m.group(2)
+    verified = _verify_written_entry(
+        store, sid, etype, title, people, tags, body)
+    if verified:
+        return "verified", verified
+    if _near_duplicate_refusal(r, out):
+        return "duplicate_skipped", None
+    log(f"routine={rid} linked-note WARN add failed (exit {r.returncode})")
     return "error", None
 
 

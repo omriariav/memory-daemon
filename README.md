@@ -1922,6 +1922,125 @@ captured before the Zoom entry is cross-referenced. `link_transcripts` is
 accepted and ignored. See
 `routines/_example-zoom-to-memory.yaml`.
 
+### MI cross-check (`source.kind: mi`)
+
+A second recording service ("MI") can run beside Mila. Mila stays the primary
+meeting source; MI is a cross-check. `source.kind: mi` reads the service
+through three read-only MCP tools (`list_tool`, `summary_tool`,
+`transcript_tool`: exactly `mcp__<server>__list_meetings`, `__get_summary`,
+`__get_transcript`, from one server) and reads the `calendar_cache` JSON
+(`calendar_file`) to tie each ready session to a calendar event. A session
+matches when its title equals the event title (case-folded, whitespace
+collapsed) and it started within `match_window_minutes` of the event start;
+failing that, the same title on the same local date (`calendar_timezone`,
+required) when exactly one event has it and it starts within 4 hours of the
+session (logged when used). An ambiguous or missing match is re-checked until
+`retry_hours`, then dropped; a declined event is skipped (`skip_declined`).
+MI data arrives 13 to 50 minutes after a meeting ends. Events are remembered in
+`state/mi-sessions.json` (0600) because the calendar file holds only the next
+hours.
+
+Three cases, by what the store holds for the calendar event:
+
+* **Both exist (cross-check).** The primary entry carries
+  `<scheme>-gcal:<event id>` (for the default `primary_sources: [mila]`,
+  `mila-gcal:<event id>`) and a source id of a `primary_sources` scheme; it is
+  not a todo or pending decision. The plain `gcal:` id is never used to find
+  it: hand-logged entries carry that one. Failing that, the Mila receipts name it. With
+  several, the earliest `(date, id)` wins. One no-tools `diff_model` call
+  (default `sonnet`; the prompt goes on stdin) compares the MI summary and
+  transcript with the Mila entry, its `:review` todo and its action-todo
+  titles, and lists only what Mila lacks or states differently: decisions,
+  action items (an owner's item carries owner and due) and fact conflicts. The
+  answer is validated strictly (at most 8 items per list, 300 characters per
+  field; a malformed answer is retried on the next run and settled as
+  `mi_check_failed` after 3 tries), an action already in the Mila entry,
+  review todo or an action title is dropped, and the owner's ID-like numbers
+  are redacted as everywhere. A non-empty result becomes ONE `note`, `MI check:
+  <title>`, tagged `mi-check` and `auto-captured`, with the Mila entry's people
+  and date. It carries its own source id `mi:<meetingId>:<sessionId>` and a
+  note-only link `mi-check:<event id>` (offered through
+  `linkable_extra_source_ids`, so it can never retarget another entry). It
+  never carries a calendar id of the Mila entry, plain or `mila-gcal:`: the
+  store targets an entry by ANY source id it is given, so such an id would
+  anchor the note onto the Mila entry. The note body names the Mila entry id
+  instead. It is never `--follows` or `--force-new`, and no todo is touched or
+  created.
+  Nothing differs: nothing is written (ledger outcome `mi_check_nodiff`).
+* **MI only.** No primary entry within `grace_minutes` (default 90) after the
+  meeting end (the later of the event end and the session end). The normal
+  pipeline captures it like any meeting source: source id
+  `mi:<meetingId>:<sessionId>` linked to the event as `mi-gcal:<event id>`
+  (never the plain `gcal:` id, which hand-logged entries use), with
+  the usual owner action-item review.
+* **Mila only.** Untouched: this source never sees it.
+
+**One session per event.** A drop-and-rejoin gives two sessions of one
+meeting; only the first is handled. An event is settled when state holds a
+done or pending session for it, or the store holds an entry carrying
+`mi-gcal:<event id>` or `mi-check:<event id>`. Later sessions are skipped
+(`event_settled`, logged once).
+
+**Failures.** These count toward 3 attempts: an exception in the fetch or the
+cross-check (tool call, malformed diff), a cross-check store write that fails,
+and an MI-only capture the runner ledgered as a memory error (once per distinct
+failure). After 3 the session is settled as `failed`, logged once, and never
+offered again, so an odd transcript cannot cost a re-fetch and re-diff every
+run. A budget or pause stop, an outage across a machine sleep, and a capture
+held by a stop do not count. Known limit: an exception in the normal pipeline
+before anything is ledgered (the analysis call of an MI-only capture) is not
+counted; it is bounded by `retry_hours`.
+
+**A late Mila capture.** Mila can hold a recording (`language_check`, the
+app-summary wait, its schedule) longer than any timer. Set
+`primary_recordings_file` to the Mila `recordings_file` (the live Mila routine's
+`recordings.json`): while any recording overlaps the meeting slot (event start
+to the later of event end and session end, plus 10 minutes of tolerance), the
+session stays waiting even after `grace_minutes`, until `retry_hours` drops it.
+It never goes full while a Mila recording of the slot exists, and an unreadable
+file keeps it waiting too. Without the key only the `grace_minutes` timer
+decides, so set it in a live config. A back-to-back meeting recorded by Mila
+can keep a neighbouring MI-only session waiting; that is the safe side. On the
+Mila side, `mila_source.match_calendar` ledgers a recording as a duplicate
+(`captured by mi`, no analysis, no second entry or review todo) when the store
+already holds an entry carrying `mi-gcal:<event id>`; a store read error fails
+open and Mila captures normally.
+
+`shadow` defaults to **true** for this kind: nothing is written to the store
+and no capture model is called for an MI-only session. What would have been
+written (the note, or the entry's type, title, source ids and people) is
+appended to `state/mi-check-shadow.jsonl` (0600, append-only, one JSON object
+per line: time, session, mode, event id, primary entry id, `would_write`,
+counts, diff), and the run log carries the title and counts only. A shadowed
+session is settled in the ledger like any other, so switching to
+`shadow: false` does not backfill it: only sessions seen afterwards are
+written. Set `shadow: false` to write.
+
+Keys: `list_tool`, `summary_tool`, `transcript_tool`, `calendar_file`
+(required); `calendar_timezone` (UTC), `skip_declined` (true), `shadow` (true),
+`grace_minutes` (90), `match_window_minutes` (10), `lookback_hours` (24, the
+`from` of the list call), `retry_hours` (24), `max_sessions_per_run` (5),
+`max_summary_chars` (20000), `max_transcript_chars` (60000), `diff_model`
+(`sonnet`), `model` (`haiku`, the bridge model for the tool calls),
+`primary_sources` (`[mila]`), `primary_recordings_file` (unset).
+`calendar_timezone` is required, and `grace_minutes` must be less than
+`retry_hours * 60`. The list call is pinned to `from` and `limit: 50`
+and is not paged; a next page is logged as a warning. The list call is made on
+most runs while any recent event has no settled session (about one small haiku
+session per run); it is skipped when nothing is open and no recent event is
+unsettled. Without `primary_recordings_file`, set `grace_minutes` above the Mila
+routine's worst-case delay (`language_check.hold_minutes`, plus its app-summary
+wait and schedule), or an MI-only entry may be written for a meeting Mila
+captures later. The routine also needs `memory.store`.
+
+Privacy: MI content reaches Anthropic models only, which validation enforces
+(`analyze.provider: claude`, `model` and `diff_model` an Anthropic alias or
+`claude-*`, no `analyze.local_triage`, no local `match` block). The tool
+allowlist is exactly the three configured read tools, each pinned to its
+arguments and capped at one call per session; the service's write tools are
+never reachable. No content is passed in argv: model prompts and note bodies go
+on stdin. See `routines/_example-mi-to-memory.yaml`.
+
 ### Whisper pipeline transcriptions
 
 `source.kind: whisper` ingests finished transcripts from the local

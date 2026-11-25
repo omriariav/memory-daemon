@@ -17,7 +17,7 @@ from .time_utils import is_rfc3339_instant, rfc3339_key
 REQUIRED_TOP_LEVEL = ["id", "analyze"]
 VALID_SOURCE_KINDS = {
     "gmail", "gmail_mcp", "drive_docs", "slack", "slack_mcp", "gchat", "mila",
-    "whisper", "zoom", "whatsapp",
+    "whisper", "zoom", "whatsapp", "mi",
 }
 VALID_ROUTINE_ROLES = {
     "general", "domain", "specialized", "partial", "maintenance",
@@ -2214,6 +2214,138 @@ def _validate_zoom(prefix, source):
     return problems
 
 
+def _validate_mi(prefix, source, routine):
+    """MI cross-check: three exact read-only tools, a calendar file, bounds,
+    and the privacy rules (content may reach Anthropic models only)."""
+    from . import mi_source, memory_sink
+    problems = []
+    servers = set()
+    for key, name in mi_source.TOOL_NAMES.items():
+        value = source.get(key)
+        if not _exact_tool(value, name):
+            problems.append(
+                f"{prefix}.{key} must be the exact read-only MCP tool "
+                f"mcp__<server>__{name}"
+            )
+        elif isinstance(value, str):
+            servers.add(value.split("__")[1])
+    if len(servers) > 1:
+        problems.append(
+            f"{prefix}: list_tool, summary_tool and transcript_tool must "
+            "come from the same MCP server"
+        )
+    if not _non_empty_str(source.get("calendar_file")):
+        problems.append(
+            f"{prefix}.calendar_file is required (the calendar_cache JSON)"
+        )
+    zone = source.get("calendar_timezone")
+    if zone is None:
+        problems.append(
+            f"{prefix}.calendar_timezone is required for source.kind 'mi' "
+            "(the title-and-date fallback match depends on it)"
+        )
+    else:
+        try:
+            ZoneInfo(zone)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            problems.append(
+                f"{prefix}.calendar_timezone must be an IANA timezone")
+    recordings = source.get("primary_recordings_file")
+    if recordings is not None and not (
+        _non_empty_str(recordings)
+        and recordings.startswith(("/", "~"))
+    ):
+        problems.append(
+            f"{prefix}.primary_recordings_file must be an absolute path "
+            "(the Mila recordings.json)"
+        )
+    for key, lower, upper in (
+        ("grace_minutes", 0, 720), ("match_window_minutes", 0, 120),
+        ("lookback_hours", 1, 168), ("retry_hours", 1, 168),
+        ("max_sessions_per_run", 1, 20),
+        ("max_summary_chars", 1000, 200000),
+        ("max_transcript_chars", 1000, 1000000),
+    ):
+        if key in source and not _bounded_int(source[key], lower, upper):
+            problems.append(
+                f"{prefix}.{key} must be an integer from {lower} to {upper}"
+            )
+    grace, retry = source.get("grace_minutes", 90), source.get("retry_hours", 24)
+    if (_bounded_int(grace, 0, 720) and _bounded_int(retry, 1, 168)
+            and grace >= retry * 60):
+        problems.append(
+            f"{prefix}.grace_minutes must be less than retry_hours * 60: a "
+            "session is dropped at retry_hours, so it could never go full"
+        )
+    for key in ("shadow", "skip_declined"):
+        if key in source and not isinstance(source[key], bool):
+            problems.append(f"{prefix}.{key} must be true or false")
+    for key in ("model", "diff_model"):
+        if key in source and not (
+            isinstance(source[key], str)
+            and mi_source.ANTHROPIC_MODEL.match(source[key])
+        ):
+            problems.append(
+                f"{prefix}.{key} must be an Anthropic model (haiku, sonnet, "
+                "opus or a claude-* id): MI content never goes to another "
+                "provider"
+            )
+    primary = source.get("primary_sources")
+    if primary is not None and (
+        not isinstance(primary, list) or not primary
+        or not all(
+            isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9_-]*", v)
+            and v not in ("mi", "gcal", "mi-check")
+            and not v.endswith("-gcal")
+            for v in primary
+        )
+    ):
+        problems.append(
+            f"{prefix}.primary_sources must be a non-empty list of "
+            "source-id schemes (lower case, not mi, gcal or a *-gcal link scheme)"
+        )
+    for key in ("query", "max_results"):
+        if key in source:
+            problems.append(f"{prefix}.{key} is not supported by mi")
+    analyze = routine.get("analyze") if isinstance(routine, dict) else None
+    analyze = analyze if isinstance(analyze, dict) else {}
+    if analyze.get("provider") != "claude":
+        problems.append(
+            f"{prefix}: analyze.provider must be claude for source.kind "
+            "'mi' (MI content may reach Anthropic models only)"
+        )
+    triage = analyze.get("local_triage")
+    if isinstance(triage, dict) and triage.get("enabled") is True:
+        problems.append(
+            f"{prefix}: analyze.local_triage is not allowed with source.kind "
+            "'mi' (it would send MI content to a local model)"
+        )
+    memory = memory_sink.memory_cfg(routine)
+    for label, value in (
+        ("memory.extract_model", memory.get("extract_model")),
+        ("memory.person_briefs.model",
+         (memory.get("person_briefs") or {}).get("model")
+         if isinstance(memory.get("person_briefs"), dict) else None),
+        ("memory.identity.model",
+         (memory.get("identity") or {}).get("model")
+         if isinstance(memory.get("identity"), dict) else None),
+    ):
+        if value is not None and not (
+            isinstance(value, str) and mi_source.ANTHROPIC_MODEL.match(value)
+        ):
+            problems.append(
+                f"{prefix}: {label} must be an Anthropic model (haiku, "
+                "sonnet, opus or a claude-* id) with source.kind 'mi': the "
+                "capture path sees MI content"
+            )
+    if not memory.get("store"):
+        problems.append(
+            f"{prefix}: source.kind 'mi' needs memory.store (the primary "
+            "entry is read from the store)"
+        )
+    return problems
+
+
 def _validate_schedule(routine):
     """Validate the cadence shared by capture and maintenance routines."""
     problems = []
@@ -2416,8 +2548,10 @@ def _validate_mila_match(source, prefix):
 def _validate_source(routine, source, prefix):
     """Validate one source block. Messages carry the source's config path."""
     problems = []
-    from . import gmail_mcp, slack_mcp, whatsapp_source, zoom_source
+    from . import gmail_mcp, mi_source, slack_mcp, whatsapp_source, zoom_source
     allowed = SOURCE_KEYS | (
+        mi_source.SOURCE_KEYS if source.get("kind") == "mi" else set()
+    ) | (
         whatsapp_source.SOURCE_KEYS if source.get("kind") == "whatsapp"
         else set()
     ) | (
@@ -2745,6 +2879,8 @@ def _validate_source(routine, source, prefix):
         problems.extend(_validate_gmail_mcp(prefix, source))
     if kind == "zoom":
         problems.extend(_validate_zoom(prefix, source))
+    if kind == "mi":
+        problems.extend(_validate_mi(prefix, source, routine))
     if kind == "whatsapp":
         problems.extend(whatsapp_source.validate(prefix, source, routine))
     if kind == "gchat":
@@ -2931,10 +3067,12 @@ def _validate_source(routine, source, prefix):
 
     if kind == "mila":
         problems.extend(_validate_mila_match(source, prefix))
-    elif any(key in source for key in (
-        "calendar", "match", "max_transcript_chars", "app_summary",
-        "language_check", "link_calendar_event",
-    )):
+    elif any(
+        key in source
+        for key in ("calendar", "match", "max_transcript_chars",
+                    "app_summary", "language_check", "link_calendar_event")
+        if not (kind == "mi" and key == "max_transcript_chars")
+    ):
         problems.append(
             f"{prefix}: calendar, match, max_transcript_chars, "
             f"app_summary, language_check and link_calendar_event are only "
