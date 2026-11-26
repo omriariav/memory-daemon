@@ -14,7 +14,7 @@ HAVE_TEXTUAL = importlib.util.find_spec("textual") is not None
 
 if HAVE_TEXTUAL:
     from rich.cells import cell_len
-    from workspace_daemon.inbox import rowmenu, widgets
+    from workspace_daemon.inbox import widgets
     from workspace_daemon.inbox.actions import FakeActions
     from workspace_daemon.inbox.app import InboxApp
     from workspace_daemon.inbox.screens import ConfirmSend, RowMenu
