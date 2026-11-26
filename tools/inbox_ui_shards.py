@@ -54,6 +54,7 @@ MODULES = {
     "tests.test_inbox_agents": 0.2,
     "tests.test_inbox_agents_ui": 25.0,
     "tests.test_inbox_start_task_ui": 30.0,
+    "tests.test_inbox_away": 30.0,
 }
 
 # Inbox test modules the plain `test` job already runs (they need no Textual).

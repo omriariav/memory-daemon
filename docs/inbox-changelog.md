@@ -7,6 +7,35 @@ versions follow [Semantic Versioning](https://semver.org). The policy is in
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-11-26
+
+A row can say that the person you wait on is away, and the nudge waits. A
+source opts in by two new optional `meta` keys; nothing changes for a source
+that does not send them.
+
+### Added
+
+- **`meta.away_until`** (the return day, the first day back, as an ISO date
+  `YYYY-MM-DD`, or `null` when the return is not known) and
+  **`meta.away_note`** (short text, one line, at most 60 characters). An item
+  is away for a return day after today, or, with an unknown return, for a
+  non-empty note.
+- **Away badge** on the row's second line, in the warning colour, next to the
+  task badge: the note, else `away until Mon 30 Nov` from the date. The gist is cut, never a badge. When both badges do not fit, the
+  task badge stays and the away badge shrinks to `away`. The detail pane shows
+  the same text as a `!` line (the row's date and the pane use the app's
+  date, so they expire together).
+- **Nudge held**: on an away row `n` (and `a` on a waiting row) does not open
+  the nudge flow. It shows the toast `Nudge held: <text>`. The footer says
+  `a nudge held`, and the row menu lists Nudge greyed with the reason (a new
+  `disabled_reason` on a menu entry; running a greyed entry only shows it).
+  Done, snooze, open, reply and the rest are unchanged. A confirm screen that
+  was already open when the row became away does not send either.
+- A return day of today or earlier (the local date) means the person is back:
+  no badge, no hold, whatever the note says. A present but unusable
+  `away_until` (a bad date, a number, an object, `false`) makes the item not
+  away, so a malformed value never holds a nudge for good.
+
 ## [0.13.5] - 2026-11-25
 
 An easier due-date picker for tasks (`s` in the Tasks view). Nothing changes

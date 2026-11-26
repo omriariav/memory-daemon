@@ -35,7 +35,7 @@ from . import writes as writes_mod
 from . import summary as summod
 from .actions import Result, act_meta
 from .models import (SOURCES, Item, copy_item_text, copy_section_markdown,
-                     copy_section_text, from_v1)
+                     copy_section_text, from_v1, away_text)
 from .screens import (ActionBusy, AuditScreen, ChoicePicker, ConfirmSend,
                       ConfirmWrite, DateScreen, HelpScreen, NoteScreen, OutcomeScreen,
                       OpsScreen,
@@ -703,7 +703,8 @@ class InboxApp(App):
         badges = tuple(sorted(
             (k, c.name, c.role, c.state, c.completed)
             for k, (_row, c) in self.task_cards.items()))
-        return (today, badges, tuple(
+        away = tuple(sorted((i.key, i.away) for i in self.items if i.away))
+        return (today, badges, away, tuple(
             (v, tuple((g.key, tuple(i.key for i in g.items)) for g in gs))
             for v, gs in self._views.items()))
 
@@ -713,8 +714,10 @@ class InboxApp(App):
         busy_keys = self._busy_keys()
         now = time.time()
         self.task_cards = launchermod.index_cards(self.all_rows)
+        today = self._today()
         for i in self.all_rows:
             i.task = self.task_cards.get(i.key)
+            i.away = away_text(i.meta, today)
             i.local_due = self._due_marks.get(i.key, {}).get("due")
             # One mark for "this is in memory": saved here with `m`, or
             # saved by the daemon (meta.memory_id).
@@ -1187,6 +1190,9 @@ class InboxApp(App):
             if self.current_key != it.key:
                 self.notify("The selection changed; nothing was run",
                             timeout=3, markup=False)
+                return
+            if entry.disabled_reason:
+                self.notify(entry.disabled_reason, timeout=4, markup=False)
                 return
             entry.run()
         self.push_screen(RowMenu(title, entries, self.bidi), chosen)
@@ -2021,6 +2027,9 @@ class InboxApp(App):
         if it.kind != "nudge":
             self.notify("n nudges items under 'Waiting on them'", timeout=3, markup=False)
             return
+        if it.away:     # 0.13.6: the person is away; the nudge waits
+            self.notify(rowmenu.nudge_held(it), timeout=4, markup=False)
+            return
         if not self.actions.supports_send:
             self.notify(NOT_YET, timeout=3, markup=False)
             return
@@ -2117,6 +2126,14 @@ class InboxApp(App):
         open_url = (self._open_target(it) or "") if multi else ""
 
         def after(choice):
+            if choice == "send" and kind == "nudge":
+                # the modal can stay open across a poll: the row may be away now
+                live = self._live_item(it.key)
+                if live is not None and live.away:
+                    self.record(kind, it, "held: away", "refused")
+                    self.notify(rowmenu.nudge_held(live), timeout=4,
+                                markup=False)
+                    return
             if choice == "send":
                 self._enqueue(kind, it, f"{verb}: {dest}", text=text,
                               detail=f"{dest}: {text[:60]}")

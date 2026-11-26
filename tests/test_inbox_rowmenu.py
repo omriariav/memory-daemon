@@ -1005,7 +1005,7 @@ class HelpTest(unittest.IsolatedAsyncioTestCase):
             before = pane.scroll_y
             await pilot.press("j")
             self.assertTrue(await wait_for(pilot, lambda: pane.scroll_y > before))
-            self.assertEqual(__version__, "0.13.5")
+            self.assertEqual(__version__, "0.13.6")
 
 
 if __name__ == "__main__":

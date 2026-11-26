@@ -1,9 +1,11 @@
 """UI row model built from item format v1 dicts (no Textual import)."""
+import datetime as dt
+import re
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .items import MEMORY_ID
+from .items import MEMORY_ID, clean_line
 
 SECTIONS = [
     ("urgent", "Urgent"),
@@ -41,6 +43,51 @@ def fmt_age(secs):
     return f"{s // 86400}d"
 
 
+AWAY_NOTE_MAX = 60
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}(?!\d)", re.ASCII)
+
+
+def away_text(meta, today=None):
+    """The away badge text of an item's `meta`, or "" when it is not away.
+
+    `meta.away_until` is the RETURN day (the first day back): an ISO date, or
+    null / absent when the return is not known. `meta.away_note` is short
+    text. Rules:
+
+    - A return day of today or earlier means the person is back: not away,
+      whatever the note says. A string that starts with `YYYY-MM-DD` (an ISO
+      datetime too) is read by that prefix.
+    - An `away_until` that is present but not usable (a bad date, a number, a
+      list, "false") makes the item NOT away: nothing is shown or held, so a
+      malformed value never means "away forever". Null, absent and an empty
+      string mean an unknown return.
+    - Away needs a future return day or, with an unknown return, a note.
+      The text is the note (cleaned to one line, at most 60 characters), else
+      `away until Mon 30 Nov` from the date."""
+    if not isinstance(meta, dict):
+        return ""
+    until = meta.get("away_until")
+    day = None
+    if isinstance(until, str) and not until.strip():
+        until = None
+    if until is not None:
+        m = _ISO_DAY.match(until) if isinstance(until, str) else None
+        try:
+            day = dt.date.fromisoformat(m.group(0)) if m else None
+        except ValueError:
+            day = None
+        if day is None or day <= (today or dt.date.today()):
+            return ""
+    note = meta.get("away_note")
+    note = (clean_line(note[:1000])[:AWAY_NOTE_MAX].strip()
+            if isinstance(note, str) else "")
+    if note:
+        return note
+    if day is not None:
+        return f"away until {day:%a} {day.day} {day:%b}"
+    return ""
+
+
 @dataclass
 class Msg:
     who: str
@@ -71,6 +118,7 @@ class Item:
     feed: str = "show"             # UI-only: the Feed rule outcome (show/digest/hide/inbox)
     feed_label: str = ""           # UI-only: what the matching rule says (muted list)
     local_due: Optional[tuple] = None   # UI-only (tasks): `(date or None,)`, a due date set here that the list has not caught up with yet
+    away: str = ""                 # UI-only: the away badge text (`away_text`, set with the app's date), "" when not away
     task: Optional[tuple] = field(default=None, repr=False, compare=False)   # UI-only: `(agent row, launcher.Card)` of the task started from this row
     members: List["Item"] = field(default_factory=list, repr=False,
                                   compare=False)   # UI-only: a digest row's items

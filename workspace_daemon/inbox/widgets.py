@@ -355,12 +355,12 @@ class Queue(OptionList):
         pad = max(1, width - t.cell_len - cell_len(age))
         t.append(" " * pad + age, Style(color=pal["urgent"] if urgent else pal["muted"]))
         t.append("\n")
-        badge = task_badge(it)
-        gist = fit(it.gist, width - 4 - (cell_len(badge[0]) + 2
-                                         if badge else 0))
+        badges = row_badges(it, width)
+        gist = fit(it.gist, width - 4 - sum(cell_len(b[0]) + 2
+                                            for b in badges))
         t.append("   " + vis(gist, visual), Style(color=pal["muted"]))
-        if badge:
-            t.append("  " + badge[0], Style(color=pal[badge[1]]))
+        for text, col in badges:
+            t.append("  " + vis(text, visual), Style(color=pal[col]))
         return t
 
     def _ghost_opt(self, it, width, pal, visual):
@@ -432,6 +432,10 @@ class ThreadView(VerticalScroll):
                        f"{ago(now, item.ts)}\n", Style(color=pal["muted"]))
         if item.hint:  # e.g. an RSVP the calendar never confirmed
             out.append("! " + item.hint + "\n", Style(color=pal["warn"], bold=True))
+        if item.away:  # the person is away (meta.away_note / away_until)
+            out.append("! " + vis(item.away, visual) + (
+                " · nudge held" if item.kind == "nudge" else "") + "\n",
+                Style(color=pal["warn"]))
         if item.memory_id:  # already saved to memory (the ◆ of the row)
             out.append(f"{SAVED_GLYPH} In memory: {item.memory_id}\n",
                        Style(color=pal["ok"]))
@@ -787,6 +791,37 @@ def agent_marks(it):
     if it.meta.get("rules_stale") is True:
         out.append(("old rules", "warn"))
     return out
+
+
+MIN_GIST = 12      # cells a row's gist keeps before the badges give way
+
+
+def away_badge(it):
+    """`(text, palette key)` of the away note of this row (`meta.away_note`,
+    `meta.away_until`; see `models.away_text`), or None. A task row has none."""
+    if tasksmod.is_task(it):
+        return None
+    text = it.away
+    return (text, "warn") if text else None
+
+
+def row_badges(it, width):
+    """The badges of a row's second line, in order (task, then away), as
+    `(text, palette key)` pairs that fit `width` (the row's width). The gist
+    is cut, never a badge. The full away text is kept only while at least
+    MIN_GIST cells stay for the gist; otherwise it shrinks to `away` (also
+    when it is alone), which is kept while at least one cell stays for the
+    gist and is left out below that. The task badge always stays."""
+    task, away = task_badge(it), away_badge(it)
+    if not away:
+        return [task] if task else []
+    budget = width - 4 - MIN_GIST
+    used = cell_len(task[0]) + 2 if task else 0
+    if used + cell_len(away[0]) + 2 > budget:
+        away = ("away", away[1])
+        if used + cell_len(away[0]) + 2 >= width - 4:   # no cell left for the gist
+            away = None
+    return [b for b in (task, away) if b]
 
 
 def task_badge(it):

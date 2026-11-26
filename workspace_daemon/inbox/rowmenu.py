@@ -31,6 +31,7 @@ class MenuEntry:
     also: tuple = ()          # more keys that run it (the `n` of a nudge)
     detail: str = ""
     titles: tuple = ()        # the palette commands this entry stands for
+    disabled_reason: str = ""  # set: listed greyed with this reason; running it only shows it
     keys: tuple = field(init=False)
 
     def __post_init__(self):
@@ -63,6 +64,11 @@ APPROVE_TITLES = {
     "accept": ("Approve draft / acknowledge", "Accept invite"),
     "nudge": ("Approve draft / acknowledge", "Nudge"),
 }
+
+
+def nudge_held(it):
+    """The toast of a nudge that is held because the person is away."""
+    return f"Nudge held: {it.away}"
 
 
 def filter_entries(entries, text):
@@ -229,7 +235,8 @@ def verb_hints(app, it):
     hints = []
     label = approve_label(app, it)
     if label:
-        hints.append(("a", label))
+        hints.append(("a", "nudge held" if label == "nudge" and it.away
+                      else label))
     if _closable(app, it):
         hints.append(("d", "done"))
     if not tasksmod.is_task(it) or app._acts_on(it, "due"):
@@ -247,12 +254,13 @@ def build_entries(app, it):
     """The menu of `it`: only what is valid for this row now."""
     entries = []
 
-    def add(group, key, label, run, also=(), detail="", titles=None):
+    def add(group, key, label, run, also=(), detail="", titles=None,
+            disabled_reason=""):
         if titles is None:
             titles = ((label,) if group == G_CUSTOM
                       else KEY_TITLES.get(key, ()))
         entries.append(MenuEntry(key, label, group, run, tuple(also), detail,
-                                 tuple(titles)))
+                                 tuple(titles), disabled_reason))
 
     if it is None:
         return entries
@@ -377,9 +385,11 @@ def _row_entries(app, it, add, in_feed):
         long = {"send": "Send reply…", "accept": "Accept invite",
                 "nudge": "Nudge…", "ack": "Acknowledge"}[label]
         also = ("n",) if label == "nudge" else ()
+        held = nudge_held(it) if label == "nudge" and it.away else ""
         add(G_ACT, "a", long, app.action_approve, also=also,
-            detail="confirm first" if label in ("send", "nudge") else "",
-            titles=APPROVE_TITLES[label])
+            detail=held or ("confirm first"
+                            if label in ("send", "nudge") else ""),
+            titles=APPROVE_TITLES[label], disabled_reason=held)
     rsvp = app._rsvp_on(it)
     if rsvp:
         add(G_ACT, "X", "Decline invite", app.action_rsvp_decline)
