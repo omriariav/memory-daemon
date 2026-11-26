@@ -661,25 +661,34 @@ optional `meta` keys:
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `away_until` | string or null | ISO date `YYYY-MM-DD` of the return day; `null` (or a value that is not a date) when it is not known |
+| `away_until` | string or null | the RETURN day (the first day back) as an ISO date `YYYY-MM-DD`; a longer ISO datetime is read by its first 10 characters. `null` (or absent) when the return is not known |
 | `away_note` | string | short text for the badge, shown as one line of at most 60 characters |
 
-An item is away when either key holds a non-empty value. The inbox then:
+An item is away when `away_until` is a date after today (the local date), or,
+with `away_until` null or absent, when `away_note` is a non-empty string. The
+inbox then:
 
 - draws a badge in the warning colour on the row's second line (the same line
-  as the task badge): the note, else `away until Mon 30 Nov` from the date, else
-  `away`. The gist is cut to make room, never a badge. When the task badge and
-  the away badge do not both fit, the task badge stays and the away badge
-  becomes `away`;
+  as the task badge): the note, else `away until Mon 30 Nov` from the date. The
+  gist is cut to make room, never a badge. When the task badge and the away
+  badge do not both fit, the task badge stays and the away badge becomes
+  `away` (left out only when not even that leaves a cell for the gist);
 - shows the same text as a `! ` line in the detail pane;
 - holds the nudge: `n` (and `a` on a waiting row, and the palette's Nudge) shows
   the toast `Nudge held: <text>` and opens nothing. The footer says
   `a nudge held` and the row menu lists Nudge greyed with that reason (its
-  entry has a `disabled_reason`). Every other action is unchanged.
+  entry has a `disabled_reason`). A confirm screen that was already open when
+  the row became away does not send either; it shows the same toast. Every other
+  action is unchanged.
 
-A date before today (the local date) is ignored: no badge, and the nudge is
-allowed. A date of today or later is away. The text is cleaned the way other
-untrusted text is (see [Untrusted text](#untrusted-text)).
+`away_until` is the day the person is back, so a return day of today or
+earlier (the local date) means they are back: no badge, and the nudge is
+allowed, whatever the note says. A present but unusable `away_until` (a bad
+date such as `2026-13-45` or `11/20/2026`, a number, an object, the string
+`false`) makes the item not away at all, so a malformed value never holds a
+nudge for good. The note is cleaned like other untrusted text (see
+[Untrusted text](#untrusted-text): escapes, control and bidi characters
+removed, one line) and cut at 60 characters.
 
 ### `done_reaction`
 

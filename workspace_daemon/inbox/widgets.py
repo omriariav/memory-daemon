@@ -360,7 +360,7 @@ class Queue(OptionList):
                                             for b in badges))
         t.append("   " + vis(gist, visual), Style(color=pal["muted"]))
         for text, col in badges:
-            t.append("  " + text, Style(color=pal[col]))
+            t.append("  " + vis(text, visual), Style(color=pal[col]))
         return t
 
     def _ghost_opt(self, it, width, pal, visual):
@@ -807,11 +807,11 @@ def away_badge(it):
 
 def row_badges(it, width):
     """The badges of a row's second line, in order (task, then away), as
-    `(text, palette key)` pairs that fit `width` (the row's width) with at
-    least MIN_GIST cells left for the gist. The gist is cut, never a badge;
-    when both do not fit the task badge stays and the away badge shrinks to
-    `away` (an away badge that does not fit alone shrinks the same way, and
-    is left out when even `away` leaves no cell for the gist)."""
+    `(text, palette key)` pairs that fit `width` (the row's width). The gist
+    is cut, never a badge. The full away text is kept only while at least
+    MIN_GIST cells stay for the gist; otherwise it shrinks to `away` (also
+    when it is alone), which is kept while at least one cell stays for the
+    gist and is left out below that. The task badge always stays."""
     task, away = task_badge(it), away_badge(it)
     if not away:
         return [task] if task else []
@@ -819,7 +819,7 @@ def row_badges(it, width):
     used = cell_len(task[0]) + 2 if task else 0
     if used + cell_len(away[0]) + 2 > budget:
         away = ("away", away[1])
-        if used + cell_len(away[0]) + 2 > width - 4:   # not even that: no room at all
+        if used + cell_len(away[0]) + 2 >= width - 4:   # no cell left for the gist
             away = None
     return [b for b in (task, away) if b]
 

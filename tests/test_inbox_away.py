@@ -62,11 +62,16 @@ class AwayTextTest(unittest.TestCase):
             {"away_until": "2030-11-30"}, today=dt.date(2030, 1, 1)),
             "away until Sat 30 Nov")
 
-    def test_neither_is_plain_away(self):
+    def test_an_unknown_return_needs_a_note(self):
         self.assertEqual(models.away_text({"away_until": None, "away_note": "away"}),
                          "away")
+        self.assertEqual(models.away_text({"away_note": "away, return unknown"}),
+                         "away, return unknown")
+        self.assertEqual(models.away_text({"away_until": "", "away_note": "away"}),
+                         "away")
         self.assertEqual(models.away_text({"away_note": "  \n "}), "")
-        self.assertEqual(models.away_text({"away_until": "someday"}), "away")
+        self.assertEqual(models.away_text({"away_until": None, "away_note": "  "}), "")
+        self.assertEqual(models.away_text({"away_note": 5}), "")
 
     def test_not_away(self):
         for meta in ({}, {"away_until": None}, {"away_note": ""}, {"away_until": ""},
@@ -79,9 +84,46 @@ class AwayTextTest(unittest.TestCase):
         self.assertEqual(models.away_text(
             {"away_until": PAST.isoformat(), "away_note": "away until yesterday"}), "")
 
-    def test_today_is_still_away(self):
-        self.assertEqual(models.away_text({"away_until": TODAY.isoformat()}),
-                         until_text(TODAY))
+    def test_the_return_day_is_the_first_day_back(self):
+        # away_until is the day the person is back: today is not away, tomorrow is
+        for meta in ({"away_until": TODAY.isoformat()},
+                     {"away_until": TODAY.isoformat(), "away_note": "away until today"}):
+            with self.subTest(meta=meta):
+                self.assertEqual(models.away_text(meta), "")
+        tomorrow = TODAY + dt.timedelta(days=1)
+        self.assertEqual(models.away_text({"away_until": tomorrow.isoformat()}),
+                         until_text(tomorrow))
+        day = dt.date(2030, 1, 10)
+        self.assertEqual(models.away_text({"away_until": "2030-01-10"}, today=day), "")
+        self.assertEqual(models.away_text({"away_until": "2030-01-11",
+                                           "away_note": "out"}, today=day), "out")
+
+    def test_an_iso_datetime_is_read_by_its_date_and_expires(self):
+        day = dt.date(2030, 1, 10)
+        self.assertEqual(models.away_text({"away_until": "2030-01-11T09:30:00Z"},
+                                          today=day), "away until Fri 11 Jan")
+        self.assertEqual(models.away_text({"away_until": "2030-01-10T09:30:00+02:00",
+                                           "away_note": "out"}, today=day), "")
+        self.assertEqual(models.away_text({"away_until": "2030-01-09 23:59",
+                                           "away_note": "out"}, today=day), "")
+
+    def test_a_malformed_return_is_not_away_at_all(self):
+        for bad in ("2026-13-45", "2026-02-30", "11/20/2026", "20261120", "someday",
+                    "false", "null", 12345, 1.5, True, False, {"x": 1}, ["2030-01-11"],
+                    "x2030-01-11", "2030-01-111", "\u0662\u0660\u0663\u0660-01-11"):
+            with self.subTest(bad=bad):
+                self.assertEqual(models.away_text(
+                    {"away_until": bad, "away_note": "away until Mon 30 Nov"},
+                    today=dt.date(2000, 1, 1)), "")
+                self.assertEqual(models.away_text(
+                    {"away_until": bad}, today=dt.date(2000, 1, 1)), "")
+
+    def test_an_ansi_note_is_cleaned(self):
+        text = models.away_text({"away_note": "\x1b[31mout\x1b[0m of \x1b]0;title\x07office\u202e"})
+        self.assertEqual(text, "out of office")
+        self.assertNotIn("\x1b", text)
+        text = models.away_text({"away_note": "\x1b[2J" + "x" * 5000})
+        self.assertEqual(text, "x" * models.AWAY_NOTE_MAX)
 
     def test_the_note_is_one_line_and_capped(self):
         text = models.away_text({"away_note": "out\x00 of\noffice\t" + "x" * 100})
@@ -90,20 +132,19 @@ class AwayTextTest(unittest.TestCase):
         self.assertLessEqual(len(text), models.AWAY_NOTE_MAX)
         self.assertTrue(text.startswith("out of office xxx"))
 
-    def test_an_item_reads_its_own_meta(self):
+    def test_an_item_that_was_not_refiltered_is_not_away(self):
         item = models.Item(key="k", section="waiting", who="P", where="DM",
                            ts=time.time(), gist="g",
                            meta={"away_until": FUTURE.isoformat()})
-        self.assertEqual(item.away, until_text(FUTURE))
-        self.assertEqual(models.Item(key="k", section="fyi", who="P", where="DM",
-                                     ts=time.time(), gist="g").away, "")
+        self.assertEqual(item.away, "")
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
 class BadgeWidthTest(unittest.TestCase):
     def item(self, task=None, **meta):
         return models.Item(key="k", section="waiting", who="P", where="DM",
-                           ts=time.time(), gist="g", meta=meta, task=task)
+                           ts=time.time(), gist="g", meta=meta, task=task,
+                           away=models.away_text(meta))
 
     class Card:
         name, role, state, completed = "scout-1", "researcher", "in progress", False
@@ -148,10 +189,16 @@ class BadgeWidthTest(unittest.TestCase):
                     self.assertGreaterEqual(width - 4 - used, widgets.MIN_GIST)
                 if len(badges) == 2:
                     self.assertIn(badges[1][0], ("away", "away until Mon 30 Nov"))
+                    self.assertGreaterEqual(width - 4 - used, 1)   # a cell for the gist
+
+    def test_a_lone_badge_is_left_out_when_no_cell_is_left_for_the_gist(self):
+        it = self.item(away_note="away")
+        self.assertEqual(widgets.row_badges(it, 10), [])
+        self.assertEqual(widgets.row_badges(it, 11), [("away", "warn")])
 
     def test_a_task_row_has_no_away_badge(self):
         it = models.Item(key="k", section="fyi", who="P", where="x",
-                         ts=time.time(), gist="g", source="other",
+                         ts=time.time(), gist="g", source="other", away="away",
                          meta={"kind": "task", "away_note": "away"})
         self.assertEqual(widgets.row_badges(it, 80), [])
 
@@ -195,11 +242,15 @@ class Fixed:
         return [sources.SourceResult("src", self.rows, False, None, None)]
 
 
-def make_app(rows, view="waiting"):
+def make_app(rows, view="waiting", today=None):
     store = InboxStore(None)
     actions = FakeActions(store=store, draft_delay=0)
-    return InboxApp(Fixed(rows), store, actions, settings=dict(DEFAULTS),
-                    undo_s=30.0, leave_s=0, stream_delay=0, view=view)
+    fetch = Fixed(rows)
+    app = InboxApp(fetch, store, actions, settings=dict(DEFAULTS),
+                   undo_s=30.0, leave_s=0, stream_delay=0, view=view,
+                   today=(lambda: today) if today else None)
+    app.fetch = fetch
+    return app
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "Textual not installed")
@@ -295,6 +346,43 @@ class RowAndDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("away", row_text(app, "w:1"))
             self.assertNotIn("away", str(app.query_one("#thread-body").render()))
 
+    async def test_the_apps_date_decides_the_expiry(self):
+        day = dt.date(2030, 1, 10)
+        rows = [waiting(1, away_until="2030-01-10", away_note="away until today"),
+                waiting(2, away_until="2030-01-11", away_note="out until tomorrow"),
+                waiting(3, away_until="2030-01-10T08:00:00Z", away_note="datetime")]
+        app = make_app(rows, today=day)
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertNotIn("away", row_text(app, "w:1"))
+            self.assertIn("out until tomorrow", row_text(app, "w:2"))
+            self.assertNotIn("datetime", row_text(app, "w:3"))
+            self.assertEqual([app._rows[k].away for k in ("w:1", "w:2", "w:3")],
+                             ["", "out until tomorrow", ""])
+
+    async def test_a_changed_away_note_redraws_the_row(self):
+        app = make_app([waiting(1, away_note="out sick")])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertIn("out sick", row_text(app, "w:1"))
+            app.fetch.rows = [waiting(1, away_note="on leave")]
+            app.poll()
+            self.assertTrue(await until(
+                pilot, lambda: "on leave" in row_text(app, "w:1")))
+            app.fetch.rows = [waiting(1)]
+            app.poll()
+            self.assertTrue(await until(
+                pilot, lambda: "on leave" not in row_text(app, "w:1")))
+
+    async def test_a_malformed_return_shows_nothing_and_holds_nothing(self):
+        app = make_app([waiting(1, away_until="2026-13-45", away_note="away")])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            self.assertNotIn("away", row_text(app, "w:1"))
+            await pilot.press("n")
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
+
     async def test_an_item_without_away_meta_is_unchanged(self):
         app = make_app([waiting(1)])
         async with app.run_test(size=SIZE) as pilot:
@@ -369,6 +457,38 @@ class NudgeHeldTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("n")
             self.assertTrue(await until(
                 pilot, lambda: isinstance(app.screen, ConfirmSend)))
+            self.assertFalse(any("Nudge held" in t for t in toasts(app)))
+
+    async def test_the_confirm_screen_does_not_send_once_the_row_is_away(self):
+        app = make_app([waiting(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("n")
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
+            # a poll while the confirm is open: the person is away now
+            app.fetch.rows = [waiting(1, away_note="away until Mon 30 Nov")]
+            app.poll()
+            self.assertTrue(await until(
+                pilot, lambda: app._live_item("w:1").away))
+            await pilot.press("y")
+            self.assertTrue(await until(pilot, lambda: any(
+                "Nudge held: away until Mon 30 Nov" in t for t in toasts(app))),
+                toasts(app))
+            await pilot.pause(0.3)
+            self.assertFalse(isinstance(app.screen, ConfirmSend))
+            self.assertEqual(list(app.pending), [])
+            self.assertEqual(app.actions.sent(), [])
+
+    async def test_the_confirm_screen_still_sends_when_the_row_is_not_away(self):
+        app = make_app([waiting(1)])
+        async with app.run_test(size=SIZE) as pilot:
+            await settle(pilot, app)
+            await pilot.press("n")
+            self.assertTrue(await until(
+                pilot, lambda: isinstance(app.screen, ConfirmSend)))
+            await pilot.press("y")
+            self.assertTrue(await until(pilot, lambda: bool(app.pending)))
             self.assertFalse(any("Nudge held" in t for t in toasts(app)))
 
     async def test_an_item_without_away_meta_nudges_as_before(self):
