@@ -1,4 +1,6 @@
 """UI row model built from item format v1 dicts (no Textual import)."""
+import datetime as dt
+import re
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -41,6 +43,41 @@ def fmt_age(secs):
     return f"{s // 86400}d"
 
 
+AWAY_NOTE_MAX = 60
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def away_text(meta, today=None):
+    """The away badge text of an item's `meta`, or "" when it is not away.
+
+    Away when `meta.away_until` (an ISO date, or null for an unknown return)
+    or `meta.away_note` (short text) holds a usable value. The text is the
+    note (one line, at most 60 characters), else `away until Mon 30 Nov` from
+    the date, else `away`. A date before today (the local date) means the
+    person is back: nothing is away, whatever the note says. A value that is
+    not a date is read as an unknown return."""
+    if not isinstance(meta, dict):
+        return ""
+    until = meta.get("away_until")
+    day = None
+    if isinstance(until, str) and _ISO_DAY.fullmatch(until.strip()):
+        try:
+            day = dt.date.fromisoformat(until.strip())
+        except ValueError:
+            day = None
+    if day is not None and day < (today or dt.date.today()):
+        return ""
+    note = meta.get("away_note")
+    note = " ".join("".join(c if c.isprintable() else " " for c in note).split()
+                    )[:AWAY_NOTE_MAX].strip() if isinstance(note, str) else ""
+    if note:
+        return note
+    if day is not None:
+        return f"away until {day:%a} {day.day} {day:%b}"
+    given = until.strip() if isinstance(until, str) else until
+    return "away" if given else ""
+
+
 @dataclass
 class Msg:
     who: str
@@ -75,6 +112,12 @@ class Item:
     members: List["Item"] = field(default_factory=list, repr=False,
                                   compare=False)   # UI-only: a digest row's items
     raw: Optional[dict] = field(default=None, repr=False, compare=False)
+
+    @property
+    def away(self):
+        """The away badge text (`meta.away_until` / `meta.away_note`, see
+        `away_text`), or "" when the person is not away."""
+        return away_text(self.meta)
 
     @property
     def memory_id(self):

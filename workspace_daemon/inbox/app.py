@@ -1188,6 +1188,9 @@ class InboxApp(App):
                 self.notify("The selection changed; nothing was run",
                             timeout=3, markup=False)
                 return
+            if entry.disabled_reason:
+                self.notify(entry.disabled_reason, timeout=4, markup=False)
+                return
             entry.run()
         self.push_screen(RowMenu(title, entries, self.bidi), chosen)
 
@@ -2020,6 +2023,9 @@ class InboxApp(App):
             return
         if it.kind != "nudge":
             self.notify("n nudges items under 'Waiting on them'", timeout=3, markup=False)
+            return
+        if it.away:     # 0.13.6: the person is away; the nudge waits
+            self.notify(rowmenu.nudge_held(it), timeout=4, markup=False)
             return
         if not self.actions.supports_send:
             self.notify(NOT_YET, timeout=3, markup=False)

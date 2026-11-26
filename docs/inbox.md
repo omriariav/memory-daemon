@@ -53,7 +53,7 @@ One item is one JSON object:
 | `thread` | list | `{"who": str, "ts": number, "text": str}` objects, up to 100, oldest first. Slack items are rendered as Slack mrkdwn, every other source as plain text. |
 | `draft` | string or null | suggested reply text, up to 8000 chars |
 | `actions` | list | no duplicates, a subset of `reply`, `ack`, `done`, `snooze`, `nudge`, `open` |
-| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read, and `meta.task`, `meta.todo` and `meta.ask` (strings: what the owner is to do, shown as `To do:` in an I OWE item's Thread pane, see [Thread pane of an I OWE item](#thread-pane-of-an-i-owe-item)) (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)) |
+| `meta` | object | opaque to the inbox apart from the keys below; handed back to the source by `act` (with `memory_id` and `thread_memory_id` possibly added by the inbox, see below). Five optional keys are read, and `meta.task`, `meta.todo` and `meta.ask` (strings: what the owner is to do, shown as `To do:` in an I OWE item's Thread pane, see [Thread pane of an I OWE item](#thread-pane-of-an-i-owe-item)) (plus `meta.channel_id`, `meta.thread_ts` and `meta.message_ts`, read only for the [memory match](#already-in-memory) when there is no valid `reply_to`, never for sending): `meta.thread_note`, a string shown as one dim line above the thread (cleaned to one line, cut at 200 chars; an item with an empty `thread` and a note shows only the note), `meta.reply_to`, the Slack destination of a send or a reaction (see [The `reply_to` contract](#the-reply_to-contract)), `meta.suggested_reaction`, an emoji name (`^[a-z0-9_+\-]{1,64}$`) that the react picker preselects (see [Slack reactions](#slack-reactions-e)), and `meta.memory_id`, the id of the memory entry the item is already saved as (`^[a-z0-9][a-z0-9-]{0,200}$`; a command source may set it; the inbox itself also **adds** it to the item of any source when the daemon's events say the item is in memory, see [Already in memory](#already-in-memory), and adds `meta.thread_memory_id` when only a Slack thread is, so both reach the save, context, precheck and custom-action commands in the item they receive), and `meta.thread_fixed`, `true` for a thread that is a fixed list of labelled entries (an alert's): it is not reversed by the thread order and gets no thread-start marker, and `meta.last_seen_ts`, a number (the time of the newest message the source knows of), which an `act` call sends back as `seen.last_seen_ts` for the source's compare-and-set (see [Acts](#acts)), and `meta.away_until` and `meta.away_note`, which mark the person an item waits on as away (a badge, and the nudge is held; see [Away items](#away-items-metaaway_until-metaaway_note)) |
 
 All fields are required. Unknown extra keys are ignored and dropped.
 
@@ -653,6 +653,33 @@ the person's first name without punctuation; `there` when the sender is a
 channel such as `#launch`, You, or a name with no letters), `{who}` (the whole
 name) and `{topic}` (the row's gist cut to one line of 80 characters); any other field, a format spec or an unbalanced
 brace is a settings error. Write a literal brace as `{{` or `}}`.
+
+### Away items (`meta.away_until`, `meta.away_note`)
+
+A source that knows the person an item waits on is away can say so in two
+optional `meta` keys:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `away_until` | string or null | ISO date `YYYY-MM-DD` of the return day; `null` (or a value that is not a date) when it is not known |
+| `away_note` | string | short text for the badge, shown as one line of at most 60 characters |
+
+An item is away when either key holds a non-empty value. The inbox then:
+
+- draws a badge in the warning colour on the row's second line (the same line
+  as the task badge): the note, else `away until Mon 30 Nov` from the date, else
+  `away`. The gist is cut to make room, never a badge. When the task badge and
+  the away badge do not both fit, the task badge stays and the away badge
+  becomes `away`;
+- shows the same text as a `! ` line in the detail pane;
+- holds the nudge: `n` (and `a` on a waiting row, and the palette's Nudge) shows
+  the toast `Nudge held: <text>` and opens nothing. The footer says
+  `a nudge held` and the row menu lists Nudge greyed with that reason (its
+  entry has a `disabled_reason`). Every other action is unchanged.
+
+A date before today (the local date) is ignored: no badge, and the nudge is
+allowed. A date of today or later is away. The text is cleaned the way other
+untrusted text is (see [Untrusted text](#untrusted-text)).
 
 ### `done_reaction`
 

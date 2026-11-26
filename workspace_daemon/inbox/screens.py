@@ -566,8 +566,11 @@ class RowMenu(ModalScreen):
                 if first is None:
                     first = len(options)
                 prompt = Text()
-                prompt.append(f" {e.shown:<7}", Style(bold=True))
-                prompt.append(" " + vis(e.label, self.visual))
+                grey = bool(e.disabled_reason)    # listed, but it only says why
+                prompt.append(f" {e.shown:<7}",
+                              Style(bold=True, dim=grey))
+                prompt.append(" " + vis(e.label, self.visual),
+                              Style(dim=True, strike=True) if grey else None)
                 if e.detail:
                     prompt.append("  " + vis(e.detail, self.visual),
                                   Style(dim=True))
@@ -876,7 +879,7 @@ HELP = [
         ("", "every old key still works; a row's others are in its enter menu")]),
     (POWER, [
         ("e", "edit the draft  (esc / ctrl+s done)"),
-        ("n", "nudge (confirm first); the same as a on a waiting row"),
+        ("n", "nudge (confirm first); the same as a on a waiting row; held, with a toast, while the row shows an away badge"),
         ("a / X / T", "accept / decline / tentative on an invite (rsvp: in inbox.yaml)"),
         ("D", "Slack ask: draft a reply for me (summary: or polish:; fills the Draft pane, never sends) · todo: done with an outcome · review: copy a save hint"),
         ("P", "polish the draft in your tone (polish: in inbox.yaml); never sends"),
